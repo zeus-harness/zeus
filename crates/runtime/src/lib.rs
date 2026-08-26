@@ -30,8 +30,9 @@ use protocol::{
 pub use storage::{
     AuthPrincipal, AuthSessionCommit, BootstrapOwnerCommit, ReplyClaimOutcome, ReplyCompletion,
     ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus,
-    ReplyOutcomeUnknownCommit, ReplySuccessCommit, SessionSummaryPage, StoredCredential,
-    StoredPreferences, StoredUser, StoredUserRole, StoredUserStatus,
+    ReplyOutcomeUnknownCommit, ReplySuccessCommit, SessionSummaryPage, StorageLimits,
+    StorageLimitsError, StoredCredential, StoredPreferences, StoredUser, StoredUserRole,
+    StoredUserStatus,
 };
 use storage::{
     ClaimOutcome, CommitOutcome, DispatchCompleteCommit, DispatchContext, DispatchJob,
@@ -119,6 +120,16 @@ pub enum StoreError {
     UserNotFound(String),
     #[error("user {0} is disabled")]
     UserDisabled(String),
+    #[error("the durable storage quota is exhausted")]
+    StorageQuotaExceeded,
+    #[error("the durable reply queue is at capacity")]
+    ReplyQueueCapacityExceeded,
+    #[error("the durable dispatch queue is at capacity")]
+    DispatchQueueCapacityExceeded,
+    #[error("the authentication session store is at capacity")]
+    AuthSessionCapacityExceeded,
+    #[error("durable finalization capacity is unavailable")]
+    FinalizationReservationUnavailable,
     #[error("invalid account data: {0}")]
     InvalidAccountData(String),
     #[error("run {run_id} already belongs to session {session_id}")]
@@ -178,6 +189,13 @@ impl From<StorageError> for StoreError {
             StorageError::InvalidBootstrapToken => Self::InvalidBootstrapToken,
             StorageError::UserNotFound(id) => Self::UserNotFound(id),
             StorageError::UserDisabled(id) => Self::UserDisabled(id),
+            StorageError::StorageQuotaExceeded => Self::StorageQuotaExceeded,
+            StorageError::ReplyQueueCapacityExceeded => Self::ReplyQueueCapacityExceeded,
+            StorageError::DispatchQueueCapacityExceeded => Self::DispatchQueueCapacityExceeded,
+            StorageError::AuthSessionCapacityExceeded => Self::AuthSessionCapacityExceeded,
+            StorageError::FinalizationReservationUnavailable => {
+                Self::FinalizationReservationUnavailable
+            }
             StorageError::InvalidAccountData(detail) => Self::InvalidAccountData(detail),
             StorageError::RunAlreadyAttached { run_id, session_id } => {
                 Self::RunAlreadyAttached { run_id, session_id }
@@ -211,6 +229,13 @@ impl DemoStore {
         Self::open_with_profile(path, DemoProfile::ProductionGuarded).await
     }
 
+    pub async fn open_with_limits(
+        path: impl AsRef<Path>,
+        limits: StorageLimits,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_profile_and_limits(path, DemoProfile::ProductionGuarded, limits).await
+    }
+
     /// Opens an explicit local-development demonstration with one fixed marker
     /// root and no production connector.
     pub async fn open_local(
@@ -226,11 +251,34 @@ impl DemoStore {
         .await
     }
 
+    pub async fn open_local_with_limits(
+        path: impl AsRef<Path>,
+        marker_root: impl Into<PathBuf>,
+        limits: StorageLimits,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_profile_and_limits(
+            path,
+            DemoProfile::LocalDevelopment {
+                marker_root: marker_root.into(),
+            },
+            limits,
+        )
+        .await
+    }
+
     pub async fn open_with_profile(
         path: impl AsRef<Path>,
         profile: DemoProfile,
     ) -> Result<Self, StoreError> {
-        let storage = SqliteStore::open(path).await?;
+        Self::open_with_profile_and_limits(path, profile, StorageLimits::default()).await
+    }
+
+    pub async fn open_with_profile_and_limits(
+        path: impl AsRef<Path>,
+        profile: DemoProfile,
+        limits: StorageLimits,
+    ) -> Result<Self, StoreError> {
+        let storage = SqliteStore::open_with_limits(path, limits).await?;
         Self::from_storage(storage, profile, true).await
     }
 
@@ -3364,7 +3412,7 @@ mod tests {
 
     async fn bootstrap_test_owner(store: &DemoStore) {
         let bootstrap_token_hash = "a".repeat(64);
-        let expiry = "2999-01-01T00:00:00Z";
+        let expiry = "2999-01-01T00:00:00.000Z";
         store
             .replace_bootstrap_token(&bootstrap_token_hash, expiry)
             .await

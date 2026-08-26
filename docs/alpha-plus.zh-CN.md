@@ -1,7 +1,7 @@
 # Zeus Harness Alpha+ 设计冻结
 
-状态：主机 Alpha+、Actor Boundary Foundation、API Resource Envelope、Bounded Event Feed、Point-query Durable Context 与 Bounded Read Models 验收通过；Apple container 新镜像验收待完成
-前置基线：`78a65e1`（Point-query Durable Context）
+状态：主机 Alpha+、Actor Boundary Foundation、API Resource Envelope、Bounded Event Feed、Point-query Durable Context、Bounded Read Models 与 SQLite Capacity Slice 1 已实现并通过主机全量验收；Apple container 新镜像验收待完成
+前置基线：`8656e52`（Bounded Read Models）
 
 ## 1. 产品术语
 
@@ -47,7 +47,9 @@ Health 路由保持公开。公开注册、邮件找回、OAuth/SSO、WebAuthn �
 
 这些边界只是未来 member 能力的安全底座。当前 API 仍拒绝 member 登录；字段、HTTP/SSE
 连接、事件页边界、内部 point/batch read 和 Session/Run 有界 read model 已经落地，但
-SQLite 存储/队列配额完成前不得开放 member。
+即使第一阶段 SQLite 行数、活跃队列和 event-slot 配额已落地，也不得开放 member。剩余门槛是
+terminal payload byte reservation、tenant/account membership scope、SQLite 主库/WAL/磁盘
+应急余量，以及 bootstrap audit 的明确保留期。
 
 Resource Envelope 的固定边界：auth JSON 8 KiB、command JSON 512 KiB；新建 Session/turn
 ID 128 UTF-8 bytes、Session title 256 bytes、user message 64 KiB、review note 8 KiB；
@@ -66,6 +68,21 @@ actor/resource scope 绑定的 opaque cursor，页内仍按原顺序升序输出
 不在 bounded turn tail 中的 durable retry identity 通过 actor-scoped turn point GET 确认；无法
 确认时保留原 idempotency key，不把旧消息改成新命令重发。异步点查返回前若用户切换 Session
 或 attempt identity 已改变，selection epoch/session/turn/key guard 会丢弃旧结果。
+
+SQLite Capacity Slice 1 在每个 `BEGIN IMMEDIATE` admission 事务内执行 owner scope 与 global
+双层限制：Session 1,000/10,000、open turn 32/64、active reply 32/64、active dispatch
+16/32、auth session 每用户/全局 32/256。每个 Session 的 ledger head 加未消费预留槽默认
+最多 10,000，每个 Run 默认 50,000；bootstrap audit 默认最多 1,024 行。配置可调但不得为
+0、不得让 scope 超过 global，也不得越过编译期 hard ceiling。鉴权和 exact receipt replay
+先于容量检查，所以 foreign resource 仍是 `404`，已成功命令在满配额时仍能 replay。
+
+接受 turn 时预留两个 Session 终结事件槽；接受 dispatch 时预留两个 Run 槽。reply claim
+必须确认两个槽仍在，dispatch claim 消耗一个 started 槽，success/failure/rejection/recovery
+在同一事务消费或释放剩余槽并删除空 reservation。reservation 丢失时 provider/connector
+之前 fail closed 为脱敏 `503`。普通容量拒绝为带 `Cache-Control: no-store` 的 `429`；reply/
+dispatch queue 另带 `Retry-After: 2`。该阶段只保证 event row slots，不宣称 payload bytes、
+DB file、WAL 或宿主磁盘空间有保证。过期 auth session 只在启动和新建登录会话前按稳定顺序
+清理最多 64 行；ledger、receipt、job、turn 和 bootstrap audit 不做静默删除。
 
 ## 4. 设置
 
@@ -110,6 +127,10 @@ POST /sessions/{id}/turns
   解码并原位回填既有事件，随后安装 approval/call/policy 与恢复队列索引、Run ledger
   连续序列 trigger。审批、派发、reply completion、attachment 与冷恢复只使用 point query
   或固定 64 行 batch。
+- `0010_capacity.sql`：`finalization_reservations`、Session turn/dispatch 的 owner scope 与
+  2→1→0 event-slot 状态机、legacy active-work 回填、auth expiry index，以及 reservation
+  binding/scope/单调递减/空槽删除 trigger。旧库即使已经超过新配额仍可迁移、读取和排空；
+  只拒绝新的 admission。
 
 迁移必须原地保留 Alpha append-only ledger、事件外键与 runtime identity。任何一步失败都回滚整个 migration transaction。
 
@@ -129,6 +150,9 @@ POST /sessions/{id}/turns
 - reply job 的 queued/start/success/failure/outcome_unknown 和重启语义有存储测试。
 - v8 到 v9 的 typed lookup 回填不改写 payload；不连续 ledger 整体回滚，64+1 条恢复任务
   通过两批排空，同 key 并发审批只提交一次并重放其余响应。
+- v9 到 v10 为既有 open turn、queued dispatch 和 started dispatch 分别回填 2/2/1 个
+  event slots；oversized durable TEXT 和已超配额旧库不得导致迁移失败。配额 exact/+1、
+  满额 replay、reservation 消费/回滚、auth expiry cleanup 与稳定 429/503 合约有自动测试。
 - Session/Run detail 只返回最新 bounded tail；opaque cursor 的 kind、resource scope、canonical
   encoding、future-head 和跨资源使用均有自动测试，返回页保持连续且升序。
 - disabled/降权/owner mismatch 的 reply 与 dispatch claim 不触达外部执行，并留下

@@ -16,7 +16,7 @@ use protocol::{
     SessionEvent, SessionEventData, SessionStatus, SessionTurnStatus, Severity, StartTurnRequest,
     ToolCall, ToolCallStatus, ToolEffect, ToolExecutorStatus, ToolOutcome, ToolPolicySummary,
 };
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde_json::json;
 
 use crate::{
@@ -24,7 +24,7 @@ use crate::{
     DispatchJobSpec, DispatchRecoveryCommit, DispatchStartCommit, DispatchStatus,
     ReplyClaimOutcome, ReplyFailureCommit, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
     ReplySuccessCommit, ReviewCommit, RunSnapshot, RuntimeIdentity, SqliteStore, StorageError,
-    StoredUserRole, StoredUserStatus,
+    StorageLimits, StoredUserRole, StoredUserStatus,
 };
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
@@ -867,7 +867,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     let owner: Option<String> = connection
         .query_row(
             "SELECT owner_user_id FROM runs WHERE id = ?1",
@@ -995,7 +995,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     let approval_plan = explain_query_plan(
         &connection,
         r#"SELECT sequence FROM run_events
@@ -1899,7 +1899,17 @@ async fn startup_recovery_interrupts_each_open_turn_once() {
 async fn open_turn_and_started_reply_recovery_use_fixed_sixty_four_row_batches() {
     const TOTAL: usize = 65;
 
-    let open_store = SqliteStore::open(":memory:").await.unwrap();
+    let limits = StorageLimits {
+        open_turns_per_scope: TOTAL,
+        open_turns_global: TOTAL,
+        active_reply_jobs_per_scope: TOTAL,
+        active_reply_jobs_global: TOTAL,
+        ..StorageLimits::default()
+    };
+
+    let open_store = SqliteStore::open_with_limits(":memory:", limits.clone())
+        .await
+        .unwrap();
     for index in 0..TOTAL {
         let session_id = format!("session-open-batch-{index:03}");
         let turn_id = format!("turn-open-batch-{index:03}");
@@ -1930,7 +1940,9 @@ async fn open_turn_and_started_reply_recovery_use_fixed_sixty_four_row_batches()
     assert_eq!(open_store.recover_open_turns().await.unwrap().len(), 1);
     assert!(open_store.recover_open_turns().await.unwrap().is_empty());
 
-    let reply_store = SqliteStore::open(":memory:").await.unwrap();
+    let reply_store = SqliteStore::open_with_limits(":memory:", limits)
+        .await
+        .unwrap();
     bootstrap_test_owner(&reply_store).await;
     for index in 0..TOTAL {
         let session_id = format!("session-reply-batch-{index:03}");
@@ -4031,6 +4043,572 @@ async fn started_job_restart_recovery_records_outcome_unknown_without_requeue() 
 }
 
 #[tokio::test]
+async fn session_quota_rejects_a_new_key_but_replays_an_admitted_create() {
+    let limits = StorageLimits {
+        sessions_per_scope: 1,
+        sessions_global: 1,
+        ..StorageLimits::default()
+    };
+    let store = SqliteStore::open_with_limits(":memory:", limits)
+        .await
+        .unwrap();
+    bootstrap_test_owner(&store).await;
+
+    let admitted = CreateSessionRequest {
+        id: "session-quota-admitted".into(),
+        title: "Admitted at the exact Session limit".into(),
+    };
+    let created = store
+        .create_session_for_actor(
+            "user-owner",
+            admitted.clone(),
+            "create-session-quota-admitted",
+        )
+        .await
+        .unwrap();
+    assert!(!created.replayed);
+
+    assert!(matches!(
+        store
+            .create_session_for_actor(
+                "user-owner",
+                CreateSessionRequest {
+                    id: "session-quota-rejected".into(),
+                    title: "One Session beyond the limit".into(),
+                },
+                "create-session-quota-rejected",
+            )
+            .await,
+        Err(StorageError::StorageQuotaExceeded)
+    ));
+
+    let replayed = store
+        .create_session_for_actor("user-owner", admitted, "create-session-quota-admitted")
+        .await
+        .unwrap();
+    assert!(replayed.replayed);
+    assert_eq!(replayed.session, created.session);
+    assert_eq!(
+        store.list_sessions_for_actor("user-owner").await.unwrap(),
+        vec![created.session]
+    );
+}
+
+#[tokio::test]
+async fn open_turn_quota_admits_the_exact_limit_and_rejects_plus_one_atomically() {
+    let limits = StorageLimits {
+        sessions_per_scope: 3,
+        sessions_global: 3,
+        open_turns_per_scope: 2,
+        open_turns_global: 2,
+        ..StorageLimits::default()
+    };
+    let store = SqliteStore::open_with_limits(":memory:", limits)
+        .await
+        .unwrap();
+    bootstrap_test_owner(&store).await;
+    create_owned_test_sessions(
+        &store,
+        ["session-open-1", "session-open-2", "session-open-3"],
+    )
+    .await;
+
+    for index in 1..=2 {
+        let response = store
+            .start_turn_for_actor(
+                "user-owner",
+                &format!("session-open-{index}"),
+                StartTurnRequest {
+                    turn_id: format!("turn-open-{index}"),
+                    user_message: "Keep this turn open".into(),
+                    expected_sequence: 1,
+                },
+                &format!("start-open-{index}"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.turn.status, SessionTurnStatus::Open);
+    }
+
+    assert!(matches!(
+        store
+            .start_turn_for_actor(
+                "user-owner",
+                "session-open-3",
+                StartTurnRequest {
+                    turn_id: "turn-open-3".into(),
+                    user_message: "This is one turn beyond capacity".into(),
+                    expected_sequence: 1,
+                },
+                "start-open-3",
+            )
+            .await,
+        Err(StorageError::StorageQuotaExceeded)
+    ));
+    let untouched = store.get_session("session-open-3").await.unwrap();
+    assert_eq!(untouched.session.status, SessionStatus::Ready);
+    assert_eq!(untouched.session.sequence, 1);
+    assert!(untouched.turns.is_empty());
+}
+
+#[tokio::test]
+async fn reply_queue_quota_admits_the_exact_limit_and_rejects_plus_one_atomically() {
+    let limits = StorageLimits {
+        sessions_per_scope: 3,
+        sessions_global: 3,
+        open_turns_per_scope: 3,
+        open_turns_global: 3,
+        active_reply_jobs_per_scope: 2,
+        active_reply_jobs_global: 2,
+        ..StorageLimits::default()
+    };
+    let store = SqliteStore::open_with_limits(":memory:", limits)
+        .await
+        .unwrap();
+    bootstrap_test_owner(&store).await;
+    create_owned_test_sessions(
+        &store,
+        ["session-reply-1", "session-reply-2", "session-reply-3"],
+    )
+    .await;
+
+    for index in 1..=2 {
+        let session_id = format!("session-reply-{index}");
+        let turn_id = format!("turn-reply-{index}");
+        let enqueued = store
+            .start_turn_and_enqueue_reply_for_actor(
+                "user-owner",
+                &session_id,
+                StartTurnRequest {
+                    turn_id: turn_id.clone(),
+                    user_message: "Queue this reply".into(),
+                    expected_sequence: 1,
+                },
+                &format!("start-reply-{index}"),
+                reply_job_spec(&format!("reply-quota-{index}"), &turn_id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(enqueued.job.status, ReplyJobStatus::Queued);
+    }
+
+    assert!(matches!(
+        store
+            .start_turn_and_enqueue_reply_for_actor(
+                "user-owner",
+                "session-reply-3",
+                StartTurnRequest {
+                    turn_id: "turn-reply-3".into(),
+                    user_message: "This is one reply beyond capacity".into(),
+                    expected_sequence: 1,
+                },
+                "start-reply-3",
+                reply_job_spec("reply-quota-3", "turn-reply-3"),
+            )
+            .await,
+        Err(StorageError::ReplyQueueCapacityExceeded)
+    ));
+    assert!(store.reply_job("reply-quota-3").await.unwrap().is_none());
+    let untouched = store.get_session("session-reply-3").await.unwrap();
+    assert_eq!(untouched.session.status, SessionStatus::Ready);
+    assert_eq!(untouched.session.sequence, 1);
+    assert!(untouched.turns.is_empty());
+}
+
+#[tokio::test]
+async fn reply_reservations_cover_success_failure_and_missing_claim_fail_closed() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    create_owned_test_sessions(&store, ["session-reply-failure", "session-reply-missing"]).await;
+
+    store
+        .start_turn_and_enqueue_reply_for_actor(
+            "user-owner",
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-reserved-success".into(),
+                user_message: "Complete with two terminal events".into(),
+                expected_sequence: 1,
+            },
+            "start-reserved-success",
+            reply_job_spec("reply-reserved-success", "turn-reserved-success"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        session_finalization_slots(database.path(), "session-alpha", "turn-reserved-success"),
+        Some(2)
+    );
+    assert!(matches!(
+        store.claim_next_reply().await.unwrap(),
+        ReplyClaimOutcome::Claimed(_)
+    ));
+    assert_eq!(
+        session_finalization_slots(database.path(), "session-alpha", "turn-reserved-success"),
+        Some(2)
+    );
+    store
+        .complete_reply_success(ReplySuccessCommit {
+            job_id: "reply-reserved-success".into(),
+            expected_sequence: 2,
+            assistant_message: "The reserved reply completed.".into(),
+            provenance: AssistantReplyProvenance {
+                provider_id: "test-provider".into(),
+                model: Some("test-model".into()),
+                reply_kind: AssistantReplyKind::Model,
+            },
+            response_json: json!({"id": "reserved-success"}),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        session_finalization_slots(database.path(), "session-alpha", "turn-reserved-success"),
+        None
+    );
+
+    store
+        .start_turn_and_enqueue_reply_for_actor(
+            "user-owner",
+            "session-reply-failure",
+            StartTurnRequest {
+                turn_id: "turn-reserved-failure".into(),
+                user_message: "Complete with one interruption event".into(),
+                expected_sequence: 1,
+            },
+            "start-reserved-failure",
+            reply_job_spec("reply-reserved-failure", "turn-reserved-failure"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        session_finalization_slots(
+            database.path(),
+            "session-reply-failure",
+            "turn-reserved-failure"
+        ),
+        Some(2)
+    );
+    assert!(matches!(
+        store.claim_next_reply().await.unwrap(),
+        ReplyClaimOutcome::Claimed(_)
+    ));
+    store
+        .complete_reply_failure(ReplyFailureCommit {
+            job_id: "reply-reserved-failure".into(),
+            expected_sequence: 2,
+            error_json: json!({"code": "fixture_provider_failure"}),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        session_finalization_slots(
+            database.path(),
+            "session-reply-failure",
+            "turn-reserved-failure"
+        ),
+        None
+    );
+
+    store
+        .start_turn_and_enqueue_reply_for_actor(
+            "user-owner",
+            "session-reply-missing",
+            StartTurnRequest {
+                turn_id: "turn-reservation-missing".into(),
+                user_message: "Never cross the provider boundary".into(),
+                expected_sequence: 1,
+            },
+            "start-reservation-missing",
+            reply_job_spec("reply-reservation-missing", "turn-reservation-missing"),
+        )
+        .await
+        .unwrap();
+    remove_session_finalization_reservation(
+        database.path(),
+        "session-reply-missing",
+        "turn-reservation-missing",
+    );
+    assert!(matches!(
+        store.claim_next_reply().await,
+        Err(StorageError::FinalizationReservationUnavailable)
+    ));
+    let still_queued = store
+        .reply_job("reply-reservation-missing")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(still_queued.status, ReplyJobStatus::Queued);
+    assert_eq!(still_queued.attempt, 0);
+}
+
+#[tokio::test]
+async fn dispatch_reservation_rolls_back_then_transitions_two_to_one_to_deleted() {
+    let database = TestDatabase::new();
+    let store = seeded_file_store(database.path()).await;
+    bootstrap_test_owner(&store).await;
+    let (snapshot, _) = seed_fixture();
+    let review = approved_dispatch_commit(&snapshot, "dispatch-reservation-lifecycle");
+    store.commit_review(review.clone()).await.unwrap();
+    assert_eq!(
+        dispatch_finalization_slots(database.path(), RUN_ID, "call-local-001"),
+        Some(2)
+    );
+
+    let start = start_commit(&review.snapshot);
+    assert!(matches!(
+        store.claim_next_dispatch_with_failure(start.clone()).await,
+        Err(StorageError::InjectedFailure)
+    ));
+    assert_eq!(
+        dispatch_finalization_slots(database.path(), RUN_ID, "call-local-001"),
+        Some(2)
+    );
+    assert!(matches!(
+        store.claim_next_dispatch(start.clone()).await.unwrap(),
+        ClaimOutcome::Claimed(_)
+    ));
+    assert_eq!(
+        dispatch_finalization_slots(database.path(), RUN_ID, "call-local-001"),
+        Some(1)
+    );
+
+    let completion = completion_commit(&start.snapshot);
+    assert!(matches!(
+        store
+            .complete_dispatch_with_failure(completion.clone())
+            .await,
+        Err(StorageError::InjectedFailure)
+    ));
+    assert_eq!(
+        dispatch_finalization_slots(database.path(), RUN_ID, "call-local-001"),
+        Some(1)
+    );
+    store.complete_dispatch(completion).await.unwrap();
+    assert_eq!(
+        dispatch_finalization_slots(database.path(), RUN_ID, "call-local-001"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn auth_session_capacity_counts_only_active_rows_and_cleans_expired_rows() {
+    const FAR_PAST: &str = "2000-01-01T00:00:00.000Z";
+    const FAR_FUTURE: &str = "2999-01-01T00:00:00.000Z";
+
+    let database = TestDatabase::new();
+    let limits = StorageLimits {
+        auth_sessions_per_user: 3,
+        auth_sessions_global: 3,
+        ..StorageLimits::default()
+    };
+    let store = SqliteStore::open_with_limits(database.path(), limits)
+        .await
+        .unwrap();
+    store
+        .replace_bootstrap_token(&"a".repeat(64), FAR_FUTURE)
+        .await
+        .unwrap();
+    store
+        .bootstrap_owner(BootstrapOwnerCommit {
+            bootstrap_token_hash: "a".repeat(64),
+            user_id: "user-owner".into(),
+            username: "owner".into(),
+            password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA".into(),
+            session_token_hash: "b".repeat(64),
+            csrf_hash: "c".repeat(64),
+            session_expires_at: FAR_FUTURE.into(),
+        })
+        .await
+        .unwrap();
+    store
+        .create_auth_session(AuthSessionCommit {
+            user_id: "user-owner".into(),
+            session_token_hash: "d".repeat(64),
+            csrf_hash: "e".repeat(64),
+            expires_at: FAR_FUTURE.into(),
+        })
+        .await
+        .unwrap();
+
+    let expired_token = "1".repeat(64);
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO auth_sessions(
+                   token_hash, user_id, csrf_hash, created_at, expires_at, last_seen_at
+               ) VALUES (?1, 'user-owner', ?2, ?3, ?3, ?3)"#,
+            params![expired_token, "2".repeat(64), FAR_PAST],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(store.authenticate(&expired_token).await.unwrap().is_none());
+
+    store
+        .create_auth_session(AuthSessionCommit {
+            user_id: "user-owner".into(),
+            session_token_hash: "3".repeat(64),
+            csrf_hash: "4".repeat(64),
+            expires_at: FAR_FUTURE.into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(auth_session_count(database.path(), Some(FAR_PAST)), 3);
+    assert_eq!(auth_session_count(database.path(), None), 3);
+
+    assert!(matches!(
+        store
+            .create_auth_session(AuthSessionCommit {
+                user_id: "user-owner".into(),
+                session_token_hash: "5".repeat(64),
+                csrf_hash: "6".repeat(64),
+                expires_at: FAR_FUTURE.into(),
+            })
+            .await,
+        Err(StorageError::AuthSessionCapacityExceeded)
+    ));
+    assert_eq!(auth_session_count(database.path(), Some(FAR_PAST)), 3);
+}
+
+#[tokio::test]
+async fn v9_database_over_new_limits_still_opens_reads_and_recovers() {
+    let database = TestDatabase::new();
+    {
+        let store = SqliteStore::open(database.path()).await.unwrap();
+        for index in 1..=2 {
+            let session_id = format!("session-v9-over-limit-{index}");
+            store
+                .create_session(
+                    CreateSessionRequest {
+                        id: session_id.clone(),
+                        title: format!("Preexisting Session {index}"),
+                    },
+                    &format!("create-v9-over-limit-{index}"),
+                )
+                .await
+                .unwrap();
+            store
+                .start_turn(
+                    &session_id,
+                    StartTurnRequest {
+                        turn_id: format!("turn-v9-over-limit-{index}"),
+                        user_message: "This work predates the lower limits".into(),
+                        expected_sequence: 1,
+                    },
+                    &format!("start-v9-over-limit-{index}"),
+                )
+                .await
+                .unwrap();
+        }
+    }
+    downgrade_capacity_fixture_to_v9(database.path());
+
+    let limits = StorageLimits {
+        sessions_per_scope: 1,
+        sessions_global: 1,
+        open_turns_per_scope: 1,
+        open_turns_global: 1,
+        ..StorageLimits::default()
+    };
+    let reopened = SqliteStore::open_with_limits(database.path(), limits)
+        .await
+        .unwrap();
+    reopened.readiness().await.unwrap();
+    assert_eq!(reopened.list_sessions().await.unwrap().len(), 2);
+    assert_eq!(finalization_reservation_count(database.path()), 2);
+
+    let recovered = reopened.recover_open_turns().await.unwrap();
+    assert_eq!(recovered.len(), 2);
+    assert_eq!(finalization_reservation_count(database.path()), 0);
+    assert!(reopened.recover_open_turns().await.unwrap().is_empty());
+    for index in 1..=2 {
+        let detail = reopened
+            .get_session(&format!("session-v9-over-limit-{index}"))
+            .await
+            .unwrap();
+        assert_eq!(detail.session.status, SessionStatus::NeedsAttention);
+        assert_eq!(detail.session.sequence, 3);
+        assert_eq!(detail.turns[0].status, SessionTurnStatus::Interrupted);
+    }
+}
+
+#[tokio::test]
+async fn startup_seeds_enforce_capacity_before_inserting_and_replay_existing_state() {
+    let run_limits = StorageLimits {
+        run_event_slots_per_run: 5,
+        ..StorageLimits::default()
+    };
+    let run_store = SqliteStore::open_with_limits(":memory:", run_limits)
+        .await
+        .unwrap();
+    let (snapshot, events) = seed_fixture();
+    assert!(matches!(
+        run_store
+            .seed_if_empty(snapshot.clone(), events.clone())
+            .await,
+        Err(StorageError::StorageQuotaExceeded)
+    ));
+    assert!(matches!(
+        run_store.load_run(RUN_ID).await,
+        Err(StorageError::RunNotFound(run_id)) if run_id == RUN_ID
+    ));
+
+    let session_limits = StorageLimits {
+        session_event_slots_per_session: 1,
+        ..StorageLimits::default()
+    };
+    let session_store = SqliteStore::open_with_limits(":memory:", session_limits)
+        .await
+        .unwrap();
+    assert!(
+        session_store
+            .seed_if_empty(snapshot.clone(), events.clone())
+            .await
+            .unwrap()
+    );
+    assert!(matches!(
+        session_store
+            .seed_demo_session("session-capacity-seed", "Capacity seed", RUN_ID)
+            .await,
+        Err(StorageError::StorageQuotaExceeded)
+    ));
+    assert!(session_store.list_sessions().await.unwrap().is_empty());
+
+    let database = TestDatabase::new();
+    {
+        let existing = SqliteStore::open(database.path()).await.unwrap();
+        assert!(
+            existing
+                .seed_if_empty(snapshot.clone(), events.clone())
+                .await
+                .unwrap()
+        );
+        assert!(
+            existing
+                .seed_demo_session("session-existing-seed", "Existing seed", RUN_ID)
+                .await
+                .unwrap()
+        );
+    }
+    let below_existing_state = StorageLimits {
+        sessions_per_scope: 1,
+        sessions_global: 1,
+        session_event_slots_per_session: 1,
+        run_event_slots_per_run: 1,
+        ..StorageLimits::default()
+    };
+    let reopened = SqliteStore::open_with_limits(database.path(), below_existing_state)
+        .await
+        .unwrap();
+    assert!(!reopened.seed_if_empty(snapshot, events).await.unwrap());
+    assert!(
+        !reopened
+            .seed_demo_session("session-existing-seed", "Existing seed", RUN_ID)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
 async fn event_reader_fails_closed_on_unknown_kind_and_payload_version() {
     let kind_database = TestDatabase::new();
     let kind_store = seeded_file_store(kind_database.path()).await;
@@ -4047,6 +4625,117 @@ async fn event_reader_fails_closed_on_unknown_kind_and_payload_version() {
         version_store.events_after(RUN_ID, 6).await,
         Err(StorageError::UnsupportedPayloadVersion { version: 99, .. })
     ));
+}
+
+async fn create_owned_test_sessions<const N: usize>(store: &SqliteStore, session_ids: [&str; N]) {
+    for session_id in session_ids {
+        store
+            .create_session_for_actor(
+                "user-owner",
+                CreateSessionRequest {
+                    id: session_id.into(),
+                    title: format!("Capacity fixture {session_id}"),
+                },
+                &format!("create-{session_id}"),
+            )
+            .await
+            .unwrap();
+    }
+}
+
+fn session_finalization_slots(path: &Path, session_id: &str, turn_id: &str) -> Option<i64> {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .query_row(
+            r#"SELECT remaining_event_slots
+               FROM finalization_reservations
+               WHERE kind = 'session_turn' AND session_id = ?1 AND turn_id = ?2"#,
+            params![session_id, turn_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap()
+}
+
+fn dispatch_finalization_slots(path: &Path, run_id: &str, call_id: &str) -> Option<i64> {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .query_row(
+            r#"SELECT remaining_event_slots
+               FROM finalization_reservations
+               WHERE kind = 'dispatch' AND run_id = ?1 AND call_id = ?2"#,
+            params![run_id, call_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap()
+}
+
+fn remove_session_finalization_reservation(path: &Path, session_id: &str, turn_id: &str) {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    let changed = connection
+        .execute(
+            r#"UPDATE finalization_reservations
+               SET remaining_event_slots = 0
+               WHERE kind = 'session_turn' AND session_id = ?1 AND turn_id = ?2
+                 AND remaining_event_slots = 2"#,
+            params![session_id, turn_id],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    let deleted = connection
+        .execute(
+            r#"DELETE FROM finalization_reservations
+               WHERE kind = 'session_turn' AND session_id = ?1 AND turn_id = ?2
+                 AND remaining_event_slots = 0"#,
+            params![session_id, turn_id],
+        )
+        .unwrap();
+    assert_eq!(deleted, 1);
+}
+
+fn auth_session_count(path: &Path, active_after: Option<&str>) -> i64 {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    match active_after {
+        Some(timestamp) => connection
+            .query_row(
+                "SELECT COUNT(*) FROM auth_sessions WHERE expires_at > ?1",
+                [timestamp],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        None => connection
+            .query_row("SELECT COUNT(*) FROM auth_sessions", [], |row| row.get(0))
+            .unwrap(),
+    }
+}
+
+fn downgrade_capacity_fixture_to_v9(path: &Path) {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .execute_batch(
+            r#"DROP TABLE finalization_reservations;
+               DROP INDEX auth_sessions_expiry_idx;
+               DELETE FROM schema_migrations WHERE version = 10;"#,
+        )
+        .unwrap();
+    let version: i64 = connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(version, 9);
+}
+
+fn finalization_reservation_count(path: &Path) -> i64 {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM finalization_reservations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
 }
 
 async fn seeded_memory_store() -> SqliteStore {
@@ -4251,6 +4940,18 @@ fn insert_legacy_oversized_reply_fixture(
                 .unwrap(),
                 timestamp,
             ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO finalization_reservations(
+                   kind, scope_id, session_id, turn_id, run_id, call_id,
+                   remaining_event_slots, reserved_bytes, created_at
+               ) VALUES (
+                   'session_turn', 'user-owner', ?1, ?2, NULL, NULL,
+                   2, NULL, ?3
+               )"#,
+            params![session_id, turn_id, timestamp],
         )
         .unwrap();
 }

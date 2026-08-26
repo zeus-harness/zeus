@@ -1,7 +1,7 @@
 use std::{future::IntoFuture, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use llm::{LocalFallbackProvider, OpenAiCompatibleProvider, ReplyProvider};
-use runtime::DemoStore;
+use runtime::{DemoStore, StorageLimits};
 use tenancy::BootstrapToken;
 use tokio::sync::oneshot;
 
@@ -14,12 +14,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("ZEUS_DATABASE_PATH").unwrap_or_else(|_| ".zeus/zeus.db".into());
     let profile =
         std::env::var("ZEUS_DEMO_PROFILE").unwrap_or_else(|_| "production-guarded".into());
+    let storage_limits = configured_storage_limits()?;
     let store = match profile.as_str() {
-        "production-guarded" => DemoStore::open(&database_path).await?,
+        "production-guarded" => {
+            DemoStore::open_with_limits(&database_path, storage_limits.clone()).await?
+        }
         "local-development" => {
             let marker_root = std::env::var("ZEUS_LOCAL_MARKER_ROOT")
                 .unwrap_or_else(|_| ".zeus/local-markers".into());
-            DemoStore::open_local(&database_path, marker_root).await?
+            DemoStore::open_local_with_limits(&database_path, marker_root, storage_limits).await?
         }
         other => {
             return Err(io::Error::new(
@@ -57,6 +60,93 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     serve_with_bounded_shutdown(listener, app).await?;
     Ok(())
+}
+
+fn configured_storage_limits() -> Result<StorageLimits, io::Error> {
+    let defaults = StorageLimits::default();
+    StorageLimits {
+        sessions_per_scope: environment_capacity(
+            "ZEUS_MAX_SESSIONS_PER_SCOPE",
+            defaults.sessions_per_scope,
+        )?,
+        sessions_global: environment_capacity(
+            "ZEUS_MAX_SESSIONS_GLOBAL",
+            defaults.sessions_global,
+        )?,
+        open_turns_per_scope: environment_capacity(
+            "ZEUS_MAX_OPEN_TURNS_PER_SCOPE",
+            defaults.open_turns_per_scope,
+        )?,
+        open_turns_global: environment_capacity(
+            "ZEUS_MAX_OPEN_TURNS_GLOBAL",
+            defaults.open_turns_global,
+        )?,
+        active_reply_jobs_per_scope: environment_capacity(
+            "ZEUS_MAX_ACTIVE_REPLY_JOBS_PER_SCOPE",
+            defaults.active_reply_jobs_per_scope,
+        )?,
+        active_reply_jobs_global: environment_capacity(
+            "ZEUS_MAX_ACTIVE_REPLY_JOBS_GLOBAL",
+            defaults.active_reply_jobs_global,
+        )?,
+        active_dispatch_jobs_per_scope: environment_capacity(
+            "ZEUS_MAX_ACTIVE_DISPATCH_JOBS_PER_SCOPE",
+            defaults.active_dispatch_jobs_per_scope,
+        )?,
+        active_dispatch_jobs_global: environment_capacity(
+            "ZEUS_MAX_ACTIVE_DISPATCH_JOBS_GLOBAL",
+            defaults.active_dispatch_jobs_global,
+        )?,
+        auth_sessions_per_user: environment_capacity(
+            "ZEUS_MAX_AUTH_SESSIONS_PER_USER",
+            defaults.auth_sessions_per_user,
+        )?,
+        auth_sessions_global: environment_capacity(
+            "ZEUS_MAX_AUTH_SESSIONS_GLOBAL",
+            defaults.auth_sessions_global,
+        )?,
+        session_event_slots_per_session: environment_capacity(
+            "ZEUS_MAX_SESSION_EVENT_SLOTS_PER_SESSION",
+            defaults.session_event_slots_per_session,
+        )?,
+        run_event_slots_per_run: environment_capacity(
+            "ZEUS_MAX_RUN_EVENT_SLOTS_PER_RUN",
+            defaults.run_event_slots_per_run,
+        )?,
+        bootstrap_audit_rows: environment_capacity(
+            "ZEUS_MAX_BOOTSTRAP_AUDIT_ROWS",
+            defaults.bootstrap_audit_rows,
+        )?,
+    }
+    .validated()
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+}
+
+fn environment_capacity(name: &str, default: usize) -> Result<usize, io::Error> {
+    parse_environment_capacity(name, std::env::var(name), default)
+}
+
+fn parse_environment_capacity(
+    name: &str,
+    value: Result<String, std::env::VarError>,
+    default: usize,
+) -> Result<usize, io::Error> {
+    match value {
+        Ok(value) if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) => {
+            value.parse::<usize>().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("{name} is too large"))
+            })
+        }
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be an unsigned decimal integer without whitespace"),
+        )),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be valid UTF-8"),
+        )),
+    }
 }
 
 fn configured_reply_provider() -> Result<Arc<dyn ReplyProvider>, io::Error> {
@@ -165,5 +255,53 @@ async fn shutdown_signal() {
     tokio::select! {
         () = ctrl_c => {},
         () = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_environment_capacity;
+    use std::{env::VarError, io};
+
+    #[test]
+    fn capacity_environment_uses_the_default_only_when_unset() {
+        assert_eq!(
+            parse_environment_capacity("ZEUS_TEST_LIMIT", Err(VarError::NotPresent), 17).unwrap(),
+            17
+        );
+        assert_eq!(
+            parse_environment_capacity("ZEUS_TEST_LIMIT", Ok("23".into()), 17).unwrap(),
+            23
+        );
+    }
+
+    #[test]
+    fn capacity_environment_rejects_empty_whitespace_signed_and_non_ascii_values() {
+        for value in ["", " 1", "1 ", "+1", "-1", "1_000", "１２"] {
+            let error =
+                parse_environment_capacity("ZEUS_TEST_LIMIT", Ok(value.into()), 17).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn capacity_environment_rejects_overflow_and_non_utf8_values() {
+        let overflow = format!("{}0", usize::MAX);
+        assert_eq!(
+            parse_environment_capacity("ZEUS_TEST_LIMIT", Ok(overflow), 17)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            parse_environment_capacity(
+                "ZEUS_TEST_LIMIT",
+                Err(VarError::NotUnicode("invalid".into())),
+                17,
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 }

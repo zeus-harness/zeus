@@ -32,11 +32,11 @@ use crate::{
     RecoveredSessionTurn, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit, ReplyJob,
     ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
     ReplySuccessCommit, ReviewCommit, ReviewContext, ReviewReceipt, RunSnapshot, RuntimeIdentity,
-    SessionSummaryPage, StorageError, StoredCredential, StoredPreferences, StoredRun, StoredUser,
-    StoredUserRole, StoredUserStatus,
+    SessionSummaryPage, StorageError, StorageLimits, StoredCredential, StoredPreferences,
+    StoredRun, StoredUser, StoredUserRole, StoredUserStatus,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 9;
+const CURRENT_SCHEMA_VERSION: i64 = 10;
 const EVENT_PAYLOAD_VERSION_V1: i64 = 1;
 const EVENT_PAYLOAD_VERSION_V2: i64 = 2;
 const SESSION_EVENT_PAYLOAD_VERSION_V1: i64 = 1;
@@ -50,11 +50,14 @@ const MIGRATION_0006: &str = include_str!("../migrations/0006_actor_receipts.sql
 const MIGRATION_0007: &str = include_str!("../migrations/0007_reply_jobs.sql");
 const MIGRATION_0008: &str = include_str!("../migrations/0008_actor_boundaries.sql");
 const MIGRATION_0009: &str = include_str!("../migrations/0009_point_queries.sql");
+const MIGRATION_0010: &str = include_str!("../migrations/0010_capacity.sql");
 const RECOVERY_BATCH_LIMIT: i64 = 64;
+const AUTH_SESSION_CLEANUP_BATCH_LIMIT: i64 = 64;
 
 #[derive(Clone)]
 pub struct SqliteStore {
     backend: Backend,
+    limits: StorageLimits,
 }
 
 #[derive(Clone)]
@@ -71,17 +74,27 @@ struct FileBackend {
 
 impl SqliteStore {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Self::open_with_limits(path, StorageLimits::default()).await
+    }
+
+    pub async fn open_with_limits(
+        path: impl AsRef<Path>,
+        limits: StorageLimits,
+    ) -> Result<Self, StorageError> {
+        limits.validate()?;
         let path = path.as_ref().to_path_buf();
         if path == Path::new(":memory:") {
             let connection = tokio::task::spawn_blocking(move || {
                 let mut connection = Connection::open_in_memory()?;
                 configure_connection(&connection, false)?;
                 migrate(&mut connection)?;
+                cleanup_expired_auth_sessions(&mut connection, &now())?;
                 Ok::<_, StorageError>(connection)
             })
             .await??;
             Ok(Self {
                 backend: Backend::Memory(Arc::new(Mutex::new(connection))),
+                limits,
             })
         } else {
             let backend = tokio::task::spawn_blocking(move || {
@@ -89,6 +102,7 @@ impl SqliteStore {
                 let lock_file = acquire_database_lock(&path)?;
                 let mut connection = open_file_connection(&path)?;
                 migrate(&mut connection)?;
+                cleanup_expired_auth_sessions(&mut connection, &now())?;
                 Ok::<_, StorageError>(FileBackend {
                     path,
                     _lock_file: lock_file,
@@ -97,8 +111,13 @@ impl SqliteStore {
             .await??;
             Ok(Self {
                 backend: Backend::File(Arc::new(backend)),
+                limits,
             })
         }
+    }
+
+    pub fn limits(&self) -> &StorageLimits {
+        &self.limits
     }
 
     /// Binds this database to one immutable runtime profile and policy.
@@ -121,7 +140,8 @@ impl SqliteStore {
         snapshot: RunSnapshot,
         events: Vec<RunEvent>,
     ) -> Result<bool, StorageError> {
-        self.with_connection(move |connection| seed_if_empty(connection, snapshot, events))
+        let limits = self.limits.clone();
+        self.with_connection(move |connection| seed_if_empty(connection, snapshot, events, &limits))
             .await
     }
 
@@ -139,8 +159,9 @@ impl SqliteStore {
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let title = title.to_owned();
         let run_id = validated_durable_reference(run_id, "run ID")?.to_owned();
+        let limits = self.limits.clone();
         self.with_connection(move |connection| {
-            seed_demo_session(connection, &session_id, &title, &run_id)
+            seed_demo_session(connection, &session_id, &title, &run_id, &limits)
         })
         .await
     }
@@ -381,8 +402,11 @@ impl SqliteStore {
         idempotency_key: &str,
     ) -> Result<CreateSessionResponse, StorageError> {
         let key = normalized_key(idempotency_key)?.to_owned();
-        self.with_connection(move |connection| create_session(connection, request, &key, None))
-            .await
+        let limits = self.limits.clone();
+        self.with_connection(move |connection| {
+            create_session(connection, request, &key, None, &limits)
+        })
+        .await
     }
 
     /// Creates a session owned by the authenticated actor and stores the
@@ -396,8 +420,9 @@ impl SqliteStore {
         let actor_user_id =
             normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
+        let limits = self.limits.clone();
         self.with_connection(move |connection| {
-            create_session(connection, request, &key, Some(&actor_user_id))
+            create_session(connection, request, &key, Some(&actor_user_id), &limits)
         })
         .await
     }
@@ -412,8 +437,9 @@ impl SqliteStore {
     ) -> Result<AttachRunResponse, StorageError> {
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
+        let limits = self.limits.clone();
         self.with_connection(move |connection| {
-            attach_run(connection, &session_id, request, &key, None)
+            attach_run(connection, &session_id, request, &key, None, &limits)
         })
         .await
     }
@@ -429,8 +455,16 @@ impl SqliteStore {
             normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
+        let limits = self.limits.clone();
         self.with_connection(move |connection| {
-            attach_run(connection, &session_id, request, &key, Some(&actor_user_id))
+            attach_run(
+                connection,
+                &session_id,
+                request,
+                &key,
+                Some(&actor_user_id),
+                &limits,
+            )
         })
         .await
     }
@@ -445,9 +479,21 @@ impl SqliteStore {
     ) -> Result<StartTurnResponse, StorageError> {
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
+        let limits = self.limits.clone();
         self.with_connection(move |connection| {
-            start_turn(connection, &session_id, request, &key, None, None, false)
-                .map(|(response, _)| response)
+            start_turn(
+                connection,
+                &session_id,
+                request,
+                &key,
+                StartTurnOptions {
+                    actor_user_id: None,
+                    reply_job: None,
+                    limits: &limits,
+                    fail_after_enqueue: false,
+                },
+            )
+            .map(|(response, _)| response)
         })
         .await
     }
@@ -463,15 +509,19 @@ impl SqliteStore {
             normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
+        let limits = self.limits.clone();
         self.with_connection(move |connection| {
             start_turn(
                 connection,
                 &session_id,
                 request,
                 &key,
-                Some(&actor_user_id),
-                None,
-                false,
+                StartTurnOptions {
+                    actor_user_id: Some(&actor_user_id),
+                    reply_job: None,
+                    limits: &limits,
+                    fail_after_enqueue: false,
+                },
             )
             .map(|(response, _)| response)
         })
@@ -495,15 +545,19 @@ impl SqliteStore {
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         let actor_user_id = job.actor_user_id.clone();
+        let limits = self.limits.clone();
         self.with_connection(move |connection| {
             start_turn(
                 connection,
                 &session_id,
                 request,
                 &key,
-                Some(&actor_user_id),
-                Some(job),
-                false,
+                StartTurnOptions {
+                    actor_user_id: Some(&actor_user_id),
+                    reply_job: Some(job),
+                    limits: &limits,
+                    fail_after_enqueue: false,
+                },
             )
             .and_then(|(start, job)| {
                 job.map(|job| ReplyJobEnqueueResponse { start, job })
@@ -532,15 +586,19 @@ impl SqliteStore {
         }
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
+        let limits = self.limits.clone();
         self.with_connection(move |connection| {
             start_turn(
                 connection,
                 &session_id,
                 request,
                 &key,
-                Some(&actor_user_id),
-                Some(job),
-                false,
+                StartTurnOptions {
+                    actor_user_id: Some(&actor_user_id),
+                    reply_job: Some(job),
+                    limits: &limits,
+                    fail_after_enqueue: false,
+                },
             )
             .and_then(|(start, job)| {
                 job.map(|job| ReplyJobEnqueueResponse { start, job })
@@ -651,8 +709,9 @@ impl SqliteStore {
     ) -> Result<ResumeSessionResponse, StorageError> {
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
+        let limits = self.limits.clone();
         self.with_connection(move |connection| {
-            resume_session(connection, &session_id, request, &key, None)
+            resume_session(connection, &session_id, request, &key, None, &limits)
         })
         .await
     }
@@ -668,8 +727,16 @@ impl SqliteStore {
             normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
+        let limits = self.limits.clone();
         self.with_connection(move |connection| {
-            resume_session(connection, &session_id, request, &key, Some(&actor_user_id))
+            resume_session(
+                connection,
+                &session_id,
+                request,
+                &key,
+                Some(&actor_user_id),
+                &limits,
+            )
         })
         .await
     }
@@ -703,8 +770,9 @@ impl SqliteStore {
     ) -> Result<(), StorageError> {
         let token_hash = normalized_token_hash(token_hash, "bootstrap token hash")?.to_owned();
         let expires_at = normalized_timestamp(expires_at, "bootstrap token expiry")?.to_owned();
+        let limits = self.limits.clone();
         self.with_connection(move |connection| {
-            replace_bootstrap_token(connection, &token_hash, &expires_at)
+            replace_bootstrap_token(connection, &token_hash, &expires_at, &limits)
         })
         .await
     }
@@ -715,7 +783,8 @@ impl SqliteStore {
         &self,
         commit: BootstrapOwnerCommit,
     ) -> Result<(StoredUser, StoredPreferences), StorageError> {
-        self.with_connection(move |connection| bootstrap_owner(connection, commit))
+        let limits = self.limits.clone();
+        self.with_connection(move |connection| bootstrap_owner(connection, commit, &limits))
             .await
     }
 
@@ -732,7 +801,8 @@ impl SqliteStore {
         &self,
         commit: AuthSessionCommit,
     ) -> Result<AuthPrincipal, StorageError> {
-        self.with_connection(move |connection| create_auth_session(connection, commit))
+        let limits = self.limits.clone();
+        self.with_connection(move |connection| create_auth_session(connection, commit, &limits))
             .await
     }
 
@@ -1033,8 +1103,11 @@ impl SqliteStore {
     /// System/test-only legacy write. Authenticated paths must use
     /// [`Self::commit_review_for_actor`].
     pub async fn commit_review(&self, commit: ReviewCommit) -> Result<CommitOutcome, StorageError> {
-        self.with_connection(move |connection| commit_review(connection, commit, None, false))
-            .await
+        let limits = self.limits.clone();
+        self.with_connection(move |connection| {
+            commit_review(connection, commit, None, &limits, false)
+        })
+        .await
     }
 
     pub async fn commit_review_for_actor(
@@ -1044,8 +1117,9 @@ impl SqliteStore {
     ) -> Result<CommitOutcome, StorageError> {
         let actor_user_id =
             normalized_account_value(actor_user_id, "review actor user ID", 128)?.to_owned();
+        let limits = self.limits.clone();
         self.with_connection(move |connection| {
-            commit_review(connection, commit, Some(&actor_user_id), false)
+            commit_review(connection, commit, Some(&actor_user_id), &limits, false)
         })
         .await
     }
@@ -1104,8 +1178,11 @@ impl SqliteStore {
         &self,
         commit: ReviewCommit,
     ) -> Result<CommitOutcome, StorageError> {
-        self.with_connection(move |connection| commit_review(connection, commit, None, true))
-            .await
+        let limits = self.limits.clone();
+        self.with_connection(move |connection| {
+            commit_review(connection, commit, None, &limits, true)
+        })
+        .await
     }
 
     #[cfg(test)]
@@ -1152,15 +1229,19 @@ impl SqliteStore {
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         let actor_user_id = job.actor_user_id.clone();
+        let limits = self.limits.clone();
         self.with_connection(move |connection| {
             start_turn(
                 connection,
                 &session_id,
                 request,
                 &key,
-                Some(&actor_user_id),
-                Some(job),
-                true,
+                StartTurnOptions {
+                    actor_user_id: Some(&actor_user_id),
+                    reply_job: Some(job),
+                    limits: &limits,
+                    fail_after_enqueue: true,
+                },
             )
             .and_then(|(start, job)| {
                 job.map(|job| ReplyJobEnqueueResponse { start, job })
@@ -1421,6 +1502,13 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
             params![9, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 10 {
+        transaction.execute_batch(MIGRATION_0010)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![10, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -1581,12 +1669,12 @@ fn readiness(connection: &mut Connection, expects_wal: bool) -> Result<(), Stora
                'dispatch_jobs', 'runtime_identity', 'sessions', 'session_runs',
                'session_turns', 'session_events', 'session_command_receipts',
                'users', 'auth_sessions', 'bootstrap_tokens', 'user_preferences',
-               'reply_jobs'
+               'reply_jobs', 'finalization_reservations'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if table_count != 17 {
+    if table_count != 18 {
         return Err(StorageError::CorruptData(
             "one or more required tables are missing".into(),
         ));
@@ -1649,12 +1737,17 @@ fn readiness(connection: &mut Connection, expects_wal: bool) -> Result<(), Stora
                'session_runs_session_attached_idx',
                'reply_jobs_started_idx',
                'dispatch_jobs_started_idx',
-               'session_turns_open_recovery_idx'
+               'session_turns_open_recovery_idx',
+               'finalization_reservations_turn_idx',
+               'finalization_reservations_dispatch_idx',
+               'finalization_reservations_scope_active_idx',
+               'finalization_reservations_kind_active_idx',
+               'auth_sessions_expiry_idx'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if point_query_indexes != 7 {
+    if point_query_indexes != 12 {
         return Err(StorageError::CorruptData(
             "one or more point-query indexes are missing".into(),
         ));
@@ -1701,12 +1794,17 @@ fn readiness(connection: &mut Connection, expects_wal: bool) -> Result<(), Stora
                'session_receipts_require_session_owner_on_insert',
                'session_receipts_require_session_owner_on_claim',
                'run_receipts_require_run_owner_on_insert',
-               'run_receipts_require_run_owner_on_claim'
+               'run_receipts_require_run_owner_on_claim',
+               'finalization_reservations_require_dispatch_binding',
+               'finalization_reservations_require_resource_scope_on_insert',
+               'finalization_reservations_require_resource_scope_on_claim',
+               'finalization_reservations_enforce_update',
+               'finalization_reservations_reject_live_delete'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 39 {
+    if trigger_count != 44 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
         ));
@@ -1742,6 +1840,18 @@ fn readiness(connection: &mut Connection, expects_wal: bool) -> Result<(), Stora
                JOIN runs r ON r.id = job.run_id
                WHERE job.approving_actor_user_id IS NOT NULL
                  AND job.approving_actor_user_id IS NOT r.owner_user_id
+               UNION ALL
+               SELECT 1
+               FROM finalization_reservations reservation
+               JOIN sessions s ON s.id = reservation.session_id
+               WHERE reservation.kind = 'session_turn'
+                 AND reservation.scope_id IS NOT COALESCE(s.owner_user_id, '__legacy__')
+               UNION ALL
+               SELECT 1
+               FROM finalization_reservations reservation
+               JOIN runs r ON r.id = reservation.run_id
+               WHERE reservation.kind = 'dispatch'
+                 AND reservation.scope_id IS NOT COALESCE(r.owner_user_id, '__legacy__')
            )"#,
         [],
         |row| row.get(0),
@@ -1775,6 +1885,8 @@ fn readiness(connection: &mut Connection, expects_wal: bool) -> Result<(), Stora
                SELECT 1 FROM idempotency_receipts WHERE actor_scope = '__legacy__'
                UNION ALL
                SELECT 1 FROM dispatch_jobs WHERE approving_actor_user_id IS NULL
+               UNION ALL
+               SELECT 1 FROM finalization_reservations WHERE scope_id = '__legacy__'
            )"#,
         [],
         |row| row.get(0),
@@ -1782,6 +1894,40 @@ fn readiness(connection: &mut Connection, expects_wal: bool) -> Result<(), Stora
     if configured_legacy_boundary != 0 {
         return Err(StorageError::CorruptData(
             "configured database still contains unclaimed legacy actor state".into(),
+        ));
+    }
+
+    let finalization_violation: i64 = connection.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1
+               FROM session_turns t
+               LEFT JOIN finalization_reservations reservation
+                 ON reservation.kind = 'session_turn'
+                AND reservation.session_id = t.session_id
+                AND reservation.turn_id = t.id
+               WHERE (t.status = 'open' AND reservation.remaining_event_slots IS NOT 2)
+                  OR (t.status <> 'open' AND reservation.turn_id IS NOT NULL)
+               UNION ALL
+               SELECT 1
+               FROM dispatch_jobs job
+               LEFT JOIN finalization_reservations reservation
+                 ON reservation.kind = 'dispatch'
+                AND reservation.run_id = job.run_id
+                AND reservation.call_id = job.call_id
+               WHERE (job.status = 'queued' AND reservation.remaining_event_slots IS NOT 2)
+                  OR (job.status = 'started' AND reservation.remaining_event_slots IS NOT 1)
+                  OR (job.status IN ('finished', 'rejected') AND reservation.call_id IS NOT NULL)
+               UNION ALL
+               SELECT 1
+               FROM finalization_reservations
+               WHERE remaining_event_slots = 0 OR reserved_bytes IS NOT NULL
+           )"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if finalization_violation != 0 {
+        return Err(StorageError::CorruptData(
+            "one or more durable finalization reservations are inconsistent".into(),
         ));
     }
 
@@ -1807,10 +1953,491 @@ fn readiness(connection: &mut Connection, expects_wal: bool) -> Result<(), Stora
     Ok(())
 }
 
+fn cleanup_expired_auth_sessions(
+    connection: &mut Connection,
+    timestamp: &str,
+) -> Result<usize, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let deleted = cleanup_expired_auth_sessions_in_transaction(&transaction, timestamp)?;
+    transaction.commit()?;
+    Ok(deleted)
+}
+
+fn cleanup_expired_auth_sessions_in_transaction(
+    connection: &Connection,
+    timestamp: &str,
+) -> Result<usize, StorageError> {
+    Ok(connection.execute(
+        r#"DELETE FROM auth_sessions
+           WHERE token_hash IN (
+               SELECT token_hash FROM auth_sessions
+               WHERE expires_at <= ?1
+               ORDER BY expires_at, token_hash
+               LIMIT ?2
+           )"#,
+        params![timestamp, AUTH_SESSION_CLEANUP_BATCH_LIMIT],
+    )?)
+}
+
+fn capacity_limit(limit: usize) -> Result<i64, StorageError> {
+    i64::try_from(limit).map_err(|_| StorageError::IntegerOutOfRange("storage capacity limit"))
+}
+
+fn require_bootstrap_audit_capacity(
+    connection: &Connection,
+    limits: &StorageLimits,
+) -> Result<(), StorageError> {
+    let limit = capacity_limit(limits.bootstrap_audit_rows)?;
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM (SELECT 1 FROM bootstrap_tokens LIMIT ?1)",
+        [limit],
+        |row| row.get(0),
+    )?;
+    if count >= limit {
+        return Err(StorageError::StorageQuotaExceeded);
+    }
+    Ok(())
+}
+
+fn require_auth_session_capacity(
+    connection: &Connection,
+    user_id: &str,
+    timestamp: &str,
+    limits: &StorageLimits,
+) -> Result<(), StorageError> {
+    let per_user_limit = capacity_limit(limits.auth_sessions_per_user)?;
+    let per_user_count: i64 = connection.query_row(
+        r#"SELECT COUNT(*) FROM (
+               SELECT 1 FROM auth_sessions
+               WHERE user_id = ?1 AND expires_at > ?2
+               LIMIT ?3
+           )"#,
+        params![user_id, timestamp, per_user_limit],
+        |row| row.get(0),
+    )?;
+    if per_user_count >= per_user_limit {
+        return Err(StorageError::AuthSessionCapacityExceeded);
+    }
+
+    let global_limit = capacity_limit(limits.auth_sessions_global)?;
+    let global_count: i64 = connection.query_row(
+        r#"SELECT COUNT(*) FROM (
+               SELECT 1 FROM auth_sessions
+               WHERE expires_at > ?1
+               LIMIT ?2
+           )"#,
+        params![timestamp, global_limit],
+        |row| row.get(0),
+    )?;
+    if global_count >= global_limit {
+        return Err(StorageError::AuthSessionCapacityExceeded);
+    }
+    Ok(())
+}
+
+fn require_session_count_capacity(
+    connection: &Connection,
+    scope_id: &str,
+    limits: &StorageLimits,
+) -> Result<(), StorageError> {
+    let scope_limit = capacity_limit(limits.sessions_per_scope)?;
+    let scope_count: i64 = if scope_id == "__legacy__" {
+        connection.query_row(
+            r#"SELECT COUNT(*) FROM (
+                   SELECT 1 FROM sessions WHERE owner_user_id IS NULL LIMIT ?1
+               )"#,
+            [scope_limit],
+            |row| row.get(0),
+        )?
+    } else {
+        connection.query_row(
+            r#"SELECT COUNT(*) FROM (
+                   SELECT 1 FROM sessions WHERE owner_user_id = ?1 LIMIT ?2
+               )"#,
+            params![scope_id, scope_limit],
+            |row| row.get(0),
+        )?
+    };
+    if scope_count >= scope_limit {
+        return Err(StorageError::StorageQuotaExceeded);
+    }
+
+    let global_limit = capacity_limit(limits.sessions_global)?;
+    let global_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM (SELECT 1 FROM sessions LIMIT ?1)",
+        [global_limit],
+        |row| row.get(0),
+    )?;
+    if global_count >= global_limit {
+        return Err(StorageError::StorageQuotaExceeded);
+    }
+    Ok(())
+}
+
+fn require_open_turn_capacity(
+    connection: &Connection,
+    scope_id: &str,
+    limits: &StorageLimits,
+) -> Result<(), StorageError> {
+    let scope_limit = capacity_limit(limits.open_turns_per_scope)?;
+    let scope_count: i64 = connection.query_row(
+        r#"SELECT COUNT(*) FROM (
+               SELECT 1 FROM finalization_reservations
+               WHERE scope_id = ?1 AND kind = 'session_turn'
+                 AND remaining_event_slots > 0
+               LIMIT ?2
+           )"#,
+        params![scope_id, scope_limit],
+        |row| row.get(0),
+    )?;
+    if scope_count >= scope_limit {
+        return Err(StorageError::StorageQuotaExceeded);
+    }
+
+    let global_limit = capacity_limit(limits.open_turns_global)?;
+    let global_count: i64 = connection.query_row(
+        r#"SELECT COUNT(*) FROM (
+               SELECT 1 FROM finalization_reservations
+               WHERE kind = 'session_turn' AND remaining_event_slots > 0
+               LIMIT ?1
+           )"#,
+        [global_limit],
+        |row| row.get(0),
+    )?;
+    if global_count >= global_limit {
+        return Err(StorageError::StorageQuotaExceeded);
+    }
+    Ok(())
+}
+
+fn require_reply_queue_capacity(
+    connection: &Connection,
+    scope_id: &str,
+    limits: &StorageLimits,
+) -> Result<(), StorageError> {
+    let scope_limit = capacity_limit(limits.active_reply_jobs_per_scope)?;
+    let scope_count: i64 = if scope_id == "__legacy__" {
+        0
+    } else {
+        connection.query_row(
+            r#"SELECT COUNT(*) FROM (
+                   SELECT 1 FROM reply_jobs
+                   WHERE actor_user_id = ?1 AND status IN ('queued', 'started')
+                   LIMIT ?2
+               )"#,
+            params![scope_id, scope_limit],
+            |row| row.get(0),
+        )?
+    };
+    if scope_count >= scope_limit {
+        return Err(StorageError::ReplyQueueCapacityExceeded);
+    }
+
+    let global_limit = capacity_limit(limits.active_reply_jobs_global)?;
+    let global_count: i64 = connection.query_row(
+        r#"SELECT COUNT(*) FROM (
+               SELECT 1 FROM reply_jobs
+               WHERE status IN ('queued', 'started') LIMIT ?1
+           )"#,
+        [global_limit],
+        |row| row.get(0),
+    )?;
+    if global_count >= global_limit {
+        return Err(StorageError::ReplyQueueCapacityExceeded);
+    }
+    Ok(())
+}
+
+fn require_dispatch_queue_capacity(
+    connection: &Connection,
+    scope_id: &str,
+    limits: &StorageLimits,
+) -> Result<(), StorageError> {
+    let scope_limit = capacity_limit(limits.active_dispatch_jobs_per_scope)?;
+    let scope_count: i64 = if scope_id == "__legacy__" {
+        connection.query_row(
+            r#"SELECT COUNT(*) FROM (
+                   SELECT 1 FROM dispatch_jobs
+                   WHERE approving_actor_user_id IS NULL
+                     AND status IN ('queued', 'started')
+                   LIMIT ?1
+               )"#,
+            [scope_limit],
+            |row| row.get(0),
+        )?
+    } else {
+        connection.query_row(
+            r#"SELECT COUNT(*) FROM (
+                   SELECT 1 FROM dispatch_jobs
+                   WHERE approving_actor_user_id = ?1
+                     AND status IN ('queued', 'started')
+                   LIMIT ?2
+               )"#,
+            params![scope_id, scope_limit],
+            |row| row.get(0),
+        )?
+    };
+    if scope_count >= scope_limit {
+        return Err(StorageError::DispatchQueueCapacityExceeded);
+    }
+
+    let global_limit = capacity_limit(limits.active_dispatch_jobs_global)?;
+    let global_count: i64 = connection.query_row(
+        r#"SELECT COUNT(*) FROM (
+               SELECT 1 FROM dispatch_jobs
+               WHERE status IN ('queued', 'started') LIMIT ?1
+           )"#,
+        [global_limit],
+        |row| row.get(0),
+    )?;
+    if global_count >= global_limit {
+        return Err(StorageError::DispatchQueueCapacityExceeded);
+    }
+    Ok(())
+}
+
+fn session_scope_id(connection: &Connection, session_id: &str) -> Result<String, StorageError> {
+    connection
+        .query_row(
+            "SELECT COALESCE(owner_user_id, '__legacy__') FROM sessions WHERE id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| StorageError::SessionNotFound(session_id.to_owned()))
+}
+
+fn run_scope_id(connection: &Connection, run_id: &str) -> Result<String, StorageError> {
+    connection
+        .query_row(
+            "SELECT COALESCE(owner_user_id, '__legacy__') FROM runs WHERE id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| StorageError::RunNotFound(run_id.to_owned()))
+}
+
+fn require_session_event_capacity(
+    connection: &Connection,
+    session_id: &str,
+    new_events: usize,
+    new_reserved_slots: usize,
+    limits: &StorageLimits,
+) -> Result<(), StorageError> {
+    let (head, reserved): (i64, i64) = connection.query_row(
+        r#"SELECT s.sequence, COALESCE(SUM(r.remaining_event_slots), 0)
+           FROM sessions s
+           LEFT JOIN finalization_reservations r
+             ON r.kind = 'session_turn' AND r.session_id = s.id
+           WHERE s.id = ?1
+           GROUP BY s.id"#,
+        [session_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let requested = i64::try_from(new_events.saturating_add(new_reserved_slots))
+        .map_err(|_| StorageError::IntegerOutOfRange("session event capacity request"))?;
+    let limit = capacity_limit(limits.session_event_slots_per_session)?;
+    let used = head
+        .checked_add(reserved)
+        .and_then(|value| value.checked_add(requested))
+        .ok_or(StorageError::IntegerOutOfRange("session event capacity"))?;
+    if used > limit {
+        return Err(StorageError::StorageQuotaExceeded);
+    }
+    Ok(())
+}
+
+fn require_run_event_capacity(
+    connection: &Connection,
+    run_id: &str,
+    new_events: usize,
+    new_reserved_slots: usize,
+    limits: &StorageLimits,
+) -> Result<(), StorageError> {
+    let (head, reserved): (i64, i64) = connection.query_row(
+        r#"SELECT r.sequence, COALESCE(SUM(f.remaining_event_slots), 0)
+           FROM runs r
+           LEFT JOIN finalization_reservations f
+             ON f.kind = 'dispatch' AND f.run_id = r.id
+           WHERE r.id = ?1
+           GROUP BY r.id"#,
+        [run_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let requested = i64::try_from(new_events.saturating_add(new_reserved_slots))
+        .map_err(|_| StorageError::IntegerOutOfRange("run event capacity request"))?;
+    let limit = capacity_limit(limits.run_event_slots_per_run)?;
+    let used = head
+        .checked_add(reserved)
+        .and_then(|value| value.checked_add(requested))
+        .ok_or(StorageError::IntegerOutOfRange("run event capacity"))?;
+    if used > limit {
+        return Err(StorageError::StorageQuotaExceeded);
+    }
+    Ok(())
+}
+
+fn insert_session_finalization_reservation(
+    connection: &Connection,
+    scope_id: &str,
+    session_id: &str,
+    turn_id: &str,
+    timestamp: &str,
+) -> Result<(), StorageError> {
+    connection.execute(
+        r#"INSERT INTO finalization_reservations(
+               kind, scope_id, session_id, turn_id, run_id, call_id,
+               remaining_event_slots, reserved_bytes, created_at
+           ) VALUES ('session_turn', ?1, ?2, ?3, NULL, NULL, 2, NULL, ?4)"#,
+        params![scope_id, session_id, turn_id, timestamp],
+    )?;
+    Ok(())
+}
+
+fn require_session_finalization_slots(
+    connection: &Connection,
+    session_id: &str,
+    turn_id: &str,
+    minimum: i64,
+) -> Result<i64, StorageError> {
+    let remaining = connection
+        .query_row(
+            r#"SELECT remaining_event_slots
+               FROM finalization_reservations
+               WHERE kind = 'session_turn' AND session_id = ?1 AND turn_id = ?2"#,
+            params![session_id, turn_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    match remaining {
+        Some(remaining) if remaining >= minimum => Ok(remaining),
+        _ => Err(StorageError::FinalizationReservationUnavailable),
+    }
+}
+
+fn finish_session_finalization(
+    connection: &Connection,
+    session_id: &str,
+    turn_id: &str,
+    emitted_events: i64,
+) -> Result<(), StorageError> {
+    require_session_finalization_slots(connection, session_id, turn_id, emitted_events)?;
+    let changed = connection.execute(
+        r#"UPDATE finalization_reservations
+           SET remaining_event_slots = 0
+           WHERE kind = 'session_turn'
+             AND session_id = ?1 AND turn_id = ?2
+             AND remaining_event_slots >= ?3"#,
+        params![session_id, turn_id, emitted_events],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::FinalizationReservationUnavailable);
+    }
+    let deleted = connection.execute(
+        r#"DELETE FROM finalization_reservations
+           WHERE kind = 'session_turn'
+             AND session_id = ?1 AND turn_id = ?2
+             AND remaining_event_slots = 0"#,
+        params![session_id, turn_id],
+    )?;
+    if deleted != 1 {
+        return Err(StorageError::FinalizationReservationUnavailable);
+    }
+    Ok(())
+}
+
+fn insert_dispatch_finalization_reservation(
+    connection: &Connection,
+    scope_id: &str,
+    run_id: &str,
+    call_id: &str,
+    timestamp: &str,
+) -> Result<(), StorageError> {
+    connection.execute(
+        r#"INSERT INTO finalization_reservations(
+               kind, scope_id, session_id, turn_id, run_id, call_id,
+               remaining_event_slots, reserved_bytes, created_at
+           ) VALUES ('dispatch', ?1, NULL, NULL, ?2, ?3, 2, NULL, ?4)"#,
+        params![scope_id, run_id, call_id, timestamp],
+    )?;
+    Ok(())
+}
+
+fn require_dispatch_finalization_slots(
+    connection: &Connection,
+    run_id: &str,
+    call_id: &str,
+    expected: i64,
+) -> Result<(), StorageError> {
+    let remaining = connection
+        .query_row(
+            r#"SELECT remaining_event_slots
+               FROM finalization_reservations
+               WHERE kind = 'dispatch' AND run_id = ?1 AND call_id = ?2"#,
+            params![run_id, call_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if remaining != Some(expected) {
+        return Err(StorageError::FinalizationReservationUnavailable);
+    }
+    Ok(())
+}
+
+fn consume_dispatch_claim_slot(
+    connection: &Connection,
+    run_id: &str,
+    call_id: &str,
+) -> Result<(), StorageError> {
+    require_dispatch_finalization_slots(connection, run_id, call_id, 2)?;
+    let changed = connection.execute(
+        r#"UPDATE finalization_reservations
+           SET remaining_event_slots = 1
+           WHERE kind = 'dispatch' AND run_id = ?1 AND call_id = ?2
+             AND remaining_event_slots = 2"#,
+        params![run_id, call_id],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::FinalizationReservationUnavailable);
+    }
+    Ok(())
+}
+
+fn finish_dispatch_finalization(
+    connection: &Connection,
+    run_id: &str,
+    call_id: &str,
+    expected_remaining: i64,
+) -> Result<(), StorageError> {
+    require_dispatch_finalization_slots(connection, run_id, call_id, expected_remaining)?;
+    let changed = connection.execute(
+        r#"UPDATE finalization_reservations
+           SET remaining_event_slots = 0
+           WHERE kind = 'dispatch' AND run_id = ?1 AND call_id = ?2
+             AND remaining_event_slots = ?3"#,
+        params![run_id, call_id, expected_remaining],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::FinalizationReservationUnavailable);
+    }
+    let deleted = connection.execute(
+        r#"DELETE FROM finalization_reservations
+           WHERE kind = 'dispatch' AND run_id = ?1 AND call_id = ?2
+             AND remaining_event_slots = 0"#,
+        params![run_id, call_id],
+    )?;
+    if deleted != 1 {
+        return Err(StorageError::FinalizationReservationUnavailable);
+    }
+    Ok(())
+}
+
 fn replace_bootstrap_token(
     connection: &mut Connection,
     token_hash: &str,
     expires_at: &str,
+    limits: &StorageLimits,
 ) -> Result<(), StorageError> {
     let timestamp = now();
     if expires_at <= timestamp.as_str() {
@@ -1824,6 +2451,7 @@ fn replace_bootstrap_token(
     if configured != 0 {
         return Err(StorageError::AccountAlreadyConfigured);
     }
+    require_bootstrap_audit_capacity(&transaction, limits)?;
     transaction.execute(
         "UPDATE bootstrap_tokens SET used_at = ?1 WHERE used_at IS NULL",
         [&timestamp],
@@ -1840,6 +2468,7 @@ fn replace_bootstrap_token(
 fn bootstrap_owner(
     connection: &mut Connection,
     commit: BootstrapOwnerCommit,
+    limits: &StorageLimits,
 ) -> Result<(StoredUser, StoredPreferences), StorageError> {
     let bootstrap_token_hash =
         normalized_token_hash(&commit.bootstrap_token_hash, "bootstrap token hash")?;
@@ -1877,6 +2506,8 @@ fn bootstrap_owner(
     {
         return Err(StorageError::InvalidBootstrapToken);
     }
+    cleanup_expired_auth_sessions_in_transaction(&transaction, &timestamp)?;
+    require_auth_session_capacity(&transaction, user_id, &timestamp, limits)?;
 
     transaction.execute(
         r#"INSERT INTO users(
@@ -1911,6 +2542,12 @@ fn bootstrap_owner(
         r#"UPDATE dispatch_jobs
            SET approving_actor_user_id = ?1
            WHERE approving_actor_user_id IS NULL"#,
+        [user_id],
+    )?;
+    transaction.execute(
+        r#"UPDATE finalization_reservations
+           SET scope_id = ?1
+           WHERE scope_id = '__legacy__'"#,
         [user_id],
     )?;
 
@@ -1973,6 +2610,7 @@ fn query_credential(
 fn create_auth_session(
     connection: &mut Connection,
     commit: AuthSessionCommit,
+    limits: &StorageLimits,
 ) -> Result<AuthPrincipal, StorageError> {
     let user_id = normalized_account_value(&commit.user_id, "user ID", 128)?;
     let token_hash = normalized_token_hash(&commit.session_token_hash, "session token hash")?;
@@ -1989,6 +2627,8 @@ fn create_auth_session(
     if user.status != StoredUserStatus::Active {
         return Err(StorageError::UserDisabled(user_id.to_owned()));
     }
+    cleanup_expired_auth_sessions_in_transaction(&transaction, &timestamp)?;
+    require_auth_session_capacity(&transaction, user_id, &timestamp, limits)?;
     insert_auth_session(
         &transaction,
         user_id,
@@ -2405,6 +3045,7 @@ fn seed_if_empty(
     connection: &mut Connection,
     snapshot: RunSnapshot,
     events: Vec<RunEvent>,
+    limits: &StorageLimits,
 ) -> Result<bool, StorageError> {
     validate_seed(&snapshot, &events)?;
     let metrics_json = serde_json::to_string(&snapshot.metrics)?;
@@ -2423,6 +3064,9 @@ fn seed_if_empty(
     if run_count != 0 {
         transaction.commit()?;
         return Ok(false);
+    }
+    if events.len() > limits.run_event_slots_per_run {
+        return Err(StorageError::StorageQuotaExceeded);
     }
 
     transaction.execute(
@@ -2477,6 +3121,7 @@ fn seed_demo_session(
     session_id: &str,
     title: &str,
     run_id: &str,
+    limits: &StorageLimits,
 ) -> Result<bool, StorageError> {
     validated_durable_reference(session_id, "session ID")?;
     validated_durable_reference(run_id, "run ID")?;
@@ -2512,6 +3157,10 @@ fn seed_demo_session(
     if summary.is_none() {
         validated_new_session_id(session_id, "session ID")?;
         validated_new_session_title(title, "session title")?;
+        require_session_count_capacity(&transaction, "__legacy__", limits)?;
+        if limits.session_event_slots_per_session < 2 {
+            return Err(StorageError::StorageQuotaExceeded);
+        }
         let timestamp = now();
         transaction.execute(
             r#"INSERT INTO sessions(
@@ -2539,6 +3188,8 @@ fn seed_demo_session(
             &timestamp,
         )?;
         summary = Some(query_session_summary(&transaction, session_id)?);
+    } else {
+        require_session_event_capacity(&transaction, session_id, 1, 0, limits)?;
     }
 
     let summary = summary.ok_or_else(|| {
@@ -3302,6 +3953,7 @@ fn create_session(
     request: CreateSessionRequest,
     idempotency_key: &str,
     actor_user_id: Option<&str>,
+    limits: &StorageLimits,
 ) -> Result<CreateSessionResponse, StorageError> {
     normalized_key(idempotency_key)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3333,6 +3985,8 @@ fn create_session(
     if query_session_summary_optional(&transaction, &request.id)?.is_some() {
         return Err(StorageError::SessionAlreadyExists(request.id));
     }
+    let scope_id = actor_user_id.unwrap_or("__legacy__");
+    require_session_count_capacity(&transaction, scope_id, limits)?;
     let timestamp = now();
     transaction.execute(
         r#"INSERT INTO sessions(
@@ -3341,6 +3995,7 @@ fn create_session(
            ) VALUES (?1, ?2, 'ready', ?3, ?3, 0, 0, NULL, ?4)"#,
         params![request.id, request.title, timestamp, actor_user_id],
     )?;
+    require_session_event_capacity(&transaction, &request.id, 1, 0, limits)?;
     let event = build_session_event(
         &request.id,
         1,
@@ -3396,6 +4051,7 @@ fn attach_run(
     request: AttachRunRequest,
     idempotency_key: &str,
     actor_user_id: Option<&str>,
+    limits: &StorageLimits,
 ) -> Result<AttachRunResponse, StorageError> {
     validated_durable_reference(session_id, "session ID")?;
     normalized_key(idempotency_key)?;
@@ -3460,6 +4116,8 @@ fn attach_run(
         });
     }
 
+    require_session_event_capacity(&transaction, session_id, 1, 0, limits)?;
+
     let timestamp = now();
     transaction.execute(
         "INSERT INTO session_runs(session_id, run_id, attached_at) VALUES (?1, ?2, ?3)",
@@ -3515,15 +4173,26 @@ fn attach_run(
     Ok(response)
 }
 
+struct StartTurnOptions<'a> {
+    actor_user_id: Option<&'a str>,
+    reply_job: Option<ReplyJobSpec>,
+    limits: &'a StorageLimits,
+    fail_after_enqueue: bool,
+}
+
 fn start_turn(
     connection: &mut Connection,
     session_id: &str,
     request: StartTurnRequest,
     idempotency_key: &str,
-    actor_user_id: Option<&str>,
-    reply_job: Option<ReplyJobSpec>,
-    fail_after_enqueue: bool,
+    options: StartTurnOptions<'_>,
 ) -> Result<(StartTurnResponse, Option<ReplyJob>), StorageError> {
+    let StartTurnOptions {
+        actor_user_id,
+        reply_job,
+        limits,
+        fail_after_enqueue,
+    } = options;
     validated_durable_reference(session_id, "session ID")?;
     normalized_key(idempotency_key)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3589,6 +4258,12 @@ fn start_turn(
             request.turn_id
         )));
     }
+    let scope_id = session_scope_id(&transaction, session_id)?;
+    require_open_turn_capacity(&transaction, &scope_id, limits)?;
+    if reply_job.is_some() {
+        require_reply_queue_capacity(&transaction, &scope_id, limits)?;
+    }
+    require_session_event_capacity(&transaction, session_id, 1, 2, limits)?;
     let ordinal: i64 = transaction.query_row(
         "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM session_turns WHERE session_id = ?1",
         [session_id],
@@ -3607,6 +4282,13 @@ fn start_turn(
             request.user_message,
             timestamp
         ],
+    )?;
+    insert_session_finalization_reservation(
+        &transaction,
+        &scope_id,
+        session_id,
+        &request.turn_id,
+        &timestamp,
     )?;
     let sequence = next_session_sequence(summary.sequence)?;
     let event = build_session_event(
@@ -3722,6 +4404,9 @@ fn claim_next_reply(connection: &mut Connection) -> Result<ReplyClaimOutcome, St
 
     let job = query_reply_job(&transaction, &job_id)?;
     let summary = require_open_reply_turn(&transaction, &job)?;
+    if require_session_finalization_slots(&transaction, &job.session_id, &job.turn_id, 2)? != 2 {
+        return Err(StorageError::FinalizationReservationUnavailable);
+    }
     let changed = transaction.execute(
         r#"UPDATE reply_jobs
            SET status = 'started', attempt = 1, started_at = ?1
@@ -3796,6 +4481,9 @@ fn complete_reply_success(
             replay_reply_completion(&transaction, job, ReplyJobStatus::Succeeded, &fingerprint)?;
         transaction.commit()?;
         return Ok(replay);
+    }
+    if require_session_finalization_slots(&transaction, &job.session_id, &job.turn_id, 2)? != 2 {
+        return Err(StorageError::FinalizationReservationUnavailable);
     }
 
     let mut summary = require_open_reply_turn(&transaction, &job)?;
@@ -3885,6 +4573,7 @@ fn complete_reply_success(
     if changed != 1 {
         return Err(StorageError::ConcurrentModification);
     }
+    finish_session_finalization(&transaction, &job.session_id, &job.turn_id, 2)?;
     let completion = query_reply_completion(&transaction, &job.id, false)?;
     transaction.commit()?;
     Ok(completion)
@@ -4057,6 +4746,7 @@ fn interrupt_reply_job(
     if changed != 1 {
         return Err(StorageError::ConcurrentModification);
     }
+    finish_session_finalization(connection, &job.session_id, &job.turn_id, 1)?;
     query_reply_completion(connection, &job.id, false)
 }
 
@@ -4135,6 +4825,26 @@ fn flush_turn(
             request.turn_id
         )));
     }
+    let active_reply: i64 = transaction.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM reply_jobs
+               WHERE session_id = ?1 AND turn_id = ?2
+                 AND status IN ('queued', 'started')
+           )"#,
+        params![session_id, request.turn_id],
+        |row| row.get(0),
+    )?;
+    if active_reply != 0 {
+        return Err(StorageError::InvalidSessionTransition(
+            "reply-backed turns must finalize through their durable reply job".into(),
+        ));
+    }
+    let emitted_events = if request.assistant_message.is_some() {
+        2
+    } else {
+        1
+    };
+    require_session_finalization_slots(&transaction, session_id, &request.turn_id, emitted_events)?;
 
     let timestamp = now();
     let mut events = Vec::with_capacity(if request.assistant_message.is_some() {
@@ -4245,6 +4955,7 @@ fn flush_turn(
             flush_sequence,
         )?;
     }
+    finish_session_finalization(&transaction, session_id, &request.turn_id, emitted_events)?;
     transaction.commit()?;
     Ok(response)
 }
@@ -4255,6 +4966,7 @@ fn resume_session(
     request: ResumeSessionRequest,
     idempotency_key: &str,
     actor_user_id: Option<&str>,
+    limits: &StorageLimits,
 ) -> Result<ResumeSessionResponse, StorageError> {
     validated_durable_reference(session_id, "session ID")?;
     normalized_key(idempotency_key)?;
@@ -4291,6 +5003,7 @@ fn resume_session(
             "session `{session_id}` is not awaiting an explicit resume"
         )));
     }
+    require_session_event_capacity(&transaction, session_id, 1, 0, limits)?;
     let timestamp = now();
     let sequence = next_session_sequence(summary.sequence)?;
     let event = build_session_event(
@@ -4373,6 +5086,7 @@ fn recover_open_turns(
                 "open turn `{turn_id}` disagrees with session `{session_id}` projection"
             )));
         }
+        require_session_finalization_slots(&transaction, &session_id, &turn_id, 1)?;
         let timestamp = now();
         let changed = transaction.execute(
             r#"UPDATE session_turns
@@ -4403,6 +5117,7 @@ fn recover_open_turns(
             sequence,
             &timestamp,
         )?;
+        finish_session_finalization(&transaction, &session_id, &turn_id, 1)?;
         recovered.push(RecoveredSessionTurn { session_id, event });
     }
     transaction.commit()?;
@@ -6217,6 +6932,7 @@ fn commit_review(
     connection: &mut Connection,
     commit: ReviewCommit,
     actor_user_id: Option<&str>,
+    limits: &StorageLimits,
     fail_after_event: bool,
 ) -> Result<CommitOutcome, StorageError> {
     validated_durable_reference(&commit.snapshot.run.id, "run ID")?;
@@ -6252,6 +6968,18 @@ fn commit_review(
         return Ok(CommitOutcome::Replayed(Box::new(receipt)));
     }
 
+    let scope_id = run_scope_id(&transaction, &commit.snapshot.run.id)?;
+    if commit.dispatch.is_some() {
+        require_dispatch_queue_capacity(&transaction, &scope_id, limits)?;
+    }
+    require_run_event_capacity(
+        &transaction,
+        &commit.snapshot.run.id,
+        1,
+        if commit.dispatch.is_some() { 2 } else { 0 },
+        limits,
+    )?;
+
     update_projection(&transaction, &commit.snapshot, commit.expected_sequence)?;
 
     if commit.event.data.is_some() {
@@ -6277,11 +7005,20 @@ fn commit_review(
     )?;
 
     if let Some(dispatch) = &commit.dispatch {
+        let queued_at = now();
         insert_dispatch_job(
             &transaction,
             &commit.snapshot.run.id,
             new_sequence,
             dispatch,
+            &queued_at,
+        )?;
+        insert_dispatch_finalization_reservation(
+            &transaction,
+            &scope_id,
+            &commit.snapshot.run.id,
+            &dispatch.call_id,
+            &queued_at,
         )?;
     }
 
@@ -6412,6 +7149,7 @@ fn claim_next_dispatch(
 
     let job = query_dispatch_job(&transaction, &commit.call_id)?
         .ok_or_else(|| StorageError::DispatchJobNotFound(commit.call_id.clone()))?;
+    require_dispatch_finalization_slots(&transaction, &job.run_id, &job.call_id, 2)?;
     if let Some(reason) = dispatch_authorization_failure(&transaction, &job)? {
         let rejection = reject_dispatch_authorization(&transaction, job, reason)?;
         transaction.commit()?;
@@ -6466,6 +7204,7 @@ fn claim_next_dispatch(
     if changed != 1 {
         return Err(StorageError::ConcurrentModification);
     }
+    consume_dispatch_claim_slot(&transaction, &job.run_id, &job.call_id)?;
 
     #[cfg(test)]
     if inject_failure {
@@ -6620,6 +7359,7 @@ fn reject_dispatch_authorization(
     if changed != 1 {
         return Err(StorageError::ConcurrentModification);
     }
+    finish_dispatch_finalization(connection, &job.run_id, &job.call_id, 2)?;
     let rejected = query_dispatch_job(connection, &job.call_id)?.ok_or_else(|| {
         StorageError::CorruptData("rejected dispatch disappeared before commit".into())
     })?;
@@ -6679,6 +7419,7 @@ fn complete_dispatch(
             "only the matching started dispatch may be completed".into(),
         ));
     }
+    require_dispatch_finalization_slots(&transaction, &job.run_id, &job.call_id, 1)?;
     match commit.event.data.as_ref() {
         Some(RunEventData::ToolResult {
             call_id,
@@ -6714,6 +7455,7 @@ fn complete_dispatch(
     if changed != 1 {
         return Err(StorageError::ConcurrentModification);
     }
+    finish_dispatch_finalization(&transaction, &job.run_id, &job.call_id, 1)?;
 
     #[cfg(test)]
     if inject_failure {
@@ -6769,6 +7511,7 @@ fn insert_dispatch_job(
     run_id: &str,
     approval_event_sequence: i64,
     job: &DispatchJobSpec,
+    queued_at: &str,
 ) -> Result<(), StorageError> {
     connection.execute(
         r#"INSERT INTO dispatch_jobs(
@@ -6793,7 +7536,7 @@ fn insert_dispatch_job(
             job.policy_id,
             job.policy_revision,
             sandbox_profile_to_db(&job.sandbox_profile),
-            now(),
+            queued_at,
         ],
     )?;
     Ok(())
@@ -7178,9 +7921,17 @@ fn normalized_password_hash(value: &str) -> Result<&str, StorageError> {
 }
 
 fn normalized_timestamp<'a>(value: &'a str, field: &'static str) -> Result<&'a str, StorageError> {
-    chrono::DateTime::parse_from_rfc3339(value).map_err(|_| {
+    let parsed = chrono::DateTime::parse_from_rfc3339(value).map_err(|_| {
         StorageError::InvalidAccountData(format!("{field} must be an RFC 3339 timestamp"))
     })?;
+    let canonical = parsed
+        .with_timezone(&Utc)
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
+    if value != canonical {
+        return Err(StorageError::InvalidAccountData(format!(
+            "{field} must use canonical UTC millisecond form"
+        )));
+    }
     Ok(value)
 }
 

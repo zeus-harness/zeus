@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::StorageLimitsError;
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("I/O error: {0}")]
@@ -10,6 +12,8 @@ pub enum StorageError {
     Json(#[from] serde_json::Error),
     #[error("blocking storage task failed: {0}")]
     Join(#[from] tokio::task::JoinError),
+    #[error("invalid storage limits: {0}")]
+    InvalidLimits(#[from] StorageLimitsError),
     #[error("persistent SQLite database `{0}` is already owned by another Zeus instance")]
     DatabaseLocked(String),
     #[error("run `{0}` was not found")]
@@ -30,6 +34,16 @@ pub enum StorageError {
     UserDisabled(String),
     #[error("the authentication session was not found or has expired")]
     AuthSessionNotFound,
+    #[error("the durable storage quota is exhausted")]
+    StorageQuotaExceeded,
+    #[error("the durable reply queue is at capacity")]
+    ReplyQueueCapacityExceeded,
+    #[error("the durable dispatch queue is at capacity")]
+    DispatchQueueCapacityExceeded,
+    #[error("the authentication session store is at capacity")]
+    AuthSessionCapacityExceeded,
+    #[error("the durable finalization reservation is missing or inconsistent")]
+    FinalizationReservationUnavailable,
     #[error("invalid account data: {0}")]
     InvalidAccountData(String),
     #[error("run `{run_id}` already belongs to session `{session_id}`")]

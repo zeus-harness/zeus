@@ -2284,6 +2284,59 @@ impl ApiError {
         .with_no_store()
     }
 
+    fn storage_quota_exceeded() -> Self {
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "storage_quota_exceeded",
+            "Storage capacity exceeded",
+            "The durable storage limit for this Zeus instance has been reached",
+        )
+        .with_no_store()
+    }
+
+    fn reply_queue_capacity_exceeded() -> Self {
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "reply_queue_capacity_exceeded",
+            "Reply queue capacity exceeded",
+            "Too many assistant replies are active; retry later",
+        )
+        .with_retry_after(Duration::from_secs(2))
+        .with_no_store()
+    }
+
+    fn dispatch_queue_capacity_exceeded() -> Self {
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "dispatch_queue_capacity_exceeded",
+            "Dispatch queue capacity exceeded",
+            "Too many tool dispatches are active; retry later",
+        )
+        .with_retry_after(Duration::from_secs(2))
+        .with_no_store()
+    }
+
+    fn auth_session_capacity_exceeded() -> Self {
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "auth_session_capacity_exceeded",
+            "Sign-in session capacity exceeded",
+            "Too many authentication sessions are active for this Zeus instance",
+        )
+        .with_no_store()
+    }
+
+    fn finalization_unavailable(error: &StoreError) -> Self {
+        eprintln!("zeus durable finalization reservation failed closed: {error:?}");
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime_unavailable",
+            "Runtime is unavailable",
+            "The runtime cannot safely finalize durable work",
+        )
+        .with_no_store()
+    }
+
     fn unavailable_message(detail: &'static str) -> Self {
         eprintln!("zeus API capacity state is unavailable");
         Self::new(
@@ -2364,6 +2417,13 @@ impl From<StoreError> for ApiError {
             ),
             StoreError::InvalidBootstrapToken => Self::invalid_bootstrap(),
             StoreError::UserNotFound(_) | StoreError::UserDisabled(_) => Self::invalid_login(),
+            StoreError::StorageQuotaExceeded => Self::storage_quota_exceeded(),
+            StoreError::ReplyQueueCapacityExceeded => Self::reply_queue_capacity_exceeded(),
+            StoreError::DispatchQueueCapacityExceeded => Self::dispatch_queue_capacity_exceeded(),
+            StoreError::AuthSessionCapacityExceeded => Self::auth_session_capacity_exceeded(),
+            StoreError::FinalizationReservationUnavailable => {
+                Self::finalization_unavailable(&error)
+            }
             StoreError::InvalidAccountData(reason) => {
                 Self::bad_request("invalid_account_data", reason.clone())
             }
@@ -5113,6 +5173,62 @@ mod tests {
             assert!(!problem.detail.contains("binding"));
             assert!(!problem.detail.contains("tool call"));
         }
+    }
+
+    #[tokio::test]
+    async fn durable_capacity_errors_use_stable_429_contracts() {
+        for (error, code, retry_after) in [
+            (
+                StoreError::StorageQuotaExceeded,
+                "storage_quota_exceeded",
+                None,
+            ),
+            (
+                StoreError::ReplyQueueCapacityExceeded,
+                "reply_queue_capacity_exceeded",
+                Some("2"),
+            ),
+            (
+                StoreError::DispatchQueueCapacityExceeded,
+                "dispatch_queue_capacity_exceeded",
+                Some("2"),
+            ),
+            (
+                StoreError::AuthSessionCapacityExceeded,
+                "auth_session_capacity_exceeded",
+                None,
+            ),
+        ] {
+            let response = ApiError::from(error).into_response();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                response.headers().get(header::CACHE_CONTROL).unwrap(),
+                "no-store"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok()),
+                retry_after
+            );
+            let problem: ProblemDetails = response_json(response).await;
+            assert_eq!(problem.code, code);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_finalization_reservation_is_sanitized_and_not_cached() {
+        let response =
+            ApiError::from(StoreError::FinalizationReservationUnavailable).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let problem: ProblemDetails = response_json(response).await;
+        assert_eq!(problem.code, "runtime_unavailable");
+        assert!(!problem.detail.contains("reservation"));
     }
 
     #[tokio::test]

@@ -76,6 +76,31 @@ ZEUS_LLM_API_KEY=your-secret
 Partial provider configuration fails startup. The endpoint and key are never
 writable through the browser Settings API.
 
+SQLite logical-capacity defaults can be reduced for local tests or raised only
+up to the compiled hard ceiling. Explicit values must be non-empty unsigned
+decimal integers; zero, non-UTF-8, per-scope values above their global value,
+and values above the hard ceiling fail startup.
+
+| Environment variable | Default | Hard ceiling |
+| --- | ---: | ---: |
+| `ZEUS_MAX_SESSIONS_PER_SCOPE` | 1,000 | 10,000 |
+| `ZEUS_MAX_SESSIONS_GLOBAL` | 10,000 | 100,000 |
+| `ZEUS_MAX_OPEN_TURNS_PER_SCOPE` | 32 | 128 |
+| `ZEUS_MAX_OPEN_TURNS_GLOBAL` | 64 | 512 |
+| `ZEUS_MAX_ACTIVE_REPLY_JOBS_PER_SCOPE` | 32 | 128 |
+| `ZEUS_MAX_ACTIVE_REPLY_JOBS_GLOBAL` | 64 | 512 |
+| `ZEUS_MAX_ACTIVE_DISPATCH_JOBS_PER_SCOPE` | 16 | 64 |
+| `ZEUS_MAX_ACTIVE_DISPATCH_JOBS_GLOBAL` | 32 | 256 |
+| `ZEUS_MAX_AUTH_SESSIONS_PER_USER` | 32 | 128 |
+| `ZEUS_MAX_AUTH_SESSIONS_GLOBAL` | 256 | 4,096 |
+| `ZEUS_MAX_SESSION_EVENT_SLOTS_PER_SESSION` | 10,000 | 100,000 |
+| `ZEUS_MAX_RUN_EVENT_SLOTS_PER_RUN` | 50,000 | 500,000 |
+| `ZEUS_MAX_BOOTSTRAP_AUDIT_ROWS` | 1,024 | 65,536 |
+
+Event-slot limits cover the current durable ledger head plus slots reserved for
+accepted work to reach a terminal state. They are not byte, database-file, WAL,
+or free-disk guarantees.
+
 To exercise the only executable Alpha connector, use a separate database and
 an explicit fixed root. The caller supplies marker text only; it cannot choose
 a path or invoke a host command:
@@ -296,6 +321,9 @@ and bounded memory, CPU, and PID resources.
   triggers plus a durable authorization-revoked terminal state. Schema v9 adds
   typed, immutable Run-event lookup projections, point-query indexes, contiguous
   Run-event insertion enforcement, and fixed 64-row startup-recovery batches.
+  Schema v10 adds owner/global row and active-work admission limits, durable
+  Session-turn and dispatch event-slot reservations, bounded expired-auth-session
+  cleanup, and readiness checks for reservation ownership and lifecycle.
   Existing Runs and events are decoded, validated, and migrated in place without
   rewriting their payloads. Runtime identity still binds profile, environment,
   primary Session and Run, policy ID, and policy revision; a mismatch fails
@@ -331,7 +359,8 @@ directly.
   state changes additionally require `X-CSRF-Token` to match the login and an
   exact same-origin request. Alpha+ deliberately rejects the schema-reserved
   `member` role. Actor isolation is now present, but member access remains
-  blocked until SQLite storage and queue quotas land.
+  blocked until terminal-payload byte reservation, a tenant/account membership
+  scope, SQLite/WAL emergency headroom, and bootstrap-audit retention policy land.
 - `GET /api/v1/me/settings` returns the current safe preferences.
   `PATCH /api/v1/me/settings` accepts `theme`, optional allowlisted
   `preferred_model`, and `expected_revision`. Provider endpoints and API keys
@@ -391,6 +420,10 @@ directly.
   updates use their own replay/concurrency rules. Malformed input returns 400,
   oversized JSON returns 413, a wrong content type returns 415, schema mismatch
   or unknown fields return 422, and capacity/rate rejection returns 429.
+  Durable capacity problems use `storage_quota_exceeded`,
+  `reply_queue_capacity_exceeded`, `dispatch_queue_capacity_exceeded`, or
+  `auth_session_capacity_exceeded` with `Cache-Control: no-store`; reply and
+  dispatch queue responses also return `Retry-After: 2`.
   Missing or unowned resources return 404; unauthenticated requests return 401;
   CSRF/origin rejection returns 403; duplicate identity, idempotency conflict,
   invalid state, or sequence conflict returns 409 as
@@ -400,7 +433,7 @@ directly.
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Schema v9 retains durable Run attachment during migration and demo seeding,
+Schema v10 retains durable Run attachment during migration and demo seeding,
 but Alpha+ does not expose a public attach-Run HTTP route.
 
 The application boundary now caps auth JSON at 8 KiB and command JSON at
@@ -414,8 +447,15 @@ approval, dispatch, reply completion, attachment checks, and startup recovery
 use typed point queries or fixed 64-row batches. Production Session list/detail,
 Run detail, and overview reads now use indexed `LIMIT + 1` keyset pages inside
 actor-authorized SQLite snapshots; no production HTTP read loads a complete
-ledger or collection. SQLite usage quotas and retention are not present. Add
-those storage budgets before any shared-network or multi-tenant deployment.
+ledger or collection. Schema v10 enforces bounded Session, open-turn, active
+reply/dispatch, auth-session, bootstrap-audit, and event-slot admission. Exact
+idempotent replay is checked before capacity, while accepted work consumes its
+reserved terminal slots without ordinary admission. Expired auth sessions are
+deleted in deterministic batches of at most 64 on startup and before session
+creation; append-only ledgers, receipts, jobs, turns, and audit records are not
+silently pruned. Logical payload bytes, main DB/WAL/disk headroom, and a complete
+audit retention horizon remain unresolved, so shared-network and multi-tenant
+deployment is still out of scope.
 
 ## Container images
 
@@ -464,12 +504,12 @@ committed data. Use SQLite's backup/checkpoint facilities.
 ## Verification status
 
 Current Alpha+ plus Actor Boundary Foundation, API Resource Envelope, Bounded
-Event Feed, Point-query Durable Context, and Bounded Read Models host
-verification:
+Event Feed, Point-query Durable Context, Bounded Read Models, and SQLite
+Capacity Slice 1 host verification:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --all-targets`: 195 tests passed, including the real
+- `cargo test --workspace --all-targets`: 213 tests passed, including the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,
   body/field/idempotency boundaries, atomic login limits, SSE lease capacity,
@@ -478,7 +518,10 @@ verification:
   fixed-batch restart recovery, bounded 50/50/1 Session-list traversal,
   independent Session/Run history tails, actor/resource-scoped cursors, an
   old-turn point lookup for durable retry recovery, concurrent claim, and
-  provider `outcome_unknown` semantics.
+  provider `outcome_unknown` semantics. Capacity coverage includes exact-limit
+  and limit-plus-one admission, terminal event-slot reservation lifecycles,
+  startup seed idempotency, over-limit legacy migration/recovery, bounded
+  expired-auth cleanup, and fail-closed environment parsing.
 - `pnpm --filter web test`: 25 tests passed for CSRF headers, stable command
   identity, deep-page active-Session restore, Session-list cursor encoding and
   deduplication, bounded-tail retry reconciliation and Session-switch race
@@ -516,16 +559,20 @@ durable worker to sequence 4 with local-fallback provenance. Rate-window and
 SSE body-drop behavior are covered by deterministic automated tests.
 
 Apple `container` remains a supported local debug path. `bash -n` passes for
-the helper, and the pre-existing labeled API/Web/gateway containers plus
-`zeus-alpha-data` volume remained healthy and untouched during this change.
+the helper. A current read-only status check found the pre-existing labeled
+API/Web/gateway containers running and `zeus-alpha-data` present; no container
+or volume was replaced. The gateway Web/API readiness probes passed, then the
+full helper `verify` stopped at `GET /api/v1/auth/status` with `404`, confirming
+that the running image is the older Alpha baseline rather than this slice.
 The Alpha+ image rebuild on this machine stalled while updating the crates.io
 index inside BuildKit and was interrupted before any running container was
 replaced. Therefore the new image, `verify`, and named-volume `restart-verify`
 are not yet claimed as current Alpha+ acceptance. The earlier Alpha baseline
 container acceptance belongs to commit `9a89706`; the pushed host baseline
-before this slice is Point-query Durable Context commit `78a65e1`. No
+before this slice is Bounded Read Models commit `8656e52`. No
 replacement image containing Actor Boundary, API Resource Envelope, Bounded
-Event Feed, Point-query Durable Context, or Bounded Read Models is yet verified.
+Event Feed, Point-query Durable Context, Bounded Read Models, or SQLite Capacity
+Slice 1 is yet verified.
 
 Docker Compose configuration remains available for environments with Docker
 Compose v2; this machine currently has Apple `container` but no Docker CLI, so

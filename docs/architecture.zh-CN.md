@@ -27,8 +27,8 @@ Client / SvelteKit Web
 - `authz`：精确工具名规则、策略 revision、环境和 effect guard；没有命中即拒绝。
 - `tools`：工具描述、注册表、参数验证和 object-safe executor 边界。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
-- `storage`：schema v9 migration、用户/偏好、独立 Session/Run ledger、typed event lookup、
-  actor-scoped 回执，以及 durable reply/dispatch queue。
+- `storage`：schema v10 migration、用户/偏好、独立 Session/Run ledger、typed event lookup、
+  actor-scoped 回执、durable reply/dispatch queue，以及事务级 logical capacity/reservation。
 - `runtime`：Session 命令编排、reply/Run worker、提交后 SSE 提示和启动恢复。
 - `zeus-api`：进程组合、owner 认证、CSRF、provider 配置、REST/SSE 和 readiness。
 
@@ -142,7 +142,8 @@ connector 在数据库事务和锁之外运行。
 
 API 监听端口之前按固定顺序完成：
 
-1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v9。
+1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v10；按
+   `(expires_at, token_hash)` 最多清理 64 个过期 auth session。
 2. 绑定并核对 runtime identity、primary Session/Run 和 demo attachment。
 3. 以固定 64 行 batch 读取 `started` 且没有持久结果的 reply job，循环排空：结算为 `outcome_unknown`，追加
    `turn_interrupted`，不得重放可能已经计费的 provider 请求。queued reply 原样保留并可安全领取。
@@ -169,8 +170,10 @@ exactly-once 语义。
   `ZEUS_COOKIE_SECURE=true` 才附加 `Secure`。
 - Alpha+ 明确拒绝 schema 预留的 `member` 登录。正式 Run/Session 查询、SSE、resume、turn、
   review 和 receipt 已全部 actor-scoped，并有 Alice/Bob 隔离测试；字段、HTTP/SSE 连接和
-  event page 边界、内部 point/batch read 与有界 list/detail 已落地，但 member 仍须等待
-  SQLite 存储/队列配额，不能仅因数据面已隔离就开放。
+  event page 边界、内部 point/batch read、有界 list/detail，以及第一阶段 SQLite 行数/
+  active queue/event-slot 配额已落地。但 member 仍须等待 terminal payload byte reserve、
+  tenant/account scope、DB/WAL/disk 应急余量和 bootstrap audit retention，不能仅因数据面
+  已隔离就开放。
 - auth JSON 明确限制为 8 KiB、command JSON 为 512 KiB；新建 Session/turn ID、title、
   user message、review note 与严格幂等键分别按 UTF-8 bytes 设置硬上限。新 Session event
   使用有界 ledger-local ID；pre-v9 durable reference 继续可寻址。共享纯校验在相关 API、
@@ -202,12 +205,21 @@ exactly-once 语义。
   与授权撤销拒绝终态。v9 增加从 typed payload 派生并逐行核对的 Run event lookup
   projection、approval/call/policy 和恢复队列索引、连续 Run sequence trigger；既有 payload
   在 128 行 keyset batch 中解码回填，失败时整个 migration 回滚。
+  v10 增加 owner/global admission quota、过期 auth session 的 64 行确定性清理，以及
+  `finalization_reservations`。open turn、queued dispatch、started dispatch 在迁移中分别回填
+  2/2/1 个 event slots；旧库已超配额不阻止迁移、读取或 recovery，只拒绝新 admission。
   每个 pre-v4 Run 会绑定到生成的 `session-{run_id}`，原 Run/Event 不重写、不丢弃。
 - runtime identity 持久绑定 profile、environment、primary Session/Run、policy ID 和
   revision；不一致时启动失败。Run attachment 当前用于 migration 和 demo seed，Alpha 不公开
   attach-Run HTTP route。
 - queue claim 与 started recovery 在任何外部调用前再次核对 actor 状态、role、resource owner、
   job 的 run、policy ID 和 revision。
+- Session/Run command 在鉴权与 exact receipt replay 之后、状态写入之前检查 logical capacity。
+  turn admission 预留两个 Session event slots；dispatch admission 预留两个 Run slots。reply
+  claim 必须仍持有 2，dispatch started 将 2→1；success/failure/rejection/recovery 在终态事务
+  降到 0 后删除 reservation。缺失/错绑时在 provider/connector 前脱敏 `503`，普通容量拒绝
+  使用 `429 + Cache-Control: no-store`，reply/dispatch queue 另返回 `Retry-After: 2`。
+  这些槽不等于 payload byte、SQLite 主库、WAL 或宿主磁盘保证。
 - OpenAI-compatible reply endpoint 默认只接受 HTTPS 或 loopback HTTP，禁止 redirect，限制连接/
   总超时和响应体；queued job 绑定 endpoint/model/limits 的非秘密配置 digest，API key 不入 ledger。
 - sandbox 或 executor 不可用：写入 `NotDispatched`，禁止回退到宿主机裸执行。
@@ -247,7 +259,7 @@ exactly-once 语义。
 
 ## Alpha+ 验收
 
-- schema v1/v3/v7/v8 原地迁移到 v9 后，原 Run/Event payload 保留，primary Session/Run 绑定稳定；迁移时
+- schema v1/v3/v7/v8/v9 原地迁移到 v10 后，原 Run/Event payload 保留，primary Session/Run 绑定稳定；迁移时
   尚未 bootstrap 的 legacy actor 只允许在首次 owner bootstrap 事务中认领一次。
 - 重启后用户/偏好、Session/turn/event、reply job、Run/Event、审批决定、dispatch job 和命令
   回执仍存在。
@@ -278,16 +290,18 @@ exactly-once 语义。
   replay 已在 storage 层分页，future cursor 对已授权资源返回 `409`，foreign resource 仍为
   `404`。审批、派发、reply completion、attachment 和启动恢复已改为 typed point query 或
   固定 64 行 batch；Session list/detail 与 Run detail/overview 也已改为 indexed bounded read
-  model。对外或多租户部署前仍必须增加 SQLite usage quota 与保留策略。
+  model。SQLite row/active/event-slot quota 已落地；对外或多租户部署前仍必须完成 byte/
+  physical capacity guarantee 与完整 audit retention。
 - Web 保持紧凑时间线、一个内联审批卡和一个 composer；支持真实 New Session、活动 Session
   刷新恢复、owner 设置/退出和 system/light/dark。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化结果是 195 个 Rust 测试和 25 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化结果是 213 个 Rust 测试和 25 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
-Apple `container` 的 Alpha 基线验收属于提交 `9a89706`。Point-query Durable Context 的已推送
-主机基线为 `78a65e1`；当前 helper shell 和现有 labeled container/volume 状态检查通过，但包含
-Actor Boundary/API Resource Envelope/Bounded Event Feed/Point-query Durable Context/Bounded Read Models 的新镜像构建仍受 BuildKit 内
+Apple `container` 的 Alpha 基线验收属于提交 `9a89706`。Bounded Read Models 的已推送
+主机基线为 `8656e52`；当前 helper shell 语法通过，现有 labeled API/Web/gateway 均为 running、
+volume 存在且 Web/API readiness 通过，但旧镜像的 `/api/v1/auth/status` 返回 `404`。包含
+Actor Boundary/API Resource Envelope/Bounded Event Feed/Point-query Durable Context/Bounded Read Models/SQLite Capacity Slice 1 的新镜像构建仍受 BuildKit 内
 crates.io 索引更新阻塞，并在替换运行容器前安全中止；因此不声明当前
 `up/verify/restart-verify` 已通过。
 Docker Compose 当前只有静态配置检查；本机缺少 Docker CLI 时不声明 Compose build/up 已通过。
