@@ -689,7 +689,15 @@ async fn liveness() -> Json<HealthResponse> {
 }
 
 async fn readiness(State(state): State<ApiState>) -> Result<Json<HealthResponse>, ApiError> {
-    state.store.readiness().await?;
+    match state.store.readiness().await {
+        Ok(()) => {}
+        Err(StoreError::PhysicalStorageExhausted) => {
+            return Err(ApiError::unavailable_message(
+                "The runtime cannot safely accept new durable work at the current disk watermark",
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    }
     Ok(Json(HealthResponse { status: "ready" }))
 }
 
@@ -2349,6 +2357,16 @@ impl ApiError {
         .with_no_store()
     }
 
+    fn physical_storage_exhausted() -> Self {
+        Self::new(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "physical_storage_exhausted",
+            "Physical storage capacity exhausted",
+            "SQLite cannot safely accept new durable work at the current disk watermark",
+        )
+        .with_no_store()
+    }
+
     fn reply_queue_capacity_exceeded() -> Self {
         Self::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -2476,6 +2494,7 @@ impl From<StoreError> for ApiError {
             StoreError::InvalidBootstrapToken => Self::invalid_bootstrap(),
             StoreError::UserNotFound(_) | StoreError::UserDisabled(_) => Self::invalid_login(),
             StoreError::StorageQuotaExceeded => Self::storage_quota_exceeded(),
+            StoreError::PhysicalStorageExhausted => Self::physical_storage_exhausted(),
             StoreError::ReplyQueueCapacityExceeded => Self::reply_queue_capacity_exceeded(),
             StoreError::DispatchQueueCapacityExceeded => Self::dispatch_queue_capacity_exceeded(),
             StoreError::AuthSessionCapacityExceeded => Self::auth_session_capacity_exceeded(),
@@ -5395,6 +5414,21 @@ mod tests {
             let problem: ProblemDetails = response_json(response).await;
             assert_eq!(problem.code, code);
         }
+    }
+
+    #[tokio::test]
+    async fn physical_capacity_errors_use_a_stable_507_contract() {
+        let response = ApiError::from(StoreError::PhysicalStorageExhausted).into_response();
+        assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let problem: ProblemDetails = response_json(response).await;
+        assert_eq!(problem.code, "physical_storage_exhausted");
+        assert_eq!(problem.title, "Physical storage capacity exhausted");
+        assert!(!problem.detail.contains("bytes"));
+        assert!(!problem.detail.contains("path"));
     }
 
     #[tokio::test]

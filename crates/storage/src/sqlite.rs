@@ -9,7 +9,7 @@ use std::{
 };
 
 use chrono::{SecondsFormat, Utc};
-use fs2::FileExt;
+use fs2::{FileExt, available_space};
 use protocol::{
     ApprovalScope, ApprovalStatus, AssistantReplyProvenance, AttachRunRequest, AttachRunResponse,
     COLLECTION_PAGE_MAX_LIMIT, CreateSessionRequest, CreateSessionResponse, EVENT_PAGE_MAX_LIMIT,
@@ -33,8 +33,8 @@ use crate::{
     RecoveredSessionTurn, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit, ReplyJob,
     ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
     ReplySuccessCommit, ReviewCommit, ReviewContext, ReviewReceipt, RunSnapshot, RuntimeIdentity,
-    SessionSummaryPage, StorageError, StorageLimits, StoredCredential, StoredPreferences,
-    StoredRun, StoredUser, StoredUserRole, StoredUserStatus,
+    SessionSummaryPage, SqlitePhysicalLimits, StorageError, StorageLimits, StoredCredential,
+    StoredPreferences, StoredRun, StoredUser, StoredUserRole, StoredUserStatus,
 };
 
 const CURRENT_SCHEMA_VERSION: i64 = 11;
@@ -101,6 +101,7 @@ impl EventCapacityRequest {
 pub struct SqliteStore {
     backend: Backend,
     limits: StorageLimits,
+    physical_limits: SqlitePhysicalLimits,
 }
 
 #[derive(Clone)]
@@ -111,43 +112,79 @@ enum Backend {
 
 struct FileBackend {
     path: PathBuf,
+    physical_limits: SqlitePhysicalLimits,
     // Dropping the final backend clone releases the process-wide lease.
     _lock_file: File,
 }
 
 impl SqliteStore {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        Self::open_with_limits(path, StorageLimits::default()).await
+        Self::open_with_limits_and_physical(
+            path,
+            StorageLimits::default(),
+            SqlitePhysicalLimits::default(),
+        )
+        .await
     }
 
     pub async fn open_with_limits(
         path: impl AsRef<Path>,
         limits: StorageLimits,
     ) -> Result<Self, StorageError> {
+        Self::open_with_limits_and_physical(path, limits, SqlitePhysicalLimits::default()).await
+    }
+
+    pub async fn open_with_limits_and_physical(
+        path: impl AsRef<Path>,
+        limits: StorageLimits,
+        physical_limits: SqlitePhysicalLimits,
+    ) -> Result<Self, StorageError> {
         limits.validate()?;
+        physical_limits.validate()?;
         let path = path.as_ref().to_path_buf();
         if path == Path::new(":memory:") {
             let connection = tokio::task::spawn_blocking(move || {
                 let mut connection = Connection::open_in_memory()?;
-                configure_connection(&connection, false)?;
+                configure_connection(&connection, false, None)?;
                 migrate(&mut connection)?;
                 cleanup_expired_auth_sessions(&mut connection, &now())?;
+                deep_readiness(&mut connection, false, None)?;
                 Ok::<_, StorageError>(connection)
             })
             .await??;
             Ok(Self {
                 backend: Backend::Memory(Arc::new(Mutex::new(connection))),
                 limits,
+                physical_limits,
             })
         } else {
+            let backend_physical_limits = physical_limits.clone();
             let backend = tokio::task::spawn_blocking(move || {
                 let path = normalized_file_path(&path)?;
                 let lock_file = acquire_database_lock(&path)?;
-                let mut connection = open_file_connection(&path)?;
+                let mut connection = open_file_connection(&path, &backend_physical_limits)?;
+                let schema_version = current_schema_version(&connection)?;
+                if schema_version < CURRENT_SCHEMA_VERSION {
+                    require_physical_capacity(
+                        &connection,
+                        &path,
+                        &backend_physical_limits,
+                        PhysicalCapacityGate::Migration,
+                    )?;
+                }
                 migrate(&mut connection)?;
+                require_physical_capacity(
+                    &connection,
+                    &path,
+                    &backend_physical_limits,
+                    PhysicalCapacityGate::Finalization,
+                )?;
                 cleanup_expired_auth_sessions(&mut connection, &now())?;
+                checkpoint_wal(&connection)?;
+                deep_readiness(&mut connection, true, Some(&backend_physical_limits))?;
                 Ok::<_, StorageError>(FileBackend {
                     path,
+                    physical_limits: backend_physical_limits,
                     _lock_file: lock_file,
                 })
             })
@@ -155,12 +192,33 @@ impl SqliteStore {
             Ok(Self {
                 backend: Backend::File(Arc::new(backend)),
                 limits,
+                physical_limits,
             })
         }
     }
 
     pub fn limits(&self) -> &StorageLimits {
         &self.limits
+    }
+
+    pub fn physical_limits(&self) -> &SqlitePhysicalLimits {
+        &self.physical_limits
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn physical_pragma_snapshot(
+        &self,
+    ) -> Result<(u64, u64, u64, i64, i64), StorageError> {
+        self.with_connection(|connection| {
+            Ok((
+                pragma_positive_u64(connection, "max_page_count")?,
+                pragma_positive_u64(connection, "wal_autocheckpoint")?,
+                pragma_non_negative_u64(connection, "journal_size_limit")?,
+                connection.pragma_query_value(None, "cache_size", |row| row.get(0))?,
+                connection.pragma_query_value(None, "mmap_size", |row| row.get(0))?,
+            ))
+        })
+        .await
     }
 
     /// Binds this database to one immutable runtime profile and policy.
@@ -172,8 +230,11 @@ impl SqliteStore {
         &self,
         identity: RuntimeIdentity,
     ) -> Result<(), StorageError> {
-        self.with_connection(move |connection| bind_runtime_identity(connection, identity))
-            .await
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            bind_runtime_identity(connection, identity, &physical_limits)
+        })
+        .await
     }
 
     /// Seeds the database only when it has no runs. Existing state is never
@@ -184,8 +245,11 @@ impl SqliteStore {
         events: Vec<RunEvent>,
     ) -> Result<bool, StorageError> {
         let limits = self.limits.clone();
-        self.with_connection(move |connection| seed_if_empty(connection, snapshot, events, &limits))
-            .await
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            seed_if_empty(connection, snapshot, events, &limits, &physical_limits)
+        })
+        .await
     }
 
     /// Creates (or completes) the durable demo-session attachment.
@@ -203,8 +267,16 @@ impl SqliteStore {
         let title = title.to_owned();
         let run_id = validated_durable_reference(run_id, "run ID")?.to_owned();
         let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
         self.with_connection(move |connection| {
-            seed_demo_session(connection, &session_id, &title, &run_id, &limits)
+            seed_demo_session(
+                connection,
+                &session_id,
+                &title,
+                &run_id,
+                &limits,
+                &physical_limits,
+            )
         })
         .await
     }
@@ -446,8 +518,9 @@ impl SqliteStore {
     ) -> Result<CreateSessionResponse, StorageError> {
         let key = normalized_key(idempotency_key)?.to_owned();
         let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
         self.with_connection(move |connection| {
-            create_session(connection, request, &key, None, &limits)
+            create_session(connection, request, &key, None, &limits, &physical_limits)
         })
         .await
     }
@@ -464,8 +537,16 @@ impl SqliteStore {
             normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
         self.with_connection(move |connection| {
-            create_session(connection, request, &key, Some(&actor_user_id), &limits)
+            create_session(
+                connection,
+                request,
+                &key,
+                Some(&actor_user_id),
+                &limits,
+                &physical_limits,
+            )
         })
         .await
     }
@@ -481,8 +562,17 @@ impl SqliteStore {
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
         self.with_connection(move |connection| {
-            attach_run(connection, &session_id, request, &key, None, &limits)
+            attach_run(
+                connection,
+                &session_id,
+                request,
+                &key,
+                None,
+                &limits,
+                &physical_limits,
+            )
         })
         .await
     }
@@ -499,6 +589,7 @@ impl SqliteStore {
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
         self.with_connection(move |connection| {
             attach_run(
                 connection,
@@ -507,6 +598,7 @@ impl SqliteStore {
                 &key,
                 Some(&actor_user_id),
                 &limits,
+                &physical_limits,
             )
         })
         .await
@@ -523,6 +615,7 @@ impl SqliteStore {
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
         self.with_connection(move |connection| {
             start_turn(
                 connection,
@@ -533,6 +626,7 @@ impl SqliteStore {
                     actor_user_id: None,
                     reply_job: None,
                     limits: &limits,
+                    physical_limits: &physical_limits,
                     fail_after_enqueue: false,
                 },
             )
@@ -553,6 +647,7 @@ impl SqliteStore {
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
         self.with_connection(move |connection| {
             start_turn(
                 connection,
@@ -563,6 +658,7 @@ impl SqliteStore {
                     actor_user_id: Some(&actor_user_id),
                     reply_job: None,
                     limits: &limits,
+                    physical_limits: &physical_limits,
                     fail_after_enqueue: false,
                 },
             )
@@ -589,6 +685,7 @@ impl SqliteStore {
         let key = normalized_key(idempotency_key)?.to_owned();
         let actor_user_id = job.actor_user_id.clone();
         let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
         self.with_connection(move |connection| {
             start_turn(
                 connection,
@@ -599,6 +696,7 @@ impl SqliteStore {
                     actor_user_id: Some(&actor_user_id),
                     reply_job: Some(job),
                     limits: &limits,
+                    physical_limits: &physical_limits,
                     fail_after_enqueue: false,
                 },
             )
@@ -630,6 +728,7 @@ impl SqliteStore {
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
         self.with_connection(move |connection| {
             start_turn(
                 connection,
@@ -640,6 +739,7 @@ impl SqliteStore {
                     actor_user_id: Some(&actor_user_id),
                     reply_job: Some(job),
                     limits: &limits,
+                    physical_limits: &physical_limits,
                     fail_after_enqueue: false,
                 },
             )
@@ -664,7 +764,9 @@ impl SqliteStore {
     /// Claims at most one queued reply. The committed `started` transition is
     /// the authorization boundary for provider execution.
     pub async fn claim_next_reply(&self) -> Result<ReplyClaimOutcome, StorageError> {
-        self.with_connection(claim_next_reply).await
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| claim_next_reply(connection, &physical_limits))
+            .await
     }
 
     /// Commits provider output, assistant/flush ledger events, and the ready
@@ -673,8 +775,11 @@ impl SqliteStore {
         &self,
         commit: ReplySuccessCommit,
     ) -> Result<ReplyCompletion, StorageError> {
-        self.with_connection(move |connection| complete_reply_success(connection, commit, false))
-            .await
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            complete_reply_success(connection, commit, &physical_limits, false)
+        })
+        .await
     }
 
     /// Commits a terminal provider failure together with interruption evidence.
@@ -682,8 +787,11 @@ impl SqliteStore {
         &self,
         commit: ReplyFailureCommit,
     ) -> Result<ReplyCompletion, StorageError> {
-        self.with_connection(move |connection| complete_reply_failure(connection, commit))
-            .await
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            complete_reply_failure(connection, commit, &physical_limits)
+        })
+        .await
     }
 
     /// Commits an indeterminate provider outcome together with interruption
@@ -692,14 +800,21 @@ impl SqliteStore {
         &self,
         commit: ReplyOutcomeUnknownCommit,
     ) -> Result<ReplyCompletion, StorageError> {
-        self.with_connection(move |connection| complete_reply_outcome_unknown(connection, commit))
-            .await
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            complete_reply_outcome_unknown(connection, commit, &physical_limits)
+        })
+        .await
     }
 
     /// Converts one bounded batch of replies durably claimed by a previous
     /// process into `outcome_unknown`. Queued work remains claimable.
     pub async fn recover_started_replies(&self) -> Result<Vec<ReplyCompletion>, StorageError> {
-        self.with_connection(recover_started_replies).await
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            recover_started_replies(connection, &physical_limits)
+        })
+        .await
     }
 
     /// System/test-only legacy write. Authenticated paths must use
@@ -712,8 +827,17 @@ impl SqliteStore {
     ) -> Result<FlushSessionResponse, StorageError> {
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
+        let physical_limits = self.physical_limits.clone();
         self.with_connection(move |connection| {
-            flush_turn(connection, &session_id, request, &key, None, false)
+            flush_turn(
+                connection,
+                &session_id,
+                request,
+                &key,
+                None,
+                &physical_limits,
+                false,
+            )
         })
         .await
     }
@@ -729,6 +853,7 @@ impl SqliteStore {
             normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
+        let physical_limits = self.physical_limits.clone();
         self.with_connection(move |connection| {
             flush_turn(
                 connection,
@@ -736,6 +861,7 @@ impl SqliteStore {
                 request,
                 &key,
                 Some(&actor_user_id),
+                &physical_limits,
                 false,
             )
         })
@@ -753,8 +879,17 @@ impl SqliteStore {
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
         self.with_connection(move |connection| {
-            resume_session(connection, &session_id, request, &key, None, &limits)
+            resume_session(
+                connection,
+                &session_id,
+                request,
+                &key,
+                None,
+                &limits,
+                &physical_limits,
+            )
         })
         .await
     }
@@ -771,6 +906,7 @@ impl SqliteStore {
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
         self.with_connection(move |connection| {
             resume_session(
                 connection,
@@ -779,6 +915,7 @@ impl SqliteStore {
                 &key,
                 Some(&actor_user_id),
                 &limits,
+                &physical_limits,
             )
         })
         .await
@@ -788,7 +925,9 @@ impl SqliteStore {
     /// Recovery only appends `turn_interrupted`; it never manufactures a flush
     /// acknowledgement.
     pub async fn recover_open_turns(&self) -> Result<Vec<RecoveredSessionTurn>, StorageError> {
-        self.with_connection(recover_open_turns).await
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| recover_open_turns(connection, &physical_limits))
+            .await
     }
 
     pub async fn has_users(&self) -> Result<bool, StorageError> {
@@ -814,8 +953,15 @@ impl SqliteStore {
         let token_hash = normalized_token_hash(token_hash, "bootstrap token hash")?.to_owned();
         let expires_at = normalized_timestamp(expires_at, "bootstrap token expiry")?.to_owned();
         let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
         self.with_connection(move |connection| {
-            replace_bootstrap_token(connection, &token_hash, &expires_at, &limits)
+            replace_bootstrap_token(
+                connection,
+                &token_hash,
+                &expires_at,
+                &limits,
+                &physical_limits,
+            )
         })
         .await
     }
@@ -827,8 +973,11 @@ impl SqliteStore {
         commit: BootstrapOwnerCommit,
     ) -> Result<(StoredUser, StoredPreferences), StorageError> {
         let limits = self.limits.clone();
-        self.with_connection(move |connection| bootstrap_owner(connection, commit, &limits))
-            .await
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            bootstrap_owner(connection, commit, &limits, &physical_limits)
+        })
+        .await
     }
 
     pub async fn credential_for_username(
@@ -845,8 +994,11 @@ impl SqliteStore {
         commit: AuthSessionCommit,
     ) -> Result<AuthPrincipal, StorageError> {
         let limits = self.limits.clone();
-        self.with_connection(move |connection| create_auth_session(connection, commit, &limits))
-            .await
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            create_auth_session(connection, commit, &limits, &physical_limits)
+        })
+        .await
     }
 
     pub async fn authenticate(
@@ -867,7 +1019,13 @@ impl SqliteStore {
     ) -> Result<bool, StorageError> {
         let session_token_hash =
             normalized_token_hash(session_token_hash, "session token hash")?.to_owned();
+        let physical_limits = self.physical_limits.clone();
         self.with_connection(move |connection| {
+            require_connection_physical_capacity(
+                connection,
+                &physical_limits,
+                PhysicalCapacityGate::Finalization,
+            )?;
             Ok(connection.execute(
                 "DELETE FROM auth_sessions WHERE token_hash = ?1",
                 [&session_token_hash],
@@ -894,6 +1052,7 @@ impl SqliteStore {
         let preferred_model = preferred_model
             .map(|model| normalized_account_value(model, "preferred model", 128).map(str::to_owned))
             .transpose()?;
+        let physical_limits = self.physical_limits.clone();
         self.with_connection(move |connection| {
             update_preferences(
                 connection,
@@ -901,6 +1060,7 @@ impl SqliteStore {
                 expected_revision,
                 &theme,
                 preferred_model.as_deref(),
+                &physical_limits,
             )
         })
         .await
@@ -908,8 +1068,33 @@ impl SqliteStore {
 
     pub async fn readiness(&self) -> Result<(), StorageError> {
         let expects_wal = matches!(self.backend, Backend::File(_));
-        self.with_connection(move |connection| readiness(connection, expects_wal))
-            .await
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            readiness(
+                connection,
+                expects_wal,
+                expects_wal.then_some(&physical_limits),
+                true,
+                false,
+            )
+        })
+        .await
+    }
+
+    /// Runs the expensive business, ledger, FK, and SQLite integrity checks.
+    /// The public readiness endpoint intentionally uses [`Self::readiness`]
+    /// instead so probes remain independent of historical ledger size.
+    pub async fn verify_integrity(&self) -> Result<(), StorageError> {
+        let expects_wal = matches!(self.backend, Backend::File(_));
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            deep_readiness(
+                connection,
+                expects_wal,
+                expects_wal.then_some(&physical_limits),
+            )
+        })
+        .await
     }
 
     /// System/test-only unscoped read. Authenticated paths must use
@@ -1147,8 +1332,9 @@ impl SqliteStore {
     /// [`Self::commit_review_for_actor`].
     pub async fn commit_review(&self, commit: ReviewCommit) -> Result<CommitOutcome, StorageError> {
         let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
         self.with_connection(move |connection| {
-            commit_review(connection, commit, None, &limits, false)
+            commit_review(connection, commit, None, &limits, &physical_limits, false)
         })
         .await
     }
@@ -1161,8 +1347,16 @@ impl SqliteStore {
         let actor_user_id =
             normalized_account_value(actor_user_id, "review actor user ID", 128)?.to_owned();
         let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
         self.with_connection(move |connection| {
-            commit_review(connection, commit, Some(&actor_user_id), &limits, false)
+            commit_review(
+                connection,
+                commit,
+                Some(&actor_user_id),
+                &limits,
+                &physical_limits,
+                false,
+            )
         })
         .await
     }
@@ -1191,8 +1385,11 @@ impl SqliteStore {
         &self,
         commit: DispatchStartCommit,
     ) -> Result<ClaimOutcome, StorageError> {
-        self.with_connection(move |connection| claim_next_dispatch(connection, commit, false))
-            .await
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            claim_next_dispatch(connection, commit, &physical_limits, false)
+        })
+        .await
     }
 
     /// Atomically records a connector result, appends its v2 event, and
@@ -1201,8 +1398,11 @@ impl SqliteStore {
         &self,
         commit: DispatchCompleteCommit,
     ) -> Result<DispatchJob, StorageError> {
-        self.with_connection(move |connection| complete_dispatch(connection, commit, false))
-            .await
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            complete_dispatch(connection, commit, &physical_limits, false)
+        })
+        .await
     }
 
     /// Converts one previously-started call into a terminal
@@ -1212,8 +1412,11 @@ impl SqliteStore {
         &self,
         commit: DispatchRecoveryCommit,
     ) -> Result<DispatchJob, StorageError> {
-        self.with_connection(move |connection| recover_started(connection, commit))
-            .await
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            recover_started(connection, commit, &physical_limits)
+        })
+        .await
     }
 
     #[cfg(test)]
@@ -1222,8 +1425,9 @@ impl SqliteStore {
         commit: ReviewCommit,
     ) -> Result<CommitOutcome, StorageError> {
         let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
         self.with_connection(move |connection| {
-            commit_review(connection, commit, None, &limits, true)
+            commit_review(connection, commit, None, &limits, &physical_limits, true)
         })
         .await
     }
@@ -1233,8 +1437,11 @@ impl SqliteStore {
         &self,
         commit: DispatchStartCommit,
     ) -> Result<ClaimOutcome, StorageError> {
-        self.with_connection(move |connection| claim_next_dispatch(connection, commit, true))
-            .await
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            claim_next_dispatch(connection, commit, &physical_limits, true)
+        })
+        .await
     }
 
     #[cfg(test)]
@@ -1242,8 +1449,11 @@ impl SqliteStore {
         &self,
         commit: DispatchCompleteCommit,
     ) -> Result<DispatchJob, StorageError> {
-        self.with_connection(move |connection| complete_dispatch(connection, commit, true))
-            .await
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            complete_dispatch(connection, commit, &physical_limits, true)
+        })
+        .await
     }
 
     #[cfg(test)]
@@ -1255,8 +1465,17 @@ impl SqliteStore {
     ) -> Result<FlushSessionResponse, StorageError> {
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
+        let physical_limits = self.physical_limits.clone();
         self.with_connection(move |connection| {
-            flush_turn(connection, &session_id, request, &key, None, true)
+            flush_turn(
+                connection,
+                &session_id,
+                request,
+                &key,
+                None,
+                &physical_limits,
+                true,
+            )
         })
         .await
     }
@@ -1273,6 +1492,7 @@ impl SqliteStore {
         let key = normalized_key(idempotency_key)?.to_owned();
         let actor_user_id = job.actor_user_id.clone();
         let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
         self.with_connection(move |connection| {
             start_turn(
                 connection,
@@ -1283,6 +1503,7 @@ impl SqliteStore {
                     actor_user_id: Some(&actor_user_id),
                     reply_job: Some(job),
                     limits: &limits,
+                    physical_limits: &physical_limits,
                     fail_after_enqueue: true,
                 },
             )
@@ -1303,8 +1524,11 @@ impl SqliteStore {
         &self,
         commit: ReplySuccessCommit,
     ) -> Result<ReplyCompletion, StorageError> {
-        self.with_connection(move |connection| complete_reply_success(connection, commit, true))
-            .await
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            complete_reply_success(connection, commit, &physical_limits, true)
+        })
+        .await
     }
 
     async fn with_connection<T, F>(&self, operation: F) -> Result<T, StorageError>
@@ -1316,7 +1540,8 @@ impl SqliteStore {
             Backend::File(backend) => {
                 let backend = Arc::clone(backend);
                 tokio::task::spawn_blocking(move || {
-                    let mut connection = open_file_connection(&backend.path)?;
+                    let mut connection =
+                        open_file_connection(&backend.path, &backend.physical_limits)?;
                     operation(&mut connection)
                 })
                 .await?
@@ -1385,7 +1610,10 @@ fn acquire_database_lock(path: &Path) -> Result<File, StorageError> {
     }
 }
 
-fn open_file_connection(path: &Path) -> Result<Connection, StorageError> {
+fn open_file_connection(
+    path: &Path,
+    physical_limits: &SqlitePhysicalLimits,
+) -> Result<Connection, StorageError> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -1393,17 +1621,27 @@ fn open_file_connection(path: &Path) -> Result<Connection, StorageError> {
         fs::create_dir_all(parent)?;
     }
     let connection = Connection::open(path)?;
-    configure_connection(&connection, true)?;
+    configure_connection(&connection, true, Some(physical_limits))?;
     Ok(connection)
 }
 
-fn configure_connection(connection: &Connection, enable_wal: bool) -> Result<(), StorageError> {
+fn configure_connection(
+    connection: &Connection,
+    enable_wal: bool,
+    physical_limits: Option<&SqlitePhysicalLimits>,
+) -> Result<(), StorageError> {
     connection.busy_timeout(BUSY_TIMEOUT)?;
     connection.pragma_update(None, "foreign_keys", true)?;
     if enable_wal {
         connection.pragma_update(None, "journal_mode", "WAL")?;
     }
     connection.pragma_update(None, "synchronous", "FULL")?;
+    connection.pragma_update(None, "cache_size", -2048_i64)?;
+    connection.pragma_update(None, "mmap_size", 0_i64)?;
+
+    if let Some(physical_limits) = physical_limits {
+        configure_physical_pragmas(connection, physical_limits)?;
+    }
 
     let journal_mode: String =
         connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
@@ -1418,6 +1656,269 @@ fn configure_connection(connection: &Connection, enable_wal: bool) -> Result<(),
         return Err(StorageError::CorruptData(format!(
             "expected UTF-8 database encoding, found `{encoding}`"
         )));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PhysicalCapacityGate {
+    Migration,
+    Admission,
+    ReservedProgress,
+    Finalization,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PhysicalCapacitySnapshot {
+    main_bytes: u64,
+    wal_bytes: u64,
+    available_bytes: u64,
+}
+
+fn configure_physical_pragmas(
+    connection: &Connection,
+    limits: &SqlitePhysicalLimits,
+) -> Result<(), StorageError> {
+    let page_size = pragma_positive_u64(connection, "page_size")?;
+    let page_count = pragma_non_negative_u64(connection, "page_count")?;
+    let max_page_count = limits.max_main_bytes / page_size;
+    if max_page_count == 0 || page_count > max_page_count {
+        return Err(StorageError::PhysicalStorageExhausted);
+    }
+    let max_page_count = i64::try_from(max_page_count)
+        .map_err(|_| StorageError::IntegerOutOfRange("SQLite max page count"))?;
+    connection.pragma_update(None, "max_page_count", max_page_count)?;
+    let configured_max_page_count = pragma_positive_u64(connection, "max_page_count")?;
+    if configured_max_page_count != max_page_count as u64 {
+        return Err(StorageError::CorruptData(format!(
+            "expected SQLite max_page_count {max_page_count}, found {configured_max_page_count}"
+        )));
+    }
+
+    const WAL_HEADER_BYTES: u64 = 32;
+    const WAL_FRAME_HEADER_BYTES: u64 = 24;
+    let frame_bytes = page_size
+        .checked_add(WAL_FRAME_HEADER_BYTES)
+        .ok_or(StorageError::IntegerOutOfRange("SQLite WAL frame size"))?;
+    let wal_autocheckpoint = limits
+        .wal_target_bytes
+        .saturating_sub(WAL_HEADER_BYTES)
+        .checked_div(frame_bytes)
+        .unwrap_or(0)
+        .max(1);
+    let wal_autocheckpoint = i64::try_from(wal_autocheckpoint)
+        .map_err(|_| StorageError::IntegerOutOfRange("SQLite WAL autocheckpoint"))?;
+    let journal_size_limit = i64::try_from(limits.wal_target_bytes)
+        .map_err(|_| StorageError::IntegerOutOfRange("SQLite journal size limit"))?;
+    connection.pragma_update(None, "wal_autocheckpoint", wal_autocheckpoint)?;
+    connection.pragma_update(None, "journal_size_limit", journal_size_limit)?;
+
+    let configured_autocheckpoint = pragma_positive_u64(connection, "wal_autocheckpoint")?;
+    let configured_journal_limit = pragma_non_negative_u64(connection, "journal_size_limit")?;
+    if configured_autocheckpoint != wal_autocheckpoint as u64
+        || configured_journal_limit != limits.wal_target_bytes
+    {
+        return Err(StorageError::CorruptData(
+            "SQLite physical-capacity pragmas are not active".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_physical_pragmas(
+    connection: &Connection,
+    limits: &SqlitePhysicalLimits,
+) -> Result<(), StorageError> {
+    let page_size = pragma_positive_u64(connection, "page_size")?;
+    let expected_max_page_count = limits.max_main_bytes / page_size;
+    const WAL_HEADER_BYTES: u64 = 32;
+    const WAL_FRAME_HEADER_BYTES: u64 = 24;
+    let frame_bytes = page_size
+        .checked_add(WAL_FRAME_HEADER_BYTES)
+        .ok_or(StorageError::IntegerOutOfRange("SQLite WAL frame size"))?;
+    let expected_autocheckpoint = limits
+        .wal_target_bytes
+        .saturating_sub(WAL_HEADER_BYTES)
+        .checked_div(frame_bytes)
+        .unwrap_or(0)
+        .max(1);
+    let actual_max_page_count = pragma_positive_u64(connection, "max_page_count")?;
+    let actual_autocheckpoint = pragma_positive_u64(connection, "wal_autocheckpoint")?;
+    let actual_journal_limit = pragma_non_negative_u64(connection, "journal_size_limit")?;
+    if actual_max_page_count != expected_max_page_count
+        || actual_autocheckpoint != expected_autocheckpoint
+        || actual_journal_limit != limits.wal_target_bytes
+    {
+        return Err(StorageError::CorruptData(
+            "SQLite physical-capacity pragmas are not active".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn pragma_positive_u64(connection: &Connection, pragma: &'static str) -> Result<u64, StorageError> {
+    let value = pragma_non_negative_u64(connection, pragma)?;
+    if value == 0 {
+        return Err(StorageError::CorruptData(format!(
+            "SQLite PRAGMA {pragma} must be positive"
+        )));
+    }
+    Ok(value)
+}
+
+fn pragma_non_negative_u64(
+    connection: &Connection,
+    pragma: &'static str,
+) -> Result<u64, StorageError> {
+    let value: i64 = connection.pragma_query_value(None, pragma, |row| row.get(0))?;
+    u64::try_from(value).map_err(|_| {
+        StorageError::CorruptData(format!("SQLite PRAGMA {pragma} cannot be negative"))
+    })
+}
+
+fn current_schema_version(connection: &Connection) -> Result<i64, StorageError> {
+    let has_migrations: i64 = connection.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM sqlite_schema
+               WHERE type = 'table' AND name = 'schema_migrations'
+           )"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if has_migrations == 0 {
+        return Ok(0);
+    }
+    Ok(connection.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+fn checkpoint_wal(connection: &Connection) -> Result<(), StorageError> {
+    let (busy, _, _): (i64, i64, i64) =
+        connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    if busy != 0 {
+        return Err(StorageError::CorruptData(
+            "SQLite WAL checkpoint could not complete during exclusive startup".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_physical_capacity(
+    connection: &Connection,
+    database_path: &Path,
+    limits: &SqlitePhysicalLimits,
+    gate: PhysicalCapacityGate,
+) -> Result<(), StorageError> {
+    let snapshot = physical_capacity_snapshot(connection, database_path)?;
+    evaluate_physical_capacity(snapshot, limits, gate)
+}
+
+fn require_connection_physical_capacity(
+    connection: &Connection,
+    limits: &SqlitePhysicalLimits,
+    gate: PhysicalCapacityGate,
+) -> Result<(), StorageError> {
+    let Some(path) = connection.path() else {
+        return Ok(());
+    };
+    if path.is_empty() || path == ":memory:" {
+        return Ok(());
+    }
+    require_physical_capacity(connection, Path::new(path), limits, gate)
+}
+
+fn physical_capacity_snapshot(
+    connection: &Connection,
+    database_path: &Path,
+) -> Result<PhysicalCapacitySnapshot, StorageError> {
+    let page_size = pragma_positive_u64(connection, "page_size")?;
+    let page_count = pragma_non_negative_u64(connection, "page_count")?;
+    let page_bytes = page_size
+        .checked_mul(page_count)
+        .ok_or(StorageError::IntegerOutOfRange(
+            "SQLite main database bytes",
+        ))?;
+    let main_bytes = file_size_or_zero(database_path)?.max(page_bytes);
+    let wal_bytes = file_size_or_zero(&sqlite_sidecar_path(database_path, "-wal"))?;
+    let parent = database_path.parent().ok_or_else(|| {
+        StorageError::CorruptData("SQLite database path has no parent directory".into())
+    })?;
+    Ok(PhysicalCapacitySnapshot {
+        main_bytes,
+        wal_bytes,
+        available_bytes: available_space(parent)?,
+    })
+}
+
+fn sqlite_sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
+    let mut file_name = database_path
+        .file_name()
+        .map(OsString::from)
+        .unwrap_or_default();
+    file_name.push(suffix);
+    database_path.with_file_name(file_name)
+}
+
+fn file_size_or_zero(path: &Path) -> Result<u64, StorageError> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn evaluate_physical_capacity(
+    snapshot: PhysicalCapacitySnapshot,
+    limits: &SqlitePhysicalLimits,
+    gate: PhysicalCapacityGate,
+) -> Result<(), StorageError> {
+    if snapshot.main_bytes > limits.max_main_bytes {
+        return Err(StorageError::PhysicalStorageExhausted);
+    }
+    match gate {
+        PhysicalCapacityGate::Migration => {
+            let main_admission_ceiling = limits
+                .max_main_bytes
+                .checked_sub(limits.admission_reserve_bytes)
+                .ok_or(StorageError::PhysicalStorageExhausted)?;
+            let required_available = limits
+                .min_free_bytes
+                .checked_add(limits.admission_reserve_bytes)
+                .and_then(|headroom| headroom.checked_add(snapshot.main_bytes))
+                .ok_or(StorageError::PhysicalStorageExhausted)?;
+            if snapshot.main_bytes > main_admission_ceiling
+                || snapshot.wal_bytes > limits.wal_target_bytes
+                || snapshot.available_bytes < required_available
+            {
+                return Err(StorageError::PhysicalStorageExhausted);
+            }
+        }
+        PhysicalCapacityGate::Admission => {
+            let main_admission_ceiling = limits
+                .max_main_bytes
+                .checked_sub(limits.admission_reserve_bytes)
+                .ok_or(StorageError::PhysicalStorageExhausted)?;
+            let required_available = limits
+                .min_free_bytes
+                .checked_add(limits.admission_reserve_bytes)
+                .ok_or(StorageError::PhysicalStorageExhausted)?;
+            if snapshot.main_bytes > main_admission_ceiling
+                || snapshot.wal_bytes > limits.wal_target_bytes
+                || snapshot.available_bytes < required_available
+            {
+                return Err(StorageError::PhysicalStorageExhausted);
+            }
+        }
+        PhysicalCapacityGate::ReservedProgress | PhysicalCapacityGate::Finalization => {
+            if snapshot.available_bytes < limits.min_free_bytes {
+                return Err(StorageError::PhysicalStorageExhausted);
+            }
+        }
     }
     Ok(())
 }
@@ -1687,7 +2188,13 @@ fn validate_migrated_run_ledgers(connection: &Connection) -> Result<(), StorageE
     Ok(())
 }
 
-fn readiness(connection: &mut Connection, expects_wal: bool) -> Result<(), StorageError> {
+fn readiness(
+    connection: &mut Connection,
+    expects_wal: bool,
+    physical_limits: Option<&SqlitePhysicalLimits>,
+    require_admission: bool,
+    deep_invariants: bool,
+) -> Result<(), StorageError> {
     let version: i64 = connection.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
         [],
@@ -1705,6 +2212,12 @@ fn readiness(connection: &mut Connection, expects_wal: bool) -> Result<(), Stora
     let synchronous: i64 = connection.pragma_query_value(None, "synchronous", |row| row.get(0))?;
     let busy_timeout: i64 =
         connection.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
+    let cache_size: i64 = connection.pragma_query_value(None, "cache_size", |row| row.get(0))?;
+    let mmap_size: i64 = if expects_wal {
+        connection.pragma_query_value(None, "mmap_size", |row| row.get(0))?
+    } else {
+        0
+    };
     let journal_mode: String =
         connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
     let encoding: String = connection.pragma_query_value(None, "encoding", |row| row.get(0))?;
@@ -1712,12 +2225,24 @@ fn readiness(connection: &mut Connection, expects_wal: bool) -> Result<(), Stora
     if foreign_keys != 1
         || synchronous != 2
         || busy_timeout != BUSY_TIMEOUT.as_millis() as i64
+        || cache_size != -2048
+        || mmap_size != 0
         || !journal_mode.eq_ignore_ascii_case(expected_journal)
         || !encoding.eq_ignore_ascii_case("UTF-8")
     {
         return Err(StorageError::CorruptData(
             "SQLite safety pragmas are not active".into(),
         ));
+    }
+    if let Some(physical_limits) = physical_limits {
+        verify_physical_pragmas(connection, physical_limits)?;
+        if require_admission {
+            require_connection_physical_capacity(
+                connection,
+                physical_limits,
+                PhysicalCapacityGate::Admission,
+            )?;
+        }
     }
 
     let table_count: i64 = connection.query_row(
@@ -1893,34 +2418,39 @@ fn readiness(connection: &mut Connection, expects_wal: bool) -> Result<(), Stora
         ));
     }
 
+    if !deep_invariants {
+        let (usage_rows, singleton, used_bytes): (i64, i64, i64) = connection.query_row(
+            r#"SELECT COUNT(*), COALESCE(MAX(singleton), 0),
+                      COALESCE(MAX(used_bytes), -1)
+               FROM event_payload_usage"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if usage_rows != 1 || singleton != 1 || used_bytes < 0 {
+            return Err(StorageError::CorruptData(
+                "the event payload usage singleton is inconsistent".into(),
+            ));
+        }
+        return Ok(());
+    }
+
     let event_payload_counter_violation: i64 = connection.query_row(
         r#"SELECT EXISTS(
-               SELECT 1
-               FROM sessions session
-               WHERE session.event_payload_bytes <> COALESCE((
-                   SELECT SUM(length(CAST(event.payload_json AS BLOB)))
-                   FROM session_events event
-                   WHERE event.session_id = session.id
-               ), 0)
-               UNION ALL
-               SELECT 1
-               FROM runs run
-               WHERE run.event_payload_bytes <> COALESCE((
-                   SELECT SUM(length(CAST(event.payload_json AS BLOB)))
-                   FROM run_events event
-                   WHERE event.run_id = run.id
-               ), 0)
-               UNION ALL
                SELECT 1
                WHERE (SELECT COUNT(*) FROM event_payload_usage) <> 1
                UNION ALL
                SELECT 1
                FROM event_payload_usage usage
                WHERE usage.singleton <> 1
+                  OR usage.used_bytes < 0
                   OR usage.used_bytes <> (
                       COALESCE((SELECT SUM(event_payload_bytes) FROM sessions), 0)
                       + COALESCE((SELECT SUM(event_payload_bytes) FROM runs), 0)
                   )
+               UNION ALL
+               SELECT 1 FROM sessions WHERE event_payload_bytes < 0
+               UNION ALL
+               SELECT 1 FROM runs WHERE event_payload_bytes < 0
            )"#,
         [],
         |row| row.get(0),
@@ -2121,6 +2651,43 @@ fn readiness(connection: &mut Connection, expects_wal: bool) -> Result<(), Stora
     if finalization_violation != 0 {
         return Err(StorageError::CorruptData(
             "one or more durable finalization reservations are inconsistent".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn deep_readiness(
+    connection: &mut Connection,
+    expects_wal: bool,
+    physical_limits: Option<&SqlitePhysicalLimits>,
+) -> Result<(), StorageError> {
+    readiness(connection, expects_wal, physical_limits, false, true)?;
+
+    let exact_payload_counter_violation: i64 = connection.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1
+               FROM sessions session
+               WHERE session.event_payload_bytes <> COALESCE((
+                   SELECT SUM(length(CAST(event.payload_json AS BLOB)))
+                   FROM session_events event
+                   WHERE event.session_id = session.id
+               ), 0)
+               UNION ALL
+               SELECT 1
+               FROM runs run
+               WHERE run.event_payload_bytes <> COALESCE((
+                   SELECT SUM(length(CAST(event.payload_json AS BLOB)))
+                   FROM run_events event
+                   WHERE event.run_id = run.id
+               ), 0)
+           )"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if exact_payload_counter_violation != 0 {
+        return Err(StorageError::CorruptData(
+            "one or more event payload byte counters are inconsistent".into(),
         ));
     }
 
@@ -2889,6 +3456,7 @@ fn replace_bootstrap_token(
     token_hash: &str,
     expires_at: &str,
     limits: &StorageLimits,
+    physical_limits: &SqlitePhysicalLimits,
 ) -> Result<(), StorageError> {
     let timestamp = now();
     if expires_at <= timestamp.as_str() {
@@ -2902,6 +3470,11 @@ fn replace_bootstrap_token(
     if configured != 0 {
         return Err(StorageError::AccountAlreadyConfigured);
     }
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Admission,
+    )?;
     require_bootstrap_audit_capacity(&transaction, limits)?;
     transaction.execute(
         "UPDATE bootstrap_tokens SET used_at = ?1 WHERE used_at IS NULL",
@@ -2920,6 +3493,7 @@ fn bootstrap_owner(
     connection: &mut Connection,
     commit: BootstrapOwnerCommit,
     limits: &StorageLimits,
+    physical_limits: &SqlitePhysicalLimits,
 ) -> Result<(StoredUser, StoredPreferences), StorageError> {
     let bootstrap_token_hash =
         normalized_token_hash(&commit.bootstrap_token_hash, "bootstrap token hash")?;
@@ -2957,6 +3531,11 @@ fn bootstrap_owner(
     {
         return Err(StorageError::InvalidBootstrapToken);
     }
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Admission,
+    )?;
     cleanup_expired_auth_sessions_in_transaction(&transaction, &timestamp)?;
     require_auth_session_capacity(&transaction, user_id, &timestamp, limits)?;
 
@@ -3062,6 +3641,7 @@ fn create_auth_session(
     connection: &mut Connection,
     commit: AuthSessionCommit,
     limits: &StorageLimits,
+    physical_limits: &SqlitePhysicalLimits,
 ) -> Result<AuthPrincipal, StorageError> {
     let user_id = normalized_account_value(&commit.user_id, "user ID", 128)?;
     let token_hash = normalized_token_hash(&commit.session_token_hash, "session token hash")?;
@@ -3078,6 +3658,11 @@ fn create_auth_session(
     if user.status != StoredUserStatus::Active {
         return Err(StorageError::UserDisabled(user_id.to_owned()));
     }
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Admission,
+    )?;
     cleanup_expired_auth_sessions_in_transaction(&transaction, &timestamp)?;
     require_auth_session_capacity(&transaction, user_id, &timestamp, limits)?;
     insert_auth_session(
@@ -3251,10 +3836,16 @@ fn update_preferences(
     expected_revision: u64,
     theme: &str,
     preferred_model: Option<&str>,
+    physical_limits: &SqlitePhysicalLimits,
 ) -> Result<StoredPreferences, StorageError> {
     let expected_revision = u64_to_i64(expected_revision, "expected preference revision")?;
     let timestamp = now();
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Admission,
+    )?;
     let changed = transaction.execute(
         r#"UPDATE user_preferences
            SET theme = ?1, preferred_model = ?2, revision = revision + 1, updated_at = ?3
@@ -3286,6 +3877,7 @@ fn update_preferences(
 fn bind_runtime_identity(
     connection: &mut Connection,
     identity: RuntimeIdentity,
+    physical_limits: &SqlitePhysicalLimits,
 ) -> Result<(), StorageError> {
     validate_runtime_identity(&identity)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3317,6 +3909,11 @@ fn bind_runtime_identity(
     }
 
     validate_legacy_runtime_identity(&transaction, &identity)?;
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Admission,
+    )?;
     transaction.execute(
         r#"INSERT INTO runtime_identity(
                singleton, profile, environment, primary_session_id, primary_run_id,
@@ -3497,6 +4094,7 @@ fn seed_if_empty(
     snapshot: RunSnapshot,
     events: Vec<RunEvent>,
     limits: &StorageLimits,
+    physical_limits: &SqlitePhysicalLimits,
 ) -> Result<bool, StorageError> {
     validate_seed(&snapshot, &events)?;
     let encoded_events = events
@@ -3521,6 +4119,11 @@ fn seed_if_empty(
         transaction.commit()?;
         return Ok(false);
     }
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Admission,
+    )?;
     if events.len() > limits.run_event_slots_per_run {
         return Err(StorageError::StorageQuotaExceeded);
     }
@@ -3584,6 +4187,7 @@ fn seed_demo_session(
     title: &str,
     run_id: &str,
     limits: &StorageLimits,
+    physical_limits: &SqlitePhysicalLimits,
 ) -> Result<bool, StorageError> {
     validated_durable_reference(session_id, "session ID")?;
     validated_durable_reference(run_id, "run ID")?;
@@ -3614,6 +4218,12 @@ fn seed_demo_session(
         transaction.commit()?;
         return Ok(false);
     }
+
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Admission,
+    )?;
 
     let mut summary = query_session_summary_optional(&transaction, session_id)?;
     if summary.is_none() {
@@ -4425,6 +5035,7 @@ fn create_session(
     idempotency_key: &str,
     actor_user_id: Option<&str>,
     limits: &StorageLimits,
+    physical_limits: &SqlitePhysicalLimits,
 ) -> Result<CreateSessionResponse, StorageError> {
     normalized_key(idempotency_key)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -4453,6 +5064,11 @@ fn create_session(
         transaction.commit()?;
         return Ok(response);
     }
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Admission,
+    )?;
     if query_session_summary_optional(&transaction, &request.id)?.is_some() {
         return Err(StorageError::SessionAlreadyExists(request.id));
     }
@@ -4529,6 +5145,7 @@ fn attach_run(
     idempotency_key: &str,
     actor_user_id: Option<&str>,
     limits: &StorageLimits,
+    physical_limits: &SqlitePhysicalLimits,
 ) -> Result<AttachRunResponse, StorageError> {
     validated_durable_reference(session_id, "session ID")?;
     normalized_key(idempotency_key)?;
@@ -4558,6 +5175,11 @@ fn attach_run(
         transaction.commit()?;
         return Ok(response);
     }
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Admission,
+    )?;
     let summary = query_session_summary(&transaction, session_id)?;
     require_session_sequence(&summary, request.expected_sequence)?;
     let run_exists = match actor_user_id {
@@ -4659,6 +5281,7 @@ struct StartTurnOptions<'a> {
     actor_user_id: Option<&'a str>,
     reply_job: Option<ReplyJobSpec>,
     limits: &'a StorageLimits,
+    physical_limits: &'a SqlitePhysicalLimits,
     fail_after_enqueue: bool,
 }
 
@@ -4673,6 +5296,7 @@ fn start_turn(
         actor_user_id,
         reply_job,
         limits,
+        physical_limits,
         fail_after_enqueue,
     } = options;
     validated_durable_reference(session_id, "session ID")?;
@@ -4720,6 +5344,11 @@ fn start_turn(
         transaction.commit()?;
         return Ok((response, stored_job));
     }
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Admission,
+    )?;
     let summary = query_session_summary(&transaction, session_id)?;
     require_session_sequence(&summary, request.expected_sequence)?;
     if summary.status != SessionStatus::Ready || summary.active_turn_id.is_some() {
@@ -4886,7 +5515,10 @@ fn insert_reply_job(
     Ok(())
 }
 
-fn claim_next_reply(connection: &mut Connection) -> Result<ReplyClaimOutcome, StorageError> {
+fn claim_next_reply(
+    connection: &mut Connection,
+    physical_limits: &SqlitePhysicalLimits,
+) -> Result<ReplyClaimOutcome, StorageError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let job_id = transaction
         .query_row(
@@ -4919,6 +5551,11 @@ fn claim_next_reply(connection: &mut Connection) -> Result<ReplyClaimOutcome, St
     {
         return Err(StorageError::FinalizationReservationUnavailable);
     }
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::ReservedProgress,
+    )?;
     let changed = transaction.execute(
         r#"UPDATE reply_jobs
            SET status = 'started', attempt = 1, started_at = ?1
@@ -4979,6 +5616,7 @@ fn reply_actor_is_authorized(
 fn complete_reply_success(
     connection: &mut Connection,
     commit: ReplySuccessCommit,
+    physical_limits: &SqlitePhysicalLimits,
     fail_before_flush_event: bool,
 ) -> Result<ReplyCompletion, StorageError> {
     normalized_reply_value(&commit.job_id, "reply job ID")?;
@@ -4999,6 +5637,11 @@ fn complete_reply_success(
         transaction.commit()?;
         return Ok(replay);
     }
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Finalization,
+    )?;
     let mut summary = require_open_reply_turn(&transaction, &job)?;
     require_session_sequence(&summary, commit.expected_sequence)?;
     let timestamp = now();
@@ -5122,6 +5765,7 @@ fn complete_reply_success(
 fn complete_reply_failure(
     connection: &mut Connection,
     commit: ReplyFailureCommit,
+    physical_limits: &SqlitePhysicalLimits,
 ) -> Result<ReplyCompletion, StorageError> {
     normalized_reply_value(&commit.job_id, "reply job ID")?;
     validate_reply_error_json(&commit.error_json, "reply failure JSON")?;
@@ -5134,6 +5778,11 @@ fn complete_reply_failure(
         transaction.commit()?;
         return Ok(replay);
     }
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Finalization,
+    )?;
     let completion = interrupt_reply_job(
         &transaction,
         job,
@@ -5150,6 +5799,7 @@ fn complete_reply_failure(
 fn complete_reply_outcome_unknown(
     connection: &mut Connection,
     commit: ReplyOutcomeUnknownCommit,
+    physical_limits: &SqlitePhysicalLimits,
 ) -> Result<ReplyCompletion, StorageError> {
     normalized_reply_value(&commit.job_id, "reply job ID")?;
     validate_reply_error_json(&commit.error_json, "reply outcome-unknown JSON")?;
@@ -5166,6 +5816,11 @@ fn complete_reply_outcome_unknown(
         transaction.commit()?;
         return Ok(replay);
     }
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Finalization,
+    )?;
     let completion = interrupt_reply_job(
         &transaction,
         job,
@@ -5181,6 +5836,7 @@ fn complete_reply_outcome_unknown(
 
 fn recover_started_replies(
     connection: &mut Connection,
+    physical_limits: &SqlitePhysicalLimits,
 ) -> Result<Vec<ReplyCompletion>, StorageError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut statement = transaction.prepare(
@@ -5191,6 +5847,14 @@ fn recover_started_replies(
         .query_map([RECOVERY_BATCH_LIMIT], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
+
+    if !job_ids.is_empty() {
+        require_connection_physical_capacity(
+            &transaction,
+            physical_limits,
+            PhysicalCapacityGate::Finalization,
+        )?;
+    }
 
     let mut recovered = Vec::with_capacity(job_ids.len());
     for job_id in job_ids {
@@ -5325,6 +5989,7 @@ fn flush_turn(
     request: FlushSessionRequest,
     idempotency_key: &str,
     actor_user_id: Option<&str>,
+    physical_limits: &SqlitePhysicalLimits,
     fail_before_flush_event: bool,
 ) -> Result<FlushSessionResponse, StorageError> {
     validated_durable_reference(session_id, "session ID")?;
@@ -5358,6 +6023,11 @@ fn flush_turn(
         transaction.commit()?;
         return Ok(response);
     }
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Finalization,
+    )?;
     let mut summary = query_session_summary(&transaction, session_id)?;
     require_session_sequence(&summary, request.expected_sequence)?;
     if summary.status != SessionStatus::Running
@@ -5548,6 +6218,7 @@ fn resume_session(
     idempotency_key: &str,
     actor_user_id: Option<&str>,
     limits: &StorageLimits,
+    physical_limits: &SqlitePhysicalLimits,
 ) -> Result<ResumeSessionResponse, StorageError> {
     validated_durable_reference(session_id, "session ID")?;
     normalized_key(idempotency_key)?;
@@ -5576,6 +6247,12 @@ fn resume_session(
         transaction.commit()?;
         return Ok(response);
     }
+
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Admission,
+    )?;
 
     let summary = query_session_summary(&transaction, session_id)?;
     require_session_sequence(&summary, request.expected_sequence)?;
@@ -5644,6 +6321,7 @@ fn resume_session(
 
 fn recover_open_turns(
     connection: &mut Connection,
+    physical_limits: &SqlitePhysicalLimits,
 ) -> Result<Vec<RecoveredSessionTurn>, StorageError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut statement = transaction.prepare(
@@ -5662,6 +6340,14 @@ fn recover_open_turns(
         })?
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
+
+    if !open_turns.is_empty() {
+        require_connection_physical_capacity(
+            &transaction,
+            physical_limits,
+            PhysicalCapacityGate::Finalization,
+        )?;
+    }
 
     let mut recovered = Vec::with_capacity(open_turns.len());
     for (session_id, turn_id) in open_turns {
@@ -7674,6 +8360,7 @@ fn commit_review(
     commit: ReviewCommit,
     actor_user_id: Option<&str>,
     limits: &StorageLimits,
+    physical_limits: &SqlitePhysicalLimits,
     fail_after_event: bool,
 ) -> Result<CommitOutcome, StorageError> {
     validated_durable_reference(&commit.snapshot.run.id, "run ID")?;
@@ -7708,6 +8395,12 @@ fn commit_review(
         transaction.commit()?;
         return Ok(CommitOutcome::Replayed(Box::new(receipt)));
     }
+
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Admission,
+    )?;
 
     if let Some(dispatch) = &commit.dispatch {
         validate_dispatch_admission_binding(
@@ -7899,6 +8592,7 @@ fn query_dispatch_job(
 fn claim_next_dispatch(
     connection: &mut Connection,
     commit: DispatchStartCommit,
+    physical_limits: &SqlitePhysicalLimits,
     inject_failure: bool,
 ) -> Result<ClaimOutcome, StorageError> {
     normalized_identifier(&commit.call_id, "call ID")?;
@@ -7928,6 +8622,11 @@ fn claim_next_dispatch(
         &job.call_id,
         2,
         queued_payload_reservation,
+    )?;
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::ReservedProgress,
     )?;
     if let Some(reason) = dispatch_authorization_failure(&transaction, &job)? {
         let rejection = reject_dispatch_authorization(&transaction, job, reason)?;
@@ -8216,6 +8915,7 @@ fn validate_dispatch_job_binding(
 fn complete_dispatch(
     connection: &mut Connection,
     commit: DispatchCompleteCommit,
+    physical_limits: &SqlitePhysicalLimits,
     inject_failure: bool,
 ) -> Result<DispatchJob, StorageError> {
     validate_dispatch_transition(
@@ -8234,6 +8934,11 @@ fn complete_dispatch(
             "only the matching started dispatch may be completed".into(),
         ));
     }
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Finalization,
+    )?;
     validate_canonical_dispatch_completion(&transaction, &job, &commit)?;
     match commit.event.data.as_ref() {
         Some(RunEventData::ToolResult {
@@ -8303,6 +9008,7 @@ fn complete_dispatch(
 fn recover_started(
     connection: &mut Connection,
     commit: DispatchRecoveryCommit,
+    physical_limits: &SqlitePhysicalLimits,
 ) -> Result<DispatchJob, StorageError> {
     validate_dispatch_transition(
         &commit.call_id,
@@ -8331,6 +9037,7 @@ fn recover_started(
             event: commit.event,
             result_json: commit.result_json,
         },
+        physical_limits,
         false,
     )
 }

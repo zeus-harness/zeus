@@ -23,8 +23,8 @@ use crate::{
     AuthSessionCommit, BootstrapOwnerCommit, ClaimOutcome, CommitOutcome, DispatchCompleteCommit,
     DispatchJobSpec, DispatchRecoveryCommit, DispatchStartCommit, DispatchStatus,
     ReplyClaimOutcome, ReplyFailureCommit, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
-    ReplySuccessCommit, ReviewCommit, RunSnapshot, RuntimeIdentity, SqliteStore, StorageError,
-    StorageLimits, StoredUserRole, StoredUserStatus,
+    ReplySuccessCommit, ReviewCommit, RunSnapshot, RuntimeIdentity, SqlitePhysicalLimits,
+    SqliteStore, StorageError, StorageLimits, StoredUserRole, StoredUserStatus,
 };
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
@@ -64,6 +64,52 @@ impl Drop for TestDatabase {
         let _ = fs::remove_file(self.path.with_extension("sqlite3-shm"));
         let _ = fs::remove_file(format!("{}.zeus.lock", self.path.display()));
     }
+}
+
+fn sqlite_main_geometry(path: &Path) -> (u64, u64, u64) {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    let page_size: u64 = connection
+        .pragma_query_value(None, "page_size", |row| row.get::<_, i64>(0))
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let page_count: u64 = connection
+        .pragma_query_value(None, "page_count", |row| row.get::<_, i64>(0))
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let page_bytes = page_size.checked_mul(page_count).unwrap();
+    let file_bytes = fs::metadata(path).unwrap().len();
+    (page_size, page_count, page_bytes.max(file_bytes))
+}
+
+fn admission_exhausted_physical_limits(path: &Path) -> SqlitePhysicalLimits {
+    let (page_size, _, main_bytes) = sqlite_main_geometry(path);
+    let admission_reserve_bytes = 1024 * 1024;
+    SqlitePhysicalLimits {
+        max_main_bytes: main_bytes
+            .checked_add(admission_reserve_bytes)
+            .and_then(|value| value.checked_sub(page_size))
+            .unwrap(),
+        wal_target_bytes: 64 * 1024,
+        min_free_bytes: 1,
+        admission_reserve_bytes,
+    }
+}
+
+fn physical_admission_counts(path: &Path) -> (i64, i64, i64, i64) {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row(
+            r#"SELECT
+                   (SELECT COUNT(*) FROM sessions),
+                   (SELECT COUNT(*) FROM session_events),
+                   (SELECT COUNT(*) FROM session_command_receipts),
+                   (SELECT used_bytes FROM event_payload_usage WHERE singleton = 1)"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap()
 }
 
 #[tokio::test]
@@ -160,6 +206,256 @@ async fn independent_memory_databases_do_not_share_the_file_lease() {
     let second = SqliteStore::open(":memory:").await.unwrap();
     first.readiness().await.unwrap();
     second.readiness().await.unwrap();
+}
+
+#[tokio::test]
+async fn file_connections_apply_the_exact_physical_pragma_policy() {
+    const WAL_HEADER_BYTES: u64 = 32;
+    const WAL_FRAME_HEADER_BYTES: u64 = 24;
+
+    let database = TestDatabase::new();
+    let physical_limits = SqlitePhysicalLimits {
+        max_main_bytes: 64 * 1024 * 1024,
+        wal_target_bytes: 1024 * 1024,
+        min_free_bytes: 1,
+        admission_reserve_bytes: 2 * 1024 * 1024,
+    };
+    let store = SqliteStore::open_with_limits_and_physical(
+        database.path(),
+        StorageLimits::default(),
+        physical_limits.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(store.physical_limits(), &physical_limits);
+    store.readiness().await.unwrap();
+
+    let (page_size, _, _) = sqlite_main_geometry(database.path());
+    let expected_max_page_count = physical_limits.max_main_bytes / page_size;
+    let expected_wal_autocheckpoint = physical_limits
+        .wal_target_bytes
+        .saturating_sub(WAL_HEADER_BYTES)
+        .checked_div(page_size + WAL_FRAME_HEADER_BYTES)
+        .unwrap()
+        .max(1);
+    assert!(expected_wal_autocheckpoint > 0);
+    assert_eq!(expected_max_page_count, 16_384);
+    assert_eq!(
+        store.physical_pragma_snapshot().await.unwrap(),
+        (
+            expected_max_page_count,
+            expected_wal_autocheckpoint,
+            physical_limits.wal_target_bytes,
+            -2048,
+            0,
+        )
+    );
+}
+
+#[tokio::test]
+async fn physical_admission_watermark_preserves_reads_and_exact_replay() {
+    let database = TestDatabase::new();
+    let request = CreateSessionRequest {
+        id: "session-physical-replay".into(),
+        title: "Physical replay fixture".into(),
+    };
+    let committed = {
+        let store = SqliteStore::open(database.path()).await.unwrap();
+        store
+            .create_session(request.clone(), "create-physical-replay")
+            .await
+            .unwrap()
+    };
+    assert!(!committed.replayed);
+
+    let physical_limits = admission_exhausted_physical_limits(database.path());
+    let store = SqliteStore::open_with_limits_and_physical(
+        database.path(),
+        StorageLimits::default(),
+        physical_limits,
+    )
+    .await
+    .unwrap();
+    let loaded = store.get_session(&request.id).await.unwrap();
+    assert_eq!(loaded.session, committed.session);
+    assert!(matches!(
+        store.readiness().await,
+        Err(StorageError::PhysicalStorageExhausted)
+    ));
+
+    let replayed = store
+        .create_session(request.clone(), "create-physical-replay")
+        .await
+        .unwrap();
+    assert!(replayed.replayed);
+    assert_eq!(replayed.session, committed.session);
+
+    let before = physical_admission_counts(database.path());
+    assert!(matches!(
+        store
+            .create_session(
+                CreateSessionRequest {
+                    id: "session-physical-rejected".into(),
+                    title: "Must not cross the admission watermark".into(),
+                },
+                "create-physical-rejected",
+            )
+            .await,
+        Err(StorageError::PhysicalStorageExhausted)
+    ));
+    assert_eq!(physical_admission_counts(database.path()), before);
+    assert!(matches!(
+        store.get_session("session-physical-rejected").await,
+        Err(StorageError::SessionNotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn reserved_reply_progress_and_finalization_survive_admission_exhaustion() {
+    let database = TestDatabase::new();
+    {
+        let store = created_owned_file_session_store(database.path()).await;
+        store
+            .start_turn_and_enqueue_reply_for_actor(
+                "user-owner",
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: "turn-physical-finalization".into(),
+                    user_message: "This accepted reply must remain settleable".into(),
+                    expected_sequence: 1,
+                },
+                "start-physical-finalization",
+                reply_job_spec("reply-physical-finalization", "turn-physical-finalization"),
+            )
+            .await
+            .unwrap();
+    }
+
+    let physical_limits = admission_exhausted_physical_limits(database.path());
+    let (_, _, main_bytes) = sqlite_main_geometry(database.path());
+    assert!(
+        main_bytes > physical_limits.max_main_bytes - physical_limits.admission_reserve_bytes,
+        "fixture must be below the ordinary admission watermark"
+    );
+    assert!(
+        fs2::available_space(database.path().parent().unwrap()).unwrap()
+            >= physical_limits.min_free_bytes,
+        "fixture must retain the minimum free space required for accepted work"
+    );
+    let store = SqliteStore::open_with_limits_and_physical(
+        database.path(),
+        StorageLimits::default(),
+        physical_limits,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        store.readiness().await,
+        Err(StorageError::PhysicalStorageExhausted)
+    ));
+    assert!(matches!(
+        store.claim_next_reply().await.unwrap(),
+        ReplyClaimOutcome::Claimed(_)
+    ));
+    let completed = store
+        .complete_reply_failure(ReplyFailureCommit {
+            job_id: "reply-physical-finalization".into(),
+            expected_sequence: 2,
+            error_json: json!({
+                "code": "physical_finalization_fixture",
+                "message": "settled inside reserved physical headroom",
+            }),
+        })
+        .await
+        .unwrap();
+    assert!(!completed.replayed);
+    assert!(matches!(
+        completed.events[0].data,
+        SessionEventData::TurnInterrupted { .. }
+    ));
+    let detail = store.get_session("session-alpha").await.unwrap();
+    assert_eq!(detail.session.status, SessionStatus::NeedsAttention);
+    assert_eq!(detail.turns[0].status, SessionTurnStatus::Interrupted);
+    assert_eq!(
+        session_finalization_capacity(
+            database.path(),
+            "session-alpha",
+            "turn-physical-finalization"
+        ),
+        None
+    );
+}
+
+#[tokio::test]
+async fn physical_main_file_exact_boundary_opens_and_below_boundary_fails() {
+    let database = TestDatabase::new();
+    {
+        let store = SqliteStore::open(database.path()).await.unwrap();
+        store
+            .create_session(
+                CreateSessionRequest {
+                    id: "session-main-boundary".into(),
+                    title: "Main file boundary".into(),
+                },
+                "create-main-boundary",
+            )
+            .await
+            .unwrap();
+    }
+    let (page_size, _, main_bytes) = sqlite_main_geometry(database.path());
+    let exact_limits = SqlitePhysicalLimits {
+        max_main_bytes: main_bytes,
+        wal_target_bytes: page_size,
+        min_free_bytes: 1,
+        admission_reserve_bytes: page_size * 2,
+    };
+    let exact = SqliteStore::open_with_limits_and_physical(
+        database.path(),
+        StorageLimits::default(),
+        exact_limits,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        exact
+            .get_session("session-main-boundary")
+            .await
+            .unwrap()
+            .session
+            .id,
+        "session-main-boundary"
+    );
+    drop(exact);
+
+    let below_limits = SqlitePhysicalLimits {
+        max_main_bytes: main_bytes - page_size,
+        wal_target_bytes: page_size,
+        min_free_bytes: 1,
+        admission_reserve_bytes: page_size * 2,
+    };
+    assert!(matches!(
+        SqliteStore::open_with_limits_and_physical(
+            database.path(),
+            StorageLimits::default(),
+            below_limits,
+        )
+        .await,
+        Err(StorageError::PhysicalStorageExhausted)
+    ));
+
+    let over_hard = SqlitePhysicalLimits {
+        max_main_bytes: SqlitePhysicalLimits::HARD_CEILINGS.max_main_bytes + 1,
+        ..SqlitePhysicalLimits::default()
+    };
+    assert!(matches!(
+        SqliteStore::open_with_limits_and_physical(
+            database.path(),
+            StorageLimits::default(),
+            over_hard,
+        )
+        .await,
+        Err(StorageError::InvalidPhysicalLimits(_))
+    ));
 }
 
 #[tokio::test]
@@ -3470,7 +3766,7 @@ async fn dispatch_claim_rechecks_owner_and_records_not_dispatched_evidence() {
         ClaimOutcome::NotAvailable
     );
     assert!(matches!(
-        store.readiness().await,
+        store.verify_integrity().await,
         Err(StorageError::CorruptData(message))
             if message.contains("exactly one owner")
     ));
@@ -4324,7 +4620,10 @@ async fn queued_job_survives_restart_and_remains_dispatchable() {
         let store = SqliteStore::open(database.path()).await.unwrap();
         store.seed_if_empty(snapshot, events).await.unwrap();
         bootstrap_test_owner(&store).await;
-        store.commit_review(review.clone()).await.unwrap();
+        store
+            .commit_review_for_actor("user-owner", review.clone())
+            .await
+            .unwrap();
     }
 
     let reopened = SqliteStore::open(database.path()).await.unwrap();
@@ -4350,7 +4649,10 @@ async fn started_job_restart_recovery_records_outcome_unknown_without_requeue() 
         let store = SqliteStore::open(database.path()).await.unwrap();
         store.seed_if_empty(snapshot, events).await.unwrap();
         bootstrap_test_owner(&store).await;
-        store.commit_review(review).await.unwrap();
+        store
+            .commit_review_for_actor("user-owner", review)
+            .await
+            .unwrap();
         store.claim_next_dispatch(start.clone()).await.unwrap();
     }
 
@@ -5319,7 +5621,7 @@ async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempot
 }
 
 #[tokio::test]
-async fn readiness_rejects_parent_global_and_reservation_payload_counter_tampering() {
+async fn integrity_verification_rejects_parent_global_and_reservation_payload_counter_tampering() {
     let parent_database = TestDatabase::new();
     let parent_store = SqliteStore::open(parent_database.path()).await.unwrap();
     parent_store
@@ -5345,7 +5647,7 @@ async fn readiness_rejects_parent_global_and_reservation_payload_counter_tamperi
         1
     );
     assert!(matches!(
-        parent_store.readiness().await,
+        parent_store.verify_integrity().await,
         Err(StorageError::CorruptData(message))
             if message.contains("event payload byte counters")
     ));
@@ -5373,7 +5675,7 @@ async fn readiness_rejects_parent_global_and_reservation_payload_counter_tamperi
         1
     );
     assert!(matches!(
-        global_store.readiness().await,
+        global_store.verify_integrity().await,
         Err(StorageError::CorruptData(message))
             if message.contains("event payload byte counters")
     ));
@@ -5407,7 +5709,7 @@ async fn readiness_rejects_parent_global_and_reservation_payload_counter_tamperi
         1
     );
     assert!(matches!(
-        reservation_store.readiness().await,
+        reservation_store.verify_integrity().await,
         Err(StorageError::CorruptData(message))
             if message.contains("finalization reservations")
     ));

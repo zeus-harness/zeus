@@ -108,6 +108,47 @@ cover the UTF-8 byte length of serialized `session_events.payload_json` and
 not cover other rows, indexes, SQLite page overhead, the database file, WAL, or
 free-disk capacity.
 
+The implemented and locally verified SQLite Physical Capacity Slice uses these
+configuration limits:
+
+| Environment variable | Default | Hard ceiling | Purpose |
+| --- | ---: | ---: | --- |
+| `ZEUS_SQLITE_MAX_MAIN_BYTES` | 4 GiB (4,294,967,296) | 32 GiB | Main database page budget |
+| `ZEUS_SQLITE_WAL_TARGET_BYTES` | 16 MiB (16,777,216) | 256 MiB | WAL autocheckpoint/reset target |
+| `ZEUS_SQLITE_MIN_FREE_BYTES` | 256 MiB (268,435,456) | 8 GiB | Minimum filesystem headroom |
+| `ZEUS_SQLITE_ADMISSION_RESERVE_BYTES` | 512 MiB (536,870,912) | 8 GiB | Admission filesystem headroom watermark |
+
+Startup rejects invalid configuration unless
+`WAL target < admission reserve < max main`; it must also use checked arithmetic
+so `min free + admission reserve` cannot overflow. `max main` is translated to
+SQLite `max_page_count` and limits pages in the main database only. The WAL
+target drives autocheckpoint and journal reset; it is not an absolute hard cap
+on the size of an active WAL. Filesystem free space comes from `statvfs`, whose
+result has an unavoidable TOCTOU window, so that check is an admission signal,
+not a durable disk reservation. The logical event-payload quotas above remain
+independent and continue to protect ledger payload growth.
+
+Every file-backed connection reapplies and verifies the safety and physical
+PRAGMAs, including `max_page_count`, `wal_autocheckpoint`,
+`journal_size_limit`, the bounded cache, and disabled `mmap`. Ordinary
+`Admission` requires the main file to remain below the configured headroom
+watermark, the active WAL to be at or below its target, and filesystem free
+space to cover `min free + admission reserve`. `ReservedProgress` and
+`Finalization` preserve already accepted work: they still enforce the main-file
+maximum and minimum free space, but do not pretend that the WAL target is a hard
+cap. The admission headroom is one watermark, not a reserve accumulated once
+per request or active job.
+
+Business operations rejected by the physical gate return a redacted
+`507 physical_storage_exhausted` with `Cache-Control: no-store`; the public
+`/health/ready` endpoint reports the same watermark as a redacted `503` with
+`Cache-Control: no-store`. Readiness performs only schema/PRAGMA metadata and
+physical-watermark checks. Startup performs the deep business, ledger, foreign-
+key and SQLite integrity checks plus a truncating WAL checkpoint before the
+listener is exposed. Operators and tests can request the same deep integrity
+check, without the startup checkpoint, explicitly through
+`SqliteStore::verify_integrity`; it is not run for every health probe.
+
 To exercise the only executable Alpha connector, use a separate database and
 an explicit fixed root. The caller supplies marker text only; it cannot choose
 a path or invoke a host command:
@@ -372,9 +413,10 @@ directly.
 - Every business REST/SSE route requires the active local owner. Protected
   state changes additionally require `X-CSRF-Token` to match the login and an
   exact same-origin request. Alpha+ deliberately rejects the schema-reserved
-  `member` role. Actor isolation is now present, but member access remains
-  blocked until a tenant/account membership scope, SQLite/WAL emergency
-  headroom, and a bootstrap-audit retention policy land.
+  `member` role. Actor isolation and SQLite physical headroom are now present,
+  but member access remains blocked until a tenant/account membership scope, a
+  bootstrap-audit retention policy, and explicit operation-concurrency/OOM
+  controls land.
 - `GET /api/v1/me/settings` returns the current safe preferences.
   `PATCH /api/v1/me/settings` accepts `theme`, optional allowlisted
   `preferred_model`, and `expected_revision`. Provider endpoints and API keys
@@ -477,9 +519,12 @@ existing bytes and conservatively reserves active work so historical databases
 can still drain even when they exceed a newly configured limit. Expired auth
 sessions are deleted in deterministic batches of at most 64 on startup and
 before session creation; append-only ledgers, receipts, jobs, turns, and audit
-records are not silently pruned. Main DB/WAL/disk headroom and a complete audit
-retention horizon remain unresolved, so shared-network and multi-tenant
-deployment is still out of scope.
+records are not silently pruned. The locally verified Physical Capacity Slice
+now gates the main DB, active-WAL target, and filesystem headroom, subject to
+the documented WAL and `statvfs` limitations. A complete audit-retention
+horizon, tenant/member scope, and explicit operation-concurrency/OOM policy
+remain unresolved; shared-network and multi-tenant deployment is therefore
+still out of scope.
 
 ## Container images
 
@@ -529,11 +574,13 @@ committed data. Use SQLite's backup/checkpoint facilities.
 
 Current Alpha+ plus Actor Boundary Foundation, API Resource Envelope, Terminal
 Payload Envelope, Bounded Event Feed, Point-query Durable Context, Bounded Read
-Models, and SQLite Capacity Slice 2 host verification:
+Models, SQLite Capacity Slice 2, and the SQLite Physical Capacity Slice host
+verification:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --all-targets`: 237 tests passed, including the real
+- `cargo test --workspace --all-targets`: 251 tests passed, including 106
+  storage tests, 42 API library tests, and 4 API main/config tests, plus the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,
   body/field/idempotency boundaries, atomic login limits, SSE lease capacity,
@@ -597,10 +644,12 @@ index inside BuildKit and was interrupted before any running container was
 replaced. Therefore the new image, `verify`, and named-volume `restart-verify`
 are not yet claimed as current Alpha+ acceptance. The earlier Alpha baseline
 container acceptance belongs to commit `9a89706`; the pushed host baseline
-before this slice is Bounded Read Models commit `8656e52`. No
+before this slice is event-payload quotas commit `fd38d60`. No
 replacement image containing Actor Boundary, API Resource Envelope, Bounded
-Event Feed, Point-query Durable Context, Bounded Read Models, or SQLite Capacity
-Slice 1 is yet verified.
+Event Feed, Point-query Durable Context, Bounded Read Models, SQLite Capacity
+Slice 2, or the SQLite Physical Capacity Slice is yet verified. Process-level
+operation concurrency/OOM behavior also remains outside current-image
+acceptance.
 
 Docker Compose configuration remains available for environments with Docker
 Compose v2; this machine currently has Apple `container` but no Docker CLI, so

@@ -7,12 +7,14 @@
 mod cursor;
 mod error;
 mod limits;
+mod physical;
 mod sqlite;
 
 use std::fmt;
 
 pub use error::StorageError;
 pub use limits::{StorageLimits, StorageLimitsError};
+pub use physical::{SqlitePhysicalLimits, SqlitePhysicalLimitsError};
 use protocol::{
     Approval, EvidenceSummary, IncidentSummary, Metric, ReadPageInfo, ReviewResponse, RunEvent,
     RunSummary, SandboxProfile, SessionEvent, SessionSummary, SessionTurn, StartTurnResponse,

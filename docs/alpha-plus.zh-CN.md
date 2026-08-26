@@ -1,7 +1,7 @@
 # Zeus Harness Alpha+ 设计冻结
 
-状态：主机 Alpha+、Actor Boundary Foundation、API/Terminal Payload Resource Envelope、Bounded Event Feed、Point-query Durable Context、Bounded Read Models 与 SQLite Capacity Slice 2 已实现并通过主机全量验收；Apple container 新镜像验收待完成
-前置基线：`4916276`（Terminal Payload Envelope）
+状态：主机 Alpha+、Actor Boundary Foundation、API/Terminal Payload Resource Envelope、Bounded Event Feed、Point-query Durable Context、Bounded Read Models、SQLite Capacity Slice 2 与 SQLite Physical Capacity Slice 已实现并通过主机全量验收；Apple container 新镜像验收待完成
+前置基线：`fd38d60`（Event Payload Byte Quotas）
 
 ## 1. 产品术语
 
@@ -48,8 +48,9 @@ Health 路由保持公开。公开注册、邮件找回、OAuth/SSO、WebAuthn �
 这些边界只是未来 member 能力的安全底座。当前 API 仍拒绝 member 登录；字段、HTTP/SSE
 连接、事件页边界、内部 point/batch read 和 Session/Run 有界 read model 已经落地，但
 即使 SQLite 行数、活跃队列、event-slot 和事件载荷逻辑字节配额已落地，也不得开放 member。
-剩余门槛是 tenant/account membership scope、SQLite 主库/WAL/磁盘应急余量，以及
-bootstrap audit 的明确保留期。
+SQLite 主库/WAL/磁盘 headroom 门禁已经落地，但 member 仍须等待 tenant/account
+membership scope、bootstrap audit 的明确保留期，以及显式的 operation concurrency/OOM
+策略。
 
 Resource Envelope 的固定边界：auth JSON 8 KiB、command JSON 512 KiB；新建 Session/turn
 ID 128 UTF-8 bytes、Session title 256 bytes、user/assistant message 64 KiB、review note 8 KiB；
@@ -93,6 +94,34 @@ dispatch queue 另带 `Retry-After: 2`。计量只覆盖 `session_events.payload
 `run_events.payload_json` 的实际 UTF-8 序列化字节，不宣称 DB file、WAL、索引、page overhead
 或宿主磁盘空间有保证。过期 auth session 只在启动和新建登录会话前按稳定顺序清理最多 64 行；
 ledger、receipt、job、turn 和 bootstrap audit 不做静默删除。
+
+SQLite Physical Capacity Slice 已实现并通过本地主机验证，采用以下默认值与编译期 hard ceiling：
+
+| 配置 | 默认值 | hard ceiling | 含义 |
+| --- | ---: | ---: | --- |
+| `ZEUS_SQLITE_MAX_MAIN_BYTES` | 4 GiB（4,294,967,296） | 32 GiB | 主库 page 预算 |
+| `ZEUS_SQLITE_WAL_TARGET_BYTES` | 16 MiB（16,777,216） | 256 MiB | WAL autocheckpoint/reset 目标 |
+| `ZEUS_SQLITE_MIN_FREE_BYTES` | 256 MiB（268,435,456） | 8 GiB | 文件系统最小剩余空间 |
+| `ZEUS_SQLITE_ADMISSION_RESERVE_BYTES` | 512 MiB（536,870,912） | 8 GiB | admission 文件系统 headroom watermark |
+
+启动必须校验 `WAL target < admission reserve < max main`，并以 checked addition
+保证 `min free + admission reserve` 不溢出。`max_page_count` 只限制 SQLite 主库页数；WAL
+target 是 autocheckpoint 与 journal reset 的目标，不是 active WAL 的绝对硬上限。可用空间通过
+`statvfs` 读取，存在不可避免的 TOCTOU，因此它只能作为 admission signal，不能当作持久磁盘
+预留。上面的逻辑 event-payload 配额仍是独立限制，不因物理容量门禁而替代或放宽。
+
+每个 file-backed connection 都重新应用并核对 `max_page_count`、`wal_autocheckpoint`、
+`journal_size_limit`、有界 cache 与禁用 `mmap`。普通 `Admission` 要求主库低于保留 headroom
+后的 watermark、active WAL 不超过 target，并保有 `min free + admission reserve` 可用空间；
+`ReservedProgress`/`Finalization` 为已接受工作保留排空能力，只继续要求主库不越绝对上限且
+可用空间不少于 `min free`。admission reserve 是单一 watermark，不会按每个请求或 active job
+重复累加。
+
+物理门禁拒绝业务操作时返回脱敏的 `507 physical_storage_exhausted + Cache-Control: no-store`；
+`/health/ready` 对相同 watermark 返回脱敏 `503 + Cache-Control: no-store`。readiness 只做
+schema/PRAGMA metadata 与物理 watermark 检查；启动在监听端口开放前完成深度业务/ledger/FK/
+SQLite integrity 检查和 truncating WAL checkpoint。运维或测试可显式调用
+`SqliteStore::verify_integrity` 重跑昂贵检查，不把它放进每次 health probe。
 
 ## 4. 设置
 
@@ -141,6 +170,9 @@ POST /sessions/{id}/turns
   2→1→0 event-slot 状态机、legacy active-work 回填、auth expiry index，以及 reservation
   binding/scope/单调递减/空槽删除 trigger。旧库即使已经超过新配额仍可迁移、读取和排空；
   只拒绝新的 admission。
+- `0011_event_payload_bytes.sql`：为 Session/Run ledger 与 active finalization reservation
+  增加逻辑载荷字节计数和预留，按既有 UTF-8 `payload_json` 的 BLOB byte length 精确回填，
+  并由 trigger 在同一事务中记账。
 
 迁移必须原地保留 Alpha append-only ledger、事件外键与 runtime identity。任何一步失败都回滚整个 migration transaction。
 
@@ -163,6 +195,9 @@ POST /sessions/{id}/turns
 - v9 到 v10 为既有 open turn、queued dispatch 和 started dispatch 分别回填 2/2/1 个
   event slots；oversized durable TEXT 和已超配额旧库不得导致迁移失败。配额 exact/+1、
   满额 replay、reservation 消费/回滚、auth expiry cleanup 与稳定 429/503 合约有自动测试。
+- v10 到 v11 精确回填 Session/Run event payload bytes 与 active finalization reservation；
+  逻辑字节 exact/+1、物理主库边界、Admission/ReservedProgress/Finalization、507/503 合约、
+  startup deep check 与显式 `verify_integrity` 都有自动测试。
 - Session/Run detail 只返回最新 bounded tail；opaque cursor 的 kind、resource scope、canonical
   encoding、future-head 和跨资源使用均有自动测试，返回页保持连续且升序。
 - disabled/降权/owner mismatch 的 reply 与 dispatch claim 不触达外部执行，并留下
@@ -171,4 +206,5 @@ POST /sessions/{id}/turns
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 通过完整 Rust/Web 测试；Apple container 的当前镜像验收状态按下文边界单独记录。
+- host 通过 251 个 Rust 测试（storage 106、API library 42、API main/config 4）与 25 个 Web
+  Node 测试；Apple container 的当前镜像验收状态按下文边界单独记录。

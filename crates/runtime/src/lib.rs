@@ -30,9 +30,9 @@ use protocol::{
 pub use storage::{
     AuthPrincipal, AuthSessionCommit, BootstrapOwnerCommit, ReplyClaimOutcome, ReplyCompletion,
     ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus,
-    ReplyOutcomeUnknownCommit, ReplySuccessCommit, SessionSummaryPage, StorageLimits,
-    StorageLimitsError, StoredCredential, StoredPreferences, StoredUser, StoredUserRole,
-    StoredUserStatus,
+    ReplyOutcomeUnknownCommit, ReplySuccessCommit, SessionSummaryPage, SqlitePhysicalLimits,
+    SqlitePhysicalLimitsError, StorageLimits, StorageLimitsError, StoredCredential,
+    StoredPreferences, StoredUser, StoredUserRole, StoredUserStatus,
 };
 use storage::{
     ClaimOutcome, CommitOutcome, DispatchCompleteCommit, DispatchContext, DispatchJob,
@@ -122,6 +122,8 @@ pub enum StoreError {
     UserDisabled(String),
     #[error("the durable storage quota is exhausted")]
     StorageQuotaExceeded,
+    #[error("SQLite physical storage cannot safely accept this operation")]
+    PhysicalStorageExhausted,
     #[error("the durable reply queue is at capacity")]
     ReplyQueueCapacityExceeded,
     #[error("the durable dispatch queue is at capacity")]
@@ -190,6 +192,7 @@ impl From<StorageError> for StoreError {
             StorageError::UserNotFound(id) => Self::UserNotFound(id),
             StorageError::UserDisabled(id) => Self::UserDisabled(id),
             StorageError::StorageQuotaExceeded => Self::StorageQuotaExceeded,
+            StorageError::PhysicalStorageExhausted => Self::PhysicalStorageExhausted,
             StorageError::ReplyQueueCapacityExceeded => Self::ReplyQueueCapacityExceeded,
             StorageError::DispatchQueueCapacityExceeded => Self::DispatchQueueCapacityExceeded,
             StorageError::AuthSessionCapacityExceeded => Self::AuthSessionCapacityExceeded,
@@ -236,6 +239,20 @@ impl DemoStore {
         Self::open_with_profile_and_limits(path, DemoProfile::ProductionGuarded, limits).await
     }
 
+    pub async fn open_with_limits_and_physical(
+        path: impl AsRef<Path>,
+        limits: StorageLimits,
+        physical_limits: SqlitePhysicalLimits,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_profile_and_limits_and_physical(
+            path,
+            DemoProfile::ProductionGuarded,
+            limits,
+            physical_limits,
+        )
+        .await
+    }
+
     /// Opens an explicit local-development demonstration with one fixed marker
     /// root and no production connector.
     pub async fn open_local(
@@ -266,6 +283,23 @@ impl DemoStore {
         .await
     }
 
+    pub async fn open_local_with_limits_and_physical(
+        path: impl AsRef<Path>,
+        marker_root: impl Into<PathBuf>,
+        limits: StorageLimits,
+        physical_limits: SqlitePhysicalLimits,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_profile_and_limits_and_physical(
+            path,
+            DemoProfile::LocalDevelopment {
+                marker_root: marker_root.into(),
+            },
+            limits,
+            physical_limits,
+        )
+        .await
+    }
+
     pub async fn open_with_profile(
         path: impl AsRef<Path>,
         profile: DemoProfile,
@@ -278,7 +312,23 @@ impl DemoStore {
         profile: DemoProfile,
         limits: StorageLimits,
     ) -> Result<Self, StoreError> {
-        let storage = SqliteStore::open_with_limits(path, limits).await?;
+        Self::open_with_profile_and_limits_and_physical(
+            path,
+            profile,
+            limits,
+            SqlitePhysicalLimits::default(),
+        )
+        .await
+    }
+
+    pub async fn open_with_profile_and_limits_and_physical(
+        path: impl AsRef<Path>,
+        profile: DemoProfile,
+        limits: StorageLimits,
+        physical_limits: SqlitePhysicalLimits,
+    ) -> Result<Self, StoreError> {
+        let storage =
+            SqliteStore::open_with_limits_and_physical(path, limits, physical_limits).await?;
         Self::from_storage(storage, profile, true).await
     }
 

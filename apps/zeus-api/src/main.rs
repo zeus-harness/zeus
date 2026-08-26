@@ -1,7 +1,7 @@
 use std::{future::IntoFuture, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use llm::{LocalFallbackProvider, OpenAiCompatibleProvider, ReplyProvider};
-use runtime::{DemoStore, StorageLimits};
+use runtime::{DemoStore, SqlitePhysicalLimits, StorageLimits};
 use tenancy::BootstrapToken;
 use tokio::sync::oneshot;
 
@@ -15,14 +15,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let profile =
         std::env::var("ZEUS_DEMO_PROFILE").unwrap_or_else(|_| "production-guarded".into());
     let storage_limits = configured_storage_limits()?;
+    let physical_limits = configured_sqlite_physical_limits()?;
     let store = match profile.as_str() {
         "production-guarded" => {
-            DemoStore::open_with_limits(&database_path, storage_limits.clone()).await?
+            DemoStore::open_with_limits_and_physical(
+                &database_path,
+                storage_limits.clone(),
+                physical_limits.clone(),
+            )
+            .await?
         }
         "local-development" => {
             let marker_root = std::env::var("ZEUS_LOCAL_MARKER_ROOT")
                 .unwrap_or_else(|_| ".zeus/local-markers".into());
-            DemoStore::open_local_with_limits(&database_path, marker_root, storage_limits).await?
+            DemoStore::open_local_with_limits_and_physical(
+                &database_path,
+                marker_root,
+                storage_limits,
+                physical_limits,
+            )
+            .await?
         }
         other => {
             return Err(io::Error::new(
@@ -136,6 +148,51 @@ fn configured_storage_limits() -> Result<StorageLimits, io::Error> {
 
 fn environment_capacity(name: &str, default: usize) -> Result<usize, io::Error> {
     parse_environment_capacity(name, std::env::var(name), default)
+}
+
+fn configured_sqlite_physical_limits() -> Result<SqlitePhysicalLimits, io::Error> {
+    let defaults = SqlitePhysicalLimits::default();
+    SqlitePhysicalLimits {
+        max_main_bytes: environment_u64("ZEUS_SQLITE_MAX_MAIN_BYTES", defaults.max_main_bytes)?,
+        wal_target_bytes: environment_u64(
+            "ZEUS_SQLITE_WAL_TARGET_BYTES",
+            defaults.wal_target_bytes,
+        )?,
+        min_free_bytes: environment_u64("ZEUS_SQLITE_MIN_FREE_BYTES", defaults.min_free_bytes)?,
+        admission_reserve_bytes: environment_u64(
+            "ZEUS_SQLITE_ADMISSION_RESERVE_BYTES",
+            defaults.admission_reserve_bytes,
+        )?,
+    }
+    .validated()
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+}
+
+fn environment_u64(name: &str, default: u64) -> Result<u64, io::Error> {
+    parse_environment_u64(name, std::env::var(name), default)
+}
+
+fn parse_environment_u64(
+    name: &str,
+    value: Result<String, std::env::VarError>,
+    default: u64,
+) -> Result<u64, io::Error> {
+    match value {
+        Ok(value) if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) => {
+            value.parse::<u64>().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("{name} is too large"))
+            })
+        }
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be an unsigned decimal integer without whitespace"),
+        )),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be valid UTF-8"),
+        )),
+    }
 }
 
 fn parse_environment_capacity(
@@ -272,7 +329,7 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_environment_capacity;
+    use super::{parse_environment_capacity, parse_environment_u64};
     use std::{env::VarError, io};
 
     #[test]
@@ -313,6 +370,32 @@ mod tests {
             )
             .unwrap_err()
             .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn physical_byte_environment_uses_strict_unsigned_u64_values() {
+        assert_eq!(
+            parse_environment_u64("ZEUS_TEST_BYTES", Err(VarError::NotPresent), 19).unwrap(),
+            19
+        );
+        assert_eq!(
+            parse_environment_u64("ZEUS_TEST_BYTES", Ok(u64::MAX.to_string()), 19).unwrap(),
+            u64::MAX
+        );
+        for value in ["", " 1", "1 ", "+1", "-1", "1_000", "１２"] {
+            assert_eq!(
+                parse_environment_u64("ZEUS_TEST_BYTES", Ok(value.into()), 19)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        assert_eq!(
+            parse_environment_u64("ZEUS_TEST_BYTES", Ok(format!("{}0", u64::MAX)), 19,)
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidInput
         );
     }

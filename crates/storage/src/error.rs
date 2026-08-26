@@ -1,19 +1,21 @@
 use thiserror::Error;
 
-use crate::StorageLimitsError;
+use crate::{SqlitePhysicalLimitsError, StorageLimitsError};
 
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("SQLite error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlite(rusqlite::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("blocking storage task failed: {0}")]
     Join(#[from] tokio::task::JoinError),
     #[error("invalid storage limits: {0}")]
     InvalidLimits(#[from] StorageLimitsError),
+    #[error("invalid SQLite physical limits: {0}")]
+    InvalidPhysicalLimits(#[from] SqlitePhysicalLimitsError),
     #[error("persistent SQLite database `{0}` is already owned by another Zeus instance")]
     DatabaseLocked(String),
     #[error("run `{0}` was not found")]
@@ -36,6 +38,8 @@ pub enum StorageError {
     AuthSessionNotFound,
     #[error("the durable storage quota is exhausted")]
     StorageQuotaExceeded,
+    #[error("SQLite physical storage cannot safely accept this operation")]
+    PhysicalStorageExhausted,
     #[error("the durable reply queue is at capacity")]
     ReplyQueueCapacityExceeded,
     #[error("the durable dispatch queue is at capacity")]
@@ -93,4 +97,14 @@ pub enum StorageError {
     #[cfg(test)]
     #[error("injected storage transaction failure")]
     InjectedFailure,
+}
+
+impl From<rusqlite::Error> for StorageError {
+    fn from(error: rusqlite::Error) -> Self {
+        if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) {
+            Self::PhysicalStorageExhausted
+        } else {
+            Self::Sqlite(error)
+        }
+    }
 }
