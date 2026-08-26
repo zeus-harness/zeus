@@ -2301,6 +2301,37 @@ async fn legacy_oversized_session_and_reply_settle_after_file_database_reopen() 
 
     let reopened = SqliteStore::open(database.path()).await.unwrap();
     reopened.readiness().await.unwrap();
+    reopened
+        .create_session_for_actor(
+            "user-owner",
+            CreateSessionRequest {
+                id: "zz-normal-session".into(),
+                title: "Normal Session".into(),
+            },
+            "create-normal-session-after-legacy-reopen",
+        )
+        .await
+        .unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute(
+            "UPDATE sessions SET updated_at = ?1 WHERE id IN (?2, ?3)",
+            params!["2026-08-27T00:00:00.000Z", session_id, "zz-normal-session"],
+        )
+        .unwrap();
+    drop(connection);
+
+    let first_page = reopened
+        .session_summary_page_for_actor("user-owner", None, 1)
+        .await
+        .unwrap();
+    assert_eq!(first_page.items[0].id, session_id);
+    let second_page = reopened
+        .session_summary_page_for_actor("user-owner", first_page.next_cursor.as_deref(), 1)
+        .await
+        .unwrap();
+    assert_eq!(second_page.items[0].id, "zz-normal-session");
+    assert!(second_page.next_cursor.is_none());
     assert!(
         reopened
             .list_sessions_for_actor("user-owner")
@@ -2316,6 +2347,13 @@ async fn legacy_oversized_session_and_reply_settle_after_file_database_reopen() 
     assert_eq!(detail.session.sequence, 2);
     assert_eq!(detail.turns[0].id, turn_id);
     assert_eq!(detail.turns[0].user_message, user_message);
+    assert_eq!(
+        reopened
+            .session_turn_for_actor("user-owner", &session_id, &turn_id)
+            .await
+            .unwrap(),
+        detail.turns[0]
+    );
     assert!(
         detail.events[..2]
             .iter()
@@ -2437,6 +2475,515 @@ async fn actor_scoped_session_and_run_reads_hide_foreign_or_disabled_resources()
     assert!(matches!(
         store.snapshot_for_actor("user-owner", RUN_ID).await,
         Err(StorageError::RunNotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn actor_session_summary_pages_are_stable_bounded_and_indexed() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    bootstrap_test_owner(&store).await;
+
+    for index in 0..101 {
+        let id = format!("session-page-{index:03}");
+        store
+            .create_session_for_actor(
+                "user-owner",
+                CreateSessionRequest {
+                    id: id.clone(),
+                    title: format!("Page fixture {index:03}"),
+                },
+                &format!("create-{id}"),
+            )
+            .await
+            .unwrap();
+    }
+
+    let timestamp = "2026-08-27T00:00:00.000Z";
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE sessions SET updated_at = ?1 WHERE owner_user_id = ?2",
+                params![timestamp, "user-owner"],
+            )
+            .unwrap(),
+        101
+    );
+    let plan = explain_query_plan(
+        &connection,
+        r#"SELECT id, updated_at FROM sessions
+           WHERE owner_user_id = ?1
+             AND (updated_at < ?2 OR (updated_at = ?2 AND id > ?3))
+           ORDER BY updated_at DESC, id ASC
+           LIMIT ?4"#,
+        params!["user-owner", timestamp, "session-page-049", 51_i64],
+    );
+    assert!(
+        plan.contains("sessions_owner_updated_idx"),
+        "unexpected Session keyset plan: {plan}"
+    );
+    drop(connection);
+
+    let mut cursor = None;
+    let mut first_owner_cursor = None;
+    let mut ids = Vec::new();
+    for (page_index, expected_len) in [50, 50, 1].into_iter().enumerate() {
+        let page = store
+            .session_summary_page_for_actor("user-owner", cursor.as_deref(), 50)
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), expected_len);
+        ids.extend(page.items.into_iter().map(|session| session.id));
+        if page_index < 2 {
+            assert!(page.next_cursor.is_some());
+        } else {
+            assert!(page.next_cursor.is_none());
+        }
+        if page_index == 0 {
+            first_owner_cursor = page.next_cursor.clone();
+        }
+        cursor = page.next_cursor;
+    }
+    assert_eq!(
+        ids,
+        (0..101)
+            .map(|index| format!("session-page-{index:03}"))
+            .collect::<Vec<_>>()
+    );
+
+    for invalid_limit in [0, protocol::COLLECTION_PAGE_MAX_LIMIT + 1] {
+        assert!(matches!(
+            store
+                .session_summary_page_for_actor("user-owner", None, invalid_limit)
+                .await,
+            Err(StorageError::InvalidPageLimit { limit, max })
+                if limit == invalid_limit && max == protocol::COLLECTION_PAGE_MAX_LIMIT
+        ));
+    }
+    assert!(matches!(
+        store
+            .session_summary_page_for_actor("user-owner", Some("not-a-cursor"), 50)
+            .await,
+        Err(StorageError::InvalidPageCursor)
+    ));
+
+    insert_test_member(database.path(), "foreign-user", "foreign");
+    assert!(matches!(
+        store
+            .session_summary_page_for_actor("foreign-user", first_owner_cursor.as_deref(), 50,)
+            .await,
+        Err(StorageError::InvalidPageCursor)
+    ));
+    assert!(matches!(
+        store
+            .session_detail_page_for_actor(
+                "foreign-user",
+                "session-page-000",
+                Some("not-a-cursor"),
+                0,
+                Some("not-a-cursor"),
+                0,
+                Some("not-a-cursor"),
+                0,
+            )
+            .await,
+        Err(StorageError::SessionNotFound(id)) if id == "session-page-000"
+    ));
+}
+
+#[tokio::test]
+async fn actor_session_detail_tails_are_independent_scoped_and_contiguous() {
+    let database = TestDatabase::new();
+    let store = seeded_file_store(database.path()).await;
+    bootstrap_test_owner(&store).await;
+    insert_second_run(database.path());
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE runs SET owner_user_id = ?1 WHERE id = 'ZR-SECOND'",
+                ["user-owner"],
+            )
+            .unwrap(),
+        1
+    );
+    drop(connection);
+    for id in ["session-tail", "session-other"] {
+        store
+            .create_session_for_actor(
+                "user-owner",
+                CreateSessionRequest {
+                    id: id.into(),
+                    title: format!("Tail fixture {id}"),
+                },
+                &format!("create-{id}"),
+            )
+            .await
+            .unwrap();
+    }
+
+    let mut sequence = 1;
+    for (index, run_id) in [RUN_ID, "ZR-SECOND"].into_iter().enumerate() {
+        let attached = store
+            .attach_run_for_actor(
+                "user-owner",
+                "session-tail",
+                AttachRunRequest {
+                    run_id: run_id.into(),
+                    expected_sequence: sequence,
+                },
+                &format!("attach-{index}"),
+            )
+            .await
+            .unwrap();
+        sequence = attached.session.sequence;
+    }
+    for ordinal in 1..=3 {
+        let turn_id = format!("turn-{ordinal}");
+        let started = store
+            .start_turn_for_actor(
+                "user-owner",
+                "session-tail",
+                StartTurnRequest {
+                    turn_id: turn_id.clone(),
+                    user_message: format!("message {ordinal}"),
+                    expected_sequence: sequence,
+                },
+                &format!("start-{ordinal}"),
+            )
+            .await
+            .unwrap();
+        sequence = started.session.sequence;
+        let flushed = store
+            .flush_turn_for_actor(
+                "user-owner",
+                "session-tail",
+                FlushSessionRequest {
+                    turn_id,
+                    assistant_message: Some(format!("answer {ordinal}")),
+                    expected_sequence: sequence,
+                },
+                &format!("flush-{ordinal}"),
+            )
+            .await
+            .unwrap();
+        sequence = flushed.session.sequence;
+    }
+    assert_eq!(sequence, 12);
+
+    let first = store
+        .session_detail_page_for_actor("user-owner", "session-tail", None, 1, None, 2, None, 2)
+        .await
+        .unwrap();
+    assert_eq!(first.session.sequence, 12);
+    assert_eq!(first.run_ids.len(), 1);
+    assert_eq!(
+        first
+            .turns
+            .iter()
+            .map(|turn| turn.ordinal)
+            .collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+    assert_eq!(
+        first
+            .events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![11, 12]
+    );
+    let first_pagination = first.pagination.as_ref().unwrap();
+    assert!(first_pagination.run_ids.has_more);
+    assert!(first_pagination.turns.has_more);
+    assert!(first_pagination.events.has_more);
+
+    let run_ids_before = first_pagination.run_ids.next_before.clone().unwrap();
+    let older_run_ids = store
+        .session_detail_page_for_actor(
+            "user-owner",
+            "session-tail",
+            Some(&run_ids_before),
+            1,
+            None,
+            2,
+            None,
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(older_run_ids.run_ids.len(), 1);
+    assert_ne!(older_run_ids.run_ids, first.run_ids);
+    assert!(!older_run_ids.pagination.unwrap().run_ids.has_more);
+
+    assert!(matches!(
+        store
+            .session_detail_page_for_actor(
+                "user-owner",
+                "session-other",
+                Some(&run_ids_before),
+                1,
+                None,
+                2,
+                None,
+                2,
+            )
+            .await,
+        Err(StorageError::InvalidPageCursor)
+    ));
+
+    let turns_before = first_pagination.turns.next_before.clone().unwrap();
+    let older_turns = store
+        .session_detail_page_for_actor(
+            "user-owner",
+            "session-tail",
+            None,
+            1,
+            Some(&turns_before),
+            2,
+            None,
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(older_turns.turns.len(), 1);
+    assert_eq!(older_turns.turns[0].ordinal, 1);
+    assert!(!older_turns.pagination.unwrap().turns.has_more);
+
+    let first_events_before = first_pagination.events.next_before.clone().unwrap();
+    let mut event_sequences = first
+        .events
+        .iter()
+        .map(|event| event.sequence)
+        .collect::<Vec<_>>();
+    let mut events_before = Some(first_events_before.clone());
+    while let Some(before) = events_before {
+        let page = store
+            .session_detail_page_for_actor(
+                "user-owner",
+                "session-tail",
+                None,
+                1,
+                None,
+                2,
+                Some(&before),
+                2,
+            )
+            .await
+            .unwrap();
+        assert!(
+            page.events
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence)
+        );
+        event_sequences.extend(page.events.iter().map(|event| event.sequence));
+        events_before = page.pagination.unwrap().events.next_before;
+    }
+    event_sequences.sort_unstable();
+    assert_eq!(event_sequences, (1..=12).collect::<Vec<_>>());
+
+    assert!(matches!(
+        store
+            .session_detail_page_for_actor(
+                "user-owner",
+                "session-other",
+                None,
+                1,
+                None,
+                2,
+                Some(&first_events_before),
+                2,
+            )
+            .await,
+        Err(StorageError::InvalidPageCursor)
+    ));
+    assert!(matches!(
+        store
+            .session_detail_page_for_actor(
+                "user-owner",
+                "session-tail",
+                None,
+                1,
+                None,
+                2,
+                Some("not-a-cursor"),
+                2,
+            )
+            .await,
+        Err(StorageError::InvalidPageCursor)
+    ));
+    for (run_ids_limit, turns_limit, events_limit, expected_max) in [
+        (0, 2, 2, protocol::COLLECTION_PAGE_MAX_LIMIT),
+        (
+            1,
+            protocol::COLLECTION_PAGE_MAX_LIMIT + 1,
+            2,
+            protocol::COLLECTION_PAGE_MAX_LIMIT,
+        ),
+        (
+            1,
+            2,
+            protocol::EVENT_PAGE_MAX_LIMIT + 1,
+            protocol::EVENT_PAGE_MAX_LIMIT,
+        ),
+    ] {
+        assert!(matches!(
+            store
+                .session_detail_page_for_actor(
+                    "user-owner",
+                    "session-tail",
+                    None,
+                    run_ids_limit,
+                    None,
+                    turns_limit,
+                    None,
+                    events_limit,
+                )
+                .await,
+            Err(StorageError::InvalidPageLimit { max, .. }) if max == expected_max
+        ));
+    }
+    let future = crate::cursor::encode_session_events("session-tail", sequence + 1).unwrap();
+    assert!(matches!(
+        store
+            .session_detail_page_for_actor(
+                "user-owner",
+                "session-tail",
+                None,
+                1,
+                None,
+                2,
+                Some(&future),
+                2,
+            )
+            .await,
+        Err(StorageError::PageCursorBeyondHead { head }) if head == sequence
+    ));
+
+    insert_test_member(database.path(), "foreign-user", "foreign");
+    assert!(matches!(
+        store
+            .session_detail_page_for_actor(
+                "foreign-user",
+                "session-tail",
+                Some("not-a-cursor"),
+                0,
+                Some("not-a-cursor"),
+                0,
+                Some("not-a-cursor"),
+                0,
+            )
+            .await,
+        Err(StorageError::SessionNotFound(id)) if id == "session-tail"
+    ));
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let event_plan = explain_query_plan(
+        &connection,
+        r#"SELECT sequence FROM session_events
+           WHERE session_id = ?1 AND sequence < ?2
+           ORDER BY sequence DESC LIMIT ?3"#,
+        params!["session-tail", 9_i64, 3_i64],
+    );
+    assert!(
+        event_plan.contains("SEARCH session_events USING PRIMARY KEY"),
+        "unexpected Session event-tail plan: {event_plan}"
+    );
+    let attachment_plan = explain_query_plan(
+        &connection,
+        r#"SELECT run_id, attached_at FROM session_runs
+           WHERE session_id = ?1 AND attached_at < ?2
+           ORDER BY attached_at DESC, run_id DESC LIMIT ?3"#,
+        params!["session-tail", "9999-12-31T23:59:59Z", 2_i64],
+    );
+    assert!(
+        attachment_plan.contains("session_runs_session_attached_idx"),
+        "unexpected Run-attachment tail plan: {attachment_plan}"
+    );
+}
+
+#[tokio::test]
+async fn actor_bounded_run_reads_latest_tail_with_scoped_cursor_and_one_head() {
+    let total = protocol::EVENT_PAGE_MAX_LIMIT + 2;
+    let store = bounded_event_store(total).await;
+
+    let first = store
+        .bounded_run_for_actor("user-owner", RUN_ID, None, 128)
+        .await
+        .unwrap();
+    assert_eq!(first.snapshot.run.sequence, total as u64);
+    assert_eq!(first.events.len(), 128);
+    assert_eq!(first.events.first().unwrap().sequence, 131);
+    assert_eq!(first.events.last().unwrap().sequence, 258);
+    assert!(first.events_page.has_more);
+    let first_before = first.events_page.next_before.unwrap();
+
+    let second = store
+        .bounded_run_for_actor("user-owner", RUN_ID, Some(&first_before), 128)
+        .await
+        .unwrap();
+    assert_eq!(second.snapshot.run.sequence, total as u64);
+    assert_eq!(second.events.first().unwrap().sequence, 3);
+    assert_eq!(second.events.last().unwrap().sequence, 130);
+    assert!(second.events_page.has_more);
+    let second_before = second.events_page.next_before.unwrap();
+
+    let third = store
+        .bounded_run_for_actor("user-owner", RUN_ID, Some(&second_before), 128)
+        .await
+        .unwrap();
+    assert_eq!(
+        third
+            .events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert!(!third.events_page.has_more);
+    assert!(third.events_page.next_before.is_none());
+
+    for invalid_limit in [0, protocol::EVENT_PAGE_MAX_LIMIT + 1] {
+        assert!(matches!(
+            store
+                .bounded_run_for_actor("user-owner", RUN_ID, None, invalid_limit)
+                .await,
+            Err(StorageError::InvalidPageLimit { limit, max })
+                if limit == invalid_limit && max == protocol::EVENT_PAGE_MAX_LIMIT
+        ));
+    }
+    assert!(matches!(
+        store
+            .bounded_run_for_actor("user-owner", RUN_ID, Some("not-a-cursor"), 2)
+            .await,
+        Err(StorageError::InvalidPageCursor)
+    ));
+    assert!(matches!(
+        store
+            .bounded_run_for_actor("user-owner", RUN_ID, Some(&(first_before.clone() + "=")), 2,)
+            .await,
+        Err(StorageError::InvalidPageCursor)
+    ));
+    let wrong_kind = crate::cursor::encode_session_events("session-tail", 2).unwrap();
+    assert!(matches!(
+        store
+            .bounded_run_for_actor("user-owner", RUN_ID, Some(&wrong_kind), 2)
+            .await,
+        Err(StorageError::InvalidPageCursor)
+    ));
+    let future = crate::cursor::encode_run_events(RUN_ID, total as u64 + 1).unwrap();
+    assert!(matches!(
+        store
+            .bounded_run_for_actor("user-owner", RUN_ID, Some(&future), 2)
+            .await,
+        Err(StorageError::PageCursorBeyondHead { head }) if head == total as u64
+    ));
+    assert!(matches!(
+        store
+            .bounded_run_for_actor("foreign-user", RUN_ID, Some("not-a-cursor"), 0)
+            .await,
+        Err(StorageError::RunNotFound(id)) if id == RUN_ID
     ));
 }
 
@@ -2696,6 +3243,33 @@ async fn active_owner_and_member_have_independent_session_receipt_namespaces() {
         .unwrap();
     assert_eq!(owner_turn.turn.id, "turn-owner-scope");
     assert_eq!(member_turn.turn.id, "turn-member-scope");
+    assert_eq!(
+        store
+            .session_turn_for_actor("user-owner", "session-owner-scope", "turn-owner-scope",)
+            .await
+            .unwrap(),
+        owner_turn.turn
+    );
+    assert!(matches!(
+        store
+            .session_turn_for_actor(
+                "user-member",
+                "session-owner-scope",
+                " malformed-turn ",
+            )
+            .await,
+        Err(StorageError::SessionNotFound(id)) if id == "session-owner-scope"
+    ));
+    assert!(matches!(
+        store
+            .session_turn_for_actor(
+                "user-owner",
+                "session-owner-scope",
+                "unknown-turn",
+            )
+            .await,
+        Err(StorageError::SessionTurnNotFound(id)) if id == "unknown-turn"
+    ));
     assert!(matches!(
         store
             .get_session_for_actor("user-member", "session-owner-scope")

@@ -338,6 +338,7 @@ impl DemoScenario {
             recent_events: self.events.clone(),
             evidence: self.evidence.clone(),
             tool_policy: Some(self.tool_policy.clone()),
+            recent_events_page: None,
         }
     }
 }

@@ -20,18 +20,18 @@ use kernel::{
 };
 use protocol::{
     Approval, ApprovalStatus, AttachRunRequest, AttachRunResponse, CreateSessionRequest,
-    CreateSessionResponse, FlushSessionRequest, FlushSessionResponse, NotDispatchedReason,
-    OverviewResponse, PolicyDecision, ResourceEnvelopeError, ResumeSessionRequest,
-    ResumeSessionResponse, ReviewDecision, ReviewRequest, ReviewResponse, RunDetail, RunEvent,
-    RunEventData, RunEventPage, RunSummary, SessionDetail, SessionEvent, SessionEventData,
-    SessionEventPage, SessionSummary, StartTurnRequest, StartTurnResponse, ToolCall,
-    ToolExecutorStatus, ToolOutcome,
+    CreateSessionResponse, EVENT_PAGE_DEFAULT_LIMIT, FlushSessionRequest, FlushSessionResponse,
+    NotDispatchedReason, OverviewResponse, PolicyDecision, ResourceEnvelopeError,
+    ResumeSessionRequest, ResumeSessionResponse, ReviewDecision, ReviewRequest, ReviewResponse,
+    RunDetail, RunDetailPagination, RunEvent, RunEventData, RunEventPage, RunSummary,
+    SessionDetail, SessionEvent, SessionEventData, SessionEventPage, SessionSummary, SessionTurn,
+    StartTurnRequest, StartTurnResponse, ToolCall, ToolExecutorStatus, ToolOutcome,
 };
 pub use storage::{
     AuthPrincipal, AuthSessionCommit, BootstrapOwnerCommit, ReplyClaimOutcome, ReplyCompletion,
     ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus,
-    ReplyOutcomeUnknownCommit, ReplySuccessCommit, StoredCredential, StoredPreferences, StoredUser,
-    StoredUserRole, StoredUserStatus,
+    ReplyOutcomeUnknownCommit, ReplySuccessCommit, SessionSummaryPage, StoredCredential,
+    StoredPreferences, StoredUser, StoredUserRole, StoredUserStatus,
 };
 use storage::{
     ClaimOutcome, CommitOutcome, DispatchCompleteCommit, DispatchContext, DispatchJob,
@@ -149,6 +149,12 @@ pub enum StoreError {
     EventCursorOutOfRange { after: u64 },
     #[error("event cursor {after} is ahead of durable ledger head {head_sequence}")]
     EventCursorBeyondHead { after: u64, head_sequence: u64 },
+    #[error("read page limit {limit} is invalid; expected 1..={max}")]
+    InvalidPageLimit { limit: usize, max: usize },
+    #[error("read page cursor is invalid")]
+    InvalidPageCursor,
+    #[error("read page cursor is ahead of the durable collection head {head}")]
+    PageCursorBeyondHead { head: u64 },
     #[error(transparent)]
     Kernel(#[from] KernelError),
     #[error(transparent)]
@@ -191,6 +197,9 @@ impl From<StorageError> for StoreError {
                 after,
                 head_sequence,
             },
+            StorageError::InvalidPageLimit { limit, max } => Self::InvalidPageLimit { limit, max },
+            StorageError::InvalidPageCursor => Self::InvalidPageCursor,
+            StorageError::PageCursorBeyondHead { head } => Self::PageCursorBeyondHead { head },
             other => Self::Storage(other),
         }
     }
@@ -385,6 +394,7 @@ impl DemoStore {
             recent_events: stored.events,
             evidence: stored.snapshot.evidence,
             tool_policy: stored.snapshot.tool_policy,
+            recent_events_page: None,
         })
     }
 
@@ -398,7 +408,12 @@ impl DemoStore {
     ) -> Result<OverviewResponse, StoreError> {
         let stored = self
             .storage
-            .load_run_for_actor(actor_user_id, &self.primary_run_id)
+            .bounded_run_for_actor(
+                actor_user_id,
+                &self.primary_run_id,
+                None,
+                EVENT_PAGE_DEFAULT_LIMIT,
+            )
             .await?;
         Ok(OverviewResponse {
             primary_session_id: self.primary_session_id.to_string(),
@@ -408,6 +423,7 @@ impl DemoStore {
             recent_events: stored.events,
             evidence: stored.snapshot.evidence,
             tool_policy: stored.snapshot.tool_policy,
+            recent_events_page: Some(stored.events_page),
         })
     }
 
@@ -418,6 +434,7 @@ impl DemoStore {
             incident: stored.snapshot.incident,
             run: stored.snapshot.run,
             events: stored.events,
+            pagination: None,
         })
     }
 
@@ -425,16 +442,21 @@ impl DemoStore {
         &self,
         actor_user_id: &str,
         run_id: &str,
+        events_before: Option<&str>,
+        events_limit: usize,
     ) -> Result<RunDetail, StoreError> {
         validate_durable_reference(run_id, "run ID")?;
         let stored = self
             .storage
-            .load_run_for_actor(actor_user_id, run_id)
+            .bounded_run_for_actor(actor_user_id, run_id, events_before, events_limit)
             .await?;
         Ok(RunDetail {
             incident: stored.snapshot.incident,
             run: stored.snapshot.run,
             events: stored.events,
+            pagination: Some(RunDetailPagination {
+                events: stored.events_page,
+            }),
         })
     }
 
@@ -530,8 +552,13 @@ impl DemoStore {
     pub async fn list_sessions_for_actor(
         &self,
         actor_user_id: &str,
-    ) -> Result<Vec<SessionSummary>, StoreError> {
-        Ok(self.storage.list_sessions_for_actor(actor_user_id).await?)
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<SessionSummaryPage, StoreError> {
+        Ok(self
+            .storage
+            .session_summary_page_for_actor(actor_user_id, cursor, limit)
+            .await?)
     }
 
     pub async fn get_session(&self, session_id: &str) -> Result<SessionDetail, StoreError> {
@@ -544,15 +571,44 @@ impl DemoStore {
         Ok(self.storage.session_summary(session_id).await?)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_session_for_actor(
         &self,
         actor_user_id: &str,
         session_id: &str,
+        run_ids_before: Option<&str>,
+        run_ids_limit: usize,
+        turns_before: Option<&str>,
+        turns_limit: usize,
+        events_before: Option<&str>,
+        events_limit: usize,
     ) -> Result<SessionDetail, StoreError> {
         validate_durable_reference(session_id, "session ID")?;
         Ok(self
             .storage
-            .get_session_for_actor(actor_user_id, session_id)
+            .session_detail_page_for_actor(
+                actor_user_id,
+                session_id,
+                run_ids_before,
+                run_ids_limit,
+                turns_before,
+                turns_limit,
+                events_before,
+                events_limit,
+            )
+            .await?)
+    }
+
+    pub async fn session_turn_for_actor(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<SessionTurn, StoreError> {
+        validate_durable_reference(session_id, "session ID")?;
+        Ok(self
+            .storage
+            .session_turn_for_actor(actor_user_id, session_id, turn_id)
             .await?)
     }
 
@@ -1945,7 +2001,12 @@ mod tests {
         // pre-existing queued job during startup.
         store.auto_dispatch = true;
         let run_before = store
-            .run_detail_for_actor(TEST_OWNER_ID, DEMO_RUN_ID)
+            .run_detail_for_actor(
+                TEST_OWNER_ID,
+                DEMO_RUN_ID,
+                None,
+                protocol::EVENT_PAGE_DEFAULT_LIMIT,
+            )
             .await
             .unwrap();
         let mut session_feed = store
@@ -2029,7 +2090,12 @@ mod tests {
 
         assert_eq!(
             store
-                .run_detail_for_actor(TEST_OWNER_ID, DEMO_RUN_ID)
+                .run_detail_for_actor(
+                    TEST_OWNER_ID,
+                    DEMO_RUN_ID,
+                    None,
+                    protocol::EVENT_PAGE_DEFAULT_LIMIT,
+                )
                 .await
                 .unwrap(),
             run_before
@@ -2060,7 +2126,12 @@ mod tests {
         .unwrap();
         bootstrap_test_owner(&store).await;
         let run_before = store
-            .run_detail_for_actor(TEST_OWNER_ID, DEMO_RUN_ID)
+            .run_detail_for_actor(
+                TEST_OWNER_ID,
+                DEMO_RUN_ID,
+                None,
+                protocol::EVENT_PAGE_DEFAULT_LIMIT,
+            )
             .await
             .unwrap();
         store
@@ -2086,7 +2157,16 @@ mod tests {
         .await
         .unwrap();
         let detail = reopened
-            .get_session_for_actor(TEST_OWNER_ID, DEMO_SESSION_ID)
+            .get_session_for_actor(
+                TEST_OWNER_ID,
+                DEMO_SESSION_ID,
+                None,
+                protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                None,
+                protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                None,
+                protocol::EVENT_PAGE_DEFAULT_LIMIT,
+            )
             .await
             .unwrap();
         assert_eq!(detail.session.status, SessionStatus::NeedsAttention);
@@ -2105,7 +2185,12 @@ mod tests {
         );
         assert_eq!(
             reopened
-                .run_detail_for_actor(TEST_OWNER_ID, DEMO_RUN_ID)
+                .run_detail_for_actor(
+                    TEST_OWNER_ID,
+                    DEMO_RUN_ID,
+                    None,
+                    protocol::EVENT_PAGE_DEFAULT_LIMIT,
+                )
                 .await
                 .unwrap(),
             run_before
@@ -2137,7 +2222,16 @@ mod tests {
         assert!(replayed.replayed);
         assert_eq!(
             reopened
-                .get_session_for_actor(TEST_OWNER_ID, DEMO_SESSION_ID)
+                .get_session_for_actor(
+                    TEST_OWNER_ID,
+                    DEMO_SESSION_ID,
+                    None,
+                    protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                    None,
+                    protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                    None,
+                    protocol::EVENT_PAGE_DEFAULT_LIMIT,
+                )
                 .await
                 .unwrap()
                 .session
@@ -2146,7 +2240,12 @@ mod tests {
         );
         assert_eq!(
             reopened
-                .run_detail_for_actor(TEST_OWNER_ID, DEMO_RUN_ID)
+                .run_detail_for_actor(
+                    TEST_OWNER_ID,
+                    DEMO_RUN_ID,
+                    None,
+                    protocol::EVENT_PAGE_DEFAULT_LIMIT,
+                )
                 .await
                 .unwrap(),
             run_before
@@ -2158,15 +2257,71 @@ mod tests {
         let store = production_store(false).await;
         let overview = store.overview_for_actor(TEST_OWNER_ID).await.unwrap();
         assert_eq!(overview.primary_session_id, DEMO_SESSION_ID);
-        let sessions = store.list_sessions_for_actor(TEST_OWNER_ID).await.unwrap();
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].id, DEMO_SESSION_ID);
+        assert_eq!(overview.recent_events.len(), 8);
+        assert_eq!(
+            overview.recent_events_page,
+            Some(protocol::ReadPageInfo {
+                next_before: None,
+                has_more: false,
+            })
+        );
+        let latest_run = store
+            .run_detail_for_actor(TEST_OWNER_ID, DEMO_RUN_ID, None, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            latest_run
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![6, 7, 8]
+        );
+        let run_page = latest_run.pagination.unwrap().events;
+        assert!(run_page.has_more);
+        let older_run = store
+            .run_detail_for_actor(
+                TEST_OWNER_ID,
+                DEMO_RUN_ID,
+                run_page.next_before.as_deref(),
+                3,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            older_run
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+        let sessions = store
+            .list_sessions_for_actor(TEST_OWNER_ID, None, protocol::COLLECTION_PAGE_DEFAULT_LIMIT)
+            .await
+            .unwrap();
+        assert_eq!(sessions.items.len(), 1);
+        assert_eq!(sessions.items[0].id, DEMO_SESSION_ID);
+        assert!(sessions.next_cursor.is_none());
         let detail = store
-            .get_session_for_actor(TEST_OWNER_ID, DEMO_SESSION_ID)
+            .get_session_for_actor(
+                TEST_OWNER_ID,
+                DEMO_SESSION_ID,
+                None,
+                protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                None,
+                protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                None,
+                protocol::EVENT_PAGE_DEFAULT_LIMIT,
+            )
             .await
             .unwrap();
         assert_eq!(detail.run_ids, vec![DEMO_RUN_ID]);
         assert_eq!(detail.events.len(), 2);
+        let detail_page = detail.pagination.unwrap();
+        assert!(!detail_page.run_ids.has_more);
+        assert!(!detail_page.turns.has_more);
+        assert!(!detail_page.events.has_more);
     }
 
     #[tokio::test]
@@ -2187,7 +2342,14 @@ mod tests {
         );
         assert!(
             matches!(
-                store.run_detail_for_actor(OTHER_ACTOR, DEMO_RUN_ID).await,
+                store
+                    .run_detail_for_actor(
+                        OTHER_ACTOR,
+                        DEMO_RUN_ID,
+                        None,
+                        protocol::EVENT_PAGE_DEFAULT_LIMIT,
+                    )
+                    .await,
                 Err(StoreError::RunNotFound(id)) if id == DEMO_RUN_ID
             ),
             "run detail must conceal another owner's run"
@@ -2213,7 +2375,18 @@ mod tests {
 
         assert!(
             matches!(
-                store.get_session_for_actor(OTHER_ACTOR, DEMO_SESSION_ID).await,
+                store
+                    .get_session_for_actor(
+                        OTHER_ACTOR,
+                        DEMO_SESSION_ID,
+                        None,
+                        protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                        None,
+                        protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                        None,
+                        protocol::EVENT_PAGE_DEFAULT_LIMIT,
+                    )
+                    .await,
                 Err(StoreError::SessionNotFound(id)) if id == DEMO_SESSION_ID
             ),
             "session detail must conceal another owner's session"
@@ -2291,7 +2464,16 @@ mod tests {
         );
         assert_eq!(
             store
-                .get_session_for_actor(TEST_OWNER_ID, DEMO_SESSION_ID)
+                .get_session_for_actor(
+                    TEST_OWNER_ID,
+                    DEMO_SESSION_ID,
+                    None,
+                    protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                    None,
+                    protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                    None,
+                    protocol::EVENT_PAGE_DEFAULT_LIMIT,
+                )
                 .await
                 .unwrap()
                 .session
@@ -2399,7 +2581,16 @@ mod tests {
     async fn runtime_envelope_rejections_leave_session_receipts_and_ledger_untouched() {
         let store = production_store(false).await;
         let before = store
-            .get_session_for_actor(TEST_OWNER_ID, DEMO_SESSION_ID)
+            .get_session_for_actor(
+                TEST_OWNER_ID,
+                DEMO_SESSION_ID,
+                None,
+                protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                None,
+                protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                None,
+                protocol::EVENT_PAGE_DEFAULT_LIMIT,
+            )
             .await
             .unwrap();
 
@@ -2435,7 +2626,16 @@ mod tests {
         ));
 
         let unchanged = store
-            .get_session_for_actor(TEST_OWNER_ID, DEMO_SESSION_ID)
+            .get_session_for_actor(
+                TEST_OWNER_ID,
+                DEMO_SESSION_ID,
+                None,
+                protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                None,
+                protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                None,
+                protocol::EVENT_PAGE_DEFAULT_LIMIT,
+            )
             .await
             .unwrap();
         assert_eq!(unchanged, before);
@@ -2459,7 +2659,12 @@ mod tests {
     async fn runtime_review_note_envelope_rejects_before_fingerprint_receipt_and_ledger() {
         let store = production_store(false).await;
         let before = store
-            .run_detail_for_actor(TEST_OWNER_ID, DEMO_RUN_ID)
+            .run_detail_for_actor(
+                TEST_OWNER_ID,
+                DEMO_RUN_ID,
+                None,
+                protocol::EVENT_PAGE_DEFAULT_LIMIT,
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -2512,7 +2717,12 @@ mod tests {
         );
         assert_eq!(
             store
-                .run_detail_for_actor(TEST_OWNER_ID, DEMO_RUN_ID)
+                .run_detail_for_actor(
+                    TEST_OWNER_ID,
+                    DEMO_RUN_ID,
+                    None,
+                    protocol::EVENT_PAGE_DEFAULT_LIMIT,
+                )
                 .await
                 .unwrap(),
             before

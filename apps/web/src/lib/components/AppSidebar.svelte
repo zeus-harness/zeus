@@ -9,9 +9,13 @@
 		activeSessionId: string;
 		creatingSession: boolean;
 		sessionActionError?: string;
+		hasMoreSessions: boolean;
+		loadingMoreSessions: boolean;
+		sessionListError?: string;
 		onClose: () => void;
 		onCreateSession: () => void;
 		onSelectSession: (sessionId: string) => void;
+		onLoadMoreSessions: () => void;
 		onOpenSettings: (trigger: HTMLButtonElement) => void;
 	}
 
@@ -21,9 +25,13 @@
 		activeSessionId,
 		creatingSession,
 		sessionActionError = '',
+		hasMoreSessions,
+		loadingMoreSessions,
+		sessionListError = '',
 		onClose,
 		onCreateSession,
 		onSelectSession,
+		onLoadMoreSessions,
 		onOpenSettings
 	}: Props = $props();
 
@@ -120,6 +128,23 @@
 					></span>
 				</button>
 			{/each}
+			{#if hasMoreSessions}
+				<div class="px-2 pt-2 pb-3 text-center">
+					<button
+						type="button"
+						disabled={loadingMoreSessions}
+						class="border-zeus-border text-zeus-muted hover:bg-zeus-surface-2 hover:text-zeus-text h-8 px-3 text-xs rounded-lg w-full border transition-colors disabled:cursor-wait disabled:opacity-70"
+						onclick={onLoadMoreSessions}
+					>
+						{loadingMoreSessions ? 'Loading…' : sessionListError ? 'Try again' : 'Load more'}
+					</button>
+					{#if sessionListError}
+						<p class="text-zeus-red mt-1.5 leading-4 text-[10px]" role="alert">
+							{sessionListError}
+						</p>
+					{/if}
+				</div>
+			{/if}
 		</div>
 	</nav>
 

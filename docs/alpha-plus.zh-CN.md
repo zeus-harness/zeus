@@ -1,7 +1,7 @@
 # Zeus Harness Alpha+ 设计冻结
 
-状态：主机 Alpha+、Actor Boundary Foundation、API Resource Envelope、Bounded Event Feed 与 Point-query Durable Context 验收通过；Apple container 新镜像验收待完成
-前置基线：`7c4c269`（Bounded Event Feed）
+状态：主机 Alpha+、Actor Boundary Foundation、API Resource Envelope、Bounded Event Feed、Point-query Durable Context 与 Bounded Read Models 验收通过；Apple container 新镜像验收待完成
+前置基线：`78a65e1`（Point-query Durable Context）
 
 ## 1. 产品术语
 
@@ -46,8 +46,8 @@ Health 路由保持公开。公开注册、邮件找回、OAuth/SSO、WebAuthn �
   `authorization_revoked` 证据，provider/connector 调用次数必须为零。
 
 这些边界只是未来 member 能力的安全底座。当前 API 仍拒绝 member 登录；字段、HTTP/SSE
-连接、事件页边界和内部 point/batch read 已经落地，但 Session/Run list/detail 与 SQLite
-存储/队列配额完成前不得开放 member。
+连接、事件页边界、内部 point/batch read 和 Session/Run 有界 read model 已经落地，但
+SQLite 存储/队列配额完成前不得开放 member。
 
 Resource Envelope 的固定边界：auth JSON 8 KiB、command JSON 512 KiB；新建 Session/turn
 ID 128 UTF-8 bytes、Session title 256 bytes、user message 64 KiB、review note 8 KiB；
@@ -56,6 +56,16 @@ ledger-local ID；pre-v9 durable ID 继续可寻址，避免升级后数据失�
 fingerprint/receipt 之前。Run/Session SSE 共用 global 64、每 actor 4 条连接配额，permit
 由 response body 持有。initial/hint/lag/poll 每次只从 SQLite 读取最多 128 条事件的
 `LIMIT + 1` page；积压通过 cooperative continuation 分页补齐，cursor 只随已发送事件推进。
+
+生产读取同样固定为 indexed `LIMIT + 1` keyset page：Session 列表默认 50、最大 100，
+保持裸数组响应并通过 `X-Zeus-Next-Cursor` 返回续页 cursor；Session detail 的 Run ID/turn
+分别默认 50、最大 100，Session event 默认 128、最大 256；Run detail 与 overview 的 Run
+event 默认 128、最大 256。详情 collection 以 `pagination.*.{next_before,has_more}` 返回独立、
+actor/resource scope 绑定的 opaque cursor，页内仍按原顺序升序输出。鉴权、projection/tail 校验和各页
+读取位于同一 SQLite snapshot；foreign resource 在 limit/cursor 语义检查前统一得到 `404`。
+不在 bounded turn tail 中的 durable retry identity 通过 actor-scoped turn point GET 确认；无法
+确认时保留原 idempotency key，不把旧消息改成新命令重发。异步点查返回前若用户切换 Session
+或 attempt identity 已改变，selection epoch/session/turn/key guard 会丢弃旧结果。
 
 ## 4. 设置
 
@@ -110,11 +120,17 @@ POST /sessions/{id}/turns
 - owner-only 认证门槛和 Alice/Bob 的 REST、SSE、receipt collision 隔离有自动测试；
   未拥有资源统一为 `404`，member cookie 在产品 gate 打开前保持 `401`。
 - New Session 创建、切换和刷新后恢复通过浏览器测试，旧 SSE 会被关闭。
+- 101 个 Session 可按 50/50/1 无重漏遍历；活动 Session 即使位于后续页也先用 point detail
+  恢复，只有权威 `404` 才回退 primary Session。侧栏续页追加时按 ID 去重并保留已加载摘要。
+- 51 个 turn 后，最旧 turn 即使离开默认 tail 仍可通过 actor-scoped point GET 恢复；Web
+  使用 primary Session identity 判断主 Run 展示，不把 attachment tail 误当全集。
 - user message 之后由服务端产生 durable assistant/failure event；浏览器不能提交 assistant content。
 - `system/light/dark` 首屏无闪白，刷新后保持，系统主题变化可跟随。
 - reply job 的 queued/start/success/failure/outcome_unknown 和重启语义有存储测试。
 - v8 到 v9 的 typed lookup 回填不改写 payload；不连续 ledger 整体回滚，64+1 条恢复任务
   通过两批排空，同 key 并发审批只提交一次并重放其余响应。
+- Session/Run detail 只返回最新 bounded tail；opaque cursor 的 kind、resource scope、canonical
+  encoding、future-head 和跨资源使用均有自动测试，返回页保持连续且升序。
 - disabled/降权/owner mismatch 的 reply 与 dispatch claim 不触达外部执行，并留下
   durable terminal evidence。
 - body、字段和幂等键超限在 fingerprint/receipt/ledger/job 前失败；413/415/422/429

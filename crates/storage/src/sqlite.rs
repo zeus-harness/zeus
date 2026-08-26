@@ -11,26 +11,29 @@ use chrono::{SecondsFormat, Utc};
 use fs2::FileExt;
 use protocol::{
     ApprovalScope, ApprovalStatus, AssistantReplyProvenance, AttachRunRequest, AttachRunResponse,
-    CreateSessionRequest, CreateSessionResponse, EVENT_PAGE_MAX_LIMIT, EventType,
-    FlushSessionRequest, FlushSessionResponse, IncidentStatus, IncidentSummary,
-    NotDispatchedReason, ResourceEnvelopeError, ResumeSessionRequest, ResumeSessionResponse,
-    ReviewDecision, ReviewResponse, RunEvent, RunEventData, RunEventPage, RunStatus, RunSummary,
-    SandboxProfile, SessionDetail, SessionEvent, SessionEventData, SessionEventPage,
-    SessionFlushAck, SessionStatus, SessionSummary, SessionTurn, SessionTurnStatus, Severity,
-    StartTurnRequest, StartTurnResponse, ToolCallStatus, ToolEffect, ToolOutcome,
+    COLLECTION_PAGE_MAX_LIMIT, CreateSessionRequest, CreateSessionResponse, EVENT_PAGE_MAX_LIMIT,
+    EventType, FlushSessionRequest, FlushSessionResponse, IncidentStatus, IncidentSummary,
+    NotDispatchedReason, ReadPageInfo, ResourceEnvelopeError, ResumeSessionRequest,
+    ResumeSessionResponse, ReviewDecision, ReviewResponse, RunEvent, RunEventData, RunEventPage,
+    RunStatus, RunSummary, SandboxProfile, SessionDetail, SessionDetailPagination, SessionEvent,
+    SessionEventData, SessionEventPage, SessionFlushAck, SessionStatus, SessionSummary,
+    SessionTurn, SessionTurnStatus, Severity, StartTurnRequest, StartTurnResponse, ToolCallStatus,
+    ToolEffect, ToolOutcome,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
+use crate::cursor;
 use crate::{
-    AuthPrincipal, AuthSessionCommit, BootstrapOwnerCommit, ClaimOutcome, CommitOutcome,
-    DispatchCompleteCommit, DispatchContext, DispatchJob, DispatchJobSpec, DispatchRecoveryCommit,
-    DispatchRejection, DispatchStartCommit, DispatchStatus, RecoveredSessionTurn,
-    ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse,
-    ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit, ReplySuccessCommit, ReviewCommit,
-    ReviewContext, ReviewReceipt, RunSnapshot, RuntimeIdentity, StorageError, StoredCredential,
-    StoredPreferences, StoredRun, StoredUser, StoredUserRole, StoredUserStatus,
+    AuthPrincipal, AuthSessionCommit, BootstrapOwnerCommit, BoundedRunRead, ClaimOutcome,
+    CommitOutcome, DispatchCompleteCommit, DispatchContext, DispatchJob, DispatchJobSpec,
+    DispatchRecoveryCommit, DispatchRejection, DispatchStartCommit, DispatchStatus,
+    RecoveredSessionTurn, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit, ReplyJob,
+    ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
+    ReplySuccessCommit, ReviewCommit, ReviewContext, ReviewReceipt, RunSnapshot, RuntimeIdentity,
+    SessionSummaryPage, StorageError, StoredCredential, StoredPreferences, StoredRun, StoredUser,
+    StoredUserRole, StoredUserStatus,
 };
 
 const CURRENT_SCHEMA_VERSION: i64 = 9;
@@ -160,6 +163,28 @@ impl SqliteStore {
         .await
     }
 
+    /// Returns one actor-scoped keyset page while keeping the public JSON body
+    /// compatible with the historical bare Session-summary array.
+    pub async fn session_summary_page_for_actor(
+        &self,
+        actor_user_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<SessionSummaryPage, StorageError> {
+        let actor_user_id =
+            normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
+        let cursor = cursor.map(str::to_owned);
+        self.with_connection(move |connection| {
+            query_session_summary_page_for_actor(
+                connection,
+                &actor_user_id,
+                cursor.as_deref(),
+                limit,
+            )
+        })
+        .await
+    }
+
     /// System/test-only unscoped read. Authenticated paths must use
     /// [`Self::get_session_for_actor`].
     pub async fn get_session(&self, session_id: &str) -> Result<SessionDetail, StorageError> {
@@ -178,6 +203,65 @@ impl SqliteStore {
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         self.with_connection(move |connection| {
             query_session_detail_for_actor(connection, &actor_user_id, &session_id)
+        })
+        .await
+    }
+
+    /// Returns bounded latest-first history slices, normalized back to the
+    /// ascending collection order used by the original Session detail shape.
+    /// Authorization, projection checks, and every page are read from one
+    /// SQLite snapshot.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn session_detail_page_for_actor(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+        run_ids_before: Option<&str>,
+        run_ids_limit: usize,
+        turns_before: Option<&str>,
+        turns_limit: usize,
+        events_before: Option<&str>,
+        events_limit: usize,
+    ) -> Result<SessionDetail, StorageError> {
+        let actor_user_id =
+            normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        let run_ids_before = run_ids_before.map(str::to_owned);
+        let turns_before = turns_before.map(str::to_owned);
+        let events_before = events_before.map(str::to_owned);
+        self.with_connection(move |connection| {
+            query_session_detail_page_for_actor(
+                connection,
+                &actor_user_id,
+                &session_id,
+                run_ids_before.as_deref(),
+                run_ids_limit,
+                turns_before.as_deref(),
+                turns_limit,
+                events_before.as_deref(),
+                events_limit,
+            )
+        })
+        .await
+    }
+
+    /// Returns one durable Session turn after authorizing its parent Session.
+    /// The parent authorization and point lookup share one SQLite snapshot so
+    /// an unknown turn cannot reveal a foreign Session.
+    pub async fn session_turn_for_actor(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<SessionTurn, StorageError> {
+        let actor_user_id =
+            normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        // Durable references intentionally have no new-write byte ceiling so
+        // pre-envelope turn IDs remain addressable.
+        let turn_id = turn_id.to_owned();
+        self.with_connection(move |connection| {
+            query_session_turn_for_actor(connection, &actor_user_id, &session_id, &turn_id)
         })
         .await
     }
@@ -827,6 +911,31 @@ impl SqliteStore {
         let run_id = validated_durable_reference(run_id, "run ID")?.to_owned();
         self.with_connection(move |connection| {
             load_run_for_actor(connection, &actor_user_id, &run_id)
+        })
+        .await
+    }
+
+    /// Returns one actor-scoped Run projection and one bounded event-history
+    /// tail from the same SQLite read transaction.
+    pub async fn bounded_run_for_actor(
+        &self,
+        actor_user_id: &str,
+        run_id: &str,
+        events_before: Option<&str>,
+        events_limit: usize,
+    ) -> Result<BoundedRunRead, StorageError> {
+        let actor_user_id =
+            normalized_account_value(actor_user_id, "run actor user ID", 128)?.to_owned();
+        let run_id = validated_durable_reference(run_id, "run ID")?.to_owned();
+        let events_before = events_before.map(str::to_owned);
+        self.with_connection(move |connection| {
+            query_bounded_run_for_actor(
+                connection,
+                &actor_user_id,
+                &run_id,
+                events_before.as_deref(),
+                events_limit,
+            )
         })
         .await
     }
@@ -2513,6 +2622,83 @@ fn query_session_summaries_for_actor(
     Ok(summaries)
 }
 
+fn query_session_summary_page_for_actor(
+    connection: &mut Connection,
+    actor_user_id: &str,
+    page_cursor: Option<&str>,
+    limit: usize,
+) -> Result<SessionSummaryPage, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    require_active_user(&transaction, actor_user_id)?;
+    let fetch_limit = validated_read_page_limit(limit, COLLECTION_PAGE_MAX_LIMIT)?;
+    let page_cursor = page_cursor
+        .map(|value| cursor::decode_session_list(value, actor_user_id))
+        .transpose()?;
+
+    let rows = if let Some(page_cursor) = page_cursor {
+        let mut statement = transaction.prepare(
+            r#"SELECT id, title, status, created_at, updated_at, sequence,
+                      projection_sequence, active_turn_id
+               FROM sessions
+               WHERE owner_user_id = ?1
+                 AND (updated_at < ?2 OR (updated_at = ?2 AND id > ?3))
+               ORDER BY updated_at DESC, id ASC
+               LIMIT ?4"#,
+        )?;
+        statement
+            .query_map(
+                params![
+                    actor_user_id,
+                    page_cursor.first,
+                    page_cursor.second,
+                    fetch_limit
+                ],
+                decode_session_summary_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        let mut statement = transaction.prepare(
+            r#"SELECT id, title, status, created_at, updated_at, sequence,
+                      projection_sequence, active_turn_id
+               FROM sessions
+               WHERE owner_user_id = ?1
+               ORDER BY updated_at DESC, id ASC
+               LIMIT ?2"#,
+        )?;
+        statement
+            .query_map(
+                params![actor_user_id, fetch_limit],
+                decode_session_summary_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    let has_more = rows.len() > limit;
+    let mut summaries = Vec::with_capacity(rows.len().min(limit));
+    for row in rows.into_iter().take(limit) {
+        let summary = row.decode()?;
+        validate_session_event_tail(&transaction, &summary)?;
+        summaries.push(summary);
+    }
+    let next_cursor = if has_more {
+        let last = summaries.last().ok_or_else(|| {
+            StorageError::CorruptData("Session page sentinel has no returned item".into())
+        })?;
+        Some(cursor::encode_session_list(
+            actor_user_id,
+            &last.updated_at,
+            &last.id,
+        )?)
+    } else {
+        None
+    };
+    transaction.commit()?;
+    Ok(SessionSummaryPage {
+        items: summaries,
+        next_cursor,
+    })
+}
+
 fn query_consistent_session_summary(
     connection: &mut Connection,
     session_id: &str,
@@ -2627,6 +2813,7 @@ fn query_session_detail(
         run_ids,
         turns,
         events,
+        pagination: None,
     })
 }
 
@@ -2669,6 +2856,369 @@ fn query_session_detail_for_actor(
         run_ids,
         turns,
         events,
+        pagination: None,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn query_session_detail_page_for_actor(
+    connection: &mut Connection,
+    actor_user_id: &str,
+    session_id: &str,
+    run_ids_before: Option<&str>,
+    run_ids_limit: usize,
+    turns_before: Option<&str>,
+    turns_limit: usize,
+    events_before: Option<&str>,
+    events_limit: usize,
+) -> Result<SessionDetail, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    // Authorization deliberately precedes semantic cursor and limit checks so
+    // a foreign resource cannot become a cursor oracle.
+    require_active_session_actor(&transaction, session_id, actor_user_id)?;
+    let run_ids_fetch = validated_read_page_limit(run_ids_limit, COLLECTION_PAGE_MAX_LIMIT)?;
+    let turns_fetch = validated_read_page_limit(turns_limit, COLLECTION_PAGE_MAX_LIMIT)?;
+    let events_fetch = validated_read_page_limit(events_limit, EVENT_PAGE_MAX_LIMIT)?;
+    let run_ids_before = run_ids_before
+        .map(|value| cursor::decode_session_run_ids(value, session_id))
+        .transpose()?;
+    let turns_before = turns_before
+        .map(|value| cursor::decode_session_turns(value, session_id))
+        .transpose()?;
+    let events_before = events_before
+        .map(|value| cursor::decode_session_events(value, session_id))
+        .transpose()?;
+
+    let session = query_session_summary(&transaction, session_id)?;
+    validate_session_event_tail(&transaction, &session)?;
+    validate_active_turn_projection(&transaction, &session)?;
+
+    let (run_ids, run_ids_page) = query_session_run_ids_tail(
+        &transaction,
+        actor_user_id,
+        session_id,
+        run_ids_before.as_ref(),
+        run_ids_limit,
+        run_ids_fetch,
+    )?;
+    let (turns, turns_page) = query_session_turns_tail(
+        &transaction,
+        session_id,
+        turns_before,
+        turns_limit,
+        turns_fetch,
+    )?;
+    let (events, events_page) = query_session_events_tail(
+        &transaction,
+        session_id,
+        session.sequence,
+        events_before,
+        events_limit,
+        events_fetch,
+    )?;
+    transaction.commit()?;
+    Ok(SessionDetail {
+        session,
+        run_ids,
+        turns,
+        events,
+        pagination: Some(SessionDetailPagination {
+            run_ids: run_ids_page,
+            turns: turns_page,
+            events: events_page,
+        }),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn query_session_run_ids_tail(
+    connection: &Connection,
+    actor_user_id: &str,
+    session_id: &str,
+    before: Option<&cursor::TextKeyCursor>,
+    limit: usize,
+    fetch_limit: i64,
+) -> Result<(Vec<String>, ReadPageInfo), StorageError> {
+    let mut rows = if let Some(before) = before {
+        let mut statement = connection.prepare(
+            r#"SELECT sr.run_id, sr.attached_at
+               FROM session_runs sr
+               JOIN runs r ON r.id = sr.run_id
+               WHERE sr.session_id = ?1
+                 AND r.owner_user_id = ?2
+                 AND (sr.attached_at < ?3 OR (sr.attached_at = ?3 AND sr.run_id < ?4))
+               ORDER BY sr.attached_at DESC, sr.run_id DESC
+               LIMIT ?5"#,
+        )?;
+        statement
+            .query_map(
+                params![
+                    session_id,
+                    actor_user_id,
+                    before.first,
+                    before.second,
+                    fetch_limit
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        let mut statement = connection.prepare(
+            r#"SELECT sr.run_id, sr.attached_at
+               FROM session_runs sr
+               JOIN runs r ON r.id = sr.run_id
+               WHERE sr.session_id = ?1 AND r.owner_user_id = ?2
+               ORDER BY sr.attached_at DESC, sr.run_id DESC
+               LIMIT ?3"#,
+        )?;
+        statement
+            .query_map(params![session_id, actor_user_id, fetch_limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+    let next_before = if has_more {
+        let (run_id, attached_at) = rows.last().ok_or_else(|| {
+            StorageError::CorruptData("Run attachment page sentinel has no returned item".into())
+        })?;
+        Some(cursor::encode_session_run_ids(
+            session_id,
+            attached_at,
+            run_id,
+        )?)
+    } else {
+        None
+    };
+    rows.reverse();
+    Ok((
+        rows.into_iter().map(|(run_id, _)| run_id).collect(),
+        ReadPageInfo {
+            next_before,
+            has_more,
+        },
+    ))
+}
+
+fn query_session_turns_tail(
+    connection: &Connection,
+    session_id: &str,
+    before: Option<u64>,
+    limit: usize,
+    fetch_limit: i64,
+) -> Result<(Vec<SessionTurn>, ReadPageInfo), StorageError> {
+    let head = connection.query_row(
+        "SELECT COALESCE(MAX(ordinal), 0) FROM session_turns WHERE session_id = ?1",
+        [session_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let head = i64_to_u64(head, "session turn head")?;
+    if before.is_some_and(|position| position > head) {
+        return Err(StorageError::PageCursorBeyondHead { head });
+    }
+    let mut rows = if let Some(before) = before {
+        let mut statement = connection.prepare(
+            r#"SELECT id, session_id, ordinal, status, user_message, assistant_message,
+                      started_at, completed_at
+               FROM session_turns
+               WHERE session_id = ?1 AND ordinal < ?2
+               ORDER BY ordinal DESC LIMIT ?3"#,
+        )?;
+        statement
+            .query_map(
+                params![session_id, u64_to_i64(before, "turn cursor")?, fetch_limit],
+                decode_session_turn_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        let mut statement = connection.prepare(
+            r#"SELECT id, session_id, ordinal, status, user_message, assistant_message,
+                      started_at, completed_at
+               FROM session_turns
+               WHERE session_id = ?1
+               ORDER BY ordinal DESC LIMIT ?2"#,
+        )?;
+        statement
+            .query_map(params![session_id, fetch_limit], decode_session_turn_row)?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    validate_descending_ordinals(
+        rows.iter().map(|row| row.ordinal),
+        before.map_or(head, |position| position.saturating_sub(1)),
+        "session turn",
+    )?;
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+    let next_before = if has_more {
+        let oldest = rows.last().ok_or_else(|| {
+            StorageError::CorruptData("Session turn page sentinel has no returned item".into())
+        })?;
+        Some(cursor::encode_session_turns(
+            session_id,
+            i64_to_u64(oldest.ordinal, "session turn ordinal")?,
+        )?)
+    } else {
+        None
+    };
+    let mut turns = rows
+        .into_iter()
+        .map(StoredSessionTurnRow::decode)
+        .collect::<Result<Vec<_>, _>>()?;
+    turns.reverse();
+    Ok((
+        turns,
+        ReadPageInfo {
+            next_before,
+            has_more,
+        },
+    ))
+}
+
+fn query_session_events_tail(
+    connection: &Connection,
+    session_id: &str,
+    head: u64,
+    before: Option<u64>,
+    limit: usize,
+    fetch_limit: i64,
+) -> Result<(Vec<SessionEvent>, ReadPageInfo), StorageError> {
+    if before.is_some_and(|position| position > head) {
+        return Err(StorageError::PageCursorBeyondHead { head });
+    }
+    let mut rows = if let Some(before) = before {
+        let mut statement = connection.prepare(
+            r#"SELECT sequence, event_id, event_kind, payload_version, payload_json,
+                      turn_id, created_at
+               FROM session_events
+               WHERE session_id = ?1 AND sequence < ?2
+               ORDER BY sequence DESC LIMIT ?3"#,
+        )?;
+        statement
+            .query_map(
+                params![
+                    session_id,
+                    u64_to_i64(before, "Session history cursor")?,
+                    fetch_limit
+                ],
+                decode_stored_session_event_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        let mut statement = connection.prepare(
+            r#"SELECT sequence, event_id, event_kind, payload_version, payload_json,
+                      turn_id, created_at
+               FROM session_events
+               WHERE session_id = ?1
+               ORDER BY sequence DESC LIMIT ?2"#,
+        )?;
+        statement
+            .query_map(
+                params![session_id, fetch_limit],
+                decode_stored_session_event_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    validate_descending_ordinals(
+        rows.iter().map(|row| row.sequence),
+        before.map_or(head, |position| position.saturating_sub(1)),
+        "session event",
+    )?;
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+    let next_before = if has_more {
+        let oldest = rows.last().ok_or_else(|| {
+            StorageError::CorruptData("Session event page sentinel has no returned item".into())
+        })?;
+        Some(cursor::encode_session_events(
+            session_id,
+            i64_to_u64(oldest.sequence, "session event sequence")?,
+        )?)
+    } else {
+        None
+    };
+    let mut events = rows
+        .into_iter()
+        .map(StoredSessionEventRow::decode)
+        .collect::<Result<Vec<_>, _>>()?;
+    events.reverse();
+    Ok((
+        events,
+        ReadPageInfo {
+            next_before,
+            has_more,
+        },
+    ))
+}
+
+fn validate_active_turn_projection(
+    connection: &Connection,
+    session: &SessionSummary,
+) -> Result<(), StorageError> {
+    let mut statement = connection.prepare(
+        r#"SELECT id, session_id, ordinal, status, user_message, assistant_message,
+                  started_at, completed_at
+           FROM session_turns
+           WHERE session_id = ?1 AND status = 'open'
+           ORDER BY ordinal LIMIT 2"#,
+    )?;
+    let rows = statement
+        .query_map([&session.id], decode_session_turn_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.len() > 1 {
+        return Err(StorageError::CorruptData(format!(
+            "session `{}` has more than one open turn",
+            session.id
+        )));
+    }
+    let open = rows
+        .into_iter()
+        .next()
+        .map(StoredSessionTurnRow::decode)
+        .transpose()?;
+    match (
+        &session.status,
+        session.active_turn_id.as_deref(),
+        open.as_ref(),
+    ) {
+        (SessionStatus::Running, Some(active), Some(turn)) if active == turn.id => Ok(()),
+        (SessionStatus::Ready | SessionStatus::NeedsAttention, None, None) => Ok(()),
+        _ => Err(StorageError::CorruptData(format!(
+            "session `{}` projection disagrees with its open turn",
+            session.id
+        ))),
+    }
+}
+
+fn validate_descending_ordinals(
+    values: impl IntoIterator<Item = i64>,
+    expected_first: u64,
+    label: &'static str,
+) -> Result<(), StorageError> {
+    let mut expected = i64::try_from(expected_first)
+        .map_err(|_| StorageError::IntegerOutOfRange("read page sequence"))?;
+    for value in values {
+        if value != expected {
+            return Err(StorageError::CorruptData(format!(
+                "{label} page gap: expected {expected}, found {value}"
+            )));
+        }
+        expected = expected.saturating_sub(1);
+    }
+    Ok(())
+}
+
+fn decode_stored_session_event_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StoredSessionEventRow> {
+    Ok(StoredSessionEventRow {
+        sequence: row.get(0)?,
+        event_id: row.get(1)?,
+        event_kind: row.get(2)?,
+        payload_version: row.get(3)?,
+        payload_json: row.get(4)?,
+        turn_id: row.get(5)?,
+        created_at: row.get(6)?,
     })
 }
 
@@ -4222,6 +4772,19 @@ fn query_session_turn(
         .decode()
 }
 
+fn query_session_turn_for_actor(
+    connection: &mut Connection,
+    actor_user_id: &str,
+    session_id: &str,
+    turn_id: &str,
+) -> Result<SessionTurn, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    require_active_session_actor(&transaction, session_id, actor_user_id)?;
+    let turn = query_session_turn(&transaction, session_id, turn_id)?;
+    transaction.commit()?;
+    Ok(turn)
+}
+
 fn decode_session_turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredSessionTurnRow> {
     Ok(StoredSessionTurnRow {
         id: row.get(0)?,
@@ -5151,6 +5714,112 @@ fn load_run_for_actor(
     }
     transaction.commit()?;
     Ok(StoredRun { snapshot, events })
+}
+
+fn query_bounded_run_for_actor(
+    connection: &mut Connection,
+    actor_user_id: &str,
+    run_id: &str,
+    events_before: Option<&str>,
+    events_limit: usize,
+) -> Result<BoundedRunRead, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    // Authorization precedes semantic cursor validation so an unowned Run is
+    // indistinguishable from a missing Run even when a cursor was supplied.
+    require_active_run_owner(&transaction, run_id, actor_user_id)?;
+    let fetch_limit = validated_read_page_limit(events_limit, EVENT_PAGE_MAX_LIMIT)?;
+    let events_before = events_before
+        .map(|value| cursor::decode_run_events(value, run_id))
+        .transpose()?;
+    let snapshot = query_snapshot(&transaction, run_id)?;
+    validate_run_event_tail(&transaction, &snapshot)?;
+    let (events, events_page) = query_run_events_tail(
+        &transaction,
+        run_id,
+        snapshot.run.sequence,
+        events_before,
+        events_limit,
+        fetch_limit,
+    )?;
+    transaction.commit()?;
+    Ok(BoundedRunRead {
+        snapshot,
+        events,
+        events_page,
+    })
+}
+
+fn query_run_events_tail(
+    connection: &Connection,
+    run_id: &str,
+    head: u64,
+    before: Option<u64>,
+    limit: usize,
+    fetch_limit: i64,
+) -> Result<(Vec<RunEvent>, ReadPageInfo), StorageError> {
+    if before.is_some_and(|position| position > head) {
+        return Err(StorageError::PageCursorBeyondHead { head });
+    }
+    let mut rows = if let Some(before) = before {
+        let mut statement = connection.prepare(
+            r#"SELECT sequence, event_id, event_kind, payload_version, payload_json,
+                      data_kind, call_id, approval_id, approval_status, policy_revision
+               FROM run_events
+               WHERE run_id = ?1 AND sequence < ?2
+               ORDER BY sequence DESC LIMIT ?3"#,
+        )?;
+        statement
+            .query_map(
+                params![
+                    run_id,
+                    u64_to_i64(before, "Run history cursor")?,
+                    fetch_limit
+                ],
+                decode_stored_event_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        let mut statement = connection.prepare(
+            r#"SELECT sequence, event_id, event_kind, payload_version, payload_json,
+                      data_kind, call_id, approval_id, approval_status, policy_revision
+               FROM run_events
+               WHERE run_id = ?1
+               ORDER BY sequence DESC LIMIT ?2"#,
+        )?;
+        statement
+            .query_map(params![run_id, fetch_limit], decode_stored_event_row)?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    validate_descending_ordinals(
+        rows.iter().map(|row| row.sequence),
+        before.map_or(head, |position| position.saturating_sub(1)),
+        "Run event",
+    )?;
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+    let next_before = if has_more {
+        let oldest = rows.last().ok_or_else(|| {
+            StorageError::CorruptData("Run event page sentinel has no returned item".into())
+        })?;
+        Some(cursor::encode_run_events(
+            run_id,
+            i64_to_u64(oldest.sequence, "Run event sequence")?,
+        )?)
+    } else {
+        None
+    };
+    let mut events = rows
+        .into_iter()
+        .map(StoredEventRow::decode)
+        .collect::<Result<Vec<_>, _>>()?;
+    events.reverse();
+    Ok((
+        events,
+        ReadPageInfo {
+            next_before,
+            has_more,
+        },
+    ))
 }
 
 fn query_snapshot(connection: &Connection, run_id: &str) -> Result<RunSnapshot, StorageError> {
@@ -6541,6 +7210,13 @@ fn validated_event_page_request(after: u64, limit: usize) -> Result<(i64, i64), 
     let fetch_limit = i64::try_from(limit + 1)
         .expect("the bounded event page limit is always representable by SQLite");
     Ok((after_sql, fetch_limit))
+}
+
+fn validated_read_page_limit(limit: usize, max: usize) -> Result<i64, StorageError> {
+    if limit == 0 || limit > max {
+        return Err(StorageError::InvalidPageLimit { limit, max });
+    }
+    i64::try_from(limit + 1).map_err(|_| StorageError::IntegerOutOfRange("read page limit"))
 }
 
 fn reject_cursor_beyond_head(after: u64, head_sequence: u64) -> Result<(), StorageError> {

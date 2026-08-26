@@ -54,6 +54,12 @@ pub enum StorageError {
     InvalidResourceEnvelope(String),
     #[error("event page limit {limit} is invalid; expected 1..={max}")]
     InvalidEventPageLimit { limit: usize, max: usize },
+    #[error("read page limit {limit} is invalid; expected 1..={max}")]
+    InvalidPageLimit { limit: usize, max: usize },
+    #[error("read page cursor is invalid")]
+    InvalidPageCursor,
+    #[error("read page cursor is ahead of the durable collection head {head}")]
+    PageCursorBeyondHead { head: u64 },
     #[error("event cursor {after} cannot be represented by SQLite")]
     EventCursorOutOfRange { after: u64 },
     #[error("event cursor {after} is ahead of durable ledger head {head_sequence}")]

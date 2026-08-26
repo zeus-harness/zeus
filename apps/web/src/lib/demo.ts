@@ -38,6 +38,7 @@ export const demoOverview: OverviewResponse = {
 		requires_approval: ['Parameter group changes', 'Scaling / capacity changes'],
 		denies: ['Delete / Stop resources']
 	},
+	recent_events_page: { has_more: false },
 	recent_events: [
 		{
 			id: 'evt-1',

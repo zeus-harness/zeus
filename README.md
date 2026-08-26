@@ -331,18 +331,28 @@ directly.
   state changes additionally require `X-CSRF-Token` to match the login and an
   exact same-origin request. Alpha+ deliberately rejects the schema-reserved
   `member` role. Actor isolation is now present, but member access remains
-  blocked until bounded list/detail queries and storage/queue quotas land.
+  blocked until SQLite storage and queue quotas land.
 - `GET /api/v1/me/settings` returns the current safe preferences.
   `PATCH /api/v1/me/settings` accepts `theme`, optional allowlisted
   `preferred_model`, and `expected_revision`. Provider endpoints and API keys
   are server-only configuration and never cross this API.
 - `GET /api/v1/overview` returns `primary_session_id`, the current profile's
-  primary Run, and its complete recent Run ledger.
-- `GET /api/v1/sessions` lists Session summaries. `POST /api/v1/sessions`
-  creates one from `{"id":...,"title":...}` and returns `201` for both the
-  first committed response and an idempotent replay.
-- `GET /api/v1/sessions/{session_id}` returns its summary, attached Run IDs,
-  turns, and ordered Session events.
+  primary Run, and the latest 128 Run events with opaque backward-pagination
+  metadata. Older Run history remains available through Run detail.
+- `GET /api/v1/sessions` lists Session summaries in stable
+  `updated_at DESC, id ASC` order. `limit` defaults to 50 and is capped at 100;
+  the response body remains a bare JSON array, while `X-Zeus-Next-Cursor`
+  carries the opaque continuation cursor when another page exists.
+  `POST /api/v1/sessions` creates one from `{"id":...,"title":...}` and
+  returns `201` for both the first committed response and an idempotent replay.
+- `GET /api/v1/sessions/{session_id}` returns its current summary plus bounded,
+  independently pageable tails of attached Run IDs, turns, and ordered Session
+  events. Run-ID and turn pages default to 50 and are capped at 100; event pages
+  default to 128 and are capped at 256. The optional `pagination` object returns
+  scoped opaque `next_before` cursors and `has_more` for each collection.
+- `GET /api/v1/sessions/{session_id}/turns/{turn_id}` performs one
+  actor-scoped point lookup. The Web client uses it to settle a durable retry
+  identity when that turn is older than the bounded detail tail.
 - `POST /api/v1/sessions/{session_id}/turns` accepts
   `{"turn_id":...,"user_message":...,"expected_sequence":...}`, atomically
   persists the user turn and a durable reply job, and returns `202`. The
@@ -357,7 +367,10 @@ directly.
   `needs_attention`.
 - `GET /api/v1/sessions/{session_id}/events?after={sequence}` streams
   `session.event` SSE from the independent Session ledger.
-- `GET /api/v1/runs/{run_id}` returns one run projection plus ordered events.
+- `GET /api/v1/runs/{run_id}` returns one Run projection plus a bounded ordered
+  event tail. `events_limit` defaults to 128 and is capped at 256;
+  `events_before` accepts the resource-scoped opaque cursor returned in
+  `pagination.events`.
 - `GET /api/v1/runs/{run_id}/events?after={sequence}` streams Run SSE. For both
   feeds, `Last-Event-ID` takes precedence over the query cursor when present.
   Run and Session streams share a limit of 64 open connections globally and 4
@@ -398,10 +411,11 @@ remain addressable so the stricter write envelope does not strand existing
 data. Shared validation runs before command fingerprinting or receipt lookup at
 the relevant API/runtime/storage entry points. Event feeds use bounded pages;
 approval, dispatch, reply completion, attachment checks, and startup recovery
-use typed point queries or fixed 64-row batches. Session list/detail and Run
-detail/overview still load complete matching histories, and SQLite usage
-quotas/retention are not present. Bound those read models and add storage
-budgets before any shared-network or multi-tenant deployment.
+use typed point queries or fixed 64-row batches. Production Session list/detail,
+Run detail, and overview reads now use indexed `LIMIT + 1` keyset pages inside
+actor-authorized SQLite snapshots; no production HTTP read loads a complete
+ledger or collection. SQLite usage quotas and retention are not present. Add
+those storage budgets before any shared-network or multi-tenant deployment.
 
 ## Container images
 
@@ -450,20 +464,25 @@ committed data. Use SQLite's backup/checkpoint facilities.
 ## Verification status
 
 Current Alpha+ plus Actor Boundary Foundation, API Resource Envelope, Bounded
-Event Feed, and Point-query Durable Context host verification:
+Event Feed, Point-query Durable Context, and Bounded Read Models host
+verification:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --all-targets`: 185 tests passed, including the real
+- `cargo test --workspace --all-targets`: 195 tests passed, including the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,
   body/field/idempotency boundaries, atomic login limits, SSE lease capacity,
   bounded `LIMIT + 1` event pages and cooperative multi-page replay, durable
   reply provenance, typed v9 point lookups, a 16-way same-key review race,
-  fixed-batch restart recovery, concurrent claim, and provider `outcome_unknown`
-  semantics.
-- `pnpm --filter web test`: 19 tests passed for CSRF headers, stable command
-  identity, active-Session restore, Session event merging, and theme behavior.
+  fixed-batch restart recovery, bounded 50/50/1 Session-list traversal,
+  independent Session/Run history tails, actor/resource-scoped cursors, an
+  old-turn point lookup for durable retry recovery, concurrent claim, and
+  provider `outcome_unknown` semantics.
+- `pnpm --filter web test`: 25 tests passed for CSRF headers, stable command
+  identity, deep-page active-Session restore, Session-list cursor encoding and
+  deduplication, bounded-tail retry reconciliation and Session-switch race
+  guards, primary-Run identity, Session event merging, and theme behavior.
 - `pnpm --filter web check`: zero errors and zero warnings.
 - `pnpm --filter web lint` and `pnpm --filter web build`: passed; the Node
   adapter production artifact was generated.
@@ -503,10 +522,10 @@ The Alpha+ image rebuild on this machine stalled while updating the crates.io
 index inside BuildKit and was interrupted before any running container was
 replaced. Therefore the new image, `verify`, and named-volume `restart-verify`
 are not yet claimed as current Alpha+ acceptance. The earlier Alpha baseline
-container acceptance belongs to commit `9a89706`; the latest pushed host
-baseline before this slice is API Resource Envelope commit `df96f3e`. No
-replacement image containing Actor Boundary, API Resource Envelope, or Bounded
-Event Feed is yet verified.
+container acceptance belongs to commit `9a89706`; the pushed host baseline
+before this slice is Point-query Durable Context commit `78a65e1`. No
+replacement image containing Actor Boundary, API Resource Envelope, Bounded
+Event Feed, Point-query Durable Context, or Bounded Read Models is yet verified.
 
 Docker Compose configuration remains available for environments with Docker
 Compose v2; this machine currently has Apple `container` but no Docker CLI, so

@@ -8,7 +8,7 @@ export interface ActiveSessionStorage {
 }
 
 function isPlausibleSessionId(value: string): boolean {
-	if (value.length === 0 || value.length > 256) return false;
+	if (value.length === 0 || value.length > 256 || value.trim() !== value) return false;
 	for (const character of value) {
 		const codePoint = character.codePointAt(0) ?? 0;
 		if (codePoint <= 31 || codePoint === 127) return false;
@@ -36,11 +36,24 @@ export function saveActiveSessionId(storage: ActiveSessionStorage | null, sessio
 }
 
 export function resolveInitialSessionId(
-	sessions: Pick<SessionSummary, 'id'>[],
 	primarySessionId: string,
 	storedSessionId: string | null
 ): string {
-	return storedSessionId && sessions.some((session) => session.id === storedSessionId)
-		? storedSessionId
-		: primarySessionId;
+	return storedSessionId ?? primarySessionId;
+}
+
+export function resolveInitialSessionFallback(
+	primarySessionId: string,
+	initialSessionId: string,
+	apiErrorStatus: number | null
+): string | null {
+	return initialSessionId !== primarySessionId && apiErrorStatus === 404 ? primarySessionId : null;
+}
+
+export function appendSessionPage(
+	current: SessionSummary[],
+	incoming: SessionSummary[]
+): SessionSummary[] {
+	const existing = new Set(current.map((session) => session.id));
+	return [...current, ...incoming.filter((session) => !existing.has(session.id))];
 }

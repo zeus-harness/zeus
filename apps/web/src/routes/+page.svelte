@@ -10,7 +10,9 @@
 	import SettingsPanel from '$lib/components/SettingsPanel.svelte';
 	import Timeline from '$lib/components/Timeline.svelte';
 	import {
+		appendSessionPage,
 		readActiveSessionId,
+		resolveInitialSessionFallback,
 		resolveInitialSessionId,
 		saveActiveSessionId,
 		type ActiveSessionStorage
@@ -22,6 +24,7 @@
 		getAuthStatus,
 		getOverview,
 		getSession,
+		getSessionTurn,
 		listSessions,
 		login,
 		logout as logoutOwner,
@@ -41,14 +44,18 @@
 		type TurnAttempt
 	} from '$lib/session-command';
 	import {
+		attemptTurnNeedsPointLookup,
 		clearTurnAttempt,
 		loadTurnAttempt,
 		mergeSessionEvents,
 		orderTimelineEvents,
+		ownsTurnAttemptState,
 		saveTurnAttempt,
+		sessionDisplaysPrimaryRun,
 		turnAttemptDisposition,
 		upsertTurn,
-		type AttemptStorage
+		type AttemptStorage,
+		type TurnAttemptDisposition
 	} from '$lib/session-state';
 	import type {
 		AuthenticationResponse,
@@ -66,6 +73,7 @@
 	} from '$lib/types';
 
 	const sessionCommandClient: SessionCommandClient = { start: startSessionTurn };
+	const SESSION_LIST_PAGE_LIMIT = 24;
 
 	let authStatus = $state.raw<AuthStatusResponse | null>(null);
 	let authLoading = $state(true);
@@ -76,6 +84,9 @@
 	let overview = $state.raw<OverviewResponse>(demoOverview);
 	let events = $state.raw<RunEvent[]>([]);
 	let sessions = $state.raw<SessionSummary[]>([]);
+	let nextSessionCursor = $state<string | null>(null);
+	let loadingMoreSessions = $state(false);
+	let sessionListError = $state('');
 	let activeSessionId = $state('');
 	let sessionDetail = $state.raw<SessionDetail | null>(null);
 	let sessionEvents = $state.raw<SessionEvent[]>([]);
@@ -115,7 +126,9 @@
 		sessionDetail?.session ?? sessions.find((session) => session.id === activeSessionId) ?? null
 	);
 	const attachedToRun = $derived(
-		sessionDetail ? sessionDetail.run_ids.includes(overview.run.id) : true
+		sessionDetail
+			? sessionDisplaysPrimaryRun(sessionDetail.session.id, overview.primary_session_id)
+			: true
 	);
 	const latestApprovalEvent = $derived(
 		attachedToRun ? events.findLast((event) => event.approval !== undefined) : undefined
@@ -165,6 +178,25 @@
 		return error instanceof DOMException && error.name === 'AbortError';
 	}
 
+	function isCurrentSelection(sessionId: string, selectionEpoch: number): boolean {
+		return activeSessionId === sessionId && sessionSelectionEpoch === selectionEpoch;
+	}
+
+	function isCurrentTurnAttempt(
+		sessionId: string,
+		attempt: TurnAttempt,
+		selectionEpoch: number
+	): boolean {
+		return ownsTurnAttemptState(
+			activeSessionId,
+			sessionId,
+			pendingTurnAttempt,
+			attempt,
+			sessionSelectionEpoch,
+			selectionEpoch
+		);
+	}
+
 	function authenticatedStatus(response: AuthenticationResponse): AuthStatusResponse {
 		return {
 			configured: true,
@@ -196,6 +228,9 @@
 		overview = demoOverview;
 		events = [];
 		sessions = [];
+		nextSessionCursor = null;
+		loadingMoreSessions = false;
+		sessionListError = '';
 		activeSessionId = '';
 		sessionDetail = null;
 		sessionEvents = [];
@@ -301,10 +336,36 @@
 		upsertSessionSummary(sessionDetail.session);
 	}
 
-	function settlePendingAttempt(detail: SessionDetail) {
+	async function durableTurnAttemptDisposition(
+		detail: SessionDetail,
+		attempt: TurnAttempt,
+		signal?: AbortSignal
+	): Promise<TurnAttemptDisposition> {
+		const immediate = turnAttemptDisposition(detail, attempt);
+		if (immediate !== 'not_owned' || !attemptTurnNeedsPointLookup(detail, attempt)) {
+			return immediate;
+		}
+		try {
+			const turn = await getSessionTurn(detail.session.id, attempt.turnId, signal);
+			return turnAttemptDisposition(detail, attempt, turn);
+		} catch (error) {
+			if (error instanceof ApiError && error.status === 404) return 'not_owned';
+			throw error;
+		}
+	}
+
+	async function settlePendingAttempt(detail: SessionDetail, signal?: AbortSignal) {
 		const attempt = pendingTurnAttempt;
 		if (!attempt) return;
-		const disposition = turnAttemptDisposition(detail, attempt);
+		const selectionEpoch = sessionSelectionEpoch;
+		let disposition: TurnAttemptDisposition;
+		try {
+			disposition = await durableTurnAttemptDisposition(detail, attempt, signal);
+		} catch (error) {
+			if (!isCurrentTurnAttempt(detail.session.id, attempt, selectionEpoch)) return;
+			throw error;
+		}
+		if (!isCurrentTurnAttempt(detail.session.id, attempt, selectionEpoch)) return;
 		if (disposition === 'completed') {
 			forgetTurnAttempt(detail.session.id, true);
 			composerError = '';
@@ -314,8 +375,8 @@
 			composerError = '';
 			composerStatusText = 'Awaiting Zeus reply…';
 		} else if (!turnCommandInFlight) {
-			forgetTurnAttempt(detail.session.id, false);
 			composerDraft = attempt.text;
+			composerStatusText = 'The saved request is ready to retry with its original identity.';
 		}
 	}
 
@@ -327,17 +388,28 @@
 		const fetched = await getSession(sessionId, signal);
 		if (activeSessionId !== sessionId) return fetched;
 		const detail = applySessionDetail(fetched);
-		if (settleAttempt) settlePendingAttempt(detail);
+		if (settleAttempt) await settlePendingAttempt(detail, signal);
 		return detail;
 	}
 
-	async function loadSession(sessionId: string, signal?: AbortSignal): Promise<SessionDetail> {
+	async function loadSession(
+		sessionId: string,
+		selectionEpoch: number,
+		signal?: AbortSignal
+	): Promise<SessionDetail> {
 		const detail = await refreshSession(sessionId, signal, false);
-		if (activeSessionId !== sessionId) return detail;
+		if (!isCurrentSelection(sessionId, selectionEpoch)) return detail;
 		const storedAttempt = loadTurnAttempt(attemptStorage, sessionId);
 		if (!storedAttempt) return detail;
 
-		const disposition = turnAttemptDisposition(detail, storedAttempt);
+		let disposition: TurnAttemptDisposition;
+		try {
+			disposition = await durableTurnAttemptDisposition(detail, storedAttempt, signal);
+		} catch (error) {
+			if (!isCurrentSelection(sessionId, selectionEpoch)) return detail;
+			throw error;
+		}
+		if (!isCurrentSelection(sessionId, selectionEpoch)) return detail;
 		if (disposition === 'completed') {
 			clearTurnAttempt(attemptStorage, sessionId);
 			return detail;
@@ -349,11 +421,11 @@
 			return detail;
 		}
 
-		clearTurnAttempt(attemptStorage, sessionId);
+		rememberTurnAttempt(sessionId, storedAttempt);
 		composerDraft = storedAttempt.text;
 		composerStatusText =
 			detail.session.status === 'ready'
-				? 'A saved draft was restored; send it again when ready.'
+				? 'A saved request was restored and will retry with its original identity.'
 				: `Saved through session event ${detail.session.sequence}`;
 		return detail;
 	}
@@ -372,7 +444,7 @@
 		composerError = '';
 		composerStatusText = 'Loading session…';
 
-		const detail = await loadSession(sessionId, signal);
+		const detail = await loadSession(sessionId, selectionEpoch, signal);
 		if (signal.aborted || selectionEpoch !== sessionSelectionEpoch) return;
 		saveActiveSessionId(activeSessionStorage, sessionId);
 		stopSessionStream = subscribeToSession(
@@ -416,28 +488,35 @@
 		workspaceLoading = true;
 		workspaceReady = false;
 		workspaceError = '';
+		sessionListError = '';
+		loadingMoreSessions = false;
 		stopWorkspaceStreams();
 		try {
-			const [payload, listedSessions] = await Promise.all([
+			const [payload, sessionPage] = await Promise.all([
 				getOverview(signal),
-				listSessions(signal)
+				listSessions({ limit: SESSION_LIST_PAGE_LIMIT, signal })
 			]);
 			if (signal.aborted) return;
 			overview = payload;
 			events = payload.recent_events.map((event) => ({ ...event, source: 'api' }));
-			sessions = listedSessions;
+			sessions = sessionPage.items;
+			nextSessionCursor = sessionPage.nextCursor;
 			source = 'api';
 			connectRunStream(payload);
 			const initialSessionId = resolveInitialSessionId(
-				listedSessions,
 				payload.primary_session_id,
 				readActiveSessionId(activeSessionStorage)
 			);
 			try {
 				await selectSession(initialSessionId, signal);
 			} catch (error) {
-				if (initialSessionId === payload.primary_session_id) throw error;
-				await selectSession(payload.primary_session_id, signal);
+				const fallbackSessionId = resolveInitialSessionFallback(
+					payload.primary_session_id,
+					initialSessionId,
+					error instanceof ApiError ? error.status : null
+				);
+				if (!fallbackSessionId) throw error;
+				await selectSession(fallbackSessionId, signal);
 			}
 			if (signal.aborted) return;
 			workspaceReady = true;
@@ -448,6 +527,26 @@
 				error instanceof Error ? error.message : 'The workspace could not be loaded.';
 		} finally {
 			workspaceLoading = false;
+		}
+	}
+
+	async function loadMoreSessionSummaries() {
+		const cursor = nextSessionCursor;
+		const signal = pageController?.signal;
+		if (!cursor || !signal || signal.aborted || loadingMoreSessions) return;
+		loadingMoreSessions = true;
+		sessionListError = '';
+		try {
+			const page = await listSessions({ cursor, limit: SESSION_LIST_PAGE_LIMIT, signal });
+			if (signal.aborted || nextSessionCursor !== cursor) return;
+			sessions = appendSessionPage(sessions, page.items);
+			nextSessionCursor = page.nextCursor;
+		} catch (error) {
+			if (isAbortError(error)) return;
+			sessionListError =
+				error instanceof Error ? error.message : 'More sessions could not be loaded.';
+		} finally {
+			loadingMoreSessions = false;
 		}
 	}
 
@@ -577,19 +676,32 @@
 	async function reconcileTurnConflict(
 		sessionId: string,
 		attempt: TurnAttempt,
-		error: ApiError
+		error: ApiError,
+		selectionEpoch: number
 	): Promise<boolean> {
 		let detail: SessionDetail;
 		try {
 			detail = await refreshSession(sessionId, undefined, false);
 		} catch (refreshError) {
+			if (!isCurrentTurnAttempt(sessionId, attempt, selectionEpoch)) return false;
 			composerError = `The session changed, but its current state could not be loaded: ${
 				refreshError instanceof Error ? refreshError.message : 'unknown error'
 			}`;
 			return false;
 		}
+		if (!isCurrentTurnAttempt(sessionId, attempt, selectionEpoch)) return false;
 
-		const disposition = turnAttemptDisposition(detail, attempt);
+		let disposition: TurnAttemptDisposition;
+		try {
+			disposition = await durableTurnAttemptDisposition(detail, attempt);
+		} catch (lookupError) {
+			if (!isCurrentTurnAttempt(sessionId, attempt, selectionEpoch)) return false;
+			composerError = `The saved turn could not be verified: ${
+				lookupError instanceof Error ? lookupError.message : 'unknown error'
+			}`;
+			return false;
+		}
+		if (!isCurrentTurnAttempt(sessionId, attempt, selectionEpoch)) return false;
 		if (disposition === 'completed') {
 			forgetTurnAttempt(sessionId, true);
 			composerError = '';
@@ -616,6 +728,7 @@
 
 	async function commitTurnAttempt(sessionId: string, attempt: TurnAttempt): Promise<boolean> {
 		if (turnCommandInFlight) return false;
+		const selectionEpoch = sessionSelectionEpoch;
 		turnCommandInFlight = true;
 		composerError = '';
 		composerStatusText = attempt.started ? 'Checking the saved turn…' : 'Starting the turn…';
@@ -623,22 +736,34 @@
 			const started = await persistTurn(sessionId, attempt, sessionCommandClient, (response) => {
 				applyStartedResponse(response);
 			});
+			if (!isCurrentTurnAttempt(sessionId, attempt, selectionEpoch)) return true;
 			applyStartedResponse(started);
 			rememberTurnAttempt(sessionId, attempt);
 			composerDraft = '';
 			composerError = '';
 			composerStatusText = 'Awaiting Zeus reply…';
+			if (started.replayed) await refreshSession(sessionId);
 			return true;
 		} catch (error) {
+			if (!isCurrentTurnAttempt(sessionId, attempt, selectionEpoch)) return false;
 			const current = sessionDetail;
-			if (current && turnAttemptDisposition(current, attempt) === 'completed') {
-				forgetTurnAttempt(sessionId, true);
-				composerError = '';
-				composerStatusText = `Saved through session event ${current.session.sequence}`;
-				return true;
+			if (current) {
+				try {
+					const disposition = await durableTurnAttemptDisposition(current, attempt);
+					if (!isCurrentTurnAttempt(sessionId, attempt, selectionEpoch)) return false;
+					if (disposition === 'completed') {
+						forgetTurnAttempt(sessionId, true);
+						composerError = '';
+						composerStatusText = `Saved through session event ${current.session.sequence}`;
+						return true;
+					}
+				} catch {
+					if (!isCurrentTurnAttempt(sessionId, attempt, selectionEpoch)) return false;
+					// Preserve the original command identity; the primary error remains actionable below.
+				}
 			}
 			if (error instanceof ApiError && error.status === 409) {
-				return await reconcileTurnConflict(sessionId, attempt, error);
+				return await reconcileTurnConflict(sessionId, attempt, error, selectionEpoch);
 			}
 			composerError = error instanceof Error ? error.message : 'The message could not be saved.';
 			return false;
@@ -671,7 +796,17 @@
 		const detail = sessionDetail;
 		const attempt = pendingTurnAttempt;
 		if (!detail || !attempt) return false;
-		const disposition = turnAttemptDisposition(detail, attempt);
+		const selectionEpoch = sessionSelectionEpoch;
+		let disposition: TurnAttemptDisposition;
+		try {
+			disposition = await durableTurnAttemptDisposition(detail, attempt);
+		} catch (error) {
+			if (!isCurrentTurnAttempt(detail.session.id, attempt, selectionEpoch)) return false;
+			composerError =
+				error instanceof Error ? error.message : 'The saved turn could not be verified.';
+			return false;
+		}
+		if (!isCurrentTurnAttempt(detail.session.id, attempt, selectionEpoch)) return false;
 		if (disposition === 'completed') {
 			forgetTurnAttempt(detail.session.id, true);
 			return true;
@@ -685,6 +820,7 @@
 		try {
 			await refreshSession(detail.session.id);
 		} catch (error) {
+			if (!isCurrentTurnAttempt(detail.session.id, attempt, selectionEpoch)) return false;
 			composerError =
 				error instanceof Error ? error.message : 'The session could not be refreshed.';
 		}
@@ -836,9 +972,13 @@
 				{activeSessionId}
 				{creatingSession}
 				{sessionActionError}
+				hasMoreSessions={nextSessionCursor !== null}
+				{loadingMoreSessions}
+				{sessionListError}
 				onClose={() => (navOpen = false)}
 				onCreateSession={() => void createNewSession()}
 				onSelectSession={(sessionId) => void handleSelectSession(sessionId)}
+				onLoadMoreSessions={() => void loadMoreSessionSummaries()}
 				onOpenSettings={openSettings}
 			/>
 			<SettingsPanel

@@ -36,6 +36,8 @@ SQLite 是本地单实例 Alpha+ 的权威存储。Restate、MinIO 和 PostgreSQ
 当前 Web 认证后列出用户 Session，恢复仍存在的上次活动 Session，并行订阅 Run/Session SSE；
 命令响应和后续权威 Session GET 用于合并事件并校准投影。浏览器只能提交 user message，不能
 提交 assistant content 或调用生产 flush route。
+Session 列表按 opaque cursor 逐页追加；保存的活动 Session 即使不在首屏，也先通过 actor-scoped
+point detail 恢复，只有权威 `404` 才回退 primary Session。
 
 ## 事件与状态
 
@@ -167,7 +169,7 @@ exactly-once 语义。
   `ZEUS_COOKIE_SECURE=true` 才附加 `Secure`。
 - Alpha+ 明确拒绝 schema 预留的 `member` 登录。正式 Run/Session 查询、SSE、resume、turn、
   review 和 receipt 已全部 actor-scoped，并有 Alice/Bob 隔离测试；字段、HTTP/SSE 连接和
-  event page 边界与内部 point/batch read 已落地，但 member 仍须等待有界 list/detail 与
+  event page 边界、内部 point/batch read 与有界 list/detail 已落地，但 member 仍须等待
   SQLite 存储/队列配额，不能仅因数据面已隔离就开放。
 - auth JSON 明确限制为 8 KiB、command JSON 为 512 KiB；新建 Session/turn ID、title、
   user message、review note 与严格幂等键分别按 UTF-8 bytes 设置硬上限。新 Session event
@@ -180,6 +182,17 @@ exactly-once 语义。
   stream，只有 body drop 或流结束才释放。initial replay、hint reconciliation、Lagged recovery
   和 durable poll 都使用 SQL `LIMIT + 1` page，默认 128、硬上限 256；`has_more` 通过页间
   `yield_now` cooperative continuation 补齐，cursor 只随实际发送的 sequence 前进。
+- Session summary list 使用 `(owner, updated_at DESC, id ASC)` indexed keyset，默认 50、最大
+  100，并以响应头续页。Session detail 的 attachment/turn/event tail 和 Run detail/overview 的
+  event tail 都使用 `LIMIT + 1`，collection 上限 100、event 上限 256；opaque cursor 绑定 kind
+  与 actor/resource scope。actor 鉴权先于 cursor/limit 语义，projection、tail 和各独立 page 在同一
+  SQLite read transaction 中校验，页内再恢复为原始升序。
+- Session turn 提供 actor-scoped `(session_id, turn_id)` point GET。Web 的 durable retry 不会因
+  turn 离开默认 50 条 tail 就清除原 command identity；回执重放后会再次读取权威 turn 终态。
+  点查跨越 Session 切换时由 selection epoch、Session ID、turn ID 和 command key 联合 guard，
+  旧异步结果不得覆盖新 Session 的 attempt 或 draft。
+  主 Run 是否属于当前页面由启动时已校验的 primary Session identity 决定，不从 attachment tail
+  反推。
 - 未知工具、缺失策略、重复/冲突规则、effect 或 environment 不匹配：默认拒绝。
 - Approval 只能解除 `require_approval`，不能覆盖显式 deny。
 - dispatch 前用同一 policy revision 和不可绕过 guard 再检查一次。
@@ -264,17 +277,17 @@ exactly-once 语义。
 - 本地 Alpha+ 已按 UTF-8 bytes 限制 Session ID/title/message/review note 与幂等键；SSE
   replay 已在 storage 层分页，future cursor 对已授权资源返回 `409`，foreign resource 仍为
   `404`。审批、派发、reply completion、attachment 和启动恢复已改为 typed point query 或
-  固定 64 行 batch；Session list/detail 与 Run detail/overview 仍无界。对外或多租户部署前
-  必须完成有界 read model，并增加 SQLite usage quota 与保留策略。
+  固定 64 行 batch；Session list/detail 与 Run detail/overview 也已改为 indexed bounded read
+  model。对外或多租户部署前仍必须增加 SQLite usage quota 与保留策略。
 - Web 保持紧凑时间线、一个内联审批卡和一个 composer；支持真实 New Session、活动 Session
   刷新恢复、owner 设置/退出和 system/light/dark。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化结果是 185 个 Rust 测试和 19 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化结果是 195 个 Rust 测试和 25 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
-Apple `container` 的 Alpha 基线验收属于提交 `9a89706`。API Resource Envelope 的已推送主机
-基线为 `7c4c269`；当前 helper shell 和现有 labeled container/volume 状态检查通过，但包含
-Actor Boundary/API Resource Envelope/Bounded Event Feed/Point-query Durable Context 的新镜像构建仍受 BuildKit 内
+Apple `container` 的 Alpha 基线验收属于提交 `9a89706`。Point-query Durable Context 的已推送
+主机基线为 `78a65e1`；当前 helper shell 和现有 labeled container/volume 状态检查通过，但包含
+Actor Boundary/API Resource Envelope/Bounded Event Feed/Point-query Durable Context/Bounded Read Models 的新镜像构建仍受 BuildKit 内
 crates.io 索引更新阻塞，并在替换运行容器前安全中止；因此不声明当前
 `up/verify/restart-verify` 已通过。
 Docker Compose 当前只有静态配置检查；本机缺少 Docker CLI 时不声明 Compose build/up 已通过。

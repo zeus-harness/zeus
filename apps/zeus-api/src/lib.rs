@@ -28,11 +28,11 @@ use llm::{
 };
 use protocol::{
     AccountRole, AccountStatus, AccountUser, AssistantReplyKind, AssistantReplyProvenance,
-    AuthStatusResponse, AuthenticationResponse, BootstrapRequest, CreateSessionRequest,
-    CreateSessionResponse, HealthResponse, LoginRequest, LogoutResponse, ProblemDetails,
-    ResumeSessionRequest, ResumeSessionResponse, ReviewRequest, ReviewResponse, RunDetail,
-    SessionDetail, SessionEvent, SessionSummary, StartTurnRequest, ThemePreference,
-    UpdatePreferencesRequest, UserPreferences,
+    AuthStatusResponse, AuthenticationResponse, BootstrapRequest, COLLECTION_PAGE_DEFAULT_LIMIT,
+    CreateSessionRequest, CreateSessionResponse, EVENT_PAGE_DEFAULT_LIMIT, HealthResponse,
+    LoginRequest, LogoutResponse, ProblemDetails, ResumeSessionRequest, ResumeSessionResponse,
+    ReviewRequest, ReviewResponse, RunDetail, SessionDetail, SessionEvent, SessionTurn,
+    StartTurnRequest, ThemePreference, UpdatePreferencesRequest, UserPreferences,
 };
 use runtime::{
     AuthPrincipal, AuthSessionCommit, BootstrapOwnerCommit, DemoStore, PublishedEvent,
@@ -454,6 +454,31 @@ struct EventsQuery {
     after: Option<u64>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionListQuery {
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionDetailQuery {
+    run_ids_before: Option<String>,
+    run_ids_limit: Option<usize>,
+    turns_before: Option<String>,
+    turns_limit: Option<usize>,
+    events_before: Option<String>,
+    events_limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunDetailQuery {
+    events_before: Option<String>,
+    events_limit: Option<usize>,
+}
+
 pub fn authenticated_app(
     store: DemoStore,
     cookie_secure: bool,
@@ -510,6 +535,7 @@ fn build_authenticated_app(state: ApiState) -> Router {
         .route("/api/v1/sessions/{id}", get(session_detail))
         .route("/api/v1/sessions/{id}/resume", post(resume_session))
         .route("/api/v1/sessions/{id}/turns", post(start_turn))
+        .route("/api/v1/sessions/{id}/turns/{turn_id}", get(session_turn))
         .route("/api/v1/sessions/{id}/events", get(session_events))
         .route("/api/v1/runs/{id}", get(run_detail))
         .route(
@@ -577,6 +603,7 @@ fn build_test_app(state: ApiState, request_auth: TestRequestAuth) -> Router {
         .route("/api/v1/sessions/{id}", get(session_detail))
         .route("/api/v1/sessions/{id}/resume", post(resume_session))
         .route("/api/v1/sessions/{id}/turns", post(test_start_turn))
+        .route("/api/v1/sessions/{id}/turns/{turn_id}", get(session_turn))
         .route(
             "/api/v1/sessions/{id}/turns/{turn_id}/flush",
             post(test_flush_turn),
@@ -1400,13 +1427,25 @@ async fn overview(
 async fn list_sessions(
     State(state): State<ApiState>,
     Extension(current): Extension<CurrentAuth>,
-) -> Result<Json<Vec<SessionSummary>>, ApiError> {
-    Ok(Json(
-        state
-            .store
-            .list_sessions_for_actor(&current.principal.user.id)
-            .await?,
-    ))
+    query: Result<Query<SessionListQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let Query(query) = query.map_err(ApiError::invalid_query)?;
+    let page = state
+        .store
+        .list_sessions_for_actor(
+            &current.principal.user.id,
+            query.cursor.as_deref(),
+            query.limit.unwrap_or(COLLECTION_PAGE_DEFAULT_LIMIT),
+        )
+        .await?;
+    let mut headers = HeaderMap::new();
+    if let Some(cursor) = page.next_cursor {
+        headers.insert(
+            "x-zeus-next-cursor",
+            HeaderValue::from_str(&cursor).expect("opaque cursor is canonical base64url"),
+        );
+    }
+    Ok((headers, Json(page.items)).into_response())
 }
 
 async fn create_session(
@@ -1428,11 +1467,35 @@ async fn session_detail(
     State(state): State<ApiState>,
     Extension(current): Extension<CurrentAuth>,
     Path(id): Path<String>,
+    query: Result<Query<SessionDetailQuery>, QueryRejection>,
 ) -> Result<Json<SessionDetail>, ApiError> {
+    let Query(query) = query.map_err(ApiError::invalid_query)?;
     Ok(Json(
         state
             .store
-            .get_session_for_actor(&current.principal.user.id, &id)
+            .get_session_for_actor(
+                &current.principal.user.id,
+                &id,
+                query.run_ids_before.as_deref(),
+                query.run_ids_limit.unwrap_or(COLLECTION_PAGE_DEFAULT_LIMIT),
+                query.turns_before.as_deref(),
+                query.turns_limit.unwrap_or(COLLECTION_PAGE_DEFAULT_LIMIT),
+                query.events_before.as_deref(),
+                query.events_limit.unwrap_or(EVENT_PAGE_DEFAULT_LIMIT),
+            )
+            .await?,
+    ))
+}
+
+async fn session_turn(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    Path((id, turn_id)): Path<(String, String)>,
+) -> Result<Json<SessionTurn>, ApiError> {
+    Ok(Json(
+        state
+            .store
+            .session_turn_for_actor(&current.principal.user.id, &id, &turn_id)
             .await?,
     ))
 }
@@ -1538,11 +1601,18 @@ async fn run_detail(
     State(state): State<ApiState>,
     Extension(current): Extension<CurrentAuth>,
     Path(id): Path<String>,
+    query: Result<Query<RunDetailQuery>, QueryRejection>,
 ) -> Result<Json<RunDetail>, ApiError> {
+    let Query(query) = query.map_err(ApiError::invalid_query)?;
     Ok(Json(
         state
             .store
-            .run_detail_for_actor(&current.principal.user.id, &id)
+            .run_detail_for_actor(
+                &current.principal.user.id,
+                &id,
+                query.events_before.as_deref(),
+                query.events_limit.unwrap_or(EVENT_PAGE_DEFAULT_LIMIT),
+            )
             .await?,
     ))
 }
@@ -2361,6 +2431,16 @@ impl From<StoreError> for ApiError {
                 "Event cursor is ahead of the ledger",
                 "The event cursor is ahead of the current durable ledger head",
             ),
+            StoreError::InvalidPageLimit { .. } => Self::bad_request(
+                "invalid_page_limit",
+                "The page limit is outside the supported range",
+            ),
+            StoreError::InvalidPageCursor | StoreError::PageCursorBeyondHead { .. } => {
+                Self::bad_request(
+                    "invalid_page_cursor",
+                    "The page cursor is malformed or belongs to another collection",
+                )
+            }
             StoreError::PolicyBuild(_)
             | StoreError::ConnectorConfig(_)
             | StoreError::Registry(_)
@@ -3059,7 +3139,16 @@ mod tests {
         let detail = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let detail = store
-                    .get_session_for_actor(&owner.user_id, &session_id)
+                    .get_session_for_actor(
+                        &owner.user_id,
+                        &session_id,
+                        None,
+                        protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                        None,
+                        protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                        None,
+                        protocol::EVENT_PAGE_DEFAULT_LIMIT,
+                    )
                     .await
                     .unwrap();
                 if detail.session.status == SessionStatus::Ready {
@@ -3700,6 +3789,44 @@ mod tests {
         let problem: ProblemDetails = response_json(detail).await;
         assert_eq!(problem.code, "session_not_found");
 
+        let malformed_foreign_cursor = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/sessions/{session_id}?events_before=not-a-canonical-cursor"
+                ))
+                .header(header::COOKIE, &alice.cookie_header)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            malformed_foreign_cursor,
+            StatusCode::NOT_FOUND,
+            "session_not_found",
+        )
+        .await;
+
+        let malformed_foreign_turn = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/sessions/{session_id}/turns/%20malformed-turn%20"
+                ))
+                .header(header::COOKIE, &alice.cookie_header)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            malformed_foreign_turn,
+            StatusCode::NOT_FOUND,
+            "session_not_found",
+        )
+        .await;
+
         let resume = app
             .clone()
             .oneshot(
@@ -3829,6 +3956,25 @@ mod tests {
         assert_eq!(detail.status(), StatusCode::NOT_FOUND);
         let problem: ProblemDetails = response_json(detail).await;
         assert_eq!(problem.code, "run_not_found");
+
+        let malformed_foreign_cursor = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/runs/{DEMO_RUN_ID}?events_before=not-a-canonical-cursor"
+                ))
+                .header(header::COOKIE, &alice.cookie_header)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            malformed_foreign_cursor,
+            StatusCode::NOT_FOUND,
+            "run_not_found",
+        )
+        .await;
 
         let review = app
             .clone()
@@ -4025,6 +4171,304 @@ mod tests {
         let detail: SessionDetail = response_json(detail).await;
         assert_eq!(detail.session, first.session);
         assert_eq!(detail.events, vec![first.event]);
+    }
+
+    #[tokio::test]
+    async fn session_list_is_a_bare_bounded_array_and_cursor_walks_101_rows() {
+        let store = DemoStore::seeded().await.unwrap();
+        let app = app(store.clone()).await;
+        for index in 0..100 {
+            store
+                .create_session_for_actor(
+                    "user-test-owner",
+                    CreateSessionRequest {
+                        id: format!("session-page-{index:03}"),
+                        title: format!("Pagination fixture {index:03}"),
+                    },
+                    &format!("create-page-{index:03}"),
+                )
+                .await
+                .unwrap();
+        }
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_cursor = first
+            .headers()
+            .get("x-zeus-next-cursor")
+            .expect("the first 50 rows must advertise a continuation cursor")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let first_json: serde_json::Value = response_json(first).await;
+        assert!(
+            first_json.is_array(),
+            "the response contract is a bare array"
+        );
+        let first_page: Vec<SessionSummary> = serde_json::from_value(first_json).unwrap();
+        assert_eq!(first_page.len(), 50);
+
+        let second = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/sessions?cursor={first_cursor}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_cursor = second
+            .headers()
+            .get("x-zeus-next-cursor")
+            .expect("the second 50 rows must advertise the last row")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let second_page: Vec<SessionSummary> = response_json(second).await;
+        assert_eq!(second_page.len(), 50);
+
+        let third = app
+            .oneshot(
+                Request::get(format!("/api/v1/sessions?cursor={second_cursor}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(third.status(), StatusCode::OK);
+        assert!(third.headers().get("x-zeus-next-cursor").is_none());
+        let third_page: Vec<SessionSummary> = response_json(third).await;
+        assert_eq!(third_page.len(), 1);
+
+        let ids = first_page
+            .iter()
+            .chain(&second_page)
+            .chain(&third_page)
+            .map(|session| session.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), 101, "cursor pages must not overlap or skip rows");
+    }
+
+    #[tokio::test]
+    async fn session_list_rejects_invalid_limits_and_cursor_with_stable_problems() {
+        let app = test_app().await;
+        for uri in ["/api/v1/sessions?limit=0", "/api/v1/sessions?limit=101"] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_problem(response, StatusCode::BAD_REQUEST, "invalid_page_limit").await;
+        }
+
+        let response = app
+            .oneshot(
+                Request::get("/api/v1/sessions?cursor=not-a-canonical-cursor")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(response, StatusCode::BAD_REQUEST, "invalid_page_cursor").await;
+
+        let future = ApiError::from(StoreError::PageCursorBeyondHead { head: 8 });
+        assert_eq!(future.status, StatusCode::BAD_REQUEST);
+        assert_eq!(future.problem.code, "invalid_page_cursor");
+    }
+
+    #[tokio::test]
+    async fn session_detail_events_tail_pages_latest_first_but_returns_each_page_ascending() {
+        let app = test_app().await;
+        let latest = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/sessions/session-ZR-1842?events_limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(latest.status(), StatusCode::OK);
+        let latest: SessionDetail = response_json(latest).await;
+        assert_eq!(
+            latest
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        let latest_page = &latest.pagination.as_ref().unwrap().events;
+        assert!(latest_page.has_more);
+        let before = latest_page.next_before.as_deref().unwrap();
+
+        let older = app
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/sessions/session-ZR-1842?events_limit=1&events_before={before}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(older.status(), StatusCode::OK);
+        let older: SessionDetail = response_json(older).await;
+        assert_eq!(
+            older
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        let older_page = &older.pagination.as_ref().unwrap().events;
+        assert!(!older_page.has_more);
+        assert!(older_page.next_before.is_none());
+    }
+
+    #[tokio::test]
+    async fn session_turn_point_read_reaches_beyond_tail_and_masks_unknown_turns() {
+        const SESSION_ID: &str = "session-ZR-1842";
+        const ACTOR_ID: &str = "user-test-owner";
+
+        let store = DemoStore::seeded().await.unwrap();
+        let app = app(store.clone()).await;
+        let mut sequence = 2;
+        for ordinal in 1..=51 {
+            let turn_id = format!("turn-point-{ordinal:03}");
+            let started = store
+                .start_turn_for_actor(
+                    ACTOR_ID,
+                    SESSION_ID,
+                    StartTurnRequest {
+                        turn_id: turn_id.clone(),
+                        user_message: format!("message {ordinal}"),
+                        expected_sequence: sequence,
+                    },
+                    &format!("start-point-{ordinal:03}"),
+                )
+                .await
+                .unwrap();
+            let flushed = store
+                .flush_turn_for_actor(
+                    ACTOR_ID,
+                    SESSION_ID,
+                    protocol::FlushSessionRequest {
+                        turn_id,
+                        assistant_message: Some(format!("answer {ordinal}")),
+                        expected_sequence: started.session.sequence,
+                    },
+                    &format!("flush-point-{ordinal:03}"),
+                )
+                .await
+                .unwrap();
+            sequence = flushed.session.sequence;
+        }
+
+        let detail = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/sessions/{SESSION_ID}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail: SessionDetail = response_json(detail).await;
+        assert_eq!(detail.turns.len(), protocol::COLLECTION_PAGE_DEFAULT_LIMIT);
+        assert!(detail.pagination.unwrap().turns.has_more);
+        assert!(detail.turns.iter().all(|turn| turn.id != "turn-point-001"));
+
+        let point = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/sessions/{SESSION_ID}/turns/turn-point-001"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(point.status(), StatusCode::OK);
+        let point: SessionTurn = response_json(point).await;
+        assert_eq!(point.id, "turn-point-001");
+        assert_eq!(point.status, protocol::SessionTurnStatus::Flushed);
+
+        for turn_id in ["unknown-turn", "%20malformed-turn%20"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/api/v1/sessions/{SESSION_ID}/turns/{turn_id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_problem(response, StatusCode::NOT_FOUND, "session_turn_not_found").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn run_detail_events_tail_and_before_cursor_are_bounded_and_ascending() {
+        let app = test_app().await;
+        let latest = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/runs/{DEMO_RUN_ID}?events_limit=2"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(latest.status(), StatusCode::OK);
+        let latest: RunDetail = response_json(latest).await;
+        assert_eq!(
+            latest
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![7, 8]
+        );
+        let latest_page = &latest.pagination.as_ref().unwrap().events;
+        assert!(latest_page.has_more);
+        let before = latest_page.next_before.as_deref().unwrap();
+
+        let older = app
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/runs/{DEMO_RUN_ID}?events_limit=2&events_before={before}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(older.status(), StatusCode::OK);
+        let older: RunDetail = response_json(older).await;
+        assert_eq!(
+            older
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![5, 6]
+        );
+        let older_page = &older.pagination.as_ref().unwrap().events;
+        assert!(older_page.has_more);
+        assert!(older_page.next_before.is_some());
     }
 
     #[tokio::test]

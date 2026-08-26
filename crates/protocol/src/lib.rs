@@ -31,6 +31,10 @@ pub const IDEMPOTENCY_KEY_MAX_BYTES: usize = 128;
 pub const EVENT_PAGE_DEFAULT_LIMIT: usize = 128;
 /// Maximum number of durable ledger events returned by one event page.
 pub const EVENT_PAGE_MAX_LIMIT: usize = 256;
+/// Default number of non-event read-model rows returned by one page.
+pub const COLLECTION_PAGE_DEFAULT_LIMIT: usize = 50;
+/// Maximum number of non-event read-model rows returned by one page.
+pub const COLLECTION_PAGE_MAX_LIMIT: usize = 100;
 
 /// A pure Resource Envelope validation failure shared by every application
 /// boundary. All length checks refer to UTF-8 bytes, not Unicode scalar values.
@@ -601,12 +605,29 @@ pub struct SessionEventPage {
     pub has_more: bool,
 }
 
+/// Opaque backward-pagination state for one bounded history collection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadPageInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_before: Option<String>,
+    pub has_more: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDetailPagination {
+    pub run_ids: ReadPageInfo,
+    pub turns: ReadPageInfo,
+    pub events: ReadPageInfo,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionDetail {
     pub session: SessionSummary,
     pub run_ids: Vec<String>,
     pub turns: Vec<SessionTurn>,
     pub events: Vec<SessionEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pagination: Option<SessionDetailPagination>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -821,6 +842,13 @@ pub struct OverviewResponse {
     pub evidence: Vec<EvidenceSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_policy: Option<ToolPolicySummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_events_page: Option<ReadPageInfo>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunDetailPagination {
+    pub events: ReadPageInfo,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -828,6 +856,8 @@ pub struct RunDetail {
     pub incident: IncidentSummary,
     pub run: RunSummary,
     pub events: Vec<RunEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pagination: Option<RunDetailPagination>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

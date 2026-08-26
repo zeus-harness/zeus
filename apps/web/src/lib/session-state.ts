@@ -19,6 +19,26 @@ interface StoredTurnAttempt {
 
 export type TurnAttemptDisposition = 'owned_running' | 'completed' | 'not_owned';
 
+export function sessionDisplaysPrimaryRun(sessionId: string, primarySessionId: string): boolean {
+	return sessionId === primarySessionId;
+}
+
+export function ownsTurnAttemptState(
+	activeSessionId: string,
+	expectedSessionId: string,
+	current: TurnAttempt | null,
+	expected: TurnAttempt,
+	currentSelectionEpoch: number,
+	expectedSelectionEpoch: number
+): boolean {
+	return (
+		activeSessionId === expectedSessionId &&
+		currentSelectionEpoch === expectedSelectionEpoch &&
+		current?.turnId === expected.turnId &&
+		current.startKey === expected.startKey
+	);
+}
+
 function attemptStorageKey(sessionId: string): string {
 	return `zeus.session.${sessionId}.turn-attempt`;
 }
@@ -104,10 +124,14 @@ export function clearTurnAttempt(storage: AttemptStorage | null, sessionId: stri
 
 export function turnAttemptDisposition(
 	detail: SessionDetail,
-	attempt: TurnAttempt
+	attempt: TurnAttempt,
+	pointTurn: SessionTurn | null = null
 ): TurnAttemptDisposition {
-	const turn = detail.turns.find((candidate) => candidate.id === attempt.turnId);
-	if (turn?.status === 'flushed') return 'completed';
+	const turn =
+		pointTurn?.id === attempt.turnId
+			? pointTurn
+			: detail.turns.find((candidate) => candidate.id === attempt.turnId);
+	if (turn && turn.status !== 'open') return 'completed';
 	if (
 		detail.session.status === 'running' &&
 		detail.session.active_turn_id === attempt.turnId &&
@@ -116,6 +140,10 @@ export function turnAttemptDisposition(
 		return 'owned_running';
 	}
 	return 'not_owned';
+}
+
+export function attemptTurnNeedsPointLookup(detail: SessionDetail, attempt: TurnAttempt): boolean {
+	return turnAttemptDisposition(detail, attempt) === 'not_owned';
 }
 
 export function mergeSessionEvents(

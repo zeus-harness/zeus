@@ -204,11 +204,23 @@ export interface SessionEvent {
 	data: SessionEventData;
 }
 
+export interface ReadPageInfo {
+	next_before?: string;
+	has_more: boolean;
+}
+
+export interface SessionDetailPagination {
+	run_ids: ReadPageInfo;
+	turns: ReadPageInfo;
+	events: ReadPageInfo;
+}
+
 export interface SessionDetail {
 	session: SessionSummary;
 	run_ids: string[];
 	turns: SessionTurn[];
 	events: SessionEvent[];
+	pagination?: SessionDetailPagination;
 }
 
 export interface CreateSessionRequest {
@@ -310,8 +322,16 @@ export interface OverviewResponse {
 	run: RunOverview;
 	metrics: Metric[];
 	recent_events: RunEvent[];
+	recent_events_page?: ReadPageInfo;
 	evidence?: EvidenceItem[];
 	tool_policy?: ToolPolicy;
+}
+
+export interface RunDetail {
+	incident: IncidentOverview;
+	run: RunOverview;
+	events: RunEvent[];
+	pagination?: { events: ReadPageInfo };
 }
 
 export interface AccountUser {

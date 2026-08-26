@@ -3,11 +3,14 @@ import test from 'node:test';
 
 import type { TurnAttempt } from './session-command.ts';
 import {
+	attemptTurnNeedsPointLookup,
 	clearTurnAttempt,
 	loadTurnAttempt,
 	mergeSessionEvents,
 	orderTimelineEvents,
+	ownsTurnAttemptState,
 	saveTurnAttempt,
+	sessionDisplaysPrimaryRun,
 	turnAttemptDisposition,
 	type AttemptStorage
 } from './session-state.ts';
@@ -156,6 +159,72 @@ test('only the matching open turn is owned by the restored tab attempt', () => {
 	assert.equal(
 		turnAttemptDisposition(sessionDetail('ready', undefined, 'flushed'), saved),
 		'completed'
+	);
+	assert.equal(
+		turnAttemptDisposition(sessionDetail('needs_attention', undefined, 'interrupted'), saved),
+		'completed'
+	);
+});
+
+test('uses a point turn when a completed attempt is older than the bounded tail', () => {
+	const saved = attempt();
+	const detail = sessionDetail('ready', undefined, null);
+	detail.pagination = {
+		run_ids: { has_more: false },
+		turns: { has_more: true, next_before: 'older-turns' },
+		events: { has_more: false }
+	};
+	assert.equal(attemptTurnNeedsPointLookup(detail, saved), true);
+	assert.equal(
+		turnAttemptDisposition(detail, saved, {
+			id: saved.turnId,
+			session_id: detail.session.id,
+			ordinal: 1,
+			status: 'flushed',
+			user_message: saved.text,
+			assistant_message: 'done',
+			started_at: '2026-08-26T00:00:01Z',
+			completed_at: '2026-08-26T00:00:02Z'
+		}),
+		'completed'
+	);
+});
+
+test('uses primary Session identity instead of a bounded attachment tail', () => {
+	assert.equal(sessionDisplaysPrimaryRun('session-primary', 'session-primary'), true);
+	assert.equal(sessionDisplaysPrimaryRun('session-later', 'session-primary'), false);
+});
+
+test('rejects a deferred point result after Session or attempt identity changes', async () => {
+	const expected = attempt();
+	let activeSessionId = 'session-1';
+	let currentAttempt: TurnAttempt | null = expected;
+	let selectionEpoch = 7;
+	let releasePoint!: () => void;
+	const deferredPoint = new Promise<void>((resolve) => {
+		releasePoint = resolve;
+	});
+	const guardedResult = deferredPoint.then(() =>
+		ownsTurnAttemptState(activeSessionId, 'session-1', currentAttempt, expected, selectionEpoch, 7)
+	);
+
+	activeSessionId = 'session-2';
+	currentAttempt = null;
+	selectionEpoch += 1;
+	releasePoint();
+	assert.equal(await guardedResult, false);
+	assert.equal(ownsTurnAttemptState('session-1', 'session-1', expected, expected, 7, 7), true);
+	assert.equal(ownsTurnAttemptState('session-1', 'session-1', expected, expected, 8, 7), false);
+	assert.equal(
+		ownsTurnAttemptState(
+			'session-1',
+			'session-1',
+			{ ...expected, startKey: 'new-key' },
+			expected,
+			7,
+			7
+		),
+		false
 	);
 });
 

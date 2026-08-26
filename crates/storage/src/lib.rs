@@ -4,6 +4,7 @@
 //! is append-only, and review/dispatch state changes commit atomically before
 //! callers publish events or invoke external tools.
 
+mod cursor;
 mod error;
 mod sqlite;
 
@@ -11,9 +12,9 @@ use std::fmt;
 
 pub use error::StorageError;
 use protocol::{
-    Approval, EvidenceSummary, IncidentSummary, Metric, ReviewResponse, RunEvent, RunSummary,
-    SandboxProfile, SessionEvent, SessionSummary, SessionTurn, StartTurnResponse, ToolCall,
-    ToolEffect, ToolPolicySummary,
+    Approval, EvidenceSummary, IncidentSummary, Metric, ReadPageInfo, ReviewResponse, RunEvent,
+    RunSummary, SandboxProfile, SessionEvent, SessionSummary, SessionTurn, StartTurnResponse,
+    ToolCall, ToolEffect, ToolPolicySummary,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -179,6 +180,19 @@ pub struct ReplyJob {
 pub struct ReplyJobEnqueueResponse {
     pub start: StartTurnResponse,
     pub job: ReplyJob,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSummaryPage {
+    pub items: Vec<SessionSummary>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoundedRunRead {
+    pub snapshot: RunSnapshot,
+    pub events: Vec<RunEvent>,
+    pub events_page: ReadPageInfo,
 }
 
 #[derive(Clone, Debug, PartialEq)]

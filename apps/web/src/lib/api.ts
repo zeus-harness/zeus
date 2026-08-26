@@ -15,11 +15,22 @@ import type {
 	SessionDetail,
 	SessionEvent,
 	SessionSummary,
+	SessionTurn,
 	StartTurnResponse
 } from './types';
 import { apiFetch } from './http';
+import { buildSessionListPath, type SessionListQuery } from './session-list';
 
 export type StreamStatus = 'connected' | 'reconnecting';
+
+export interface SessionListPage {
+	items: SessionSummary[];
+	nextCursor: string | null;
+}
+
+export interface ListSessionsOptions extends SessionListQuery {
+	signal?: AbortSignal;
+}
 
 export class ApiError extends Error {
 	constructor(
@@ -86,6 +97,22 @@ export async function getSession(sessionId: string, signal?: AbortSignal): Promi
 	return response.json() as Promise<SessionDetail>;
 }
 
+export async function getSessionTurn(
+	sessionId: string,
+	turnId: string,
+	signal?: AbortSignal
+): Promise<SessionTurn> {
+	const response = await apiFetch(
+		`/api/v1/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}`,
+		{
+			headers: { Accept: 'application/json' },
+			signal
+		}
+	);
+	if (!response.ok) throw await responseError(response, 'Session turn API');
+	return response.json() as Promise<SessionTurn>;
+}
+
 export async function startSessionTurn(
 	sessionId: string,
 	request: { turn_id: string; user_message: string; expected_sequence: number },
@@ -142,13 +169,16 @@ export async function logout(): Promise<LogoutResponse> {
 	return response.json() as Promise<LogoutResponse>;
 }
 
-export async function listSessions(signal?: AbortSignal): Promise<SessionSummary[]> {
-	const response = await apiFetch('/api/v1/sessions', {
+export async function listSessions(options: ListSessionsOptions = {}): Promise<SessionListPage> {
+	const response = await apiFetch(buildSessionListPath(options), {
 		headers: { Accept: 'application/json' },
-		signal
+		signal: options.signal
 	});
 	if (!response.ok) throw await responseError(response, 'Sessions API');
-	return response.json() as Promise<SessionSummary[]>;
+	return {
+		items: (await response.json()) as SessionSummary[],
+		nextCursor: response.headers.get('X-Zeus-Next-Cursor') || null
+	};
 }
 
 export async function createSession(
