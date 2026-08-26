@@ -1,0 +1,18 @@
+[workspace]
+members = [
+    "apps/zeus-api",
+    "crates/*"
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Fynn Tang <fzpying@gmail.com>"]
+description = ""
+homepage = "https://github.com/zeus-harness/zeus"
+repository = "https://github.com/zeus-harness/zeus.git"
+publish = false
+
+[workspace.dependencies]

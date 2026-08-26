@@ -1,0 +1,22 @@
+{
+  "name": "zeus",
+  "version": "0.1.0",
+  "description": "",
+  "keywords": [],
+  "license": "MIT",
+  "author": "Fynn Tang <fzpying@gmail.com>",
+  "homepage": "https://github.com/zeus-harness/zeus",
+  "repository": "https://github.com/zeus-harness/zeus.git",
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "lint": "turbo run lint",
+    "format": "prettier --write \"**/*.{ts,tsx,md}\""
+  },
+  "packageManager": "pnpm@10.33.0",
+  "devDependencies": {
+    "eslint": "^10.9.1",
+    "prettier": "^3.9.6",
+    "turbo": "^2.10.11"
+  }
+}

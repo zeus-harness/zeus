@@ -1,0 +1,15 @@
+{
+  "extends": "@zeus/typescript-config/base.json",
+  "include": [
+    "./"
+  ],
+  "exclude": ["node_modules"],
+  "compilerOptions": {
+    "strictNullChecks": true,
+    "baseUrl": ".",
+    "paths": {
+      "$lib": ["./lib"],
+      "$lib/*": ["./lib/*"]
+    }
+  }
+}
