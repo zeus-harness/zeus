@@ -183,6 +183,9 @@ pub struct ReplyJobEnqueueResponse {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ReplyClaimOutcome {
     Claimed(Box<ReplyJob>),
+    /// The queued job lost authorization before provider execution. Storage
+    /// has already failed the job and appended interruption evidence.
+    Rejected(Box<ReplyCompletion>),
     NotAvailable,
 }
 
@@ -288,6 +291,8 @@ pub enum CommitOutcome {
 pub struct DispatchJobSpec {
     pub call_id: String,
     pub approval_id: String,
+    /// The owner whose approval authorized this immutable dispatch.
+    pub approving_actor_user_id: String,
     pub tool_name: String,
     pub tool_version: String,
     pub effect: ToolEffect,
@@ -303,6 +308,7 @@ pub enum DispatchStatus {
     Queued,
     Started,
     Finished,
+    Rejected,
 }
 
 /// Durable queue state returned to the dispatcher.
@@ -312,6 +318,7 @@ pub struct DispatchJob {
     pub run_id: String,
     pub approval_id: String,
     pub approval_event_sequence: u64,
+    pub approving_actor_user_id: Option<String>,
     pub tool_name: String,
     pub tool_version: String,
     pub effect: ToolEffect,
@@ -323,11 +330,20 @@ pub struct DispatchJob {
     pub status: DispatchStatus,
     pub attempt: u32,
     pub result_json: Option<Value>,
+    pub authorization_error_json: Option<Value>,
     pub queued_at: String,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
     pub start_event_sequence: Option<u64>,
     pub result_event_sequence: Option<u64>,
+}
+
+/// A queued tool call that lost authorization before any connector was
+/// invoked. The event and terminal job state were committed atomically.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DispatchRejection {
+    pub job: DispatchJob,
+    pub event: RunEvent,
 }
 
 /// Caller-computed transition used to claim the current queue head.
@@ -346,6 +362,7 @@ pub struct DispatchStartCommit {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ClaimOutcome {
     Claimed(Box<DispatchJob>),
+    Rejected(Box<DispatchRejection>),
     NotAvailable,
 }
 

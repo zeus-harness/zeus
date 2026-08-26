@@ -19,11 +19,12 @@ use kernel::{
     apply_tool_result, start_tool_dispatch,
 };
 use protocol::{
-    Approval, ApprovalStatus, CreateSessionRequest, CreateSessionResponse, FlushSessionRequest,
-    FlushSessionResponse, NotDispatchedReason, OverviewResponse, PolicyDecision,
-    ResumeSessionRequest, ResumeSessionResponse, ReviewDecision, ReviewRequest, ReviewResponse,
-    RunDetail, RunEvent, RunEventData, RunSummary, SessionDetail, SessionEvent, SessionEventData,
-    SessionSummary, StartTurnRequest, StartTurnResponse, ToolCall, ToolExecutorStatus, ToolOutcome,
+    Approval, ApprovalStatus, AttachRunRequest, AttachRunResponse, CreateSessionRequest,
+    CreateSessionResponse, FlushSessionRequest, FlushSessionResponse, NotDispatchedReason,
+    OverviewResponse, PolicyDecision, ResumeSessionRequest, ResumeSessionResponse, ReviewDecision,
+    ReviewRequest, ReviewResponse, RunDetail, RunEvent, RunEventData, RunSummary, SessionDetail,
+    SessionEvent, SessionEventData, SessionSummary, StartTurnRequest, StartTurnResponse, ToolCall,
+    ToolExecutorStatus, ToolOutcome,
 };
 pub use storage::{
     AuthPrincipal, AuthSessionCommit, BootstrapOwnerCommit, ReplyClaimOutcome, ReplyCompletion,
@@ -365,8 +366,47 @@ impl DemoStore {
         })
     }
 
+    /// Returns the primary workspace only when the actor is still an active
+    /// owner of its primary Run. The storage predicate intentionally maps a
+    /// missing, unowned, disabled, or non-owner actor to the same not-found
+    /// result.
+    pub async fn overview_for_actor(
+        &self,
+        actor_user_id: &str,
+    ) -> Result<OverviewResponse, StoreError> {
+        let stored = self
+            .storage
+            .load_run_for_actor(actor_user_id, &self.primary_run_id)
+            .await?;
+        Ok(OverviewResponse {
+            primary_session_id: self.primary_session_id.to_string(),
+            incident: stored.snapshot.incident,
+            run: stored.snapshot.run,
+            metrics: stored.snapshot.metrics,
+            recent_events: stored.events,
+            evidence: stored.snapshot.evidence,
+            tool_policy: stored.snapshot.tool_policy,
+        })
+    }
+
     pub async fn run_detail(&self, run_id: &str) -> Result<RunDetail, StoreError> {
         let stored = self.storage.load_run(run_id).await?;
+        Ok(RunDetail {
+            incident: stored.snapshot.incident,
+            run: stored.snapshot.run,
+            events: stored.events,
+        })
+    }
+
+    pub async fn run_detail_for_actor(
+        &self,
+        actor_user_id: &str,
+        run_id: &str,
+    ) -> Result<RunDetail, StoreError> {
+        let stored = self
+            .storage
+            .load_run_for_actor(actor_user_id, run_id)
+            .await?;
         Ok(RunDetail {
             incident: stored.snapshot.incident,
             run: stored.snapshot.run,
@@ -382,6 +422,18 @@ impl DemoStore {
         Ok(self.storage.events_after(run_id, after).await?)
     }
 
+    pub async fn events_after_for_actor(
+        &self,
+        actor_user_id: &str,
+        run_id: &str,
+        after: u64,
+    ) -> Result<Vec<RunEvent>, StoreError> {
+        Ok(self
+            .storage
+            .events_after_for_actor(actor_user_id, run_id, after)
+            .await?)
+    }
+
     /// Subscribes before taking the durable replay snapshot. Consumers discard
     /// broadcasts at or below their cursor, avoiding both gaps and duplicates.
     pub async fn event_feed(&self, run_id: &str, after: u64) -> Result<EventFeed, StoreError> {
@@ -390,13 +442,47 @@ impl DemoStore {
         Ok(EventFeed { replay, receiver })
     }
 
+    /// Subscribes before the actor-scoped durable snapshot so a commit cannot
+    /// fall between authorization/replay and the live wake channel.
+    pub async fn event_feed_for_actor(
+        &self,
+        actor_user_id: &str,
+        run_id: &str,
+        after: u64,
+    ) -> Result<EventFeed, StoreError> {
+        let receiver = self.publisher.subscribe();
+        let replay = self
+            .events_after_for_actor(actor_user_id, run_id, after)
+            .await?;
+        Ok(EventFeed { replay, receiver })
+    }
+
     pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, StoreError> {
         Ok(self.storage.list_sessions().await?)
+    }
+
+    pub async fn list_sessions_for_actor(
+        &self,
+        actor_user_id: &str,
+    ) -> Result<Vec<SessionSummary>, StoreError> {
+        Ok(self.storage.list_sessions_for_actor(actor_user_id).await?)
     }
 
     pub async fn get_session(&self, session_id: &str) -> Result<SessionDetail, StoreError> {
         validate_canonical_session_value(session_id, "session ID")?;
         Ok(self.storage.get_session(session_id).await?)
+    }
+
+    pub async fn get_session_for_actor(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+    ) -> Result<SessionDetail, StoreError> {
+        validate_canonical_session_value(session_id, "session ID")?;
+        Ok(self
+            .storage
+            .get_session_for_actor(actor_user_id, session_id)
+            .await?)
     }
 
     pub async fn session_events_after(
@@ -407,6 +493,20 @@ impl DemoStore {
         validate_canonical_session_value(session_id, "session ID")?;
         validate_session_sequence(after, "session event cursor")?;
         Ok(self.storage.session_events_after(session_id, after).await?)
+    }
+
+    pub async fn session_events_after_for_actor(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+        after: u64,
+    ) -> Result<Vec<SessionEvent>, StoreError> {
+        validate_canonical_session_value(session_id, "session ID")?;
+        validate_session_sequence(after, "session event cursor")?;
+        Ok(self
+            .storage
+            .session_events_after_for_actor(actor_user_id, session_id, after)
+            .await?)
     }
 
     /// Subscribes to the session channel before loading the durable replay.
@@ -423,6 +523,23 @@ impl DemoStore {
         validate_canonical_session_value(session_id, "session ID")?;
         let receiver = self.session_publisher.subscribe();
         let replay = self.session_events_after(session_id, after).await?;
+        Ok(SessionEventFeed { replay, receiver })
+    }
+
+    /// Actor-scoped counterpart used by authenticated SSE. Subscription still
+    /// precedes the durable query, while storage performs the owner check in
+    /// the same read transaction that builds the replay.
+    pub async fn session_event_feed_for_actor(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+        after: u64,
+    ) -> Result<SessionEventFeed, StoreError> {
+        validate_canonical_session_value(session_id, "session ID")?;
+        let receiver = self.session_publisher.subscribe();
+        let replay = self
+            .session_events_after_for_actor(actor_user_id, session_id, after)
+            .await?;
         Ok(SessionEventFeed { replay, receiver })
     }
 
@@ -463,6 +580,27 @@ impl DemoStore {
         Ok(response)
     }
 
+    pub async fn attach_run_for_actor(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+        request: AttachRunRequest,
+        idempotency_key: &str,
+    ) -> Result<AttachRunResponse, StoreError> {
+        validate_canonical_session_value(session_id, "session ID")?;
+        validate_canonical_session_value(&request.run_id, "run ID")?;
+        validate_session_sequence(request.expected_sequence, "expected session sequence")?;
+        let idempotency_key = normalized_idempotency_key(idempotency_key)?;
+        let response = self
+            .storage
+            .attach_run_for_actor(actor_user_id, session_id, request, idempotency_key)
+            .await?;
+        if !response.replayed {
+            self.publish_session_event(session_id, response.event.clone());
+        }
+        Ok(response)
+    }
+
     pub async fn resume_session(
         &self,
         session_id: &str,
@@ -475,6 +613,26 @@ impl DemoStore {
         let response = self
             .storage
             .resume_session(session_id, request, idempotency_key)
+            .await?;
+        if !response.replayed {
+            self.publish_session_event(session_id, response.event.clone());
+        }
+        Ok(response)
+    }
+
+    pub async fn resume_session_for_actor(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+        request: ResumeSessionRequest,
+        idempotency_key: &str,
+    ) -> Result<ResumeSessionResponse, StoreError> {
+        validate_canonical_session_value(session_id, "session ID")?;
+        validate_session_sequence(request.expected_sequence, "expected session sequence")?;
+        let idempotency_key = normalized_idempotency_key(idempotency_key)?;
+        let response = self
+            .storage
+            .resume_session_for_actor(actor_user_id, session_id, request, idempotency_key)
             .await?;
         if !response.replayed {
             self.publish_session_event(session_id, response.event.clone());
@@ -496,6 +654,28 @@ impl DemoStore {
         let response = self
             .storage
             .start_turn(session_id, request, idempotency_key)
+            .await?;
+        if !response.replayed {
+            self.publish_session_event(session_id, response.event.clone());
+        }
+        Ok(response)
+    }
+
+    pub async fn start_turn_for_actor(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+        request: StartTurnRequest,
+        idempotency_key: &str,
+    ) -> Result<StartTurnResponse, StoreError> {
+        validate_canonical_session_value(session_id, "session ID")?;
+        validate_canonical_session_value(&request.turn_id, "turn ID")?;
+        validate_session_message(&request.user_message, "user message")?;
+        validate_session_sequence(request.expected_sequence, "expected session sequence")?;
+        let idempotency_key = normalized_idempotency_key(idempotency_key)?;
+        let response = self
+            .storage
+            .start_turn_for_actor(actor_user_id, session_id, request, idempotency_key)
             .await?;
         if !response.replayed {
             self.publish_session_event(session_id, response.event.clone());
@@ -525,8 +705,50 @@ impl DemoStore {
         Ok(response)
     }
 
+    pub async fn start_turn_and_enqueue_reply_for_actor(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+        request: StartTurnRequest,
+        idempotency_key: &str,
+        job: ReplyJobSpec,
+    ) -> Result<ReplyJobEnqueueResponse, StoreError> {
+        validate_canonical_session_value(session_id, "session ID")?;
+        validate_canonical_session_value(&request.turn_id, "turn ID")?;
+        validate_session_message(&request.user_message, "user message")?;
+        validate_session_sequence(request.expected_sequence, "expected session sequence")?;
+        let idempotency_key = normalized_idempotency_key(idempotency_key)?;
+        let response = self
+            .storage
+            .start_turn_and_enqueue_reply_for_actor(
+                actor_user_id,
+                session_id,
+                request,
+                idempotency_key,
+                job,
+            )
+            .await?;
+        if !response.start.replayed {
+            self.publish_session_event(session_id, response.start.event.clone());
+        }
+        Ok(response)
+    }
+
     pub async fn claim_next_reply(&self) -> Result<ReplyClaimOutcome, StoreError> {
-        Ok(self.storage.claim_next_reply().await?)
+        loop {
+            match self.storage.claim_next_reply().await? {
+                ReplyClaimOutcome::Rejected(completion) => {
+                    // Storage committed the terminal failure before returning.
+                    // Publish only as a post-commit wake hint and continue to
+                    // the next queue item without exposing rejected work to a
+                    // provider caller.
+                    for event in &completion.events {
+                        self.publish_session_event(&completion.session.id, event.clone());
+                    }
+                }
+                outcome => return Ok(outcome),
+            }
+        }
     }
 
     pub async fn reply_job(&self, job_id: &str) -> Result<Option<ReplyJob>, StoreError> {
@@ -597,10 +819,71 @@ impl DemoStore {
         Ok(response)
     }
 
+    pub async fn flush_turn_for_actor(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+        request: FlushSessionRequest,
+        idempotency_key: &str,
+    ) -> Result<FlushSessionResponse, StoreError> {
+        validate_canonical_session_value(session_id, "session ID")?;
+        validate_canonical_session_value(&request.turn_id, "turn ID")?;
+        if let Some(message) = &request.assistant_message {
+            validate_session_message(message, "assistant message")?;
+        }
+        validate_session_sequence(request.expected_sequence, "expected session sequence")?;
+        let idempotency_key = normalized_idempotency_key(idempotency_key)?;
+        let response = self
+            .storage
+            .flush_turn_for_actor(actor_user_id, session_id, request, idempotency_key)
+            .await?;
+        if !response.replayed {
+            for event in &response.events {
+                self.publish_session_event(session_id, event.clone());
+            }
+        }
+        Ok(response)
+    }
+
     /// Records one call-bound approval decision. Approving only queues the
     /// exact call; it does not claim that execution has started.
     pub async fn review(
         &self,
+        run_id: &str,
+        approval_id: &str,
+        request: ReviewRequest,
+        idempotency_key: &str,
+    ) -> Result<ReviewResponse, StoreError> {
+        self.review_inner(None, run_id, approval_id, request, idempotency_key)
+            .await
+    }
+
+    /// Actor-scoped approval boundary used by the authenticated server.
+    ///
+    /// Resource authorization deliberately happens before receipt lookup, so
+    /// possession of another owner's idempotency key can neither replay their
+    /// response nor turn an ownership miss into an idempotency conflict.
+    pub async fn review_for_actor(
+        &self,
+        actor_user_id: &str,
+        run_id: &str,
+        approval_id: &str,
+        request: ReviewRequest,
+        idempotency_key: &str,
+    ) -> Result<ReviewResponse, StoreError> {
+        self.review_inner(
+            Some(actor_user_id),
+            run_id,
+            approval_id,
+            request,
+            idempotency_key,
+        )
+        .await
+    }
+
+    async fn review_inner(
+        &self,
+        actor_user_id: Option<&str>,
         run_id: &str,
         approval_id: &str,
         request: ReviewRequest,
@@ -612,13 +895,29 @@ impl DemoStore {
         }
         let fingerprint = review_fingerprint(run_id, approval_id, &request)?;
 
-        if let Some(receipt) = self.storage.review_receipt(idempotency_key).await? {
-            let response = replay_receipt(receipt, &fingerprint)?;
-            self.kick_dispatcher();
-            return Ok(response);
-        }
-
-        let stored = self.storage.load_run(run_id).await?;
+        let stored = if let Some(actor_user_id) = actor_user_id {
+            let stored = self
+                .storage
+                .load_run_for_actor(actor_user_id, run_id)
+                .await?;
+            if let Some(receipt) = self
+                .storage
+                .review_receipt_for_actor(actor_user_id, run_id, idempotency_key)
+                .await?
+            {
+                let response = replay_receipt(receipt, &fingerprint)?;
+                self.kick_dispatcher();
+                return Ok(response);
+            }
+            stored
+        } else {
+            if let Some(receipt) = self.storage.review_receipt(idempotency_key).await? {
+                let response = replay_receipt(receipt, &fingerprint)?;
+                self.kick_dispatcher();
+                return Ok(response);
+            }
+            self.storage.load_run(run_id).await?
+        };
         let (pending, call) = pending_approval_and_call(&stored, approval_id)?;
         let approving = request.decision == ReviewDecision::Approve;
         if approving {
@@ -636,6 +935,11 @@ impl DemoStore {
         )?;
 
         let dispatch = if approving {
+            let approving_actor_user_id = actor_user_id.ok_or_else(|| {
+                StoreError::ExecutionInvariant(
+                    "approval execution requires an authenticated owner actor".into(),
+                )
+            })?;
             let approved = transition.event.approval.as_ref().ok_or_else(|| {
                 StoreError::ExecutionInvariant(
                     "an approved transition is missing its approval binding".into(),
@@ -658,6 +962,7 @@ impl DemoStore {
                 policy_id: self.policy_id.to_string(),
                 policy_revision: evaluation.policy_revision,
                 sandbox_profile: call.sandbox_profile.clone(),
+                approving_actor_user_id: approving_actor_user_id.to_owned(),
             })
         } else {
             None
@@ -675,18 +980,22 @@ impl DemoStore {
             run_id: run_id.to_owned(),
             event: transition.event.clone(),
         };
-        let outcome = self
-            .storage
-            .commit_review(ReviewCommit {
-                expected_sequence,
-                snapshot,
-                event: transition.event,
-                idempotency_key: idempotency_key.to_owned(),
-                request_fingerprint: fingerprint.clone(),
-                response: response.clone(),
-                dispatch,
-            })
-            .await?;
+        let commit = ReviewCommit {
+            expected_sequence,
+            snapshot,
+            event: transition.event,
+            idempotency_key: idempotency_key.to_owned(),
+            request_fingerprint: fingerprint.clone(),
+            response: response.clone(),
+            dispatch,
+        };
+        let outcome = if let Some(actor_user_id) = actor_user_id {
+            self.storage
+                .commit_review_for_actor(actor_user_id, commit)
+                .await?
+        } else {
+            self.storage.commit_review(commit).await?
+        };
 
         match outcome {
             CommitOutcome::Committed => {
@@ -717,6 +1026,17 @@ impl DemoStore {
 
     pub async fn current_run(&self) -> Result<RunSummary, StoreError> {
         Ok(self.storage.snapshot(&self.primary_run_id).await?.run)
+    }
+
+    pub async fn current_run_for_actor(
+        &self,
+        actor_user_id: &str,
+    ) -> Result<RunSummary, StoreError> {
+        Ok(self
+            .storage
+            .snapshot_for_actor(actor_user_id, &self.primary_run_id)
+            .await?
+            .run)
     }
 
     async fn recover_started_reply_jobs(&self) -> Result<(), StoreError> {
@@ -802,49 +1122,61 @@ impl DemoStore {
     }
 
     async fn claim_next_dispatch(&self) -> Result<Option<ClaimedDispatch>, StoreError> {
-        let Some(job) = self.storage.peek_next_dispatch().await? else {
-            return Ok(None);
-        };
-        self.validate_dispatch_job_identity(&job)?;
-        let stored = self.storage.load_run(&job.run_id).await?;
-        let (call, approval) = bindings_for_job(&stored, &job)?;
-        let environment = stored.snapshot.run.environment.clone();
-        let expected_sequence = stored.snapshot.run.sequence;
-        let transition = start_tool_dispatch(
-            &stored.snapshot.run,
-            &approval,
-            &call,
-            executor_label(&self.registry, &call),
-            next_sequence(expected_sequence)?,
-            now(),
-        )?;
-        let mut snapshot = stored.snapshot;
-        snapshot.run = transition.run;
-        let event = transition.event.clone();
+        loop {
+            let Some(job) = self.storage.peek_next_dispatch().await? else {
+                return Ok(None);
+            };
+            self.validate_dispatch_job_identity(&job)?;
+            let stored = self.storage.load_run(&job.run_id).await?;
+            let (call, approval) = bindings_for_job(&stored, &job)?;
+            let environment = stored.snapshot.run.environment.clone();
+            let expected_sequence = stored.snapshot.run.sequence;
+            let transition = start_tool_dispatch(
+                &stored.snapshot.run,
+                &approval,
+                &call,
+                executor_label(&self.registry, &call),
+                next_sequence(expected_sequence)?,
+                now(),
+            )?;
+            let mut snapshot = stored.snapshot;
+            snapshot.run = transition.run;
+            let event = transition.event.clone();
 
-        match self
-            .storage
-            .claim_next_dispatch(DispatchStartCommit {
-                call_id: job.call_id.clone(),
-                expected_sequence,
-                snapshot,
-                event: transition.event,
-            })
-            .await?
-        {
-            ClaimOutcome::Claimed(claimed_job) => {
-                let _ = self.publisher.send(PublishedEvent {
-                    run_id: claimed_job.run_id.clone(),
-                    event,
-                });
-                Ok(Some(ClaimedDispatch {
-                    job: *claimed_job,
-                    call,
-                    approval,
-                    environment,
-                }))
+            match self
+                .storage
+                .claim_next_dispatch(DispatchStartCommit {
+                    call_id: job.call_id.clone(),
+                    expected_sequence,
+                    snapshot,
+                    event: transition.event,
+                })
+                .await?
+            {
+                ClaimOutcome::Claimed(claimed_job) => {
+                    let _ = self.publisher.send(PublishedEvent {
+                        run_id: claimed_job.run_id.clone(),
+                        event,
+                    });
+                    return Ok(Some(ClaimedDispatch {
+                        job: *claimed_job,
+                        call,
+                        approval,
+                        environment,
+                    }));
+                }
+                ClaimOutcome::Rejected(rejection) => {
+                    // Storage revalidated the approving actor and committed
+                    // both the terminal job state and durable rejection event.
+                    // Publish only after that commit, then skip the connector.
+                    let rejection = *rejection;
+                    let _ = self.publisher.send(PublishedEvent {
+                        run_id: rejection.job.run_id,
+                        event: rejection.event,
+                    });
+                }
+                ClaimOutcome::NotAvailable => return Ok(None),
             }
-            ClaimOutcome::NotAvailable => Ok(None),
         }
     }
 
@@ -1323,14 +1655,16 @@ mod tests {
 
     use kernel::{LOCAL_MARKER_CALL_ID, PRODUCTION_DEMO_CALL_ID};
     use protocol::{
-        DEMO_RUN_ID, DEMO_SESSION_ID, LOCAL_DEMO_RUN_ID, RunStatus, SessionStatus,
-        SessionTurnStatus, ToolCallStatus,
+        DEMO_RUN_ID, DEMO_SESSION_ID, LOCAL_DEMO_RUN_ID, LOCAL_DEMO_SESSION_ID, RunStatus,
+        SessionStatus, SessionTurnStatus, ToolCallStatus,
     };
+    use rusqlite::{Connection, params};
     use storage::DispatchStatus;
 
     use super::*;
 
     static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
+    const TEST_OWNER_ID: &str = "user-runtime-owner";
 
     fn approval_request(decision: ReviewDecision) -> ReviewRequest {
         ReviewRequest {
@@ -1343,7 +1677,10 @@ mod tests {
     #[tokio::test]
     async fn replay_is_strictly_after_the_cursor() {
         let store = production_store(false).await;
-        let replay = store.events_after(protocol::DEMO_RUN_ID, 4).await.unwrap();
+        let replay = store
+            .events_after_for_actor(TEST_OWNER_ID, protocol::DEMO_RUN_ID, 4)
+            .await
+            .unwrap();
 
         assert_eq!(
             replay
@@ -1369,17 +1706,24 @@ mod tests {
         // Make an accidental `kick_dispatcher` observable without draining the
         // pre-existing queued job during startup.
         store.auto_dispatch = true;
-        let run_before = store.run_detail(DEMO_RUN_ID).await.unwrap();
-        let mut session_feed = store.session_event_feed(DEMO_SESSION_ID, 2).await.unwrap();
+        let run_before = store
+            .run_detail_for_actor(TEST_OWNER_ID, DEMO_RUN_ID)
+            .await
+            .unwrap();
+        let mut session_feed = store
+            .session_event_feed_for_actor(TEST_OWNER_ID, DEMO_SESSION_ID, 2)
+            .await
+            .unwrap();
         let mut run_feed = store
-            .event_feed(DEMO_RUN_ID, run_before.run.sequence)
+            .event_feed_for_actor(TEST_OWNER_ID, DEMO_RUN_ID, run_before.run.sequence)
             .await
             .unwrap();
         assert!(session_feed.replay.is_empty());
         assert!(run_feed.replay.is_empty());
 
         let started = store
-            .start_turn(
+            .start_turn_for_actor(
+                TEST_OWNER_ID,
                 DEMO_SESSION_ID,
                 StartTurnRequest {
                     turn_id: "turn-runtime-isolation".into(),
@@ -1406,7 +1750,8 @@ mod tests {
             expected_sequence: 3,
         };
         let flushed = store
-            .flush_turn(
+            .flush_turn_for_actor(
+                TEST_OWNER_ID,
                 DEMO_SESSION_ID,
                 flush_request.clone(),
                 "runtime-flush-isolation",
@@ -1426,7 +1771,12 @@ mod tests {
         );
 
         let replayed = store
-            .flush_turn(DEMO_SESSION_ID, flush_request, "runtime-flush-isolation")
+            .flush_turn_for_actor(
+                TEST_OWNER_ID,
+                DEMO_SESSION_ID,
+                flush_request,
+                "runtime-flush-isolation",
+            )
             .await
             .unwrap();
         assert!(replayed.replayed);
@@ -1439,7 +1789,13 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        assert_eq!(store.run_detail(DEMO_RUN_ID).await.unwrap(), run_before);
+        assert_eq!(
+            store
+                .run_detail_for_actor(TEST_OWNER_ID, DEMO_RUN_ID)
+                .await
+                .unwrap(),
+            run_before
+        );
         let still_queued = store
             .storage
             .dispatch_job(PRODUCTION_DEMO_CALL_ID)
@@ -1464,9 +1820,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let run_before = store.run_detail(DEMO_RUN_ID).await.unwrap();
+        bootstrap_test_owner(&store).await;
+        let run_before = store
+            .run_detail_for_actor(TEST_OWNER_ID, DEMO_RUN_ID)
+            .await
+            .unwrap();
         store
-            .start_turn(
+            .start_turn_for_actor(
+                TEST_OWNER_ID,
                 DEMO_SESSION_ID,
                 StartTurnRequest {
                     turn_id: "turn-restart-recovery".into(),
@@ -1486,7 +1847,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let detail = reopened.get_session(DEMO_SESSION_ID).await.unwrap();
+        let detail = reopened
+            .get_session_for_actor(TEST_OWNER_ID, DEMO_SESSION_ID)
+            .await
+            .unwrap();
         assert_eq!(detail.session.status, SessionStatus::NeedsAttention);
         assert_eq!(detail.session.sequence, 4);
         assert_eq!(detail.turns[0].status, SessionTurnStatus::Interrupted);
@@ -1501,13 +1865,20 @@ mod tests {
                 .iter()
                 .all(|event| !matches!(event.data, SessionEventData::TurnFlushed { .. }))
         );
-        assert_eq!(reopened.run_detail(DEMO_RUN_ID).await.unwrap(), run_before);
+        assert_eq!(
+            reopened
+                .run_detail_for_actor(TEST_OWNER_ID, DEMO_RUN_ID)
+                .await
+                .unwrap(),
+            run_before
+        );
 
         let resume_request = ResumeSessionRequest {
             expected_sequence: 4,
         };
         let resumed = reopened
-            .resume_session(
+            .resume_session_for_actor(
+                TEST_OWNER_ID,
                 DEMO_SESSION_ID,
                 resume_request.clone(),
                 "runtime-resume-recovery",
@@ -1517,40 +1888,259 @@ mod tests {
         assert_eq!(resumed.session.status, SessionStatus::Ready);
         assert_eq!(resumed.session.sequence, 5);
         let replayed = reopened
-            .resume_session(DEMO_SESSION_ID, resume_request, "runtime-resume-recovery")
+            .resume_session_for_actor(
+                TEST_OWNER_ID,
+                DEMO_SESSION_ID,
+                resume_request,
+                "runtime-resume-recovery",
+            )
             .await
             .unwrap();
         assert!(replayed.replayed);
         assert_eq!(
             reopened
-                .get_session(DEMO_SESSION_ID)
+                .get_session_for_actor(TEST_OWNER_ID, DEMO_SESSION_ID)
                 .await
                 .unwrap()
                 .session
                 .sequence,
             5
         );
-        assert_eq!(reopened.run_detail(DEMO_RUN_ID).await.unwrap(), run_before);
+        assert_eq!(
+            reopened
+                .run_detail_for_actor(TEST_OWNER_ID, DEMO_RUN_ID)
+                .await
+                .unwrap(),
+            run_before
+        );
     }
 
     #[tokio::test]
     async fn overview_and_session_queries_expose_the_stable_primary_session() {
         let store = production_store(false).await;
-        let overview = store.overview().await.unwrap();
+        let overview = store.overview_for_actor(TEST_OWNER_ID).await.unwrap();
         assert_eq!(overview.primary_session_id, DEMO_SESSION_ID);
-        let sessions = store.list_sessions().await.unwrap();
+        let sessions = store.list_sessions_for_actor(TEST_OWNER_ID).await.unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, DEMO_SESSION_ID);
-        let detail = store.get_session(DEMO_SESSION_ID).await.unwrap();
+        let detail = store
+            .get_session_for_actor(TEST_OWNER_ID, DEMO_SESSION_ID)
+            .await
+            .unwrap();
         assert_eq!(detail.run_ids, vec![DEMO_RUN_ID]);
         assert_eq!(detail.events.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn actor_scoped_queries_and_commands_hide_another_owners_resources() {
+        const OTHER_ACTOR: &str = "user-other-owner";
+
+        let store = production_store(false).await;
+        assert_eq!(
+            store.current_run_for_actor(TEST_OWNER_ID).await.unwrap().id,
+            DEMO_RUN_ID
+        );
+        assert!(
+            matches!(
+                store.overview_for_actor(OTHER_ACTOR).await,
+                Err(StoreError::RunNotFound(id)) if id == DEMO_RUN_ID
+            ),
+            "overview must conceal another owner's run"
+        );
+        assert!(
+            matches!(
+                store.run_detail_for_actor(OTHER_ACTOR, DEMO_RUN_ID).await,
+                Err(StoreError::RunNotFound(id)) if id == DEMO_RUN_ID
+            ),
+            "run detail must conceal another owner's run"
+        );
+        assert!(
+            matches!(
+                store.events_after_for_actor(OTHER_ACTOR, DEMO_RUN_ID, 0).await,
+                Err(StoreError::RunNotFound(id)) if id == DEMO_RUN_ID
+            ),
+            "run replay must conceal another owner's run"
+        );
+        let run_feed_error = match store
+            .event_feed_for_actor(OTHER_ACTOR, DEMO_RUN_ID, 0)
+            .await
+        {
+            Ok(_) => panic!("run feed must conceal another owner's run"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            run_feed_error,
+            StoreError::RunNotFound(id) if id == DEMO_RUN_ID
+        ));
+
+        assert!(
+            matches!(
+                store.get_session_for_actor(OTHER_ACTOR, DEMO_SESSION_ID).await,
+                Err(StoreError::SessionNotFound(id)) if id == DEMO_SESSION_ID
+            ),
+            "session detail must conceal another owner's session"
+        );
+        assert!(
+            matches!(
+                store
+                    .session_events_after_for_actor(OTHER_ACTOR, DEMO_SESSION_ID, 0)
+                    .await,
+                Err(StoreError::SessionNotFound(id)) if id == DEMO_SESSION_ID
+            ),
+            "session replay must conceal another owner's session"
+        );
+        let session_feed_error = match store
+            .session_event_feed_for_actor(OTHER_ACTOR, DEMO_SESSION_ID, 0)
+            .await
+        {
+            Ok(_) => panic!("session feed must conceal another owner's session"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            session_feed_error,
+            StoreError::SessionNotFound(id) if id == DEMO_SESSION_ID
+        ));
+        assert!(
+            matches!(
+                store
+                    .start_turn_for_actor(
+                        OTHER_ACTOR,
+                        DEMO_SESSION_ID,
+                        StartTurnRequest {
+                            turn_id: "turn-other-owner".into(),
+                            user_message: "This must remain unauthorized.".into(),
+                            expected_sequence: 2,
+                        },
+                        "runtime-other-owner-start",
+                    )
+                    .await,
+                Err(StoreError::SessionNotFound(id)) if id == DEMO_SESSION_ID
+            ),
+            "session commands must authorize the resource before transition validation"
+        );
+        assert!(
+            matches!(
+                store
+                    .attach_run_for_actor(
+                        OTHER_ACTOR,
+                        DEMO_SESSION_ID,
+                        AttachRunRequest {
+                            run_id: DEMO_RUN_ID.into(),
+                            expected_sequence: 2,
+                        },
+                        "runtime-other-owner-attach",
+                    )
+                    .await,
+                Err(StoreError::SessionNotFound(id)) if id == DEMO_SESSION_ID
+            ),
+            "run attachment must authorize the session before checking attachment state"
+        );
+        assert!(
+            matches!(
+                store
+                    .resume_session_for_actor(
+                        OTHER_ACTOR,
+                        DEMO_SESSION_ID,
+                        ResumeSessionRequest {
+                            expected_sequence: 2,
+                        },
+                        "runtime-other-owner-resume",
+                    )
+                    .await,
+                Err(StoreError::SessionNotFound(id)) if id == DEMO_SESSION_ID
+            ),
+            "resume must authorize the session before checking its state"
+        );
+        assert_eq!(
+            store
+                .get_session_for_actor(TEST_OWNER_ID, DEMO_SESSION_ID)
+                .await
+                .unwrap()
+                .session
+                .sequence,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn actor_review_authorizes_the_run_before_receipt_replay() {
+        const OTHER_ACTOR: &str = "user-other-owner";
+
+        let store = production_store(false).await;
+        let request = approval_request(ReviewDecision::Reject);
+        let first = store
+            .review_for_actor(
+                TEST_OWNER_ID,
+                DEMO_RUN_ID,
+                "APR-901",
+                request.clone(),
+                "actor-review-replay",
+            )
+            .await
+            .unwrap();
+        assert!(!first.replayed);
+        assert_eq!(first.run.status, RunStatus::Blocked);
+
+        let replay = store
+            .review_for_actor(
+                TEST_OWNER_ID,
+                DEMO_RUN_ID,
+                "APR-901",
+                request.clone(),
+                "actor-review-replay",
+            )
+            .await
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.event, first.event);
+
+        assert!(
+            matches!(
+                store
+                    .review_for_actor(
+                        OTHER_ACTOR,
+                        DEMO_RUN_ID,
+                        "APR-901",
+                        request,
+                        "actor-review-replay",
+                    )
+                    .await,
+                Err(StoreError::RunNotFound(id)) if id == DEMO_RUN_ID
+            ),
+            "receipt possession must not bypass run authorization"
+        );
+    }
+
+    #[tokio::test]
+    async fn actor_review_without_a_bootstrapped_owner_fails_closed() {
+        let store = DemoStore::from_storage(
+            SqliteStore::open(":memory:").await.unwrap(),
+            DemoProfile::ProductionGuarded,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            store
+                .review_for_actor(
+                    TEST_OWNER_ID,
+                    DEMO_RUN_ID,
+                    "APR-901",
+                    approval_request(ReviewDecision::Reject),
+                    "unbootstrapped-review",
+                )
+                .await,
+            Err(StoreError::RunNotFound(id)) if id == DEMO_RUN_ID
+        ));
     }
 
     #[tokio::test]
     async fn production_approval_is_never_reported_as_execution_success() {
         let store = production_store(false).await;
         let response = store
-            .review(
+            .review_for_actor(
+                TEST_OWNER_ID,
                 protocol::DEMO_RUN_ID,
                 "APR-901",
                 approval_request(ReviewDecision::Approve),
@@ -1580,6 +2170,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(job.approving_actor_user_id.as_deref(), Some(TEST_OWNER_ID));
         assert_eq!(job.status, DispatchStatus::Finished);
         assert_eq!(job.attempt, 1);
     }
@@ -1590,7 +2181,8 @@ mod tests {
         let store = local_store(&paths, false).await;
         let request = approval_request(ReviewDecision::Approve);
         let first = store
-            .review(
+            .review_for_actor(
+                TEST_OWNER_ID,
                 LOCAL_DEMO_RUN_ID,
                 "APR-DEV-1",
                 request.clone(),
@@ -1608,7 +2200,13 @@ mod tests {
         assert_eq!(directory_entries(&paths.marker_root), 1);
 
         let replay = store
-            .review(LOCAL_DEMO_RUN_ID, "APR-DEV-1", request, "local-review")
+            .review_for_actor(
+                TEST_OWNER_ID,
+                LOCAL_DEMO_RUN_ID,
+                "APR-DEV-1",
+                request,
+                "local-review",
+            )
             .await
             .unwrap();
         assert!(replay.replayed);
@@ -1628,7 +2226,8 @@ mod tests {
         let paths = TestPaths::new("local-reject");
         let store = local_store(&paths, false).await;
         let response = store
-            .review(
+            .review_for_actor(
+                TEST_OWNER_ID,
                 LOCAL_DEMO_RUN_ID,
                 "APR-DEV-1",
                 approval_request(ReviewDecision::Reject),
@@ -1651,11 +2250,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn revoked_owner_dispatch_is_rejected_before_the_connector_runs() {
+        for revocation in [ActorRevocation::Member, ActorRevocation::Disabled] {
+            let label = format!("dispatch-revoked-{}", revocation.label());
+            let paths = TestPaths::new(&label);
+            let store = local_store(&paths, false).await;
+            let approved = store
+                .review_for_actor(
+                    TEST_OWNER_ID,
+                    LOCAL_DEMO_RUN_ID,
+                    "APR-DEV-1",
+                    approval_request(ReviewDecision::Approve),
+                    &format!("approve-{label}"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(approved.run.status, RunStatus::Queued);
+            let mut feed = store
+                .event_feed_for_actor(TEST_OWNER_ID, LOCAL_DEMO_RUN_ID, approved.event.sequence)
+                .await
+                .unwrap();
+
+            revoke_test_actor(&paths.database, revocation);
+            store.dispatch_pending().await.unwrap();
+
+            assert_eq!(directory_entries(&paths.marker_root), 0);
+            let job = store
+                .storage
+                .dispatch_job(LOCAL_MARKER_CALL_ID)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.status, DispatchStatus::Rejected);
+            assert_eq!(job.attempt, 0);
+            assert!(job.started_at.is_none());
+            assert!(job.start_event_sequence.is_none());
+            assert_eq!(
+                job.authorization_error_json
+                    .as_ref()
+                    .and_then(|error| error.get("code"))
+                    .and_then(serde_json::Value::as_str),
+                Some("authorization_revoked")
+            );
+
+            let detail = store.run_detail(LOCAL_DEMO_RUN_ID).await.unwrap();
+            assert_eq!(detail.run.status, RunStatus::NeedsAttention);
+            let rejection = detail.events.last().unwrap();
+            assert_eq!(
+                rejection.metadata.get("executor_invoked"),
+                Some(&serde_json::Value::Bool(false))
+            );
+            assert_eq!(
+                job.result_event_sequence,
+                Some(rejection.sequence),
+                "the rejected queue record must reference the durable rejection event"
+            );
+            assert!(matches!(
+                rejection.data.as_ref(),
+                Some(RunEventData::ToolResult {
+                    outcome: ToolOutcome::NotDispatched {
+                        reason: NotDispatchedReason::AuthorizationRevoked,
+                        ..
+                    },
+                    status: ToolCallStatus::NotDispatched,
+                    ..
+                })
+            ));
+            let published =
+                tokio::time::timeout(std::time::Duration::from_secs(1), feed.receiver.recv())
+                    .await
+                    .expect("runtime must publish the committed authorization rejection")
+                    .unwrap();
+            assert_eq!(published.run_id, LOCAL_DEMO_RUN_ID);
+            assert_eq!(published.event, *rejection);
+            assert!(matches!(
+                feed.receiver.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_reply_actor_is_interrupted_without_exposing_a_claimed_job() {
+        let paths = TestPaths::new("reply-actor-disabled");
+        let store = local_store(&paths, false).await;
+        let job_id = "reply-runtime-authorization-revoked";
+        let enqueued = store
+            .start_turn_and_enqueue_reply_for_actor(
+                TEST_OWNER_ID,
+                LOCAL_DEMO_SESSION_ID,
+                StartTurnRequest {
+                    turn_id: "turn-runtime-authorization-revoked".into(),
+                    user_message: "Do not call a provider after authorization is revoked.".into(),
+                    expected_sequence: 2,
+                },
+                "enqueue-runtime-authorization-revoked",
+                ReplyJobSpec {
+                    id: job_id.into(),
+                    actor_user_id: TEST_OWNER_ID.into(),
+                    provider_name: "provider-must-not-run".into(),
+                    model_name: Some("model-must-not-run".into()),
+                    request_json: serde_json::json!({"prompt": "must remain durable only"}),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(enqueued.job.status, ReplyJobStatus::Queued);
+        let mut feed = store
+            .session_event_feed_for_actor(
+                TEST_OWNER_ID,
+                LOCAL_DEMO_SESSION_ID,
+                enqueued.start.event.sequence,
+            )
+            .await
+            .unwrap();
+
+        revoke_test_actor(&paths.database, ActorRevocation::Disabled);
+        assert!(matches!(
+            store.claim_next_reply().await.unwrap(),
+            ReplyClaimOutcome::NotAvailable
+        ));
+
+        let job = store.reply_job(job_id).await.unwrap().unwrap();
+        assert_eq!(job.status, ReplyJobStatus::Failed);
+        assert_eq!(job.attempt, 1);
+        assert_eq!(
+            job.error_json
+                .as_ref()
+                .and_then(|error| error.get("code"))
+                .and_then(serde_json::Value::as_str),
+            Some("authorization_revoked")
+        );
+        let detail = store.get_session(LOCAL_DEMO_SESSION_ID).await.unwrap();
+        assert_eq!(detail.session.status, SessionStatus::NeedsAttention);
+        let interruption = detail.events.last().unwrap();
+        assert!(matches!(
+            &interruption.data,
+            SessionEventData::TurnInterrupted { turn_id, .. }
+                if turn_id == "turn-runtime-authorization-revoked"
+        ));
+        let published =
+            tokio::time::timeout(std::time::Duration::from_secs(1), feed.receiver.recv())
+                .await
+                .expect("runtime must publish the committed reply interruption")
+                .unwrap();
+        assert_eq!(published.session_id, LOCAL_DEMO_SESSION_ID);
+        assert_eq!(published.event, *interruption);
+        assert!(matches!(
+            feed.receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
     async fn started_call_becomes_outcome_unknown_after_restart_and_is_not_retried() {
         let paths = TestPaths::new("recovery");
         let store = local_store(&paths, false).await;
         store
-            .review(
+            .review_for_actor(
+                TEST_OWNER_ID,
                 LOCAL_DEMO_RUN_ID,
                 "APR-DEV-1",
                 approval_request(ReviewDecision::Approve),
@@ -1704,7 +2457,8 @@ mod tests {
     async fn one_key_cannot_be_reused_for_another_approval_decision() {
         let store = production_store(false).await;
         store
-            .review(
+            .review_for_actor(
+                TEST_OWNER_ID,
                 protocol::DEMO_RUN_ID,
                 "APR-901",
                 approval_request(ReviewDecision::Approve),
@@ -1713,7 +2467,8 @@ mod tests {
             .await
             .unwrap();
         let error = store
-            .review(
+            .review_for_actor(
+                TEST_OWNER_ID,
                 protocol::DEMO_RUN_ID,
                 "APR-901",
                 approval_request(ReviewDecision::Reject),
@@ -1854,26 +2609,30 @@ mod tests {
         };
         let outcome = store
             .storage
-            .commit_review(ReviewCommit {
-                expected_sequence,
-                snapshot,
-                event: transition.event,
-                idempotency_key: idempotency_key.into(),
-                request_fingerprint: format!(r#"{{"fixture":"{idempotency_key}"}}"#),
-                response,
-                dispatch: Some(DispatchJobSpec {
-                    call_id: call.call_id.clone(),
-                    approval_id: pending.id,
-                    tool_name: call.tool,
-                    tool_version: call.tool_version,
-                    effect: call.effect,
-                    args_json: call.arguments,
-                    args_digest: call.arguments_digest,
-                    policy_id: policy_id.into(),
-                    policy_revision: policy_revision.into(),
-                    sandbox_profile: call.sandbox_profile,
-                }),
-            })
+            .commit_review_for_actor(
+                TEST_OWNER_ID,
+                ReviewCommit {
+                    expected_sequence,
+                    snapshot,
+                    event: transition.event,
+                    idempotency_key: idempotency_key.into(),
+                    request_fingerprint: format!(r#"{{"fixture":"{idempotency_key}"}}"#),
+                    response,
+                    dispatch: Some(DispatchJobSpec {
+                        call_id: call.call_id.clone(),
+                        approval_id: pending.id,
+                        approving_actor_user_id: TEST_OWNER_ID.into(),
+                        tool_name: call.tool,
+                        tool_version: call.tool_version,
+                        effect: call.effect,
+                        args_json: call.arguments,
+                        args_digest: call.arguments_digest,
+                        policy_id: policy_id.into(),
+                        policy_revision: policy_revision.into(),
+                        sandbox_profile: call.sandbox_profile,
+                    }),
+                },
+            )
             .await
             .unwrap();
         assert_eq!(outcome, CommitOutcome::Committed);
@@ -1916,17 +2675,19 @@ mod tests {
     }
 
     async fn production_store(auto_dispatch: bool) -> DemoStore {
-        DemoStore::from_storage(
+        let store = DemoStore::from_storage(
             SqliteStore::open(":memory:").await.unwrap(),
             DemoProfile::ProductionGuarded,
             auto_dispatch,
         )
         .await
-        .unwrap()
+        .unwrap();
+        bootstrap_test_owner(&store).await;
+        store
     }
 
     async fn local_store(paths: &TestPaths, auto_dispatch: bool) -> DemoStore {
-        DemoStore::from_storage(
+        let store = DemoStore::from_storage(
             SqliteStore::open(&paths.database).await.unwrap(),
             DemoProfile::LocalDevelopment {
                 marker_root: paths.marker_root.clone(),
@@ -1934,7 +2695,66 @@ mod tests {
             auto_dispatch,
         )
         .await
-        .unwrap()
+        .unwrap();
+        bootstrap_test_owner(&store).await;
+        store
+    }
+
+    async fn bootstrap_test_owner(store: &DemoStore) {
+        let bootstrap_token_hash = "a".repeat(64);
+        let expiry = "2999-01-01T00:00:00Z";
+        store
+            .replace_bootstrap_token(&bootstrap_token_hash, expiry)
+            .await
+            .unwrap();
+        let (owner, _) = store
+            .bootstrap_owner(BootstrapOwnerCommit {
+                bootstrap_token_hash,
+                user_id: TEST_OWNER_ID.into(),
+                username: "runtime-owner".into(),
+                password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA".into(),
+                session_token_hash: "b".repeat(64),
+                csrf_hash: "c".repeat(64),
+                session_expires_at: expiry.into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(owner.id, TEST_OWNER_ID);
+    }
+
+    #[derive(Clone, Copy)]
+    enum ActorRevocation {
+        Member,
+        Disabled,
+    }
+
+    impl ActorRevocation {
+        fn label(self) -> &'static str {
+            match self {
+                Self::Member => "member",
+                Self::Disabled => "disabled",
+            }
+        }
+    }
+
+    fn revoke_test_actor(path: &Path, revocation: ActorRevocation) {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .busy_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let changed = match revocation {
+            ActorRevocation::Member => connection.execute(
+                "UPDATE users SET role = 'member', updated_at = ?1 WHERE id = ?2",
+                params![timestamp, TEST_OWNER_ID],
+            ),
+            ActorRevocation::Disabled => connection.execute(
+                "UPDATE users SET status = 'disabled', updated_at = ?1 WHERE id = ?2",
+                params![timestamp, TEST_OWNER_ID],
+            ),
+        }
+        .unwrap();
+        assert_eq!(changed, 1);
     }
 
     fn directory_entries(path: &Path) -> usize {

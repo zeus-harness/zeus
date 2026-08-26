@@ -23,10 +23,10 @@ use llm::{
 use protocol::{
     AccountRole, AccountStatus, AccountUser, AssistantReplyKind, AssistantReplyProvenance,
     AuthStatusResponse, AuthenticationResponse, BootstrapRequest, CreateSessionRequest,
-    CreateSessionResponse, FlushSessionRequest, FlushSessionResponse, HealthResponse, LoginRequest,
-    LogoutResponse, ProblemDetails, ResumeSessionRequest, ResumeSessionResponse, ReviewRequest,
-    ReviewResponse, RunDetail, SessionDetail, SessionEvent, SessionSummary, StartTurnRequest,
-    ThemePreference, UpdatePreferencesRequest, UserPreferences,
+    CreateSessionResponse, HealthResponse, LoginRequest, LogoutResponse, ProblemDetails,
+    ResumeSessionRequest, ResumeSessionResponse, ReviewRequest, ReviewResponse, RunDetail,
+    SessionDetail, SessionEvent, SessionSummary, StartTurnRequest, ThemePreference,
+    UpdatePreferencesRequest, UserPreferences,
 };
 use runtime::{
     AuthPrincipal, AuthSessionCommit, BootstrapOwnerCommit, DemoStore, PublishedEvent,
@@ -73,13 +73,17 @@ struct CurrentAuth {
     session_token_hash: String,
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+struct TestRequestAuth {
+    user_id: String,
+    cookie_header: HeaderValue,
+    csrf_token: HeaderValue,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct EventsQuery {
     after: Option<u64>,
-}
-
-pub fn app(store: DemoStore) -> Router {
-    app_with_event_feed_options(store, DURABLE_LEDGER_POLL_INTERVAL, true)
 }
 
 pub fn authenticated_app(
@@ -103,49 +107,27 @@ pub fn authenticated_app_with_provider(
         provider,
         drain: Mutex::new(()),
     });
-    Ok(build_app(
-        store,
-        DURABLE_LEDGER_POLL_INTERVAL,
-        true,
-        Some(auth),
-        Some(reply),
-    ))
-}
-
-fn app_with_event_feed_options(
-    store: DemoStore,
-    durable_ledger_poll_interval: Duration,
-    broadcast_hints_enabled: bool,
-) -> Router {
-    build_app(
-        store,
-        durable_ledger_poll_interval,
-        broadcast_hints_enabled,
-        None,
-        None,
-    )
-}
-
-fn build_app(
-    store: DemoStore,
-    durable_ledger_poll_interval: Duration,
-    broadcast_hints_enabled: bool,
-    auth: Option<Arc<AuthConfig>>,
-    reply: Option<Arc<ReplyExecutor>>,
-) -> Router {
-    assert!(
-        !durable_ledger_poll_interval.is_zero(),
-        "the durable ledger poll interval must be positive"
-    );
     let state = ApiState {
         store,
-        durable_ledger_poll_interval,
-        broadcast_hints_enabled,
-        auth,
-        reply,
+        durable_ledger_poll_interval: DURABLE_LEDGER_POLL_INTERVAL,
+        broadcast_hints_enabled: true,
+        auth: Some(auth),
+        reply: Some(reply),
     };
+    Ok(build_authenticated_app(state))
+}
 
-    let mut protected = Router::new()
+fn build_authenticated_app(state: ApiState) -> Router {
+    assert!(
+        !state.durable_ledger_poll_interval.is_zero(),
+        "the durable ledger poll interval must be positive"
+    );
+    assert!(
+        state.auth.is_some() && state.reply.is_some(),
+        "the production router requires authentication and a reply executor"
+    );
+
+    let protected = Router::new()
         .route("/api/v1/overview", get(overview))
         .route("/api/v1/sessions", get(list_sessions).post(create_session))
         .route("/api/v1/sessions/{id}", get(session_detail))
@@ -157,35 +139,20 @@ fn build_app(
             "/api/v1/runs/{id}/approvals/{approval_id}/decision",
             post(review_decision),
         )
-        .route("/api/v1/runs/{id}/events", get(run_events));
+        .route("/api/v1/runs/{id}/events", get(run_events))
+        .route("/api/v1/auth/logout", post(logout))
+        .route(
+            "/api/v1/me/settings",
+            get(get_preferences).patch(patch_preferences),
+        )
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
-    if state.auth.is_some() {
-        protected = protected
-            .route("/api/v1/auth/logout", post(logout))
-            .route(
-                "/api/v1/me/settings",
-                get(get_preferences).patch(patch_preferences),
-            )
-            .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
-    } else {
-        // Kept only for the existing storage/runtime contract tests. The real
-        // server uses `authenticated_app`, where assistant content is owned by
-        // the reply worker and this route is absent.
-        protected = protected.route(
-            "/api/v1/sessions/{id}/turns/{turn_id}/flush",
-            post(flush_turn),
-        );
-    }
-
-    let mut public = Router::new()
+    let public = Router::new()
         .route("/health/live", get(liveness))
-        .route("/health/ready", get(readiness));
-    if state.auth.is_some() {
-        public = public
-            .route("/api/v1/auth/status", get(auth_status))
-            .route("/api/v1/auth/bootstrap", post(bootstrap))
-            .route("/api/v1/auth/login", post(login));
-    }
+        .route("/health/ready", get(readiness))
+        .route("/api/v1/auth/status", get(auth_status))
+        .route("/api/v1/auth/bootstrap", post(bootstrap))
+        .route("/api/v1/auth/login", post(login));
 
     let router = public
         .merge(protected)
@@ -193,6 +160,124 @@ fn build_app(
         .with_state(state.clone());
     kick_reply_worker(&state);
     router
+}
+
+#[cfg(test)]
+async fn app(store: DemoStore) -> Router {
+    app_with_event_feed_options(store, DURABLE_LEDGER_POLL_INTERVAL, true).await
+}
+
+#[cfg(test)]
+async fn app_with_event_feed_options(
+    store: DemoStore,
+    durable_ledger_poll_interval: Duration,
+    broadcast_hints_enabled: bool,
+) -> Router {
+    assert!(
+        !durable_ledger_poll_interval.is_zero(),
+        "the durable ledger poll interval must be positive"
+    );
+    let request_auth = configure_test_actor(&store).await;
+    let auth = Arc::new(AuthConfig {
+        authenticator: Arc::new(PasswordAuthenticator::new().unwrap()),
+        password_workers: Arc::new(Semaphore::new(2)),
+        cookie_secure: false,
+    });
+    let state = ApiState {
+        store,
+        durable_ledger_poll_interval,
+        broadcast_hints_enabled,
+        auth: Some(auth),
+        reply: None,
+    };
+    build_test_app(state, request_auth)
+}
+
+#[cfg(test)]
+fn build_test_app(state: ApiState, request_auth: TestRequestAuth) -> Router {
+    let protected = Router::new()
+        .route("/api/v1/overview", get(overview))
+        .route("/api/v1/sessions", get(list_sessions).post(create_session))
+        .route("/api/v1/sessions/{id}", get(session_detail))
+        .route("/api/v1/sessions/{id}/resume", post(resume_session))
+        .route("/api/v1/sessions/{id}/turns", post(test_start_turn))
+        .route(
+            "/api/v1/sessions/{id}/turns/{turn_id}/flush",
+            post(test_flush_turn),
+        )
+        .route("/api/v1/sessions/{id}/events", get(session_events))
+        .route("/api/v1/runs/{id}", get(run_detail))
+        .route(
+            "/api/v1/runs/{id}/approvals/{approval_id}/decision",
+            post(review_decision),
+        )
+        .route("/api/v1/runs/{id}/events", get(run_events))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
+    let public = Router::new()
+        .route("/health/live", get(liveness))
+        .route("/health/ready", get(readiness));
+    public
+        .merge(protected)
+        .fallback(not_found)
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            request_auth,
+            inject_test_auth,
+        ))
+}
+
+#[cfg(test)]
+async fn configure_test_actor(store: &DemoStore) -> TestRequestAuth {
+    let bootstrap_token_hash = "a".repeat(64);
+    let session_token = SessionToken::generate().unwrap();
+    let csrf_token = CsrfToken::generate().unwrap();
+    let expires_at = (chrono::Utc::now() + chrono::Duration::hours(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    store
+        .replace_bootstrap_token(&bootstrap_token_hash, &expires_at)
+        .await
+        .expect("the test bootstrap token should persist");
+    store
+        .bootstrap_owner(BootstrapOwnerCommit {
+            bootstrap_token_hash,
+            user_id: "user-test-owner".into(),
+            username: "test-owner".into(),
+            password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA".into(),
+            session_token_hash: session_token.digest().to_persistence(),
+            csrf_hash: csrf_token.digest().to_persistence(),
+            session_expires_at: expires_at,
+        })
+        .await
+        .expect("the test owner should claim the seeded resources");
+    TestRequestAuth {
+        user_id: "user-test-owner".into(),
+        cookie_header: HeaderValue::from_str(&format!(
+            "{SESSION_COOKIE}={}; {CSRF_COOKIE}={}",
+            session_token.expose_secret(),
+            csrf_token.expose_secret()
+        ))
+        .unwrap(),
+        csrf_token: HeaderValue::from_str(csrf_token.expose_secret()).unwrap(),
+    }
+}
+
+#[cfg(test)]
+async fn inject_test_auth(
+    State(auth): State<TestRequestAuth>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    request
+        .headers_mut()
+        .insert(header::HOST, HeaderValue::from_static("zeus.test"));
+    request
+        .headers_mut()
+        .insert(header::ORIGIN, HeaderValue::from_static("http://zeus.test"));
+    request
+        .headers_mut()
+        .insert(header::COOKIE, auth.cookie_header);
+    request.headers_mut().insert(CSRF_HEADER, auth.csrf_token);
+    next.run(request).await
 }
 
 async fn liveness() -> Json<HealthResponse> {
@@ -690,6 +775,7 @@ async fn drain_reply_jobs(state: &ApiState) -> Result<(), StoreError> {
     loop {
         let job = match state.store.claim_next_reply().await? {
             ReplyClaimOutcome::Claimed(job) => *job,
+            ReplyClaimOutcome::Rejected(_) => continue,
             ReplyClaimOutcome::NotAvailable => return Ok(()),
         };
         process_reply_job(state, job).await?;
@@ -854,51 +940,59 @@ fn provider_error_code(error: &ProviderError) -> &'static str {
 
 async fn overview(
     State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
 ) -> Result<Json<protocol::OverviewResponse>, ApiError> {
-    Ok(Json(state.store.overview().await?))
+    Ok(Json(
+        state
+            .store
+            .overview_for_actor(&current.principal.user.id)
+            .await?,
+    ))
 }
 
 async fn list_sessions(
     State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
 ) -> Result<Json<Vec<SessionSummary>>, ApiError> {
-    Ok(Json(state.store.list_sessions().await?))
+    Ok(Json(
+        state
+            .store
+            .list_sessions_for_actor(&current.principal.user.id)
+            .await?,
+    ))
 }
 
 async fn create_session(
     State(state): State<ApiState>,
-    current: Option<Extension<CurrentAuth>>,
+    Extension(current): Extension<CurrentAuth>,
     headers: HeaderMap,
     payload: Result<Json<CreateSessionRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
     let idempotency_key = required_idempotency_key(&headers)?;
     let Json(request) = payload.map_err(ApiError::invalid_json)?;
-    let response = match current {
-        Some(Extension(current)) => {
-            state
-                .store
-                .create_session_for_actor(&current.principal.user.id, request, &idempotency_key)
-                .await?
-        }
-        None if state.auth.is_none() => {
-            state
-                .store
-                .create_session(request, &idempotency_key)
-                .await?
-        }
-        None => return Err(ApiError::unauthorized()),
-    };
+    let response = state
+        .store
+        .create_session_for_actor(&current.principal.user.id, request, &idempotency_key)
+        .await?;
     Ok((StatusCode::CREATED, Json(response)))
 }
 
 async fn session_detail(
     State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
     Path(id): Path<String>,
 ) -> Result<Json<SessionDetail>, ApiError> {
-    Ok(Json(state.store.get_session(&id).await?))
+    Ok(Json(
+        state
+            .store
+            .get_session_for_actor(&current.principal.user.id, &id)
+            .await?,
+    ))
 }
 
 async fn resume_session(
     State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
     Path(id): Path<String>,
     headers: HeaderMap,
     payload: Result<Json<ResumeSessionRequest>, JsonRejection>,
@@ -908,31 +1002,20 @@ async fn resume_session(
     Ok(Json(
         state
             .store
-            .resume_session(&id, request, &idempotency_key)
+            .resume_session_for_actor(&current.principal.user.id, &id, request, &idempotency_key)
             .await?,
     ))
 }
 
 async fn start_turn(
     State(state): State<ApiState>,
-    current: Option<Extension<CurrentAuth>>,
+    Extension(current): Extension<CurrentAuth>,
     Path(id): Path<String>,
     headers: HeaderMap,
     payload: Result<Json<StartTurnRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let idempotency_key = required_idempotency_key(&headers)?;
     let Json(request) = payload.map_err(ApiError::invalid_json)?;
-    let Some(Extension(current)) = current else {
-        if state.auth.is_some() {
-            return Err(ApiError::unauthorized());
-        }
-        let response = state
-            .store
-            .start_turn(&id, request, &idempotency_key)
-            .await?;
-        return Ok(Json(response).into_response());
-    };
-
     let reply = reply_executor(&state)?;
     let metadata = reply.provider.metadata();
     let reply_request = ReplyRequest::new([ReplyMessage::new(
@@ -941,7 +1024,7 @@ async fn start_turn(
     )]);
     let job = ReplyJobSpec {
         id: format!("reply:{id}:{}", request.turn_id),
-        actor_user_id: current.principal.user.id,
+        actor_user_id: current.principal.user.id.clone(),
         provider_name: metadata.provider_id.clone(),
         model_name: metadata.model.clone(),
         request_json: serde_json::to_value(reply_request)
@@ -949,18 +1032,44 @@ async fn start_turn(
     };
     let response = state
         .store
-        .start_turn_and_enqueue_reply(&id, request, &idempotency_key, job)
+        .start_turn_and_enqueue_reply_for_actor(
+            &current.principal.user.id,
+            &id,
+            request,
+            &idempotency_key,
+            job,
+        )
         .await?;
     kick_reply_worker(&state);
     Ok((StatusCode::ACCEPTED, Json(response.start)).into_response())
 }
 
-async fn flush_turn(
+#[cfg(test)]
+async fn test_start_turn(
     State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    payload: Result<Json<StartTurnRequest>, JsonRejection>,
+) -> Result<Json<protocol::StartTurnResponse>, ApiError> {
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let Json(request) = payload.map_err(ApiError::invalid_json)?;
+    Ok(Json(
+        state
+            .store
+            .start_turn_for_actor(&current.principal.user.id, &id, request, &idempotency_key)
+            .await?,
+    ))
+}
+
+#[cfg(test)]
+async fn test_flush_turn(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
     Path((id, turn_id)): Path<(String, String)>,
     headers: HeaderMap,
-    payload: Result<Json<FlushSessionRequest>, JsonRejection>,
-) -> Result<Json<FlushSessionResponse>, ApiError> {
+    payload: Result<Json<protocol::FlushSessionRequest>, JsonRejection>,
+) -> Result<Json<protocol::FlushSessionResponse>, ApiError> {
     let idempotency_key = required_idempotency_key(&headers)?;
     let Json(request) = payload.map_err(ApiError::invalid_json)?;
     if turn_id != request.turn_id {
@@ -972,20 +1081,27 @@ async fn flush_turn(
     Ok(Json(
         state
             .store
-            .flush_turn(&id, request, &idempotency_key)
+            .flush_turn_for_actor(&current.principal.user.id, &id, request, &idempotency_key)
             .await?,
     ))
 }
 
 async fn run_detail(
     State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
     Path(id): Path<String>,
 ) -> Result<Json<RunDetail>, ApiError> {
-    Ok(Json(state.store.run_detail(&id).await?))
+    Ok(Json(
+        state
+            .store
+            .run_detail_for_actor(&current.principal.user.id, &id)
+            .await?,
+    ))
 }
 
 async fn review_decision(
     State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
     Path((id, approval_id)): Path<(String, String)>,
     headers: HeaderMap,
     payload: Result<Json<ReviewRequest>, JsonRejection>,
@@ -1005,7 +1121,13 @@ async fn review_decision(
     Ok(Json(
         state
             .store
-            .review(&id, &approval_id, request, &header_key)
+            .review_for_actor(
+                &current.principal.user.id,
+                &id,
+                &approval_id,
+                request,
+                &header_key,
+            )
             .await?,
     ))
 }
@@ -1035,18 +1157,24 @@ fn required_idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {
 
 async fn session_events(
     State(state): State<ApiState>,
-    current: Option<Extension<CurrentAuth>>,
+    Extension(current): Extension<CurrentAuth>,
     Path(id): Path<String>,
     headers: HeaderMap,
     query: Result<Query<EventsQuery>, QueryRejection>,
 ) -> Result<Response, ApiError> {
     let Query(query) = query.map_err(ApiError::invalid_query)?;
     let after = event_cursor(&headers, query)?;
-    let mut feed = state.store.session_event_feed(&id, after).await?;
+    if !sse_auth_is_current(&state.store, &current).await {
+        return Err(ApiError::unauthorized());
+    }
+    let actor_user_id = current.principal.user.id.clone();
+    let mut feed = state
+        .store
+        .session_event_feed_for_actor(&actor_user_id, &id, after)
+        .await?;
     let store = state.store.clone();
     let durable_ledger_poll_interval = state.durable_ledger_poll_interval;
     let broadcast_hints_enabled = state.broadcast_hints_enabled;
-    let auth_session_token_hash = current.map(|Extension(current)| current.session_token_hash);
     let session_id = id;
 
     let stream = async_stream::stream! {
@@ -1068,7 +1196,7 @@ async fn session_events(
             tokio::select! {
                 received = feed.receiver.recv(), if broadcast_hints_enabled => match received {
                     Ok(published) => {
-                        if !sse_auth_is_current(&store, auth_session_token_hash.as_deref()).await {
+                        if !sse_auth_is_current(&store, &current).await {
                             break;
                         }
                         if published.session_id == session_id && published.event.sequence > cursor {
@@ -1076,7 +1204,14 @@ async fn session_events(
                             // commits can publish out of order. Always advance
                             // from the ordered durable ledger so a later hint
                             // cannot make an earlier event permanently vanish.
-                            match store.session_events_after(&session_id, cursor).await {
+                            match store
+                                .session_events_after_for_actor(
+                                    &actor_user_id,
+                                    &session_id,
+                                    cursor,
+                                )
+                                .await
+                            {
                                 Ok(events) => {
                                     for event in events {
                                         if event.sequence > cursor {
@@ -1095,10 +1230,13 @@ async fn session_events(
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        if !sse_auth_is_current(&store, auth_session_token_hash.as_deref()).await {
+                        if !sse_auth_is_current(&store, &current).await {
                             break;
                         }
-                        match store.session_events_after(&session_id, cursor).await {
+                        match store
+                            .session_events_after_for_actor(&actor_user_id, &session_id, cursor)
+                            .await
+                        {
                             Ok(events) => {
                                 for event in events {
                                     if event.sequence > cursor {
@@ -1118,10 +1256,13 @@ async fn session_events(
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
                 _ = durable_poll.tick() => {
-                    if !sse_auth_is_current(&store, auth_session_token_hash.as_deref()).await {
+                    if !sse_auth_is_current(&store, &current).await {
                         break;
                     }
-                    match store.session_events_after(&session_id, cursor).await {
+                    match store
+                        .session_events_after_for_actor(&actor_user_id, &session_id, cursor)
+                        .await
+                    {
                         Ok(events) => {
                             for event in events {
                                 if event.sequence > cursor {
@@ -1151,18 +1292,24 @@ async fn session_events(
 
 async fn run_events(
     State(state): State<ApiState>,
-    current: Option<Extension<CurrentAuth>>,
+    Extension(current): Extension<CurrentAuth>,
     Path(id): Path<String>,
     headers: HeaderMap,
     query: Result<Query<EventsQuery>, QueryRejection>,
 ) -> Result<Response, ApiError> {
     let Query(query) = query.map_err(ApiError::invalid_query)?;
     let after = event_cursor(&headers, query)?;
-    let mut feed = state.store.event_feed(&id, after).await?;
+    if !sse_auth_is_current(&state.store, &current).await {
+        return Err(ApiError::unauthorized());
+    }
+    let actor_user_id = current.principal.user.id.clone();
+    let mut feed = state
+        .store
+        .event_feed_for_actor(&actor_user_id, &id, after)
+        .await?;
     let store = state.store.clone();
     let durable_ledger_poll_interval = state.durable_ledger_poll_interval;
     let broadcast_hints_enabled = state.broadcast_hints_enabled;
-    let auth_session_token_hash = current.map(|Extension(current)| current.session_token_hash);
     let run_id = id;
 
     let stream = async_stream::stream! {
@@ -1191,14 +1338,22 @@ async fn run_events(
             tokio::select! {
                 received = feed.receiver.recv(), if broadcast_hints_enabled => match received {
                     Ok(published) => {
-                        if !sse_auth_is_current(&store, auth_session_token_hash.as_deref()).await {
+                        if !sse_auth_is_current(&store, &current).await {
                             break;
                         }
                         // Broadcast is only a wake hint. Separate commits can
                         // publish out of order, so advancing directly to the
                         // hinted sequence could permanently skip an earlier
                         // durable event.
-                        match run_events_for_hint(&store, &run_id, cursor, &published).await {
+                        match run_events_for_hint(
+                            &store,
+                            &actor_user_id,
+                            &run_id,
+                            cursor,
+                            &published,
+                        )
+                        .await
+                        {
                             Ok(events) => {
                                 for event in events {
                                     if event.sequence > cursor {
@@ -1216,12 +1371,15 @@ async fn run_events(
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        if !sse_auth_is_current(&store, auth_session_token_hash.as_deref()).await {
+                        if !sse_auth_is_current(&store, &current).await {
                             break;
                         }
                         // Recover a slow client from the append-only ledger
                         // instead of silently skipping events.
-                        match store.events_after(&run_id, cursor).await {
+                        match store
+                            .events_after_for_actor(&actor_user_id, &run_id, cursor)
+                            .await
+                        {
                             Ok(events) => {
                                 for event in events {
                                     if event.sequence > cursor {
@@ -1241,10 +1399,13 @@ async fn run_events(
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
                 _ = durable_poll.tick() => {
-                    if !sse_auth_is_current(&store, auth_session_token_hash.as_deref()).await {
+                    if !sse_auth_is_current(&store, &current).await {
                         break;
                     }
-                    match store.events_after(&run_id, cursor).await {
+                    match store
+                        .events_after_for_actor(&actor_user_id, &run_id, cursor)
+                        .await
+                    {
                         Ok(events) => {
                             for event in events {
                                 if event.sequence > cursor {
@@ -1274,15 +1435,19 @@ async fn run_events(
         .into_response())
 }
 
-async fn sse_auth_is_current(store: &DemoStore, session_token_hash: Option<&str>) -> bool {
-    let Some(session_token_hash) = session_token_hash else {
-        return true;
-    };
-    matches!(store.authenticate(session_token_hash).await, Ok(Some(_)))
+async fn sse_auth_is_current(store: &DemoStore, current: &CurrentAuth) -> bool {
+    matches!(
+        store.authenticate(&current.session_token_hash).await,
+        Ok(Some(principal))
+            if principal.user.id == current.principal.user.id
+                && principal.user.role == StoredUserRole::Owner
+                && principal.user.status == StoredUserStatus::Active
+    )
 }
 
 async fn run_events_for_hint(
     store: &DemoStore,
+    actor_user_id: &str,
     run_id: &str,
     cursor: u64,
     published: &PublishedEvent,
@@ -1290,7 +1455,9 @@ async fn run_events_for_hint(
     if published.run_id != run_id || published.event.sequence <= cursor {
         return Ok(Vec::new());
     }
-    store.events_after(run_id, cursor).await
+    store
+        .events_after_for_actor(actor_user_id, run_id, cursor)
+        .await
 }
 
 fn sse_event(event: &protocol::RunEvent) -> Event {
@@ -1559,6 +1726,8 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use axum::{
         body::Body,
         http::{Request, header},
@@ -1570,6 +1739,7 @@ mod tests {
         ReviewRequest, ReviewResponse, SessionDetail, SessionStatus, SessionSummary,
         StartTurnResponse,
     };
+    use rusqlite::{Connection, params};
     use tenancy::BootstrapToken;
     use tower::ServiceExt;
 
@@ -1662,7 +1832,8 @@ mod tests {
             let provider: Arc<dyn ReplyProvider> = Arc::new(IndeterminateProvider::new(failure));
             let metadata = provider.metadata();
             store
-                .start_turn_and_enqueue_reply(
+                .start_turn_and_enqueue_reply_for_actor(
+                    "user-owner",
                     &session_id,
                     StartTurnRequest {
                         turn_id: turn_id.clone(),
@@ -2062,6 +2233,311 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn cross_actor_rest_and_sse_are_not_found_and_live_sse_closes_on_owner_change() {
+        let (app, store, alice, path) = authenticated_file_app("cross-actor").await;
+        let bob = insert_test_member(&path, "user-bob", "bob");
+        let session_id = "session-cross-actor";
+
+        let created = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &alice.cookie_header)
+                    .header(CSRF_HEADER, &alice.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "create-cross-actor")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": session_id,
+                            "title": "Cross actor boundary",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let sse = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/sessions/{session_id}/events?after=1"))
+                    .header(header::COOKIE, &alice.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sse.status(), StatusCode::OK);
+        let mut sse_body = sse.into_body();
+        let opened = tokio::time::timeout(Duration::from_secs(1), sse_body.frame())
+            .await
+            .expect("owned SSE should open immediately")
+            .expect("owned SSE should produce an opening frame")
+            .expect("owned SSE opening frame should be valid");
+        assert!(
+            String::from_utf8(opened.into_data().unwrap().to_vec())
+                .unwrap()
+                .contains("stream-open")
+        );
+
+        // Production ownership is immutable. This test-only database mutation
+        // simulates a future administrative transfer and proves the stream
+        // does not keep relying on the authorization snapshot from open time.
+        transfer_test_session(&path, session_id, &bob.user_id);
+        let ended = tokio::time::timeout(Duration::from_secs(3), sse_body.frame())
+            .await
+            .expect("ownership-changed SSE should close by the next durable poll");
+        assert!(
+            ended.is_none(),
+            "ownership-changed SSE emitted another frame"
+        );
+
+        let detail = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/sessions/{session_id}"))
+                    .header(header::COOKIE, &alice.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::NOT_FOUND);
+        let problem: ProblemDetails = response_json(detail).await;
+        assert_eq!(problem.code, "session_not_found");
+
+        let resume = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/sessions/{session_id}/resume"))
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &alice.cookie_header)
+                    .header(CSRF_HEADER, &alice.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "resume-cross-actor")
+                    .body(Body::from(r#"{"expected_sequence":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resume.status(), StatusCode::NOT_FOUND);
+
+        let start_turn = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/sessions/{session_id}/turns"))
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &alice.cookie_header)
+                    .header(CSRF_HEADER, &alice.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "turn-cross-actor")
+                    .body(Body::from(
+                        r#"{"turn_id":"turn-cross-actor","user_message":"private","expected_sequence":1}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start_turn.status(), StatusCode::NOT_FOUND);
+
+        let cross_actor_sse = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/sessions/{session_id}/events?after=0"))
+                    .header(header::COOKIE, &alice.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cross_actor_sse.status(), StatusCode::NOT_FOUND);
+
+        let sessions = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/sessions")
+                    .header(header::COOKIE, &alice.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sessions.status(), StatusCode::OK);
+        let sessions: Vec<SessionSummary> = response_json(sessions).await;
+        assert!(!sessions.iter().any(|session| session.id == session_id));
+
+        let member_cookie = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/sessions/session-ZR-1842")
+                    .header(header::COOKIE, &bob.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(member_cookie.status(), StatusCode::UNAUTHORIZED);
+
+        drop(app);
+        drop(store);
+        cleanup_test_database(&path);
+    }
+
+    #[tokio::test]
+    async fn cross_actor_run_rest_review_and_sse_are_not_found_and_live_sse_closes() {
+        let (app, store, alice, path) = authenticated_file_app("cross-run").await;
+        let bob = insert_test_member(&path, "user-bob-run", "bob-run");
+
+        let sse = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/runs/{DEMO_RUN_ID}/events?after=8"))
+                    .header(header::COOKIE, &alice.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sse.status(), StatusCode::OK);
+        let mut body = sse.into_body();
+        let opened = tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .expect("owned Run SSE should open immediately")
+            .expect("owned Run SSE should produce an opening frame")
+            .expect("owned Run SSE opening frame should be valid");
+        assert!(
+            String::from_utf8(opened.into_data().unwrap().to_vec())
+                .unwrap()
+                .contains("stream-open")
+        );
+
+        transfer_test_run(&path, DEMO_RUN_ID, &bob.user_id);
+        let ended = tokio::time::timeout(Duration::from_secs(3), body.frame())
+            .await
+            .expect("ownership-changed Run SSE should close by the next durable poll");
+        assert!(
+            ended.is_none(),
+            "ownership-changed Run SSE emitted another frame"
+        );
+
+        let detail = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/runs/{DEMO_RUN_ID}"))
+                    .header(header::COOKIE, &alice.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::NOT_FOUND);
+        let problem: ProblemDetails = response_json(detail).await;
+        assert_eq!(problem.code, "run_not_found");
+
+        let review = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/v1/runs/{DEMO_RUN_ID}/approvals/APR-901/decision"
+                ))
+                .header(header::HOST, "zeus.test")
+                .header(header::ORIGIN, "http://zeus.test")
+                .header(header::COOKIE, &alice.cookie_header)
+                .header(CSRF_HEADER, &alice.csrf_token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("idempotency-key", "review-cross-actor")
+                .body(Body::from(r#"{"decision":"reject"}"#))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(review.status(), StatusCode::NOT_FOUND);
+
+        let cross_actor_sse = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/runs/{DEMO_RUN_ID}/events?after=0"))
+                    .header(header::COOKIE, &alice.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cross_actor_sse.status(), StatusCode::NOT_FOUND);
+
+        let overview = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/overview")
+                    .header(header::COOKIE, &alice.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(overview.status(), StatusCode::NOT_FOUND);
+
+        drop(app);
+        drop(store);
+        cleanup_test_database(&path);
+    }
+
+    #[tokio::test]
+    async fn sse_closes_when_the_authenticated_actor_role_changes() {
+        let (app, store, alice, path) = authenticated_file_app("role-change").await;
+        let sse = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/sessions/session-ZR-1842/events?after=999")
+                    .header(header::COOKIE, &alice.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sse.status(), StatusCode::OK);
+        let mut body = sse.into_body();
+        let opened = tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .expect("owner SSE should open immediately")
+            .expect("owner SSE should produce an opening frame")
+            .expect("owner SSE opening frame should be valid");
+        assert!(
+            String::from_utf8(opened.into_data().unwrap().to_vec())
+                .unwrap()
+                .contains("stream-open")
+        );
+
+        change_test_user_role(&path, &alice.user_id, "member");
+        let ended = tokio::time::timeout(Duration::from_secs(3), body.frame())
+            .await
+            .expect("role-changed SSE should close by the next durable poll");
+        assert!(ended.is_none(), "role-changed SSE emitted another frame");
+
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/overview")
+                    .header(header::COOKIE, &alice.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+        drop(app);
+        drop(store);
+        cleanup_test_database(&path);
     }
 
     #[tokio::test]
@@ -2480,6 +2956,7 @@ mod tests {
     async fn sse_polls_the_ledger_without_local_broadcast_hints() {
         let store = DemoStore::seeded().await.unwrap();
         let response = app_with_event_feed_options(store.clone(), Duration::from_millis(10), false)
+            .await
             .oneshot(
                 Request::get(format!("/api/v1/runs/{DEMO_RUN_ID}/events?after=8"))
                     .body(Body::empty())
@@ -2511,7 +2988,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         let reviewed = store
-            .review(
+            .review_for_actor(
+                "user-test-owner",
                 DEMO_RUN_ID,
                 "APR-901",
                 ReviewRequest {
@@ -2535,8 +3013,10 @@ mod tests {
     #[tokio::test]
     async fn run_broadcast_hint_reconciles_every_durable_event_before_it() {
         let store = DemoStore::seeded().await.unwrap();
+        let current = configure_test_actor(&store).await;
         let reviewed = store
-            .review(
+            .review_for_actor(
+                &current.user_id,
                 DEMO_RUN_ID,
                 "APR-901",
                 ReviewRequest {
@@ -2566,6 +3046,7 @@ mod tests {
 
         let replay = run_events_for_hint(
             &store,
+            &current.user_id,
             DEMO_RUN_ID,
             8,
             &PublishedEvent {
@@ -2649,8 +3130,193 @@ mod tests {
         assert_eq!(problem.code, "missing_idempotency_key");
     }
 
+    struct TestIdentity {
+        user_id: String,
+        cookie_header: String,
+        csrf_token: String,
+    }
+
+    async fn authenticated_file_app(label: &str) -> (Router, DemoStore, TestIdentity, PathBuf) {
+        let unique = UserId::generate().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "zeus-api-{label}-{}.db",
+            unique.as_str().replace(':', "-")
+        ));
+        let store = DemoStore::open(&path).await.unwrap();
+        let identity = provision_test_owner(&store, "user-alice", "alice").await;
+        let app = authenticated_app(store.clone(), false).unwrap();
+        (app, store, identity, path)
+    }
+
+    async fn provision_test_owner(
+        store: &DemoStore,
+        user_id: &str,
+        username: &str,
+    ) -> TestIdentity {
+        let bootstrap_hash = "1".repeat(64);
+        let session_token = SessionToken::generate().unwrap();
+        let csrf_token = CsrfToken::generate().unwrap();
+        let expires_at = (chrono::Utc::now() + chrono::Duration::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        store
+            .replace_bootstrap_token(&bootstrap_hash, &expires_at)
+            .await
+            .unwrap();
+        store
+            .bootstrap_owner(BootstrapOwnerCommit {
+                bootstrap_token_hash: bootstrap_hash,
+                user_id: user_id.into(),
+                username: username.into(),
+                password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA".into(),
+                session_token_hash: session_token.digest().to_persistence(),
+                csrf_hash: csrf_token.digest().to_persistence(),
+                session_expires_at: expires_at,
+            })
+            .await
+            .unwrap();
+        TestIdentity {
+            user_id: user_id.into(),
+            cookie_header: format!(
+                "{SESSION_COOKIE}={}; {CSRF_COOKIE}={}",
+                session_token.expose_secret(),
+                csrf_token.expose_secret()
+            ),
+            csrf_token: csrf_token.expose_secret().into(),
+        }
+    }
+
+    fn insert_test_member(path: &Path, user_id: &str, username: &str) -> TestIdentity {
+        let session_token = SessionToken::generate().unwrap();
+        let csrf_token = CsrfToken::generate().unwrap();
+        let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let expires_at = (chrono::Utc::now() + chrono::Duration::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let connection = Connection::open(path).unwrap();
+        connection.busy_timeout(Duration::from_secs(1)).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        connection
+            .execute(
+                r#"INSERT INTO users(
+                       id, username, role, status, password_hash, created_at, updated_at
+                   ) VALUES (?1, ?2, 'member', 'active', ?3, ?4, ?4)"#,
+                params![
+                    user_id,
+                    username,
+                    "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA",
+                    timestamp,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                r#"INSERT INTO user_preferences(
+                       user_id, theme, preferred_model, revision, updated_at
+                   ) VALUES (?1, 'system', NULL, 1, ?2)"#,
+                params![user_id, timestamp],
+            )
+            .unwrap();
+        connection
+            .execute(
+                r#"INSERT INTO auth_sessions(
+                       token_hash, user_id, csrf_hash, created_at, expires_at, last_seen_at
+                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?4)"#,
+                params![
+                    session_token.digest().to_persistence(),
+                    user_id,
+                    csrf_token.digest().to_persistence(),
+                    timestamp,
+                    expires_at,
+                ],
+            )
+            .unwrap();
+        TestIdentity {
+            user_id: user_id.into(),
+            cookie_header: format!(
+                "{SESSION_COOKIE}={}; {CSRF_COOKIE}={}",
+                session_token.expose_secret(),
+                csrf_token.expose_secret()
+            ),
+            csrf_token: csrf_token.expose_secret().into(),
+        }
+    }
+
+    fn transfer_test_session(path: &Path, session_id: &str, new_owner_user_id: &str) {
+        let connection = Connection::open(path).unwrap();
+        connection.busy_timeout(Duration::from_secs(1)).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        connection
+            .execute_batch("DROP TRIGGER sessions_owner_is_write_once")
+            .unwrap();
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE sessions SET owner_user_id = ?1 WHERE id = ?2",
+                    params![new_owner_user_id, session_id],
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    fn transfer_test_run(path: &Path, run_id: &str, new_owner_user_id: &str) {
+        let connection = Connection::open(path).unwrap();
+        connection.busy_timeout(Duration::from_secs(1)).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        connection
+            .execute_batch("DROP TRIGGER runs_owner_is_write_once")
+            .unwrap();
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE runs SET owner_user_id = ?1 WHERE id = ?2",
+                    params![new_owner_user_id, run_id],
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    fn change_test_user_role(path: &Path, user_id: &str, role: &str) {
+        let connection = Connection::open(path).unwrap();
+        connection.busy_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE users SET role = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![
+                        role,
+                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                        user_id,
+                    ],
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    fn cleanup_test_database(path: &Path) {
+        let mut lock_name = path.file_name().unwrap().to_os_string();
+        lock_name.push(".zeus.lock");
+        let lock_path = path.with_file_name(lock_name);
+        let wal_path = PathBuf::from(format!("{}-wal", path.display()));
+        let shm_path = PathBuf::from(format!("{}-shm", path.display()));
+        for candidate in [path.to_path_buf(), wal_path, shm_path, lock_path] {
+            match std::fs::remove_file(candidate) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("failed to clean up test database: {error}"),
+            }
+        }
+    }
+
     async fn test_app() -> Router {
-        app(DemoStore::seeded().await.unwrap())
+        app(DemoStore::seeded().await.unwrap()).await
     }
 
     async fn create_test_session(app: &Router, session_id: &str) -> CreateSessionResponse {

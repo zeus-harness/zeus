@@ -8,7 +8,7 @@
 Client / SvelteKit Web
           │ same-origin REST + Run/Session SSE
           ▼
-  Owner Auth / CSRF ───────► Axum API
+  Actor Auth / CSRF ───────► Axum API
                                  │
                                  ▼
                    Runtime（Session + Run Coordinator）
@@ -27,7 +27,7 @@ Client / SvelteKit Web
 - `authz`：精确工具名规则、策略 revision、环境和 effect guard；没有命中即拒绝。
 - `tools`：工具描述、注册表、参数验证和 object-safe executor 边界。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
-- `storage`：schema v7 migration、用户/偏好、独立 Session/Run ledger、actor-scoped
+- `storage`：schema v8 migration、用户/偏好、独立 Session/Run ledger、actor-scoped
   回执，以及 durable reply/dispatch queue。
 - `runtime`：Session 命令编排、reply/Run worker、提交后 SSE 提示和启动恢复。
 - `zeus-api`：进程组合、owner 认证、CSRF、provider 配置、REST/SSE 和 readiness。
@@ -101,7 +101,8 @@ Session ledger 记录 `session_created`、`run_attached`、`user_message`、可�
 - start：只允许 actor 拥有的 `ready` Session；在一个事务中创建唯一 open turn、追加
   `user_message`、投影进入 `running`、保存 actor-scoped 响应回执，并插入 immutable queued
   reply job。真实 API 返回 `202`。
-- reply worker：先把 queued job durable claim 为 `started`，再在数据库锁之外调用 provider。
+- reply worker：claim 事务先复验 active actor 与 Session owner，再把 queued job durable
+  claim 为 `started`，随后在数据库锁之外调用 provider。
   成功事务追加带 `provider_id/model/reply_kind` 的 `assistant_message`、flush turn、追加
   `turn_flushed` 并把 job 标为 `succeeded`。确定失败写 `failed`；timeout/transport 等不确定
   远端结果写 `outcome_unknown`，两者都把 Session 转为 `needs_attention`，不得自动重调 provider。
@@ -115,7 +116,7 @@ job；reply job 与 Run dispatch job 是两条独立队列。
 
 审批命令也在一个 `BEGIN IMMEDIATE` 事务内完成：
 
-1. 读取并核对持久幂等回执。
+1. 重新校验 active owner 与 Run ownership，再读取 actor-scoped 持久幂等回执。
 2. 对 Run head sequence 做 CAS。
 3. 追加 `ApprovalDecided` 事件并更新 Run 投影。
 4. Approve 时插入唯一的 queued dispatch job。
@@ -125,8 +126,11 @@ job；reply job 与 Run dispatch job 是两条独立队列。
 Session 和 Run 的进程内 broadcast 都只负责低延迟提示，不是事件事实源。两种 SSE 都从各自
 的 sequence cursor 每 2 秒补读一次持久 ledger；即使提示丢失，也不会永久漏掉已提交事件。
 
-worker 在调用 connector 之前，必须先在另一个事务中把 job 从 queued CAS 为 started、追加
-`ToolDispatchStarted` 并推进 Run sequence。该事务失败时 executor 调用次数必须为零。
+worker 在调用 connector 之前，必须先在另一个事务中复验 dispatch job 绑定的批准 actor 仍是
+active owner 且仍拥有 Run，再把 job 从 queued CAS 为 started、追加 `ToolDispatchStarted` 并推进
+Run sequence。授权已撤销时，该事务直接把 job 置为 rejected、Run 置为 `needs_attention`，追加
+`ToolResult::NotDispatched(reason=authorization_revoked)`；不会生成假的 started checkpoint，也不会
+调用 connector。该事务失败时 executor 调用次数同样必须为零。
 connector 在数据库事务和锁之外运行。
 
 结果事务把 started job 变成 finished，追加一个 ToolResult 并更新 Run 投影。外部执行已经发生
@@ -136,7 +140,7 @@ connector 在数据库事务和锁之外运行。
 
 API 监听端口之前按固定顺序完成：
 
-1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v7。
+1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v8。
 2. 绑定并核对 runtime identity、primary Session/Run 和 demo attachment。
 3. 先扫描 `started` 且没有持久结果的 reply job：结算为 `outcome_unknown`，追加
    `turn_interrupted`，不得重放可能已经计费的 provider 请求。queued reply 原样保留并可安全领取。
@@ -161,19 +165,22 @@ exactly-once 语义。
   owner。bootstrap/login 必须 exact same-origin；写请求还要求与登录会话绑定的 CSRF token。
   session cookie 为 opaque、`HttpOnly; SameSite=Strict`；HTTPS 部署必须显式设置
   `ZEUS_COOKIE_SECURE=true` 才附加 `Secure`。
-- Alpha+ 明确拒绝 schema 预留的 `member` 登录。当前未 actor-scope 的 Alpha 遗留查询因此不在
-  远程可达的跨用户面上；在启用 member 前仍必须迁移所有 Run/Session 查询、SSE、resume、review
-  和 receipt，并补 Alice/Bob 隔离测试。
+- Alpha+ 明确拒绝 schema 预留的 `member` 登录。正式 Run/Session 查询、SSE、resume、turn、
+  review 和 receipt 已全部 actor-scoped，并有 Alice/Bob 隔离测试；member 仍须等待字段/队列
+  配额、分页、SSE 上限和登录限速，不能仅因数据面已隔离就开放。
 - 未知工具、缺失策略、重复/冲突规则、effect 或 environment 不匹配：默认拒绝。
 - Approval 只能解除 `require_approval`，不能覆盖显式 deny。
 - dispatch 前用同一 policy revision 和不可绕过 guard 再检查一次。
 - SQLite schema v4 增加 Session ledger；v5 增加用户、认证会话、偏好和 write-once owner；
   v6 把命令 receipt 主键迁移为 actor scope；v7 增加 immutable、forward-only reply job。
+  v8 为 dispatch 持久化 approving actor，并增加 Session/Run/reply/receipt owner 一致性 trigger
+  与授权撤销拒绝终态。
   每个 pre-v4 Run 会绑定到生成的 `session-{run_id}`，原 Run/Event 不重写、不丢弃。
 - runtime identity 持久绑定 profile、environment、primary Session/Run、policy ID 和
   revision；不一致时启动失败。Run attachment 当前用于 migration 和 demo seed，Alpha 不公开
   attach-Run HTTP route。
-- queue claim 与 started recovery 在任何落盘前再次核对 job 的 run、policy ID 和 revision。
+- queue claim 与 started recovery 在任何外部调用前再次核对 actor 状态、role、resource owner、
+  job 的 run、policy ID 和 revision。
 - OpenAI-compatible reply endpoint 默认只接受 HTTPS 或 loopback HTTP，禁止 redirect，限制连接/
   总超时和响应体；queued job 绑定 endpoint/model/limits 的非秘密配置 digest，API key 不入 ledger。
 - sandbox 或 executor 不可用：写入 `NotDispatched`，禁止回退到宿主机裸执行。
@@ -213,7 +220,8 @@ exactly-once 语义。
 
 ## Alpha+ 验收
 
-- schema v1/v3 原地迁移到 v7 后，原 Run/Event 保留，primary Session/Run 绑定稳定。
+- schema v1/v3/v7 原地迁移到 v8 后，原 Run/Event 保留，primary Session/Run 绑定稳定；迁移时
+  尚未 bootstrap 的 legacy actor 只允许在首次 owner bootstrap 事务中认领一次。
 - 重启后用户/偏好、Session/turn/event、reply job、Run/Event、审批决定、dispatch job 和命令
   回执仍存在。
 - Session start 与 reply enqueue 同事务；reply success 把 assistant provenance、连续事件、turn
@@ -224,6 +232,8 @@ exactly-once 语义。
   head sequence CAS 仲裁。
 - 未知工具和策略拒绝路径的 executor 调用数为零。
 - checkpoint 写入失败时外部副作用为零。
+- reply/dispatch 排队后 actor 被禁用、降权或失去 ownership 时，claim 写入 durable
+  `authorization_revoked` 终态，provider/connector 调用数为零。
 - reply/dispatch started 后模拟崩溃，均恢复为 `outcome_unknown` 且不发生第二次外部执行。
 - 首次 bootstrap 只能消费一次 token；登录、CSRF、同源、Cookie 属性、设置 revision、退出后
   401 以及退出/失效后 SSE 关闭有自动化或 live 验收。
@@ -242,7 +252,7 @@ exactly-once 语义。
 - Web 保持紧凑时间线、一个内联审批卡和一个 composer；支持真实 New Session、活动 Session
   刷新恢复、owner 设置/退出和 system/light/dark。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化结果是 130 个 Rust 测试和 19 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化结果是 145 个 Rust 测试和 19 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
 Apple `container` 的 Alpha 基线验收属于提交 `9a89706`。Alpha+ 本轮已通过 helper shell

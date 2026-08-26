@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     ffi::OsString,
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
@@ -11,11 +12,12 @@ use fs2::FileExt;
 use protocol::{
     ApprovalScope, ApprovalStatus, AssistantReplyProvenance, AttachRunRequest, AttachRunResponse,
     CreateSessionRequest, CreateSessionResponse, EventType, FlushSessionRequest,
-    FlushSessionResponse, IncidentStatus, IncidentSummary, ResumeSessionRequest,
-    ResumeSessionResponse, ReviewDecision, ReviewResponse, RunEvent, RunEventData, RunStatus,
-    RunSummary, SandboxProfile, SessionDetail, SessionEvent, SessionEventData, SessionFlushAck,
-    SessionStatus, SessionSummary, SessionTurn, SessionTurnStatus, Severity, StartTurnRequest,
-    StartTurnResponse, ToolCallStatus, ToolEffect, ToolOutcome,
+    FlushSessionResponse, IncidentStatus, IncidentSummary, NotDispatchedReason,
+    ResumeSessionRequest, ResumeSessionResponse, ReviewDecision, ReviewResponse, RunEvent,
+    RunEventData, RunStatus, RunSummary, SandboxProfile, SessionDetail, SessionEvent,
+    SessionEventData, SessionFlushAck, SessionStatus, SessionSummary, SessionTurn,
+    SessionTurnStatus, Severity, StartTurnRequest, StartTurnResponse, ToolCallStatus, ToolEffect,
+    ToolOutcome,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Serialize, de::DeserializeOwned};
@@ -24,13 +26,14 @@ use serde_json::{Value, json};
 use crate::{
     AuthPrincipal, AuthSessionCommit, BootstrapOwnerCommit, ClaimOutcome, CommitOutcome,
     DispatchCompleteCommit, DispatchJob, DispatchJobSpec, DispatchRecoveryCommit,
-    DispatchStartCommit, DispatchStatus, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit,
-    ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
-    ReplySuccessCommit, ReviewCommit, ReviewReceipt, RunSnapshot, RuntimeIdentity, StorageError,
-    StoredCredential, StoredPreferences, StoredRun, StoredUser, StoredUserRole, StoredUserStatus,
+    DispatchRejection, DispatchStartCommit, DispatchStatus, ReplyClaimOutcome, ReplyCompletion,
+    ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus,
+    ReplyOutcomeUnknownCommit, ReplySuccessCommit, ReviewCommit, ReviewReceipt, RunSnapshot,
+    RuntimeIdentity, StorageError, StoredCredential, StoredPreferences, StoredRun, StoredUser,
+    StoredUserRole, StoredUserStatus,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 7;
+const CURRENT_SCHEMA_VERSION: i64 = 8;
 const EVENT_PAYLOAD_VERSION_V1: i64 = 1;
 const EVENT_PAYLOAD_VERSION_V2: i64 = 2;
 const SESSION_EVENT_PAYLOAD_VERSION_V1: i64 = 1;
@@ -42,6 +45,7 @@ const MIGRATION_0004: &str = include_str!("../migrations/0004_sessions.sql");
 const MIGRATION_0005: &str = include_str!("../migrations/0005_accounts.sql");
 const MIGRATION_0006: &str = include_str!("../migrations/0006_actor_receipts.sql");
 const MIGRATION_0007: &str = include_str!("../migrations/0007_reply_jobs.sql");
+const MIGRATION_0008: &str = include_str!("../migrations/0008_actor_boundaries.sql");
 
 #[derive(Clone)]
 pub struct SqliteStore {
@@ -136,16 +140,48 @@ impl SqliteStore {
         .await
     }
 
+    /// System/test-only unscoped read. Authenticated paths must use
+    /// [`Self::list_sessions_for_actor`].
     pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, StorageError> {
         self.with_connection(query_session_summaries).await
     }
 
+    pub async fn list_sessions_for_actor(
+        &self,
+        actor_user_id: &str,
+    ) -> Result<Vec<SessionSummary>, StorageError> {
+        let actor_user_id =
+            normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
+        self.with_connection(move |connection| {
+            query_session_summaries_for_actor(connection, &actor_user_id)
+        })
+        .await
+    }
+
+    /// System/test-only unscoped read. Authenticated paths must use
+    /// [`Self::get_session_for_actor`].
     pub async fn get_session(&self, session_id: &str) -> Result<SessionDetail, StorageError> {
         let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
         self.with_connection(move |connection| query_session_detail(connection, &session_id))
             .await
     }
 
+    pub async fn get_session_for_actor(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+    ) -> Result<SessionDetail, StorageError> {
+        let actor_user_id =
+            normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
+        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
+        self.with_connection(move |connection| {
+            query_session_detail_for_actor(connection, &actor_user_id, &session_id)
+        })
+        .await
+    }
+
+    /// System/test-only unscoped read. Authenticated paths must use
+    /// [`Self::session_events_after_for_actor`].
     pub async fn session_events_after(
         &self,
         session_id: &str,
@@ -158,6 +194,23 @@ impl SqliteStore {
         .await
     }
 
+    pub async fn session_events_after_for_actor(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+        after: u64,
+    ) -> Result<Vec<SessionEvent>, StorageError> {
+        let actor_user_id =
+            normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
+        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
+        self.with_connection(move |connection| {
+            query_session_events_after_for_actor(connection, &actor_user_id, &session_id, after)
+        })
+        .await
+    }
+
+    /// System/test-only legacy write. Authenticated paths must use
+    /// [`Self::create_session_for_actor`].
     pub async fn create_session(
         &self,
         request: CreateSessionRequest,
@@ -185,6 +238,8 @@ impl SqliteStore {
         .await
     }
 
+    /// System/test-only legacy write. Authenticated paths must use
+    /// [`Self::attach_run_for_actor`].
     pub async fn attach_run(
         &self,
         session_id: &str,
@@ -193,10 +248,31 @@ impl SqliteStore {
     ) -> Result<AttachRunResponse, StorageError> {
         let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
-        self.with_connection(move |connection| attach_run(connection, &session_id, request, &key))
-            .await
+        self.with_connection(move |connection| {
+            attach_run(connection, &session_id, request, &key, None)
+        })
+        .await
     }
 
+    pub async fn attach_run_for_actor(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+        request: AttachRunRequest,
+        idempotency_key: &str,
+    ) -> Result<AttachRunResponse, StorageError> {
+        let actor_user_id =
+            normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
+        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
+        let key = normalized_key(idempotency_key)?.to_owned();
+        self.with_connection(move |connection| {
+            attach_run(connection, &session_id, request, &key, Some(&actor_user_id))
+        })
+        .await
+    }
+
+    /// System/test-only legacy write. Authenticated paths must use
+    /// [`Self::start_turn_for_actor`].
     pub async fn start_turn(
         &self,
         session_id: &str,
@@ -206,8 +282,34 @@ impl SqliteStore {
         let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         self.with_connection(move |connection| {
-            start_turn(connection, &session_id, request, &key, None, false)
+            start_turn(connection, &session_id, request, &key, None, None, false)
                 .map(|(response, _)| response)
+        })
+        .await
+    }
+
+    pub async fn start_turn_for_actor(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+        request: StartTurnRequest,
+        idempotency_key: &str,
+    ) -> Result<StartTurnResponse, StorageError> {
+        let actor_user_id =
+            normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
+        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
+        let key = normalized_key(idempotency_key)?.to_owned();
+        self.with_connection(move |connection| {
+            start_turn(
+                connection,
+                &session_id,
+                request,
+                &key,
+                Some(&actor_user_id),
+                None,
+                false,
+            )
+            .map(|(response, _)| response)
         })
         .await
     }
@@ -217,6 +319,8 @@ impl SqliteStore {
     /// Replaying the same idempotency key returns the original turn and queue
     /// record. Changing either the turn request or immutable job input is an
     /// idempotency conflict.
+    /// System/test-only legacy write. Authenticated paths must use
+    /// [`Self::start_turn_and_enqueue_reply_for_actor`].
     pub async fn start_turn_and_enqueue_reply(
         &self,
         session_id: &str,
@@ -226,17 +330,62 @@ impl SqliteStore {
     ) -> Result<ReplyJobEnqueueResponse, StorageError> {
         let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
+        let actor_user_id = job.actor_user_id.clone();
         self.with_connection(move |connection| {
-            start_turn(connection, &session_id, request, &key, Some(job), false).and_then(
-                |(start, job)| {
-                    job.map(|job| ReplyJobEnqueueResponse { start, job })
-                        .ok_or_else(|| {
-                            StorageError::CorruptData(
-                                "reply enqueue committed without a queue record".into(),
-                            )
-                        })
-                },
+            start_turn(
+                connection,
+                &session_id,
+                request,
+                &key,
+                Some(&actor_user_id),
+                Some(job),
+                false,
             )
+            .and_then(|(start, job)| {
+                job.map(|job| ReplyJobEnqueueResponse { start, job })
+                    .ok_or_else(|| {
+                        StorageError::CorruptData(
+                            "reply enqueue committed without a queue record".into(),
+                        )
+                    })
+            })
+        })
+        .await
+    }
+
+    pub async fn start_turn_and_enqueue_reply_for_actor(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+        request: StartTurnRequest,
+        idempotency_key: &str,
+        job: ReplyJobSpec,
+    ) -> Result<ReplyJobEnqueueResponse, StorageError> {
+        let actor_user_id =
+            normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
+        if job.actor_user_id != actor_user_id {
+            return Err(StorageError::SessionNotFound(session_id.to_owned()));
+        }
+        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
+        let key = normalized_key(idempotency_key)?.to_owned();
+        self.with_connection(move |connection| {
+            start_turn(
+                connection,
+                &session_id,
+                request,
+                &key,
+                Some(&actor_user_id),
+                Some(job),
+                false,
+            )
+            .and_then(|(start, job)| {
+                job.map(|job| ReplyJobEnqueueResponse { start, job })
+                    .ok_or_else(|| {
+                        StorageError::CorruptData(
+                            "reply enqueue committed without a queue record".into(),
+                        )
+                    })
+            })
         })
         .await
     }
@@ -288,6 +437,8 @@ impl SqliteStore {
         self.with_connection(recover_started_replies).await
     }
 
+    /// System/test-only legacy write. Authenticated paths must use
+    /// [`Self::flush_turn_for_actor`].
     pub async fn flush_turn(
         &self,
         session_id: &str,
@@ -297,11 +448,37 @@ impl SqliteStore {
         let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         self.with_connection(move |connection| {
-            flush_turn(connection, &session_id, request, &key, false)
+            flush_turn(connection, &session_id, request, &key, None, false)
         })
         .await
     }
 
+    pub async fn flush_turn_for_actor(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+        request: FlushSessionRequest,
+        idempotency_key: &str,
+    ) -> Result<FlushSessionResponse, StorageError> {
+        let actor_user_id =
+            normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
+        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
+        let key = normalized_key(idempotency_key)?.to_owned();
+        self.with_connection(move |connection| {
+            flush_turn(
+                connection,
+                &session_id,
+                request,
+                &key,
+                Some(&actor_user_id),
+                false,
+            )
+        })
+        .await
+    }
+
+    /// System/test-only legacy write. Authenticated paths must use
+    /// [`Self::resume_session_for_actor`].
     pub async fn resume_session(
         &self,
         session_id: &str,
@@ -311,7 +488,24 @@ impl SqliteStore {
         let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         self.with_connection(move |connection| {
-            resume_session(connection, &session_id, request, &key)
+            resume_session(connection, &session_id, request, &key, None)
+        })
+        .await
+    }
+
+    pub async fn resume_session_for_actor(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+        request: ResumeSessionRequest,
+        idempotency_key: &str,
+    ) -> Result<ResumeSessionResponse, StorageError> {
+        let actor_user_id =
+            normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
+        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
+        let key = normalized_key(idempotency_key)?.to_owned();
+        self.with_connection(move |connection| {
+            resume_session(connection, &session_id, request, &key, Some(&actor_user_id))
         })
         .await
     }
@@ -440,18 +634,52 @@ impl SqliteStore {
             .await
     }
 
+    /// System/test-only unscoped read. Authenticated paths must use
+    /// [`Self::snapshot_for_actor`].
     pub async fn snapshot(&self, run_id: &str) -> Result<RunSnapshot, StorageError> {
         let run_id = run_id.to_owned();
         self.with_connection(move |connection| load_snapshot(connection, &run_id))
             .await
     }
 
+    pub async fn snapshot_for_actor(
+        &self,
+        actor_user_id: &str,
+        run_id: &str,
+    ) -> Result<RunSnapshot, StorageError> {
+        let actor_user_id =
+            normalized_account_value(actor_user_id, "run actor user ID", 128)?.to_owned();
+        let run_id = normalized_identifier(run_id, "run ID")?.to_owned();
+        self.with_connection(move |connection| {
+            load_snapshot_for_actor(connection, &actor_user_id, &run_id)
+        })
+        .await
+    }
+
+    /// System/test-only unscoped read. Authenticated paths must use
+    /// [`Self::load_run_for_actor`].
     pub async fn load_run(&self, run_id: &str) -> Result<StoredRun, StorageError> {
         let run_id = run_id.to_owned();
         self.with_connection(move |connection| load_run(connection, &run_id))
             .await
     }
 
+    pub async fn load_run_for_actor(
+        &self,
+        actor_user_id: &str,
+        run_id: &str,
+    ) -> Result<StoredRun, StorageError> {
+        let actor_user_id =
+            normalized_account_value(actor_user_id, "run actor user ID", 128)?.to_owned();
+        let run_id = normalized_identifier(run_id, "run ID")?.to_owned();
+        self.with_connection(move |connection| {
+            load_run_for_actor(connection, &actor_user_id, &run_id)
+        })
+        .await
+    }
+
+    /// System/test-only unscoped read. Authenticated paths must use
+    /// [`Self::events_after_for_actor`].
     pub async fn events_after(
         &self,
         run_id: &str,
@@ -462,6 +690,23 @@ impl SqliteStore {
             .await
     }
 
+    pub async fn events_after_for_actor(
+        &self,
+        actor_user_id: &str,
+        run_id: &str,
+        after: u64,
+    ) -> Result<Vec<RunEvent>, StorageError> {
+        let actor_user_id =
+            normalized_account_value(actor_user_id, "run actor user ID", 128)?.to_owned();
+        let run_id = normalized_identifier(run_id, "run ID")?.to_owned();
+        self.with_connection(move |connection| {
+            events_after_for_actor(connection, &actor_user_id, &run_id, after)
+        })
+        .await
+    }
+
+    /// System/test-only legacy receipt lookup. Authenticated paths must use
+    /// [`Self::review_receipt_for_actor`].
     pub async fn review_receipt(
         &self,
         idempotency_key: &str,
@@ -471,12 +716,43 @@ impl SqliteStore {
             .await
     }
 
+    pub async fn review_receipt_for_actor(
+        &self,
+        actor_user_id: &str,
+        run_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<ReviewReceipt>, StorageError> {
+        let actor_user_id =
+            normalized_account_value(actor_user_id, "review actor user ID", 128)?.to_owned();
+        let run_id = normalized_identifier(run_id, "run ID")?.to_owned();
+        let idempotency_key = normalized_key(idempotency_key)?.to_owned();
+        self.with_connection(move |connection| {
+            load_review_receipt_for_actor(connection, &actor_user_id, &run_id, &idempotency_key)
+        })
+        .await
+    }
+
     /// Atomically advances the run projection, appends the v1 event payload,
     /// and records the idempotency receipt. Business transition validation is
     /// intentionally owned by the runtime/kernel before this call.
+    /// System/test-only legacy write. Authenticated paths must use
+    /// [`Self::commit_review_for_actor`].
     pub async fn commit_review(&self, commit: ReviewCommit) -> Result<CommitOutcome, StorageError> {
-        self.with_connection(move |connection| commit_review(connection, commit, false))
+        self.with_connection(move |connection| commit_review(connection, commit, None, false))
             .await
+    }
+
+    pub async fn commit_review_for_actor(
+        &self,
+        actor_user_id: &str,
+        commit: ReviewCommit,
+    ) -> Result<CommitOutcome, StorageError> {
+        let actor_user_id =
+            normalized_account_value(actor_user_id, "review actor user ID", 128)?.to_owned();
+        self.with_connection(move |connection| {
+            commit_review(connection, commit, Some(&actor_user_id), false)
+        })
+        .await
     }
 
     /// Returns a queued job without mutating it. Callers use this to build the
@@ -532,7 +808,7 @@ impl SqliteStore {
         &self,
         commit: ReviewCommit,
     ) -> Result<CommitOutcome, StorageError> {
-        self.with_connection(move |connection| commit_review(connection, commit, true))
+        self.with_connection(move |connection| commit_review(connection, commit, None, true))
             .await
     }
 
@@ -564,7 +840,7 @@ impl SqliteStore {
         let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         self.with_connection(move |connection| {
-            flush_turn(connection, &session_id, request, &key, true)
+            flush_turn(connection, &session_id, request, &key, None, true)
         })
         .await
     }
@@ -579,17 +855,25 @@ impl SqliteStore {
     ) -> Result<ReplyJobEnqueueResponse, StorageError> {
         let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
+        let actor_user_id = job.actor_user_id.clone();
         self.with_connection(move |connection| {
-            start_turn(connection, &session_id, request, &key, Some(job), true).and_then(
-                |(start, job)| {
-                    job.map(|job| ReplyJobEnqueueResponse { start, job })
-                        .ok_or_else(|| {
-                            StorageError::CorruptData(
-                                "reply enqueue committed without a queue record".into(),
-                            )
-                        })
-                },
+            start_turn(
+                connection,
+                &session_id,
+                request,
+                &key,
+                Some(&actor_user_id),
+                Some(job),
+                true,
             )
+            .and_then(|(start, job)| {
+                job.map(|job| ReplyJobEnqueueResponse { start, job })
+                    .ok_or_else(|| {
+                        StorageError::CorruptData(
+                            "reply enqueue committed without a queue record".into(),
+                        )
+                    })
+            })
         })
         .await
     }
@@ -786,6 +1070,13 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
             params![7, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 8 {
+        transaction.execute_batch(MIGRATION_0008)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![8, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -861,6 +1152,18 @@ fn readiness(connection: &mut Connection, expects_wal: bool) -> Result<(), Stora
         ));
     }
 
+    let dispatch_authorization_columns: i64 = connection.query_row(
+        r#"SELECT COUNT(*) FROM pragma_table_info('dispatch_jobs')
+           WHERE name IN ('approving_actor_user_id', 'authorization_error_json')"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if dispatch_authorization_columns != 2 {
+        return Err(StorageError::CorruptData(
+            "dispatch authorization columns are missing".into(),
+        ));
+    }
+
     let trigger_count: i64 = connection.query_row(
         r#"SELECT COUNT(*) FROM sqlite_schema
            WHERE type = 'trigger' AND name IN (
@@ -869,6 +1172,8 @@ fn readiness(connection: &mut Connection, expects_wal: bool) -> Result<(), Stora
                'dispatch_jobs_reject_input_update',
                'dispatch_jobs_enforce_forward_transition',
                'dispatch_jobs_reject_delete',
+               'dispatch_jobs_require_actor_on_insert',
+               'dispatch_jobs_require_owner_on_legacy_claim',
                'runtime_identity_reject_update',
                'runtime_identity_reject_delete',
                'session_events_require_next_sequence',
@@ -893,14 +1198,93 @@ fn readiness(connection: &mut Connection, expects_wal: bool) -> Result<(), Stora
                'runs_owner_is_write_once',
                'reply_jobs_reject_input_update',
                'reply_jobs_enforce_forward_transition',
-               'reply_jobs_reject_delete'
+               'reply_jobs_reject_delete',
+               'session_runs_require_same_owner',
+               'reply_jobs_require_session_owner',
+               'session_receipts_require_session_owner_on_insert',
+               'session_receipts_require_session_owner_on_claim',
+               'run_receipts_require_run_owner_on_insert',
+               'run_receipts_require_run_owner_on_claim'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 30 {
+    if trigger_count != 38 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
+        ));
+    }
+
+    let actor_boundary_violation: i64 = connection.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1
+               FROM session_runs sr
+               JOIN sessions s ON s.id = sr.session_id
+               JOIN runs r ON r.id = sr.run_id
+               WHERE s.owner_user_id IS NOT r.owner_user_id
+               UNION ALL
+               SELECT 1
+               FROM reply_jobs j
+               JOIN sessions s ON s.id = j.session_id
+               WHERE j.actor_user_id IS NOT s.owner_user_id
+               UNION ALL
+               SELECT 1
+               FROM session_command_receipts receipt
+               JOIN sessions s ON s.id = receipt.session_id
+               WHERE receipt.actor_scope <> '__legacy__'
+                 AND receipt.actor_scope IS NOT s.owner_user_id
+               UNION ALL
+               SELECT 1
+               FROM idempotency_receipts receipt
+               JOIN runs r ON r.id = receipt.run_id
+               WHERE receipt.actor_scope <> '__legacy__'
+                 AND receipt.actor_scope IS NOT r.owner_user_id
+               UNION ALL
+               SELECT 1
+               FROM dispatch_jobs job
+               JOIN runs r ON r.id = job.run_id
+               WHERE job.approving_actor_user_id IS NOT NULL
+                 AND job.approving_actor_user_id IS NOT r.owner_user_id
+           )"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if actor_boundary_violation != 0 {
+        return Err(StorageError::CorruptData(
+            "one or more durable records cross an actor ownership boundary".into(),
+        ));
+    }
+    let (user_count, owner_count): (i64, i64) = connection.query_row(
+        r#"SELECT COUNT(*),
+                  COALESCE(SUM(CASE WHEN role = 'owner' THEN 1 ELSE 0 END), 0)
+           FROM users"#,
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if user_count != 0 && owner_count != 1 {
+        return Err(StorageError::CorruptData(
+            "configured database must contain exactly one owner".into(),
+        ));
+    }
+    let configured_legacy_boundary: i64 = connection.query_row(
+        r#"SELECT EXISTS(SELECT 1 FROM users)
+           AND EXISTS(
+               SELECT 1 FROM sessions WHERE owner_user_id IS NULL
+               UNION ALL
+               SELECT 1 FROM runs WHERE owner_user_id IS NULL
+               UNION ALL
+               SELECT 1 FROM session_command_receipts WHERE actor_scope = '__legacy__'
+               UNION ALL
+               SELECT 1 FROM idempotency_receipts WHERE actor_scope = '__legacy__'
+               UNION ALL
+               SELECT 1 FROM dispatch_jobs WHERE approving_actor_user_id IS NULL
+           )"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if configured_legacy_boundary != 0 {
+        return Err(StorageError::CorruptData(
+            "configured database still contains unclaimed legacy actor state".into(),
         ));
     }
 
@@ -1024,6 +1408,12 @@ fn bootstrap_owner(
     )?;
     transaction.execute(
         "UPDATE idempotency_receipts SET actor_scope = ?1 WHERE actor_scope = '__legacy__'",
+        [user_id],
+    )?;
+    transaction.execute(
+        r#"UPDATE dispatch_jobs
+           SET approving_actor_user_id = ?1
+           WHERE approving_actor_user_id IS NULL"#,
         [user_id],
     )?;
 
@@ -1725,6 +2115,31 @@ fn query_session_summaries(
     Ok(summaries)
 }
 
+fn query_session_summaries_for_actor(
+    connection: &mut Connection,
+    actor_user_id: &str,
+) -> Result<Vec<SessionSummary>, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    require_active_user(&transaction, actor_user_id)?;
+    let mut statement = transaction.prepare(
+        r#"SELECT id, title, status, created_at, updated_at, sequence,
+                  projection_sequence, active_turn_id
+           FROM sessions
+           WHERE owner_user_id = ?1
+           ORDER BY updated_at DESC, id"#,
+    )?;
+    let rows = statement
+        .query_map([actor_user_id], decode_session_summary_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    let summaries = rows
+        .into_iter()
+        .map(StoredSessionSummaryRow::decode)
+        .collect::<Result<Vec<_>, _>>()?;
+    transaction.commit()?;
+    Ok(summaries)
+}
+
 fn query_session_detail(
     connection: &mut Connection,
     session_id: &str,
@@ -1760,6 +2175,48 @@ fn query_session_detail(
     })
 }
 
+fn query_session_detail_for_actor(
+    connection: &mut Connection,
+    actor_user_id: &str,
+    session_id: &str,
+) -> Result<SessionDetail, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    require_active_session_actor(&transaction, session_id, actor_user_id)?;
+    let session = query_session_summary(&transaction, session_id)?;
+
+    let mut run_statement = transaction.prepare(
+        r#"SELECT sr.run_id
+           FROM session_runs sr
+           JOIN runs r ON r.id = sr.run_id
+           WHERE sr.session_id = ?1 AND r.owner_user_id = ?2
+           ORDER BY sr.attached_at, sr.run_id"#,
+    )?;
+    let run_ids = run_statement
+        .query_map(params![session_id, actor_user_id], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(run_statement);
+
+    let turns = query_session_turns(&transaction, session_id)?;
+    let events = query_session_events(&transaction, session_id, 0)?;
+    let event_head = events.last().map_or(0, |event| event.sequence);
+    if event_head != session.sequence {
+        return Err(StorageError::CorruptData(format!(
+            "session head {} does not match event head {event_head}",
+            session.sequence
+        )));
+    }
+    validate_session_turn_projection(&session, &turns)?;
+    transaction.commit()?;
+    Ok(SessionDetail {
+        session,
+        run_ids,
+        turns,
+        events,
+    })
+}
+
 fn query_session_events_after(
     connection: &mut Connection,
     session_id: &str,
@@ -1773,6 +2230,20 @@ fn query_session_events_after(
     Ok(events)
 }
 
+fn query_session_events_after_for_actor(
+    connection: &mut Connection,
+    actor_user_id: &str,
+    session_id: &str,
+    after: u64,
+) -> Result<Vec<SessionEvent>, StorageError> {
+    let after = u64_to_i64(after, "session event cursor")?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    require_active_session_actor(&transaction, session_id, actor_user_id)?;
+    let events = query_session_events(&transaction, session_id, after)?;
+    transaction.commit()?;
+    Ok(events)
+}
+
 fn create_session(
     connection: &mut Connection,
     request: CreateSessionRequest,
@@ -1781,6 +2252,9 @@ fn create_session(
 ) -> Result<CreateSessionResponse, StorageError> {
     let fingerprint = session_command_fingerprint(None, &request)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(actor_user_id) = actor_user_id {
+        require_active_user(&transaction, actor_user_id)?;
+    }
     let stored_response = match actor_user_id {
         Some(actor_user_id) => load_session_command_receipt_for_actor::<CreateSessionResponse>(
             &transaction,
@@ -1804,9 +2278,6 @@ fn create_session(
 
     normalized_session_value(&request.id, "session ID")?;
     normalized_session_value(&request.title, "session title")?;
-    if let Some(actor_user_id) = actor_user_id {
-        require_active_user(&transaction, actor_user_id)?;
-    }
     if query_session_summary_optional(&transaction, &request.id)?.is_some() {
         return Err(StorageError::SessionAlreadyExists(request.id));
     }
@@ -1872,15 +2343,29 @@ fn attach_run(
     session_id: &str,
     request: AttachRunRequest,
     idempotency_key: &str,
+    actor_user_id: Option<&str>,
 ) -> Result<AttachRunResponse, StorageError> {
     let fingerprint = session_command_fingerprint(Some(session_id), &request)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if let Some(mut response) = load_session_command_receipt::<AttachRunResponse>(
-        &transaction,
-        idempotency_key,
-        "attach_run",
-        &fingerprint,
-    )? {
+    if let Some(actor_user_id) = actor_user_id {
+        require_active_session_actor(&transaction, session_id, actor_user_id)?;
+    }
+    let stored_response = match actor_user_id {
+        Some(actor_user_id) => load_session_command_receipt_for_actor::<AttachRunResponse>(
+            &transaction,
+            actor_user_id,
+            idempotency_key,
+            "attach_run",
+            &fingerprint,
+        )?,
+        None => load_session_command_receipt::<AttachRunResponse>(
+            &transaction,
+            idempotency_key,
+            "attach_run",
+            &fingerprint,
+        )?,
+    };
+    if let Some(mut response) = stored_response {
         response.replayed = true;
         transaction.commit()?;
         return Ok(response);
@@ -1889,13 +2374,22 @@ fn attach_run(
     normalized_session_value(&request.run_id, "run ID")?;
     let summary = query_session_summary(&transaction, session_id)?;
     require_session_sequence(&summary, request.expected_sequence)?;
-    let run_exists = transaction
-        .query_row(
-            "SELECT 1 FROM runs WHERE id = ?1",
-            [&request.run_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?;
+    let run_exists = match actor_user_id {
+        Some(actor_user_id) => transaction
+            .query_row(
+                "SELECT 1 FROM runs WHERE id = ?1 AND owner_user_id = ?2",
+                params![request.run_id, actor_user_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?,
+        None => transaction
+            .query_row(
+                "SELECT 1 FROM runs WHERE id = ?1",
+                [&request.run_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?,
+    };
     if run_exists.is_none() {
         return Err(StorageError::RunNotFound(request.run_id));
     }
@@ -1942,15 +2436,28 @@ fn attach_run(
         event,
         replayed: false,
     };
-    insert_session_command_receipt(
-        &transaction,
-        idempotency_key,
-        "attach_run",
-        &fingerprint,
-        &response,
-        session_id,
-        response.event.sequence,
-    )?;
+    if let Some(actor_user_id) = actor_user_id {
+        insert_session_command_receipt_for_actor(
+            &transaction,
+            actor_user_id,
+            idempotency_key,
+            "attach_run",
+            &fingerprint,
+            &response,
+            session_id,
+            response.event.sequence,
+        )?;
+    } else {
+        insert_session_command_receipt(
+            &transaction,
+            idempotency_key,
+            "attach_run",
+            &fingerprint,
+            &response,
+            session_id,
+            response.event.sequence,
+        )?;
+    }
     transaction.commit()?;
     Ok(response)
 }
@@ -1960,6 +2467,7 @@ fn start_turn(
     session_id: &str,
     request: StartTurnRequest,
     idempotency_key: &str,
+    actor_user_id: Option<&str>,
     reply_job: Option<ReplyJobSpec>,
     fail_after_enqueue: bool,
 ) -> Result<(StartTurnResponse, Option<ReplyJob>), StorageError> {
@@ -1968,10 +2476,19 @@ fn start_turn(
         None => session_command_fingerprint(Some(session_id), &request)?,
     };
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let stored_response = match &reply_job {
-        Some(job) => load_session_command_receipt_for_actor::<StartTurnResponse>(
+    if let Some(job) = &reply_job {
+        validate_reply_job_spec(job)?;
+        if actor_user_id != Some(job.actor_user_id.as_str()) {
+            return Err(StorageError::SessionNotFound(session_id.to_owned()));
+        }
+    }
+    if let Some(actor_user_id) = actor_user_id {
+        require_active_session_actor(&transaction, session_id, actor_user_id)?;
+    }
+    let stored_response = match actor_user_id {
+        Some(actor_user_id) => load_session_command_receipt_for_actor::<StartTurnResponse>(
             &transaction,
-            &job.actor_user_id,
+            actor_user_id,
             idempotency_key,
             "start_turn",
             &fingerprint,
@@ -1999,10 +2516,6 @@ fn start_turn(
 
     normalized_session_value(&request.turn_id, "turn ID")?;
     validate_message(&request.user_message, "user message")?;
-    if let Some(job) = &reply_job {
-        validate_reply_job_spec(job)?;
-        require_active_reply_actor(&transaction, session_id, &job.actor_user_id)?;
-    }
     let summary = query_session_summary(&transaction, session_id)?;
     require_session_sequence(&summary, request.expected_sequence)?;
     if summary.status != SessionStatus::Ready || summary.active_turn_id.is_some() {
@@ -2082,10 +2595,10 @@ fn start_turn(
         event,
         replayed: false,
     };
-    if let Some(job) = &stored_job {
+    if let Some(actor_user_id) = actor_user_id {
         insert_session_command_receipt_for_actor(
             &transaction,
-            &job.actor_user_id,
+            actor_user_id,
             idempotency_key,
             "start_turn",
             &fingerprint,
@@ -2155,7 +2668,7 @@ fn claim_next_reply(connection: &mut Connection) -> Result<ReplyClaimOutcome, St
     };
 
     let job = query_reply_job(&transaction, &job_id)?;
-    require_open_reply_turn(&transaction, &job)?;
+    let summary = require_open_reply_turn(&transaction, &job)?;
     let changed = transaction.execute(
         r#"UPDATE reply_jobs
            SET status = 'started', attempt = 1, started_at = ?1
@@ -2165,9 +2678,52 @@ fn claim_next_reply(connection: &mut Connection) -> Result<ReplyClaimOutcome, St
     if changed != 1 {
         return Err(StorageError::ConcurrentModification);
     }
+    if !reply_actor_is_authorized(&transaction, &job)? {
+        let error_json = json!({
+            "code": "authorization_revoked",
+            "message": "the reply actor is no longer authorized for this session"
+        });
+        let fingerprint = serde_json::to_string(&json!({
+            "kind": "failed",
+            "job_id": job.id,
+            "expected_sequence": summary.sequence,
+            "error_json": error_json,
+        }))?;
+        let completion = interrupt_reply_job(
+            &transaction,
+            job,
+            summary.sequence,
+            ReplyJobStatus::Failed,
+            &error_json,
+            &fingerprint,
+            "reply authorization was revoked before provider execution",
+        )?;
+        transaction.commit()?;
+        return Ok(ReplyClaimOutcome::Rejected(Box::new(completion)));
+    }
     let claimed = query_reply_job(&transaction, &job_id)?;
     transaction.commit()?;
     Ok(ReplyClaimOutcome::Claimed(Box::new(claimed)))
+}
+
+fn reply_actor_is_authorized(
+    connection: &Connection,
+    job: &ReplyJob,
+) -> Result<bool, StorageError> {
+    let authorized: i64 = connection.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1
+               FROM sessions s
+               JOIN users u ON u.id = ?1
+               WHERE s.id = ?2
+                 AND s.owner_user_id = u.id
+                 AND u.status = 'active'
+                 AND u.role IN ('owner', 'member')
+           )"#,
+        params![job.actor_user_id, job.session_id],
+        |row| row.get(0),
+    )?;
+    Ok(authorized != 0)
 }
 
 fn complete_reply_success(
@@ -2475,16 +3031,30 @@ fn flush_turn(
     session_id: &str,
     request: FlushSessionRequest,
     idempotency_key: &str,
+    actor_user_id: Option<&str>,
     fail_before_flush_event: bool,
 ) -> Result<FlushSessionResponse, StorageError> {
     let fingerprint = session_command_fingerprint(Some(session_id), &request)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if let Some(mut response) = load_session_command_receipt::<FlushSessionResponse>(
-        &transaction,
-        idempotency_key,
-        "flush_turn",
-        &fingerprint,
-    )? {
+    if let Some(actor_user_id) = actor_user_id {
+        require_active_session_actor(&transaction, session_id, actor_user_id)?;
+    }
+    let stored_response = match actor_user_id {
+        Some(actor_user_id) => load_session_command_receipt_for_actor::<FlushSessionResponse>(
+            &transaction,
+            actor_user_id,
+            idempotency_key,
+            "flush_turn",
+            &fingerprint,
+        )?,
+        None => load_session_command_receipt::<FlushSessionResponse>(
+            &transaction,
+            idempotency_key,
+            "flush_turn",
+            &fingerprint,
+        )?,
+    };
+    if let Some(mut response) = stored_response {
         response.replayed = true;
         transaction.commit()?;
         return Ok(response);
@@ -2599,15 +3169,28 @@ fn flush_turn(
         },
         replayed: false,
     };
-    insert_session_command_receipt(
-        &transaction,
-        idempotency_key,
-        "flush_turn",
-        &fingerprint,
-        &response,
-        session_id,
-        flush_sequence,
-    )?;
+    if let Some(actor_user_id) = actor_user_id {
+        insert_session_command_receipt_for_actor(
+            &transaction,
+            actor_user_id,
+            idempotency_key,
+            "flush_turn",
+            &fingerprint,
+            &response,
+            session_id,
+            flush_sequence,
+        )?;
+    } else {
+        insert_session_command_receipt(
+            &transaction,
+            idempotency_key,
+            "flush_turn",
+            &fingerprint,
+            &response,
+            session_id,
+            flush_sequence,
+        )?;
+    }
     transaction.commit()?;
     Ok(response)
 }
@@ -2617,15 +3200,29 @@ fn resume_session(
     session_id: &str,
     request: ResumeSessionRequest,
     idempotency_key: &str,
+    actor_user_id: Option<&str>,
 ) -> Result<ResumeSessionResponse, StorageError> {
     let fingerprint = session_command_fingerprint(Some(session_id), &request)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if let Some(mut response) = load_session_command_receipt::<ResumeSessionResponse>(
-        &transaction,
-        idempotency_key,
-        "resume_session",
-        &fingerprint,
-    )? {
+    if let Some(actor_user_id) = actor_user_id {
+        require_active_session_actor(&transaction, session_id, actor_user_id)?;
+    }
+    let stored_response = match actor_user_id {
+        Some(actor_user_id) => load_session_command_receipt_for_actor::<ResumeSessionResponse>(
+            &transaction,
+            actor_user_id,
+            idempotency_key,
+            "resume_session",
+            &fingerprint,
+        )?,
+        None => load_session_command_receipt::<ResumeSessionResponse>(
+            &transaction,
+            idempotency_key,
+            "resume_session",
+            &fingerprint,
+        )?,
+    };
+    if let Some(mut response) = stored_response {
         response.replayed = true;
         transaction.commit()?;
         return Ok(response);
@@ -2663,15 +3260,28 @@ fn resume_session(
         event,
         replayed: false,
     };
-    insert_session_command_receipt(
-        &transaction,
-        idempotency_key,
-        "resume_session",
-        &fingerprint,
-        &response,
-        session_id,
-        response.event.sequence,
-    )?;
+    if let Some(actor_user_id) = actor_user_id {
+        insert_session_command_receipt_for_actor(
+            &transaction,
+            actor_user_id,
+            idempotency_key,
+            "resume_session",
+            &fingerprint,
+            &response,
+            session_id,
+            response.event.sequence,
+        )?;
+    } else {
+        insert_session_command_receipt(
+            &transaction,
+            idempotency_key,
+            "resume_session",
+            &fingerprint,
+            &response,
+            session_id,
+            response.event.sequence,
+        )?;
+    }
     transaction.commit()?;
     Ok(response)
 }
@@ -2972,24 +3582,47 @@ fn require_reply_provenance_matches_job(
     Ok(())
 }
 
-fn require_active_reply_actor(
+fn require_active_session_actor(
     connection: &Connection,
     session_id: &str,
     actor_user_id: &str,
 ) -> Result<(), StorageError> {
-    require_active_user(connection, actor_user_id)?;
-    let owner = connection
-        .query_row(
-            "SELECT owner_user_id FROM sessions WHERE id = ?1",
-            [session_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()?
-        .ok_or_else(|| StorageError::SessionNotFound(session_id.to_owned()))?;
-    if owner.as_deref() != Some(actor_user_id) {
-        return Err(StorageError::InvalidReplyTransition(format!(
-            "user `{actor_user_id}` does not own session `{session_id}`"
-        )));
+    let authorized = connection.query_row(
+        r#"SELECT EXISTS(
+                   SELECT 1
+                   FROM sessions s
+                   JOIN users u ON u.id = s.owner_user_id
+                   WHERE s.id = ?1 AND u.id = ?2 AND u.status = 'active'
+               )"#,
+        params![session_id, actor_user_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if authorized == 0 {
+        return Err(StorageError::SessionNotFound(session_id.to_owned()));
+    }
+    Ok(())
+}
+
+fn require_active_run_owner(
+    connection: &Connection,
+    run_id: &str,
+    actor_user_id: &str,
+) -> Result<(), StorageError> {
+    let authorized = connection.query_row(
+        r#"SELECT EXISTS(
+                   SELECT 1
+                   FROM runs r
+                   JOIN users u ON u.id = r.owner_user_id
+                   WHERE r.id = ?1
+                     AND u.id = ?2
+                     AND u.role = 'owner'
+                     AND u.status = 'active'
+               )"#,
+        params![run_id, actor_user_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if authorized == 0 {
+        return Err(StorageError::RunNotFound(run_id.to_owned()));
     }
     Ok(())
 }
@@ -3467,8 +4100,40 @@ fn load_snapshot(connection: &mut Connection, run_id: &str) -> Result<RunSnapsho
     Ok(snapshot)
 }
 
+fn load_snapshot_for_actor(
+    connection: &mut Connection,
+    actor_user_id: &str,
+    run_id: &str,
+) -> Result<RunSnapshot, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    require_active_run_owner(&transaction, run_id, actor_user_id)?;
+    let snapshot = query_snapshot(&transaction, run_id)?;
+    transaction.commit()?;
+    Ok(snapshot)
+}
+
 fn load_run(connection: &mut Connection, run_id: &str) -> Result<StoredRun, StorageError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let snapshot = query_snapshot(&transaction, run_id)?;
+    let events = query_events(&transaction, run_id, 0)?;
+    let event_head = events.last().map_or(0, |event| event.sequence);
+    if event_head != snapshot.run.sequence {
+        return Err(StorageError::CorruptData(format!(
+            "run head {} does not match event head {event_head}",
+            snapshot.run.sequence
+        )));
+    }
+    transaction.commit()?;
+    Ok(StoredRun { snapshot, events })
+}
+
+fn load_run_for_actor(
+    connection: &mut Connection,
+    actor_user_id: &str,
+    run_id: &str,
+) -> Result<StoredRun, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    require_active_run_owner(&transaction, run_id, actor_user_id)?;
     let snapshot = query_snapshot(&transaction, run_id)?;
     let events = query_events(&transaction, run_id, 0)?;
     let event_head = events.last().map_or(0, |event| event.sequence);
@@ -3543,6 +4208,20 @@ fn events_after(
     Ok(events)
 }
 
+fn events_after_for_actor(
+    connection: &mut Connection,
+    actor_user_id: &str,
+    run_id: &str,
+    after: u64,
+) -> Result<Vec<RunEvent>, StorageError> {
+    let after = u64_to_i64(after, "event cursor")?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    require_active_run_owner(&transaction, run_id, actor_user_id)?;
+    let events = query_events(&transaction, run_id, after)?;
+    transaction.commit()?;
+    Ok(events)
+}
+
 fn query_events(
     connection: &Connection,
     run_id: &str,
@@ -3584,7 +4263,10 @@ fn load_review_receipt(
     let stored = connection
         .query_row(
             r#"SELECT operation, request_fingerprint, response_json, run_id, event_sequence
-               FROM idempotency_receipts WHERE idempotency_key = ?1"#,
+               FROM idempotency_receipts
+               WHERE actor_scope = '__legacy__'
+                 AND operation = 'review'
+                 AND idempotency_key = ?1"#,
             [idempotency_key],
             |row| {
                 Ok((
@@ -3625,9 +4307,123 @@ fn load_review_receipt(
     }))
 }
 
+fn load_review_receipt_for_actor(
+    connection: &mut Connection,
+    actor_user_id: &str,
+    run_id: &str,
+    idempotency_key: &str,
+) -> Result<Option<ReviewReceipt>, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    require_active_run_owner(&transaction, run_id, actor_user_id)?;
+    let stored = transaction
+        .query_row(
+            r#"SELECT request_fingerprint, response_json, run_id, event_sequence
+               FROM idempotency_receipts
+               WHERE actor_scope = ?1
+                 AND operation = 'review'
+                 AND idempotency_key = ?2"#,
+            params![actor_user_id, idempotency_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let receipt = stored
+        .map(
+            |(request_fingerprint, response_json, stored_run_id, event_sequence)| {
+                if stored_run_id != run_id {
+                    return Err(StorageError::IdempotencyConflict);
+                }
+                decode_review_receipt(
+                    request_fingerprint,
+                    response_json,
+                    stored_run_id,
+                    event_sequence,
+                )
+            },
+        )
+        .transpose()?;
+    transaction.commit()?;
+    Ok(receipt)
+}
+
+fn load_review_receipt_for_actor_in_transaction(
+    connection: &Connection,
+    actor_user_id: &str,
+    run_id: &str,
+    idempotency_key: &str,
+) -> Result<Option<ReviewReceipt>, StorageError> {
+    let stored = connection
+        .query_row(
+            r#"SELECT request_fingerprint, response_json, run_id, event_sequence
+               FROM idempotency_receipts
+               WHERE actor_scope = ?1
+                 AND operation = 'review'
+                 AND idempotency_key = ?2"#,
+            params![actor_user_id, idempotency_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    stored
+        .map(
+            |(request_fingerprint, response_json, stored_run_id, event_sequence)| {
+                if stored_run_id != run_id {
+                    return Err(StorageError::IdempotencyConflict);
+                }
+                decode_review_receipt(
+                    request_fingerprint,
+                    response_json,
+                    stored_run_id,
+                    event_sequence,
+                )
+            },
+        )
+        .transpose()
+}
+
+fn decode_review_receipt(
+    request_fingerprint: String,
+    response_json: String,
+    run_id: String,
+    event_sequence: i64,
+) -> Result<ReviewReceipt, StorageError> {
+    validate_fingerprint(&request_fingerprint)?;
+    let response: ReviewResponse = serde_json::from_str(&response_json)?;
+    if response.replayed {
+        return Err(StorageError::CorruptData(
+            "stored review receipt must contain the original response".into(),
+        ));
+    }
+    if response.run.id != run_id
+        || u64_to_i64(response.run.sequence, "receipt run sequence")? != event_sequence
+        || u64_to_i64(response.event.sequence, "receipt event sequence")? != event_sequence
+    {
+        return Err(StorageError::CorruptData(
+            "review receipt identity does not match its stored run/event reference".into(),
+        ));
+    }
+    Ok(ReviewReceipt {
+        request_fingerprint,
+        response,
+    })
+}
+
 fn commit_review(
     connection: &mut Connection,
     commit: ReviewCommit,
+    actor_user_id: Option<&str>,
     fail_after_event: bool,
 ) -> Result<CommitOutcome, StorageError> {
     validate_commit(&commit)?;
@@ -3636,7 +4432,26 @@ fn commit_review(
     let response_json = serde_json::to_string(&commit.response)?;
 
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if let Some(receipt) = load_review_receipt(&transaction, &key)? {
+    if let Some(actor_user_id) = actor_user_id {
+        require_active_run_owner(&transaction, &commit.snapshot.run.id, actor_user_id)?;
+        if commit
+            .dispatch
+            .as_ref()
+            .is_some_and(|dispatch| dispatch.approving_actor_user_id != actor_user_id)
+        {
+            return Err(StorageError::RunNotFound(commit.snapshot.run.id.clone()));
+        }
+    }
+    let stored_receipt = match actor_user_id {
+        Some(actor_user_id) => load_review_receipt_for_actor_in_transaction(
+            &transaction,
+            actor_user_id,
+            &commit.snapshot.run.id,
+            &key,
+        )?,
+        None => load_review_receipt(&transaction, &key)?,
+    };
+    if let Some(receipt) = stored_receipt {
         if receipt.request_fingerprint != commit.request_fingerprint {
             return Err(StorageError::IdempotencyConflict);
         }
@@ -3654,10 +4469,11 @@ fn commit_review(
 
     transaction.execute(
         r#"INSERT INTO idempotency_receipts(
-               idempotency_key, operation, request_fingerprint, response_json, run_id,
-               event_sequence, created_at
-           ) VALUES (?1, 'review', ?2, ?3, ?4, ?5, ?6)"#,
+               actor_scope, idempotency_key, operation, request_fingerprint,
+               response_json, run_id, event_sequence, created_at
+           ) VALUES (?1, ?2, 'review', ?3, ?4, ?5, ?6, ?7)"#,
         params![
+            actor_user_id.unwrap_or("__legacy__"),
             key,
             commit.request_fingerprint,
             response_json,
@@ -3740,9 +4556,9 @@ fn query_dispatch_job(
         .query_row(
             r#"SELECT
                    call_id, run_id, approval_id, approval_event_sequence,
-                   tool_name, tool_version, effect, args_json, args_digest,
+                   approving_actor_user_id, tool_name, tool_version, effect, args_json, args_digest,
                    policy_id, policy_revision, sandbox_profile, status, attempt,
-                   result_json, queued_at, started_at, finished_at,
+                   result_json, authorization_error_json, queued_at, started_at, finished_at,
                    start_event_sequence, result_event_sequence
                FROM dispatch_jobs WHERE call_id = ?1"#,
             [call_id],
@@ -3752,22 +4568,24 @@ fn query_dispatch_job(
                     run_id: row.get(1)?,
                     approval_id: row.get(2)?,
                     approval_event_sequence: row.get(3)?,
-                    tool_name: row.get(4)?,
-                    tool_version: row.get(5)?,
-                    effect: row.get(6)?,
-                    args_json: row.get(7)?,
-                    args_digest: row.get(8)?,
-                    policy_id: row.get(9)?,
-                    policy_revision: row.get(10)?,
-                    sandbox_profile: row.get(11)?,
-                    status: row.get(12)?,
-                    attempt: row.get(13)?,
-                    result_json: row.get(14)?,
-                    queued_at: row.get(15)?,
-                    started_at: row.get(16)?,
-                    finished_at: row.get(17)?,
-                    start_event_sequence: row.get(18)?,
-                    result_event_sequence: row.get(19)?,
+                    approving_actor_user_id: row.get(4)?,
+                    tool_name: row.get(5)?,
+                    tool_version: row.get(6)?,
+                    effect: row.get(7)?,
+                    args_json: row.get(8)?,
+                    args_digest: row.get(9)?,
+                    policy_id: row.get(10)?,
+                    policy_revision: row.get(11)?,
+                    sandbox_profile: row.get(12)?,
+                    status: row.get(13)?,
+                    attempt: row.get(14)?,
+                    result_json: row.get(15)?,
+                    authorization_error_json: row.get(16)?,
+                    queued_at: row.get(17)?,
+                    started_at: row.get(18)?,
+                    finished_at: row.get(19)?,
+                    start_event_sequence: row.get(20)?,
+                    result_event_sequence: row.get(21)?,
                 })
             },
         )
@@ -3781,17 +4599,7 @@ fn claim_next_dispatch(
     commit: DispatchStartCommit,
     inject_failure: bool,
 ) -> Result<ClaimOutcome, StorageError> {
-    validate_dispatch_transition(
-        &commit.call_id,
-        commit.expected_sequence,
-        &commit.snapshot,
-        &commit.event,
-    )?;
-    if execution_status_to_db(&commit.snapshot.run.status) != "running" {
-        return Err(StorageError::InvalidDispatchTransition(
-            "claim projection must have running execution status".into(),
-        ));
-    }
+    normalized_identifier(&commit.call_id, "call ID")?;
 
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let queue_head = transaction
@@ -3811,6 +4619,23 @@ fn claim_next_dispatch(
 
     let job = query_dispatch_job(&transaction, &commit.call_id)?
         .ok_or_else(|| StorageError::DispatchJobNotFound(commit.call_id.clone()))?;
+    if let Some(reason) = dispatch_authorization_failure(&transaction, &job)? {
+        let rejection = reject_dispatch_authorization(&transaction, job, reason)?;
+        transaction.commit()?;
+        return Ok(ClaimOutcome::Rejected(Box::new(rejection)));
+    }
+
+    validate_dispatch_transition(
+        &commit.call_id,
+        commit.expected_sequence,
+        &commit.snapshot,
+        &commit.event,
+    )?;
+    if execution_status_to_db(&commit.snapshot.run.status) != "running" {
+        return Err(StorageError::InvalidDispatchTransition(
+            "claim projection must have running execution status".into(),
+        ));
+    }
     if job.status != DispatchStatus::Queued || job.run_id != commit.snapshot.run.id {
         return Err(StorageError::InvalidDispatchTransition(
             "queue head does not match the supplied run projection".into(),
@@ -3861,6 +4686,137 @@ fn claim_next_dispatch(
     })?;
     transaction.commit()?;
     Ok(ClaimOutcome::Claimed(Box::new(claimed)))
+}
+
+fn dispatch_authorization_failure(
+    connection: &Connection,
+    job: &DispatchJob,
+) -> Result<Option<&'static str>, StorageError> {
+    let Some(actor_user_id) = job.approving_actor_user_id.as_deref() else {
+        return Ok(Some("missing_approving_actor"));
+    };
+    let actor = connection
+        .query_row(
+            "SELECT role, status FROM users WHERE id = ?1",
+            [actor_user_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((role, status)) = actor else {
+        return Ok(Some("approving_actor_missing"));
+    };
+    if status != "active" {
+        return Ok(Some("approving_actor_disabled"));
+    }
+    if role != "owner" {
+        return Ok(Some("approving_actor_role_changed"));
+    }
+    let owns_run: i64 = connection.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM runs
+               WHERE id = ?1 AND owner_user_id = ?2
+           )"#,
+        params![job.run_id, actor_user_id],
+        |row| row.get(0),
+    )?;
+    if owns_run == 0 {
+        return Ok(Some("approving_actor_no_longer_owns_run"));
+    }
+    Ok(None)
+}
+
+fn reject_dispatch_authorization(
+    connection: &Connection,
+    job: DispatchJob,
+    reason: &'static str,
+) -> Result<DispatchRejection, StorageError> {
+    if job.status != DispatchStatus::Queued {
+        return Err(StorageError::InvalidDispatchTransition(
+            "only a queued dispatch may be authorization-rejected".into(),
+        ));
+    }
+    let mut snapshot = query_snapshot(connection, &job.run_id)?;
+    let expected_sequence = snapshot.run.sequence;
+    let next_sequence = expected_sequence
+        .checked_add(1)
+        .ok_or(StorageError::IntegerOutOfRange("run sequence"))?;
+    let previous_after = expected_sequence
+        .checked_sub(1)
+        .ok_or_else(|| StorageError::CorruptData("queued dispatch has no approval event".into()))?;
+    let previous = query_events(
+        connection,
+        &job.run_id,
+        u64_to_i64(previous_after, "previous event cursor")?,
+    )?
+    .into_iter()
+    .last()
+    .ok_or_else(|| StorageError::CorruptData("queued dispatch has no durable event head".into()))?;
+    let timestamp = now();
+    let summary =
+        "The approving actor is no longer authorized; connector execution was not attempted.";
+    let outcome = ToolOutcome::NotDispatched {
+        reason: NotDispatchedReason::AuthorizationRevoked,
+        summary: summary.into(),
+    };
+    let event = RunEvent {
+        sequence: next_sequence,
+        id: format!("evt-{next_sequence:06}"),
+        turn: previous.turn,
+        step: previous.step.saturating_add(1),
+        event_type: EventType::ToolCall,
+        title: "Tool was not dispatched".into(),
+        at: timestamp.clone(),
+        summary: Some(summary.into()),
+        content: None,
+        metadata: BTreeMap::from([
+            ("durable".into(), json!(true)),
+            ("executor_invoked".into(), json!(false)),
+            ("authorization_rechecked".into(), json!(true)),
+        ]),
+        approval: None,
+        data: Some(RunEventData::ToolResult {
+            call_id: job.call_id.clone(),
+            outcome: outcome.clone(),
+            status: ToolCallStatus::NotDispatched,
+        }),
+    };
+    snapshot.run.status = RunStatus::NeedsAttention;
+    snapshot.run.sequence = next_sequence;
+    update_projection(connection, &snapshot, expected_sequence)?;
+    insert_event_v2(connection, &job.run_id, &event)?;
+
+    let result_json = serde_json::to_string(&serde_json::to_value(&outcome)?)?;
+    let authorization_error_json = serde_json::to_string(&json!({
+        "code": "authorization_revoked",
+        "reason": reason,
+        "executor_invoked": false
+    }))?;
+    let changed = connection.execute(
+        r#"UPDATE dispatch_jobs SET
+               status = 'rejected',
+               result_json = ?1,
+               authorization_error_json = ?2,
+               finished_at = ?3,
+               result_event_sequence = ?4
+           WHERE call_id = ?5 AND status = 'queued' AND attempt = 0"#,
+        params![
+            result_json,
+            authorization_error_json,
+            timestamp,
+            u64_to_i64(next_sequence, "dispatch rejection event sequence")?,
+            job.call_id,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::ConcurrentModification);
+    }
+    let rejected = query_dispatch_job(connection, &job.call_id)?.ok_or_else(|| {
+        StorageError::CorruptData("rejected dispatch disappeared before commit".into())
+    })?;
+    Ok(DispatchRejection {
+        job: rejected,
+        event,
+    })
 }
 
 fn complete_dispatch(
@@ -3978,16 +4934,18 @@ fn insert_dispatch_job(
     connection.execute(
         r#"INSERT INTO dispatch_jobs(
                call_id, run_id, approval_id, approval_event_sequence,
-               tool_name, tool_version, effect, args_json, args_digest,
+               approving_actor_user_id, tool_name, tool_version, effect, args_json, args_digest,
                policy_id, policy_revision, sandbox_profile, status, attempt, queued_at
            ) VALUES (
-               ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'queued', 0, ?13
+               ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+               'queued', 0, ?14
            )"#,
         params![
             job.call_id,
             run_id,
             job.approval_id,
             approval_event_sequence,
+            job.approving_actor_user_id,
             job.tool_name,
             job.tool_version,
             tool_effect_to_db(&job.effect),
@@ -4209,6 +5167,7 @@ fn validate_dispatch_spec(job: &DispatchJobSpec) -> Result<(), StorageError> {
     for (value, field) in [
         (&job.call_id, "call ID"),
         (&job.approval_id, "approval ID"),
+        (&job.approving_actor_user_id, "approving actor user ID"),
         (&job.tool_name, "tool name"),
         (&job.tool_version, "tool version"),
         (&job.args_digest, "argument digest"),
@@ -4895,6 +5854,7 @@ struct StoredDispatchRow {
     run_id: String,
     approval_id: String,
     approval_event_sequence: i64,
+    approving_actor_user_id: Option<String>,
     tool_name: String,
     tool_version: String,
     effect: String,
@@ -4906,6 +5866,7 @@ struct StoredDispatchRow {
     status: String,
     attempt: i64,
     result_json: Option<String>,
+    authorization_error_json: Option<String>,
     queued_at: String,
     started_at: Option<String>,
     finished_at: Option<String>,
@@ -4919,6 +5880,7 @@ impl StoredDispatchRow {
             "queued" => DispatchStatus::Queued,
             "started" => DispatchStatus::Started,
             "finished" => DispatchStatus::Finished,
+            "rejected" => DispatchStatus::Rejected,
             other => {
                 return Err(StorageError::CorruptData(format!(
                     "unknown dispatch status `{other}`"
@@ -4933,6 +5895,7 @@ impl StoredDispatchRow {
                 self.approval_event_sequence,
                 "approval event sequence",
             )?,
+            approving_actor_user_id: self.approving_actor_user_id,
             tool_name: self.tool_name,
             tool_version: self.tool_version,
             effect: tool_effect_from_db(&self.effect)?,
@@ -4946,6 +5909,10 @@ impl StoredDispatchRow {
                 .map_err(|_| StorageError::IntegerOutOfRange("dispatch attempt"))?,
             result_json: self
                 .result_json
+                .map(|value| serde_json::from_str(&value))
+                .transpose()?,
+            authorization_error_json: self
+                .authorization_error_json
                 .map(|value| serde_json::from_str(&value))
                 .transpose()?,
             queued_at: self.queued_at,

@@ -1,7 +1,7 @@
 # Zeus Harness Alpha+ 设计冻结
 
-状态：主机 Alpha+ 验收通过；Apple container 新镜像验收待完成
-基线：`9a89706`（Alpha）
+状态：主机 Alpha+ 与 Actor Boundary Foundation 验收通过；Apple container 新镜像验收待完成
+基线：`4fede62`（Alpha+）
 
 ## 1. 产品术语
 
@@ -31,14 +31,19 @@ Health 路由保持公开。公开注册、邮件找回、OAuth/SSO、WebAuthn �
 
 - `sessions.owner_user_id` 与 `runs.owner_user_id` 在首次 bootstrap 前允许为 `NULL`；业务路由在 bootstrap 前不可访问。
 - bootstrap 事务把所有遗留空 owner 行认领给首位 owner，此后 ownership trigger 禁止再次修改。
-- 新 Session 与新 turn/reply job 已把 `actor_user_id` 放入 SQL 条件。其余
-  Alpha 遗留查询仍依赖严格的 owner-only 认证边界；启用 member 前必须把
-  Run、事件、审批、resume、receipt 和 SSE 查询全部改为 actor-scoped SQL，
-  并统一把不存在与不拥有映射为 `404`。
-- 新建 Session 与 start-turn receipt 的身份为
-  `(actor_scope, operation, idempotency_key)`。resume、review 等 Alpha 遗留
-  receipt 仍是启用 member 前的迁移阻断项。
+- 正式 REST/SSE 的 Session/Run 读取、事件回放、resume、turn、review 和
+  receipt 全部传入当前 actor，并在同一 SQLite 查询或事务中重新校验账号状态、
+  role 与资源 owner。不存在、不拥有或不具备 Run owner 权限统一映射为 `404`。
+- 所有 Session/Run command receipt 的身份为
+  `(actor_scope, operation, idempotency_key)`；资源授权发生在 receipt replay 之前，
+  猜中其他 actor 的 key 不能重放响应或改变错误类型。
 - 既有 Alpha receipt 在迁移后使用 `__legacy__` scope，并在 owner bootstrap 时一并认领。
+- reply claim 会重新校验 active Session owner；dispatch job 永久绑定批准它的 active
+  owner。授权在排队后被撤销时，任务在一个事务中进入 durable 拒绝终态并追加
+  `authorization_revoked` 证据，provider/connector 调用次数必须为零。
+
+这些边界只是未来 member 能力的安全底座。当前 API 仍拒绝 member 登录；字段/队列配额、
+分页、SSE 连接上限和登录限速完成前不得开放 member。
 
 ## 4. 设置
 
@@ -77,6 +82,8 @@ POST /sessions/{id}/turns
 - `0005_accounts.sql`：users、auth sessions、bootstrap tokens、user preferences、Session/Run owner。
 - `0006_actor_receipts.sql`：actor-scoped Session/Run command receipts。
 - `0007_reply_jobs.sql`：durable reply job 与 forward-only 状态 trigger。
+- `0008_actor_boundaries.sql`：dispatch approving actor、授权撤销终态、owner 一致性
+  trigger，以及 v7 receipt/dispatch 的唯一 owner 认领。
 
 迁移必须原地保留 Alpha append-only ledger、事件外键与 runtime identity。任何一步失败都回滚整个 migration transaction。
 
@@ -84,10 +91,12 @@ POST /sessions/{id}/turns
 
 - 首次 bootstrap 只能成功一次，token 过期/重用均失败。
 - 登录、登出、过期、禁用用户、CSRF、Origin 和 Cookie 属性有自动测试。
-- owner-only 认证门槛有自动测试；启用 member 前必须补齐 Alice/Bob 的
-  REST、SSE、receipt collision 隔离测试，并把未拥有资源统一为 `404`。
+- owner-only 认证门槛和 Alice/Bob 的 REST、SSE、receipt collision 隔离有自动测试；
+  未拥有资源统一为 `404`，member cookie 在产品 gate 打开前保持 `401`。
 - New Session 创建、切换和刷新后恢复通过浏览器测试，旧 SSE 会被关闭。
 - user message 之后由服务端产生 durable assistant/failure event；浏览器不能提交 assistant content。
 - `system/light/dark` 首屏无闪白，刷新后保持，系统主题变化可跟随。
 - reply job 的 queued/start/success/failure/outcome_unknown 和重启语义有存储测试。
+- disabled/降权/owner mismatch 的 reply 与 dispatch claim 不触达外部执行，并留下
+  durable terminal evidence。
 - host 与 container 都通过完整 Rust/Web 测试和重启恢复检查。

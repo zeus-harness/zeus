@@ -20,3 +20,6 @@ storage.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tools.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true

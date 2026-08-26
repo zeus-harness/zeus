@@ -261,12 +261,20 @@ and bounded memory, CPU, and PID resources.
   response; reusing it with different input is a conflict. Session
   `expected_sequence` and Run head compare-and-swap arbitrate different keys
   racing on the same resource.
+- Every production Session/Run read, command, event replay, and receipt lookup
+  is actor-scoped in the same SQLite query or transaction. Authorization runs
+  before receipt replay, and a missing or unowned resource has the same 404
+  surface.
 - Approval is bound to one call ID, argument digest, policy revision, sandbox,
   and `allow_once` scope. Approve atomically appends the decision and enqueues
   that exact immutable dispatch job; reject enqueues nothing.
 - A worker commits `ToolDispatchStarted` before invoking a connector. A queued
   job can resume after restart; a started job without a durable result becomes
   `outcome_unknown` and is never retried automatically.
+- Reply and dispatch claims revalidate the approving actor's current status,
+  role, and resource ownership. Revoked work is durably rejected with
+  `authorization_revoked` evidence before any provider or connector can see
+  it; the Run or Session moves to `needs_attention`.
 - Events become visible to live subscribers only after the transaction commits.
   Process-local broadcast is a latency hint; SSE also polls the durable ledger
   every two seconds from its last sequence cursor so a missed hint cannot leave
@@ -284,9 +292,11 @@ and bounded memory, CPU, and PID resources.
 - Schema v4 adds durable Sessions and their ledger. Schema v5 adds local users,
   auth sessions, owner references, bootstrap credentials, and preferences;
   v6 migrates command receipts to actor scopes; v7 adds the forward-only reply
-  queue. Existing Runs and events are migrated in place without rewriting
-  history. Runtime identity still binds profile, environment, primary Session
-  and Run, policy ID, and policy revision; a mismatch fails startup.
+  queue; v8 binds each dispatch to its approving actor and adds owner-consistency
+  triggers plus a durable authorization-revoked terminal state. Existing Runs
+  and events are migrated in place without rewriting history. Runtime identity
+  still binds profile, environment, primary Session and Run, policy ID, and
+  policy revision; a mismatch fails startup.
 
 SQLite is the authoritative store for this local single-instance Alpha. Do not
 place it on NFS or share one database volume between multiple Zeus replicas.
@@ -311,7 +321,8 @@ directly.
 - Every business REST/SSE route requires the active local owner. Protected
   state changes additionally require `X-CSRF-Token` to match the login and an
   exact same-origin request. Alpha+ deliberately rejects the schema-reserved
-  `member` role until every storage command and query is actor-scoped.
+  `member` role. Actor isolation is now present, but member access remains
+  blocked until quotas, pagination, SSE limits, and login rate limiting land.
 - `GET /api/v1/me/settings` returns the current safe preferences.
   `PATCH /api/v1/me/settings` accepts `theme`, optional allowlisted
   `preferred_model`, and `expected_revision`. Provider endpoints and API keys
@@ -330,8 +341,8 @@ directly.
   interrupted/needs-attention event through Session SSE.
 - Browsers cannot submit assistant content. The legacy
   `POST /api/v1/sessions/{session_id}/turns/{turn_id}/flush` route exists only
-  in the unauthenticated storage/runtime contract-test router and is absent
-  from the real authenticated server.
+  in a private `#[cfg(test)]` contract router that bootstraps a real test owner;
+  it is absent from the production server.
 - `POST /api/v1/sessions/{session_id}/resume` accepts
   `{"expected_sequence":...}` and only resumes a Session in
   `needs_attention`.
@@ -356,7 +367,7 @@ directly.
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Schema v7 retains durable Run attachment during migration and demo seeding,
+Schema v8 retains durable Run attachment during migration and demo seeding,
 but Alpha+ does not expose a public attach-Run HTTP route.
 
 Session identifiers, titles, and messages currently have canonical/non-empty
@@ -410,12 +421,13 @@ committed data. Use SQLite's backup/checkpoint facilities.
 
 ## Verification status
 
-Current Alpha+ host verification:
+Current Alpha+ plus Actor Boundary Foundation host verification:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --all-targets`: 130 tests passed, including the real
+- `cargo test --workspace --all-targets`: 145 tests passed, including the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
+  actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,
   durable reply provenance, concurrent claim, restart recovery, and provider
   `outcome_unknown` semantics.
 - `pnpm --filter web test`: 19 tests passed for CSRF headers, stable command
@@ -435,6 +447,15 @@ at sequence 3, and `turn_flushed` at sequence 4. Settings revision and revoked
 session rejection were also verified. The page at `127.0.0.1:3001` had no
 browser console errors.
 
+Actor Boundary Foundation was additionally live-smoked against an isolated
+schema-v8 database at `127.0.0.1:18081`: unauthenticated access returned `401`,
+owner bootstrap returned `200`, Session creation returned `201`, turn enqueue
+returned `202`, and the durable reply settled at sequence 4. Restarting the API
+against the same database preserved the login, flushed turn, assistant
+provenance, and ordered event ledger; an unknown or masked Session returned the
+same `404` surface. Cross-owner transfer, receipt collision, revocation, and
+live-SSE closure are covered by the automated actor-isolation tests.
+
 Apple `container` remains a supported local debug path. `bash -n` passes for
 the helper, and the pre-existing labeled API/Web/gateway containers plus
 `zeus-alpha-data` volume remained healthy and untouched during this change.
@@ -442,8 +463,8 @@ The Alpha+ image rebuild on this machine stalled while updating the crates.io
 index inside BuildKit and was interrupted before any running container was
 replaced. Therefore the new image, `verify`, and named-volume `restart-verify`
 are not yet claimed as current Alpha+ acceptance. The earlier Alpha baseline
-container acceptance belongs to commit `9a89706`, not to these uncommitted
-Alpha+ changes.
+container acceptance belongs to commit `9a89706`; the committed Alpha+ host
+baseline is `4fede62`, whose replacement container image is still unverified.
 
 Docker Compose configuration remains available for environments with Docker
 Compose v2; this machine currently has Apple `container` but no Docker CLI, so

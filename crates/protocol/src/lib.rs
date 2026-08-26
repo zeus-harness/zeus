@@ -289,6 +289,7 @@ pub enum NotDispatchedReason {
     SandboxUnavailable,
     PolicyDenied,
     PolicyChanged,
+    AuthorizationRevoked,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -805,8 +806,8 @@ mod tests {
         let data = RunEventData::ToolResult {
             call_id: "call-1".into(),
             outcome: ToolOutcome::NotDispatched {
-                reason: NotDispatchedReason::ExecutorUnavailable,
-                summary: "executor is unavailable".into(),
+                reason: NotDispatchedReason::AuthorizationRevoked,
+                summary: "actor authorization was revoked".into(),
             },
             status: ToolCallStatus::NotDispatched,
         };
@@ -814,6 +815,7 @@ mod tests {
         let value = serde_json::to_value(&data).unwrap();
         assert_eq!(value["kind"], "tool_result");
         assert_eq!(value["outcome"]["status"], "not_dispatched");
+        assert_eq!(value["outcome"]["reason"], "authorization_revoked");
         assert_eq!(serde_json::from_value::<RunEventData>(value).unwrap(), data);
     }
 

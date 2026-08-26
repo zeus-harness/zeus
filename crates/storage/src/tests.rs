@@ -11,8 +11,8 @@ use std::{
 use protocol::{
     Approval, ApprovalScope, ApprovalStatus, AssistantReplyKind, AssistantReplyProvenance,
     AttachRunRequest, CreateSessionRequest, EventType, EvidenceSummary, FlushSessionRequest,
-    IncidentStatus, IncidentSummary, Metric, MetricTone, ResumeSessionRequest, ReviewDecision,
-    ReviewResponse, RunEvent, RunEventData, RunStatus, RunSummary, SandboxProfile,
+    IncidentStatus, IncidentSummary, Metric, MetricTone, NotDispatchedReason, ResumeSessionRequest,
+    ReviewDecision, ReviewResponse, RunEvent, RunEventData, RunStatus, RunSummary, SandboxProfile,
     SessionEventData, SessionStatus, SessionTurnStatus, Severity, StartTurnRequest, ToolCall,
     ToolCallStatus, ToolEffect, ToolExecutorStatus, ToolOutcome, ToolPolicySummary,
 };
@@ -208,6 +208,7 @@ async fn legacy_runtime_state_is_adopted_only_when_run_and_policy_match() {
         .seed_if_empty(snapshot.clone(), events)
         .await
         .unwrap();
+    bootstrap_test_owner(&mismatched).await;
     mismatched
         .commit_review(approved_dispatch_commit(&snapshot, "legacy-policy"))
         .await
@@ -402,6 +403,7 @@ async fn different_keys_use_run_head_cas_for_first_wins_settlement() {
 #[tokio::test]
 async fn failure_after_event_insert_rolls_back_projection_event_and_receipt() {
     let store = seeded_memory_store().await;
+    bootstrap_test_owner(&store).await;
     let (snapshot, _) = seed_fixture();
     let commit = approved_dispatch_commit(&snapshot, "atomic-review");
 
@@ -457,7 +459,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     let owner: Option<String> = connection
         .query_row(
             "SELECT owner_user_id FROM runs WHERE id = ?1",
@@ -498,6 +500,43 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         session.events[1].data,
         SessionEventData::RunAttached { .. }
     ));
+}
+
+#[tokio::test]
+async fn v7_legacy_dispatch_is_rejected_before_bootstrap_then_claimed_as_history() {
+    let database = TestDatabase::new();
+    create_v7_database_with_legacy_dispatch(database.path());
+
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    store.readiness().await.unwrap();
+    let migrated = store.dispatch_job("call-v7-legacy").await.unwrap().unwrap();
+    assert_eq!(migrated.approving_actor_user_id, None);
+    let (snapshot, _) = seed_fixture();
+    let mut queued = snapshot;
+    queued.run.status = RunStatus::Queued;
+    let mut start = start_commit(&queued);
+    start.call_id = "call-v7-legacy".into();
+    start
+        .event
+        .metadata
+        .insert("call_id".into(), json!("call-v7-legacy"));
+    if let Some(RunEventData::ToolDispatchStarted { call_id, .. }) = &mut start.event.data {
+        *call_id = "call-v7-legacy".into();
+    }
+    let outcome = store.claim_next_dispatch(start).await.unwrap();
+    let ClaimOutcome::Rejected(rejection) = outcome else {
+        panic!("a migrated dispatch without an actor must fail closed");
+    };
+    assert_eq!(rejection.job.status, DispatchStatus::Rejected);
+    assert_eq!(rejection.job.approving_actor_user_id, None);
+
+    bootstrap_test_owner(&store).await;
+    let claimed_history = store.dispatch_job("call-v7-legacy").await.unwrap().unwrap();
+    assert_eq!(
+        claimed_history.approving_actor_user_id.as_deref(),
+        Some("user-owner")
+    );
+    assert_eq!(claimed_history.status, DispatchStatus::Rejected);
 }
 
 #[tokio::test]
@@ -1297,7 +1336,329 @@ async fn actor_scoped_session_creation_sets_owner_required_by_reply_enqueue() {
                 reply_job_spec("reply-unowned", "turn-unowned"),
             )
             .await,
-        Err(StorageError::InvalidReplyTransition(_))
+        Err(StorageError::SessionNotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn actor_scoped_session_and_run_reads_hide_foreign_or_disabled_resources() {
+    let database = TestDatabase::new();
+    let store = seeded_file_store(database.path()).await;
+    store
+        .seed_demo_session("session-ZR-1842", "Checkout API latency", RUN_ID)
+        .await
+        .unwrap();
+    bootstrap_test_owner(&store).await;
+
+    let sessions = store.list_sessions_for_actor("user-owner").await.unwrap();
+    assert_eq!(sessions.len(), 1);
+    let session_id = &sessions[0].id;
+    assert_eq!(
+        store
+            .get_session_for_actor("user-owner", session_id)
+            .await
+            .unwrap()
+            .run_ids,
+        vec![RUN_ID]
+    );
+    assert!(matches!(
+        store
+            .get_session_for_actor("foreign-user", session_id)
+            .await,
+        Err(StorageError::SessionNotFound(id)) if id == *session_id
+    ));
+    assert!(matches!(
+        store
+            .session_events_after_for_actor("foreign-user", session_id, 0)
+            .await,
+        Err(StorageError::SessionNotFound(id)) if id == *session_id
+    ));
+    assert_eq!(
+        store
+            .snapshot_for_actor("user-owner", RUN_ID)
+            .await
+            .unwrap()
+            .run
+            .id,
+        RUN_ID
+    );
+    assert!(matches!(
+        store.snapshot_for_actor("foreign-user", RUN_ID).await,
+        Err(StorageError::RunNotFound(id)) if id == RUN_ID
+    ));
+    assert!(matches!(
+        store.load_run_for_actor("foreign-user", RUN_ID).await,
+        Err(StorageError::RunNotFound(id)) if id == RUN_ID
+    ));
+    assert!(matches!(
+        store
+            .events_after_for_actor("foreign-user", RUN_ID, 0)
+            .await,
+        Err(StorageError::RunNotFound(id)) if id == RUN_ID
+    ));
+
+    set_test_user_status(database.path(), "user-owner", "disabled");
+    assert!(matches!(
+        store.get_session_for_actor("user-owner", session_id).await,
+        Err(StorageError::SessionNotFound(_))
+    ));
+    assert!(matches!(
+        store.snapshot_for_actor("user-owner", RUN_ID).await,
+        Err(StorageError::RunNotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn active_owner_and_member_have_independent_session_receipt_namespaces() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    bootstrap_test_owner(&store).await;
+    insert_test_member(database.path(), "user-member", "member");
+
+    let owner = store
+        .create_session_for_actor(
+            "user-owner",
+            CreateSessionRequest {
+                id: "session-owner-scope".into(),
+                title: "Owner scope".into(),
+            },
+            "shared-create-key",
+        )
+        .await
+        .unwrap();
+    let member = store
+        .create_session_for_actor(
+            "user-member",
+            CreateSessionRequest {
+                id: "session-member-scope".into(),
+                title: "Member scope".into(),
+            },
+            "shared-create-key",
+        )
+        .await
+        .unwrap();
+    assert_eq!(owner.session.id, "session-owner-scope");
+    assert_eq!(member.session.id, "session-member-scope");
+
+    let owner_turn = store
+        .start_turn_for_actor(
+            "user-owner",
+            "session-owner-scope",
+            StartTurnRequest {
+                turn_id: "turn-owner-scope".into(),
+                user_message: "Owner turn".into(),
+                expected_sequence: 1,
+            },
+            "shared-turn-key",
+        )
+        .await
+        .unwrap();
+    let member_turn = store
+        .start_turn_for_actor(
+            "user-member",
+            "session-member-scope",
+            StartTurnRequest {
+                turn_id: "turn-member-scope".into(),
+                user_message: "Member turn".into(),
+                expected_sequence: 1,
+            },
+            "shared-turn-key",
+        )
+        .await
+        .unwrap();
+    assert_eq!(owner_turn.turn.id, "turn-owner-scope");
+    assert_eq!(member_turn.turn.id, "turn-member-scope");
+    assert!(matches!(
+        store
+            .get_session_for_actor("user-member", "session-owner-scope")
+            .await,
+        Err(StorageError::SessionNotFound(_))
+    ));
+    store.readiness().await.unwrap();
+}
+
+#[tokio::test]
+async fn actor_scoped_resume_authorizes_before_receipt_replay() {
+    let store = created_owned_session_store().await;
+    store
+        .start_turn_for_actor(
+            "user-owner",
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-resume-actor".into(),
+                user_message: "Interrupt this turn".into(),
+                expected_sequence: 1,
+            },
+            "start-resume-actor",
+        )
+        .await
+        .unwrap();
+    let recovered = store.recover_open_turns().await.unwrap();
+    assert_eq!(recovered.len(), 1);
+    let request = ResumeSessionRequest {
+        expected_sequence: 3,
+    };
+    assert!(matches!(
+        store
+            .resume_session_for_actor(
+                "foreign-user",
+                "session-alpha",
+                request.clone(),
+                "resume-shared-key",
+            )
+            .await,
+        Err(StorageError::SessionNotFound(_))
+    ));
+    let resumed = store
+        .resume_session_for_actor(
+            "user-owner",
+            "session-alpha",
+            request.clone(),
+            "resume-shared-key",
+        )
+        .await
+        .unwrap();
+    assert!(!resumed.replayed);
+    assert!(
+        store
+            .resume_session_for_actor("user-owner", "session-alpha", request, "resume-shared-key",)
+            .await
+            .unwrap()
+            .replayed
+    );
+}
+
+#[tokio::test]
+async fn review_receipts_are_actor_scoped_and_authorization_precedes_replay() {
+    let database = TestDatabase::new();
+    let store = seeded_file_store(database.path()).await;
+    bootstrap_test_owner(&store).await;
+    let (snapshot, _) = seed_fixture();
+    let commit = approved_commit(&snapshot, "actor-review");
+
+    assert_eq!(
+        store
+            .commit_review_for_actor("user-owner", commit.clone())
+            .await
+            .unwrap(),
+        CommitOutcome::Committed
+    );
+    assert!(
+        store
+            .review_receipt_for_actor("user-owner", RUN_ID, "actor-review")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(matches!(
+        store
+            .review_receipt_for_actor("foreign-user", RUN_ID, "actor-review")
+            .await,
+        Err(StorageError::RunNotFound(_))
+    ));
+
+    set_test_user_status(database.path(), "user-owner", "disabled");
+    assert!(matches!(
+        store.commit_review_for_actor("user-owner", commit).await,
+        Err(StorageError::RunNotFound(_))
+    ));
+    assert_eq!(store.load_run(RUN_ID).await.unwrap().events.len(), 7);
+}
+
+#[tokio::test]
+async fn reply_claim_rechecks_actor_and_interrupts_without_provider_execution() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    store
+        .start_turn_and_enqueue_reply_for_actor(
+            "user-owner",
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-revoked-reply".into(),
+                user_message: "Do not send this after authorization changes".into(),
+                expected_sequence: 1,
+            },
+            "start-revoked-reply",
+            reply_job_spec("reply-revoked", "turn-revoked-reply"),
+        )
+        .await
+        .unwrap();
+    set_test_user_status(database.path(), "user-owner", "disabled");
+
+    let ReplyClaimOutcome::Rejected(completion) = store.claim_next_reply().await.unwrap() else {
+        panic!("a disabled actor must be rejected before provider execution");
+    };
+    assert_eq!(completion.job.status, ReplyJobStatus::Failed);
+    assert_eq!(completion.job.attempt, 1);
+    assert_eq!(completion.session.status, SessionStatus::NeedsAttention);
+    assert_eq!(completion.turn.status, SessionTurnStatus::Interrupted);
+    assert_eq!(completion.events.len(), 1);
+    assert!(matches!(
+        completion.events[0].data,
+        SessionEventData::TurnInterrupted { .. }
+    ));
+    assert_eq!(
+        store.claim_next_reply().await.unwrap(),
+        ReplyClaimOutcome::NotAvailable
+    );
+}
+
+#[tokio::test]
+async fn dispatch_claim_rechecks_owner_and_records_not_dispatched_evidence() {
+    let database = TestDatabase::new();
+    let store = seeded_file_store(database.path()).await;
+    bootstrap_test_owner(&store).await;
+    let (snapshot, _) = seed_fixture();
+    let review = approved_dispatch_commit(&snapshot, "revoked-dispatch");
+    store
+        .commit_review_for_actor("user-owner", review.clone())
+        .await
+        .unwrap();
+    set_test_user_role(database.path(), "user-owner", "member");
+
+    let ClaimOutcome::Rejected(rejection) = store
+        .claim_next_dispatch(start_commit(&review.snapshot))
+        .await
+        .unwrap()
+    else {
+        panic!("an approving actor demoted to member must never reach a connector");
+    };
+    assert_eq!(rejection.job.status, DispatchStatus::Rejected);
+    assert_eq!(rejection.job.attempt, 0);
+    assert_eq!(rejection.job.start_event_sequence, None);
+    assert_eq!(rejection.job.result_event_sequence, Some(8));
+    assert_eq!(
+        rejection.job.authorization_error_json.as_ref().unwrap()["reason"],
+        "approving_actor_role_changed"
+    );
+    assert_eq!(rejection.event.metadata["executor_invoked"], false);
+    assert!(matches!(
+        rejection.event.data.as_ref(),
+        Some(RunEventData::ToolResult {
+            outcome: ToolOutcome::NotDispatched {
+                reason: NotDispatchedReason::AuthorizationRevoked,
+                ..
+            },
+            status: ToolCallStatus::NotDispatched,
+            ..
+        })
+    ));
+    let stored = store.load_run(RUN_ID).await.unwrap();
+    assert_eq!(stored.snapshot.run.status, RunStatus::NeedsAttention);
+    assert_eq!(stored.snapshot.run.sequence, 8);
+    assert_eq!(stored.events.last(), Some(&rejection.event));
+    assert!(store.started_dispatches().await.unwrap().is_empty());
+    assert_eq!(
+        store
+            .claim_next_dispatch(start_commit(&review.snapshot))
+            .await
+            .unwrap(),
+        ClaimOutcome::NotAvailable
+    );
+    assert!(matches!(
+        store.readiness().await,
+        Err(StorageError::CorruptData(message))
+            if message.contains("exactly one owner")
     ));
 }
 
@@ -1331,6 +1692,9 @@ async fn concurrent_reply_claims_execute_one_job_at_most_once() {
             ReplyClaimOutcome::Claimed(job) => {
                 claimed += 1;
                 assert_eq!(job.id, "reply-concurrent");
+            }
+            ReplyClaimOutcome::Rejected(_) => {
+                panic!("the active session owner must remain authorized")
             }
             ReplyClaimOutcome::NotAvailable => unavailable += 1,
         }
@@ -1634,6 +1998,7 @@ async fn session_ledger_turns_and_run_ownership_are_append_only() {
 #[tokio::test]
 async fn approval_projection_receipt_and_dispatch_enqueue_commit_atomically() {
     let store = seeded_memory_store().await;
+    bootstrap_test_owner(&store).await;
     let (snapshot, _) = seed_fixture();
     let commit = approved_dispatch_commit(&snapshot, "approve-enqueue");
 
@@ -1665,6 +2030,7 @@ async fn approval_projection_receipt_and_dispatch_enqueue_commit_atomically() {
 async fn database_rejects_dispatch_input_mutation_deletion_and_state_skips() {
     let database = TestDatabase::new();
     let store = seeded_file_store(database.path()).await;
+    bootstrap_test_owner(&store).await;
     let (snapshot, _) = seed_fixture();
     store
         .commit_review(approved_dispatch_commit(&snapshot, "immutable-job"))
@@ -1710,6 +2076,7 @@ async fn database_rejects_dispatch_input_mutation_deletion_and_state_skips() {
 #[tokio::test]
 async fn claim_is_queue_ordered_and_atomically_appends_the_start_event() {
     let store = seeded_memory_store().await;
+    bootstrap_test_owner(&store).await;
     let (snapshot, _) = seed_fixture();
     let review = approved_dispatch_commit(&snapshot, "claim-review");
     store.commit_review(review.clone()).await.unwrap();
@@ -1738,6 +2105,7 @@ async fn claim_is_queue_ordered_and_atomically_appends_the_start_event() {
 #[tokio::test]
 async fn claim_failure_rolls_back_job_projection_and_v2_event() {
     let store = seeded_memory_store().await;
+    bootstrap_test_owner(&store).await;
     let (snapshot, _) = seed_fixture();
     let review = approved_dispatch_commit(&snapshot, "claim-rollback-review");
     store.commit_review(review.clone()).await.unwrap();
@@ -1763,6 +2131,7 @@ async fn claim_failure_rolls_back_job_projection_and_v2_event() {
 #[tokio::test]
 async fn complete_is_atomic_and_persists_the_typed_result() {
     let store = seeded_memory_store().await;
+    bootstrap_test_owner(&store).await;
     let (snapshot, _) = seed_fixture();
     let review = approved_dispatch_commit(&snapshot, "complete-review");
     store.commit_review(review.clone()).await.unwrap();
@@ -1799,6 +2168,7 @@ async fn queued_job_survives_restart_and_remains_dispatchable() {
     {
         let store = SqliteStore::open(database.path()).await.unwrap();
         store.seed_if_empty(snapshot, events).await.unwrap();
+        bootstrap_test_owner(&store).await;
         store.commit_review(review.clone()).await.unwrap();
     }
 
@@ -1824,6 +2194,7 @@ async fn started_job_restart_recovery_records_outcome_unknown_without_requeue() 
     {
         let store = SqliteStore::open(database.path()).await.unwrap();
         store.seed_if_empty(snapshot, events).await.unwrap();
+        bootstrap_test_owner(&store).await;
         store.commit_review(review).await.unwrap();
         store.claim_next_dispatch(start.clone()).await.unwrap();
     }
@@ -1917,6 +2288,46 @@ async fn bootstrap_test_owner(store: &SqliteStore) {
             session_expires_at: expiry,
         })
         .await
+        .unwrap();
+}
+
+fn set_test_user_status(path: &Path, user_id: &str, status: &str) {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .execute(
+            "UPDATE users SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            params![status, "2026-08-27T00:00:00.000Z", user_id],
+        )
+        .unwrap();
+}
+
+fn set_test_user_role(path: &Path, user_id: &str, role: &str) {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .execute(
+            "UPDATE users SET role = ?1, updated_at = ?2 WHERE id = ?3",
+            params![role, "2026-08-27T00:00:00.000Z", user_id],
+        )
+        .unwrap();
+}
+
+fn insert_test_member(path: &Path, user_id: &str, username: &str) {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO users(
+                   id, username, role, status, password_hash, created_at, updated_at
+               ) VALUES (?1, ?2, 'member', 'active', ?3, ?4, ?4)"#,
+            params![
+                user_id,
+                username,
+                "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA",
+                "2026-08-27T00:00:00.000Z",
+            ],
+        )
         .unwrap();
 }
 
@@ -2128,6 +2539,7 @@ fn approved_dispatch_commit(seed: &RunSnapshot, key: &str) -> ReviewCommit {
     let dispatch = DispatchJobSpec {
         call_id: "call-local-001".into(),
         approval_id: "APR-901".into(),
+        approving_actor_user_id: "user-owner".into(),
         tool_name: "local.echo".into(),
         tool_version: "1.0.0".into(),
         effect: ToolEffect::LocalWrite,
@@ -2374,6 +2786,57 @@ fn create_v3_database_with_identity(path: &Path) {
                ) VALUES (1, 'production-guarded', 'production', ?1,
                          'production-guarded', 'production-guarded/v1', ?2)"#,
             params![RUN_ID, "2026-08-26T00:00:03.000Z"],
+        )
+        .unwrap();
+}
+
+fn create_v7_database_with_legacy_dispatch(path: &Path) {
+    create_v1_database(path);
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .unwrap();
+    for (version, migration) in [
+        (2_i64, include_str!("../migrations/0002_tool_execution.sql")),
+        (
+            3_i64,
+            include_str!("../migrations/0003_runtime_identity.sql"),
+        ),
+        (4_i64, include_str!("../migrations/0004_sessions.sql")),
+        (5_i64, include_str!("../migrations/0005_accounts.sql")),
+        (6_i64, include_str!("../migrations/0006_actor_receipts.sql")),
+        (7_i64, include_str!("../migrations/0007_reply_jobs.sql")),
+    ] {
+        connection.execute_batch(migration).unwrap();
+        connection
+            .execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+                params![version, format!("2026-08-26T00:00:0{version}.000Z")],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            "UPDATE runs SET status = 'active', execution_status = 'queued' WHERE id = ?1",
+            [RUN_ID],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO dispatch_jobs(
+                   call_id, run_id, approval_id, approval_event_sequence,
+                   tool_name, tool_version, effect, args_json, args_digest,
+                   policy_id, policy_revision, sandbox_profile, status, attempt,
+                   result_json, queued_at, started_at, finished_at,
+                   start_event_sequence, result_event_sequence
+               ) VALUES (
+                   'call-v7-legacy', ?1, 'APR-V7', 6,
+                   'local.echo', '1.0.0', 'local_write', '{}',
+                   'sha256:args-v7', 'local-alpha', 'rev-v7', 'workspace_write',
+                   'queued', 0, NULL, '2026-08-26T01:20:00.000Z',
+                   NULL, NULL, NULL, NULL
+               )"#,
+            [RUN_ID],
         )
         .unwrap();
 }

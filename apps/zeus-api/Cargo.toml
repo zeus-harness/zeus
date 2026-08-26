@@ -25,4 +25,5 @@ zeroize.workspace = true
 
 [dev-dependencies]
 http-body-util.workspace = true
+rusqlite.workspace = true
 tower.workspace = true
