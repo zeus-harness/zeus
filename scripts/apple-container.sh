@@ -39,7 +39,20 @@ MAX_AUTH_SESSIONS_PER_USER="${ZEUS_MAX_AUTH_SESSIONS_PER_USER-32}"
 MAX_AUTH_SESSIONS_GLOBAL="${ZEUS_MAX_AUTH_SESSIONS_GLOBAL-256}"
 MAX_SESSION_EVENT_SLOTS_PER_SESSION="${ZEUS_MAX_SESSION_EVENT_SLOTS_PER_SESSION-10000}"
 MAX_RUN_EVENT_SLOTS_PER_RUN="${ZEUS_MAX_RUN_EVENT_SLOTS_PER_RUN-50000}"
+MAX_SESSION_EVENT_PAYLOAD_BYTES_PER_SESSION="${ZEUS_MAX_SESSION_EVENT_PAYLOAD_BYTES_PER_SESSION-67108864}"
+MAX_RUN_EVENT_PAYLOAD_BYTES_PER_RUN="${ZEUS_MAX_RUN_EVENT_PAYLOAD_BYTES_PER_RUN-268435456}"
+MAX_EVENT_PAYLOAD_BYTES_GLOBAL="${ZEUS_MAX_EVENT_PAYLOAD_BYTES_GLOBAL-1073741824}"
 MAX_BOOTSTRAP_AUDIT_ROWS="${ZEUS_MAX_BOOTSTRAP_AUDIT_ROWS-1024}"
+SQLITE_MAX_MAIN_BYTES="${ZEUS_SQLITE_MAX_MAIN_BYTES-4294967296}"
+SQLITE_WAL_TARGET_BYTES="${ZEUS_SQLITE_WAL_TARGET_BYTES-16777216}"
+SQLITE_MIN_FREE_BYTES="${ZEUS_SQLITE_MIN_FREE_BYTES-268435456}"
+SQLITE_ADMISSION_RESERVE_BYTES="${ZEUS_SQLITE_ADMISSION_RESERVE_BYTES-536870912}"
+SQLITE_MAX_CONCURRENT_OPERATIONS="${ZEUS_SQLITE_MAX_CONCURRENT_OPERATIONS-8}"
+SQLITE_RESERVED_PROGRESS_OPERATIONS="${ZEUS_SQLITE_RESERVED_PROGRESS_OPERATIONS-1}"
+SQLITE_OPERATION_ACQUIRE_TIMEOUT_MS="${ZEUS_SQLITE_OPERATION_ACQUIRE_TIMEOUT_MS-1000}"
+
+API_CPUS="${ZEUS_CONTAINER_API_CPUS:-2}"
+API_MEMORY="${ZEUS_CONTAINER_API_MEMORY:-1G}"
 
 MANAGED_LABEL_KEY='dev.zeus-harness.managed'
 PROJECT_LABEL_KEY='dev.zeus-harness.project'
@@ -251,14 +264,71 @@ build_dns() {
 	fi
 }
 
+decimal_lte() {
+	local value="$1"
+	local ceiling="$2"
+	local index
+	local value_digit
+	local ceiling_digit
+
+	if ((${#value} < ${#ceiling})); then
+		return 0
+	fi
+	if ((${#value} > ${#ceiling})); then
+		return 1
+	fi
+	for ((index = 0; index < ${#value}; index += 1)); do
+		value_digit="${value:index:1}"
+		ceiling_digit="${ceiling:index:1}"
+		if ((10#${value_digit} < 10#${ceiling_digit})); then
+			return 0
+		fi
+		if ((10#${value_digit} > 10#${ceiling_digit})); then
+			return 1
+		fi
+	done
+	return 0
+}
+
 memory_bytes() {
 	local value="$1"
+	local amount
+	local multiplier
+	local maximum_amount
 	case "${value}" in
-		*[Gg]) printf '%s\n' "$(( ${value%[Gg]} * 1024 * 1024 * 1024 ))" ;;
-		*[Mm]) printf '%s\n' "$(( ${value%[Mm]} * 1024 * 1024 ))" ;;
-		*[Kk]) printf '%s\n' "$(( ${value%[Kk]} * 1024 ))" ;;
-		*) printf '%s\n' "${value}" ;;
+		*[Gg]) amount="${value%[Gg]}"; multiplier=$((1024 * 1024 * 1024)) ;;
+		*[Mm]) amount="${value%[Mm]}"; multiplier=$((1024 * 1024)) ;;
+		*[Kk]) amount="${value%[Kk]}"; multiplier=1024 ;;
+		*) amount="${value}"; multiplier=1 ;;
 	esac
+	[[ "${amount}" =~ ^[1-9][0-9]*$ ]] \
+		|| die "invalid positive memory limit: ${value}"
+	maximum_amount="$((9223372036854775807 / multiplier))"
+	decimal_lte "${amount}" "${maximum_amount}" \
+		|| die "memory limit overflows byte representation: ${value}"
+	printf '%s\n' "$((amount * multiplier))"
+}
+
+verify_container_resources() {
+	local name="$1"
+	local requested_cpus="$2"
+	local requested_memory="$3"
+	local requested_memory_bytes
+	[[ "${requested_cpus}" =~ ^[1-9][0-9]*$ ]] \
+		|| die "invalid positive Apple container CPU limit: ${requested_cpus}"
+	requested_memory_bytes="$(memory_bytes "${requested_memory}")"
+	require_owned_container "${name}"
+	container inspect "${name}" | jq -e \
+		--argjson cpus "${requested_cpus}" \
+		--argjson memory "${requested_memory_bytes}" '
+		.[0].configuration.resources.cpus == $cpus
+		and .[0].configuration.resources.memoryInBytes == $memory
+	' >/dev/null || {
+		container inspect "${name}" | jq \
+			'.[0].configuration.resources | {cpus, memoryInBytes}' >&2
+		die "${name} was created without the requested ${requested_cpus} CPU/${requested_memory} limits"
+	}
+	log "verified ${name} resource configuration (${requested_cpus} CPU/${requested_memory})"
 }
 
 builder_matches() {
@@ -430,6 +500,11 @@ initialize_volume() {
 }
 
 start_api() {
+	# Validate before creating anything, then verify the effective configuration
+	# from Apple container's own inspect result immediately after creation.
+	[[ "${API_CPUS}" =~ ^[1-9][0-9]*$ ]] \
+		|| die "invalid positive Apple container CPU limit: ${API_CPUS}"
+	memory_bytes "${API_MEMORY}" >/dev/null
 	log "starting ${API_CONTAINER} on the private ${NETWORK} network"
 	container run \
 		--detach \
@@ -438,8 +513,8 @@ start_api() {
 		--label "${PROJECT_LABEL_KEY}=${PROJECT}" \
 		--network "${NETWORK}" \
 		--init \
-		--cpus 2 \
-		--memory 1G \
+		--cpus "${API_CPUS}" \
+		--memory "${API_MEMORY}" \
 		--volume "${DATA_VOLUME}:/var/lib/zeus" \
 		--env ZEUS_LISTEN_ADDR=0.0.0.0:8081 \
 		--env ZEUS_DATABASE_PATH=/var/lib/zeus/zeus.db \
@@ -461,8 +536,19 @@ start_api() {
 		--env "ZEUS_MAX_AUTH_SESSIONS_GLOBAL=${MAX_AUTH_SESSIONS_GLOBAL}" \
 		--env "ZEUS_MAX_SESSION_EVENT_SLOTS_PER_SESSION=${MAX_SESSION_EVENT_SLOTS_PER_SESSION}" \
 		--env "ZEUS_MAX_RUN_EVENT_SLOTS_PER_RUN=${MAX_RUN_EVENT_SLOTS_PER_RUN}" \
+		--env "ZEUS_MAX_SESSION_EVENT_PAYLOAD_BYTES_PER_SESSION=${MAX_SESSION_EVENT_PAYLOAD_BYTES_PER_SESSION}" \
+		--env "ZEUS_MAX_RUN_EVENT_PAYLOAD_BYTES_PER_RUN=${MAX_RUN_EVENT_PAYLOAD_BYTES_PER_RUN}" \
+		--env "ZEUS_MAX_EVENT_PAYLOAD_BYTES_GLOBAL=${MAX_EVENT_PAYLOAD_BYTES_GLOBAL}" \
 		--env "ZEUS_MAX_BOOTSTRAP_AUDIT_ROWS=${MAX_BOOTSTRAP_AUDIT_ROWS}" \
+		--env "ZEUS_SQLITE_MAX_MAIN_BYTES=${SQLITE_MAX_MAIN_BYTES}" \
+		--env "ZEUS_SQLITE_WAL_TARGET_BYTES=${SQLITE_WAL_TARGET_BYTES}" \
+		--env "ZEUS_SQLITE_MIN_FREE_BYTES=${SQLITE_MIN_FREE_BYTES}" \
+		--env "ZEUS_SQLITE_ADMISSION_RESERVE_BYTES=${SQLITE_ADMISSION_RESERVE_BYTES}" \
+		--env "ZEUS_SQLITE_MAX_CONCURRENT_OPERATIONS=${SQLITE_MAX_CONCURRENT_OPERATIONS}" \
+		--env "ZEUS_SQLITE_RESERVED_PROGRESS_OPERATIONS=${SQLITE_RESERVED_PROGRESS_OPERATIONS}" \
+		--env "ZEUS_SQLITE_OPERATION_ACQUIRE_TIMEOUT_MS=${SQLITE_OPERATION_ACQUIRE_TIMEOUT_MS}" \
 		"${API_IMAGE}" >/dev/null
+	verify_container_resources "${API_CONTAINER}" "${API_CPUS}" "${API_MEMORY}"
 	local direct_url
 	direct_url="$(container_direct_url "${API_CONTAINER}" 8081)" \
 		|| die "could not resolve ${API_CONTAINER} IPv4 address"
@@ -621,6 +707,84 @@ status() {
 	fi
 }
 
+resource_evidence() {
+	require_command container
+	require_command jq
+	container system status >/dev/null
+	container_exists "${API_CONTAINER}" \
+		|| die "container is absent: ${API_CONTAINER}"
+	require_owned_container "${API_CONTAINER}"
+
+	printf '%s\n' 'Apple container inspect resource configuration:'
+	container inspect "${API_CONTAINER}" | jq --arg name "${API_CONTAINER}" '
+		.[0] | {
+			container: $name,
+			state: (.status.state // "unknown"),
+			resources: {
+				cpus: .configuration.resources.cpus,
+				memoryInBytes: .configuration.resources.memoryInBytes
+			}
+		}
+	'
+
+	if [[ "$(container_state "${API_CONTAINER}")" != 'running' ]]; then
+		log 'API container is not running; internal cgroup v2 and /proc evidence is unavailable'
+		return
+	fi
+
+	printf '%s\n' \
+		'Apple container 1.0 has no per-container PID-limit CLI option; pids.max below is observed evidence, not a configured guarantee.'
+	container exec "${API_CONTAINER}" /bin/sh -eu -c '
+		print_file() {
+			path="$1"
+			printf "%s\n" "--- $path"
+			if [ -r "$path" ]; then
+				cat "$path"
+			else
+				printf "%s\n" "<unavailable>"
+			fi
+		}
+
+		print_file /proc/self/cgroup
+		print_file /sys/fs/cgroup/cgroup.controllers
+		print_file /sys/fs/cgroup/cpu.max
+		print_file /sys/fs/cgroup/cpu.stat
+		print_file /sys/fs/cgroup/memory.max
+		print_file /sys/fs/cgroup/memory.high
+		print_file /sys/fs/cgroup/memory.current
+		print_file /sys/fs/cgroup/memory.peak
+		print_file /sys/fs/cgroup/memory.events
+		print_file /sys/fs/cgroup/memory.events.local
+		print_file /sys/fs/cgroup/memory.swap.current
+		print_file /sys/fs/cgroup/memory.swap.max
+		print_file /sys/fs/cgroup/pids.max
+		print_file /sys/fs/cgroup/pids.current
+		print_file /sys/fs/cgroup/pids.events
+		printf "%s\n" "--- /proc/meminfo (selected)"
+		awk "/^(MemTotal|MemAvailable|SwapTotal|SwapFree):/" /proc/meminfo
+		printf "%s\n" "--- /proc/1/status (container init, selected)"
+		awk "/^(Name|Pid|PPid|Threads|VmPeak|VmRSS|VmHWM|Cpus_allowed_list):/" /proc/1/status
+
+		zeus_pid=""
+		for executable in /proc/[0-9]*/exe; do
+			[ -e "$executable" ] || continue
+			if [ "$(readlink "$executable" 2>/dev/null || true)" = /usr/local/bin/zeus ]; then
+				zeus_pid="${executable#/proc/}"
+				zeus_pid="${zeus_pid%/exe}"
+				break
+			fi
+		done
+		if [ -n "$zeus_pid" ]; then
+			printf "%s\n" "--- /proc/$zeus_pid/status (Zeus, selected)"
+			awk "/^(Name|Pid|PPid|Threads|VmPeak|VmRSS|VmHWM|Cpus_allowed_list):/" "/proc/$zeus_pid/status"
+			print_file "/proc/$zeus_pid/smaps_rollup"
+		else
+			printf "%s\n" "--- Zeus process evidence"
+			printf "%s\n" "<zeus process unavailable>"
+		fi
+	'
+}
+
 show_logs() {
 	preflight
 	local service="${1:-api}"
@@ -712,6 +876,7 @@ Commands:
   up               Start API, Web and gateway; retain SQLite in a named volume.
   down             Stop/delete Zeus containers and network; retain the volume.
   status           Show Zeus container and volume state.
+  resources        Read API inspect, cgroup v2 and /proc resource evidence.
   logs [service]   Follow api, web or gateway logs (default: api).
   verify           Check Web, API, gateway and anonymous auth protection.
   restart-verify   Recreate the stack and prove owner setup state persists.
@@ -720,6 +885,10 @@ Commands:
 Useful overrides:
   ZEUS_CONTAINER_PROJECT, ZEUS_CONTAINER_DNS, ZEUS_CONTAINER_PLATFORM,
   ZEUS_CONTAINER_HTTP_PORT.
+  ZEUS_CONTAINER_API_CPUS and ZEUS_CONTAINER_API_MEMORY default to 2 CPU/1G;
+  the helper verifies their effective Apple VM configuration after creation.
+  Apple container 1.0 has no per-container PID-limit CLI option; `resources`
+  reports the observed pids.max alongside CPU/memory evidence.
   ZEUS_CONTAINER_BUILD_CONTEXT_ROOT defaults to the physical repository path
   to avoid Apple container's temporary-path empty-transfer bug.
   Set ZEUS_CONTAINER_RECONFIGURE_BUILDER=yes to opt into changing Apple's
@@ -735,6 +904,7 @@ case "${command}" in
 	up) up "$@" ;;
 	down) down "$@" ;;
 	status) status "$@" ;;
+	resources) resource_evidence "$@" ;;
 	logs) show_logs "$@" ;;
 	verify) verify "$@" ;;
 	restart-verify) restart_verify "$@" ;;

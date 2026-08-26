@@ -84,6 +84,11 @@ services:
     profiles: [full, debug]
     init: true
     restart: unless-stopped
+    # This is the cargo-watch development service, so the limits include Rust
+    # compilation headroom. They are not a production runtime benchmark.
+    cpus: ${ZEUS_COMPOSE_API_CPUS:-4.0}
+    mem_limit: ${ZEUS_COMPOSE_API_MEMORY:-4g}
+    pids_limit: ${ZEUS_COMPOSE_API_PIDS_LIMIT:-512}
     environment:
       ZEUS_LISTEN_ADDR: ${ZEUS_LISTEN_ADDR:-0.0.0.0:8081}
       ZEUS_DATABASE_PATH: ${ZEUS_DATABASE_PATH:-/var/lib/zeus/zeus.db}
@@ -113,6 +118,9 @@ services:
       ZEUS_SQLITE_WAL_TARGET_BYTES: ${ZEUS_SQLITE_WAL_TARGET_BYTES-16777216}
       ZEUS_SQLITE_MIN_FREE_BYTES: ${ZEUS_SQLITE_MIN_FREE_BYTES-268435456}
       ZEUS_SQLITE_ADMISSION_RESERVE_BYTES: ${ZEUS_SQLITE_ADMISSION_RESERVE_BYTES-536870912}
+      ZEUS_SQLITE_MAX_CONCURRENT_OPERATIONS: ${ZEUS_SQLITE_MAX_CONCURRENT_OPERATIONS-8}
+      ZEUS_SQLITE_RESERVED_PROGRESS_OPERATIONS: ${ZEUS_SQLITE_RESERVED_PROGRESS_OPERATIONS-1}
+      ZEUS_SQLITE_OPERATION_ACQUIRE_TIMEOUT_MS: ${ZEUS_SQLITE_OPERATION_ACQUIRE_TIMEOUT_MS-1000}
       RESTATE_INGRESS_URL: ${RESTATE_INGRESS_URL:-http://restate:8080}
       RESTATE_ADMIN_URL: ${RESTATE_ADMIN_URL:-http://restate:9070}
       S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
@@ -160,6 +168,9 @@ services:
     profiles: [full, debug]
     init: true
     restart: unless-stopped
+    cpus: ${ZEUS_COMPOSE_WEB_CPUS:-2.0}
+    mem_limit: ${ZEUS_COMPOSE_WEB_MEMORY:-2g}
+    pids_limit: ${ZEUS_COMPOSE_WEB_PIDS_LIMIT:-256}
     environment:
       HOST: 0.0.0.0
       PORT: 3000
@@ -203,6 +214,9 @@ services:
     image: caddy:${CADDY_VERSION:-2.10.2}-alpine
     profiles: [full, debug]
     restart: unless-stopped
+    cpus: ${ZEUS_COMPOSE_GATEWAY_CPUS:-0.5}
+    mem_limit: ${ZEUS_COMPOSE_GATEWAY_MEMORY:-256m}
+    pids_limit: ${ZEUS_COMPOSE_GATEWAY_PIDS_LIMIT:-64}
     ports:
       - "127.0.0.1:${ZEUS_HTTP_PORT:-8088}:8080"
     volumes:

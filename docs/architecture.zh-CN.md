@@ -28,7 +28,7 @@ Client / SvelteKit Web
 - `tools`：工具描述、注册表、参数验证和 object-safe executor 边界。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
 - `storage`：schema v11 migration、用户/偏好、独立 Session/Run ledger、typed event lookup、
-  actor-scoped 回执、durable reply/dispatch queue，以及事务级 logical capacity/reservation。
+  actor-scoped 回执、durable reply/dispatch queue，以及 logical/physical/operation capacity。
 - `runtime`：Session 命令编排、reply/Run worker、提交后 SSE 提示和启动恢复。
 - `zeus-api`：进程组合、owner 认证、CSRF、provider 配置、REST/SSE 和 readiness。
 
@@ -177,8 +177,8 @@ exactly-once 语义。
   review 和 receipt 已全部 actor-scoped，并有 Alice/Bob 隔离测试；字段、HTTP/SSE 连接和
   event page 边界、内部 point/batch read、有界 list/detail，以及 SQLite 行数、active queue、
   event-slot、事件载荷逻辑字节配额和 DB/WAL/disk headroom 门禁已落地。但 member 仍须等待
-  tenant/account membership scope、bootstrap audit retention 与显式 operation concurrency/OOM
-  策略，不能仅因数据面已隔离就开放。
+  tenant/account membership scope、bootstrap audit retention 与相应授权/审计语义，不能仅因
+  数据面已隔离就开放。
 - auth JSON 明确限制为 8 KiB、command JSON 为 512 KiB；新建 Session/turn ID、title、
   user/assistant message、review note 与严格幂等键分别按 UTF-8 bytes 设置硬上限。typed
   reply response 为 512 KiB，compact tool output 与 dispatch arguments JSON 为 64 KiB，
@@ -247,6 +247,26 @@ exactly-once 语义。
   `Admission` 同时检查主库/WAL/free-space watermark，`ReservedProgress`/`Finalization` 则允许
   已接受工作在主库绝对上限与 `min free` 内排空。业务拒绝为脱敏 `507 + no-store`，
   `/health/ready` 对 watermark 不满足返回脱敏 `503 + no-store`。
+- SQLite Operation Capacity Slice 把所有 blocking SQLite work 放在总量 semaphore 下：默认
+  `max=8`、`reserved progress=1`、acquire timeout 1,000 ms，hard ceiling 分别为 32、8、
+  5,000 ms。普通 lane 因 reserve 只有 7 个槽位，先用 `try_acquire` fail fast，避免在 total gate
+  前形成无界 waiter；progress lane 可使用全部 total 槽位，但其等待也受 timeout 限制。total 与
+  memory gate 共用单一 deadline。memory backend 在进入 blocking pool 前另有单连接 async gate；
+  普通 waiter 留在 FIFO 之外，已有 progress waiter 优先取得下一连接。
+- operation permit 被 move 进 `spawn_blocking`，覆盖 file connection open/drop、busy wait 和完整
+  transaction；即使 caller future abort，仍在运行的 blocking closure 也不会提前归还 permit。
+  Provider/connector 外部 `await` 不持有 permit。reply/dispatch claim、worker point read、
+  completion、recovery 与显式 manual-flush finalization 走 progress lane，普通 reads/admission 不能挤占
+  reserve。业务饱和稳定返回
+  `503 sqlite_operation_capacity_exceeded + Retry-After: 1 + no-store`；`/health/live` 完全不访问
+  SQLite，`/health/ready` 进入 operation gate 失败时返回脱敏 `503`。
+- 内部 reply/dispatch worker 对 operation capacity 使用固定 25 ms 延迟继续重试，并保留已经
+  产生的 provider/connector outcome 直到幂等 completion 成功。wake state 把任意重复 kick
+  合并为一个 running worker 与至多一个 pending cycle；非 capacity 错误只在已有 pending cycle
+  时延迟后再 drain，避免在 worker mutex 后堆积或忙转 Tokio task。
+- provider 与 connector future 在独立 Tokio task 内执行；panic 不会把 wake state 永久留在
+  running，而是在 durable started checkpoint 之后按 at-most-once 语义结算为
+  `outcome_unknown`，不重试外部操作。
 - OpenAI-compatible reply endpoint 默认只接受 HTTPS 或 loopback HTTP，禁止 redirect，限制连接/
   总超时和响应体；queued job 绑定 endpoint/model/limits 的非秘密配置 digest，API key 不入 ledger。
 - provider assistant 或 executor output/diagnostic 超过终端字段边界时，runtime 使用固定、脱敏、
@@ -262,6 +282,8 @@ exactly-once 语义。
 
 - Docker Compose 是开发拓扑：`full` 使用 `zeus_data:/var/lib/zeus`，`infra`、`postgres`、
   `debug` 和 `sandbox` 是独立 profile。Compose `.env` 和 project name 只作用于这条路径。
+  API、Web、gateway 已分别静态接线可配置的 CPU/memory/PID ceiling；`full` 的 API 是
+  `cargo-watch` 开发服务，默认 4 CPU/4 GiB/512 PID 包含编译余量，不是 runtime/OOM 基准。
 - Apple `container` helper 只运行 production-guarded API、Web 和 gateway，不启动 Compose
   基础设施或 local marker executor。默认 project 是 `zeus-alpha`，资源名为
   `zeus-alpha-{api,web,gateway,net,data}`。只有 gateway 尝试发布 loopback `18088`；API 和
@@ -271,6 +293,10 @@ exactly-once 语义。
   动态 gateway container IP，必要时回退 loopback；所有请求强制绕过代理并设置连接/响应超时。
   `status` 同时报告 direct 和 published URL，当前运行时的 port-forward reset 不会被误报成
   应用健康。
+- Apple release API VM 默认 2 CPU/1 GiB，可通过 `ZEUS_CONTAINER_API_CPUS`/
+  `ZEUS_CONTAINER_API_MEMORY` 调整并由 helper 在创建后核对。`resources` 子命令只读采集
+  `container inspect`、cgroup v2 CPU/memory/swap/PID 与 `/proc` 证据。Apple `container` 1.0
+  没有 per-container PID-limit 参数；观测到的 `pids.max` 不是配置保证。
 - Apple build 使用仓库物理路径下的过滤临时 context，规避 `/tmp` 与 `/private/tmp` 前缀不一致
   导致的空 context；完成或收到 INT/TERM 都清理 context，并保留正确退出状态。
 - Apple helper 给 container、network 和 volume 写入
@@ -321,19 +347,22 @@ exactly-once 语义。
   `404`。审批、派发、reply completion、attachment 和启动恢复已改为 typed point query 或
   固定 64 行 batch；Session list/detail 与 Run detail/overview 也已改为 indexed bounded read
   model。SQLite row/active/event-slot、逻辑 event-payload byte quota 与 physical capacity gate
-  已落地；对外或多租户部署前仍必须完成 tenant/account membership scope、完整 audit retention
-  与显式 operation concurrency/OOM 策略。
+  和 operation capacity gate 已落地；对外或多租户部署前仍必须完成 tenant/account membership
+  scope 与完整 audit retention。完整低内存/OOM 和当前镜像容器验收仍是 deployment gate。
 - Web 保持紧凑时间线、一个内联审批卡和一个 composer；支持真实 New Session、活动 Session
   刷新恢复、owner 设置/退出和 system/light/dark。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化结果是 251 个 Rust 测试（storage 106、API library 42、API main/config 4）和
-  25 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化结果是 271 个 Rust 测试（storage 121、runtime 28、API library 44、API
+  main/config 4）和 25 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
-Apple `container` 的 Alpha 基线验收属于提交 `9a89706`。当前 Physical Slice 之前的已推送
-主机基线为 `fd38d60`；当前 helper shell 语法通过，现有 labeled API/Web/gateway 均为 running、
+Apple `container` 的 Alpha 基线验收属于提交 `9a89706`。本阶段前的已推送主机基线为
+`8117ed6`（SQLite Physical Capacity）；当前 helper shell 语法通过，现有 labeled API/Web/gateway 均为 running、
 volume 存在且 Web/API readiness 通过，但旧镜像的 `/api/v1/auth/status` 返回 `404`。包含
-Actor Boundary/API Resource Envelope/Bounded Event Feed/Point-query Durable Context/Bounded Read Models/SQLite Capacity Slice 2/SQLite Physical Capacity Slice 的新镜像构建仍受 BuildKit 内
+Actor Boundary/API Resource Envelope/Bounded Event Feed/Point-query Durable Context/Bounded Read Models/SQLite Capacity Slice 2/SQLite Physical Capacity Slice 的上一轮新镜像构建受 BuildKit 内
 crates.io 索引更新阻塞，并在替换运行容器前安全中止；因此不声明当前
-`up/verify/restart-verify` 已通过；operation concurrency/OOM 也仍未完成 current-image 验收。
+`up/verify/restart-verify` 已通过。旧空闲 Alpha API 的只读 `resources` 快照为 2 CPU/1 GiB、
+OOM counters 0、`pids.current=6`、`pids.max=max`；它不是当前镜像、压力或 OOM 验收，也不构成
+PID 上限保证。Operation Capacity 已通过主机确定性测试，但尚未进入 current-image Apple
+build/压力验收；Linux Docker OOM authoritative acceptance 也仍待完成。
 Docker Compose 当前只有静态配置检查；本机缺少 Docker CLI 时不声明 Compose build/up 已通过。

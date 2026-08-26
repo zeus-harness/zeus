@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::{SqlitePhysicalLimitsError, StorageLimitsError};
+use crate::{SqliteOperationLimitsError, SqlitePhysicalLimitsError, StorageLimitsError};
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -16,6 +16,8 @@ pub enum StorageError {
     InvalidLimits(#[from] StorageLimitsError),
     #[error("invalid SQLite physical limits: {0}")]
     InvalidPhysicalLimits(#[from] SqlitePhysicalLimitsError),
+    #[error("invalid SQLite operation limits: {0}")]
+    InvalidOperationLimits(#[from] SqliteOperationLimitsError),
     #[error("persistent SQLite database `{0}` is already owned by another Zeus instance")]
     DatabaseLocked(String),
     #[error("run `{0}` was not found")]
@@ -40,6 +42,8 @@ pub enum StorageError {
     StorageQuotaExceeded,
     #[error("SQLite physical storage cannot safely accept this operation")]
     PhysicalStorageExhausted,
+    #[error("SQLite operation capacity is exhausted")]
+    OperationCapacityExceeded,
     #[error("the durable reply queue is at capacity")]
     ReplyQueueCapacityExceeded,
     #[error("the durable dispatch queue is at capacity")]

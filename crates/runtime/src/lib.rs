@@ -7,8 +7,13 @@
 //! being retried.
 
 use std::{
+    future::Future,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering as AtomicOrdering},
+    },
+    time::Duration,
 };
 
 use authz::{PolicyBuildError, PolicyContext, PolicyEngine, PolicyRule};
@@ -30,9 +35,10 @@ use protocol::{
 pub use storage::{
     AuthPrincipal, AuthSessionCommit, BootstrapOwnerCommit, ReplyClaimOutcome, ReplyCompletion,
     ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus,
-    ReplyOutcomeUnknownCommit, ReplySuccessCommit, SessionSummaryPage, SqlitePhysicalLimits,
-    SqlitePhysicalLimitsError, StorageLimits, StorageLimitsError, StoredCredential,
-    StoredPreferences, StoredUser, StoredUserRole, StoredUserStatus,
+    ReplyOutcomeUnknownCommit, ReplySuccessCommit, SessionSummaryPage, SqliteOperationLimits,
+    SqliteOperationLimitsError, SqlitePhysicalLimits, SqlitePhysicalLimitsError, StorageLimits,
+    StorageLimitsError, StoredCredential, StoredPreferences, StoredUser, StoredUserRole,
+    StoredUserStatus,
 };
 use storage::{
     ClaimOutcome, CommitOutcome, DispatchCompleteCommit, DispatchContext, DispatchJob,
@@ -45,6 +51,106 @@ use tools::{ExecutorError, RegistryError, ToolRegistry, arguments_digest};
 
 const PRODUCTION_POLICY_ID: &str = "production-guarded";
 const LOCAL_POLICY_ID: &str = "local-development";
+const INTERNAL_PROGRESS_RETRY_DELAY: Duration = Duration::from_millis(25);
+const WORKER_IDLE: u8 = 0;
+const WORKER_RUNNING: u8 = 1;
+const WORKER_PENDING: u8 = 2;
+
+#[derive(Default)]
+struct WorkerWakeState {
+    state: AtomicU8,
+}
+
+impl WorkerWakeState {
+    fn request(&self) -> bool {
+        loop {
+            match self.state.load(AtomicOrdering::Acquire) {
+                WORKER_IDLE => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            WORKER_IDLE,
+                            WORKER_RUNNING,
+                            AtomicOrdering::AcqRel,
+                            AtomicOrdering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+                WORKER_RUNNING => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            WORKER_RUNNING,
+                            WORKER_PENDING,
+                            AtomicOrdering::AcqRel,
+                            AtomicOrdering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return false;
+                    }
+                }
+                WORKER_PENDING => return false,
+                _ => unreachable!("invalid worker wake state"),
+            }
+        }
+    }
+
+    fn complete_cycle(&self) -> bool {
+        loop {
+            match self.state.load(AtomicOrdering::Acquire) {
+                WORKER_RUNNING => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            WORKER_RUNNING,
+                            WORKER_IDLE,
+                            AtomicOrdering::AcqRel,
+                            AtomicOrdering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return false;
+                    }
+                }
+                WORKER_PENDING => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            WORKER_PENDING,
+                            WORKER_RUNNING,
+                            AtomicOrdering::AcqRel,
+                            AtomicOrdering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+                WORKER_IDLE => return false,
+                _ => unreachable!("invalid worker wake state"),
+            }
+        }
+    }
+}
+
+async fn retry_operation_capacity<T, F, Fut>(mut operation: F) -> Result<T, StoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, StoreError>>,
+{
+    loop {
+        match operation().await {
+            Err(StoreError::OperationCapacityExceeded) => {
+                tokio::time::sleep(INTERNAL_PROGRESS_RETRY_DELAY).await;
+            }
+            result => return result,
+        }
+    }
+}
 
 /// Selects both the demo fixture and the only tool capability available to it.
 ///
@@ -67,6 +173,7 @@ pub struct DemoStore {
     primary_session_id: Arc<str>,
     primary_run_id: Arc<str>,
     dispatcher: Arc<Mutex<()>>,
+    dispatcher_wake: Arc<WorkerWakeState>,
     auto_dispatch: bool,
 }
 
@@ -124,6 +231,8 @@ pub enum StoreError {
     StorageQuotaExceeded,
     #[error("SQLite physical storage cannot safely accept this operation")]
     PhysicalStorageExhausted,
+    #[error("SQLite operation capacity is exhausted")]
+    OperationCapacityExceeded,
     #[error("the durable reply queue is at capacity")]
     ReplyQueueCapacityExceeded,
     #[error("the durable dispatch queue is at capacity")]
@@ -193,6 +302,7 @@ impl From<StorageError> for StoreError {
             StorageError::UserDisabled(id) => Self::UserDisabled(id),
             StorageError::StorageQuotaExceeded => Self::StorageQuotaExceeded,
             StorageError::PhysicalStorageExhausted => Self::PhysicalStorageExhausted,
+            StorageError::OperationCapacityExceeded => Self::OperationCapacityExceeded,
             StorageError::ReplyQueueCapacityExceeded => Self::ReplyQueueCapacityExceeded,
             StorageError::DispatchQueueCapacityExceeded => Self::DispatchQueueCapacityExceeded,
             StorageError::AuthSessionCapacityExceeded => Self::AuthSessionCapacityExceeded,
@@ -244,11 +354,27 @@ impl DemoStore {
         limits: StorageLimits,
         physical_limits: SqlitePhysicalLimits,
     ) -> Result<Self, StoreError> {
-        Self::open_with_profile_and_limits_and_physical(
+        Self::open_with_limits_and_physical_and_operations(
+            path,
+            limits,
+            physical_limits,
+            SqliteOperationLimits::default(),
+        )
+        .await
+    }
+
+    pub async fn open_with_limits_and_physical_and_operations(
+        path: impl AsRef<Path>,
+        limits: StorageLimits,
+        physical_limits: SqlitePhysicalLimits,
+        operation_limits: SqliteOperationLimits,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_profile_and_limits_and_physical_and_operations(
             path,
             DemoProfile::ProductionGuarded,
             limits,
             physical_limits,
+            operation_limits,
         )
         .await
     }
@@ -289,13 +415,31 @@ impl DemoStore {
         limits: StorageLimits,
         physical_limits: SqlitePhysicalLimits,
     ) -> Result<Self, StoreError> {
-        Self::open_with_profile_and_limits_and_physical(
+        Self::open_local_with_limits_and_physical_and_operations(
+            path,
+            marker_root,
+            limits,
+            physical_limits,
+            SqliteOperationLimits::default(),
+        )
+        .await
+    }
+
+    pub async fn open_local_with_limits_and_physical_and_operations(
+        path: impl AsRef<Path>,
+        marker_root: impl Into<PathBuf>,
+        limits: StorageLimits,
+        physical_limits: SqlitePhysicalLimits,
+        operation_limits: SqliteOperationLimits,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_profile_and_limits_and_physical_and_operations(
             path,
             DemoProfile::LocalDevelopment {
                 marker_root: marker_root.into(),
             },
             limits,
             physical_limits,
+            operation_limits,
         )
         .await
     }
@@ -327,8 +471,30 @@ impl DemoStore {
         limits: StorageLimits,
         physical_limits: SqlitePhysicalLimits,
     ) -> Result<Self, StoreError> {
-        let storage =
-            SqliteStore::open_with_limits_and_physical(path, limits, physical_limits).await?;
+        Self::open_with_profile_and_limits_and_physical_and_operations(
+            path,
+            profile,
+            limits,
+            physical_limits,
+            SqliteOperationLimits::default(),
+        )
+        .await
+    }
+
+    pub async fn open_with_profile_and_limits_and_physical_and_operations(
+        path: impl AsRef<Path>,
+        profile: DemoProfile,
+        limits: StorageLimits,
+        physical_limits: SqlitePhysicalLimits,
+        operation_limits: SqliteOperationLimits,
+    ) -> Result<Self, StoreError> {
+        let storage = SqliteStore::open_with_limits_and_physical_and_operations(
+            path,
+            limits,
+            physical_limits,
+            operation_limits,
+        )
+        .await?;
         Self::from_storage(storage, profile, true).await
     }
 
@@ -394,6 +560,7 @@ impl DemoStore {
             primary_session_id: Arc::from(primary_session_id),
             primary_run_id: Arc::from(primary_run_id),
             dispatcher: Arc::new(Mutex::new(())),
+            dispatcher_wake: Arc::new(WorkerWakeState::default()),
             auto_dispatch,
         };
 
@@ -667,6 +834,20 @@ impl DemoStore {
     pub async fn session_summary(&self, session_id: &str) -> Result<SessionSummary, StoreError> {
         validate_durable_reference(session_id, "session ID")?;
         Ok(self.storage.session_summary(session_id).await?)
+    }
+
+    pub async fn session_summary_for_progress(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionSummary, StoreError> {
+        validate_durable_reference(session_id, "session ID")?;
+        retry_operation_capacity(|| async {
+            Ok(self
+                .storage
+                .session_summary_for_progress(session_id)
+                .await?)
+        })
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1004,7 +1185,9 @@ impl DemoStore {
 
     pub async fn claim_next_reply(&self) -> Result<ReplyClaimOutcome, StoreError> {
         loop {
-            match self.storage.claim_next_reply().await? {
+            match retry_operation_capacity(|| async { Ok(self.storage.claim_next_reply().await?) })
+                .await?
+            {
                 ReplyClaimOutcome::Rejected(completion) => {
                     // Storage committed the terminal failure before returning.
                     // Publish only as a post-commit wake hint and continue to
@@ -1027,7 +1210,10 @@ impl DemoStore {
         &self,
         commit: ReplySuccessCommit,
     ) -> Result<ReplyCompletion, StoreError> {
-        let completion = self.storage.complete_reply_success(commit).await?;
+        let completion = retry_operation_capacity(|| async {
+            Ok(self.storage.complete_reply_success(commit.clone()).await?)
+        })
+        .await?;
         if !completion.replayed {
             for event in &completion.events {
                 self.publish_session_event(&completion.session.id, event.clone());
@@ -1040,7 +1226,10 @@ impl DemoStore {
         &self,
         commit: ReplyFailureCommit,
     ) -> Result<ReplyCompletion, StoreError> {
-        let completion = self.storage.complete_reply_failure(commit).await?;
+        let completion = retry_operation_capacity(|| async {
+            Ok(self.storage.complete_reply_failure(commit.clone()).await?)
+        })
+        .await?;
         if !completion.replayed {
             for event in &completion.events {
                 self.publish_session_event(&completion.session.id, event.clone());
@@ -1053,7 +1242,13 @@ impl DemoStore {
         &self,
         commit: ReplyOutcomeUnknownCommit,
     ) -> Result<ReplyCompletion, StoreError> {
-        let completion = self.storage.complete_reply_outcome_unknown(commit).await?;
+        let completion = retry_operation_capacity(|| async {
+            Ok(self
+                .storage
+                .complete_reply_outcome_unknown(commit.clone())
+                .await?)
+        })
+        .await?;
         if !completion.replayed {
             for event in &completion.events {
                 self.publish_session_event(&completion.session.id, event.clone());
@@ -1316,7 +1511,10 @@ impl DemoStore {
 
     async fn recover_started_reply_jobs(&self) -> Result<(), StoreError> {
         loop {
-            let recovered = self.storage.recover_started_replies().await?;
+            let recovered = retry_operation_capacity(|| async {
+                Ok(self.storage.recover_started_replies().await?)
+            })
+            .await?;
             if recovered.is_empty() {
                 return Ok(());
             }
@@ -1335,7 +1533,9 @@ impl DemoStore {
 
     async fn recover_open_session_turns(&self) -> Result<(), StoreError> {
         loop {
-            let recovered = self.storage.recover_open_turns().await?;
+            let recovered =
+                retry_operation_capacity(|| async { Ok(self.storage.recover_open_turns().await?) })
+                    .await?;
             if recovered.is_empty() {
                 return Ok(());
             }
@@ -1361,13 +1561,19 @@ impl DemoStore {
     }
 
     fn kick_dispatcher(&self) {
-        if !self.auto_dispatch {
+        if !self.auto_dispatch || !self.dispatcher_wake.request() {
             return;
         }
         let store = self.clone();
         tokio::spawn(async move {
-            if let Err(error) = store.dispatch_pending().await {
-                eprintln!("zeus dispatcher stopped: {error}");
+            loop {
+                if let Err(error) = store.dispatch_pending().await {
+                    eprintln!("zeus dispatcher stopped: {error}");
+                    tokio::time::sleep(INTERNAL_PROGRESS_RETRY_DELAY).await;
+                }
+                if !store.dispatcher_wake.complete_cycle() {
+                    return;
+                }
             }
         });
     }
@@ -1396,11 +1602,17 @@ impl DemoStore {
 
     async fn claim_next_dispatch(&self) -> Result<Option<ClaimedDispatch>, StoreError> {
         loop {
-            let Some(job) = self.storage.peek_next_dispatch().await? else {
+            let Some(job) =
+                retry_operation_capacity(|| async { Ok(self.storage.peek_next_dispatch().await?) })
+                    .await?
+            else {
                 return Ok(None);
             };
             self.validate_dispatch_job_identity(&job)?;
-            let context = self.storage.dispatch_context(&job).await?;
+            let context = retry_operation_capacity(|| async {
+                Ok(self.storage.dispatch_context(&job).await?)
+            })
+            .await?;
             let (call, approval) = bindings_for_job(&context, &job)?;
             let environment = context.snapshot.run.environment.clone();
             let expected_sequence = context.snapshot.run.sequence;
@@ -1416,15 +1628,16 @@ impl DemoStore {
             snapshot.run = transition.run;
             let event = transition.event.clone();
 
-            match self
-                .storage
-                .claim_next_dispatch(DispatchStartCommit {
-                    call_id: job.call_id.clone(),
-                    expected_sequence,
-                    snapshot,
-                    event: transition.event,
-                })
-                .await?
+            let commit = DispatchStartCommit {
+                call_id: job.call_id.clone(),
+                expected_sequence,
+                snapshot,
+                event: transition.event,
+            };
+            match retry_operation_capacity(|| async {
+                Ok(self.storage.claim_next_dispatch(commit.clone()).await?)
+            })
+            .await?
             {
                 ClaimOutcome::Claimed(claimed_job) => {
                     let _ = self.publisher.send(PublishedEvent {
@@ -1491,12 +1704,11 @@ impl DemoStore {
             );
         }
 
-        match self
-            .registry
-            .dispatch(claimed.call.clone(), &claimed.environment)
-            .await
-        {
-            Ok(output) => ToolOutcome::Succeeded {
+        let registry = Arc::clone(&self.registry);
+        let call = claimed.call.clone();
+        let environment = claimed.environment.clone();
+        match tokio::spawn(async move { registry.dispatch(call, &environment).await }).await {
+            Ok(Ok(output)) => ToolOutcome::Succeeded {
                 summary: if output.replayed {
                     "The provider returned the durable result for this existing logical call."
                         .into()
@@ -1505,7 +1717,13 @@ impl DemoStore {
                 },
                 output_digest: Some(arguments_digest(&output.value)),
             },
-            Err(error) => registry_error_outcome(error),
+            Ok(Err(error)) => registry_error_outcome(error),
+            Err(_) => {
+                eprintln!("zeus connector task panicked; settling outcome_unknown");
+                ToolOutcome::OutcomeUnknown {
+                    summary: "The connector stopped unexpectedly after the durable dispatch checkpoint; Zeus did not retry the external operation.".into(),
+                }
+            }
         }
     }
 
@@ -1515,8 +1733,7 @@ impl DemoStore {
         outcome: ToolOutcome,
     ) -> Result<(), StoreError> {
         let mut snapshot = self
-            .storage
-            .consistent_snapshot(&claimed.job.run_id)
+            .retry_consistent_snapshot_for_progress(&claimed.job.run_id)
             .await?;
         let expected_sequence = snapshot.run.sequence;
         let transition = apply_tool_result(
@@ -1529,15 +1746,17 @@ impl DemoStore {
         snapshot.run = transition.run;
         let event = transition.event.clone();
         let result_json = serde_json::to_value(&outcome).map_err(StorageError::from)?;
-        self.storage
-            .complete_dispatch(DispatchCompleteCommit {
-                call_id: claimed.job.call_id,
-                expected_sequence,
-                snapshot,
-                event: transition.event,
-                result_json,
-            })
-            .await?;
+        let commit = DispatchCompleteCommit {
+            call_id: claimed.job.call_id,
+            expected_sequence,
+            snapshot,
+            event: transition.event,
+            result_json,
+        };
+        retry_operation_capacity(|| async {
+            Ok(self.storage.complete_dispatch(commit.clone()).await?)
+        })
+        .await?;
         let _ = self.publisher.send(PublishedEvent {
             run_id: claimed.job.run_id,
             event,
@@ -1547,13 +1766,18 @@ impl DemoStore {
 
     async fn recover_started_dispatches(&self) -> Result<(), StoreError> {
         loop {
-            let jobs = self.storage.started_dispatches().await?;
+            let jobs =
+                retry_operation_capacity(|| async { Ok(self.storage.started_dispatches().await?) })
+                    .await?;
             if jobs.is_empty() {
                 return Ok(());
             }
             for job in jobs {
                 self.validate_dispatch_job_identity(&job)?;
-                let context = self.storage.dispatch_context(&job).await?;
+                let context = retry_operation_capacity(|| async {
+                    Ok(self.storage.dispatch_context(&job).await?)
+                })
+                .await?;
                 let (call, _) = bindings_for_job(&context, &job)?;
                 let outcome = ToolOutcome::OutcomeUnknown {
                     summary: "Zeus restarted after the durable dispatch checkpoint but before a durable result; the call was not retried.".into(),
@@ -1570,15 +1794,17 @@ impl DemoStore {
                 snapshot.run = transition.run;
                 let event = transition.event.clone();
                 let result_json = serde_json::to_value(&outcome).map_err(StorageError::from)?;
-                self.storage
-                    .recover_started(DispatchRecoveryCommit {
-                        call_id: job.call_id,
-                        expected_sequence,
-                        snapshot,
-                        event: transition.event,
-                        result_json,
-                    })
-                    .await?;
+                let commit = DispatchRecoveryCommit {
+                    call_id: job.call_id,
+                    expected_sequence,
+                    snapshot,
+                    event: transition.event,
+                    result_json,
+                };
+                retry_operation_capacity(|| async {
+                    Ok(self.storage.recover_started(commit.clone()).await?)
+                })
+                .await?;
                 let _ = self.publisher.send(PublishedEvent {
                     run_id: job.run_id,
                     event,
@@ -1598,6 +1824,19 @@ impl DemoStore {
             )));
         }
         Ok(())
+    }
+
+    async fn retry_consistent_snapshot_for_progress(
+        &self,
+        run_id: &str,
+    ) -> Result<RunSnapshot, StoreError> {
+        retry_operation_capacity(|| async {
+            Ok(self
+                .storage
+                .consistent_snapshot_for_progress(run_id)
+                .await?)
+        })
+        .await
     }
 }
 
@@ -1968,12 +2207,68 @@ mod tests {
     };
     use rusqlite::{Connection, params};
     use storage::DispatchStatus;
-    use tools::{RecordingExecutor, TOOL_OUTPUT_MAX_SERIALIZED_BYTES};
+    use tools::{
+        ExecutionFuture, ExecutionRequest, RecordingExecutor, TOOL_OUTPUT_MAX_SERIALIZED_BYTES,
+        ToolExecutor,
+    };
 
     use super::*;
 
     static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
     const TEST_OWNER_ID: &str = "user-runtime-owner";
+
+    struct PanickingExecutor;
+
+    impl ToolExecutor for PanickingExecutor {
+        fn execute(&self, _request: ExecutionRequest) -> ExecutionFuture<'_> {
+            Box::pin(async { panic!("test connector panic must be isolated") })
+        }
+    }
+
+    #[test]
+    fn worker_wake_state_coalesces_kicks_without_losing_a_pending_cycle() {
+        let wake = WorkerWakeState::default();
+        assert!(wake.request());
+        assert!(!wake.request());
+        assert!(!wake.request());
+        assert!(wake.complete_cycle());
+        assert!(!wake.complete_cycle());
+        assert!(wake.request());
+        assert!(!wake.complete_cycle());
+    }
+
+    #[tokio::test]
+    async fn internal_progress_retry_retries_only_operation_capacity() {
+        let capacity_attempts = Arc::new(AtomicU64::new(0));
+        let attempts = Arc::clone(&capacity_attempts);
+        let value = retry_operation_capacity(|| {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt < 2 {
+                    Err(StoreError::OperationCapacityExceeded)
+                } else {
+                    Ok(7_u8)
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(value, 7);
+        assert_eq!(capacity_attempts.load(Ordering::SeqCst), 3);
+
+        let fatal_attempts = Arc::new(AtomicU64::new(0));
+        let attempts = Arc::clone(&fatal_attempts);
+        let result = retry_operation_capacity(|| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async { Err::<(), _>(StoreError::RunNotFound("fatal".into())) }
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(StoreError::RunNotFound(run_id)) if run_id == "fatal"
+        ));
+        assert_eq!(fatal_attempts.load(Ordering::SeqCst), 1);
+    }
 
     fn approval_request(decision: ReviewDecision) -> ReviewRequest {
         ReviewRequest {
@@ -2646,7 +2941,25 @@ mod tests {
     async fn concurrent_actor_reviews_with_one_key_commit_once_and_replay() {
         const CONCURRENCY: usize = 16;
 
-        let store = production_store(false).await;
+        let store = DemoStore::from_storage(
+            SqliteStore::open_with_limits_and_physical_and_operations(
+                ":memory:",
+                StorageLimits::default(),
+                SqlitePhysicalLimits::default(),
+                SqliteOperationLimits {
+                    max_concurrent_operations: CONCURRENCY + 1,
+                    reserved_progress_operations: 1,
+                    ..SqliteOperationLimits::default()
+                },
+            )
+            .await
+            .unwrap(),
+            DemoProfile::ProductionGuarded,
+            false,
+        )
+        .await
+        .unwrap();
+        bootstrap_test_owner(&store).await;
         let barrier = Arc::new(tokio::sync::Barrier::new(CONCURRENCY));
         let mut tasks = Vec::with_capacity(CONCURRENCY);
         for _ in 0..CONCURRENCY {
@@ -3292,6 +3605,44 @@ mod tests {
             .unwrap();
         assert_eq!(job.status, DispatchStatus::Finished);
         assert_eq!(job.attempt, 1);
+    }
+
+    #[tokio::test]
+    async fn panicking_connector_settles_outcome_unknown_without_stopping_the_dispatcher() {
+        let paths = TestPaths::new("panicking-connector");
+        let mut store = local_store(&paths, false).await;
+        let descriptor = store
+            .registry
+            .descriptor("dev.marker.write")
+            .unwrap()
+            .clone();
+        let mut registry = ToolRegistry::new();
+        registry.register(descriptor, PanickingExecutor).unwrap();
+        store.registry = Arc::new(registry);
+
+        store
+            .review_for_actor(
+                TEST_OWNER_ID,
+                LOCAL_DEMO_RUN_ID,
+                "APR-DEV-1",
+                approval_request(ReviewDecision::Approve),
+                "panicking-connector-review",
+            )
+            .await
+            .unwrap();
+        store.dispatch_pending().await.unwrap();
+        store.dispatch_pending().await.unwrap();
+
+        let detail = store.run_detail(LOCAL_DEMO_RUN_ID).await.unwrap();
+        assert!(matches!(
+            detail.events.last().and_then(|event| event.data.as_ref()),
+            Some(RunEventData::ToolResult {
+                outcome: ToolOutcome::OutcomeUnknown { .. },
+                status: ToolCallStatus::OutcomeUnknown,
+                ..
+            })
+        ));
+        assert_eq!(directory_entries(&paths.marker_root), 0);
     }
 
     #[tokio::test]

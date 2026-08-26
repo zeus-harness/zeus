@@ -26,6 +26,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 use crate::cursor;
+use crate::operation::{OperationClass, OperationLimiter};
 use crate::{
     AuthPrincipal, AuthSessionCommit, BootstrapOwnerCommit, BoundedRunRead, ClaimOutcome,
     CommitOutcome, DispatchCompleteCommit, DispatchContext, DispatchJob, DispatchJobSpec,
@@ -33,8 +34,8 @@ use crate::{
     RecoveredSessionTurn, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit, ReplyJob,
     ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
     ReplySuccessCommit, ReviewCommit, ReviewContext, ReviewReceipt, RunSnapshot, RuntimeIdentity,
-    SessionSummaryPage, SqlitePhysicalLimits, StorageError, StorageLimits, StoredCredential,
-    StoredPreferences, StoredRun, StoredUser, StoredUserRole, StoredUserStatus,
+    SessionSummaryPage, SqliteOperationLimits, SqlitePhysicalLimits, StorageError, StorageLimits,
+    StoredCredential, StoredPreferences, StoredRun, StoredUser, StoredUserRole, StoredUserStatus,
 };
 
 const CURRENT_SCHEMA_VERSION: i64 = 11;
@@ -102,6 +103,8 @@ pub struct SqliteStore {
     backend: Backend,
     limits: StorageLimits,
     physical_limits: SqlitePhysicalLimits,
+    operation_limits: SqliteOperationLimits,
+    operation_limiter: Arc<OperationLimiter>,
 }
 
 #[derive(Clone)]
@@ -119,10 +122,11 @@ struct FileBackend {
 
 impl SqliteStore {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        Self::open_with_limits_and_physical(
+        Self::open_with_limits_and_physical_and_operations(
             path,
             StorageLimits::default(),
             SqlitePhysicalLimits::default(),
+            SqliteOperationLimits::default(),
         )
         .await
     }
@@ -131,7 +135,13 @@ impl SqliteStore {
         path: impl AsRef<Path>,
         limits: StorageLimits,
     ) -> Result<Self, StorageError> {
-        Self::open_with_limits_and_physical(path, limits, SqlitePhysicalLimits::default()).await
+        Self::open_with_limits_and_physical_and_operations(
+            path,
+            limits,
+            SqlitePhysicalLimits::default(),
+            SqliteOperationLimits::default(),
+        )
+        .await
     }
 
     pub async fn open_with_limits_and_physical(
@@ -139,60 +149,105 @@ impl SqliteStore {
         limits: StorageLimits,
         physical_limits: SqlitePhysicalLimits,
     ) -> Result<Self, StorageError> {
+        Self::open_with_limits_and_physical_and_operations(
+            path,
+            limits,
+            physical_limits,
+            SqliteOperationLimits::default(),
+        )
+        .await
+    }
+
+    /// Opens a store with explicit logical, physical, and blocking-operation
+    /// capacity policy. Existing constructors retain the supported defaults.
+    pub async fn open_with_limits_and_physical_and_operations(
+        path: impl AsRef<Path>,
+        limits: StorageLimits,
+        physical_limits: SqlitePhysicalLimits,
+        operation_limits: SqliteOperationLimits,
+    ) -> Result<Self, StorageError> {
         limits.validate()?;
         physical_limits.validate()?;
+        operation_limits.validate()?;
+        let operation_limiter = Arc::new(OperationLimiter::new(&operation_limits));
         let path = path.as_ref().to_path_buf();
         if path == Path::new(":memory:") {
+            let permits = operation_limiter
+                .acquire(OperationClass::General, true)
+                .await?;
+            #[cfg(test)]
+            let task_limiter = Arc::clone(&operation_limiter);
             let connection = tokio::task::spawn_blocking(move || {
-                let mut connection = Connection::open_in_memory()?;
-                configure_connection(&connection, false, None)?;
-                migrate(&mut connection)?;
-                cleanup_expired_auth_sessions(&mut connection, &now())?;
-                deep_readiness(&mut connection, false, None)?;
-                Ok::<_, StorageError>(connection)
+                #[cfg(test)]
+                let _task_guard = task_limiter.blocking_task_guard();
+                let result = (|| {
+                    let mut connection = Connection::open_in_memory()?;
+                    configure_connection(&connection, false, None)?;
+                    migrate(&mut connection)?;
+                    cleanup_expired_auth_sessions(&mut connection, &now())?;
+                    deep_readiness(&mut connection, false, None)?;
+                    Ok::<_, StorageError>(connection)
+                })();
+                drop(permits);
+                result
             })
             .await??;
             Ok(Self {
                 backend: Backend::Memory(Arc::new(Mutex::new(connection))),
                 limits,
                 physical_limits,
+                operation_limits,
+                operation_limiter,
             })
         } else {
             let backend_physical_limits = physical_limits.clone();
+            let permits = operation_limiter
+                .acquire(OperationClass::General, false)
+                .await?;
+            #[cfg(test)]
+            let task_limiter = Arc::clone(&operation_limiter);
             let backend = tokio::task::spawn_blocking(move || {
-                let path = normalized_file_path(&path)?;
-                let lock_file = acquire_database_lock(&path)?;
-                let mut connection = open_file_connection(&path, &backend_physical_limits)?;
-                let schema_version = current_schema_version(&connection)?;
-                if schema_version < CURRENT_SCHEMA_VERSION {
+                #[cfg(test)]
+                let _task_guard = task_limiter.blocking_task_guard();
+                let result = (|| {
+                    let path = normalized_file_path(&path)?;
+                    let lock_file = acquire_database_lock(&path)?;
+                    let mut connection = open_file_connection(&path, &backend_physical_limits)?;
+                    let schema_version = current_schema_version(&connection)?;
+                    if schema_version < CURRENT_SCHEMA_VERSION {
+                        require_physical_capacity(
+                            &connection,
+                            &path,
+                            &backend_physical_limits,
+                            PhysicalCapacityGate::Migration,
+                        )?;
+                    }
+                    migrate(&mut connection)?;
                     require_physical_capacity(
                         &connection,
                         &path,
                         &backend_physical_limits,
-                        PhysicalCapacityGate::Migration,
+                        PhysicalCapacityGate::Finalization,
                     )?;
-                }
-                migrate(&mut connection)?;
-                require_physical_capacity(
-                    &connection,
-                    &path,
-                    &backend_physical_limits,
-                    PhysicalCapacityGate::Finalization,
-                )?;
-                cleanup_expired_auth_sessions(&mut connection, &now())?;
-                checkpoint_wal(&connection)?;
-                deep_readiness(&mut connection, true, Some(&backend_physical_limits))?;
-                Ok::<_, StorageError>(FileBackend {
-                    path,
-                    physical_limits: backend_physical_limits,
-                    _lock_file: lock_file,
-                })
+                    cleanup_expired_auth_sessions(&mut connection, &now())?;
+                    checkpoint_wal(&connection)?;
+                    deep_readiness(&mut connection, true, Some(&backend_physical_limits))?;
+                    Ok::<_, StorageError>(FileBackend {
+                        path,
+                        physical_limits: backend_physical_limits,
+                        _lock_file: lock_file,
+                    })
+                })();
+                drop(permits);
+                result
             })
             .await??;
             Ok(Self {
                 backend: Backend::File(Arc::new(backend)),
                 limits,
                 physical_limits,
+                operation_limits,
+                operation_limiter,
             })
         }
     }
@@ -203,6 +258,10 @@ impl SqliteStore {
 
     pub fn physical_limits(&self) -> &SqlitePhysicalLimits {
         &self.physical_limits
+    }
+
+    pub fn operation_limits(&self) -> &SqliteOperationLimits {
+        &self.operation_limits
     }
 
     #[cfg(test)]
@@ -408,6 +467,20 @@ impl SqliteStore {
     pub async fn session_summary(&self, session_id: &str) -> Result<SessionSummary, StorageError> {
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         self.with_connection(move |connection| {
+            query_consistent_session_summary(connection, &session_id)
+        })
+        .await
+    }
+
+    /// Durable-worker point read that may use the reserved progress lane.
+    /// Public/API summary reads must continue to use [`Self::session_summary`]
+    /// or the actor-scoped general-admission variant.
+    pub async fn session_summary_for_progress(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionSummary, StorageError> {
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        self.with_progress_connection(move |connection| {
             query_consistent_session_summary(connection, &session_id)
         })
         .await
@@ -765,8 +838,10 @@ impl SqliteStore {
     /// the authorization boundary for provider execution.
     pub async fn claim_next_reply(&self) -> Result<ReplyClaimOutcome, StorageError> {
         let physical_limits = self.physical_limits.clone();
-        self.with_connection(move |connection| claim_next_reply(connection, &physical_limits))
-            .await
+        self.with_progress_connection(move |connection| {
+            claim_next_reply(connection, &physical_limits)
+        })
+        .await
     }
 
     /// Commits provider output, assistant/flush ledger events, and the ready
@@ -776,7 +851,7 @@ impl SqliteStore {
         commit: ReplySuccessCommit,
     ) -> Result<ReplyCompletion, StorageError> {
         let physical_limits = self.physical_limits.clone();
-        self.with_connection(move |connection| {
+        self.with_progress_connection(move |connection| {
             complete_reply_success(connection, commit, &physical_limits, false)
         })
         .await
@@ -788,7 +863,7 @@ impl SqliteStore {
         commit: ReplyFailureCommit,
     ) -> Result<ReplyCompletion, StorageError> {
         let physical_limits = self.physical_limits.clone();
-        self.with_connection(move |connection| {
+        self.with_progress_connection(move |connection| {
             complete_reply_failure(connection, commit, &physical_limits)
         })
         .await
@@ -801,7 +876,7 @@ impl SqliteStore {
         commit: ReplyOutcomeUnknownCommit,
     ) -> Result<ReplyCompletion, StorageError> {
         let physical_limits = self.physical_limits.clone();
-        self.with_connection(move |connection| {
+        self.with_progress_connection(move |connection| {
             complete_reply_outcome_unknown(connection, commit, &physical_limits)
         })
         .await
@@ -811,7 +886,7 @@ impl SqliteStore {
     /// process into `outcome_unknown`. Queued work remains claimable.
     pub async fn recover_started_replies(&self) -> Result<Vec<ReplyCompletion>, StorageError> {
         let physical_limits = self.physical_limits.clone();
-        self.with_connection(move |connection| {
+        self.with_progress_connection(move |connection| {
             recover_started_replies(connection, &physical_limits)
         })
         .await
@@ -828,7 +903,7 @@ impl SqliteStore {
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         let physical_limits = self.physical_limits.clone();
-        self.with_connection(move |connection| {
+        self.with_progress_connection(move |connection| {
             flush_turn(
                 connection,
                 &session_id,
@@ -854,7 +929,7 @@ impl SqliteStore {
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         let physical_limits = self.physical_limits.clone();
-        self.with_connection(move |connection| {
+        self.with_progress_connection(move |connection| {
             flush_turn(
                 connection,
                 &session_id,
@@ -926,8 +1001,10 @@ impl SqliteStore {
     /// acknowledgement.
     pub async fn recover_open_turns(&self) -> Result<Vec<RecoveredSessionTurn>, StorageError> {
         let physical_limits = self.physical_limits.clone();
-        self.with_connection(move |connection| recover_open_turns(connection, &physical_limits))
-            .await
+        self.with_progress_connection(move |connection| {
+            recover_open_turns(connection, &physical_limits)
+        })
+        .await
     }
 
     pub async fn has_users(&self) -> Result<bool, StorageError> {
@@ -1128,6 +1205,19 @@ impl SqliteStore {
             .await
     }
 
+    /// Durable-worker projection point read that may use reserved operation
+    /// capacity. Public/API reads remain on general admission.
+    pub async fn consistent_snapshot_for_progress(
+        &self,
+        run_id: &str,
+    ) -> Result<RunSnapshot, StorageError> {
+        let run_id = validated_durable_reference(run_id, "run ID")?.to_owned();
+        self.with_progress_connection(move |connection| {
+            query_consistent_snapshot(connection, &run_id)
+        })
+        .await
+    }
+
     pub async fn consistent_snapshot_for_actor(
         &self,
         actor_user_id: &str,
@@ -1179,7 +1269,7 @@ impl SqliteStore {
         let call_id = validated_durable_reference(&job.call_id, "call ID")?.to_owned();
         let approval_id = validated_durable_reference(&job.approval_id, "approval ID")?.to_owned();
         let approval_event_sequence = job.approval_event_sequence;
-        self.with_connection(move |connection| {
+        self.with_progress_connection(move |connection| {
             query_dispatch_context(
                 connection,
                 &run_id,
@@ -1364,7 +1454,7 @@ impl SqliteStore {
     /// Returns a queued job without mutating it. Callers use this to build the
     /// projection/event supplied to [`Self::claim_next_dispatch`].
     pub async fn peek_next_dispatch(&self) -> Result<Option<DispatchJob>, StorageError> {
-        self.with_connection(peek_next_dispatch).await
+        self.with_progress_connection(peek_next_dispatch).await
     }
 
     pub async fn dispatch_job(&self, call_id: &str) -> Result<Option<DispatchJob>, StorageError> {
@@ -1375,7 +1465,8 @@ impl SqliteStore {
 
     /// Returns one bounded startup-recovery batch ordered by durable start.
     pub async fn started_dispatches(&self) -> Result<Vec<DispatchJob>, StorageError> {
-        self.with_connection(query_started_dispatches).await
+        self.with_progress_connection(query_started_dispatches)
+            .await
     }
 
     /// Atomically claims the current queue head, appends the caller-computed
@@ -1386,7 +1477,7 @@ impl SqliteStore {
         commit: DispatchStartCommit,
     ) -> Result<ClaimOutcome, StorageError> {
         let physical_limits = self.physical_limits.clone();
-        self.with_connection(move |connection| {
+        self.with_progress_connection(move |connection| {
             claim_next_dispatch(connection, commit, &physical_limits, false)
         })
         .await
@@ -1399,7 +1490,7 @@ impl SqliteStore {
         commit: DispatchCompleteCommit,
     ) -> Result<DispatchJob, StorageError> {
         let physical_limits = self.physical_limits.clone();
-        self.with_connection(move |connection| {
+        self.with_progress_connection(move |connection| {
             complete_dispatch(connection, commit, &physical_limits, false)
         })
         .await
@@ -1413,7 +1504,7 @@ impl SqliteStore {
         commit: DispatchRecoveryCommit,
     ) -> Result<DispatchJob, StorageError> {
         let physical_limits = self.physical_limits.clone();
-        self.with_connection(move |connection| {
+        self.with_progress_connection(move |connection| {
             recover_started(connection, commit, &physical_limits)
         })
         .await
@@ -1438,7 +1529,7 @@ impl SqliteStore {
         commit: DispatchStartCommit,
     ) -> Result<ClaimOutcome, StorageError> {
         let physical_limits = self.physical_limits.clone();
-        self.with_connection(move |connection| {
+        self.with_progress_connection(move |connection| {
             claim_next_dispatch(connection, commit, &physical_limits, true)
         })
         .await
@@ -1450,7 +1541,7 @@ impl SqliteStore {
         commit: DispatchCompleteCommit,
     ) -> Result<DispatchJob, StorageError> {
         let physical_limits = self.physical_limits.clone();
-        self.with_connection(move |connection| {
+        self.with_progress_connection(move |connection| {
             complete_dispatch(connection, commit, &physical_limits, true)
         })
         .await
@@ -1466,7 +1557,7 @@ impl SqliteStore {
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         let physical_limits = self.physical_limits.clone();
-        self.with_connection(move |connection| {
+        self.with_progress_connection(move |connection| {
             flush_turn(
                 connection,
                 &session_id,
@@ -1525,7 +1616,7 @@ impl SqliteStore {
         commit: ReplySuccessCommit,
     ) -> Result<ReplyCompletion, StorageError> {
         let physical_limits = self.physical_limits.clone();
-        self.with_connection(move |connection| {
+        self.with_progress_connection(move |connection| {
             complete_reply_success(connection, commit, &physical_limits, true)
         })
         .await
@@ -1536,27 +1627,95 @@ impl SqliteStore {
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T, StorageError> + Send + 'static,
     {
+        self.with_connection_class(OperationClass::General, operation)
+            .await
+    }
+
+    async fn with_progress_connection<T, F>(&self, operation: F) -> Result<T, StorageError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T, StorageError> + Send + 'static,
+    {
+        self.with_connection_class(OperationClass::DurableProgress, operation)
+            .await
+    }
+
+    async fn with_connection_class<T, F>(
+        &self,
+        class: OperationClass,
+        operation: F,
+    ) -> Result<T, StorageError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T, StorageError> + Send + 'static,
+    {
+        let is_memory = matches!(self.backend, Backend::Memory(_));
+        let permits = self.operation_limiter.acquire(class, is_memory).await?;
+        #[cfg(test)]
+        let task_limiter = Arc::clone(&self.operation_limiter);
         match &self.backend {
             Backend::File(backend) => {
                 let backend = Arc::clone(backend);
                 tokio::task::spawn_blocking(move || {
-                    let mut connection =
-                        open_file_connection(&backend.path, &backend.physical_limits)?;
-                    operation(&mut connection)
+                    #[cfg(test)]
+                    let _task_guard = task_limiter.blocking_task_guard();
+                    let result = (|| {
+                        let mut connection =
+                            open_file_connection(&backend.path, &backend.physical_limits)?;
+                        operation(&mut connection)
+                    })();
+                    // The connection (including any busy wait or transaction)
+                    // is dropped by the inner scope before operation capacity
+                    // is returned. Aborting the async caller does not cancel
+                    // this blocking closure or release its permits early.
+                    drop(permits);
+                    result
                 })
                 .await?
             }
             Backend::Memory(connection) => {
                 let connection = Arc::clone(connection);
                 tokio::task::spawn_blocking(move || {
-                    let mut connection = connection.lock().map_err(|_| {
-                        StorageError::CorruptData("in-memory SQLite lock was poisoned".into())
-                    })?;
-                    operation(&mut connection)
+                    #[cfg(test)]
+                    let _task_guard = task_limiter.blocking_task_guard();
+                    let result = (|| {
+                        let mut connection = connection.lock().map_err(|_| {
+                            StorageError::CorruptData("in-memory SQLite lock was poisoned".into())
+                        })?;
+                        operation(&mut connection)
+                    })();
+                    drop(permits);
+                    result
                 })
                 .await?
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn test_general_operation<T, F>(&self, operation: F) -> Result<T, StorageError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T, StorageError> + Send + 'static,
+    {
+        self.with_connection(operation).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn test_progress_operation<T, F>(
+        &self,
+        operation: F,
+    ) -> Result<T, StorageError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T, StorageError> + Send + 'static,
+    {
+        self.with_progress_connection(operation).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn operation_test_snapshot(&self) -> (usize, usize) {
+        self.operation_limiter.test_snapshot()
     }
 }
 

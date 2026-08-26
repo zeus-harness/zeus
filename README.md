@@ -149,6 +149,40 @@ listener is exposed. Operators and tests can request the same deep integrity
 check, without the startup checkpoint, explicitly through
 `SqliteStore::verify_integrity`; it is not run for every health probe.
 
+SQLite blocking work also has a bounded operation gate:
+
+| Environment variable | Default | Hard ceiling |
+| --- | ---: | ---: |
+| `ZEUS_SQLITE_MAX_CONCURRENT_OPERATIONS` | 8 | 32 |
+| `ZEUS_SQLITE_RESERVED_PROGRESS_OPERATIONS` | 1 | 8 |
+| `ZEUS_SQLITE_OPERATION_ACQUIRE_TIMEOUT_MS` | 1,000 ms | 5,000 ms |
+
+With the defaults, ordinary reads and admission commands share seven general
+slots. Their general-lane acquisition uses `try_acquire`, so saturation fails
+fast instead of forming an unbounded waiter queue. Durable progress may use all
+eight total slots and waits only for the configured bounded timeout. The total
+and in-memory connection gates share one deadline instead of each receiving a
+fresh timeout budget. Ordinary in-memory waiters stay outside the connection
+FIFO, so an accepted durable-progress waiter receives the next connection.
+Reply and dispatch claim, the point reads needed by those workers, completion,
+recovery, and explicit manual-flush finalization use this progress class. An
+in-memory store has an additional single-connection async gate before work
+enters Tokio's blocking pool.
+
+The acquired permits move into `spawn_blocking` and remain held across file
+connection open/drop, SQLite busy waits, and the complete transaction. Aborting
+the async caller does not return capacity while its blocking closure is still
+running. Provider and connector calls happen outside SQLite transactions and do
+not hold an operation permit while awaiting an external system. Saturated
+business requests return `503 sqlite_operation_capacity_exceeded`,
+`Retry-After: 1`, and `Cache-Control: no-store`. `/health/live` never opens
+SQLite; `/health/ready` returns a redacted `503` when it cannot enter the
+operation gate. Internal reply/dispatch progress retries only this transient
+capacity error with a fixed bounded delay, retaining an already-produced
+provider/connector result until its idempotent finalization commits. Repeated
+worker wakeups are coalesced into at most one running worker and one pending
+drain cycle instead of spawning mutex waiters without a bound.
+
 To exercise the only executable Alpha connector, use a separate database and
 an explicit fixed root. The caller supplies marker text only; it cannot choose
 a path or invoke a host command:
@@ -199,6 +233,13 @@ this mode. The API stores SQLite files under `/var/lib/zeus` in the dedicated
 `zeus_data` named volume. Rust uses `cargo-watch`, Vite uses HMR, the repository
 is bind mounted, and dependency/build caches use separate named volumes.
 
+Compose statically wires CPU, memory, and PID ceilings for the API, Web, and
+gateway through `ZEUS_COMPOSE_{API,WEB,GATEWAY}_{CPUS,MEMORY,PIDS_LIMIT}`.
+The checked-in API defaults are 4 CPUs, 4 GiB, and 512 PIDs because `full` runs
+the `cargo-watch` development image and may compile Rust. These limits are a
+developer-machine safety boundary, not a production runtime capacity or OOM
+benchmark.
+
 Host fast mode and full container mode intentionally use different databases.
 They do not mirror state. Compose project names also scope volumes, so two
 different `COMPOSE_PROJECT_NAME` values produce isolated Zeus stores.
@@ -240,6 +281,15 @@ defaults are:
   `zeus-alpha-data` mounted at `/var/lib/zeus`;
 - the `production-guarded` profile. This helper does not enable the local
   marker executor.
+
+The release API VM defaults to two CPUs and 1 GiB and can be changed with
+`ZEUS_CONTAINER_API_CPUS` and `ZEUS_CONTAINER_API_MEMORY`; the helper verifies
+the effective values reported by `container inspect`. Run
+`scripts/apple-container.sh resources` for a read-only snapshot of inspect,
+cgroup v2 CPU/memory/swap/PID counters, selected `/proc/meminfo`, process RSS/
+high-water marks, and `smaps_rollup`. Apple `container` 1.0 exposes no
+per-container PID-limit option, so the reported `pids.max` is evidence about
+that running VM, not a configured guarantee.
 
 Every resource managed by the helper carries
 `dev.zeus-harness.managed=true` and a matching
@@ -415,8 +465,8 @@ directly.
   exact same-origin request. Alpha+ deliberately rejects the schema-reserved
   `member` role. Actor isolation and SQLite physical headroom are now present,
   but member access remains blocked until a tenant/account membership scope, a
-  bootstrap-audit retention policy, and explicit operation-concurrency/OOM
-  controls land.
+  bootstrap-audit retention policy, and their authorization/audit semantics
+  land.
 - `GET /api/v1/me/settings` returns the current safe preferences.
   `PATCH /api/v1/me/settings` accepts `theme`, optional allowlisted
   `preferred_model`, and `expected_revision`. Provider endpoints and API keys
@@ -521,10 +571,11 @@ sessions are deleted in deterministic batches of at most 64 on startup and
 before session creation; append-only ledgers, receipts, jobs, turns, and audit
 records are not silently pruned. The locally verified Physical Capacity Slice
 now gates the main DB, active-WAL target, and filesystem headroom, subject to
-the documented WAL and `statvfs` limitations. A complete audit-retention
-horizon, tenant/member scope, and explicit operation-concurrency/OOM policy
-remain unresolved; shared-network and multi-tenant deployment is therefore
-still out of scope.
+the documented WAL and `statvfs` limitations. Bounded SQLite operation
+concurrency is also implemented. A complete audit-retention horizon and
+tenant/member membership scope remain unresolved; shared-network and
+multi-tenant deployment is therefore still out of scope. Full low-memory/OOM
+and current-image container acceptance remain separate deployment gates.
 
 ## Container images
 
@@ -574,13 +625,14 @@ committed data. Use SQLite's backup/checkpoint facilities.
 
 Current Alpha+ plus Actor Boundary Foundation, API Resource Envelope, Terminal
 Payload Envelope, Bounded Event Feed, Point-query Durable Context, Bounded Read
-Models, SQLite Capacity Slice 2, and the SQLite Physical Capacity Slice host
-verification:
+Models, SQLite Capacity Slice 2, the SQLite Physical Capacity Slice, and the
+SQLite Operation Capacity Slice host verification:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --all-targets`: 251 tests passed, including 106
-  storage tests, 42 API library tests, and 4 API main/config tests, plus the real
+- `cargo test --workspace --all-targets`: 271 tests passed, including 121
+  storage tests, 28 runtime tests, 44 API library tests, and 4 API main/config
+  tests, plus the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,
   body/field/idempotency boundaries, atomic login limits, SSE lease capacity,
@@ -597,6 +649,13 @@ verification:
   expired-auth cleanup, fail-closed environment parsing, typed reply/tool
   payload envelopes, canonical dispatch admission, and one-shot oversized
   provider/executor settlement without persisting the rejected payload.
+  Operation-capacity coverage proves the seven-slot ordinary lane, fail-fast
+  general admission, one-deadline progress waiting, progress priority at the
+  single-connection in-memory gate, cancellation and partial-permit cleanup,
+  permit retention after caller abort, internal capacity-only retry, bounded
+  worker wake coalescing, progress-waiter cancellation notification,
+  provider/connector panic settlement as `outcome_unknown`, progress under
+  general saturation, and the stable API `503` mapping contract.
 - `pnpm --filter web test`: 25 tests passed for CSRF headers, stable command
   identity, deep-page active-Session restore, Session-list cursor encoding and
   deduplication, bounded-tail retry reconciliation and Session-switch race
@@ -634,7 +693,11 @@ durable worker to sequence 4 with local-fallback provenance. Rate-window and
 SSE body-drop behavior are covered by deterministic automated tests.
 
 Apple `container` remains a supported local debug path. `bash -n` passes for
-the helper. A current read-only status check found the pre-existing labeled
+the helper. Its read-only `resources` command observed the old idle Alpha API at
+2 CPUs/1 GiB, with zero OOM counters, `pids.current=6`, and `pids.max=max`.
+Those numbers are a single snapshot of the old image, not current-image,
+pressure, or OOM acceptance, and `pids.max=max` is not a PID guarantee. A
+current read-only status check found the pre-existing labeled
 API/Web/gateway containers running and `zeus-alpha-data` present; no container
 or volume was replaced. The gateway Web/API readiness probes passed, then the
 full helper `verify` stopped at `GET /api/v1/auth/status` with `404`, confirming
@@ -644,12 +707,13 @@ index inside BuildKit and was interrupted before any running container was
 replaced. Therefore the new image, `verify`, and named-volume `restart-verify`
 are not yet claimed as current Alpha+ acceptance. The earlier Alpha baseline
 container acceptance belongs to commit `9a89706`; the pushed host baseline
-before this slice is event-payload quotas commit `fd38d60`. No
+before this slice is Physical Capacity commit `8117ed6`. No
 replacement image containing Actor Boundary, API Resource Envelope, Bounded
 Event Feed, Point-query Durable Context, Bounded Read Models, SQLite Capacity
-Slice 2, or the SQLite Physical Capacity Slice is yet verified. Process-level
-operation concurrency/OOM behavior also remains outside current-image
-acceptance.
+Slice 2, the SQLite Physical Capacity Slice, or bounded SQLite operation
+concurrency is yet verified. Host deterministic operation-gate tests have
+passed, but authoritative low-memory behavior still requires a current-image
+pressure run and Linux Docker OOM evidence.
 
 Docker Compose configuration remains available for environments with Docker
 Compose v2; this machine currently has Apple `container` but no Docker CLI, so

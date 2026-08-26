@@ -1,7 +1,7 @@
 use std::{future::IntoFuture, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use llm::{LocalFallbackProvider, OpenAiCompatibleProvider, ReplyProvider};
-use runtime::{DemoStore, SqlitePhysicalLimits, StorageLimits};
+use runtime::{DemoStore, SqliteOperationLimits, SqlitePhysicalLimits, StorageLimits};
 use tenancy::BootstrapToken;
 use tokio::sync::oneshot;
 
@@ -16,23 +16,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("ZEUS_DEMO_PROFILE").unwrap_or_else(|_| "production-guarded".into());
     let storage_limits = configured_storage_limits()?;
     let physical_limits = configured_sqlite_physical_limits()?;
+    let operation_limits = configured_sqlite_operation_limits()?;
     let store = match profile.as_str() {
         "production-guarded" => {
-            DemoStore::open_with_limits_and_physical(
+            DemoStore::open_with_limits_and_physical_and_operations(
                 &database_path,
                 storage_limits.clone(),
                 physical_limits.clone(),
+                operation_limits.clone(),
             )
             .await?
         }
         "local-development" => {
             let marker_root = std::env::var("ZEUS_LOCAL_MARKER_ROOT")
                 .unwrap_or_else(|_| ".zeus/local-markers".into());
-            DemoStore::open_local_with_limits_and_physical(
+            DemoStore::open_local_with_limits_and_physical_and_operations(
                 &database_path,
                 marker_root,
                 storage_limits,
                 physical_limits,
+                operation_limits,
             )
             .await?
         }
@@ -162,6 +165,26 @@ fn configured_sqlite_physical_limits() -> Result<SqlitePhysicalLimits, io::Error
         admission_reserve_bytes: environment_u64(
             "ZEUS_SQLITE_ADMISSION_RESERVE_BYTES",
             defaults.admission_reserve_bytes,
+        )?,
+    }
+    .validated()
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+}
+
+fn configured_sqlite_operation_limits() -> Result<SqliteOperationLimits, io::Error> {
+    let defaults = SqliteOperationLimits::default();
+    SqliteOperationLimits {
+        max_concurrent_operations: environment_capacity(
+            "ZEUS_SQLITE_MAX_CONCURRENT_OPERATIONS",
+            defaults.max_concurrent_operations,
+        )?,
+        reserved_progress_operations: environment_capacity(
+            "ZEUS_SQLITE_RESERVED_PROGRESS_OPERATIONS",
+            defaults.reserved_progress_operations,
+        )?,
+        acquire_timeout_ms: environment_u64(
+            "ZEUS_SQLITE_OPERATION_ACQUIRE_TIMEOUT_MS",
+            defaults.acquire_timeout_ms,
         )?,
     }
     .validated()

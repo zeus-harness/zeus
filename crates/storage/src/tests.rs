@@ -3,7 +3,10 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -23,8 +26,9 @@ use crate::{
     AuthSessionCommit, BootstrapOwnerCommit, ClaimOutcome, CommitOutcome, DispatchCompleteCommit,
     DispatchJobSpec, DispatchRecoveryCommit, DispatchStartCommit, DispatchStatus,
     ReplyClaimOutcome, ReplyFailureCommit, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
-    ReplySuccessCommit, ReviewCommit, RunSnapshot, RuntimeIdentity, SqlitePhysicalLimits,
-    SqliteStore, StorageError, StorageLimits, StoredUserRole, StoredUserStatus,
+    ReplySuccessCommit, ReviewCommit, RunSnapshot, RuntimeIdentity, SqliteOperationLimits,
+    SqlitePhysicalLimits, SqliteStore, StorageError, StorageLimits, StoredUserRole,
+    StoredUserStatus,
 };
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
@@ -204,8 +208,268 @@ fn persistent_store_lock_holder() {
 async fn independent_memory_databases_do_not_share_the_file_lease() {
     let first = SqliteStore::open(":memory:").await.unwrap();
     let second = SqliteStore::open(":memory:").await.unwrap();
+    assert_eq!(first.operation_limits(), &SqliteOperationLimits::default());
+    assert_eq!(second.operation_limits(), &SqliteOperationLimits::default());
     first.readiness().await.unwrap();
     second.readiness().await.unwrap();
+}
+
+fn test_operation_limits(
+    max_concurrent_operations: usize,
+    reserved_progress_operations: usize,
+) -> SqliteOperationLimits {
+    SqliteOperationLimits {
+        max_concurrent_operations,
+        reserved_progress_operations,
+        acquire_timeout_ms: 1_000,
+    }
+}
+
+async fn operation_limited_store(
+    path: impl AsRef<Path>,
+    operation_limits: SqliteOperationLimits,
+) -> SqliteStore {
+    SqliteStore::open_with_limits_and_physical_and_operations(
+        path,
+        StorageLimits::default(),
+        SqlitePhysicalLimits::default(),
+        operation_limits,
+    )
+    .await
+    .unwrap()
+}
+
+async fn wait_for_operation_snapshot(
+    store: &SqliteStore,
+    predicate: impl Fn((usize, usize)) -> bool,
+) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if predicate(store.operation_test_snapshot()) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("operation limiter state did not converge");
+}
+
+#[tokio::test]
+async fn file_store_clones_share_the_bounded_general_operation_lane() {
+    let database = TestDatabase::new();
+    let operation_limits = test_operation_limits(2, 1);
+    let store = operation_limited_store(database.path(), operation_limits.clone()).await;
+    let clone = store.clone();
+    assert_eq!(store.operation_limits(), &operation_limits);
+
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let blocker = tokio::spawn(async move {
+        clone
+            .test_general_operation(move |_| {
+                let _ = started_tx.send(());
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .await
+    });
+    started_rx.await.unwrap();
+
+    let rejected_started = Arc::new(AtomicBool::new(false));
+    let rejected_started_in_operation = Arc::clone(&rejected_started);
+    let error = store
+        .test_general_operation(move |_| {
+            rejected_started_in_operation.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(error, StorageError::OperationCapacityExceeded));
+    assert!(!rejected_started.load(Ordering::SeqCst));
+
+    release_tx.send(()).unwrap();
+    blocker.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn operation_permits_are_released_after_success_and_error() {
+    let store = operation_limited_store(":memory:", test_operation_limits(2, 1)).await;
+
+    assert_eq!(store.test_general_operation(|_| Ok(7_u8)).await.unwrap(), 7);
+    assert!(matches!(
+        store
+            .test_general_operation::<(), _>(|_| Err(StorageError::InjectedFailure))
+            .await,
+        Err(StorageError::InjectedFailure)
+    ));
+    assert_eq!(store.test_general_operation(|_| Ok(9_u8)).await.unwrap(), 9);
+}
+
+#[tokio::test]
+async fn aborted_caller_keeps_its_permit_until_the_blocking_closure_exits() {
+    let database = TestDatabase::new();
+    let store = operation_limited_store(database.path(), test_operation_limits(2, 1)).await;
+    let blocker_store = store.clone();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let blocker = tokio::spawn(async move {
+        blocker_store
+            .test_general_operation(move |_| {
+                let _ = started_tx.send(());
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .await
+    });
+    started_rx.await.unwrap();
+    assert_eq!(store.operation_test_snapshot().0, 1);
+
+    blocker.abort();
+    assert!(blocker.await.unwrap_err().is_cancelled());
+    assert!(matches!(
+        store.test_general_operation(|_| Ok(())).await,
+        Err(StorageError::OperationCapacityExceeded)
+    ));
+    assert_eq!(store.operation_test_snapshot().0, 1);
+
+    release_tx.send(()).unwrap();
+    wait_for_operation_snapshot(&store, |(active, _)| active == 0).await;
+    store.test_general_operation(|_| Ok(())).await.unwrap();
+}
+
+#[tokio::test]
+async fn memory_progress_waits_for_its_connection_before_entering_the_blocking_pool() {
+    let store = operation_limited_store(":memory:", test_operation_limits(3, 1)).await;
+    let first_store = store.clone();
+    let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+    let (first_release_tx, first_release_rx) = std::sync::mpsc::channel();
+    let first = tokio::spawn(async move {
+        first_store
+            .test_general_operation(move |_| {
+                let _ = first_started_tx.send(());
+                first_release_rx.recv().unwrap();
+                Ok(())
+            })
+            .await
+    });
+    first_started_rx.await.unwrap();
+
+    let progress_store = store.clone();
+    let (progress_started_tx, progress_started_rx) = tokio::sync::oneshot::channel();
+    let progress = tokio::spawn(async move {
+        progress_store
+            .test_progress_operation(move |_| {
+                let _ = progress_started_tx.send(());
+                Ok(())
+            })
+            .await
+    });
+
+    wait_for_operation_snapshot(&store, |(_, memory_waiters)| memory_waiters == 1).await;
+    assert_eq!(store.operation_test_snapshot(), (1, 1));
+
+    first_release_tx.send(()).unwrap();
+    first.await.unwrap().unwrap();
+    progress_started_rx.await.unwrap();
+    progress.await.unwrap().unwrap();
+    assert_eq!(store.operation_test_snapshot(), (0, 0));
+}
+
+#[tokio::test]
+async fn durable_progress_uses_the_reserved_lane_when_general_work_is_saturated() {
+    let database = TestDatabase::new();
+    let store = operation_limited_store(database.path(), test_operation_limits(2, 1)).await;
+    let blocker_store = store.clone();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let blocker = tokio::spawn(async move {
+        blocker_store
+            .test_general_operation(move |_| {
+                let _ = started_tx.send(());
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .await
+    });
+    started_rx.await.unwrap();
+
+    assert!(matches!(
+        store.test_general_operation(|_| Ok(())).await,
+        Err(StorageError::OperationCapacityExceeded)
+    ));
+    assert_eq!(
+        store
+            .test_progress_operation(|_| Ok("progress"))
+            .await
+            .unwrap(),
+        "progress"
+    );
+
+    release_tx.send(()).unwrap();
+    blocker.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn durable_progress_times_out_before_spawning_when_total_capacity_is_full() {
+    let database = TestDatabase::new();
+    let store = operation_limited_store(
+        database.path(),
+        SqliteOperationLimits {
+            max_concurrent_operations: 2,
+            reserved_progress_operations: 1,
+            acquire_timeout_ms: 20,
+        },
+    )
+    .await;
+
+    let general_store = store.clone();
+    let (general_started_tx, general_started_rx) = tokio::sync::oneshot::channel();
+    let (general_release_tx, general_release_rx) = std::sync::mpsc::channel();
+    let general = tokio::spawn(async move {
+        general_store
+            .test_general_operation(move |_| {
+                let _ = general_started_tx.send(());
+                general_release_rx.recv().unwrap();
+                Ok(())
+            })
+            .await
+    });
+    general_started_rx.await.unwrap();
+
+    let progress_store = store.clone();
+    let (progress_started_tx, progress_started_rx) = tokio::sync::oneshot::channel();
+    let (progress_release_tx, progress_release_rx) = std::sync::mpsc::channel();
+    let progress = tokio::spawn(async move {
+        progress_store
+            .test_progress_operation(move |_| {
+                let _ = progress_started_tx.send(());
+                progress_release_rx.recv().unwrap();
+                Ok(())
+            })
+            .await
+    });
+    progress_started_rx.await.unwrap();
+
+    let rejected_started = Arc::new(AtomicBool::new(false));
+    let rejected_started_in_operation = Arc::clone(&rejected_started);
+    assert!(matches!(
+        store
+            .test_progress_operation(move |_| {
+                rejected_started_in_operation.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await,
+        Err(StorageError::OperationCapacityExceeded)
+    ));
+    assert!(!rejected_started.load(Ordering::SeqCst));
+
+    general_release_tx.send(()).unwrap();
+    progress_release_tx.send(()).unwrap();
+    general.await.unwrap().unwrap();
+    progress.await.unwrap().unwrap();
+    store.test_general_operation(|_| Ok(())).await.unwrap();
+    store.test_progress_operation(|_| Ok(())).await.unwrap();
 }
 
 #[tokio::test]
@@ -1043,7 +1307,8 @@ async fn legacy_oversized_run_and_review_identifiers_remain_usable_after_reopen(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_same_key_commits_once_and_replays_the_rest() {
     let database = TestDatabase::new();
-    let store = seeded_file_store(database.path()).await;
+    let store =
+        seeded_file_store_with_operation_limits(database.path(), test_operation_limits(9, 1)).await;
     let (snapshot, _) = seed_fixture();
     let commit = approved_commit(&snapshot, "concurrent-same-key");
 
@@ -2295,7 +2560,7 @@ async fn open_turn_and_started_reply_recovery_use_fixed_sixty_four_row_batches()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_session_commands_use_receipt_replay_and_sequence_cas() {
     let database = TestDatabase::new();
-    let store = SqliteStore::open(database.path()).await.unwrap();
+    let store = operation_limited_store(database.path(), test_operation_limits(9, 1)).await;
     store
         .create_session(alpha_session_request(), "create-concurrent-session")
         .await
@@ -6714,6 +6979,16 @@ fn production_identity() -> RuntimeIdentity {
 
 async fn seeded_file_store(path: &Path) -> SqliteStore {
     let store = SqliteStore::open(path).await.unwrap();
+    let (snapshot, events) = seed_fixture();
+    assert!(store.seed_if_empty(snapshot, events).await.unwrap());
+    store
+}
+
+async fn seeded_file_store_with_operation_limits(
+    path: &Path,
+    operation_limits: SqliteOperationLimits,
+) -> SqliteStore {
+    let store = operation_limited_store(path, operation_limits).await;
     let (snapshot, events) = seed_fixture();
     assert!(store.seed_if_empty(snapshot, events).await.unwrap());
     store

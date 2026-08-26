@@ -4,7 +4,10 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     net::{IpAddr, SocketAddr},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicU8, Ordering as AtomicOrdering},
+    },
     time::{Duration, Instant as StdInstant},
 };
 
@@ -64,6 +67,91 @@ const SSE_GLOBAL_CONNECTION_LIMIT: usize = 64;
 const SSE_ACTOR_CONNECTION_LIMIT: usize = 4;
 const SSE_CAPACITY_RETRY_AFTER: Duration = Duration::from_secs(2);
 const PERSISTED_REPLY_REQUEST_MAX_MESSAGES: usize = 64;
+const WORKER_ERROR_RETRY_DELAY: Duration = Duration::from_millis(25);
+const WORKER_IDLE: u8 = 0;
+const WORKER_RUNNING: u8 = 1;
+const WORKER_PENDING: u8 = 2;
+
+#[derive(Default)]
+struct WorkerWakeState {
+    state: AtomicU8,
+}
+
+impl WorkerWakeState {
+    fn request(&self) -> bool {
+        loop {
+            match self.state.load(AtomicOrdering::Acquire) {
+                WORKER_IDLE => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            WORKER_IDLE,
+                            WORKER_RUNNING,
+                            AtomicOrdering::AcqRel,
+                            AtomicOrdering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+                WORKER_RUNNING => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            WORKER_RUNNING,
+                            WORKER_PENDING,
+                            AtomicOrdering::AcqRel,
+                            AtomicOrdering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return false;
+                    }
+                }
+                WORKER_PENDING => return false,
+                _ => unreachable!("invalid worker wake state"),
+            }
+        }
+    }
+
+    fn complete_cycle(&self) -> bool {
+        loop {
+            match self.state.load(AtomicOrdering::Acquire) {
+                WORKER_RUNNING => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            WORKER_RUNNING,
+                            WORKER_IDLE,
+                            AtomicOrdering::AcqRel,
+                            AtomicOrdering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return false;
+                    }
+                }
+                WORKER_PENDING => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            WORKER_PENDING,
+                            WORKER_RUNNING,
+                            AtomicOrdering::AcqRel,
+                            AtomicOrdering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+                WORKER_IDLE => return false,
+                _ => unreachable!("invalid worker wake state"),
+            }
+        }
+    }
+}
 
 const LOGIN_RATE_POLICY: RateLimitPolicy = RateLimitPolicy {
     global_limit: 60,
@@ -433,6 +521,7 @@ impl Drop for SseLease {
 struct ReplyExecutor {
     provider: Arc<dyn ReplyProvider>,
     drain: Mutex<()>,
+    worker_wake: WorkerWakeState,
 }
 
 #[derive(Clone)]
@@ -495,6 +584,7 @@ pub fn authenticated_app_with_provider(
     let reply = Arc::new(ReplyExecutor {
         provider,
         drain: Mutex::new(()),
+        worker_wake: WorkerWakeState::default(),
     });
     let state = ApiState {
         store,
@@ -1219,16 +1309,29 @@ fn reply_executor(state: &ApiState) -> Result<&ReplyExecutor, ApiError> {
 }
 
 fn kick_reply_worker(state: &ApiState) {
-    if state.reply.is_none() {
-        return;
-    }
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         return;
     };
+    let Some(reply) = &state.reply else {
+        return;
+    };
+    if !reply.worker_wake.request() {
+        return;
+    }
     let state = state.clone();
     runtime.spawn(async move {
-        if let Err(error) = drain_reply_jobs(&state).await {
-            eprintln!("zeus reply worker stopped: {error}");
+        loop {
+            if let Err(error) = drain_reply_jobs(&state).await {
+                eprintln!("zeus reply worker stopped: {error}");
+                tokio::time::sleep(WORKER_ERROR_RETRY_DELAY).await;
+            }
+            let reply = state
+                .reply
+                .as_ref()
+                .expect("a scheduled reply worker requires a provider");
+            if !reply.worker_wake.complete_cycle() {
+                return;
+            }
         }
     });
 }
@@ -1295,9 +1398,10 @@ async fn process_reply_job(state: &ApiState, job: ReplyJob) -> Result<(), StoreE
         )
         .await;
     }
-    let response = match reply.provider.reply(request).await {
-        Ok(response) => response,
-        Err(error) => {
+    let provider = Arc::clone(&reply.provider);
+    let response = match tokio::spawn(async move { provider.reply(request).await }).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
             if matches!(&error, ProviderError::Timeout | ProviderError::Transport) {
                 return mark_reply_outcome_unknown(
                     state,
@@ -1312,6 +1416,16 @@ async fn process_reply_job(state: &ApiState, job: ReplyJob) -> Result<(), StoreE
                 &job,
                 provider_error_code(&error),
                 provider_error_message(&error),
+            )
+            .await;
+        }
+        Err(_) => {
+            eprintln!("zeus reply provider task panicked; settling outcome_unknown");
+            return mark_reply_outcome_unknown(
+                state,
+                &job,
+                "provider_panicked",
+                "The reply provider stopped unexpectedly after the durable start checkpoint",
             )
             .await;
         }
@@ -1335,7 +1449,11 @@ async fn process_reply_job(state: &ApiState, job: ReplyJob) -> Result<(), StoreE
         .await;
     }
 
-    let expected_sequence = state.store.session_summary(&job.session_id).await?.sequence;
+    let expected_sequence = state
+        .store
+        .session_summary_for_progress(&job.session_id)
+        .await?
+        .sequence;
     let response_json = match serde_json::to_value(&response) {
         Ok(value) => value,
         Err(_) => {
@@ -1396,7 +1514,11 @@ async fn fail_reply_job(
     code: &str,
     message: &str,
 ) -> Result<(), StoreError> {
-    let expected_sequence = state.store.session_summary(&job.session_id).await?.sequence;
+    let expected_sequence = state
+        .store
+        .session_summary_for_progress(&job.session_id)
+        .await?
+        .sequence;
     state
         .store
         .complete_reply_failure(ReplyFailureCommit {
@@ -1417,7 +1539,11 @@ async fn mark_reply_outcome_unknown(
     code: &str,
     message: &str,
 ) -> Result<(), StoreError> {
-    let expected_sequence = state.store.session_summary(&job.session_id).await?.sequence;
+    let expected_sequence = state
+        .store
+        .session_summary_for_progress(&job.session_id)
+        .await?
+        .sequence;
     state
         .store
         .complete_reply_outcome_unknown(ReplyOutcomeUnknownCommit {
@@ -2367,6 +2493,17 @@ impl ApiError {
         .with_no_store()
     }
 
+    fn sqlite_operation_capacity_exceeded() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sqlite_operation_capacity_exceeded",
+            "SQLite operation capacity exceeded",
+            "The durable store is temporarily at its blocking-operation capacity",
+        )
+        .with_retry_after(Duration::from_secs(1))
+        .with_no_store()
+    }
+
     fn reply_queue_capacity_exceeded() -> Self {
         Self::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -2495,6 +2632,7 @@ impl From<StoreError> for ApiError {
             StoreError::UserNotFound(_) | StoreError::UserDisabled(_) => Self::invalid_login(),
             StoreError::StorageQuotaExceeded => Self::storage_quota_exceeded(),
             StoreError::PhysicalStorageExhausted => Self::physical_storage_exhausted(),
+            StoreError::OperationCapacityExceeded => Self::sqlite_operation_capacity_exceeded(),
             StoreError::ReplyQueueCapacityExceeded => Self::reply_queue_capacity_exceeded(),
             StoreError::DispatchQueueCapacityExceeded => Self::dispatch_queue_capacity_exceeded(),
             StoreError::AuthSessionCapacityExceeded => Self::auth_session_capacity_exceeded(),
@@ -2631,6 +2769,18 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[test]
+    fn reply_worker_wake_state_coalesces_kicks_without_losing_a_pending_cycle() {
+        let wake = WorkerWakeState::default();
+        assert!(wake.request());
+        assert!(!wake.request());
+        assert!(!wake.request());
+        assert!(wake.complete_cycle());
+        assert!(!wake.complete_cycle());
+        assert!(wake.request());
+        assert!(!wake.complete_cycle());
+    }
 
     struct ManualRateLimitClock {
         now: StdMutex<StdInstant>,
@@ -3029,6 +3179,7 @@ mod tests {
             reply: Some(Arc::new(ReplyExecutor {
                 provider: Arc::new(LocalFallbackProvider::new()),
                 drain: Mutex::new(()),
+                worker_wake: WorkerWakeState::default(),
             })),
             sse_capacity: SseCapacity::production(),
         };
@@ -3174,6 +3325,7 @@ mod tests {
     enum IndeterminateFailure {
         Timeout,
         Transport,
+        Panic,
     }
 
     struct IndeterminateProvider {
@@ -3205,6 +3357,9 @@ mod tests {
                 Err(match failure {
                     IndeterminateFailure::Timeout => ProviderError::Timeout,
                     IndeterminateFailure::Transport => ProviderError::Transport,
+                    IndeterminateFailure::Panic => {
+                        panic!("test provider panic must be isolated")
+                    }
                 })
             })
         }
@@ -3409,6 +3564,7 @@ mod tests {
             reply: Some(Arc::new(ReplyExecutor {
                 provider,
                 drain: Mutex::new(()),
+                worker_wake: WorkerWakeState::default(),
             })),
             sse_capacity: SseCapacity::production(),
         };
@@ -3489,6 +3645,7 @@ mod tests {
             reply: Some(Arc::new(ReplyExecutor {
                 provider,
                 drain: Mutex::new(()),
+                worker_wake: WorkerWakeState::default(),
             })),
             sse_capacity: SseCapacity::production(),
         };
@@ -3526,6 +3683,7 @@ mod tests {
                 IndeterminateFailure::Transport,
                 "provider_transport_failed",
             ),
+            ("panic", IndeterminateFailure::Panic, "provider_panicked"),
         ] {
             let store = DemoStore::seeded().await.unwrap();
             let bootstrap_hash = "d".repeat(64);
@@ -3598,6 +3756,7 @@ mod tests {
                 reply: Some(Arc::new(ReplyExecutor {
                     provider,
                     drain: Mutex::new(()),
+                    worker_wake: WorkerWakeState::default(),
                 })),
                 sse_capacity: SseCapacity::production(),
             };
@@ -5432,6 +5591,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_operation_capacity_uses_a_stable_retryable_503_contract() {
+        let response = ApiError::from(StoreError::OperationCapacityExceeded).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
+        let problem: ProblemDetails = response_json(response).await;
+        assert_eq!(problem.code, "sqlite_operation_capacity_exceeded");
+        assert_eq!(problem.title, "SQLite operation capacity exceeded");
+        assert!(!problem.detail.contains("permit"));
+        assert!(!problem.detail.contains("timeout"));
+    }
+
+    #[tokio::test]
     async fn missing_finalization_reservation_is_sanitized_and_not_cached() {
         let response =
             ApiError::from(StoreError::FinalizationReservationUnavailable).into_response();
@@ -5548,6 +5723,7 @@ mod tests {
             reply: Some(Arc::new(ReplyExecutor {
                 provider: Arc::new(LocalFallbackProvider::new()),
                 drain: Mutex::new(()),
+                worker_wake: WorkerWakeState::default(),
             })),
             sse_capacity: SseCapacity::production(),
         };
