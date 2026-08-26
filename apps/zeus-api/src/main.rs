@@ -113,6 +113,18 @@ fn configured_storage_limits() -> Result<StorageLimits, io::Error> {
             "ZEUS_MAX_RUN_EVENT_SLOTS_PER_RUN",
             defaults.run_event_slots_per_run,
         )?,
+        session_event_payload_bytes_per_session: environment_capacity(
+            "ZEUS_MAX_SESSION_EVENT_PAYLOAD_BYTES_PER_SESSION",
+            defaults.session_event_payload_bytes_per_session,
+        )?,
+        run_event_payload_bytes_per_run: environment_capacity(
+            "ZEUS_MAX_RUN_EVENT_PAYLOAD_BYTES_PER_RUN",
+            defaults.run_event_payload_bytes_per_run,
+        )?,
+        event_payload_bytes_global: environment_capacity(
+            "ZEUS_MAX_EVENT_PAYLOAD_BYTES_GLOBAL",
+            defaults.event_payload_bytes_global,
+        )?,
         bootstrap_audit_rows: environment_capacity(
             "ZEUS_MAX_BOOTSTRAP_AUDIT_ROWS",
             defaults.bootstrap_audit_rows,

@@ -867,7 +867,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
     let owner: Option<String> = connection
         .query_row(
             "SELECT owner_user_id FROM runs WHERE id = ?1",
@@ -987,7 +987,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
     assert_eq!(
         run_event_payloads(database.path(), &long_run_id),
         payloads_before,
-        "v9 migration must only backfill lookup columns"
+        "v9-v11 migrations must not rewrite immutable event payloads"
     );
     let connection = rusqlite::Connection::open(database.path()).unwrap();
     let version: i64 = connection
@@ -995,7 +995,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     let approval_plan = explain_query_plan(
         &connection,
         r#"SELECT sequence FROM run_events
@@ -4436,6 +4436,316 @@ async fn session_quota_rejects_a_new_key_but_replays_an_admitted_create() {
 }
 
 #[tokio::test]
+async fn session_event_payload_byte_limits_admit_exact_and_reject_plus_one_atomically() {
+    let first = CreateSessionRequest {
+        id: "session-byte-exact-one".into(),
+        title: "Exact byte fixture one".into(),
+    };
+    let second = CreateSessionRequest {
+        id: "session-byte-exact-two".into(),
+        title: "Exact byte fixture two".into(),
+    };
+
+    let probe_database = TestDatabase::new();
+    {
+        let probe = SqliteStore::open(probe_database.path()).await.unwrap();
+        probe
+            .create_session(first.clone(), "probe-byte-one")
+            .await
+            .unwrap();
+        probe
+            .create_session(second.clone(), "probe-byte-two")
+            .await
+            .unwrap();
+    }
+    let probe = rusqlite::Connection::open(probe_database.path()).unwrap();
+    let first_bytes: usize = probe
+        .query_row(
+            "SELECT event_payload_bytes FROM sessions WHERE id = ?1",
+            [&first.id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let second_bytes: usize = probe
+        .query_row(
+            "SELECT event_payload_bytes FROM sessions WHERE id = ?1",
+            [&second.id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+    drop(probe);
+
+    let exact_resource_database = TestDatabase::new();
+    let exact_resource = SqliteStore::open_with_limits(
+        exact_resource_database.path(),
+        StorageLimits {
+            session_event_payload_bytes_per_session: first_bytes,
+            ..StorageLimits::default()
+        },
+    )
+    .await
+    .unwrap();
+    exact_resource
+        .create_session(first.clone(), "exact-resource-byte-one")
+        .await
+        .unwrap();
+    let exact_counter: i64 = rusqlite::Connection::open(exact_resource_database.path())
+        .unwrap()
+        .query_row(
+            "SELECT event_payload_bytes FROM sessions WHERE id = ?1",
+            [&first.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(exact_counter, i64::try_from(first_bytes).unwrap());
+
+    let below_resource_database = TestDatabase::new();
+    let below_resource = SqliteStore::open_with_limits(
+        below_resource_database.path(),
+        StorageLimits {
+            session_event_payload_bytes_per_session: first_bytes - 1,
+            ..StorageLimits::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        below_resource
+            .create_session(first.clone(), "below-resource-byte-one")
+            .await,
+        Err(StorageError::StorageQuotaExceeded)
+    ));
+    let below_connection = rusqlite::Connection::open(below_resource_database.path()).unwrap();
+    assert_eq!(
+        below_connection
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        below_connection
+            .query_row("SELECT COUNT(*) FROM session_command_receipts", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0,
+        "a rejected byte admission must not leave an idempotency receipt"
+    );
+
+    let global_exact = first_bytes.checked_add(second_bytes).unwrap();
+    let exact_global_database = TestDatabase::new();
+    let exact_global = SqliteStore::open_with_limits(
+        exact_global_database.path(),
+        StorageLimits {
+            session_event_payload_bytes_per_session: first_bytes.max(second_bytes),
+            run_event_payload_bytes_per_run: 1,
+            event_payload_bytes_global: global_exact,
+            ..StorageLimits::default()
+        },
+    )
+    .await
+    .unwrap();
+    exact_global
+        .create_session(first.clone(), "exact-global-byte-one")
+        .await
+        .unwrap();
+    exact_global
+        .create_session(second.clone(), "exact-global-byte-two")
+        .await
+        .unwrap();
+    let global_counter: i64 = rusqlite::Connection::open(exact_global_database.path())
+        .unwrap()
+        .query_row(
+            "SELECT used_bytes FROM event_payload_usage WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(global_counter, i64::try_from(global_exact).unwrap());
+
+    let below_global_database = TestDatabase::new();
+    let below_global = SqliteStore::open_with_limits(
+        below_global_database.path(),
+        StorageLimits {
+            session_event_payload_bytes_per_session: first_bytes.max(second_bytes),
+            run_event_payload_bytes_per_run: 1,
+            event_payload_bytes_global: global_exact - 1,
+            ..StorageLimits::default()
+        },
+    )
+    .await
+    .unwrap();
+    below_global
+        .create_session(first.clone(), "below-global-byte-one")
+        .await
+        .unwrap();
+    assert!(matches!(
+        below_global
+            .create_session(second.clone(), "below-global-byte-two")
+            .await,
+        Err(StorageError::StorageQuotaExceeded)
+    ));
+    let below_global_connection = rusqlite::Connection::open(below_global_database.path()).unwrap();
+    assert_eq!(
+        below_global_connection
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        below_global_connection
+            .query_row(
+                "SELECT used_bytes FROM event_payload_usage WHERE singleton = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        i64::try_from(first_bytes).unwrap(),
+        "global +1 rejection must roll back its event and counter charge"
+    );
+}
+
+#[tokio::test]
+async fn run_event_payload_byte_limit_admits_exact_and_rejects_plus_one_atomically() {
+    let (snapshot, events) = seed_fixture();
+    let probe_database = TestDatabase::new();
+    let probe_commit = approved_commit(&snapshot, "probe-run-payload-bytes");
+    let (baseline_bytes, review_bytes) = {
+        let probe = SqliteStore::open(probe_database.path()).await.unwrap();
+        assert!(
+            probe
+                .seed_if_empty(snapshot.clone(), events.clone())
+                .await
+                .unwrap()
+        );
+        let connection = rusqlite::Connection::open(probe_database.path()).unwrap();
+        let before: i64 = connection
+            .query_row(
+                "SELECT event_payload_bytes FROM runs WHERE id = ?1",
+                [RUN_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            probe.commit_review(probe_commit).await.unwrap(),
+            CommitOutcome::Committed
+        );
+        let after: i64 = rusqlite::Connection::open(probe_database.path())
+            .unwrap()
+            .query_row(
+                "SELECT event_payload_bytes FROM runs WHERE id = ?1",
+                [RUN_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (before, after - before)
+    };
+    assert!(baseline_bytes > 0);
+    assert!(review_bytes > 0);
+    let exact_limit: usize = baseline_bytes
+        .checked_add(review_bytes)
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+    let exact_database = TestDatabase::new();
+    let exact = SqliteStore::open_with_limits(
+        exact_database.path(),
+        StorageLimits {
+            run_event_payload_bytes_per_run: exact_limit,
+            ..StorageLimits::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        exact
+            .seed_if_empty(snapshot.clone(), events.clone())
+            .await
+            .unwrap()
+    );
+    let exact_commit = approved_commit(&snapshot, "exact-run-payload-bytes");
+    assert_eq!(
+        exact.commit_review(exact_commit.clone()).await.unwrap(),
+        CommitOutcome::Committed
+    );
+    let exact_loaded = exact.load_run(RUN_ID).await.unwrap();
+    assert_eq!(exact_loaded.snapshot.run.sequence, 7);
+    assert_eq!(exact_loaded.events.len(), 7);
+    assert_eq!(exact_loaded.events.last(), Some(&exact_commit.event));
+    assert!(
+        exact
+            .review_receipt("exact-run-payload-bytes")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        rusqlite::Connection::open(exact_database.path())
+            .unwrap()
+            .query_row(
+                "SELECT event_payload_bytes FROM runs WHERE id = ?1",
+                [RUN_ID],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        i64::try_from(exact_limit).unwrap()
+    );
+
+    let below_database = TestDatabase::new();
+    let below = SqliteStore::open_with_limits(
+        below_database.path(),
+        StorageLimits {
+            run_event_payload_bytes_per_run: exact_limit - 1,
+            ..StorageLimits::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        below
+            .seed_if_empty(snapshot.clone(), events.clone())
+            .await
+            .unwrap()
+    );
+    assert!(matches!(
+        below
+            .commit_review(approved_commit(&snapshot, "below-run-payload-bytes"))
+            .await,
+        Err(StorageError::StorageQuotaExceeded)
+    ));
+    let unchanged = below.load_run(RUN_ID).await.unwrap();
+    assert_eq!(unchanged.snapshot.run.sequence, 6);
+    assert_eq!(unchanged.events.len(), 6);
+    assert!(
+        below
+            .review_receipt("below-run-payload-bytes")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        rusqlite::Connection::open(below_database.path())
+            .unwrap()
+            .query_row(
+                "SELECT event_payload_bytes FROM runs WHERE id = ?1",
+                [RUN_ID],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        baseline_bytes,
+        "a rejected review must roll back its event counter charge"
+    );
+}
+
+#[tokio::test]
 async fn open_turn_quota_admits_the_exact_limit_and_rejects_plus_one_atomically() {
     let limits = StorageLimits {
         sessions_per_scope: 3,
@@ -4580,6 +4890,13 @@ async fn reply_reservations_cover_success_failure_and_missing_claim_fail_closed(
         session_finalization_slots(database.path(), "session-alpha", "turn-reserved-success"),
         Some(2)
     );
+    let success_reservation = 524_288
+        + 12 * i64::try_from("turn-reserved-success".len()).unwrap()
+        + 6 * i64::try_from("test-provider".len() + "test-model".len()).unwrap();
+    assert_eq!(
+        session_finalization_capacity(database.path(), "session-alpha", "turn-reserved-success"),
+        Some((2, success_reservation))
+    );
     assert!(matches!(
         store.claim_next_reply().await.unwrap(),
         ReplyClaimOutcome::Claimed(_)
@@ -4587,6 +4904,11 @@ async fn reply_reservations_cover_success_failure_and_missing_claim_fail_closed(
     assert_eq!(
         session_finalization_slots(database.path(), "session-alpha", "turn-reserved-success"),
         Some(2)
+    );
+    assert_eq!(
+        session_finalization_capacity(database.path(), "session-alpha", "turn-reserved-success"),
+        Some((2, success_reservation)),
+        "claiming a reply must not consume its terminal reservation"
     );
     store
         .complete_reply_success(ReplySuccessCommit {
@@ -4697,6 +5019,13 @@ async fn dispatch_reservation_rolls_back_then_transitions_two_to_one_to_deleted(
         dispatch_finalization_slots(database.path(), RUN_ID, "call-local-001"),
         Some(2)
     );
+    assert_eq!(
+        dispatch_finalization_capacity(database.path(), RUN_ID, "call-local-001"),
+        Some((
+            2,
+            98_304 + 12 * i64::try_from("call-local-001".len()).unwrap()
+        ))
+    );
 
     let start = start_commit(&review.snapshot);
     assert!(matches!(
@@ -4714,6 +5043,13 @@ async fn dispatch_reservation_rolls_back_then_transitions_two_to_one_to_deleted(
     assert_eq!(
         dispatch_finalization_slots(database.path(), RUN_ID, "call-local-001"),
         Some(1)
+    );
+    assert_eq!(
+        dispatch_finalization_capacity(database.path(), RUN_ID, "call-local-001"),
+        Some((
+            1,
+            65_536 + 6 * i64::try_from("call-local-001".len()).unwrap()
+        ))
     );
 
     let completion = completion_commit(&start.snapshot);
@@ -4814,6 +5150,527 @@ async fn auth_session_capacity_counts_only_active_rows_and_cleans_expired_rows()
 }
 
 #[tokio::test]
+async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempotent() {
+    let database = TestDatabase::new();
+    let session_id = "session-v10-byte-backfill";
+    {
+        let store = SqliteStore::open(database.path()).await.unwrap();
+        store
+            .create_session(
+                CreateSessionRequest {
+                    id: session_id.into(),
+                    title: "v10 byte migration fixture".into(),
+                },
+                "create-v10-byte-backfill",
+            )
+            .await
+            .unwrap();
+        let (snapshot, events) = seed_fixture();
+        assert!(store.seed_if_empty(snapshot, events).await.unwrap());
+    }
+    downgrade_event_payload_fixture_to_v10(database.path());
+
+    let session_payload = serde_json::to_string(&json!({
+        "ascii": "ASCII-quoted",
+        "emoji": "🙂",
+        "nul": "\0",
+        "quote": "\"double\"",
+    }))
+    .unwrap();
+    let run_payload = serde_json::to_string(&json!({
+        "ascii": "run",
+        "emoji": "运行🙂",
+        "nul": "\0",
+        "quote": "'single' and \"double\"",
+    }))
+    .unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER session_events_reject_update;
+               DROP TRIGGER run_events_reject_update;"#,
+        )
+        .unwrap();
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE session_events SET payload_json = ?1 WHERE session_id = ?2 AND sequence = 1",
+                params![&session_payload, session_id],
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE run_events SET payload_json = ?1 WHERE run_id = ?2 AND sequence = 1",
+                params![&run_payload, RUN_ID],
+            )
+            .unwrap(),
+        1
+    );
+    connection
+        .execute_batch(
+            r#"CREATE TRIGGER session_events_reject_update
+               BEFORE UPDATE ON session_events
+               BEGIN
+                   SELECT RAISE(ABORT, 'session_events are append-only');
+               END;
+               CREATE TRIGGER run_events_reject_update
+               BEFORE UPDATE ON run_events
+               BEGIN
+                   SELECT RAISE(ABORT, 'run_events are append-only');
+               END;"#,
+        )
+        .unwrap();
+
+    let session_special_bytes: i64 = connection
+        .query_row(
+            "SELECT length(CAST(?1 AS BLOB))",
+            [&session_payload],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let run_special_bytes: i64 = connection
+        .query_row("SELECT length(CAST(?1 AS BLOB))", [&run_payload], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        session_special_bytes,
+        i64::try_from(session_payload.len()).unwrap()
+    );
+    assert_eq!(run_special_bytes, i64::try_from(run_payload.len()).unwrap());
+    let expected_session_bytes: i64 = connection
+        .query_row(
+            r#"SELECT COALESCE(SUM(length(CAST(payload_json AS BLOB))), 0)
+               FROM session_events WHERE session_id = ?1"#,
+            [session_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let expected_run_bytes: i64 = connection
+        .query_row(
+            r#"SELECT COALESCE(SUM(length(CAST(payload_json AS BLOB))), 0)
+               FROM run_events WHERE run_id = ?1"#,
+            [RUN_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let expected_global_bytes: i64 = connection
+        .query_row(
+            r#"SELECT
+                   COALESCE((SELECT SUM(length(CAST(payload_json AS BLOB)))
+                             FROM session_events), 0)
+                 + COALESCE((SELECT SUM(length(CAST(payload_json AS BLOB)))
+                             FROM run_events), 0)"#,
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(connection);
+
+    {
+        let migrated = SqliteStore::open(database.path()).await.unwrap();
+        migrated.readiness().await.unwrap();
+        let connection = rusqlite::Connection::open(database.path()).unwrap();
+        let counters: (i64, i64, i64) = connection
+            .query_row(
+                r#"SELECT
+                       (SELECT event_payload_bytes FROM sessions WHERE id = ?1),
+                       (SELECT event_payload_bytes FROM runs WHERE id = ?2),
+                       (SELECT used_bytes FROM event_payload_usage WHERE singleton = 1)"#,
+                params![session_id, RUN_ID],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            counters,
+            (
+                expected_session_bytes,
+                expected_run_bytes,
+                expected_global_bytes
+            )
+        );
+    }
+
+    let reopened = SqliteStore::open(database.path()).await.unwrap();
+    reopened.readiness().await.unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let versions = connection
+        .prepare("SELECT version FROM schema_migrations ORDER BY version")
+        .unwrap()
+        .query_map([], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(versions, (1_i64..=11).collect::<Vec<_>>());
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT used_bytes FROM event_payload_usage WHERE singleton = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        expected_global_bytes,
+        "reopening v11 must not charge historical payloads a second time"
+    );
+}
+
+#[tokio::test]
+async fn readiness_rejects_parent_global_and_reservation_payload_counter_tampering() {
+    let parent_database = TestDatabase::new();
+    let parent_store = SqliteStore::open(parent_database.path()).await.unwrap();
+    parent_store
+        .create_session(
+            CreateSessionRequest {
+                id: "session-parent-counter-tamper".into(),
+                title: "Parent counter tamper".into(),
+            },
+            "create-parent-counter-tamper",
+        )
+        .await
+        .unwrap();
+    let parent_connection = rusqlite::Connection::open(parent_database.path()).unwrap();
+    assert_eq!(
+        parent_connection
+            .execute(
+                r#"UPDATE sessions
+                   SET event_payload_bytes = event_payload_bytes + 1
+                   WHERE id = 'session-parent-counter-tamper'"#,
+                [],
+            )
+            .unwrap(),
+        1
+    );
+    assert!(matches!(
+        parent_store.readiness().await,
+        Err(StorageError::CorruptData(message))
+            if message.contains("event payload byte counters")
+    ));
+
+    let global_database = TestDatabase::new();
+    let global_store = SqliteStore::open(global_database.path()).await.unwrap();
+    global_store
+        .create_session(
+            CreateSessionRequest {
+                id: "session-global-counter-tamper".into(),
+                title: "Global counter tamper".into(),
+            },
+            "create-global-counter-tamper",
+        )
+        .await
+        .unwrap();
+    let global_connection = rusqlite::Connection::open(global_database.path()).unwrap();
+    assert_eq!(
+        global_connection
+            .execute(
+                "UPDATE event_payload_usage SET used_bytes = used_bytes + 1 WHERE singleton = 1",
+                [],
+            )
+            .unwrap(),
+        1
+    );
+    assert!(matches!(
+        global_store.readiness().await,
+        Err(StorageError::CorruptData(message))
+            if message.contains("event payload byte counters")
+    ));
+
+    let reservation_database = TestDatabase::new();
+    let reservation_store = created_owned_file_session_store(reservation_database.path()).await;
+    reservation_store
+        .start_turn_for_actor(
+            "user-owner",
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-reservation-counter-tamper".into(),
+                user_message: "Reserve terminal payload capacity".into(),
+                expected_sequence: 1,
+            },
+            "start-reservation-counter-tamper",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        force_finalization_reservation_update(
+            reservation_database.path(),
+            r#"UPDATE finalization_reservations
+               SET remaining_event_slots = 1,
+                   remaining_event_payload_bytes = remaining_event_payload_bytes - 1
+               WHERE kind = 'session_turn'
+                 AND session_id = 'session-alpha'
+                 AND turn_id = 'turn-reservation-counter-tamper'"#,
+            &[],
+        ),
+        1
+    );
+    assert!(matches!(
+        reservation_store.readiness().await,
+        Err(StorageError::CorruptData(message))
+            if message.contains("finalization reservations")
+    ));
+}
+
+#[tokio::test]
+async fn insert_or_replace_cannot_reuse_event_ids_or_change_payload_counters() {
+    let database = TestDatabase::new();
+    {
+        let store = SqliteStore::open(database.path()).await.unwrap();
+        store
+            .create_session(
+                CreateSessionRequest {
+                    id: "session-replace-hardening".into(),
+                    title: "Replace hardening".into(),
+                },
+                "create-replace-hardening",
+            )
+            .await
+            .unwrap();
+        let (snapshot, events) = seed_fixture();
+        assert!(store.seed_if_empty(snapshot, events).await.unwrap());
+    }
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let before: (i64, i64, i64, String, String) = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT event_payload_bytes FROM sessions
+                    WHERE id = 'session-replace-hardening'),
+                   (SELECT event_payload_bytes FROM runs WHERE id = ?1),
+                   (SELECT used_bytes FROM event_payload_usage WHERE singleton = 1),
+                   (SELECT payload_json FROM session_events
+                    WHERE session_id = 'session-replace-hardening' AND sequence = 1),
+                   (SELECT payload_json FROM run_events
+                    WHERE run_id = ?1 AND sequence = 1)"#,
+            [RUN_ID],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+
+    assert!(
+        connection
+            .execute(
+                r#"INSERT OR REPLACE INTO session_events(
+                       session_id, sequence, event_id, event_kind, payload_version,
+                       payload_json, turn_id, created_at
+                   )
+                   SELECT session_id, 2, event_id, event_kind, payload_version,
+                          payload_json, turn_id, created_at
+                   FROM session_events
+                   WHERE session_id = 'session-replace-hardening' AND sequence = 1"#,
+                [],
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute(
+                r#"INSERT OR REPLACE INTO run_events(
+                       run_id, sequence, event_id, event_kind, payload_version, payload_json
+                   )
+                   SELECT run_id, 7, event_id, event_kind, payload_version, payload_json
+                   FROM run_events WHERE run_id = ?1 AND sequence = 1"#,
+                [RUN_ID],
+            )
+            .is_err()
+    );
+
+    let after: (i64, i64, i64, i64, i64, String, String) = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT event_payload_bytes FROM sessions
+                    WHERE id = 'session-replace-hardening'),
+                   (SELECT event_payload_bytes FROM runs WHERE id = ?1),
+                   (SELECT used_bytes FROM event_payload_usage WHERE singleton = 1),
+                   (SELECT COUNT(*) FROM session_events
+                    WHERE session_id = 'session-replace-hardening'),
+                   (SELECT COUNT(*) FROM run_events WHERE run_id = ?1),
+                   (SELECT payload_json FROM session_events
+                    WHERE session_id = 'session-replace-hardening' AND sequence = 1),
+                   (SELECT payload_json FROM run_events
+                    WHERE run_id = ?1 AND sequence = 1)"#,
+            [RUN_ID],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!((after.0, after.1, after.2), (before.0, before.1, before.2));
+    assert_eq!((after.3, after.4), (1, 6));
+    assert_eq!((after.5, after.6), (before.3, before.4));
+}
+
+#[tokio::test]
+async fn reply_job_insert_requires_provider_model_payload_reservation() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    let turn_id = "turn-provider-budget-hardening";
+    store
+        .start_turn_for_actor(
+            "user-owner",
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: turn_id.into(),
+                user_message: "Reserve only a manual turn terminal".into(),
+                expected_sequence: 1,
+            },
+            "start-provider-budget-hardening",
+        )
+        .await
+        .unwrap();
+    let reservation_before =
+        session_finalization_capacity(database.path(), "session-alpha", turn_id).unwrap();
+    assert_eq!(
+        reservation_before,
+        (2, 524_288 + 12 * i64::try_from(turn_id.len()).unwrap())
+    );
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let inserted = connection.execute(
+        r#"INSERT INTO reply_jobs(
+               id, actor_user_id, session_id, turn_id, provider_name, model_name,
+               status, attempt, request_json, response_json, error_json,
+               completion_fingerprint, assistant_event_sequence,
+               terminal_event_sequence, queued_at, started_at, finished_at
+           ) VALUES (
+               'reply-provider-budget-hardening', 'user-owner', 'session-alpha', ?1,
+               'test-provider', 'test-model', 'queued', 0, '{}', NULL, NULL,
+               NULL, NULL, NULL, ?2, NULL, NULL
+           )"#,
+        params![turn_id, "2026-08-27T00:00:00.000Z"],
+    );
+    assert!(inserted.is_err());
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM reply_jobs WHERE id = 'reply-provider-budget-hardening'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        session_finalization_capacity(database.path(), "session-alpha", turn_id),
+        Some(reservation_before),
+        "a rejected reply job must not mutate the manual-turn reservation"
+    );
+}
+
+#[tokio::test]
+async fn claims_fail_closed_on_insufficient_payload_reservations_before_state_transition() {
+    let reply_database = TestDatabase::new();
+    let reply_store = created_owned_file_session_store(reply_database.path()).await;
+    reply_store
+        .start_turn_and_enqueue_reply_for_actor(
+            "user-owner",
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-insufficient-payload-reservation".into(),
+                user_message: "Do not start this provider request".into(),
+                expected_sequence: 1,
+            },
+            "start-insufficient-payload-reservation",
+            reply_job_spec(
+                "reply-insufficient-payload-reservation",
+                "turn-insufficient-payload-reservation",
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        force_finalization_reservation_update(
+            reply_database.path(),
+            r#"UPDATE finalization_reservations
+               SET remaining_event_slots = 1,
+                   remaining_event_payload_bytes = remaining_event_payload_bytes - 1
+               WHERE kind = 'session_turn'
+                 AND session_id = 'session-alpha'
+                 AND turn_id = 'turn-insufficient-payload-reservation'"#,
+            &[],
+        ),
+        1
+    );
+    assert!(matches!(
+        reply_store.claim_next_reply().await,
+        Err(StorageError::FinalizationReservationUnavailable)
+    ));
+    let reply = reply_store
+        .reply_job("reply-insufficient-payload-reservation")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply.status, ReplyJobStatus::Queued);
+    assert_eq!(reply.attempt, 0);
+    assert_eq!(
+        reply_store
+            .get_session("session-alpha")
+            .await
+            .unwrap()
+            .session
+            .sequence,
+        2
+    );
+
+    let dispatch_database = TestDatabase::new();
+    let dispatch_store = seeded_file_store(dispatch_database.path()).await;
+    bootstrap_test_owner(&dispatch_store).await;
+    let (snapshot, _) = seed_fixture();
+    let review = approved_dispatch_commit(&snapshot, "dispatch-insufficient-payload-reservation");
+    dispatch_store.commit_review(review.clone()).await.unwrap();
+    assert_eq!(
+        force_finalization_reservation_update(
+            dispatch_database.path(),
+            r#"UPDATE finalization_reservations
+               SET remaining_event_slots = 1,
+                   remaining_event_payload_bytes = remaining_event_payload_bytes - 1
+               WHERE kind = 'dispatch' AND run_id = ?1 AND call_id = 'call-local-001'"#,
+            &[&RUN_ID],
+        ),
+        1
+    );
+    assert!(matches!(
+        dispatch_store
+            .claim_next_dispatch(start_commit(&review.snapshot))
+            .await,
+        Err(StorageError::FinalizationReservationUnavailable)
+    ));
+    let dispatch = dispatch_store
+        .dispatch_job("call-local-001")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(dispatch.status, DispatchStatus::Queued);
+    assert_eq!(
+        dispatch_store
+            .load_run(RUN_ID)
+            .await
+            .unwrap()
+            .snapshot
+            .run
+            .sequence,
+        7
+    );
+}
+
+#[tokio::test]
 async fn v9_database_over_new_limits_still_opens_reads_and_recovers() {
     let database = TestDatabase::new();
     {
@@ -4851,6 +5708,9 @@ async fn v9_database_over_new_limits_still_opens_reads_and_recovers() {
         sessions_global: 1,
         open_turns_per_scope: 1,
         open_turns_global: 1,
+        session_event_payload_bytes_per_session: 1,
+        run_event_payload_bytes_per_run: 1,
+        event_payload_bytes_global: 1,
         ..StorageLimits::default()
     };
     let reopened = SqliteStore::open_with_limits(database.path(), limits)
@@ -5001,6 +5861,24 @@ fn session_finalization_slots(path: &Path, session_id: &str, turn_id: &str) -> O
         .unwrap()
 }
 
+fn session_finalization_capacity(
+    path: &Path,
+    session_id: &str,
+    turn_id: &str,
+) -> Option<(i64, i64)> {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .query_row(
+            r#"SELECT remaining_event_slots, remaining_event_payload_bytes
+               FROM finalization_reservations
+               WHERE kind = 'session_turn' AND session_id = ?1 AND turn_id = ?2"#,
+            params![session_id, turn_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .unwrap()
+}
+
 fn dispatch_finalization_slots(path: &Path, run_id: &str, call_id: &str) -> Option<i64> {
     let connection = rusqlite::Connection::open(path).unwrap();
     connection
@@ -5015,23 +5893,62 @@ fn dispatch_finalization_slots(path: &Path, run_id: &str, call_id: &str) -> Opti
         .unwrap()
 }
 
-fn remove_session_finalization_reservation(path: &Path, session_id: &str, turn_id: &str) {
+fn dispatch_finalization_capacity(path: &Path, run_id: &str, call_id: &str) -> Option<(i64, i64)> {
     let connection = rusqlite::Connection::open(path).unwrap();
-    let changed = connection
-        .execute(
-            r#"UPDATE finalization_reservations
-               SET remaining_event_slots = 0
-               WHERE kind = 'session_turn' AND session_id = ?1 AND turn_id = ?2
-                 AND remaining_event_slots = 2"#,
-            params![session_id, turn_id],
+    connection
+        .query_row(
+            r#"SELECT remaining_event_slots, remaining_event_payload_bytes
+               FROM finalization_reservations
+               WHERE kind = 'dispatch' AND run_id = ?1 AND call_id = ?2"#,
+            params![run_id, call_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .unwrap()
+}
+
+fn force_finalization_reservation_update(
+    path: &Path,
+    statement: &str,
+    parameters: &[&dyn rusqlite::ToSql],
+) -> usize {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    let guard_sql: String = connection
+        .query_row(
+            r#"SELECT sql FROM sqlite_master
+               WHERE type = 'trigger'
+                 AND name = 'finalization_reservations_enforce_update'"#,
+            [],
+            |row| row.get(0),
         )
         .unwrap();
+    connection
+        .execute_batch("DROP TRIGGER finalization_reservations_enforce_update;")
+        .unwrap();
+    let changed = connection.execute(statement, parameters).unwrap();
+    connection.execute_batch(&guard_sql).unwrap();
+    changed
+}
+
+fn remove_session_finalization_reservation(path: &Path, session_id: &str, turn_id: &str) {
+    let changed = force_finalization_reservation_update(
+        path,
+        r#"UPDATE finalization_reservations
+               SET remaining_event_slots = 0,
+                   remaining_event_payload_bytes = 0
+               WHERE kind = 'session_turn' AND session_id = ?1 AND turn_id = ?2
+                 AND remaining_event_slots = 2
+                 AND remaining_event_payload_bytes > 0"#,
+        &[&session_id, &turn_id],
+    );
     assert_eq!(changed, 1);
+    let connection = rusqlite::Connection::open(path).unwrap();
     let deleted = connection
         .execute(
             r#"DELETE FROM finalization_reservations
                WHERE kind = 'session_turn' AND session_id = ?1 AND turn_id = ?2
-                 AND remaining_event_slots = 0"#,
+                 AND remaining_event_slots = 0
+                 AND remaining_event_payload_bytes = 0"#,
             params![session_id, turn_id],
         )
         .unwrap();
@@ -5058,9 +5975,54 @@ fn downgrade_capacity_fixture_to_v9(path: &Path) {
     let connection = rusqlite::Connection::open(path).unwrap();
     connection
         .execute_batch(
-            r#"DROP TABLE finalization_reservations;
+            r#"DROP TRIGGER session_events_charge_payload_bytes;
+               DROP TRIGGER run_events_charge_payload_bytes;
+               DROP TRIGGER session_events_require_next_sequence;
+               DROP TRIGGER run_events_require_next_sequence;
+               DROP TRIGGER reply_jobs_require_session_owner;
+               DROP TRIGGER sessions_event_payload_bytes_reject_rollback;
+               DROP TRIGGER runs_event_payload_bytes_reject_rollback;
+               DROP TRIGGER event_payload_usage_reject_duplicate_insert;
+               DROP TRIGGER event_payload_usage_enforce_monotonic_update;
+               DROP TRIGGER event_payload_usage_reject_delete;
+               DROP TRIGGER finalization_reservations_require_event_payload_capacity_on_insert;
+               DROP TRIGGER finalization_reservations_enforce_update;
+               DROP TRIGGER finalization_reservations_reject_live_delete;
+               DROP TABLE event_payload_usage;
+               ALTER TABLE sessions DROP COLUMN event_payload_bytes;
+               ALTER TABLE runs DROP COLUMN event_payload_bytes;
+               DROP TABLE finalization_reservations;
                DROP INDEX auth_sessions_expiry_idx;
-               DELETE FROM schema_migrations WHERE version = 10;"#,
+
+               CREATE TRIGGER session_events_require_next_sequence
+               BEFORE INSERT ON session_events
+               WHEN NEW.sequence <> (
+                   SELECT sequence + 1 FROM sessions WHERE id = NEW.session_id
+               )
+               BEGIN
+                   SELECT RAISE(ABORT, 'session event sequence must be contiguous');
+               END;
+
+               CREATE TRIGGER run_events_require_next_sequence
+               BEFORE INSERT ON run_events
+               WHEN NEW.sequence <> COALESCE((
+                   SELECT MAX(sequence) + 1
+                   FROM run_events
+                   WHERE run_id = NEW.run_id
+               ), 1)
+               BEGIN
+                   SELECT RAISE(ABORT, 'run event sequence must be contiguous');
+               END;
+
+               CREATE TRIGGER reply_jobs_require_session_owner
+               BEFORE INSERT ON reply_jobs
+               WHEN NEW.actor_user_id
+                    IS NOT (SELECT owner_user_id FROM sessions WHERE id = NEW.session_id)
+               BEGIN
+                   SELECT RAISE(ABORT, 'reply actor must own the session');
+               END;
+
+               DELETE FROM schema_migrations WHERE version >= 10;"#,
         )
         .unwrap();
     let version: i64 = connection
@@ -5069,6 +6031,99 @@ fn downgrade_capacity_fixture_to_v9(path: &Path) {
         })
         .unwrap();
     assert_eq!(version, 9);
+}
+
+fn downgrade_event_payload_fixture_to_v10(path: &Path) {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER session_events_charge_payload_bytes;
+               DROP TRIGGER run_events_charge_payload_bytes;
+               DROP TRIGGER session_events_require_next_sequence;
+               DROP TRIGGER run_events_require_next_sequence;
+               DROP TRIGGER reply_jobs_require_session_owner;
+               DROP TRIGGER sessions_event_payload_bytes_reject_rollback;
+               DROP TRIGGER runs_event_payload_bytes_reject_rollback;
+               DROP TRIGGER event_payload_usage_reject_duplicate_insert;
+               DROP TRIGGER event_payload_usage_enforce_monotonic_update;
+               DROP TRIGGER event_payload_usage_reject_delete;
+               DROP TRIGGER finalization_reservations_require_event_payload_capacity_on_insert;
+               DROP TRIGGER finalization_reservations_enforce_update;
+               DROP TRIGGER finalization_reservations_reject_live_delete;
+               DROP TABLE event_payload_usage;
+               ALTER TABLE sessions DROP COLUMN event_payload_bytes;
+               ALTER TABLE runs DROP COLUMN event_payload_bytes;
+               ALTER TABLE finalization_reservations
+                   DROP COLUMN remaining_event_payload_bytes;
+
+               CREATE TRIGGER session_events_require_next_sequence
+               BEFORE INSERT ON session_events
+               WHEN NEW.sequence <> (
+                   SELECT sequence + 1 FROM sessions WHERE id = NEW.session_id
+               )
+               BEGIN
+                   SELECT RAISE(ABORT, 'session event sequence must be contiguous');
+               END;
+
+               CREATE TRIGGER run_events_require_next_sequence
+               BEFORE INSERT ON run_events
+               WHEN NEW.sequence <> COALESCE((
+                   SELECT MAX(sequence) + 1
+                   FROM run_events
+                   WHERE run_id = NEW.run_id
+               ), 1)
+               BEGIN
+                   SELECT RAISE(ABORT, 'run event sequence must be contiguous');
+               END;
+
+               CREATE TRIGGER reply_jobs_require_session_owner
+               BEFORE INSERT ON reply_jobs
+               WHEN NEW.actor_user_id
+                    IS NOT (SELECT owner_user_id FROM sessions WHERE id = NEW.session_id)
+               BEGIN
+                   SELECT RAISE(ABORT, 'reply actor must own the session');
+               END;
+
+               CREATE TRIGGER finalization_reservations_enforce_update
+               BEFORE UPDATE ON finalization_reservations
+               WHEN NOT (
+                   NEW.kind IS OLD.kind
+                   AND NEW.session_id IS OLD.session_id
+                   AND NEW.turn_id IS OLD.turn_id
+                   AND NEW.run_id IS OLD.run_id
+                   AND NEW.call_id IS OLD.call_id
+                   AND NEW.reserved_bytes IS OLD.reserved_bytes
+                   AND NEW.created_at IS OLD.created_at
+                   AND (
+                       (NEW.scope_id IS OLD.scope_id
+                           AND NEW.remaining_event_slots >= 0
+                           AND NEW.remaining_event_slots < OLD.remaining_event_slots)
+                       OR
+                       (OLD.scope_id = '__legacy__'
+                           AND NEW.scope_id <> '__legacy__'
+                           AND NEW.remaining_event_slots = OLD.remaining_event_slots)
+                   )
+               )
+               BEGIN
+                   SELECT RAISE(ABORT, 'reservation updates must consume slots or claim legacy scope');
+               END;
+
+               CREATE TRIGGER finalization_reservations_reject_live_delete
+               BEFORE DELETE ON finalization_reservations
+               WHEN OLD.remaining_event_slots <> 0
+               BEGIN
+                   SELECT RAISE(ABORT, 'reservation must be empty before deletion');
+               END;
+
+               DELETE FROM schema_migrations WHERE version = 11;"#,
+        )
+        .unwrap();
+    let version: i64 = connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(version, 10);
 }
 
 fn finalization_reservation_count(path: &Path) -> i64 {
@@ -5179,6 +6234,9 @@ fn insert_legacy_oversized_reply_fixture(
         .unwrap();
     let timestamp = "2026-08-27T00:00:00.000Z";
     let title = "Legacy oversized Session";
+    let finalization_payload_bytes = 524_288_i64
+        + 12 * i64::try_from(turn_id.len()).unwrap()
+        + 6 * i64::try_from("test-provider".len() + "test-model".len()).unwrap();
     connection
         .execute(
             r#"INSERT INTO sessions(
@@ -5265,6 +6323,19 @@ fn insert_legacy_oversized_reply_fixture(
 
     connection
         .execute(
+            r#"INSERT INTO finalization_reservations(
+                   kind, scope_id, session_id, turn_id, run_id, call_id,
+                   remaining_event_slots, remaining_event_payload_bytes,
+                   reserved_bytes, created_at
+               ) VALUES (
+                   'session_turn', 'user-owner', ?1, ?2, NULL, NULL,
+                   2, ?3, NULL, ?4
+               )"#,
+            params![session_id, turn_id, finalization_payload_bytes, timestamp],
+        )
+        .unwrap();
+    connection
+        .execute(
             r#"INSERT INTO reply_jobs(
                    id, actor_user_id, session_id, turn_id, provider_name, model_name,
                    status, attempt, request_json, response_json, error_json,
@@ -5284,18 +6355,6 @@ fn insert_legacy_oversized_reply_fixture(
                 .unwrap(),
                 timestamp,
             ],
-        )
-        .unwrap();
-    connection
-        .execute(
-            r#"INSERT INTO finalization_reservations(
-                   kind, scope_id, session_id, turn_id, run_id, call_id,
-                   remaining_event_slots, reserved_bytes, created_at
-               ) VALUES (
-                   'session_turn', 'user-owner', ?1, ?2, NULL, NULL,
-                   2, NULL, ?3
-               )"#,
-            params![session_id, turn_id, timestamp],
         )
         .unwrap();
 }

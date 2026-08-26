@@ -79,7 +79,8 @@ writable through the browser Settings API.
 SQLite logical-capacity defaults can be reduced for local tests or raised only
 up to the compiled hard ceiling. Explicit values must be non-empty unsigned
 decimal integers; zero, non-UTF-8, per-scope values above their global value,
-and values above the hard ceiling fail startup.
+per-ledger event-payload byte limits above the global byte limit, and values
+above the hard ceiling fail startup.
 
 | Environment variable | Default | Hard ceiling |
 | --- | ---: | ---: |
@@ -95,11 +96,17 @@ and values above the hard ceiling fail startup.
 | `ZEUS_MAX_AUTH_SESSIONS_GLOBAL` | 256 | 4,096 |
 | `ZEUS_MAX_SESSION_EVENT_SLOTS_PER_SESSION` | 10,000 | 100,000 |
 | `ZEUS_MAX_RUN_EVENT_SLOTS_PER_RUN` | 50,000 | 500,000 |
+| `ZEUS_MAX_SESSION_EVENT_PAYLOAD_BYTES_PER_SESSION` | 64 MiB (67,108,864) | 256 MiB (268,435,456) |
+| `ZEUS_MAX_RUN_EVENT_PAYLOAD_BYTES_PER_RUN` | 256 MiB (268,435,456) | 1 GiB (1,073,741,824) |
+| `ZEUS_MAX_EVENT_PAYLOAD_BYTES_GLOBAL` | 1 GiB (1,073,741,824) | 2 GiB (2,147,483,648) |
 | `ZEUS_MAX_BOOTSTRAP_AUDIT_ROWS` | 1,024 | 65,536 |
 
 Event-slot limits cover the current durable ledger head plus slots reserved for
-accepted work to reach a terminal state. They are not byte, database-file, WAL,
-or free-disk guarantees.
+accepted work to reach a terminal state. Event-payload byte limits similarly
+cover the UTF-8 byte length of serialized `session_events.payload_json` and
+`run_events.payload_json` plus outstanding finalization reservations. They do
+not cover other rows, indexes, SQLite page overhead, the database file, WAL, or
+free-disk capacity.
 
 To exercise the only executable Alpha connector, use a separate database and
 an explicit fixed root. The caller supplies marker text only; it cannot choose
@@ -327,7 +334,10 @@ and bounded memory, CPU, and PID resources.
   Run-event insertion enforcement, and fixed 64-row startup-recovery batches.
   Schema v10 adds owner/global row and active-work admission limits, durable
   Session-turn and dispatch event-slot reservations, bounded expired-auth-session
-  cleanup, and readiness checks for reservation ownership and lifecycle.
+  cleanup, and readiness checks for reservation ownership and lifecycle. Schema
+  v11 adds exact Session/Run/global logical event-payload byte counters and
+  conservative terminal byte reservations, with migration backfill and trigger-
+  enforced accounting over the stored UTF-8 JSON.
   Existing Runs and events are decoded, validated, and migrated in place without
   rewriting their payloads. Runtime identity still binds profile, environment,
   primary Session and Run, policy ID, and policy revision; a mismatch fails
@@ -363,8 +373,8 @@ directly.
   state changes additionally require `X-CSRF-Token` to match the login and an
   exact same-origin request. Alpha+ deliberately rejects the schema-reserved
   `member` role. Actor isolation is now present, but member access remains
-  blocked until terminal-payload byte reservation, a tenant/account membership
-  scope, SQLite/WAL emergency headroom, and bootstrap-audit retention policy land.
+  blocked until a tenant/account membership scope, SQLite/WAL emergency
+  headroom, and a bootstrap-audit retention policy land.
 - `GET /api/v1/me/settings` returns the current safe preferences.
   `PATCH /api/v1/me/settings` accepts `theme`, optional allowlisted
   `preferred_model`, and `expected_revision`. Provider endpoints and API keys
@@ -437,7 +447,7 @@ directly.
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Schema v10 retains durable Run attachment during migration and demo seeding,
+Schema v11 retains durable Run attachment during migration and demo seeding,
 but Alpha+ does not expose a public attach-Run HTTP route.
 
 The application boundary now caps auth JSON at 8 KiB and command JSON at
@@ -457,15 +467,19 @@ approval, dispatch, reply completion, attachment checks, and startup recovery
 use typed point queries or fixed 64-row batches. Production Session list/detail,
 Run detail, and overview reads now use indexed `LIMIT + 1` keyset pages inside
 actor-authorized SQLite snapshots; no production HTTP read loads a complete
-ledger or collection. Schema v10 enforces bounded Session, open-turn, active
-reply/dispatch, auth-session, bootstrap-audit, and event-slot admission. Exact
-idempotent replay is checked before capacity, while accepted work consumes its
-reserved terminal slots without ordinary admission. Expired auth sessions are
-deleted in deterministic batches of at most 64 on startup and before session
-creation; append-only ledgers, receipts, jobs, turns, and audit records are not
-silently pruned. Aggregate event-payload byte accounting/reservation, main
-DB/WAL/disk headroom, and a complete audit retention horizon remain unresolved,
-so shared-network and multi-tenant deployment is still out of scope.
+ledger or collection. Schema v11 enforces bounded Session, open-turn, active
+reply/dispatch, auth-session, bootstrap-audit, event-slot, and logical event-
+payload-byte admission. Exact idempotent replay is checked before capacity,
+while accepted work consumes its reserved terminal slots and payload bytes
+without ordinary admission. Parent-ledger and global counters are charged by
+SQLite triggers from the exact stored UTF-8 `payload_json`; migration backfills
+existing bytes and conservatively reserves active work so historical databases
+can still drain even when they exceed a newly configured limit. Expired auth
+sessions are deleted in deterministic batches of at most 64 on startup and
+before session creation; append-only ledgers, receipts, jobs, turns, and audit
+records are not silently pruned. Main DB/WAL/disk headroom and a complete audit
+retention horizon remain unresolved, so shared-network and multi-tenant
+deployment is still out of scope.
 
 ## Container images
 
@@ -515,11 +529,11 @@ committed data. Use SQLite's backup/checkpoint facilities.
 
 Current Alpha+ plus Actor Boundary Foundation, API Resource Envelope, Terminal
 Payload Envelope, Bounded Event Feed, Point-query Durable Context, Bounded Read
-Models, and SQLite Capacity Slice 1 host verification:
+Models, and SQLite Capacity Slice 2 host verification:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --all-targets`: 229 tests passed, including the real
+- `cargo test --workspace --all-targets`: 237 tests passed, including the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,
   body/field/idempotency boundaries, atomic login limits, SSE lease capacity,
@@ -529,8 +543,10 @@ Models, and SQLite Capacity Slice 1 host verification:
   independent Session/Run history tails, actor/resource-scoped cursors, an
   old-turn point lookup for durable retry recovery, concurrent claim, and
   provider `outcome_unknown` semantics. Capacity coverage includes exact-limit
-  and limit-plus-one admission, terminal event-slot reservation lifecycles,
-  startup seed idempotency, over-limit legacy migration/recovery, bounded
+  and limit-plus-one admission, terminal event-slot and logical payload-byte
+  reservation lifecycles, UTF-8 migration backfill, counter-integrity and
+  `INSERT OR REPLACE` hardening, startup seed idempotency, over-limit legacy
+  migration/recovery, bounded
   expired-auth cleanup, fail-closed environment parsing, typed reply/tool
   payload envelopes, canonical dispatch admission, and one-shot oversized
   provider/executor settlement without persisting the rejected payload.

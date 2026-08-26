@@ -1,7 +1,7 @@
 # Zeus Harness Alpha+ 设计冻结
 
-状态：主机 Alpha+、Actor Boundary Foundation、API/Terminal Payload Resource Envelope、Bounded Event Feed、Point-query Durable Context、Bounded Read Models 与 SQLite Capacity Slice 1 已实现并通过主机全量验收；Apple container 新镜像验收待完成
-前置基线：`8656e52`（Bounded Read Models）
+状态：主机 Alpha+、Actor Boundary Foundation、API/Terminal Payload Resource Envelope、Bounded Event Feed、Point-query Durable Context、Bounded Read Models 与 SQLite Capacity Slice 2 已实现并通过主机全量验收；Apple container 新镜像验收待完成
+前置基线：`4916276`（Terminal Payload Envelope）
 
 ## 1. 产品术语
 
@@ -47,9 +47,9 @@ Health 路由保持公开。公开注册、邮件找回、OAuth/SSO、WebAuthn �
 
 这些边界只是未来 member 能力的安全底座。当前 API 仍拒绝 member 登录；字段、HTTP/SSE
 连接、事件页边界、内部 point/batch read 和 Session/Run 有界 read model 已经落地，但
-即使第一阶段 SQLite 行数、活跃队列和 event-slot 配额已落地，也不得开放 member。剩余门槛是
-terminal payload byte reservation、tenant/account membership scope、SQLite 主库/WAL/磁盘
-应急余量，以及 bootstrap audit 的明确保留期。
+即使 SQLite 行数、活跃队列、event-slot 和事件载荷逻辑字节配额已落地，也不得开放 member。
+剩余门槛是 tenant/account membership scope、SQLite 主库/WAL/磁盘应急余量，以及
+bootstrap audit 的明确保留期。
 
 Resource Envelope 的固定边界：auth JSON 8 KiB、command JSON 512 KiB；新建 Session/turn
 ID 128 UTF-8 bytes、Session title 256 bytes、user/assistant message 64 KiB、review note 8 KiB；
@@ -76,20 +76,23 @@ actor/resource scope 绑定的 opaque cursor，页内仍按原顺序升序输出
 确认时保留原 idempotency key，不把旧消息改成新命令重发。异步点查返回前若用户切换 Session
 或 attempt identity 已改变，selection epoch/session/turn/key guard 会丢弃旧结果。
 
-SQLite Capacity Slice 1 在每个 `BEGIN IMMEDIATE` admission 事务内执行 owner scope 与 global
+SQLite Capacity Slice 2 在每个 `BEGIN IMMEDIATE` admission 事务内执行 owner scope 与 global
 双层限制：Session 1,000/10,000、open turn 32/64、active reply 32/64、active dispatch
 16/32、auth session 每用户/全局 32/256。每个 Session 的 ledger head 加未消费预留槽默认
-最多 10,000，每个 Run 默认 50,000；bootstrap audit 默认最多 1,024 行。配置可调但不得为
-0、不得让 scope 超过 global，也不得越过编译期 hard ceiling。鉴权和 exact receipt replay
-先于容量检查，所以 foreign resource 仍是 `404`，已成功命令在满配额时仍能 replay。
+最多 10,000，每个 Run 默认 50,000；Session/Run 的 `payload_json` 逻辑 UTF-8 字节默认分别
+限制为 64 MiB/256 MiB，全局合计默认 1 GiB；bootstrap audit 默认最多 1,024 行。配置可调但
+不得为 0、不得让 scope/per-ledger 超过 global，也不得越过编译期 hard ceiling。鉴权和 exact
+receipt replay 先于容量检查，所以 foreign resource 仍是 `404`，已成功命令在满配额时仍能 replay。
 
-接受 turn 时预留两个 Session 终结事件槽；接受 dispatch 时预留两个 Run 槽。reply claim
-必须确认两个槽仍在，dispatch claim 消耗一个 started 槽，success/failure/rejection/recovery
-在同一事务消费或释放剩余槽并删除空 reservation。reservation 丢失时 provider/connector
+接受 turn 时同时预留两个 Session 终结事件槽和保守载荷字节；接受 dispatch 时同时预留两个
+Run 槽和 start+terminal 字节。reply claim 必须确认完整预留仍在；dispatch claim 把 2 个槽
+变为 1 个，并把字节预留收敛为 terminal 上界；success/failure/rejection/recovery 在同一事务
+消费或释放剩余槽与字节并删除空 reservation。reservation 丢失或不足时在 provider/connector
 之前 fail closed 为脱敏 `503`。普通容量拒绝为带 `Cache-Control: no-store` 的 `429`；reply/
-dispatch queue 另带 `Retry-After: 2`。该阶段只保证 event row slots，不宣称 payload bytes、
-DB file、WAL 或宿主磁盘空间有保证。过期 auth session 只在启动和新建登录会话前按稳定顺序
-清理最多 64 行；ledger、receipt、job、turn 和 bootstrap audit 不做静默删除。
+dispatch queue 另带 `Retry-After: 2`。计量只覆盖 `session_events.payload_json` 与
+`run_events.payload_json` 的实际 UTF-8 序列化字节，不宣称 DB file、WAL、索引、page overhead
+或宿主磁盘空间有保证。过期 auth session 只在启动和新建登录会话前按稳定顺序清理最多 64 行；
+ledger、receipt、job、turn 和 bootstrap audit 不做静默删除。
 
 ## 4. 设置
 

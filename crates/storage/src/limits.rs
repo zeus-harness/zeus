@@ -1,14 +1,13 @@
 //! Validated logical capacity limits for the Alpha SQLite store.
 //!
-//! These limits bound durable row counts, active work, and event slots. Event
-//! slot limits apply to the durable ledger head plus every outstanding reserved
-//! slot, so callers cannot consume the terminal-event capacity needed by work
-//! that is already in flight.
+//! These limits bound durable row counts, active work, event slots, and the
+//! logical UTF-8 byte length of serialized event payloads. Slot and payload-byte
+//! limits apply to the durable ledger plus every outstanding finalization
+//! reservation, so callers cannot consume the terminal-event capacity needed by
+//! work that is already in flight.
 //!
-//! Byte and SQLite/WAL size guarantees are deliberately absent. They require a
-//! separate, transactionally enforced byte-reservation design; adding byte-like
-//! configuration here without that enforcement would present a false storage
-//! guarantee.
+//! Logical event-payload bytes do not represent SQLite database-file, WAL,
+//! index, page-overhead, or free-disk usage.
 
 use thiserror::Error;
 
@@ -24,6 +23,9 @@ pub const DEFAULT_AUTH_SESSIONS_PER_USER: usize = 32;
 pub const DEFAULT_AUTH_SESSIONS_GLOBAL: usize = 256;
 pub const DEFAULT_SESSION_EVENT_SLOTS_PER_SESSION: usize = 10_000;
 pub const DEFAULT_RUN_EVENT_SLOTS_PER_RUN: usize = 50_000;
+pub const DEFAULT_SESSION_EVENT_PAYLOAD_BYTES_PER_SESSION: usize = 64 * 1024 * 1024;
+pub const DEFAULT_RUN_EVENT_PAYLOAD_BYTES_PER_RUN: usize = 256 * 1024 * 1024;
+pub const DEFAULT_EVENT_PAYLOAD_BYTES_GLOBAL: usize = 1024 * 1024 * 1024;
 pub const DEFAULT_BOOTSTRAP_AUDIT_ROWS: usize = 1_024;
 
 pub const HARD_MAX_SESSIONS_PER_SCOPE: usize = 10_000;
@@ -38,6 +40,9 @@ pub const HARD_MAX_AUTH_SESSIONS_PER_USER: usize = 128;
 pub const HARD_MAX_AUTH_SESSIONS_GLOBAL: usize = 4_096;
 pub const HARD_MAX_SESSION_EVENT_SLOTS_PER_SESSION: usize = 100_000;
 pub const HARD_MAX_RUN_EVENT_SLOTS_PER_RUN: usize = 500_000;
+pub const HARD_MAX_SESSION_EVENT_PAYLOAD_BYTES_PER_SESSION: usize = 256 * 1024 * 1024;
+pub const HARD_MAX_RUN_EVENT_PAYLOAD_BYTES_PER_RUN: usize = 1024 * 1024 * 1024;
+pub const HARD_MAX_EVENT_PAYLOAD_BYTES_GLOBAL: usize = 2 * 1024 * 1024 * 1024;
 pub const HARD_MAX_BOOTSTRAP_AUDIT_ROWS: usize = 65_536;
 
 /// Logical capacity limits enforced by the SQLite storage transaction layer.
@@ -61,6 +66,12 @@ pub struct StorageLimits {
     pub session_event_slots_per_session: usize,
     /// Maximum durable Run event head plus outstanding reserved slots.
     pub run_event_slots_per_run: usize,
+    /// Maximum serialized Session event payload bytes plus outstanding reserves.
+    pub session_event_payload_bytes_per_session: usize,
+    /// Maximum serialized Run event payload bytes plus outstanding reserves.
+    pub run_event_payload_bytes_per_run: usize,
+    /// Maximum serialized Session and Run event payload bytes plus all reserves.
+    pub event_payload_bytes_global: usize,
     pub bootstrap_audit_rows: usize,
 }
 
@@ -79,6 +90,9 @@ impl StorageLimits {
         auth_sessions_global: DEFAULT_AUTH_SESSIONS_GLOBAL,
         session_event_slots_per_session: DEFAULT_SESSION_EVENT_SLOTS_PER_SESSION,
         run_event_slots_per_run: DEFAULT_RUN_EVENT_SLOTS_PER_RUN,
+        session_event_payload_bytes_per_session: DEFAULT_SESSION_EVENT_PAYLOAD_BYTES_PER_SESSION,
+        run_event_payload_bytes_per_run: DEFAULT_RUN_EVENT_PAYLOAD_BYTES_PER_RUN,
+        event_payload_bytes_global: DEFAULT_EVENT_PAYLOAD_BYTES_GLOBAL,
         bootstrap_audit_rows: DEFAULT_BOOTSTRAP_AUDIT_ROWS,
     };
 
@@ -99,6 +113,9 @@ impl StorageLimits {
         auth_sessions_global: HARD_MAX_AUTH_SESSIONS_GLOBAL,
         session_event_slots_per_session: HARD_MAX_SESSION_EVENT_SLOTS_PER_SESSION,
         run_event_slots_per_run: HARD_MAX_RUN_EVENT_SLOTS_PER_RUN,
+        session_event_payload_bytes_per_session: HARD_MAX_SESSION_EVENT_PAYLOAD_BYTES_PER_SESSION,
+        run_event_payload_bytes_per_run: HARD_MAX_RUN_EVENT_PAYLOAD_BYTES_PER_RUN,
+        event_payload_bytes_global: HARD_MAX_EVENT_PAYLOAD_BYTES_GLOBAL,
         bootstrap_audit_rows: HARD_MAX_BOOTSTRAP_AUDIT_ROWS,
     };
 
@@ -166,6 +183,21 @@ impl StorageLimits {
                 HARD_MAX_RUN_EVENT_SLOTS_PER_RUN,
             ),
             (
+                "session_event_payload_bytes_per_session",
+                self.session_event_payload_bytes_per_session,
+                HARD_MAX_SESSION_EVENT_PAYLOAD_BYTES_PER_SESSION,
+            ),
+            (
+                "run_event_payload_bytes_per_run",
+                self.run_event_payload_bytes_per_run,
+                HARD_MAX_RUN_EVENT_PAYLOAD_BYTES_PER_RUN,
+            ),
+            (
+                "event_payload_bytes_global",
+                self.event_payload_bytes_global,
+                HARD_MAX_EVENT_PAYLOAD_BYTES_GLOBAL,
+            ),
+            (
                 "bootstrap_audit_rows",
                 self.bootstrap_audit_rows,
                 HARD_MAX_BOOTSTRAP_AUDIT_ROWS,
@@ -203,6 +235,18 @@ impl StorageLimits {
             self.auth_sessions_per_user,
             "auth_sessions_global",
             self.auth_sessions_global,
+        )?;
+        validate_scope_pair(
+            "session_event_payload_bytes_per_session",
+            self.session_event_payload_bytes_per_session,
+            "event_payload_bytes_global",
+            self.event_payload_bytes_global,
+        )?;
+        validate_scope_pair(
+            "run_event_payload_bytes_per_run",
+            self.run_event_payload_bytes_per_run,
+            "event_payload_bytes_global",
+            self.event_payload_bytes_global,
         )?;
 
         Ok(())
@@ -345,6 +389,18 @@ mod tests {
                 StorageLimits::HARD_CEILINGS.run_event_slots_per_run,
             ),
             (
+                defaults.session_event_payload_bytes_per_session,
+                StorageLimits::HARD_CEILINGS.session_event_payload_bytes_per_session,
+            ),
+            (
+                defaults.run_event_payload_bytes_per_run,
+                StorageLimits::HARD_CEILINGS.run_event_payload_bytes_per_run,
+            ),
+            (
+                defaults.event_payload_bytes_global,
+                StorageLimits::HARD_CEILINGS.event_payload_bytes_global,
+            ),
+            (
                 defaults.bootstrap_audit_rows,
                 StorageLimits::HARD_CEILINGS.bootstrap_audit_rows,
             ),
@@ -355,8 +411,24 @@ mod tests {
     }
 
     #[test]
+    fn event_payload_byte_defaults_and_hard_ceilings_are_exact() {
+        let defaults = StorageLimits::default();
+        let hard_ceilings = StorageLimits::HARD_CEILINGS;
+
+        assert_eq!(defaults.session_event_payload_bytes_per_session, 64 << 20);
+        assert_eq!(defaults.run_event_payload_bytes_per_run, 256 << 20);
+        assert_eq!(defaults.event_payload_bytes_global, 1 << 30);
+        assert_eq!(
+            hard_ceilings.session_event_payload_bytes_per_session,
+            256 << 20
+        );
+        assert_eq!(hard_ceilings.run_event_payload_bytes_per_run, 1 << 30);
+        assert_eq!(hard_ceilings.event_payload_bytes_global, 2 << 30);
+    }
+
+    #[test]
     fn every_zero_field_is_rejected_with_its_name() {
-        let mutations: [LimitMutation; 13] = [
+        let mutations: [LimitMutation; 16] = [
             ("sessions_per_scope", |limits| limits.sessions_per_scope = 0),
             ("sessions_global", |limits| limits.sessions_global = 0),
             ("open_turns_per_scope", |limits| {
@@ -387,6 +459,15 @@ mod tests {
             ("run_event_slots_per_run", |limits| {
                 limits.run_event_slots_per_run = 0
             }),
+            ("session_event_payload_bytes_per_session", |limits| {
+                limits.session_event_payload_bytes_per_session = 0
+            }),
+            ("run_event_payload_bytes_per_run", |limits| {
+                limits.run_event_payload_bytes_per_run = 0
+            }),
+            ("event_payload_bytes_global", |limits| {
+                limits.event_payload_bytes_global = 0
+            }),
             ("bootstrap_audit_rows", |limits| {
                 limits.bootstrap_audit_rows = 0
             }),
@@ -406,7 +487,7 @@ mod tests {
 
     #[test]
     fn every_value_above_its_hard_ceiling_is_rejected() {
-        let mutations: [CeilingMutation; 13] = [
+        let mutations: [CeilingMutation; 16] = [
             (
                 "sessions_per_scope",
                 HARD_MAX_SESSIONS_PER_SCOPE,
@@ -474,6 +555,29 @@ mod tests {
                 |limits| limits.run_event_slots_per_run = HARD_MAX_RUN_EVENT_SLOTS_PER_RUN + 1,
             ),
             (
+                "session_event_payload_bytes_per_session",
+                HARD_MAX_SESSION_EVENT_PAYLOAD_BYTES_PER_SESSION,
+                |limits| {
+                    limits.session_event_payload_bytes_per_session =
+                        HARD_MAX_SESSION_EVENT_PAYLOAD_BYTES_PER_SESSION + 1
+                },
+            ),
+            (
+                "run_event_payload_bytes_per_run",
+                HARD_MAX_RUN_EVENT_PAYLOAD_BYTES_PER_RUN,
+                |limits| {
+                    limits.run_event_payload_bytes_per_run =
+                        HARD_MAX_RUN_EVENT_PAYLOAD_BYTES_PER_RUN + 1
+                },
+            ),
+            (
+                "event_payload_bytes_global",
+                HARD_MAX_EVENT_PAYLOAD_BYTES_GLOBAL,
+                |limits| {
+                    limits.event_payload_bytes_global = HARD_MAX_EVENT_PAYLOAD_BYTES_GLOBAL + 1
+                },
+            ),
+            (
                 "bootstrap_audit_rows",
                 HARD_MAX_BOOTSTRAP_AUDIT_ROWS,
                 |limits| limits.bootstrap_audit_rows = HARD_MAX_BOOTSTRAP_AUDIT_ROWS + 1,
@@ -496,7 +600,7 @@ mod tests {
 
     #[test]
     fn scoped_limits_must_not_exceed_their_global_limit() {
-        let cases: [ScopePairMutation; 5] = [
+        let cases: [ScopePairMutation; 7] = [
             ("sessions_per_scope", "sessions_global", |limits| {
                 limits.sessions_per_scope = 2;
                 limits.sessions_global = 1;
@@ -525,6 +629,23 @@ mod tests {
                 limits.auth_sessions_per_user = 2;
                 limits.auth_sessions_global = 1;
             }),
+            (
+                "session_event_payload_bytes_per_session",
+                "event_payload_bytes_global",
+                |limits| {
+                    limits.session_event_payload_bytes_per_session = 2;
+                    limits.event_payload_bytes_global = 1;
+                },
+            ),
+            (
+                "run_event_payload_bytes_per_run",
+                "event_payload_bytes_global",
+                |limits| {
+                    limits.session_event_payload_bytes_per_session = 1;
+                    limits.run_event_payload_bytes_per_run = 2;
+                    limits.event_payload_bytes_global = 1;
+                },
+            ),
         ];
 
         for (scope_field, global_field, mutate) in cases {

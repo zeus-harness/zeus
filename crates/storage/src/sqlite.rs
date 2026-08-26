@@ -37,7 +37,7 @@ use crate::{
     StoredRun, StoredUser, StoredUserRole, StoredUserStatus,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 10;
+const CURRENT_SCHEMA_VERSION: i64 = 11;
 const EVENT_PAYLOAD_VERSION_V1: i64 = 1;
 const EVENT_PAYLOAD_VERSION_V2: i64 = 2;
 const SESSION_EVENT_PAYLOAD_VERSION_V1: i64 = 1;
@@ -52,6 +52,7 @@ const MIGRATION_0007: &str = include_str!("../migrations/0007_reply_jobs.sql");
 const MIGRATION_0008: &str = include_str!("../migrations/0008_actor_boundaries.sql");
 const MIGRATION_0009: &str = include_str!("../migrations/0009_point_queries.sql");
 const MIGRATION_0010: &str = include_str!("../migrations/0010_capacity.sql");
+const MIGRATION_0011: &str = include_str!("../migrations/0011_event_payload_bytes.sql");
 const RECOVERY_BATCH_LIMIT: i64 = 64;
 const AUTH_SESSION_CLEANUP_BATCH_LIMIT: i64 = 64;
 const REPLY_JOB_ID_MAX_BYTES: usize = 384;
@@ -63,6 +64,38 @@ const DISPATCH_IDENTIFIER_MAX_BYTES: usize = 128;
 const DISPATCH_TOOL_NAME_MAX_BYTES: usize = 96;
 const DISPATCH_TOOL_VERSION_MAX_BYTES: usize = 64;
 const DISPATCH_ARGS_JSON_MAX_BYTES: usize = 64 * 1024;
+const SESSION_FINALIZATION_BASE_BYTES: i64 = 512 * 1024;
+const SESSION_FINALIZATION_TURN_ID_MULTIPLIER: i64 = 12;
+const SESSION_FINALIZATION_PROVIDER_MULTIPLIER: i64 = 6;
+const DISPATCH_QUEUED_FINALIZATION_BASE_BYTES: i64 = 96 * 1024;
+const DISPATCH_QUEUED_CALL_ID_MULTIPLIER: i64 = 12;
+const DISPATCH_TERMINAL_FINALIZATION_BASE_BYTES: i64 = 64 * 1024;
+const DISPATCH_TERMINAL_CALL_ID_MULTIPLIER: i64 = 6;
+
+#[derive(Debug)]
+struct EncodedEventPayload {
+    json: String,
+    bytes: i64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EventCapacityRequest {
+    new_event_slots: usize,
+    new_event_payload_bytes: i64,
+    new_reserved_slots: usize,
+    new_reserved_payload_bytes: i64,
+}
+
+impl EventCapacityRequest {
+    fn events(new_event_slots: usize, new_event_payload_bytes: i64) -> Self {
+        Self {
+            new_event_slots,
+            new_event_payload_bytes,
+            new_reserved_slots: 0,
+            new_reserved_payload_bytes: 0,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct SqliteStore {
@@ -1374,10 +1407,16 @@ fn configure_connection(connection: &Connection, enable_wal: bool) -> Result<(),
 
     let journal_mode: String =
         connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    let encoding: String = connection.pragma_query_value(None, "encoding", |row| row.get(0))?;
     let expected_journal = if enable_wal { "wal" } else { "memory" };
     if !journal_mode.eq_ignore_ascii_case(expected_journal) {
         return Err(StorageError::CorruptData(format!(
             "expected {expected_journal} journal mode, found `{journal_mode}`"
+        )));
+    }
+    if !encoding.eq_ignore_ascii_case("UTF-8") {
+        return Err(StorageError::CorruptData(format!(
+            "expected UTF-8 database encoding, found `{encoding}`"
         )));
     }
     Ok(())
@@ -1517,6 +1556,13 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
         transaction.execute(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
             params![10, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
+    if current < 11 {
+        transaction.execute_batch(MIGRATION_0011)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![11, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
     transaction.commit()?;
@@ -1661,11 +1707,13 @@ fn readiness(connection: &mut Connection, expects_wal: bool) -> Result<(), Stora
         connection.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
     let journal_mode: String =
         connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    let encoding: String = connection.pragma_query_value(None, "encoding", |row| row.get(0))?;
     let expected_journal = if expects_wal { "wal" } else { "memory" };
     if foreign_keys != 1
         || synchronous != 2
         || busy_timeout != BUSY_TIMEOUT.as_millis() as i64
         || !journal_mode.eq_ignore_ascii_case(expected_journal)
+        || !encoding.eq_ignore_ascii_case("UTF-8")
     {
         return Err(StorageError::CorruptData(
             "SQLite safety pragmas are not active".into(),
@@ -1679,12 +1727,12 @@ fn readiness(connection: &mut Connection, expects_wal: bool) -> Result<(), Stora
                'dispatch_jobs', 'runtime_identity', 'sessions', 'session_runs',
                'session_turns', 'session_events', 'session_command_receipts',
                'users', 'auth_sessions', 'bootstrap_tokens', 'user_preferences',
-               'reply_jobs', 'finalization_reservations'
+               'reply_jobs', 'finalization_reservations', 'event_payload_usage'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if table_count != 18 {
+    if table_count != 19 {
         return Err(StorageError::CorruptData(
             "one or more required tables are missing".into(),
         ));
@@ -1735,6 +1783,23 @@ fn readiness(connection: &mut Connection, expects_wal: bool) -> Result<(), Stora
     if event_lookup_columns != 5 {
         return Err(StorageError::CorruptData(
             "run event lookup projection columns are missing".into(),
+        ));
+    }
+
+    let event_payload_accounting_columns: i64 = connection.query_row(
+        r#"SELECT
+               (SELECT COUNT(*) FROM pragma_table_info('sessions')
+                WHERE name = 'event_payload_bytes')
+             + (SELECT COUNT(*) FROM pragma_table_info('runs')
+                WHERE name = 'event_payload_bytes')
+             + (SELECT COUNT(*) FROM pragma_table_info('finalization_reservations')
+                WHERE name = 'remaining_event_payload_bytes')"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if event_payload_accounting_columns != 3 {
+        return Err(StorageError::CorruptData(
+            "event payload accounting columns are missing".into(),
         ));
     }
 
@@ -1808,15 +1873,61 @@ fn readiness(connection: &mut Connection, expects_wal: bool) -> Result<(), Stora
                'finalization_reservations_require_dispatch_binding',
                'finalization_reservations_require_resource_scope_on_insert',
                'finalization_reservations_require_resource_scope_on_claim',
+               'finalization_reservations_require_event_payload_capacity_on_insert',
                'finalization_reservations_enforce_update',
-               'finalization_reservations_reject_live_delete'
+               'finalization_reservations_reject_live_delete',
+               'sessions_event_payload_bytes_reject_rollback',
+               'runs_event_payload_bytes_reject_rollback',
+               'event_payload_usage_reject_duplicate_insert',
+               'event_payload_usage_enforce_monotonic_update',
+               'event_payload_usage_reject_delete',
+               'session_events_charge_payload_bytes',
+               'run_events_charge_payload_bytes'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 44 {
+    if trigger_count != 52 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
+        ));
+    }
+
+    let event_payload_counter_violation: i64 = connection.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1
+               FROM sessions session
+               WHERE session.event_payload_bytes <> COALESCE((
+                   SELECT SUM(length(CAST(event.payload_json AS BLOB)))
+                   FROM session_events event
+                   WHERE event.session_id = session.id
+               ), 0)
+               UNION ALL
+               SELECT 1
+               FROM runs run
+               WHERE run.event_payload_bytes <> COALESCE((
+                   SELECT SUM(length(CAST(event.payload_json AS BLOB)))
+                   FROM run_events event
+                   WHERE event.run_id = run.id
+               ), 0)
+               UNION ALL
+               SELECT 1
+               WHERE (SELECT COUNT(*) FROM event_payload_usage) <> 1
+               UNION ALL
+               SELECT 1
+               FROM event_payload_usage usage
+               WHERE usage.singleton <> 1
+                  OR usage.used_bytes <> (
+                      COALESCE((SELECT SUM(event_payload_bytes) FROM sessions), 0)
+                      + COALESCE((SELECT SUM(event_payload_bytes) FROM runs), 0)
+                  )
+           )"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if event_payload_counter_violation != 0 {
+        return Err(StorageError::CorruptData(
+            "one or more event payload byte counters are inconsistent".into(),
         ));
     }
 
@@ -1908,29 +2019,101 @@ fn readiness(connection: &mut Connection, expects_wal: bool) -> Result<(), Stora
     }
 
     let finalization_violation: i64 = connection.query_row(
-        r#"SELECT EXISTS(
+        r#"WITH session_expected AS (
+               SELECT
+                   turn.session_id,
+                   turn.id AS turn_id,
+                   CASE
+                       WHEN length(CAST(turn.id AS BLOB))
+                            > ((9223372036854775807 - 524288) / 6) / 2
+                       THEN 9223372036854775807
+                       ELSE CASE
+                           WHEN length(CAST(COALESCE(job.provider_name, '') AS BLOB))
+                                > (9223372036854775807 - 524288) / 6
+                                  - 2 * length(CAST(turn.id AS BLOB))
+                           THEN 9223372036854775807
+                           ELSE CASE
+                               WHEN length(CAST(COALESCE(job.model_name, '') AS BLOB))
+                                    > (9223372036854775807 - 524288) / 6
+                                      - 2 * length(CAST(turn.id AS BLOB))
+                                      - length(CAST(COALESCE(job.provider_name, '') AS BLOB))
+                               THEN 9223372036854775807
+                               ELSE 524288 + 6 * (
+                                   2 * length(CAST(turn.id AS BLOB))
+                                   + length(CAST(COALESCE(job.provider_name, '') AS BLOB))
+                                   + length(CAST(COALESCE(job.model_name, '') AS BLOB))
+                               )
+                           END
+                       END
+                   END AS expected_bytes
+               FROM session_turns turn
+               LEFT JOIN reply_jobs job
+                 ON job.session_id = turn.session_id
+                AND job.turn_id = turn.id
+           ),
+           dispatch_expected AS (
+               SELECT
+                   job.run_id,
+                   job.call_id,
+                   CASE job.status
+                       WHEN 'queued' THEN CASE
+                           WHEN length(CAST(job.call_id AS BLOB))
+                                > (9223372036854775807 - 98304) / 12
+                           THEN 9223372036854775807
+                           ELSE 98304 + 12 * length(CAST(job.call_id AS BLOB))
+                       END
+                       WHEN 'started' THEN CASE
+                           WHEN length(CAST(job.call_id AS BLOB))
+                                > (9223372036854775807 - 65536) / 6
+                           THEN 9223372036854775807
+                           ELSE 65536 + 6 * length(CAST(job.call_id AS BLOB))
+                       END
+                   END AS expected_bytes
+               FROM dispatch_jobs job
+           )
+           SELECT EXISTS(
                SELECT 1
                FROM session_turns t
+               JOIN session_expected expected
+                 ON expected.session_id = t.session_id
+                AND expected.turn_id = t.id
                LEFT JOIN finalization_reservations reservation
                  ON reservation.kind = 'session_turn'
                 AND reservation.session_id = t.session_id
                 AND reservation.turn_id = t.id
-               WHERE (t.status = 'open' AND reservation.remaining_event_slots IS NOT 2)
+               WHERE (t.status = 'open' AND (
+                         reservation.remaining_event_slots IS NOT 2
+                         OR reservation.remaining_event_payload_bytes
+                            IS NOT expected.expected_bytes
+                     ))
                   OR (t.status <> 'open' AND reservation.turn_id IS NOT NULL)
                UNION ALL
                SELECT 1
                FROM dispatch_jobs job
+               JOIN dispatch_expected expected
+                 ON expected.run_id = job.run_id
+                AND expected.call_id = job.call_id
                LEFT JOIN finalization_reservations reservation
                  ON reservation.kind = 'dispatch'
                 AND reservation.run_id = job.run_id
                 AND reservation.call_id = job.call_id
-               WHERE (job.status = 'queued' AND reservation.remaining_event_slots IS NOT 2)
-                  OR (job.status = 'started' AND reservation.remaining_event_slots IS NOT 1)
+               WHERE (job.status = 'queued' AND (
+                         reservation.remaining_event_slots IS NOT 2
+                         OR reservation.remaining_event_payload_bytes
+                            IS NOT expected.expected_bytes
+                     ))
+                  OR (job.status = 'started' AND (
+                         reservation.remaining_event_slots IS NOT 1
+                         OR reservation.remaining_event_payload_bytes
+                            IS NOT expected.expected_bytes
+                     ))
                   OR (job.status IN ('finished', 'rejected') AND reservation.call_id IS NOT NULL)
                UNION ALL
                SELECT 1
                FROM finalization_reservations
-               WHERE remaining_event_slots = 0 OR reserved_bytes IS NOT NULL
+               WHERE remaining_event_slots <= 0
+                  OR remaining_event_payload_bytes <= 0
+                  OR reserved_bytes IS NOT NULL
            )"#,
         [],
         |row| row.get(0),
@@ -2231,61 +2414,264 @@ fn run_scope_id(connection: &Connection, run_id: &str) -> Result<String, Storage
 fn require_session_event_capacity(
     connection: &Connection,
     session_id: &str,
-    new_events: usize,
-    new_reserved_slots: usize,
+    request: EventCapacityRequest,
     limits: &StorageLimits,
 ) -> Result<(), StorageError> {
-    let (head, reserved): (i64, i64) = connection.query_row(
-        r#"SELECT s.sequence, COALESCE(SUM(r.remaining_event_slots), 0)
-           FROM sessions s
-           LEFT JOIN finalization_reservations r
-             ON r.kind = 'session_turn' AND r.session_id = s.id
-           WHERE s.id = ?1
-           GROUP BY s.id"#,
+    let (head, committed_bytes): (i64, i64) = connection.query_row(
+        "SELECT sequence, event_payload_bytes FROM sessions WHERE id = ?1",
         [session_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    let requested = i64::try_from(new_events.saturating_add(new_reserved_slots))
+    let (reserved_slots, reserved_bytes) =
+        session_finalization_reservation_totals(connection, session_id)?;
+    let requested_slots = request
+        .new_event_slots
+        .checked_add(request.new_reserved_slots)
+        .ok_or(StorageError::IntegerOutOfRange(
+            "session event capacity request",
+        ))?;
+    let requested_slots = i64::try_from(requested_slots)
         .map_err(|_| StorageError::IntegerOutOfRange("session event capacity request"))?;
-    let limit = capacity_limit(limits.session_event_slots_per_session)?;
-    let used = head
-        .checked_add(reserved)
-        .and_then(|value| value.checked_add(requested))
+    let used_slots = head
+        .checked_add(reserved_slots)
+        .and_then(|value| value.checked_add(requested_slots))
         .ok_or(StorageError::IntegerOutOfRange("session event capacity"))?;
-    if used > limit {
+    if used_slots > capacity_limit(limits.session_event_slots_per_session)? {
         return Err(StorageError::StorageQuotaExceeded);
     }
+
+    let requested_bytes = checked_nonnegative_payload_request(request)?;
+    let used_bytes = committed_bytes
+        .checked_add(reserved_bytes)
+        .and_then(|value| value.checked_add(requested_bytes))
+        .ok_or(StorageError::StorageQuotaExceeded)?;
+    if used_bytes > capacity_limit(limits.session_event_payload_bytes_per_session)? {
+        return Err(StorageError::StorageQuotaExceeded);
+    }
+    require_global_event_payload_capacity(connection, requested_bytes, limits)?;
     Ok(())
 }
 
 fn require_run_event_capacity(
     connection: &Connection,
     run_id: &str,
-    new_events: usize,
-    new_reserved_slots: usize,
+    request: EventCapacityRequest,
     limits: &StorageLimits,
 ) -> Result<(), StorageError> {
-    let (head, reserved): (i64, i64) = connection.query_row(
-        r#"SELECT r.sequence, COALESCE(SUM(f.remaining_event_slots), 0)
-           FROM runs r
-           LEFT JOIN finalization_reservations f
-             ON f.kind = 'dispatch' AND f.run_id = r.id
-           WHERE r.id = ?1
-           GROUP BY r.id"#,
+    let (head, committed_bytes): (i64, i64) = connection.query_row(
+        "SELECT sequence, event_payload_bytes FROM runs WHERE id = ?1",
         [run_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    let requested = i64::try_from(new_events.saturating_add(new_reserved_slots))
+    let (reserved_slots, reserved_bytes) =
+        dispatch_finalization_reservation_totals(connection, run_id)?;
+    let requested_slots = request
+        .new_event_slots
+        .checked_add(request.new_reserved_slots)
+        .ok_or(StorageError::IntegerOutOfRange(
+            "run event capacity request",
+        ))?;
+    let requested_slots = i64::try_from(requested_slots)
         .map_err(|_| StorageError::IntegerOutOfRange("run event capacity request"))?;
-    let limit = capacity_limit(limits.run_event_slots_per_run)?;
-    let used = head
-        .checked_add(reserved)
-        .and_then(|value| value.checked_add(requested))
+    let used_slots = head
+        .checked_add(reserved_slots)
+        .and_then(|value| value.checked_add(requested_slots))
         .ok_or(StorageError::IntegerOutOfRange("run event capacity"))?;
-    if used > limit {
+    if used_slots > capacity_limit(limits.run_event_slots_per_run)? {
         return Err(StorageError::StorageQuotaExceeded);
     }
+
+    let requested_bytes = checked_nonnegative_payload_request(request)?;
+    let used_bytes = committed_bytes
+        .checked_add(reserved_bytes)
+        .and_then(|value| value.checked_add(requested_bytes))
+        .ok_or(StorageError::StorageQuotaExceeded)?;
+    if used_bytes > capacity_limit(limits.run_event_payload_bytes_per_run)? {
+        return Err(StorageError::StorageQuotaExceeded);
+    }
+    require_global_event_payload_capacity(connection, requested_bytes, limits)?;
     Ok(())
+}
+
+fn checked_nonnegative_payload_request(request: EventCapacityRequest) -> Result<i64, StorageError> {
+    if request.new_event_payload_bytes < 0 || request.new_reserved_payload_bytes < 0 {
+        return Err(StorageError::IntegerOutOfRange(
+            "event payload capacity request",
+        ));
+    }
+    request
+        .new_event_payload_bytes
+        .checked_add(request.new_reserved_payload_bytes)
+        .ok_or(StorageError::IntegerOutOfRange(
+            "event payload capacity request",
+        ))
+}
+
+fn session_finalization_reservation_totals(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<(i64, i64), StorageError> {
+    let mut statement = connection.prepare(
+        r#"SELECT remaining_event_slots, remaining_event_payload_bytes
+           FROM finalization_reservations
+           WHERE kind = 'session_turn' AND session_id = ?1"#,
+    )?;
+    let mut rows = statement.query([session_id])?;
+    reservation_totals(&mut rows)
+}
+
+fn dispatch_finalization_reservation_totals(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<(i64, i64), StorageError> {
+    let mut statement = connection.prepare(
+        r#"SELECT remaining_event_slots, remaining_event_payload_bytes
+           FROM finalization_reservations
+           WHERE kind = 'dispatch' AND run_id = ?1"#,
+    )?;
+    let mut rows = statement.query([run_id])?;
+    reservation_totals(&mut rows)
+}
+
+fn reservation_totals(rows: &mut rusqlite::Rows<'_>) -> Result<(i64, i64), StorageError> {
+    let mut slots = 0_i64;
+    let mut bytes = 0_i64;
+    while let Some(row) = rows.next()? {
+        let row_slots: i64 = row.get(0)?;
+        let row_bytes: i64 = row.get(1)?;
+        slots = slots
+            .checked_add(row_slots)
+            .ok_or(StorageError::StorageQuotaExceeded)?;
+        bytes = bytes
+            .checked_add(row_bytes)
+            .ok_or(StorageError::StorageQuotaExceeded)?;
+    }
+    Ok((slots, bytes))
+}
+
+fn require_global_event_payload_capacity(
+    connection: &Connection,
+    requested_bytes: i64,
+    limits: &StorageLimits,
+) -> Result<(), StorageError> {
+    let committed_bytes: i64 = connection.query_row(
+        "SELECT used_bytes FROM event_payload_usage WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let limit = capacity_limit(limits.event_payload_bytes_global)?;
+    let mut used_bytes = committed_bytes
+        .checked_add(requested_bytes)
+        .ok_or(StorageError::StorageQuotaExceeded)?;
+    if used_bytes > limit {
+        return Err(StorageError::StorageQuotaExceeded);
+    }
+    let mut statement = connection
+        .prepare("SELECT remaining_event_payload_bytes FROM finalization_reservations")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let reserved_bytes: i64 = row.get(0)?;
+        used_bytes = used_bytes
+            .checked_add(reserved_bytes)
+            .ok_or(StorageError::StorageQuotaExceeded)?;
+        if used_bytes > limit {
+            return Err(StorageError::StorageQuotaExceeded);
+        }
+    }
+    Ok(())
+}
+
+fn encode_event_payload<T: Serialize>(value: &T) -> Result<EncodedEventPayload, StorageError> {
+    let json = serde_json::to_string(value)?;
+    let bytes = i64::try_from(json.len())
+        .map_err(|_| StorageError::IntegerOutOfRange("serialized event payload bytes"))?;
+    Ok(EncodedEventPayload { json, bytes })
+}
+
+fn checked_event_payload_total<'a>(
+    payloads: impl IntoIterator<Item = &'a EncodedEventPayload>,
+) -> Result<i64, StorageError> {
+    payloads.into_iter().try_fold(0_i64, |total, payload| {
+        total
+            .checked_add(payload.bytes)
+            .ok_or(StorageError::IntegerOutOfRange(
+                "serialized event payload byte total",
+            ))
+    })
+}
+
+fn checked_scaled_utf8_bytes(
+    value: &str,
+    multiplier: i64,
+    field: &'static str,
+) -> Result<i64, StorageError> {
+    i64::try_from(value.len())
+        .map_err(|_| StorageError::IntegerOutOfRange(field))?
+        .checked_mul(multiplier)
+        .ok_or(StorageError::IntegerOutOfRange(field))
+}
+
+fn session_finalization_payload_reservation(
+    turn_id: &str,
+    provider_name: Option<&str>,
+    model_name: Option<&str>,
+) -> Result<i64, StorageError> {
+    let turn_bytes = checked_scaled_utf8_bytes(
+        turn_id,
+        SESSION_FINALIZATION_TURN_ID_MULTIPLIER,
+        "session finalization turn ID payload reservation",
+    )?;
+    let provider_bytes = provider_name
+        .map(|value| {
+            checked_scaled_utf8_bytes(
+                value,
+                SESSION_FINALIZATION_PROVIDER_MULTIPLIER,
+                "session finalization provider payload reservation",
+            )
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let model_bytes = model_name
+        .map(|value| {
+            checked_scaled_utf8_bytes(
+                value,
+                SESSION_FINALIZATION_PROVIDER_MULTIPLIER,
+                "session finalization model payload reservation",
+            )
+        })
+        .transpose()?
+        .unwrap_or(0);
+    SESSION_FINALIZATION_BASE_BYTES
+        .checked_add(turn_bytes)
+        .and_then(|value| value.checked_add(provider_bytes))
+        .and_then(|value| value.checked_add(model_bytes))
+        .ok_or(StorageError::IntegerOutOfRange(
+            "session finalization payload reservation",
+        ))
+}
+
+fn dispatch_queued_payload_reservation(call_id: &str) -> Result<i64, StorageError> {
+    DISPATCH_QUEUED_FINALIZATION_BASE_BYTES
+        .checked_add(checked_scaled_utf8_bytes(
+            call_id,
+            DISPATCH_QUEUED_CALL_ID_MULTIPLIER,
+            "queued dispatch payload reservation",
+        )?)
+        .ok_or(StorageError::IntegerOutOfRange(
+            "queued dispatch payload reservation",
+        ))
+}
+
+fn dispatch_terminal_payload_reservation(call_id: &str) -> Result<i64, StorageError> {
+    DISPATCH_TERMINAL_FINALIZATION_BASE_BYTES
+        .checked_add(checked_scaled_utf8_bytes(
+            call_id,
+            DISPATCH_TERMINAL_CALL_ID_MULTIPLIER,
+            "terminal dispatch payload reservation",
+        )?)
+        .ok_or(StorageError::IntegerOutOfRange(
+            "terminal dispatch payload reservation",
+        ))
 }
 
 fn insert_session_finalization_reservation(
@@ -2293,35 +2679,48 @@ fn insert_session_finalization_reservation(
     scope_id: &str,
     session_id: &str,
     turn_id: &str,
+    remaining_event_payload_bytes: i64,
     timestamp: &str,
 ) -> Result<(), StorageError> {
     connection.execute(
         r#"INSERT INTO finalization_reservations(
                kind, scope_id, session_id, turn_id, run_id, call_id,
-               remaining_event_slots, reserved_bytes, created_at
-           ) VALUES ('session_turn', ?1, ?2, ?3, NULL, NULL, 2, NULL, ?4)"#,
-        params![scope_id, session_id, turn_id, timestamp],
+               remaining_event_slots, reserved_bytes,
+               remaining_event_payload_bytes, created_at
+           ) VALUES ('session_turn', ?1, ?2, ?3, NULL, NULL, 2, NULL, ?4, ?5)"#,
+        params![
+            scope_id,
+            session_id,
+            turn_id,
+            remaining_event_payload_bytes,
+            timestamp
+        ],
     )?;
     Ok(())
 }
 
-fn require_session_finalization_slots(
+fn require_session_finalization_capacity(
     connection: &Connection,
     session_id: &str,
     turn_id: &str,
     minimum: i64,
-) -> Result<i64, StorageError> {
+    minimum_payload_bytes: i64,
+) -> Result<(i64, i64), StorageError> {
     let remaining = connection
         .query_row(
-            r#"SELECT remaining_event_slots
+            r#"SELECT remaining_event_slots, remaining_event_payload_bytes
                FROM finalization_reservations
                WHERE kind = 'session_turn' AND session_id = ?1 AND turn_id = ?2"#,
             params![session_id, turn_id],
-            |row| row.get::<_, i64>(0),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )
         .optional()?;
     match remaining {
-        Some(remaining) if remaining >= minimum => Ok(remaining),
+        Some((remaining_slots, remaining_bytes))
+            if remaining_slots >= minimum && remaining_bytes >= minimum_payload_bytes =>
+        {
+            Ok((remaining_slots, remaining_bytes))
+        }
         _ => Err(StorageError::FinalizationReservationUnavailable),
     }
 }
@@ -2331,15 +2730,24 @@ fn finish_session_finalization(
     session_id: &str,
     turn_id: &str,
     emitted_events: i64,
+    emitted_payload_bytes: i64,
 ) -> Result<(), StorageError> {
-    require_session_finalization_slots(connection, session_id, turn_id, emitted_events)?;
+    require_session_finalization_capacity(
+        connection,
+        session_id,
+        turn_id,
+        emitted_events,
+        emitted_payload_bytes,
+    )?;
     let changed = connection.execute(
         r#"UPDATE finalization_reservations
-           SET remaining_event_slots = 0
+           SET remaining_event_slots = 0,
+               remaining_event_payload_bytes = 0
            WHERE kind = 'session_turn'
              AND session_id = ?1 AND turn_id = ?2
-             AND remaining_event_slots >= ?3"#,
-        params![session_id, turn_id, emitted_events],
+             AND remaining_event_slots >= ?3
+             AND remaining_event_payload_bytes >= ?4"#,
+        params![session_id, turn_id, emitted_events, emitted_payload_bytes],
     )?;
     if changed != 1 {
         return Err(StorageError::FinalizationReservationUnavailable);
@@ -2348,7 +2756,8 @@ fn finish_session_finalization(
         r#"DELETE FROM finalization_reservations
            WHERE kind = 'session_turn'
              AND session_id = ?1 AND turn_id = ?2
-             AND remaining_event_slots = 0"#,
+             AND remaining_event_slots = 0
+             AND remaining_event_payload_bytes = 0"#,
         params![session_id, turn_id],
     )?;
     if deleted != 1 {
@@ -2362,51 +2771,73 @@ fn insert_dispatch_finalization_reservation(
     scope_id: &str,
     run_id: &str,
     call_id: &str,
+    remaining_event_payload_bytes: i64,
     timestamp: &str,
 ) -> Result<(), StorageError> {
     connection.execute(
         r#"INSERT INTO finalization_reservations(
                kind, scope_id, session_id, turn_id, run_id, call_id,
-               remaining_event_slots, reserved_bytes, created_at
-           ) VALUES ('dispatch', ?1, NULL, NULL, ?2, ?3, 2, NULL, ?4)"#,
-        params![scope_id, run_id, call_id, timestamp],
+               remaining_event_slots, reserved_bytes,
+               remaining_event_payload_bytes, created_at
+           ) VALUES ('dispatch', ?1, NULL, NULL, ?2, ?3, 2, NULL, ?4, ?5)"#,
+        params![
+            scope_id,
+            run_id,
+            call_id,
+            remaining_event_payload_bytes,
+            timestamp
+        ],
     )?;
     Ok(())
 }
 
-fn require_dispatch_finalization_slots(
+fn require_dispatch_finalization_capacity(
     connection: &Connection,
     run_id: &str,
     call_id: &str,
-    expected: i64,
-) -> Result<(), StorageError> {
+    expected_slots: i64,
+    minimum_payload_bytes: i64,
+) -> Result<i64, StorageError> {
     let remaining = connection
         .query_row(
-            r#"SELECT remaining_event_slots
+            r#"SELECT remaining_event_slots, remaining_event_payload_bytes
                FROM finalization_reservations
                WHERE kind = 'dispatch' AND run_id = ?1 AND call_id = ?2"#,
             params![run_id, call_id],
-            |row| row.get::<_, i64>(0),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )
         .optional()?;
-    if remaining != Some(expected) {
-        return Err(StorageError::FinalizationReservationUnavailable);
+    match remaining {
+        Some((remaining_slots, remaining_bytes))
+            if remaining_slots == expected_slots && remaining_bytes >= minimum_payload_bytes =>
+        {
+            Ok(remaining_bytes)
+        }
+        _ => Err(StorageError::FinalizationReservationUnavailable),
     }
-    Ok(())
 }
 
-fn consume_dispatch_claim_slot(
+fn consume_dispatch_claim_capacity(
     connection: &Connection,
     run_id: &str,
     call_id: &str,
+    emitted_payload_bytes: i64,
+    terminal_payload_reservation: i64,
 ) -> Result<(), StorageError> {
-    require_dispatch_finalization_slots(connection, run_id, call_id, 2)?;
+    let required = emitted_payload_bytes
+        .checked_add(terminal_payload_reservation)
+        .ok_or(StorageError::IntegerOutOfRange(
+            "dispatch claim payload reservation",
+        ))?;
+    require_dispatch_finalization_capacity(connection, run_id, call_id, 2, required)?;
     let changed = connection.execute(
         r#"UPDATE finalization_reservations
-           SET remaining_event_slots = 1
+           SET remaining_event_slots = 1,
+               remaining_event_payload_bytes = ?3
            WHERE kind = 'dispatch' AND run_id = ?1 AND call_id = ?2
-             AND remaining_event_slots = 2"#,
-        params![run_id, call_id],
+             AND remaining_event_slots = 2
+             AND remaining_event_payload_bytes >= ?4"#,
+        params![run_id, call_id, terminal_payload_reservation, required],
     )?;
     if changed != 1 {
         return Err(StorageError::FinalizationReservationUnavailable);
@@ -2419,14 +2850,23 @@ fn finish_dispatch_finalization(
     run_id: &str,
     call_id: &str,
     expected_remaining: i64,
+    emitted_payload_bytes: i64,
 ) -> Result<(), StorageError> {
-    require_dispatch_finalization_slots(connection, run_id, call_id, expected_remaining)?;
+    require_dispatch_finalization_capacity(
+        connection,
+        run_id,
+        call_id,
+        expected_remaining,
+        emitted_payload_bytes,
+    )?;
     let changed = connection.execute(
         r#"UPDATE finalization_reservations
-           SET remaining_event_slots = 0
+           SET remaining_event_slots = 0,
+               remaining_event_payload_bytes = 0
            WHERE kind = 'dispatch' AND run_id = ?1 AND call_id = ?2
-             AND remaining_event_slots = ?3"#,
-        params![run_id, call_id, expected_remaining],
+             AND remaining_event_slots = ?3
+             AND remaining_event_payload_bytes >= ?4"#,
+        params![run_id, call_id, expected_remaining, emitted_payload_bytes],
     )?;
     if changed != 1 {
         return Err(StorageError::FinalizationReservationUnavailable);
@@ -2434,7 +2874,8 @@ fn finish_dispatch_finalization(
     let deleted = connection.execute(
         r#"DELETE FROM finalization_reservations
            WHERE kind = 'dispatch' AND run_id = ?1 AND call_id = ?2
-             AND remaining_event_slots = 0"#,
+             AND remaining_event_slots = 0
+             AND remaining_event_payload_bytes = 0"#,
         params![run_id, call_id],
     )?;
     if deleted != 1 {
@@ -3058,6 +3499,11 @@ fn seed_if_empty(
     limits: &StorageLimits,
 ) -> Result<bool, StorageError> {
     validate_seed(&snapshot, &events)?;
+    let encoded_events = events
+        .iter()
+        .map(encode_event_payload)
+        .collect::<Result<Vec<_>, _>>()?;
+    let encoded_event_bytes = checked_event_payload_total(&encoded_events)?;
     let metrics_json = serde_json::to_string(&snapshot.metrics)?;
     let evidence_json = serde_json::to_string(&snapshot.evidence)?;
     let tool_policy_json = snapshot
@@ -3115,11 +3561,17 @@ fn seed_if_empty(
             execution_status_to_db(&snapshot.run.status),
         ],
     )?;
-    for event in &events {
+    require_run_event_capacity(
+        &transaction,
+        &snapshot.run.id,
+        EventCapacityRequest::events(0, encoded_event_bytes),
+        limits,
+    )?;
+    for (event, payload) in events.iter().zip(&encoded_events) {
         if event.data.is_some() {
-            insert_event_v2(&transaction, &snapshot.run.id, event)?;
+            insert_event_v2(&transaction, &snapshot.run.id, event, payload)?;
         } else {
-            insert_event_v1(&transaction, &snapshot.run.id, event)?;
+            insert_event_v1(&transaction, &snapshot.run.id, event, payload)?;
         }
     }
     transaction.commit()?;
@@ -3168,9 +3620,6 @@ fn seed_demo_session(
         validated_new_session_id(session_id, "session ID")?;
         validated_new_session_title(title, "session title")?;
         require_session_count_capacity(&transaction, "__legacy__", limits)?;
-        if limits.session_event_slots_per_session < 2 {
-            return Err(StorageError::StorageQuotaExceeded);
-        }
         let timestamp = now();
         transaction.execute(
             r#"INSERT INTO sessions(
@@ -3187,7 +3636,14 @@ fn seed_demo_session(
                 title: title.to_owned(),
             },
         );
-        insert_session_event(&transaction, session_id, &event)?;
+        let payload = encode_event_payload(&event)?;
+        require_session_event_capacity(
+            &transaction,
+            session_id,
+            EventCapacityRequest::events(1, payload.bytes),
+            limits,
+        )?;
+        insert_session_event(&transaction, session_id, &event, &payload)?;
         update_session_projection(
             &transaction,
             session_id,
@@ -3198,8 +3654,6 @@ fn seed_demo_session(
             &timestamp,
         )?;
         summary = Some(query_session_summary(&transaction, session_id)?);
-    } else {
-        require_session_event_capacity(&transaction, session_id, 1, 0, limits)?;
     }
 
     let summary = summary.ok_or_else(|| {
@@ -3223,7 +3677,14 @@ fn seed_demo_session(
             run_id: run_id.to_owned(),
         },
     );
-    insert_session_event(&transaction, session_id, &event)?;
+    let payload = encode_event_payload(&event)?;
+    require_session_event_capacity(
+        &transaction,
+        session_id,
+        EventCapacityRequest::events(1, payload.bytes),
+        limits,
+    )?;
+    insert_session_event(&transaction, session_id, &event, &payload)?;
     update_session_projection(
         &transaction,
         session_id,
@@ -4005,7 +4466,6 @@ fn create_session(
            ) VALUES (?1, ?2, 'ready', ?3, ?3, 0, 0, NULL, ?4)"#,
         params![request.id, request.title, timestamp, actor_user_id],
     )?;
-    require_session_event_capacity(&transaction, &request.id, 1, 0, limits)?;
     let event = build_session_event(
         &request.id,
         1,
@@ -4014,7 +4474,14 @@ fn create_session(
             title: request.title.clone(),
         },
     );
-    insert_session_event(&transaction, &request.id, &event)?;
+    let payload = encode_event_payload(&event)?;
+    require_session_event_capacity(
+        &transaction,
+        &request.id,
+        EventCapacityRequest::events(1, payload.bytes),
+        limits,
+    )?;
+    insert_session_event(&transaction, &request.id, &event, &payload)?;
     update_session_projection(
         &transaction,
         &request.id,
@@ -4126,8 +4593,6 @@ fn attach_run(
         });
     }
 
-    require_session_event_capacity(&transaction, session_id, 1, 0, limits)?;
-
     let timestamp = now();
     transaction.execute(
         "INSERT INTO session_runs(session_id, run_id, attached_at) VALUES (?1, ?2, ?3)",
@@ -4142,7 +4607,14 @@ fn attach_run(
             run_id: request.run_id.clone(),
         },
     );
-    insert_session_event(&transaction, session_id, &event)?;
+    let payload = encode_event_payload(&event)?;
+    require_session_event_capacity(
+        &transaction,
+        session_id,
+        EventCapacityRequest::events(1, payload.bytes),
+        limits,
+    )?;
+    insert_session_event(&transaction, session_id, &event, &payload)?;
     update_session_projection(
         &transaction,
         session_id,
@@ -4273,13 +4745,39 @@ fn start_turn(
     if reply_job.is_some() {
         require_reply_queue_capacity(&transaction, &scope_id, limits)?;
     }
-    require_session_event_capacity(&transaction, session_id, 1, 2, limits)?;
+    let finalization_payload_reservation = session_finalization_payload_reservation(
+        &request.turn_id,
+        reply_job.as_ref().map(|job| job.provider_name.as_str()),
+        reply_job.as_ref().and_then(|job| job.model_name.as_deref()),
+    )?;
+    let timestamp = now();
+    let sequence = next_session_sequence(summary.sequence)?;
+    let event = build_session_event(
+        session_id,
+        sequence,
+        &timestamp,
+        SessionEventData::UserMessage {
+            turn_id: request.turn_id.clone(),
+            content: request.user_message.clone(),
+        },
+    );
+    let payload = encode_event_payload(&event)?;
+    require_session_event_capacity(
+        &transaction,
+        session_id,
+        EventCapacityRequest {
+            new_event_slots: 1,
+            new_event_payload_bytes: payload.bytes,
+            new_reserved_slots: 2,
+            new_reserved_payload_bytes: finalization_payload_reservation,
+        },
+        limits,
+    )?;
     let ordinal: i64 = transaction.query_row(
         "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM session_turns WHERE session_id = ?1",
         [session_id],
         |row| row.get(0),
     )?;
-    let timestamp = now();
     transaction.execute(
         r#"INSERT INTO session_turns(
                id, session_id, ordinal, status, user_message, assistant_message,
@@ -4298,19 +4796,10 @@ fn start_turn(
         &scope_id,
         session_id,
         &request.turn_id,
+        finalization_payload_reservation,
         &timestamp,
     )?;
-    let sequence = next_session_sequence(summary.sequence)?;
-    let event = build_session_event(
-        session_id,
-        sequence,
-        &timestamp,
-        SessionEventData::UserMessage {
-            turn_id: request.turn_id.clone(),
-            content: request.user_message.clone(),
-        },
-    );
-    insert_session_event(&transaction, session_id, &event)?;
+    insert_session_event(&transaction, session_id, &event, &payload)?;
     update_session_projection(
         &transaction,
         session_id,
@@ -4414,7 +4903,20 @@ fn claim_next_reply(connection: &mut Connection) -> Result<ReplyClaimOutcome, St
 
     let job = query_reply_job(&transaction, &job_id)?;
     let summary = require_open_reply_turn(&transaction, &job)?;
-    if require_session_finalization_slots(&transaction, &job.session_id, &job.turn_id, 2)? != 2 {
+    let required_payload_reservation = session_finalization_payload_reservation(
+        &job.turn_id,
+        Some(&job.provider_name),
+        job.model_name.as_deref(),
+    )?;
+    if require_session_finalization_capacity(
+        &transaction,
+        &job.session_id,
+        &job.turn_id,
+        2,
+        required_payload_reservation,
+    )?
+    .0 != 2
+    {
         return Err(StorageError::FinalizationReservationUnavailable);
     }
     let changed = transaction.execute(
@@ -4497,10 +4999,6 @@ fn complete_reply_success(
         transaction.commit()?;
         return Ok(replay);
     }
-    if require_session_finalization_slots(&transaction, &job.session_id, &job.turn_id, 2)? != 2 {
-        return Err(StorageError::FinalizationReservationUnavailable);
-    }
-
     let mut summary = require_open_reply_turn(&transaction, &job)?;
     require_session_sequence(&summary, commit.expected_sequence)?;
     let timestamp = now();
@@ -4515,7 +5013,37 @@ fn complete_reply_success(
             provenance: Some(commit.provenance.clone()),
         },
     );
-    insert_session_event(&transaction, &job.session_id, &assistant_event)?;
+    let assistant_payload = encode_event_payload(&assistant_event)?;
+    let terminal_sequence = assistant_sequence
+        .checked_add(1)
+        .ok_or(StorageError::IntegerOutOfRange("session sequence"))?;
+    let flush_event = build_session_event(
+        &job.session_id,
+        terminal_sequence,
+        &timestamp,
+        SessionEventData::TurnFlushed {
+            turn_id: job.turn_id.clone(),
+        },
+    );
+    let flush_payload = encode_event_payload(&flush_event)?;
+    let emitted_payload_bytes = checked_event_payload_total([&assistant_payload, &flush_payload])?;
+    if require_session_finalization_capacity(
+        &transaction,
+        &job.session_id,
+        &job.turn_id,
+        2,
+        emitted_payload_bytes,
+    )?
+    .0 != 2
+    {
+        return Err(StorageError::FinalizationReservationUnavailable);
+    }
+    insert_session_event(
+        &transaction,
+        &job.session_id,
+        &assistant_event,
+        &assistant_payload,
+    )?;
     update_session_projection(
         &transaction,
         &job.session_id,
@@ -4550,16 +5078,7 @@ fn complete_reply_success(
     #[cfg(not(test))]
     let _ = fail_before_flush_event;
 
-    let terminal_sequence = next_session_sequence(summary.sequence)?;
-    let flush_event = build_session_event(
-        &job.session_id,
-        terminal_sequence,
-        &timestamp,
-        SessionEventData::TurnFlushed {
-            turn_id: job.turn_id.clone(),
-        },
-    );
-    insert_session_event(&transaction, &job.session_id, &flush_event)?;
+    insert_session_event(&transaction, &job.session_id, &flush_event, &flush_payload)?;
     update_session_projection(
         &transaction,
         &job.session_id,
@@ -4588,7 +5107,13 @@ fn complete_reply_success(
     if changed != 1 {
         return Err(StorageError::ConcurrentModification);
     }
-    finish_session_finalization(&transaction, &job.session_id, &job.turn_id, 2)?;
+    finish_session_finalization(
+        &transaction,
+        &job.session_id,
+        &job.turn_id,
+        2,
+        emitted_payload_bytes,
+    )?;
     let completion = query_reply_completion(&transaction, &job.id, false)?;
     transaction.commit()?;
     Ok(completion)
@@ -4716,16 +5241,6 @@ fn interrupt_reply_job(
     let summary = require_open_reply_turn(connection, &job)?;
     require_session_sequence(&summary, expected_sequence)?;
     let timestamp = now();
-    let changed = connection.execute(
-        r#"UPDATE session_turns
-           SET status = 'interrupted', completed_at = ?1
-           WHERE session_id = ?2 AND id = ?3 AND status = 'open'"#,
-        params![timestamp, job.session_id, job.turn_id],
-    )?;
-    if changed != 1 {
-        return Err(StorageError::ConcurrentModification);
-    }
-
     let terminal_sequence = next_session_sequence(summary.sequence)?;
     let event = build_session_event(
         &job.session_id,
@@ -4736,7 +5251,25 @@ fn interrupt_reply_job(
             reason: reason.to_owned(),
         },
     );
-    insert_session_event(connection, &job.session_id, &event)?;
+    let payload = encode_event_payload(&event)?;
+    require_session_finalization_capacity(
+        connection,
+        &job.session_id,
+        &job.turn_id,
+        1,
+        payload.bytes,
+    )?;
+    let changed = connection.execute(
+        r#"UPDATE session_turns
+           SET status = 'interrupted', completed_at = ?1
+           WHERE session_id = ?2 AND id = ?3 AND status = 'open'"#,
+        params![timestamp, job.session_id, job.turn_id],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::ConcurrentModification);
+    }
+
+    insert_session_event(connection, &job.session_id, &event, &payload)?;
     update_session_projection(
         connection,
         &job.session_id,
@@ -4763,7 +5296,7 @@ fn interrupt_reply_job(
     if changed != 1 {
         return Err(StorageError::ConcurrentModification);
     }
-    finish_session_finalization(connection, &job.session_id, &job.turn_id, 1)?;
+    finish_session_finalization(connection, &job.session_id, &job.turn_id, 1, payload.bytes)?;
     query_reply_completion(connection, &job.id, false)
 }
 
@@ -4861,15 +5394,8 @@ fn flush_turn(
     } else {
         1
     };
-    require_session_finalization_slots(&transaction, session_id, &request.turn_id, emitted_events)?;
-
     let timestamp = now();
-    let mut events = Vec::with_capacity(if request.assistant_message.is_some() {
-        2
-    } else {
-        1
-    });
-    if let Some(message) = &request.assistant_message {
+    let prepared_assistant = if let Some(message) = &request.assistant_message {
         let sequence = next_session_sequence(summary.sequence)?;
         let event = build_session_event(
             session_id,
@@ -4881,7 +5407,48 @@ fn flush_turn(
                 provenance: None,
             },
         );
-        insert_session_event(&transaction, session_id, &event)?;
+        let payload = encode_event_payload(&event)?;
+        Some((event, payload))
+    } else {
+        None
+    };
+    let flush_sequence = prepared_assistant
+        .as_ref()
+        .map(|(event, _)| event.sequence)
+        .unwrap_or(summary.sequence)
+        .checked_add(1)
+        .ok_or(StorageError::IntegerOutOfRange("session sequence"))?;
+    let flush_event = build_session_event(
+        session_id,
+        flush_sequence,
+        &timestamp,
+        SessionEventData::TurnFlushed {
+            turn_id: request.turn_id.clone(),
+        },
+    );
+    let flush_payload = encode_event_payload(&flush_event)?;
+    let emitted_payload_bytes = match prepared_assistant.as_ref() {
+        Some((_, assistant_payload)) => {
+            checked_event_payload_total([assistant_payload, &flush_payload])?
+        }
+        None => flush_payload.bytes,
+    };
+    require_session_finalization_capacity(
+        &transaction,
+        session_id,
+        &request.turn_id,
+        emitted_events,
+        emitted_payload_bytes,
+    )?;
+
+    let mut events = Vec::with_capacity(if request.assistant_message.is_some() {
+        2
+    } else {
+        1
+    });
+    if let Some((event, payload)) = prepared_assistant {
+        let sequence = event.sequence;
+        insert_session_event(&transaction, session_id, &event, &payload)?;
         update_session_projection(
             &transaction,
             session_id,
@@ -4918,16 +5485,7 @@ fn flush_turn(
     #[cfg(not(test))]
     let _ = fail_before_flush_event;
 
-    let flush_sequence = next_session_sequence(summary.sequence)?;
-    let flush_event = build_session_event(
-        session_id,
-        flush_sequence,
-        &timestamp,
-        SessionEventData::TurnFlushed {
-            turn_id: request.turn_id.clone(),
-        },
-    );
-    insert_session_event(&transaction, session_id, &flush_event)?;
+    insert_session_event(&transaction, session_id, &flush_event, &flush_payload)?;
     update_session_projection(
         &transaction,
         session_id,
@@ -4972,7 +5530,13 @@ fn flush_turn(
             flush_sequence,
         )?;
     }
-    finish_session_finalization(&transaction, session_id, &request.turn_id, emitted_events)?;
+    finish_session_finalization(
+        &transaction,
+        session_id,
+        &request.turn_id,
+        emitted_events,
+        emitted_payload_bytes,
+    )?;
     transaction.commit()?;
     Ok(response)
 }
@@ -5020,7 +5584,6 @@ fn resume_session(
             "session `{session_id}` is not awaiting an explicit resume"
         )));
     }
-    require_session_event_capacity(&transaction, session_id, 1, 0, limits)?;
     let timestamp = now();
     let sequence = next_session_sequence(summary.sequence)?;
     let event = build_session_event(
@@ -5031,7 +5594,14 @@ fn resume_session(
             from_status: summary.status.clone(),
         },
     );
-    insert_session_event(&transaction, session_id, &event)?;
+    let payload = encode_event_payload(&event)?;
+    require_session_event_capacity(
+        &transaction,
+        session_id,
+        EventCapacityRequest::events(1, payload.bytes),
+        limits,
+    )?;
+    insert_session_event(&transaction, session_id, &event, &payload)?;
     update_session_projection(
         &transaction,
         session_id,
@@ -5103,17 +5673,7 @@ fn recover_open_turns(
                 "open turn `{turn_id}` disagrees with session `{session_id}` projection"
             )));
         }
-        require_session_finalization_slots(&transaction, &session_id, &turn_id, 1)?;
         let timestamp = now();
-        let changed = transaction.execute(
-            r#"UPDATE session_turns
-               SET status = 'interrupted', completed_at = ?1
-               WHERE session_id = ?2 AND id = ?3 AND status = 'open'"#,
-            params![timestamp, session_id, turn_id],
-        )?;
-        if changed != 1 {
-            return Err(StorageError::ConcurrentModification);
-        }
         let sequence = next_session_sequence(summary.sequence)?;
         let event = build_session_event(
             &session_id,
@@ -5124,7 +5684,24 @@ fn recover_open_turns(
                 reason: "process restarted before session/flush committed".into(),
             },
         );
-        insert_session_event(&transaction, &session_id, &event)?;
+        let payload = encode_event_payload(&event)?;
+        require_session_finalization_capacity(
+            &transaction,
+            &session_id,
+            &turn_id,
+            1,
+            payload.bytes,
+        )?;
+        let changed = transaction.execute(
+            r#"UPDATE session_turns
+               SET status = 'interrupted', completed_at = ?1
+               WHERE session_id = ?2 AND id = ?3 AND status = 'open'"#,
+            params![timestamp, session_id, turn_id],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::ConcurrentModification);
+        }
+        insert_session_event(&transaction, &session_id, &event, &payload)?;
         update_session_projection(
             &transaction,
             &session_id,
@@ -5134,7 +5711,7 @@ fn recover_open_turns(
             sequence,
             &timestamp,
         )?;
-        finish_session_finalization(&transaction, &session_id, &turn_id, 1)?;
+        finish_session_finalization(&transaction, &session_id, &turn_id, 1, payload.bytes)?;
         recovered.push(RecoveredSessionTurn { session_id, event });
     }
     transaction.commit()?;
@@ -5616,6 +6193,7 @@ fn insert_session_event(
     connection: &Connection,
     session_id: &str,
     event: &SessionEvent,
+    payload: &EncodedEventPayload,
 ) -> Result<(), StorageError> {
     let sequence = u64_to_i64(event.sequence, "session event sequence")?;
     connection.execute(
@@ -5629,7 +6207,7 @@ fn insert_session_event(
             event.id,
             session_event_kind(&event.data),
             SESSION_EVENT_PAYLOAD_VERSION_V1,
-            serde_json::to_string(event)?,
+            payload.json,
             session_event_turn_id(&event.data),
             event.at,
         ],
@@ -7144,20 +7722,41 @@ fn commit_review(
     if commit.dispatch.is_some() {
         require_dispatch_queue_capacity(&transaction, &scope_id, limits)?;
     }
+    let event_payload = encode_event_payload(&commit.event)?;
+    let dispatch_payload_reservation = commit
+        .dispatch
+        .as_ref()
+        .map(|dispatch| dispatch_queued_payload_reservation(&dispatch.call_id))
+        .transpose()?
+        .unwrap_or(0);
     require_run_event_capacity(
         &transaction,
         &commit.snapshot.run.id,
-        1,
-        if commit.dispatch.is_some() { 2 } else { 0 },
+        EventCapacityRequest {
+            new_event_slots: 1,
+            new_event_payload_bytes: event_payload.bytes,
+            new_reserved_slots: if commit.dispatch.is_some() { 2 } else { 0 },
+            new_reserved_payload_bytes: dispatch_payload_reservation,
+        },
         limits,
     )?;
 
     update_projection(&transaction, &commit.snapshot, commit.expected_sequence)?;
 
     if commit.event.data.is_some() {
-        insert_event_v2(&transaction, &commit.snapshot.run.id, &commit.event)?;
+        insert_event_v2(
+            &transaction,
+            &commit.snapshot.run.id,
+            &commit.event,
+            &event_payload,
+        )?;
     } else {
-        insert_event_v1(&transaction, &commit.snapshot.run.id, &commit.event)?;
+        insert_event_v1(
+            &transaction,
+            &commit.snapshot.run.id,
+            &commit.event,
+            &event_payload,
+        )?;
     }
 
     transaction.execute(
@@ -7190,6 +7789,7 @@ fn commit_review(
             &scope_id,
             &commit.snapshot.run.id,
             &dispatch.call_id,
+            dispatch_payload_reservation,
             &queued_at,
         )?;
     }
@@ -7321,7 +7921,14 @@ fn claim_next_dispatch(
 
     let job = query_dispatch_job(&transaction, &commit.call_id)?
         .ok_or_else(|| StorageError::DispatchJobNotFound(commit.call_id.clone()))?;
-    require_dispatch_finalization_slots(&transaction, &job.run_id, &job.call_id, 2)?;
+    let queued_payload_reservation = dispatch_queued_payload_reservation(&job.call_id)?;
+    require_dispatch_finalization_capacity(
+        &transaction,
+        &job.run_id,
+        &job.call_id,
+        2,
+        queued_payload_reservation,
+    )?;
     if let Some(reason) = dispatch_authorization_failure(&transaction, &job)? {
         let rejection = reject_dispatch_authorization(&transaction, job, reason)?;
         transaction.commit()?;
@@ -7358,9 +7965,24 @@ fn claim_next_dispatch(
             ));
         }
     }
+    let event_payload = encode_event_payload(&commit.event)?;
+    let terminal_payload_reservation = dispatch_terminal_payload_reservation(&job.call_id)?;
+    let required_payload_reservation = event_payload
+        .bytes
+        .checked_add(terminal_payload_reservation)
+        .ok_or(StorageError::IntegerOutOfRange(
+            "dispatch claim payload reservation",
+        ))?;
+    require_dispatch_finalization_capacity(
+        &transaction,
+        &job.run_id,
+        &job.call_id,
+        2,
+        required_payload_reservation,
+    )?;
 
     update_projection(&transaction, &commit.snapshot, commit.expected_sequence)?;
-    insert_event_v2(&transaction, &job.run_id, &commit.event)?;
+    insert_event_v2(&transaction, &job.run_id, &commit.event, &event_payload)?;
     let changed = transaction.execute(
         r#"UPDATE dispatch_jobs SET
                status = 'started',
@@ -7377,7 +7999,13 @@ fn claim_next_dispatch(
     if changed != 1 {
         return Err(StorageError::ConcurrentModification);
     }
-    consume_dispatch_claim_slot(&transaction, &job.run_id, &job.call_id)?;
+    consume_dispatch_claim_capacity(
+        &transaction,
+        &job.run_id,
+        &job.call_id,
+        event_payload.bytes,
+        terminal_payload_reservation,
+    )?;
 
     #[cfg(test)]
     if inject_failure {
@@ -7502,10 +8130,18 @@ fn reject_dispatch_authorization(
             status: ToolCallStatus::NotDispatched,
         }),
     };
+    let event_payload = encode_event_payload(&event)?;
+    require_dispatch_finalization_capacity(
+        connection,
+        &job.run_id,
+        &job.call_id,
+        2,
+        event_payload.bytes,
+    )?;
     snapshot.run.status = RunStatus::NeedsAttention;
     snapshot.run.sequence = next_sequence;
     update_projection(connection, &snapshot, expected_sequence)?;
-    insert_event_v2(connection, &job.run_id, &event)?;
+    insert_event_v2(connection, &job.run_id, &event, &event_payload)?;
 
     let result_json = serde_json::to_string(&serde_json::to_value(&outcome)?)?;
     let authorization_error_json = serde_json::to_string(&json!({
@@ -7532,7 +8168,13 @@ fn reject_dispatch_authorization(
     if changed != 1 {
         return Err(StorageError::ConcurrentModification);
     }
-    finish_dispatch_finalization(connection, &job.run_id, &job.call_id, 2)?;
+    finish_dispatch_finalization(
+        connection,
+        &job.run_id,
+        &job.call_id,
+        2,
+        event_payload.bytes,
+    )?;
     let rejected = query_dispatch_job(connection, &job.call_id)?.ok_or_else(|| {
         StorageError::CorruptData("rejected dispatch disappeared before commit".into())
     })?;
@@ -7593,7 +8235,6 @@ fn complete_dispatch(
         ));
     }
     validate_canonical_dispatch_completion(&transaction, &job, &commit)?;
-    require_dispatch_finalization_slots(&transaction, &job.run_id, &job.call_id, 1)?;
     match commit.event.data.as_ref() {
         Some(RunEventData::ToolResult {
             call_id,
@@ -7608,9 +8249,17 @@ fn complete_dispatch(
             ));
         }
     }
+    let event_payload = encode_event_payload(&commit.event)?;
+    require_dispatch_finalization_capacity(
+        &transaction,
+        &job.run_id,
+        &job.call_id,
+        1,
+        event_payload.bytes,
+    )?;
 
     update_projection(&transaction, &commit.snapshot, commit.expected_sequence)?;
-    insert_event_v2(&transaction, &job.run_id, &commit.event)?;
+    insert_event_v2(&transaction, &job.run_id, &commit.event, &event_payload)?;
     let result_json = serde_json::to_string(&commit.result_json)?;
     let changed = transaction.execute(
         r#"UPDATE dispatch_jobs SET
@@ -7629,7 +8278,13 @@ fn complete_dispatch(
     if changed != 1 {
         return Err(StorageError::ConcurrentModification);
     }
-    finish_dispatch_finalization(&transaction, &job.run_id, &job.call_id, 1)?;
+    finish_dispatch_finalization(
+        &transaction,
+        &job.run_id,
+        &job.call_id,
+        1,
+        event_payload.bytes,
+    )?;
 
     #[cfg(test)]
     if inject_failure {
@@ -7790,22 +8445,25 @@ fn insert_event_v1(
     connection: &Connection,
     run_id: &str,
     event: &RunEvent,
+    payload: &EncodedEventPayload,
 ) -> Result<(), StorageError> {
-    insert_event(connection, run_id, event, EVENT_PAYLOAD_VERSION_V1)
+    insert_event(connection, run_id, event, payload, EVENT_PAYLOAD_VERSION_V1)
 }
 
 fn insert_event_v2(
     connection: &Connection,
     run_id: &str,
     event: &RunEvent,
+    payload: &EncodedEventPayload,
 ) -> Result<(), StorageError> {
-    insert_event(connection, run_id, event, EVENT_PAYLOAD_VERSION_V2)
+    insert_event(connection, run_id, event, payload, EVENT_PAYLOAD_VERSION_V2)
 }
 
 fn insert_event(
     connection: &Connection,
     run_id: &str,
     event: &RunEvent,
+    payload: &EncodedEventPayload,
     payload_version: i64,
 ) -> Result<(), StorageError> {
     let sequence = u64_to_i64(event.sequence, "event sequence")?;
@@ -7821,7 +8479,7 @@ fn insert_event(
             event.id,
             event_kind(&event.event_type),
             payload_version,
-            serde_json::to_string(event)?,
+            payload.json,
             lookup.data_kind,
             lookup.call_id,
             lookup.approval_id,
