@@ -271,6 +271,246 @@ async fn seed_round_trips_mixed_v1_and_typed_v2_events() {
 }
 
 #[tokio::test]
+async fn point_contexts_match_full_ledger_and_mask_foreign_actors() {
+    let store = SqliteStore::open(":memory:").await.unwrap();
+    let (snapshot, events) = point_context_fixture();
+    store
+        .seed_if_empty(snapshot.clone(), events.clone())
+        .await
+        .unwrap();
+    bootstrap_test_owner(&store).await;
+
+    let full = store.load_run(RUN_ID).await.unwrap();
+    let review = store
+        .review_context_for_actor("user-owner", RUN_ID, "APR-901")
+        .await
+        .unwrap();
+    assert_eq!(review.snapshot, full.snapshot);
+    assert_eq!(review.approval, events[5].approval);
+    assert_eq!(review.approval_event_sequence, Some(6));
+    assert_eq!(review.requested_call, Some(dispatch_fixture_call()));
+    assert_eq!(review.requested_call_event_sequence, Some(4));
+    assert!(matches!(
+        store
+            .review_context_for_actor("foreign-user", RUN_ID, "missing-approval")
+            .await,
+        Err(StorageError::RunNotFound(id)) if id == RUN_ID
+    ));
+
+    let commit = approved_dispatch_commit(&snapshot, "point-context-review");
+    store
+        .commit_review_for_actor("user-owner", commit.clone())
+        .await
+        .unwrap();
+    let settled_review = store
+        .review_context_for_actor("user-owner", RUN_ID, "APR-901")
+        .await
+        .unwrap();
+    assert!(settled_review.approval.is_none());
+    assert!(settled_review.requested_call.is_none());
+    let job = store.dispatch_job("call-local-001").await.unwrap().unwrap();
+    let dispatch = store.dispatch_context(&job).await.unwrap();
+    let full = store.load_run(RUN_ID).await.unwrap();
+    assert_eq!(dispatch.snapshot, full.snapshot);
+    assert_eq!(dispatch.approval_event, commit.event);
+    assert_eq!(dispatch.requested_call, Some(dispatch_fixture_call()));
+    assert_eq!(dispatch.requested_call_event_sequence, Some(4));
+
+    store
+        .create_session_for_actor(
+            "user-owner",
+            CreateSessionRequest {
+                id: "session-ZR-1842".into(),
+                title: "Checkout API latency".into(),
+            },
+            "point-context-session",
+        )
+        .await
+        .unwrap();
+    store
+        .attach_run_for_actor(
+            "user-owner",
+            "session-ZR-1842",
+            AttachRunRequest {
+                run_id: RUN_ID.into(),
+                expected_sequence: 1,
+            },
+            "point-context-attach",
+        )
+        .await
+        .unwrap();
+    let detail = store.get_session("session-ZR-1842").await.unwrap();
+    assert_eq!(
+        store.session_summary("session-ZR-1842").await.unwrap(),
+        detail.session
+    );
+    assert!(
+        store
+            .session_has_run("session-ZR-1842", RUN_ID)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn point_contexts_fail_closed_on_duplicate_or_mismatched_lookup_rows() {
+    let duplicate_database = TestDatabase::new();
+    let duplicate_store = SqliteStore::open(duplicate_database.path()).await.unwrap();
+    let (snapshot, events) = point_context_fixture();
+    duplicate_store
+        .seed_if_empty(snapshot.clone(), events.clone())
+        .await
+        .unwrap();
+    bootstrap_test_owner(&duplicate_store).await;
+    let mut duplicate = event(3, EventType::ToolCall, "Duplicate requested call");
+    duplicate.data = Some(RunEventData::ToolCallRequested {
+        call: dispatch_fixture_call(),
+        status: ToolCallStatus::Requested,
+    });
+    replace_run_event_for_test(
+        duplicate_database.path(),
+        RUN_ID,
+        3,
+        &duplicate,
+        Some("tool_call_requested"),
+        Some("call-local-001"),
+        None,
+        None,
+        None,
+    );
+    assert!(matches!(
+        duplicate_store
+            .review_context_for_actor("foreign-user", RUN_ID, "APR-901")
+            .await,
+        Err(StorageError::RunNotFound(id)) if id == RUN_ID
+    ));
+    assert!(matches!(
+        duplicate_store
+            .review_context_for_actor("user-owner", RUN_ID, "APR-901")
+            .await,
+        Err(StorageError::CorruptData(message))
+            if message.contains("multiple request events")
+    ));
+
+    let mismatch_database = TestDatabase::new();
+    let mismatch_store = SqliteStore::open(mismatch_database.path()).await.unwrap();
+    mismatch_store
+        .seed_if_empty(snapshot, events)
+        .await
+        .unwrap();
+    let mut mismatched = event(4, EventType::ToolCall, "Mismatched requested call");
+    let mut call = dispatch_fixture_call();
+    call.call_id = "payload-call-does-not-match-projection".into();
+    mismatched.data = Some(RunEventData::ToolCallRequested {
+        call,
+        status: ToolCallStatus::Requested,
+    });
+    replace_run_event_for_test(
+        mismatch_database.path(),
+        RUN_ID,
+        4,
+        &mismatched,
+        Some("tool_call_requested"),
+        Some("call-local-001"),
+        None,
+        None,
+        None,
+    );
+    assert!(matches!(
+        mismatch_store.review_context(RUN_ID, "APR-901").await,
+        Err(StorageError::CorruptData(message))
+            if message.contains("lookup projection disagrees")
+    ));
+}
+
+#[tokio::test]
+async fn approval_point_lookup_rejects_duplicate_pending_and_terminal_reuse() {
+    let duplicate_pending_database = TestDatabase::new();
+    let duplicate_pending_store = SqliteStore::open(duplicate_pending_database.path())
+        .await
+        .unwrap();
+    let (snapshot, events) = point_context_fixture();
+    duplicate_pending_store
+        .seed_if_empty(snapshot.clone(), events.clone())
+        .await
+        .unwrap();
+    let mut duplicate_pending = event(3, EventType::Approval, "Duplicate pending approval");
+    duplicate_pending.approval = events[5].approval.clone();
+    duplicate_pending.data = events[5].data.clone();
+    replace_run_event_for_test(
+        duplicate_pending_database.path(),
+        RUN_ID,
+        3,
+        &duplicate_pending,
+        Some("approval_requested"),
+        Some("call-local-001"),
+        Some("APR-901"),
+        Some("pending"),
+        Some("rev-2026-08-26"),
+    );
+    assert!(matches!(
+        duplicate_pending_store
+            .review_context(RUN_ID, "APR-901")
+            .await,
+        Err(StorageError::CorruptData(message))
+            if message.contains("multiple pending request events")
+    ));
+
+    let terminal_reuse_database = TestDatabase::new();
+    let terminal_reuse_store = SqliteStore::open(terminal_reuse_database.path())
+        .await
+        .unwrap();
+    terminal_reuse_store
+        .seed_if_empty(snapshot, events)
+        .await
+        .unwrap();
+    for sequence in [2_i64, 3_i64] {
+        let mut terminal = event(
+            sequence as u64,
+            EventType::Approval,
+            "Reused terminal approval",
+        );
+        terminal.approval = Some(Approval {
+            id: "APR-901".into(),
+            status: ApprovalStatus::Approved,
+            action: "duplicate terminal".into(),
+            tool: "local.echo".into(),
+            change: "must fail closed".into(),
+            requires_approval: true,
+            call_id: Some("call-local-001".into()),
+            policy_revision: Some("rev-2026-08-26".into()),
+            arguments_digest: Some("sha256:args-local-001".into()),
+            sandbox_profile: Some(SandboxProfile::WorkspaceWrite),
+            scope: Some(ApprovalScope::AllowOnce),
+        });
+        terminal.data = Some(RunEventData::ApprovalDecided {
+            approval_id: "APR-901".into(),
+            call_id: "call-local-001".into(),
+            decision: ReviewDecision::Approve,
+            status: ToolCallStatus::Queued,
+        });
+        replace_run_event_for_test(
+            terminal_reuse_database.path(),
+            RUN_ID,
+            sequence,
+            &terminal,
+            Some("approval_decided"),
+            Some("call-local-001"),
+            Some("APR-901"),
+            Some("approved"),
+            Some("rev-2026-08-26"),
+        );
+    }
+    assert!(matches!(
+        terminal_reuse_store
+            .review_context(RUN_ID, "APR-901")
+            .await,
+        Err(StorageError::CorruptData(message))
+            if message.contains("reused by more than one request/decision pair")
+    ));
+}
+
+#[tokio::test]
 async fn committed_review_and_receipt_survive_restart_without_reseeding() {
     let database = TestDatabase::new();
     let (seed_snapshot, seed_events) = seed_fixture();
@@ -627,7 +867,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
     let owner: Option<String> = connection
         .query_row(
             "SELECT owner_user_id FROM runs WHERE id = ?1",
@@ -668,6 +908,191 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         session.events[1].data,
         SessionEventData::RunAttached { .. }
     ));
+}
+
+#[tokio::test]
+async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
+    let database = TestDatabase::new();
+    let long_run_id = format!("v8-run-{}", "r".repeat(protocol::RESOURCE_ID_MAX_BYTES + 1));
+    let pending_call_id = format!(
+        "v8-pending-call-{}",
+        "c".repeat(protocol::RESOURCE_ID_MAX_BYTES + 1)
+    );
+    let pending_approval_id = format!(
+        "v8-pending-approval-{}",
+        "a".repeat(protocol::RESOURCE_ID_MAX_BYTES + 1)
+    );
+    let dispatch_call_id = format!(
+        "v8-dispatch-call-{}",
+        "d".repeat(protocol::RESOURCE_ID_MAX_BYTES + 1)
+    );
+    let dispatch_approval_id = format!(
+        "v8-dispatch-approval-{}",
+        "p".repeat(protocol::RESOURCE_ID_MAX_BYTES + 1)
+    );
+    create_v8_database_with_oversized_point_fixture(
+        database.path(),
+        &long_run_id,
+        &pending_call_id,
+        &pending_approval_id,
+        &dispatch_call_id,
+        &dispatch_approval_id,
+    );
+    let payloads_before = run_event_payloads(database.path(), &long_run_id);
+
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    store.readiness().await.unwrap();
+    let review = store
+        .review_context(&long_run_id, &pending_approval_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        review
+            .approval
+            .as_ref()
+            .map(|approval| approval.id.as_str()),
+        Some(pending_approval_id.as_str())
+    );
+    assert_eq!(
+        review
+            .requested_call
+            .as_ref()
+            .map(|call| call.call_id.as_str()),
+        Some(pending_call_id.as_str())
+    );
+    let job = store
+        .dispatch_job(&dispatch_call_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let dispatch = store.dispatch_context(&job).await.unwrap();
+    assert_eq!(dispatch.approval_event.sequence, 4);
+    assert_eq!(
+        dispatch
+            .approval_event
+            .approval
+            .as_ref()
+            .map(|approval| approval.id.as_str()),
+        Some(dispatch_approval_id.as_str())
+    );
+    assert_eq!(
+        dispatch
+            .requested_call
+            .as_ref()
+            .map(|call| call.call_id.as_str()),
+        Some(dispatch_call_id.as_str())
+    );
+    drop(store);
+
+    assert_eq!(
+        run_event_payloads(database.path(), &long_run_id),
+        payloads_before,
+        "v9 migration must only backfill lookup columns"
+    );
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let version: i64 = connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(version, 9);
+    let approval_plan = explain_query_plan(
+        &connection,
+        r#"SELECT sequence FROM run_events
+           WHERE run_id = ?1 AND approval_id = ?2
+           ORDER BY sequence DESC LIMIT 3"#,
+        params![long_run_id, pending_approval_id],
+    );
+    assert!(approval_plan.contains("run_events_approval_lookup_idx"));
+    let call_plan = explain_query_plan(
+        &connection,
+        r#"SELECT sequence FROM run_events
+           WHERE run_id = ?1 AND data_kind = 'tool_call_requested' AND call_id = ?2
+           ORDER BY sequence LIMIT 2"#,
+        params![long_run_id, dispatch_call_id],
+    );
+    assert!(call_plan.contains("run_events_tool_call_lookup_idx"));
+    let keyset_plan = explain_query_plan(
+        &connection,
+        r#"SELECT run_id, sequence FROM run_events
+           WHERE (run_id, sequence) > (?1, ?2)
+           ORDER BY run_id, sequence LIMIT 128"#,
+        params!["", 0_i64],
+    );
+    assert!(
+        keyset_plan.contains("SEARCH run_events USING PRIMARY KEY"),
+        "unexpected migration keyset plan: {keyset_plan}"
+    );
+}
+
+#[tokio::test]
+async fn v8_gap_aborts_v9_migration_and_restores_the_append_only_schema() {
+    let database = TestDatabase::new();
+    create_v8_database_with_legacy_dispatch(database.path());
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute_batch("DROP TRIGGER run_events_reject_delete;")
+        .unwrap();
+    assert_eq!(
+        connection
+            .execute(
+                "DELETE FROM run_events WHERE run_id = ?1 AND sequence = 3",
+                [RUN_ID],
+            )
+            .unwrap(),
+        1
+    );
+    connection
+        .execute_batch(
+            r#"CREATE TRIGGER run_events_reject_delete
+               BEFORE DELETE ON run_events
+               BEGIN
+                   SELECT RAISE(ABORT, 'run_events are append-only');
+               END;"#,
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("a gapped v8 ledger must not migrate"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        StorageError::CorruptData(message) if message.contains("ledger is not contiguous")
+    ));
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let version: i64 = connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(version, 8);
+    let lookup_columns: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('run_events') WHERE name = 'data_kind'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(lookup_columns, 0, "ALTER TABLE must roll back with v9");
+    let update_trigger: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'trigger' AND name = 'run_events_reject_update'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(update_trigger, 1, "the dropped trigger must be restored");
+    assert!(
+        connection
+            .execute(
+                "UPDATE run_events SET event_id = event_id WHERE run_id = ?1 AND sequence = 1",
+                [RUN_ID],
+            )
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -1369,9 +1794,9 @@ async fn open_turn_restart_recovery_appends_interrupted_never_flush_and_requires
     let reopened = SqliteStore::open(database.path()).await.unwrap();
     let recovered = reopened.recover_open_turns().await.unwrap();
     assert_eq!(recovered.len(), 1);
-    assert_eq!(recovered[0].sequence, 3);
+    assert_eq!(recovered[0].event.sequence, 3);
     assert!(matches!(
-        recovered[0].data,
+        recovered[0].event.data,
         SessionEventData::TurnInterrupted { .. }
     ));
     assert!(reopened.recover_open_turns().await.unwrap().is_empty());
@@ -1458,17 +1883,105 @@ async fn startup_recovery_interrupts_each_open_turn_once() {
 
     let events = store.recover_open_turns().await.unwrap();
     assert_eq!(events.len(), 2);
-    assert!(
-        events
-            .iter()
-            .all(|event| matches!(event.data, SessionEventData::TurnInterrupted { .. }))
-    );
+    assert!(events.iter().all(|recovered| matches!(
+        recovered.event.data,
+        SessionEventData::TurnInterrupted { .. }
+    )));
     assert!(store.recover_open_turns().await.unwrap().is_empty());
     for session_id in ["session-alpha", "session-beta"] {
         let detail = store.get_session(session_id).await.unwrap();
         assert_eq!(detail.session.status, SessionStatus::NeedsAttention);
         assert_eq!(detail.turns[0].status, SessionTurnStatus::Interrupted);
     }
+}
+
+#[tokio::test]
+async fn open_turn_and_started_reply_recovery_use_fixed_sixty_four_row_batches() {
+    const TOTAL: usize = 65;
+
+    let open_store = SqliteStore::open(":memory:").await.unwrap();
+    for index in 0..TOTAL {
+        let session_id = format!("session-open-batch-{index:03}");
+        let turn_id = format!("turn-open-batch-{index:03}");
+        open_store
+            .create_session(
+                CreateSessionRequest {
+                    id: session_id.clone(),
+                    title: format!("Open recovery batch {index}"),
+                },
+                &format!("create-open-batch-{index:03}"),
+            )
+            .await
+            .unwrap();
+        open_store
+            .start_turn(
+                &session_id,
+                StartTurnRequest {
+                    turn_id,
+                    user_message: "recover this open turn".into(),
+                    expected_sequence: 1,
+                },
+                &format!("start-open-batch-{index:03}"),
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(open_store.recover_open_turns().await.unwrap().len(), 64);
+    assert_eq!(open_store.recover_open_turns().await.unwrap().len(), 1);
+    assert!(open_store.recover_open_turns().await.unwrap().is_empty());
+
+    let reply_store = SqliteStore::open(":memory:").await.unwrap();
+    bootstrap_test_owner(&reply_store).await;
+    for index in 0..TOTAL {
+        let session_id = format!("session-reply-batch-{index:03}");
+        let turn_id = format!("turn-reply-batch-{index:03}");
+        reply_store
+            .create_session_for_actor(
+                "user-owner",
+                CreateSessionRequest {
+                    id: session_id.clone(),
+                    title: format!("Reply recovery batch {index}"),
+                },
+                &format!("create-reply-batch-{index:03}"),
+            )
+            .await
+            .unwrap();
+        reply_store
+            .start_turn_and_enqueue_reply_for_actor(
+                "user-owner",
+                &session_id,
+                StartTurnRequest {
+                    turn_id: turn_id.clone(),
+                    user_message: "claim this reply".into(),
+                    expected_sequence: 1,
+                },
+                &format!("start-reply-batch-{index:03}"),
+                reply_job_spec(&format!("reply-batch-{index:03}"), &turn_id),
+            )
+            .await
+            .unwrap();
+    }
+    for _ in 0..TOTAL {
+        assert!(matches!(
+            reply_store.claim_next_reply().await.unwrap(),
+            ReplyClaimOutcome::Claimed(_)
+        ));
+    }
+    assert_eq!(
+        reply_store.recover_started_replies().await.unwrap().len(),
+        64
+    );
+    assert_eq!(
+        reply_store.recover_started_replies().await.unwrap().len(),
+        1
+    );
+    assert!(
+        reply_store
+            .recover_started_replies()
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3246,6 +3759,10 @@ fn seed_fixture() -> (RunSnapshot, Vec<RunEvent>) {
         event(4, EventType::ToolCall, "Telemetry collected"),
         event(5, EventType::Evidence, "Pressure correlated"),
     ];
+    events[3].data = Some(RunEventData::ToolCallRequested {
+        call: dispatch_fixture_call(),
+        status: ToolCallStatus::Requested,
+    });
     events.push(RunEvent {
         sequence: 6,
         id: "evt-000006".into(),
@@ -3325,6 +3842,28 @@ fn seed_fixture() -> (RunSnapshot, Vec<RunEvent>) {
     (snapshot, events)
 }
 
+fn point_context_fixture() -> (RunSnapshot, Vec<RunEvent>) {
+    let (snapshot, mut events) = seed_fixture();
+    let call = dispatch_fixture_call();
+    let approval = events[5]
+        .approval
+        .as_mut()
+        .expect("fixture has a pending approval");
+    approval.tool = call.tool.clone();
+    approval.call_id = Some(call.call_id.clone());
+    approval.policy_revision = Some("rev-2026-08-26".into());
+    approval.arguments_digest = Some(call.arguments_digest.clone());
+    approval.sandbox_profile = Some(call.sandbox_profile.clone());
+    approval.scope = Some(ApprovalScope::AllowOnce);
+    events[5].data = Some(RunEventData::ApprovalRequested {
+        approval_id: approval.id.clone(),
+        call_id: call.call_id,
+        scope: ApprovalScope::AllowOnce,
+        status: ToolCallStatus::WaitingForApproval,
+    });
+    (snapshot, events)
+}
+
 fn event(sequence: u64, event_type: EventType, title: &str) -> RunEvent {
     RunEvent {
         sequence,
@@ -3339,6 +3878,19 @@ fn event(sequence: u64, event_type: EventType, title: &str) -> RunEvent {
         metadata: BTreeMap::new(),
         approval: None,
         data: None,
+    }
+}
+
+fn dispatch_fixture_call() -> ToolCall {
+    ToolCall {
+        call_id: "call-local-001".into(),
+        tool: "local.echo".into(),
+        tool_version: "1.0.0".into(),
+        arguments: json!({"message": "raise the local fixture ceiling"}),
+        arguments_digest: "sha256:args-local-001".into(),
+        effect: ToolEffect::LocalWrite,
+        sandbox_profile: SandboxProfile::WorkspaceWrite,
+        executor_status: ToolExecutorStatus::Available,
     }
 }
 
@@ -3597,7 +4149,9 @@ fn create_v1_database(path: &Path) {
             ],
         )
         .unwrap();
-    for event in events {
+    for mut event in events {
+        // Schema v1 predates typed RunEventData.
+        event.data = None;
         connection
             .execute(
                 r#"INSERT INTO run_events(
@@ -3676,6 +4230,69 @@ fn create_v7_database_with_legacy_dispatch(path: &Path) {
             )
             .unwrap();
     }
+    let call = ToolCall {
+        call_id: "call-v7-legacy".into(),
+        tool: "local.echo".into(),
+        tool_version: "1.0.0".into(),
+        arguments: json!({}),
+        arguments_digest: "sha256:args-v7".into(),
+        effect: ToolEffect::LocalWrite,
+        sandbox_profile: SandboxProfile::WorkspaceWrite,
+        executor_status: ToolExecutorStatus::Available,
+    };
+    let mut requested = event(4, EventType::ToolCall, "Legacy tool call requested");
+    requested.data = Some(RunEventData::ToolCallRequested {
+        call: call.clone(),
+        status: ToolCallStatus::Requested,
+    });
+    let mut approved = event(6, EventType::Approval, "Legacy tool call approved");
+    approved.approval = Some(Approval {
+        id: "APR-V7".into(),
+        status: ApprovalStatus::Approved,
+        action: "run legacy local echo".into(),
+        tool: call.tool.clone(),
+        change: "record the legacy dispatch".into(),
+        requires_approval: true,
+        call_id: Some(call.call_id.clone()),
+        policy_revision: Some("rev-v7".into()),
+        arguments_digest: Some(call.arguments_digest.clone()),
+        sandbox_profile: Some(call.sandbox_profile.clone()),
+        scope: Some(ApprovalScope::AllowOnce),
+    });
+    approved.data = Some(RunEventData::ApprovalDecided {
+        approval_id: "APR-V7".into(),
+        call_id: call.call_id.clone(),
+        decision: ReviewDecision::Approve,
+        status: ToolCallStatus::Queued,
+    });
+    connection
+        .execute_batch("DROP TRIGGER run_events_reject_update;")
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE run_events
+               SET event_kind = 'tool_call', payload_version = 2, payload_json = ?1
+               WHERE run_id = ?2 AND sequence = 4"#,
+            params![serde_json::to_string(&requested).unwrap(), RUN_ID],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE run_events
+               SET event_kind = 'approval', payload_version = 2, payload_json = ?1
+               WHERE run_id = ?2 AND sequence = 6"#,
+            params![serde_json::to_string(&approved).unwrap(), RUN_ID],
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            r#"CREATE TRIGGER run_events_reject_update
+               BEFORE UPDATE ON run_events
+               BEGIN
+                   SELECT RAISE(ABORT, 'run_events are append-only');
+               END;"#,
+        )
+        .unwrap();
     connection
         .execute(
             "UPDATE runs SET status = 'active', execution_status = 'queued' WHERE id = ?1",
@@ -3698,6 +4315,232 @@ fn create_v7_database_with_legacy_dispatch(path: &Path) {
                    NULL, NULL, NULL, NULL
                )"#,
             [RUN_ID],
+        )
+        .unwrap();
+}
+
+fn create_v8_database_with_legacy_dispatch(path: &Path) {
+    create_v7_database_with_legacy_dispatch(path);
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .unwrap();
+    connection
+        .execute_batch(include_str!("../migrations/0008_actor_boundaries.sql"))
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (8, ?1)",
+            ["2026-08-26T00:00:08.000Z"],
+        )
+        .unwrap();
+}
+
+fn create_v8_database_with_oversized_point_fixture(
+    path: &Path,
+    run_id: &str,
+    pending_call_id: &str,
+    pending_approval_id: &str,
+    dispatch_call_id: &str,
+    dispatch_approval_id: &str,
+) {
+    create_v8_database_with_legacy_dispatch(path);
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .unwrap();
+    let timestamp = "2026-08-26T03:00:00.000Z";
+    connection
+        .execute(
+            r#"INSERT INTO users(
+                   id, username, role, status, password_hash, created_at, updated_at
+               ) VALUES ('user-v8-owner', 'v8-owner', 'owner', 'active',
+                         '$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA', ?1, ?1)"#,
+            [timestamp],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO user_preferences(user_id, theme, revision, updated_at)
+               VALUES ('user-v8-owner', 'system', 1, ?1)"#,
+            [timestamp],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sessions SET owner_user_id = 'user-v8-owner' WHERE owner_user_id IS NULL",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE runs SET owner_user_id = 'user-v8-owner' WHERE owner_user_id IS NULL",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE dispatch_jobs SET approving_actor_user_id = 'user-v8-owner'
+               WHERE approving_actor_user_id IS NULL"#,
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE session_command_receipts SET actor_scope = 'user-v8-owner'
+               WHERE actor_scope = '__legacy__'"#,
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE idempotency_receipts SET actor_scope = 'user-v8-owner'
+               WHERE actor_scope = '__legacy__'"#,
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO incidents(
+                   id, title, severity, status, service, region, user_impact, since
+               ) VALUES ('INC-V8-POINT', 'V8 point lookup fixture', 'low', 'investigating',
+                         'local-fixture', 'local', 'none', ?1)"#,
+            [timestamp],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO runs(
+                   id, incident_id, status, environment, started_at, duration_seconds,
+                   agent, sequence, projection_sequence, metrics_json, evidence_json,
+                   tool_policy_json, execution_status, owner_user_id
+               ) VALUES (?1, 'INC-V8-POINT', 'active', 'local', ?2, 0,
+                         'Zeus Migration Test', 4, 4, '[]', '[]', NULL,
+                         'queued', 'user-v8-owner')"#,
+            params![run_id, timestamp],
+        )
+        .unwrap();
+
+    let pending_call = ToolCall {
+        call_id: pending_call_id.into(),
+        tool: "local.pending".into(),
+        tool_version: "1.0.0".into(),
+        arguments: json!({"kind": "pending-v8"}),
+        arguments_digest: "sha256:v8-pending".into(),
+        effect: ToolEffect::LocalWrite,
+        sandbox_profile: SandboxProfile::WorkspaceWrite,
+        executor_status: ToolExecutorStatus::Available,
+    };
+    let dispatch_call = ToolCall {
+        call_id: dispatch_call_id.into(),
+        tool: "local.dispatch".into(),
+        tool_version: "1.0.0".into(),
+        arguments: json!({"kind": "dispatch-v8"}),
+        arguments_digest: "sha256:v8-dispatch".into(),
+        effect: ToolEffect::LocalWrite,
+        sandbox_profile: SandboxProfile::WorkspaceWrite,
+        executor_status: ToolExecutorStatus::Available,
+    };
+
+    let mut pending_request = event(1, EventType::ToolCall, "V8 pending call requested");
+    pending_request.id = "evt-v8-point-001".into();
+    pending_request.data = Some(RunEventData::ToolCallRequested {
+        call: pending_call.clone(),
+        status: ToolCallStatus::Requested,
+    });
+    let mut pending_approval = event(2, EventType::Approval, "V8 approval requested");
+    pending_approval.id = "evt-v8-point-002".into();
+    pending_approval.approval = Some(Approval {
+        id: pending_approval_id.into(),
+        status: ApprovalStatus::Pending,
+        action: "allow pending v8 call".into(),
+        tool: pending_call.tool.clone(),
+        change: "exercise migrated review lookup".into(),
+        requires_approval: true,
+        call_id: Some(pending_call.call_id.clone()),
+        policy_revision: Some("rev-v8-point".into()),
+        arguments_digest: Some(pending_call.arguments_digest.clone()),
+        sandbox_profile: Some(pending_call.sandbox_profile.clone()),
+        scope: Some(ApprovalScope::AllowOnce),
+    });
+    pending_approval.data = Some(RunEventData::ApprovalRequested {
+        approval_id: pending_approval_id.into(),
+        call_id: pending_call.call_id.clone(),
+        scope: ApprovalScope::AllowOnce,
+        status: ToolCallStatus::WaitingForApproval,
+    });
+    let mut dispatch_request = event(3, EventType::ToolCall, "V8 dispatch call requested");
+    dispatch_request.id = "evt-v8-point-003".into();
+    dispatch_request.data = Some(RunEventData::ToolCallRequested {
+        call: dispatch_call.clone(),
+        status: ToolCallStatus::Requested,
+    });
+    let mut dispatch_approval = event(4, EventType::Approval, "V8 dispatch approved");
+    dispatch_approval.id = "evt-v8-point-004".into();
+    dispatch_approval.approval = Some(Approval {
+        id: dispatch_approval_id.into(),
+        status: ApprovalStatus::Approved,
+        action: "allow dispatch v8 call".into(),
+        tool: dispatch_call.tool.clone(),
+        change: "exercise migrated dispatch lookup".into(),
+        requires_approval: true,
+        call_id: Some(dispatch_call.call_id.clone()),
+        policy_revision: Some("rev-v8-point".into()),
+        arguments_digest: Some(dispatch_call.arguments_digest.clone()),
+        sandbox_profile: Some(dispatch_call.sandbox_profile.clone()),
+        scope: Some(ApprovalScope::AllowOnce),
+    });
+    dispatch_approval.data = Some(RunEventData::ApprovalDecided {
+        approval_id: dispatch_approval_id.into(),
+        call_id: dispatch_call.call_id.clone(),
+        decision: ReviewDecision::Approve,
+        status: ToolCallStatus::Queued,
+    });
+
+    for event in [
+        pending_request,
+        pending_approval,
+        dispatch_request,
+        dispatch_approval,
+    ] {
+        connection
+            .execute(
+                r#"INSERT INTO run_events(
+                       run_id, sequence, event_id, event_kind, payload_version, payload_json
+                   ) VALUES (?1, ?2, ?3, ?4, 2, ?5)"#,
+                params![
+                    run_id,
+                    event.sequence,
+                    event.id,
+                    event_kind(&event.event_type),
+                    serde_json::to_string(&event).unwrap(),
+                ],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            r#"INSERT INTO dispatch_jobs(
+                   call_id, run_id, approval_id, approval_event_sequence,
+                   approving_actor_user_id, tool_name, tool_version, effect, args_json,
+                   args_digest, policy_id, policy_revision, sandbox_profile, status, attempt,
+                   result_json, authorization_error_json, queued_at, started_at, finished_at,
+                   start_event_sequence, result_event_sequence
+               ) VALUES (
+                   ?1, ?2, ?3, 4, 'user-v8-owner', ?4, ?5, 'local_write', ?6,
+                   ?7, 'local-alpha', 'rev-v8-point', 'workspace_write', 'queued', 0,
+                   NULL, NULL, ?8, NULL, NULL, NULL, NULL
+               )"#,
+            params![
+                dispatch_call.call_id,
+                run_id,
+                dispatch_approval_id,
+                dispatch_call.tool,
+                dispatch_call.tool_version,
+                serde_json::to_string(&dispatch_call.arguments).unwrap(),
+                dispatch_call.arguments_digest,
+                timestamp,
+            ],
         )
         .unwrap();
 }
@@ -3760,6 +4603,86 @@ fn insert_raw_event(path: &Path, event_kind: &str, payload_version: i64) {
                 payload_version,
                 serde_json::to_string(&event).unwrap()
             ],
+        )
+        .unwrap();
+}
+
+fn run_event_payloads(path: &Path, run_id: &str) -> Vec<String> {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    let mut statement = connection
+        .prepare("SELECT payload_json FROM run_events WHERE run_id = ?1 ORDER BY sequence")
+        .unwrap();
+    statement
+        .query_map([run_id], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn explain_query_plan<P: rusqlite::Params>(
+    connection: &rusqlite::Connection,
+    sql: &str,
+    params: P,
+) -> String {
+    let mut statement = connection
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap();
+    statement
+        .query_map(params, |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .join("\n")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replace_run_event_for_test(
+    path: &Path,
+    run_id: &str,
+    sequence: i64,
+    event: &RunEvent,
+    data_kind: Option<&str>,
+    call_id: Option<&str>,
+    approval_id: Option<&str>,
+    approval_status: Option<&str>,
+    policy_revision: Option<&str>,
+) {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .execute_batch("DROP TRIGGER run_events_reject_update;")
+        .unwrap();
+    assert_eq!(
+        connection
+            .execute(
+                r#"UPDATE run_events
+                   SET event_id = ?1, event_kind = ?2, payload_version = ?3,
+                       payload_json = ?4, data_kind = ?5, call_id = ?6,
+                       approval_id = ?7, approval_status = ?8, policy_revision = ?9
+                   WHERE run_id = ?10 AND sequence = ?11"#,
+                params![
+                    event.id,
+                    event_kind(&event.event_type),
+                    if event.data.is_some() { 2 } else { 1 },
+                    serde_json::to_string(event).unwrap(),
+                    data_kind,
+                    call_id,
+                    approval_id,
+                    approval_status,
+                    policy_revision,
+                    run_id,
+                    sequence,
+                ],
+            )
+            .unwrap(),
+        1
+    );
+    connection
+        .execute_batch(
+            r#"CREATE TRIGGER run_events_reject_update
+               BEFORE UPDATE ON run_events
+               BEGIN
+                   SELECT RAISE(ABORT, 'run_events are append-only');
+               END;"#,
         )
         .unwrap();
 }

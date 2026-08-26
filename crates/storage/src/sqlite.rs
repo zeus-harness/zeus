@@ -25,15 +25,15 @@ use serde_json::{Value, json};
 
 use crate::{
     AuthPrincipal, AuthSessionCommit, BootstrapOwnerCommit, ClaimOutcome, CommitOutcome,
-    DispatchCompleteCommit, DispatchJob, DispatchJobSpec, DispatchRecoveryCommit,
-    DispatchRejection, DispatchStartCommit, DispatchStatus, ReplyClaimOutcome, ReplyCompletion,
-    ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus,
-    ReplyOutcomeUnknownCommit, ReplySuccessCommit, ReviewCommit, ReviewReceipt, RunSnapshot,
-    RuntimeIdentity, StorageError, StoredCredential, StoredPreferences, StoredRun, StoredUser,
-    StoredUserRole, StoredUserStatus,
+    DispatchCompleteCommit, DispatchContext, DispatchJob, DispatchJobSpec, DispatchRecoveryCommit,
+    DispatchRejection, DispatchStartCommit, DispatchStatus, RecoveredSessionTurn,
+    ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse,
+    ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit, ReplySuccessCommit, ReviewCommit,
+    ReviewContext, ReviewReceipt, RunSnapshot, RuntimeIdentity, StorageError, StoredCredential,
+    StoredPreferences, StoredRun, StoredUser, StoredUserRole, StoredUserStatus,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 8;
+const CURRENT_SCHEMA_VERSION: i64 = 9;
 const EVENT_PAYLOAD_VERSION_V1: i64 = 1;
 const EVENT_PAYLOAD_VERSION_V2: i64 = 2;
 const SESSION_EVENT_PAYLOAD_VERSION_V1: i64 = 1;
@@ -46,6 +46,8 @@ const MIGRATION_0005: &str = include_str!("../migrations/0005_accounts.sql");
 const MIGRATION_0006: &str = include_str!("../migrations/0006_actor_receipts.sql");
 const MIGRATION_0007: &str = include_str!("../migrations/0007_reply_jobs.sql");
 const MIGRATION_0008: &str = include_str!("../migrations/0008_actor_boundaries.sql");
+const MIGRATION_0009: &str = include_str!("../migrations/0009_point_queries.sql");
+const RECOVERY_BATCH_LIMIT: i64 = 64;
 
 #[derive(Clone)]
 pub struct SqliteStore {
@@ -176,6 +178,45 @@ impl SqliteStore {
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         self.with_connection(move |connection| {
             query_session_detail_for_actor(connection, &actor_user_id, &session_id)
+        })
+        .await
+    }
+
+    /// Returns one projection after checking its durable event tail in the
+    /// same read transaction. Unlike session detail, this never loads turns,
+    /// attachments, or the complete event ledger.
+    pub async fn session_summary(&self, session_id: &str) -> Result<SessionSummary, StorageError> {
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        self.with_connection(move |connection| {
+            query_consistent_session_summary(connection, &session_id)
+        })
+        .await
+    }
+
+    pub async fn session_summary_for_actor(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+    ) -> Result<SessionSummary, StorageError> {
+        let actor_user_id =
+            normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        self.with_connection(move |connection| {
+            query_consistent_session_summary_for_actor(connection, &actor_user_id, &session_id)
+        })
+        .await
+    }
+
+    /// Checks one immutable attachment without loading Session detail.
+    pub async fn session_has_run(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<bool, StorageError> {
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        let run_id = validated_durable_reference(run_id, "run ID")?.to_owned();
+        self.with_connection(move |connection| {
+            query_session_has_run(connection, &session_id, &run_id)
         })
         .await
     }
@@ -470,8 +511,8 @@ impl SqliteStore {
             .await
     }
 
-    /// Converts every reply durably claimed by a previous process into
-    /// `outcome_unknown`. Queued work is deliberately left claimable.
+    /// Converts one bounded batch of replies durably claimed by a previous
+    /// process into `outcome_unknown`. Queued work remains claimable.
     pub async fn recover_started_replies(&self) -> Result<Vec<ReplyCompletion>, StorageError> {
         self.with_connection(recover_started_replies).await
     }
@@ -549,9 +590,10 @@ impl SqliteStore {
         .await
     }
 
-    /// Closes every turn left open by a previous process. Recovery only
-    /// appends `turn_interrupted`; it never manufactures a flush acknowledgement.
-    pub async fn recover_open_turns(&self) -> Result<Vec<SessionEvent>, StorageError> {
+    /// Closes one bounded batch of turns left open by a previous process.
+    /// Recovery only appends `turn_interrupted`; it never manufactures a flush
+    /// acknowledgement.
+    pub async fn recover_open_turns(&self) -> Result<Vec<RecoveredSessionTurn>, StorageError> {
         self.with_connection(recover_open_turns).await
     }
 
@@ -691,6 +733,78 @@ impl SqliteStore {
         let run_id = validated_durable_reference(run_id, "run ID")?.to_owned();
         self.with_connection(move |connection| {
             load_snapshot_for_actor(connection, &actor_user_id, &run_id)
+        })
+        .await
+    }
+
+    /// Returns one Run projection after decoding and matching only its durable
+    /// event tail. Internal execution paths use this instead of loading the
+    /// complete ledger.
+    pub async fn consistent_snapshot(&self, run_id: &str) -> Result<RunSnapshot, StorageError> {
+        let run_id = validated_durable_reference(run_id, "run ID")?.to_owned();
+        self.with_connection(move |connection| query_consistent_snapshot(connection, &run_id))
+            .await
+    }
+
+    pub async fn consistent_snapshot_for_actor(
+        &self,
+        actor_user_id: &str,
+        run_id: &str,
+    ) -> Result<RunSnapshot, StorageError> {
+        let actor_user_id =
+            normalized_account_value(actor_user_id, "run actor user ID", 128)?.to_owned();
+        let run_id = validated_durable_reference(run_id, "run ID")?.to_owned();
+        self.with_connection(move |connection| {
+            query_consistent_snapshot_for_actor(connection, &actor_user_id, &run_id)
+        })
+        .await
+    }
+
+    pub async fn review_context(
+        &self,
+        run_id: &str,
+        approval_id: &str,
+    ) -> Result<ReviewContext, StorageError> {
+        let run_id = validated_durable_reference(run_id, "run ID")?.to_owned();
+        let approval_id = validated_durable_reference(approval_id, "approval ID")?.to_owned();
+        self.with_connection(move |connection| {
+            query_review_context(connection, &run_id, &approval_id)
+        })
+        .await
+    }
+
+    pub async fn review_context_for_actor(
+        &self,
+        actor_user_id: &str,
+        run_id: &str,
+        approval_id: &str,
+    ) -> Result<ReviewContext, StorageError> {
+        let actor_user_id =
+            normalized_account_value(actor_user_id, "review actor user ID", 128)?.to_owned();
+        let run_id = validated_durable_reference(run_id, "run ID")?.to_owned();
+        let approval_id = validated_durable_reference(approval_id, "approval ID")?.to_owned();
+        self.with_connection(move |connection| {
+            query_review_context_for_actor(connection, &actor_user_id, &run_id, &approval_id)
+        })
+        .await
+    }
+
+    pub async fn dispatch_context(
+        &self,
+        job: &DispatchJob,
+    ) -> Result<DispatchContext, StorageError> {
+        let run_id = validated_durable_reference(&job.run_id, "run ID")?.to_owned();
+        let call_id = validated_durable_reference(&job.call_id, "call ID")?.to_owned();
+        let approval_id = validated_durable_reference(&job.approval_id, "approval ID")?.to_owned();
+        let approval_event_sequence = job.approval_event_sequence;
+        self.with_connection(move |connection| {
+            query_dispatch_context(
+                connection,
+                &run_id,
+                approval_event_sequence,
+                &call_id,
+                &approval_id,
+            )
         })
         .await
     }
@@ -839,6 +953,7 @@ impl SqliteStore {
             .await
     }
 
+    /// Returns one bounded startup-recovery batch ordered by durable start.
     pub async fn started_dispatches(&self) -> Result<Vec<DispatchJob>, StorageError> {
         self.with_connection(query_started_dispatches).await
     }
@@ -1149,7 +1264,173 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
             params![8, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 9 {
+        // Existing rows are decoded by Rust before their immutable lookup
+        // projections are populated. This avoids making SQLite JSON-path
+        // behavior part of the durable event contract.
+        transaction.execute_batch("DROP TRIGGER run_events_reject_update;")?;
+        transaction.execute_batch(MIGRATION_0009)?;
+        backfill_run_event_lookups(&transaction)?;
+        transaction.execute_batch(
+            r#"CREATE INDEX run_events_approval_lookup_idx
+                   ON run_events(run_id, approval_id, sequence DESC, approval_status)
+                   WHERE approval_id IS NOT NULL;
+               CREATE INDEX run_events_tool_call_lookup_idx
+                   ON run_events(run_id, data_kind, call_id, sequence)
+                   WHERE data_kind = 'tool_call_requested' AND call_id IS NOT NULL;
+               CREATE INDEX run_events_policy_revision_idx
+                   ON run_events(run_id, policy_revision)
+                   WHERE policy_revision IS NOT NULL;
+               CREATE INDEX session_runs_session_attached_idx
+                   ON session_runs(session_id, attached_at, run_id);
+               CREATE INDEX reply_jobs_started_idx
+                   ON reply_jobs(status, started_at, id);
+               CREATE INDEX dispatch_jobs_started_idx
+                   ON dispatch_jobs(status, started_at, call_id);
+               CREATE INDEX session_turns_open_recovery_idx
+                   ON session_turns(status, session_id, ordinal, id);
+
+               CREATE TRIGGER run_events_reject_update
+               BEFORE UPDATE ON run_events
+               BEGIN
+                   SELECT RAISE(ABORT, 'run_events are append-only');
+               END;
+
+               CREATE TRIGGER run_events_require_next_sequence
+               BEFORE INSERT ON run_events
+               WHEN NEW.sequence <> COALESCE((
+                   SELECT MAX(sequence) + 1
+                   FROM run_events
+                   WHERE run_id = NEW.run_id
+               ), 1)
+               BEGIN
+                   SELECT RAISE(ABORT, 'run event sequence must be contiguous');
+               END;"#,
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![9, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
     transaction.commit()?;
+    Ok(())
+}
+
+fn backfill_run_event_lookups(connection: &Connection) -> Result<(), StorageError> {
+    let mut cursor: Option<(String, i64)> = None;
+    loop {
+        let rows = if let Some((run_id, sequence)) = cursor.as_ref() {
+            let mut statement = connection.prepare(
+                r#"SELECT run_id, sequence, event_id, event_kind, payload_version, payload_json
+                   FROM run_events
+                   WHERE (run_id, sequence) > (?1, ?2)
+                   ORDER BY run_id, sequence
+                   LIMIT 128"#,
+            )?;
+            statement
+                .query_map(params![run_id, sequence], decode_migration_event_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            let mut statement = connection.prepare(
+                r#"SELECT run_id, sequence, event_id, event_kind, payload_version, payload_json
+                   FROM run_events
+                   ORDER BY run_id, sequence
+                   LIMIT 128"#,
+            )?;
+            statement
+                .query_map([], decode_migration_event_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if rows.is_empty() {
+            validate_migrated_run_ledgers(connection)?;
+            return Ok(());
+        }
+
+        for (run_id, stored) in &rows {
+            let event = stored.decode_payload()?;
+            let lookup = RunEventLookup::from_event(&event)?;
+            let changed = connection.execute(
+                r#"UPDATE run_events
+                   SET data_kind = ?1, call_id = ?2, approval_id = ?3,
+                       approval_status = ?4, policy_revision = ?5
+                   WHERE run_id = ?6 AND sequence = ?7"#,
+                params![
+                    lookup.data_kind,
+                    lookup.call_id,
+                    lookup.approval_id,
+                    lookup.approval_status,
+                    lookup.policy_revision,
+                    run_id,
+                    stored.sequence,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StorageError::CorruptData(format!(
+                    "run event {run_id}/{} disappeared during lookup migration",
+                    stored.sequence
+                )));
+            }
+        }
+        let (run_id, stored) = rows.last().expect("non-empty migration batch");
+        cursor = Some((run_id.clone(), stored.sequence));
+    }
+}
+
+fn decode_migration_event_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(String, StoredEventRow)> {
+    Ok((
+        row.get(0)?,
+        StoredEventRow {
+            sequence: row.get(1)?,
+            event_id: row.get(2)?,
+            event_kind: row.get(3)?,
+            payload_version: row.get(4)?,
+            payload_json: row.get(5)?,
+            data_kind: None,
+            call_id: None,
+            approval_id: None,
+            approval_status: None,
+            policy_revision: None,
+        },
+    ))
+}
+
+fn validate_migrated_run_ledgers(connection: &Connection) -> Result<(), StorageError> {
+    let invalid = connection
+        .query_row(
+            r#"SELECT r.id, r.sequence, r.projection_sequence,
+                      COUNT(e.sequence), COALESCE(MIN(e.sequence), 0),
+                      COALESCE(MAX(e.sequence), 0)
+               FROM runs r
+               LEFT JOIN run_events e ON e.run_id = r.id
+               GROUP BY r.id
+               HAVING r.sequence <> r.projection_sequence
+                   OR COUNT(e.sequence) <> r.sequence
+                   OR (r.sequence = 0 AND COALESCE(MAX(e.sequence), 0) <> 0)
+                   OR (r.sequence > 0 AND (
+                       COALESCE(MIN(e.sequence), 0) <> 1
+                       OR COALESCE(MAX(e.sequence), 0) <> r.sequence
+                   ))
+               LIMIT 1"#,
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((run_id, sequence, projection, count, first, last)) = invalid {
+        return Err(StorageError::CorruptData(format!(
+            "run `{run_id}` ledger is not contiguous with its projection: head={sequence}, projection={projection}, count={count}, first={first}, last={last}"
+        )));
+    }
     Ok(())
 }
 
@@ -1236,11 +1517,46 @@ fn readiness(connection: &mut Connection, expects_wal: bool) -> Result<(), Stora
         ));
     }
 
+    let event_lookup_columns: i64 = connection.query_row(
+        r#"SELECT COUNT(*) FROM pragma_table_info('run_events')
+           WHERE name IN (
+               'data_kind', 'call_id', 'approval_id', 'approval_status', 'policy_revision'
+           )"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if event_lookup_columns != 5 {
+        return Err(StorageError::CorruptData(
+            "run event lookup projection columns are missing".into(),
+        ));
+    }
+
+    let point_query_indexes: i64 = connection.query_row(
+        r#"SELECT COUNT(*) FROM sqlite_schema
+           WHERE type = 'index' AND name IN (
+               'run_events_approval_lookup_idx',
+               'run_events_tool_call_lookup_idx',
+               'run_events_policy_revision_idx',
+               'session_runs_session_attached_idx',
+               'reply_jobs_started_idx',
+               'dispatch_jobs_started_idx',
+               'session_turns_open_recovery_idx'
+           )"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if point_query_indexes != 7 {
+        return Err(StorageError::CorruptData(
+            "one or more point-query indexes are missing".into(),
+        ));
+    }
+
     let trigger_count: i64 = connection.query_row(
         r#"SELECT COUNT(*) FROM sqlite_schema
            WHERE type = 'trigger' AND name IN (
                'run_events_reject_update',
                'run_events_reject_delete',
+               'run_events_require_next_sequence',
                'dispatch_jobs_reject_input_update',
                'dispatch_jobs_enforce_forward_transition',
                'dispatch_jobs_reject_delete',
@@ -1281,7 +1597,7 @@ fn readiness(connection: &mut Connection, expects_wal: bool) -> Result<(), Stora
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 38 {
+    if trigger_count != 39 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
         ));
@@ -1937,41 +2253,22 @@ fn validate_legacy_runtime_identity(
         ));
     }
 
-    let mut statement = transaction.prepare(
-        r#"SELECT payload_json FROM run_events
-           WHERE run_id = ?1 AND payload_version IN (?2, ?3) ORDER BY sequence"#,
-    )?;
-    let payloads = statement
-        .query_map(
-            params![
-                identity.primary_run_id,
-                EVENT_PAYLOAD_VERSION_V1,
-                EVENT_PAYLOAD_VERSION_V2
-            ],
+    let mismatched_event_policy = transaction
+        .query_row(
+            r#"SELECT policy_revision FROM run_events
+               WHERE run_id = ?1
+                 AND policy_revision IS NOT NULL
+                 AND policy_revision <> ?2
+               LIMIT 1"#,
+            params![identity.primary_run_id, identity.policy_revision],
             |row| row.get::<_, String>(0),
-        )?
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(statement);
-    for payload in payloads {
-        let event: RunEvent = serde_json::from_str(&payload)?;
-        if let Some(RunEventData::ToolPolicyDecided {
-            policy_revision, ..
-        }) = event.data
-            && policy_revision != identity.policy_revision
-        {
-            return Err(identity_mismatch(
-                identity,
-                format!("event policy revision {policy_revision}"),
-            ));
-        }
-        if let Some(policy_revision) = event.approval.and_then(|approval| approval.policy_revision)
-            && policy_revision != identity.policy_revision
-        {
-            return Err(identity_mismatch(
-                identity,
-                format!("approval policy revision {policy_revision}"),
-            ));
-        }
+        )
+        .optional()?;
+    if let Some(policy_revision) = mismatched_event_policy {
+        return Err(identity_mismatch(
+            identity,
+            format!("event policy revision {policy_revision}"),
+        ));
     }
     Ok(())
 }
@@ -2214,6 +2511,88 @@ fn query_session_summaries_for_actor(
         .collect::<Result<Vec<_>, _>>()?;
     transaction.commit()?;
     Ok(summaries)
+}
+
+fn query_consistent_session_summary(
+    connection: &mut Connection,
+    session_id: &str,
+) -> Result<SessionSummary, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let summary = query_session_summary(&transaction, session_id)?;
+    validate_session_event_tail(&transaction, &summary)?;
+    transaction.commit()?;
+    Ok(summary)
+}
+
+fn query_consistent_session_summary_for_actor(
+    connection: &mut Connection,
+    actor_user_id: &str,
+    session_id: &str,
+) -> Result<SessionSummary, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    require_active_session_actor(&transaction, session_id, actor_user_id)?;
+    let summary = query_session_summary(&transaction, session_id)?;
+    validate_session_event_tail(&transaction, &summary)?;
+    transaction.commit()?;
+    Ok(summary)
+}
+
+fn query_session_has_run(
+    connection: &mut Connection,
+    session_id: &str,
+    run_id: &str,
+) -> Result<bool, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let summary = query_session_summary(&transaction, session_id)?;
+    validate_session_event_tail(&transaction, &summary)?;
+    let attached = transaction.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM session_runs
+               WHERE session_id = ?1 AND run_id = ?2
+           )"#,
+        params![session_id, run_id],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    transaction.commit()?;
+    Ok(attached)
+}
+
+fn validate_session_event_tail(
+    connection: &Connection,
+    summary: &SessionSummary,
+) -> Result<(), StorageError> {
+    let tail = connection
+        .query_row(
+            r#"SELECT sequence, event_id, event_kind, payload_version, payload_json,
+                      turn_id, created_at
+               FROM session_events
+               WHERE session_id = ?1
+               ORDER BY sequence DESC LIMIT 1"#,
+            [&summary.id],
+            |row| {
+                Ok(StoredSessionEventRow {
+                    sequence: row.get(0)?,
+                    event_id: row.get(1)?,
+                    event_kind: row.get(2)?,
+                    payload_version: row.get(3)?,
+                    payload_json: row.get(4)?,
+                    turn_id: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    let tail_sequence = tail.as_ref().map_or(0, |event| event.sequence);
+    if i64_to_u64(tail_sequence, "session event tail")? != summary.sequence {
+        return Err(StorageError::CorruptData(format!(
+            "session head {} does not match event tail {tail_sequence}",
+            summary.sequence
+        )));
+    }
+    if let Some(tail) = tail {
+        tail.decode()?;
+    }
+    Ok(())
 }
 
 fn query_session_detail(
@@ -3025,10 +3404,10 @@ fn recover_started_replies(
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut statement = transaction.prepare(
         r#"SELECT id FROM reply_jobs
-           WHERE status = 'started' ORDER BY started_at, id"#,
+           WHERE status = 'started' ORDER BY started_at, id LIMIT ?1"#,
     )?;
     let job_ids = statement
-        .query_map([], |row| row.get::<_, String>(0))?
+        .query_map([RECOVERY_BATCH_LIMIT], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
 
@@ -3413,7 +3792,9 @@ fn resume_session(
     Ok(response)
 }
 
-fn recover_open_turns(connection: &mut Connection) -> Result<Vec<SessionEvent>, StorageError> {
+fn recover_open_turns(
+    connection: &mut Connection,
+) -> Result<Vec<RecoveredSessionTurn>, StorageError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut statement = transaction.prepare(
         r#"SELECT t.session_id, t.id FROM session_turns t
@@ -3423,10 +3804,10 @@ fn recover_open_turns(connection: &mut Connection) -> Result<Vec<SessionEvent>, 
                  WHERE j.session_id = t.session_id AND j.turn_id = t.id
                    AND j.status IN ('queued', 'started')
              )
-           ORDER BY t.session_id, t.ordinal"#,
+           ORDER BY t.session_id, t.ordinal LIMIT ?1"#,
     )?;
     let open_turns = statement
-        .query_map([], |row| {
+        .query_map([RECOVERY_BATCH_LIMIT], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -3472,7 +3853,7 @@ fn recover_open_turns(connection: &mut Connection) -> Result<Vec<SessionEvent>, 
             sequence,
             &timestamp,
         )?;
-        recovered.push(event);
+        recovered.push(RecoveredSessionTurn { session_id, event });
     }
     transaction.commit()?;
     Ok(recovered)
@@ -4311,6 +4692,413 @@ fn normalized_reply_value<'a>(
     }
 }
 
+fn query_consistent_snapshot(
+    connection: &mut Connection,
+    run_id: &str,
+) -> Result<RunSnapshot, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let snapshot = query_snapshot(&transaction, run_id)?;
+    validate_run_event_tail(&transaction, &snapshot)?;
+    transaction.commit()?;
+    Ok(snapshot)
+}
+
+fn query_consistent_snapshot_for_actor(
+    connection: &mut Connection,
+    actor_user_id: &str,
+    run_id: &str,
+) -> Result<RunSnapshot, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    require_active_run_owner(&transaction, run_id, actor_user_id)?;
+    let snapshot = query_snapshot(&transaction, run_id)?;
+    validate_run_event_tail(&transaction, &snapshot)?;
+    transaction.commit()?;
+    Ok(snapshot)
+}
+
+fn query_review_context(
+    connection: &mut Connection,
+    run_id: &str,
+    approval_id: &str,
+) -> Result<ReviewContext, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let context = query_review_context_in_transaction(&transaction, run_id, approval_id)?;
+    transaction.commit()?;
+    Ok(context)
+}
+
+fn query_review_context_for_actor(
+    connection: &mut Connection,
+    actor_user_id: &str,
+    run_id: &str,
+    approval_id: &str,
+) -> Result<ReviewContext, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    // Authorization deliberately precedes every lookup that could reveal
+    // whether an approval or call exists.
+    require_active_run_owner(&transaction, run_id, actor_user_id)?;
+    let context = query_review_context_in_transaction(&transaction, run_id, approval_id)?;
+    transaction.commit()?;
+    Ok(context)
+}
+
+fn query_review_context_in_transaction(
+    connection: &Connection,
+    run_id: &str,
+    approval_id: &str,
+) -> Result<ReviewContext, StorageError> {
+    let snapshot = query_snapshot(connection, run_id)?;
+    validate_run_event_tail(connection, &snapshot)?;
+    let approval_with_sequence = query_pending_approval(connection, run_id, approval_id)?;
+    let requested_call_with_sequence = approval_with_sequence
+        .as_ref()
+        .and_then(|(_, approval)| approval.call_id.as_deref())
+        .map(|call_id| query_requested_call(connection, run_id, call_id))
+        .transpose()?
+        .flatten();
+    if let (Some((approval_sequence, _)), Some((call_sequence, _))) =
+        (&approval_with_sequence, &requested_call_with_sequence)
+        && call_sequence >= approval_sequence
+    {
+        return Err(StorageError::CorruptData(format!(
+            "approval `{approval_id}` precedes its requested tool call"
+        )));
+    }
+    Ok(ReviewContext {
+        snapshot,
+        approval_event_sequence: approval_with_sequence
+            .as_ref()
+            .map(|(sequence, _)| *sequence),
+        approval: approval_with_sequence.map(|(_, approval)| approval),
+        requested_call_event_sequence: requested_call_with_sequence
+            .as_ref()
+            .map(|(sequence, _)| *sequence),
+        requested_call: requested_call_with_sequence.map(|(_, call)| call),
+    })
+}
+
+fn query_dispatch_context(
+    connection: &mut Connection,
+    run_id: &str,
+    approval_event_sequence: u64,
+    call_id: &str,
+    approval_id: &str,
+) -> Result<DispatchContext, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let snapshot = query_snapshot(&transaction, run_id)?;
+    validate_run_event_tail(&transaction, &snapshot)?;
+    let approval_event = query_run_event_at(
+        &transaction,
+        run_id,
+        u64_to_i64(approval_event_sequence, "approval event sequence")?,
+    )?;
+    validate_dispatch_approval_event(&approval_event, approval_id, call_id)?;
+    let requested_call_with_sequence = query_requested_call(&transaction, run_id, call_id)?;
+    if let Some((call_sequence, _)) = &requested_call_with_sequence
+        && *call_sequence >= approval_event_sequence
+    {
+        return Err(StorageError::CorruptData(format!(
+            "dispatch approval `{approval_id}` precedes its requested tool call"
+        )));
+    }
+    transaction.commit()?;
+    Ok(DispatchContext {
+        snapshot,
+        approval_event,
+        requested_call_event_sequence: requested_call_with_sequence
+            .as_ref()
+            .map(|(sequence, _)| *sequence),
+        requested_call: requested_call_with_sequence.map(|(_, call)| call),
+    })
+}
+
+fn validate_run_event_tail(
+    connection: &Connection,
+    snapshot: &RunSnapshot,
+) -> Result<(), StorageError> {
+    let tail = connection
+        .query_row(
+            r#"SELECT sequence, event_id, event_kind, payload_version, payload_json,
+                      data_kind, call_id, approval_id, approval_status, policy_revision
+               FROM run_events
+               WHERE run_id = ?1
+               ORDER BY sequence DESC LIMIT 1"#,
+            [&snapshot.run.id],
+            decode_stored_event_row,
+        )
+        .optional()?;
+    let tail_sequence = tail.as_ref().map_or(0, |event| event.sequence);
+    if i64_to_u64(tail_sequence, "run event tail")? != snapshot.run.sequence {
+        return Err(StorageError::CorruptData(format!(
+            "run head {} does not match event tail {tail_sequence}",
+            snapshot.run.sequence
+        )));
+    }
+    if let Some(tail) = tail {
+        tail.decode()?;
+    }
+    Ok(())
+}
+
+fn query_pending_approval(
+    connection: &Connection,
+    run_id: &str,
+    approval_id: &str,
+) -> Result<Option<(u64, protocol::Approval)>, StorageError> {
+    let mut statement = connection.prepare(
+        r#"SELECT sequence, event_id, event_kind, payload_version, payload_json,
+                  data_kind, call_id, approval_id, approval_status, policy_revision
+           FROM run_events
+           WHERE run_id = ?1 AND approval_id = ?2
+           ORDER BY sequence DESC LIMIT 3"#,
+    )?;
+    let rows = statement
+        .query_map(params![run_id, approval_id], decode_stored_event_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.len() > 2 {
+        return Err(StorageError::CorruptData(format!(
+            "approval `{approval_id}` is reused by more than one request/decision pair in run `{run_id}`"
+        )));
+    }
+
+    let mut pending = None;
+    let mut terminal = None;
+    for row in rows {
+        let sequence = i64_to_u64(row.sequence, "approval event sequence")?;
+        let event = row.decode()?;
+        let Some(approval) = event.approval else {
+            return Err(StorageError::CorruptData(format!(
+                "approval lookup `{approval_id}` resolved to an event without approval data"
+            )));
+        };
+        if approval.id != approval_id {
+            return Err(StorageError::CorruptData(format!(
+                "approval lookup `{approval_id}` resolved to `{}`",
+                approval.id
+            )));
+        }
+        if event.event_type != EventType::Approval {
+            return Err(StorageError::CorruptData(format!(
+                "approval lookup `{approval_id}` resolved to a non-approval event"
+            )));
+        }
+
+        match &approval.status {
+            ApprovalStatus::Pending => {
+                match event.data {
+                    Some(RunEventData::ApprovalRequested {
+                        approval_id: data_approval_id,
+                        call_id,
+                        scope,
+                        status: ToolCallStatus::WaitingForApproval,
+                    }) if data_approval_id == approval.id
+                        && approval.call_id.as_deref() == Some(call_id.as_str())
+                        && approval.scope.as_ref() == Some(&scope) => {}
+                    None => {}
+                    _ => {
+                        return Err(StorageError::CorruptData(format!(
+                            "pending approval `{approval_id}` has inconsistent typed request data"
+                        )));
+                    }
+                }
+                if pending.replace((sequence, approval)).is_some() {
+                    return Err(StorageError::CorruptData(format!(
+                        "approval `{approval_id}` has multiple pending request events"
+                    )));
+                }
+            }
+            ApprovalStatus::Approved | ApprovalStatus::Rejected => {
+                let typed_decision_matches = match (&approval.status, event.data) {
+                    (
+                        ApprovalStatus::Approved,
+                        Some(RunEventData::ApprovalDecided {
+                            approval_id: data_approval_id,
+                            call_id,
+                            decision: ReviewDecision::Approve,
+                            status: ToolCallStatus::Queued,
+                        }),
+                    ) => {
+                        data_approval_id == approval.id
+                            && approval.call_id.as_deref() == Some(call_id.as_str())
+                    }
+                    (
+                        ApprovalStatus::Rejected,
+                        Some(RunEventData::ApprovalDecided {
+                            approval_id: data_approval_id,
+                            call_id,
+                            decision: ReviewDecision::Reject,
+                            status: ToolCallStatus::NotDispatched,
+                        }),
+                    ) => {
+                        data_approval_id == approval.id
+                            && approval.call_id.as_deref() == Some(call_id.as_str())
+                    }
+                    (_, None) => true,
+                    _ => false,
+                };
+                if !typed_decision_matches {
+                    return Err(StorageError::CorruptData(format!(
+                        "terminal approval `{approval_id}` has inconsistent typed decision data"
+                    )));
+                }
+                if terminal.replace((sequence, approval)).is_some() {
+                    return Err(StorageError::CorruptData(format!(
+                        "approval `{approval_id}` has multiple terminal decisions"
+                    )));
+                }
+            }
+        }
+    }
+    if let Some((terminal_sequence, terminal)) = terminal {
+        let Some((pending_sequence, pending)) = pending else {
+            return Err(StorageError::CorruptData(format!(
+                "terminal approval `{approval_id}` has no durable request"
+            )));
+        };
+        if pending_sequence >= terminal_sequence {
+            return Err(StorageError::CorruptData(format!(
+                "approval `{approval_id}` decision does not follow its durable request"
+            )));
+        }
+        if let (Some(request_call), Some(decision_call)) =
+            (pending.call_id.as_deref(), terminal.call_id.as_deref())
+            && request_call != decision_call
+        {
+            return Err(StorageError::CorruptData(format!(
+                "approval `{approval_id}` request and decision target different calls"
+            )));
+        }
+        Ok(None)
+    } else {
+        Ok(pending)
+    }
+}
+
+fn query_requested_call(
+    connection: &Connection,
+    run_id: &str,
+    call_id: &str,
+) -> Result<Option<(u64, protocol::ToolCall)>, StorageError> {
+    let mut statement = connection.prepare(
+        r#"SELECT sequence, event_id, event_kind, payload_version, payload_json,
+                  data_kind, call_id, approval_id, approval_status, policy_revision
+           FROM run_events
+           WHERE run_id = ?1
+             AND data_kind = 'tool_call_requested'
+             AND call_id = ?2
+           ORDER BY sequence LIMIT 2"#,
+    )?;
+    let rows = statement
+        .query_map(params![run_id, call_id], decode_stored_event_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.len() > 1 {
+        return Err(StorageError::CorruptData(format!(
+            "tool call `{call_id}` has multiple request events in run `{run_id}`"
+        )));
+    }
+    rows.into_iter()
+        .next()
+        .map(|row| {
+            let sequence = i64_to_u64(row.sequence, "requested call event sequence")?;
+            let event = row.decode()?;
+            match (event.event_type, event.data) {
+                (
+                    EventType::ToolCall,
+                    Some(RunEventData::ToolCallRequested {
+                        call,
+                        status: ToolCallStatus::Requested,
+                    }),
+                ) if call.call_id == call_id => Ok((sequence, call)),
+                _ => Err(StorageError::CorruptData(format!(
+                    "tool call lookup `{call_id}` resolved to an incompatible event"
+                ))),
+            }
+        })
+        .transpose()
+}
+
+fn validate_dispatch_approval_event(
+    event: &RunEvent,
+    approval_id: &str,
+    call_id: &str,
+) -> Result<(), StorageError> {
+    let approval = event
+        .approval
+        .as_ref()
+        .filter(|approval| {
+            approval.id == approval_id
+                && approval.status == ApprovalStatus::Approved
+                && approval.call_id.as_deref() == Some(call_id)
+        })
+        .ok_or_else(|| {
+            StorageError::CorruptData(
+                "dispatch approval event is not bound to the queued approval/call".into(),
+            )
+        })?;
+    if event.event_type != EventType::Approval {
+        return Err(StorageError::CorruptData(
+            "dispatch approval binding is not an approval event".into(),
+        ));
+    }
+    match event.data.as_ref() {
+        Some(RunEventData::ApprovalDecided {
+            approval_id: data_approval_id,
+            call_id: data_call_id,
+            decision: ReviewDecision::Approve,
+            status: ToolCallStatus::Queued,
+        }) if data_approval_id == approval_id
+            && data_call_id == call_id
+            && approval.scope == Some(ApprovalScope::AllowOnce) =>
+        {
+            Ok(())
+        }
+        // v1 dispatch history predates typed event data. StoredEventRow has
+        // already proven that `None` is legal only for a v1 payload.
+        None => Ok(()),
+        _ => Err(StorageError::CorruptData(
+            "dispatch approval event has inconsistent typed decision data".into(),
+        )),
+    }
+}
+
+fn query_run_event_at(
+    connection: &Connection,
+    run_id: &str,
+    sequence: i64,
+) -> Result<RunEvent, StorageError> {
+    connection
+        .query_row(
+            r#"SELECT sequence, event_id, event_kind, payload_version, payload_json,
+                      data_kind, call_id, approval_id, approval_status, policy_revision
+               FROM run_events
+               WHERE run_id = ?1 AND sequence = ?2"#,
+            params![run_id, sequence],
+            decode_stored_event_row,
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StorageError::CorruptData(format!(
+                "run `{run_id}` has no event at sequence {sequence}"
+            ))
+        })?
+        .decode()
+}
+
+fn decode_stored_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredEventRow> {
+    Ok(StoredEventRow {
+        sequence: row.get(0)?,
+        event_id: row.get(1)?,
+        event_kind: row.get(2)?,
+        payload_version: row.get(3)?,
+        payload_json: row.get(4)?,
+        data_kind: row.get(5)?,
+        call_id: row.get(6)?,
+        approval_id: row.get(7)?,
+        approval_status: row.get(8)?,
+        policy_revision: row.get(9)?,
+    })
+}
+
 fn load_snapshot(connection: &mut Connection, run_id: &str) -> Result<RunSnapshot, StorageError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
     let snapshot = query_snapshot(&transaction, run_id)?;
@@ -4511,7 +5299,8 @@ fn query_events(
     after: i64,
 ) -> Result<Vec<RunEvent>, StorageError> {
     let mut statement = connection.prepare(
-        r#"SELECT sequence, event_id, event_kind, payload_version, payload_json
+        r#"SELECT sequence, event_id, event_kind, payload_version, payload_json,
+                  data_kind, call_id, approval_id, approval_status, policy_revision
            FROM run_events WHERE run_id = ?1 AND sequence > ?2 ORDER BY sequence"#,
     )?;
     let mut rows = statement.query(params![run_id, after])?;
@@ -4524,6 +5313,11 @@ fn query_events(
             event_kind: row.get(2)?,
             payload_version: row.get(3)?,
             payload_json: row.get(4)?,
+            data_kind: row.get(5)?,
+            call_id: row.get(6)?,
+            approval_id: row.get(7)?,
+            approval_status: row.get(8)?,
+            policy_revision: row.get(9)?,
         };
         if let Some(expected_sequence) = expected
             && stored.sequence != expected_sequence
@@ -4550,7 +5344,8 @@ fn query_run_events_page(
     head_sequence: u64,
 ) -> Result<RunEventPage, StorageError> {
     let mut statement = connection.prepare(
-        r#"SELECT sequence, event_id, event_kind, payload_version, payload_json
+        r#"SELECT sequence, event_id, event_kind, payload_version, payload_json,
+                  data_kind, call_id, approval_id, approval_status, policy_revision
            FROM run_events
            WHERE run_id = ?1 AND sequence > ?2
            ORDER BY sequence LIMIT ?3"#,
@@ -4565,6 +5360,11 @@ fn query_run_events_page(
             event_kind: row.get(2)?,
             payload_version: row.get(3)?,
             payload_json: row.get(4)?,
+            data_kind: row.get(5)?,
+            call_id: row.get(6)?,
+            approval_id: row.get(7)?,
+            approval_status: row.get(8)?,
+            policy_revision: row.get(9)?,
         };
         if let Some(expected_sequence) = expected
             && stored.sequence != expected_sequence
@@ -4852,10 +5652,10 @@ fn query_started_dispatches(connection: &mut Connection) -> Result<Vec<DispatchJ
     let mut statement = transaction.prepare(
         r#"SELECT call_id FROM dispatch_jobs
            WHERE status = 'started'
-           ORDER BY started_at, call_id"#,
+           ORDER BY started_at, call_id LIMIT ?1"#,
     )?;
     let call_ids = statement
-        .query_map([], |row| row.get::<_, String>(0))?
+        .query_map([RECOVERY_BATCH_LIMIT], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
     let jobs = call_ids
@@ -5060,21 +5860,38 @@ fn reject_dispatch_authorization(
         ));
     }
     let mut snapshot = query_snapshot(connection, &job.run_id)?;
+    validate_run_event_tail(connection, &snapshot)?;
+    if snapshot.run.status != RunStatus::Queued {
+        return Err(StorageError::InvalidDispatchTransition(
+            "authorization rejection requires a queued run projection".into(),
+        ));
+    }
+    if snapshot.run.sequence != job.approval_event_sequence {
+        return Err(StorageError::CorruptData(
+            "queued dispatch approval is not the current run event head".into(),
+        ));
+    }
+    let approval_event = query_run_event_at(
+        connection,
+        &job.run_id,
+        u64_to_i64(job.approval_event_sequence, "approval event sequence")?,
+    )?;
+    validate_dispatch_approval_event(&approval_event, &job.approval_id, &job.call_id)?;
+    let (call_sequence, call) = query_requested_call(connection, &job.run_id, &job.call_id)?
+        .ok_or_else(|| {
+            StorageError::CorruptData("queued dispatch has no requested-call event".into())
+        })?;
+    if call_sequence >= job.approval_event_sequence {
+        return Err(StorageError::CorruptData(
+            "queued dispatch approval precedes its requested tool call".into(),
+        ));
+    }
+    validate_dispatch_job_binding(&job, &snapshot, &approval_event, &call)?;
     let expected_sequence = snapshot.run.sequence;
     let next_sequence = expected_sequence
         .checked_add(1)
         .ok_or(StorageError::IntegerOutOfRange("run sequence"))?;
-    let previous_after = expected_sequence
-        .checked_sub(1)
-        .ok_or_else(|| StorageError::CorruptData("queued dispatch has no approval event".into()))?;
-    let previous = query_events(
-        connection,
-        &job.run_id,
-        u64_to_i64(previous_after, "previous event cursor")?,
-    )?
-    .into_iter()
-    .last()
-    .ok_or_else(|| StorageError::CorruptData("queued dispatch has no durable event head".into()))?;
+    let previous = approval_event;
     let timestamp = now();
     let summary =
         "The approving actor is no longer authorized; connector execution was not attempted.";
@@ -5141,6 +5958,35 @@ fn reject_dispatch_authorization(
         job: rejected,
         event,
     })
+}
+
+fn validate_dispatch_job_binding(
+    job: &DispatchJob,
+    snapshot: &RunSnapshot,
+    approval_event: &RunEvent,
+    call: &protocol::ToolCall,
+) -> Result<(), StorageError> {
+    let approval = approval_event.approval.as_ref().ok_or_else(|| {
+        StorageError::CorruptData("dispatch approval event has no approval binding".into())
+    })?;
+    let matches = job.run_id == snapshot.run.id
+        && job.tool_name == call.tool
+        && job.tool_version == call.tool_version
+        && job.effect == call.effect
+        && job.args_json == call.arguments
+        && job.args_digest == call.arguments_digest
+        && job.sandbox_profile == call.sandbox_profile
+        && approval.id == job.approval_id
+        && approval.call_id.as_deref() == Some(job.call_id.as_str())
+        && approval.policy_revision.as_deref() == Some(job.policy_revision.as_str())
+        && approval.arguments_digest.as_deref() == Some(job.args_digest.as_str())
+        && approval.sandbox_profile.as_ref() == Some(&job.sandbox_profile);
+    if !matches {
+        return Err(StorageError::CorruptData(
+            "dispatch job, approval, and requested call do not have one exact binding".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn complete_dispatch(
@@ -5377,10 +6223,12 @@ fn insert_event(
     payload_version: i64,
 ) -> Result<(), StorageError> {
     let sequence = u64_to_i64(event.sequence, "event sequence")?;
+    let lookup = RunEventLookup::from_event(event)?;
     connection.execute(
         r#"INSERT INTO run_events(
-               run_id, sequence, event_id, event_kind, payload_version, payload_json
-           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+               run_id, sequence, event_id, event_kind, payload_version, payload_json,
+               data_kind, call_id, approval_id, approval_status, policy_revision
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
         params![
             run_id,
             sequence,
@@ -5388,6 +6236,11 @@ fn insert_event(
             event_kind(&event.event_type),
             payload_version,
             serde_json::to_string(event)?,
+            lookup.data_kind,
+            lookup.call_id,
+            lookup.approval_id,
+            lookup.approval_status,
+            lookup.policy_revision,
         ],
     )?;
     Ok(())
@@ -6100,7 +6953,7 @@ impl StoredSessionEventRow {
     fn decode(self) -> Result<SessionEvent, StorageError> {
         if self.payload_version != SESSION_EVENT_PAYLOAD_VERSION_V1 {
             return Err(StorageError::UnsupportedPayloadVersion {
-                event_kind: self.event_kind,
+                event_kind: self.event_kind.clone(),
                 version: self.payload_version,
             });
         }
@@ -6393,17 +7246,22 @@ struct StoredEventRow {
     event_kind: String,
     payload_version: i64,
     payload_json: String,
+    data_kind: Option<String>,
+    call_id: Option<String>,
+    approval_id: Option<String>,
+    approval_status: Option<String>,
+    policy_revision: Option<String>,
 }
 
 impl StoredEventRow {
-    fn decode(self) -> Result<RunEvent, StorageError> {
+    fn decode_payload(&self) -> Result<RunEvent, StorageError> {
         let expected_type = event_type_from_kind(&self.event_kind)?;
         if !matches!(
             self.payload_version,
             EVENT_PAYLOAD_VERSION_V1 | EVENT_PAYLOAD_VERSION_V2
         ) {
             return Err(StorageError::UnsupportedPayloadVersion {
-                event_kind: self.event_kind,
+                event_kind: self.event_kind.clone(),
                 version: self.payload_version,
             });
         }
@@ -6435,5 +7293,90 @@ impl StoredEventRow {
             )));
         }
         Ok(event)
+    }
+
+    fn decode(self) -> Result<RunEvent, StorageError> {
+        let event = self.decode_payload()?;
+        let lookup = RunEventLookup::from_event(&event)?;
+        if self.data_kind.as_deref() != lookup.data_kind
+            || self.call_id.as_deref() != lookup.call_id
+            || self.approval_id.as_deref() != lookup.approval_id
+            || self.approval_status.as_deref() != lookup.approval_status
+            || self.policy_revision.as_deref() != lookup.policy_revision
+        {
+            return Err(StorageError::CorruptData(format!(
+                "run event lookup projection disagrees with payload at sequence {}",
+                self.sequence
+            )));
+        }
+        Ok(event)
+    }
+}
+
+struct RunEventLookup<'a> {
+    data_kind: Option<&'static str>,
+    call_id: Option<&'a str>,
+    approval_id: Option<&'a str>,
+    approval_status: Option<&'static str>,
+    policy_revision: Option<&'a str>,
+}
+
+impl<'a> RunEventLookup<'a> {
+    fn from_event(event: &'a RunEvent) -> Result<Self, StorageError> {
+        let (data_kind, call_id) = match event.data.as_ref() {
+            Some(RunEventData::ToolCallRequested { call, .. }) => {
+                (Some("tool_call_requested"), Some(call.call_id.as_str()))
+            }
+            Some(RunEventData::ToolPolicyDecided { call_id, .. }) => {
+                (Some("tool_policy_decided"), Some(call_id.as_str()))
+            }
+            Some(RunEventData::ApprovalRequested { call_id, .. }) => {
+                (Some("approval_requested"), Some(call_id.as_str()))
+            }
+            Some(RunEventData::ApprovalDecided { call_id, .. }) => {
+                (Some("approval_decided"), Some(call_id.as_str()))
+            }
+            Some(RunEventData::ToolDispatchStarted { call_id, .. }) => {
+                (Some("tool_dispatch_started"), Some(call_id.as_str()))
+            }
+            Some(RunEventData::ToolResult { call_id, .. }) => {
+                (Some("tool_result"), Some(call_id.as_str()))
+            }
+            None => (None, None),
+        };
+        let approval_status = event
+            .approval
+            .as_ref()
+            .map(|approval| match approval.status {
+                ApprovalStatus::Pending => "pending",
+                ApprovalStatus::Approved => "approved",
+                ApprovalStatus::Rejected => "rejected",
+            });
+        let approval_policy_revision = event
+            .approval
+            .as_ref()
+            .and_then(|approval| approval.policy_revision.as_deref());
+        let decision_policy_revision = match event.data.as_ref() {
+            Some(RunEventData::ToolPolicyDecided {
+                policy_revision, ..
+            }) => Some(policy_revision.as_str()),
+            _ => None,
+        };
+        if let (Some(approval), Some(decision)) =
+            (approval_policy_revision, decision_policy_revision)
+            && approval != decision
+        {
+            return Err(StorageError::CorruptData(format!(
+                "run event {} contains conflicting policy revisions",
+                event.sequence
+            )));
+        }
+        Ok(Self {
+            data_kind,
+            call_id,
+            approval_id: event.approval.as_ref().map(|approval| approval.id.as_str()),
+            approval_status,
+            policy_revision: approval_policy_revision.or(decision_policy_revision),
+        })
     }
 }

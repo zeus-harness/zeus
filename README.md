@@ -293,10 +293,13 @@ and bounded memory, CPU, and PID resources.
   auth sessions, owner references, bootstrap credentials, and preferences;
   v6 migrates command receipts to actor scopes; v7 adds the forward-only reply
   queue; v8 binds each dispatch to its approving actor and adds owner-consistency
-  triggers plus a durable authorization-revoked terminal state. Existing Runs
-  and events are migrated in place without rewriting history. Runtime identity
-  still binds profile, environment, primary Session and Run, policy ID, and
-  policy revision; a mismatch fails startup.
+  triggers plus a durable authorization-revoked terminal state. Schema v9 adds
+  typed, immutable Run-event lookup projections, point-query indexes, contiguous
+  Run-event insertion enforcement, and fixed 64-row startup-recovery batches.
+  Existing Runs and events are decoded, validated, and migrated in place without
+  rewriting their payloads. Runtime identity still binds profile, environment,
+  primary Session and Run, policy ID, and policy revision; a mismatch fails
+  startup.
 
 SQLite is the authoritative store for this local single-instance Alpha. Do not
 place it on NFS or share one database volume between multiple Zeus replicas.
@@ -328,8 +331,7 @@ directly.
   state changes additionally require `X-CSRF-Token` to match the login and an
   exact same-origin request. Alpha+ deliberately rejects the schema-reserved
   `member` role. Actor isolation is now present, but member access remains
-  blocked until bounded list/detail queries, internal point/batch reads, and
-  storage/queue quotas land.
+  blocked until bounded list/detail queries and storage/queue quotas land.
 - `GET /api/v1/me/settings` returns the current safe preferences.
   `PATCH /api/v1/me/settings` accepts `theme`, optional allowlisted
   `preferred_model`, and `expected_revision`. Provider endpoints and API keys
@@ -385,7 +387,7 @@ directly.
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Schema v8 retains durable Run attachment during migration and demo seeding,
+Schema v9 retains durable Run attachment during migration and demo seeding,
 but Alpha+ does not expose a public attach-Run HTTP route.
 
 The application boundary now caps auth JSON at 8 KiB and command JSON at
@@ -394,10 +396,11 @@ Session titles at 256 bytes; user messages at 64 KiB; and review notes at 8 KiB.
 New Session event IDs are ledger-local and bounded. Historical v8 durable IDs
 remain addressable so the stricter write envelope does not strand existing
 data. Shared validation runs before command fingerprinting or receipt lookup at
-the relevant API/runtime/storage entry points. Event feeds now use bounded
-pages, but Session list/detail, Run detail/overview, and several internal
-execution/recovery reads still load complete matching histories. SQLite usage
-quotas/retention are also not present. Bound those reads and add the v9 storage
+the relevant API/runtime/storage entry points. Event feeds use bounded pages;
+approval, dispatch, reply completion, attachment checks, and startup recovery
+use typed point queries or fixed 64-row batches. Session list/detail and Run
+detail/overview still load complete matching histories, and SQLite usage
+quotas/retention are not present. Bound those read models and add storage
 budgets before any shared-network or multi-tenant deployment.
 
 ## Container images
@@ -446,18 +449,19 @@ committed data. Use SQLite's backup/checkpoint facilities.
 
 ## Verification status
 
-Current Alpha+ plus Actor Boundary Foundation, API Resource Envelope, and
-Bounded Event Feed host verification:
+Current Alpha+ plus Actor Boundary Foundation, API Resource Envelope, Bounded
+Event Feed, and Point-query Durable Context host verification:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --all-targets`: 177 tests passed, including the real
+- `cargo test --workspace --all-targets`: 185 tests passed, including the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,
   body/field/idempotency boundaries, atomic login limits, SSE lease capacity,
   bounded `LIMIT + 1` event pages and cooperative multi-page replay, durable
-  reply provenance, concurrent claim, restart recovery, and provider
-  `outcome_unknown` semantics.
+  reply provenance, typed v9 point lookups, a 16-way same-key review race,
+  fixed-batch restart recovery, concurrent claim, and provider `outcome_unknown`
+  semantics.
 - `pnpm --filter web test`: 19 tests passed for CSRF headers, stable command
   identity, active-Session restore, Session event merging, and theme behavior.
 - `pnpm --filter web check`: zero errors and zero warnings.

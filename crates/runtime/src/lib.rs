@@ -34,9 +34,9 @@ pub use storage::{
     StoredUserRole, StoredUserStatus,
 };
 use storage::{
-    ClaimOutcome, CommitOutcome, DispatchCompleteCommit, DispatchJob, DispatchJobSpec,
-    DispatchRecoveryCommit, DispatchStartCommit, ReviewCommit, ReviewReceipt, RunSnapshot,
-    RuntimeIdentity, SqliteStore, StorageError, StoredRun,
+    ClaimOutcome, CommitOutcome, DispatchCompleteCommit, DispatchContext, DispatchJob,
+    DispatchJobSpec, DispatchRecoveryCommit, DispatchStartCommit, ReviewCommit, ReviewContext,
+    ReviewReceipt, RunSnapshot, RuntimeIdentity, SqliteStore, StorageError,
 };
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast};
@@ -265,11 +265,9 @@ impl DemoStore {
         // A database created for another profile must fail visibly instead of
         // silently serving or executing a different run or session attachment.
         storage.snapshot(&primary_run_id).await?;
-        let primary_session = storage.get_session(primary_session_id).await?;
-        if !primary_session
-            .run_ids
-            .iter()
-            .any(|id| id == &primary_run_id)
+        if !storage
+            .session_has_run(primary_session_id, &primary_run_id)
+            .await?
         {
             return Err(StoreError::ExecutionInvariant(
                 "the primary session is not attached to the primary run".into(),
@@ -539,6 +537,11 @@ impl DemoStore {
     pub async fn get_session(&self, session_id: &str) -> Result<SessionDetail, StoreError> {
         validate_durable_reference(session_id, "session ID")?;
         Ok(self.storage.get_session(session_id).await?)
+    }
+
+    pub async fn session_summary(&self, session_id: &str) -> Result<SessionSummary, StoreError> {
+        validate_durable_reference(session_id, "session ID")?;
+        Ok(self.storage.session_summary(session_id).await?)
     }
 
     pub async fn get_session_for_actor(
@@ -1004,15 +1007,17 @@ impl DemoStore {
         validate_durable_reference(approval_id, "approval ID")?;
         let idempotency_key = normalized_idempotency_key(idempotency_key)?;
 
-        // Authorization precedes payload fingerprinting and receipt lookup.
-        // This preserves the resource-not-found mask while ensuring an invalid
-        // payload can never be serialized or compared with a stored receipt.
-        let stored = if let Some(actor_user_id) = actor_user_id {
+        // Read the execution context before payload fingerprinting and receipt
+        // lookup. Besides preserving the resource-not-found mask, this keeps a
+        // pending approval visible across a same-key commit race; the final
+        // write transaction can then replay the winning receipt instead of
+        // incorrectly reporting that the approval is no longer pending.
+        let context = if let Some(actor_user_id) = actor_user_id {
             self.storage
-                .load_run_for_actor(actor_user_id, run_id)
+                .review_context_for_actor(actor_user_id, run_id, approval_id)
                 .await?
         } else {
-            self.storage.load_run(run_id).await?
+            self.storage.review_context(run_id, approval_id).await?
         };
         validate_review_request_value(&request)?;
         let fingerprint = review_fingerprint(run_id, approval_id, &request)?;
@@ -1032,15 +1037,15 @@ impl DemoStore {
             self.kick_dispatcher();
             return Ok(response);
         }
-        let (pending, call) = pending_approval_and_call(&stored, approval_id)?;
+        let (pending, call) = pending_approval_and_call(&context, approval_id)?;
         let approving = request.decision == ReviewDecision::Approve;
         if approving {
-            self.validate_pending_policy(&stored.snapshot.run, &pending, &call)?;
+            self.validate_pending_policy(&context.snapshot.run, &pending, &call)?;
         }
 
-        let expected_sequence = stored.snapshot.run.sequence;
+        let expected_sequence = context.snapshot.run.sequence;
         let transition = apply_review(
-            &stored.snapshot.run,
+            &context.snapshot.run,
             &pending,
             request.decision.clone(),
             request.note.as_deref(),
@@ -1059,9 +1064,11 @@ impl DemoStore {
                     "an approved transition is missing its approval binding".into(),
                 )
             })?;
-            let evaluation =
-                self.policy
-                    .guard_dispatch(&stored.snapshot.run.environment, &call, Some(approved));
+            let evaluation = self.policy.guard_dispatch(
+                &context.snapshot.run.environment,
+                &call,
+                Some(approved),
+            );
             if evaluation.decision != PolicyDecision::Allow {
                 return Err(policy_guard_error(evaluation));
             }
@@ -1082,7 +1089,7 @@ impl DemoStore {
             None
         };
 
-        let mut snapshot = stored.snapshot;
+        let mut snapshot = context.snapshot;
         snapshot.run = transition.run.clone();
         clear_pending_approval_metric(&mut snapshot);
         let response = ReviewResponse {
@@ -1154,44 +1161,42 @@ impl DemoStore {
     }
 
     async fn recover_started_reply_jobs(&self) -> Result<(), StoreError> {
-        let recovered = self.storage.recover_started_replies().await?;
-        for completion in recovered {
-            for event in completion.events {
-                if !matches!(event.data, SessionEventData::TurnInterrupted { .. }) {
-                    return Err(StoreError::ExecutionInvariant(
-                        "started-reply recovery returned a non-interruption event".into(),
-                    ));
+        loop {
+            let recovered = self.storage.recover_started_replies().await?;
+            if recovered.is_empty() {
+                return Ok(());
+            }
+            for completion in recovered {
+                for event in completion.events {
+                    if !matches!(event.data, SessionEventData::TurnInterrupted { .. }) {
+                        return Err(StoreError::ExecutionInvariant(
+                            "started-reply recovery returned a non-interruption event".into(),
+                        ));
+                    }
+                    self.publish_session_event(&completion.session.id, event);
                 }
-                self.publish_session_event(&completion.session.id, event);
             }
         }
-        Ok(())
     }
 
     async fn recover_open_session_turns(&self) -> Result<(), StoreError> {
-        let sessions = self.storage.list_sessions().await?;
-        let recovered = self.storage.recover_open_turns().await?;
-        for event in recovered {
-            let turn_id = match &event.data {
-                SessionEventData::TurnInterrupted { turn_id, .. } => turn_id,
-                _ => {
+        loop {
+            let recovered = self.storage.recover_open_turns().await?;
+            if recovered.is_empty() {
+                return Ok(());
+            }
+            for recovered_turn in recovered {
+                if !matches!(
+                    recovered_turn.event.data,
+                    SessionEventData::TurnInterrupted { .. }
+                ) {
                     return Err(StoreError::ExecutionInvariant(
                         "open-turn recovery returned a non-interruption session event".into(),
                     ));
                 }
-            };
-            let session_id = sessions
-                .iter()
-                .find(|session| session.active_turn_id.as_deref() == Some(turn_id.as_str()))
-                .map(|session| session.id.as_str())
-                .ok_or_else(|| {
-                    StoreError::ExecutionInvariant(
-                        "open-turn recovery returned an event without an owning session".into(),
-                    )
-                })?;
-            self.publish_session_event(session_id, event);
+                self.publish_session_event(&recovered_turn.session_id, recovered_turn.event);
+            }
         }
-        Ok(())
     }
 
     fn publish_session_event(&self, session_id: &str, event: SessionEvent) {
@@ -1241,19 +1246,19 @@ impl DemoStore {
                 return Ok(None);
             };
             self.validate_dispatch_job_identity(&job)?;
-            let stored = self.storage.load_run(&job.run_id).await?;
-            let (call, approval) = bindings_for_job(&stored, &job)?;
-            let environment = stored.snapshot.run.environment.clone();
-            let expected_sequence = stored.snapshot.run.sequence;
+            let context = self.storage.dispatch_context(&job).await?;
+            let (call, approval) = bindings_for_job(&context, &job)?;
+            let environment = context.snapshot.run.environment.clone();
+            let expected_sequence = context.snapshot.run.sequence;
             let transition = start_tool_dispatch(
-                &stored.snapshot.run,
+                &context.snapshot.run,
                 &approval,
                 &call,
                 executor_label(&self.registry, &call),
                 next_sequence(expected_sequence)?,
                 now(),
             )?;
-            let mut snapshot = stored.snapshot;
+            let mut snapshot = context.snapshot;
             snapshot.run = transition.run;
             let event = transition.event.clone();
 
@@ -1355,16 +1360,18 @@ impl DemoStore {
         claimed: ClaimedDispatch,
         outcome: ToolOutcome,
     ) -> Result<(), StoreError> {
-        let stored = self.storage.load_run(&claimed.job.run_id).await?;
-        let expected_sequence = stored.snapshot.run.sequence;
+        let mut snapshot = self
+            .storage
+            .consistent_snapshot(&claimed.job.run_id)
+            .await?;
+        let expected_sequence = snapshot.run.sequence;
         let transition = apply_tool_result(
-            &stored.snapshot.run,
+            &snapshot.run,
             &claimed.call,
             outcome.clone(),
             next_sequence(expected_sequence)?,
             now(),
         )?;
-        let mut snapshot = stored.snapshot;
         snapshot.run = transition.run;
         let event = transition.event.clone();
         let result_json = serde_json::to_value(&outcome).map_err(StorageError::from)?;
@@ -1385,40 +1392,45 @@ impl DemoStore {
     }
 
     async fn recover_started_dispatches(&self) -> Result<(), StoreError> {
-        for job in self.storage.started_dispatches().await? {
-            self.validate_dispatch_job_identity(&job)?;
-            let stored = self.storage.load_run(&job.run_id).await?;
-            let (call, _) = bindings_for_job(&stored, &job)?;
-            let outcome = ToolOutcome::OutcomeUnknown {
-                summary: "Zeus restarted after the durable dispatch checkpoint but before a durable result; the call was not retried.".into(),
-            };
-            let expected_sequence = stored.snapshot.run.sequence;
-            let transition = apply_tool_result(
-                &stored.snapshot.run,
-                &call,
-                outcome.clone(),
-                next_sequence(expected_sequence)?,
-                now(),
-            )?;
-            let mut snapshot = stored.snapshot;
-            snapshot.run = transition.run;
-            let event = transition.event.clone();
-            let result_json = serde_json::to_value(&outcome).map_err(StorageError::from)?;
-            self.storage
-                .recover_started(DispatchRecoveryCommit {
-                    call_id: job.call_id,
-                    expected_sequence,
-                    snapshot,
-                    event: transition.event,
-                    result_json,
-                })
-                .await?;
-            let _ = self.publisher.send(PublishedEvent {
-                run_id: job.run_id,
-                event,
-            });
+        loop {
+            let jobs = self.storage.started_dispatches().await?;
+            if jobs.is_empty() {
+                return Ok(());
+            }
+            for job in jobs {
+                self.validate_dispatch_job_identity(&job)?;
+                let context = self.storage.dispatch_context(&job).await?;
+                let (call, _) = bindings_for_job(&context, &job)?;
+                let outcome = ToolOutcome::OutcomeUnknown {
+                    summary: "Zeus restarted after the durable dispatch checkpoint but before a durable result; the call was not retried.".into(),
+                };
+                let expected_sequence = context.snapshot.run.sequence;
+                let transition = apply_tool_result(
+                    &context.snapshot.run,
+                    &call,
+                    outcome.clone(),
+                    next_sequence(expected_sequence)?,
+                    now(),
+                )?;
+                let mut snapshot = context.snapshot;
+                snapshot.run = transition.run;
+                let event = transition.event.clone();
+                let result_json = serde_json::to_value(&outcome).map_err(StorageError::from)?;
+                self.storage
+                    .recover_started(DispatchRecoveryCommit {
+                        call_id: job.call_id,
+                        expected_sequence,
+                        snapshot,
+                        event: transition.event,
+                        result_json,
+                    })
+                    .await?;
+                let _ = self.publisher.send(PublishedEvent {
+                    run_id: job.run_id,
+                    event,
+                });
+            }
         }
-        Ok(())
     }
 
     fn validate_dispatch_job_identity(&self, job: &DispatchJob) -> Result<(), StoreError> {
@@ -1533,51 +1545,42 @@ fn requested_call(events: &[RunEvent]) -> Result<ToolCall, StoreError> {
 }
 
 fn pending_approval_and_call(
-    stored: &StoredRun,
+    context: &ReviewContext,
     approval_id: &str,
 ) -> Result<(Approval, ToolCall), StoreError> {
-    let approval = stored
-        .events
-        .iter()
-        .rev()
-        .filter_map(|event| event.approval.as_ref())
-        .find(|approval| approval.id == approval_id && approval.status == ApprovalStatus::Pending)
+    let approval = context
+        .approval
+        .as_ref()
+        .filter(|approval| approval.id == approval_id && approval.status == ApprovalStatus::Pending)
         .cloned()
         .ok_or_else(|| StoreError::ApprovalNotPending {
-            run_id: stored.snapshot.run.id.clone(),
+            run_id: context.snapshot.run.id.clone(),
             approval_id: approval_id.to_owned(),
         })?;
     let call_id = approval
         .call_id
         .as_deref()
         .ok_or(KernelError::ApprovalBindingIncomplete)?;
-    let call = stored
-        .events
-        .iter()
-        .find_map(|event| match &event.data {
-            Some(RunEventData::ToolCallRequested { call, .. }) if call.call_id == call_id => {
-                Some(call.clone())
-            }
-            _ => None,
-        })
+    let call = context
+        .requested_call
+        .as_ref()
+        .filter(|call| call.call_id == call_id)
+        .cloned()
         .ok_or(StoreError::ToolCallNotFound)?;
     Ok((approval, call))
 }
 
 fn bindings_for_job(
-    stored: &StoredRun,
+    context: &DispatchContext,
     job: &DispatchJob,
 ) -> Result<(ToolCall, Approval), StoreError> {
-    let approval_event = stored
-        .events
-        .iter()
-        .find(|event| event.sequence == job.approval_event_sequence)
-        .ok_or_else(|| {
-            StoreError::ExecutionInvariant(
-                "dispatch approval event is missing from the ledger".into(),
-            )
-        })?;
-    let approval = approval_event
+    if context.approval_event.sequence != job.approval_event_sequence {
+        return Err(StoreError::ExecutionInvariant(
+            "dispatch approval event sequence does not match the queue record".into(),
+        ));
+    }
+    let approval = context
+        .approval_event
         .approval
         .as_ref()
         .filter(|approval| {
@@ -1589,18 +1592,14 @@ fn bindings_for_job(
                 "dispatch job is not bound to an approved ledger event".into(),
             )
         })?;
-    let call = stored
-        .events
-        .iter()
-        .find_map(|event| match &event.data {
-            Some(RunEventData::ToolCallRequested { call, .. }) if call.call_id == job.call_id => {
-                Some(call.clone())
-            }
-            _ => None,
-        })
+    let call = context
+        .requested_call
+        .as_ref()
+        .filter(|call| call.call_id == job.call_id)
+        .cloned()
         .ok_or(StoreError::ToolCallNotFound)?;
 
-    let matches = job.run_id == stored.snapshot.run.id
+    let matches = job.run_id == context.snapshot.run.id
         && job.tool_name == call.tool
         && job.tool_version == call.tool_version
         && job.effect == call.effect
@@ -2351,6 +2350,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_actor_reviews_with_one_key_commit_once_and_replay() {
+        const CONCURRENCY: usize = 16;
+
+        let store = production_store(false).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(CONCURRENCY));
+        let mut tasks = Vec::with_capacity(CONCURRENCY);
+        for _ in 0..CONCURRENCY {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .review_for_actor(
+                        TEST_OWNER_ID,
+                        DEMO_RUN_ID,
+                        "APR-901",
+                        approval_request(ReviewDecision::Reject),
+                        "concurrent-actor-review",
+                    )
+                    .await
+            }));
+        }
+
+        let mut responses = Vec::with_capacity(CONCURRENCY);
+        for task in tasks {
+            responses.push(task.await.unwrap().unwrap());
+        }
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| !response.replayed)
+                .count(),
+            1
+        );
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| response.replayed)
+                .count(),
+            CONCURRENCY - 1
+        );
+        let event = responses[0].event.clone();
+        assert!(responses.iter().all(|response| response.event == event));
+    }
+
+    #[tokio::test]
     async fn runtime_envelope_rejections_leave_session_receipts_and_ledger_untouched() {
         let store = production_store(false).await;
         let before = store
@@ -2582,6 +2627,46 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(job.attempt, 1);
+    }
+
+    #[tokio::test]
+    async fn execution_point_queries_do_not_decode_unrelated_history() {
+        let paths = TestPaths::new("point-query-history");
+        let store = local_store(&paths, false).await;
+        // Deliberately bypass the append-only trigger to prove only that
+        // execution-context reads are bounded. A real v9 database first
+        // validates the full pre-v9 ledger during migration and then relies on
+        // immutable/contiguous triggers; corruption in a selected row or tail
+        // still fails closed.
+        corrupt_unrelated_run_event(&paths.database, LOCAL_DEMO_RUN_ID, 1);
+
+        assert!(matches!(
+            store.storage.load_run(LOCAL_DEMO_RUN_ID).await,
+            Err(StorageError::UnsupportedPayloadVersion { version: 99, .. })
+        ));
+
+        let approved = store
+            .review_for_actor(
+                TEST_OWNER_ID,
+                LOCAL_DEMO_RUN_ID,
+                "APR-DEV-1",
+                approval_request(ReviewDecision::Approve),
+                "point-query-review",
+            )
+            .await
+            .unwrap();
+        assert_eq!(approved.run.status, RunStatus::Queued);
+
+        store.dispatch_pending().await.unwrap();
+        assert_eq!(
+            store.current_run().await.unwrap().status,
+            RunStatus::Succeeded
+        );
+        assert_eq!(directory_entries(&paths.marker_root), 1);
+        assert!(matches!(
+            store.storage.load_run(LOCAL_DEMO_RUN_ID).await,
+            Err(StorageError::UnsupportedPayloadVersion { version: 99, .. })
+        ));
     }
 
     #[tokio::test]
@@ -2950,11 +3035,15 @@ mod tests {
         policy_revision: &str,
         idempotency_key: &str,
     ) -> DispatchJob {
-        let stored = store.storage.load_run(protocol::DEMO_RUN_ID).await.unwrap();
-        let (pending, call) = pending_approval_and_call(&stored, "APR-901").unwrap();
-        let expected_sequence = stored.snapshot.run.sequence;
+        let context = store
+            .storage
+            .review_context(protocol::DEMO_RUN_ID, "APR-901")
+            .await
+            .unwrap();
+        let (pending, call) = pending_approval_and_call(&context, "APR-901").unwrap();
+        let expected_sequence = context.snapshot.run.sequence;
         let mut transition = apply_review(
-            &stored.snapshot.run,
+            &context.snapshot.run,
             &pending,
             ReviewDecision::Approve,
             Some("identity guard fixture"),
@@ -2963,7 +3052,7 @@ mod tests {
         )
         .unwrap();
         transition.event.approval.as_mut().unwrap().policy_revision = Some(policy_revision.into());
-        let mut snapshot = stored.snapshot;
+        let mut snapshot = context.snapshot;
         snapshot.run = transition.run.clone();
         let response = ReviewResponse {
             run: transition.run,
@@ -3008,11 +3097,11 @@ mod tests {
     }
 
     async fn claim_job_directly(store: &DemoStore, job: &DispatchJob) {
-        let stored = store.storage.load_run(&job.run_id).await.unwrap();
-        let (call, approval) = bindings_for_job(&stored, job).unwrap();
-        let expected_sequence = stored.snapshot.run.sequence;
+        let context = store.storage.dispatch_context(job).await.unwrap();
+        let (call, approval) = bindings_for_job(&context, job).unwrap();
+        let expected_sequence = context.snapshot.run.sequence;
         let transition = start_tool_dispatch(
-            &stored.snapshot.run,
+            &context.snapshot.run,
             &approval,
             &call,
             "identity-guard-test",
@@ -3020,7 +3109,7 @@ mod tests {
             now(),
         )
         .unwrap();
-        let mut snapshot = stored.snapshot;
+        let mut snapshot = context.snapshot;
         snapshot.run = transition.run;
         assert!(matches!(
             store
@@ -3118,6 +3207,31 @@ mod tests {
         }
         .unwrap();
         assert_eq!(changed, 1);
+    }
+
+    fn corrupt_unrelated_run_event(path: &Path, run_id: &str, sequence: i64) {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch("DROP TRIGGER run_events_reject_update;")
+            .unwrap();
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE run_events SET payload_version = 99 WHERE run_id = ?1 AND sequence = ?2",
+                    params![run_id, sequence],
+                )
+                .unwrap(),
+            1
+        );
+        connection
+            .execute_batch(
+                r#"CREATE TRIGGER run_events_reject_update
+                   BEFORE UPDATE ON run_events
+                   BEGIN
+                       SELECT RAISE(ABORT, 'run_events are append-only');
+                   END;"#,
+            )
+            .unwrap();
     }
 
     fn directory_entries(path: &Path) -> usize {

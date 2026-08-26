@@ -1276,12 +1276,7 @@ async fn process_reply_job(state: &ApiState, job: ReplyJob) -> Result<(), StoreE
         .await;
     }
 
-    let expected_sequence = state
-        .store
-        .get_session(&job.session_id)
-        .await?
-        .session
-        .sequence;
+    let expected_sequence = state.store.session_summary(&job.session_id).await?.sequence;
     let response_json = match serde_json::to_value(&response) {
         Ok(value) => value,
         Err(_) => {
@@ -1342,12 +1337,7 @@ async fn fail_reply_job(
     code: &str,
     message: &str,
 ) -> Result<(), StoreError> {
-    let expected_sequence = state
-        .store
-        .get_session(&job.session_id)
-        .await?
-        .session
-        .sequence;
+    let expected_sequence = state.store.session_summary(&job.session_id).await?.sequence;
     state
         .store
         .complete_reply_failure(ReplyFailureCommit {
@@ -1368,12 +1358,7 @@ async fn mark_reply_outcome_unknown(
     code: &str,
     message: &str,
 ) -> Result<(), StoreError> {
-    let expected_sequence = state
-        .store
-        .get_session(&job.session_id)
-        .await?
-        .session
-        .sequence;
+    let expected_sequence = state.store.session_summary(&job.session_id).await?.sequence;
     state
         .store
         .complete_reply_outcome_unknown(ReplyOutcomeUnknownCommit {

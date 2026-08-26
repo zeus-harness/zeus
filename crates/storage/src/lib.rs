@@ -11,8 +11,9 @@ use std::fmt;
 
 pub use error::StorageError;
 use protocol::{
-    EvidenceSummary, IncidentSummary, Metric, ReviewResponse, RunEvent, RunSummary, SandboxProfile,
-    SessionEvent, SessionSummary, SessionTurn, StartTurnResponse, ToolEffect, ToolPolicySummary,
+    Approval, EvidenceSummary, IncidentSummary, Metric, ReviewResponse, RunEvent, RunSummary,
+    SandboxProfile, SessionEvent, SessionSummary, SessionTurn, StartTurnResponse, ToolCall,
+    ToolEffect, ToolPolicySummary,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -253,6 +254,39 @@ pub struct RunSnapshot {
 pub struct StoredRun {
     pub snapshot: RunSnapshot,
     pub events: Vec<RunEvent>,
+}
+
+/// Minimal durable state needed to decide one approval command.
+///
+/// `approval` is absent when the requested pending approval does not exist.
+/// `requested_call` remains separate so the runtime can preserve its public
+/// distinction between a missing approval and an incomplete approval binding.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReviewContext {
+    pub snapshot: RunSnapshot,
+    pub approval: Option<Approval>,
+    pub approval_event_sequence: Option<u64>,
+    pub requested_call: Option<ToolCall>,
+    pub requested_call_event_sequence: Option<u64>,
+}
+
+/// Minimal durable state needed to claim or recover one dispatch job.
+///
+/// The approval is selected by the immutable sequence stored on the queue
+/// record. The requested call is selected by its immutable logical call ID.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DispatchContext {
+    pub snapshot: RunSnapshot,
+    pub approval_event: RunEvent,
+    pub requested_call: Option<ToolCall>,
+    pub requested_call_event_sequence: Option<u64>,
+}
+
+/// One startup-recovered turn together with the ledger that owns its event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveredSessionTurn {
+    pub session_id: String,
+    pub event: SessionEvent,
 }
 
 /// The immutable result cached for an idempotent review command.
