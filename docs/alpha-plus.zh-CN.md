@@ -1,7 +1,7 @@
 # Zeus Harness Alpha+ 设计冻结
 
-状态：主机 Alpha+、Actor Boundary Foundation 与 API Resource Envelope 验收通过；Apple container 新镜像验收待完成
-基线：`fb6eb46`（Actor Boundary Foundation）
+状态：主机 Alpha+、Actor Boundary Foundation、API Resource Envelope 与 Bounded Event Feed 验收通过；Apple container 新镜像验收待完成
+基线：`df96f3e`（API Resource Envelope）
 
 ## 1. 产品术语
 
@@ -45,15 +45,17 @@ Health 路由保持公开。公开注册、邮件找回、OAuth/SSO、WebAuthn �
   owner。授权在排队后被撤销时，任务在一个事务中进入 durable 拒绝终态并追加
   `authorization_revoked` 证据，provider/connector 调用次数必须为零。
 
-这些边界只是未来 member 能力的安全底座。当前 API 仍拒绝 member 登录；字段与 HTTP/SSE
-连接边界已经落地，但 SQLite 存储/队列配额和有界 cursor pagination 完成前不得开放 member。
+这些边界只是未来 member 能力的安全底座。当前 API 仍拒绝 member 登录；字段、HTTP/SSE
+连接和事件页边界已经落地，但 Session list/detail、内部 point/batch read 与 SQLite
+存储/队列配额完成前不得开放 member。
 
 Resource Envelope 的固定边界：auth JSON 8 KiB、command JSON 512 KiB；新建 Session/turn
 ID 128 UTF-8 bytes、Session title 256 bytes、user message 64 KiB、review note 8 KiB；
 `Idempotency-Key` 必须是单一的 1–128 ASCII graphic bytes。新 Session event ID 是有界的
 ledger-local ID；旧 v8 durable ID 继续可寻址，避免升级后数据失联。字段校验发生在
 fingerprint/receipt 之前。Run/Session SSE 共用 global 64、每 actor 4 条连接配额，permit
-由 response body 持有。事件回放仍未分页，不能把连接配额描述为有界 replay。
+由 response body 持有。initial/hint/lag/poll 每次只从 SQLite 读取最多 128 条事件的
+`LIMIT + 1` page；积压通过 cooperative continuation 分页补齐，cursor 只随已发送事件推进。
 
 ## 4. 设置
 

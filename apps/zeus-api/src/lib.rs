@@ -1655,7 +1655,12 @@ async fn session_events(
     let sse_lease = acquire_sse_lease(&state.sse_capacity, &actor_user_id)?;
     let mut feed = state
         .store
-        .session_event_feed_for_actor(&actor_user_id, &id, after)
+        .session_event_page_feed_for_actor(
+            &actor_user_id,
+            &id,
+            after,
+            protocol::EVENT_PAGE_DEFAULT_LIMIT,
+        )
         .await?;
     let store = state.store.clone();
     let durable_ledger_poll_interval = state.durable_ledger_poll_interval;
@@ -1665,12 +1670,9 @@ async fn session_events(
     let stream = async_stream::stream! {
         let _sse_lease = sse_lease;
         let mut cursor = after;
-        for event in feed.replay {
-            cursor = cursor.max(event.sequence);
-            yield Ok::<Event, Infallible>(session_sse_event(&event));
-        }
-
-        yield Ok(Event::default().comment("stream-open"));
+        let mut pending = feed.replay.items.into_iter();
+        let mut catch_up = feed.replay.has_more;
+        let mut stream_opened = false;
 
         let mut durable_poll = tokio::time::interval_at(
             Instant::now() + durable_ledger_poll_interval,
@@ -1678,7 +1680,50 @@ async fn session_events(
         );
         durable_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-        loop {
+        'stream: loop {
+            for event in pending.by_ref() {
+                if event.sequence <= cursor {
+                    eprintln!("zeus Session SSE page did not advance its durable cursor");
+                    break 'stream;
+                }
+                cursor = event.sequence;
+                yield Ok::<Event, Infallible>(session_sse_event(&event));
+            }
+            if catch_up {
+                tokio::task::yield_now().await;
+                if !sse_auth_is_current(&store, &current).await {
+                    break;
+                }
+                match store
+                    .session_event_page_for_actor(
+                        &actor_user_id,
+                        &session_id,
+                        cursor,
+                        protocol::EVENT_PAGE_DEFAULT_LIMIT,
+                    )
+                    .await
+                {
+                    Ok(page) => {
+                        if page.items.is_empty() {
+                            eprintln!("zeus Session SSE page reported more data without progress");
+                            break;
+                        }
+                        catch_up = page.has_more;
+                        pending = page.items.into_iter();
+                        continue;
+                    }
+                    Err(error) => {
+                        eprintln!("zeus SSE durable catch-up failed for a session: {error:?}");
+                        break;
+                    }
+                }
+            }
+
+            if !stream_opened {
+                yield Ok(Event::default().comment("stream-open"));
+                stream_opened = true;
+            }
+
             tokio::select! {
                 received = feed.receiver.recv(), if broadcast_hints_enabled => match received {
                     Ok(published) => {
@@ -1691,20 +1736,17 @@ async fn session_events(
                             // from the ordered durable ledger so a later hint
                             // cannot make an earlier event permanently vanish.
                             match store
-                                .session_events_after_for_actor(
+                                .session_event_page_for_actor(
                                     &actor_user_id,
                                     &session_id,
                                     cursor,
+                                    protocol::EVENT_PAGE_DEFAULT_LIMIT,
                                 )
                                 .await
                             {
-                                Ok(events) => {
-                                    for event in events {
-                                        if event.sequence > cursor {
-                                            cursor = event.sequence;
-                                            yield Ok(session_sse_event(&event));
-                                        }
-                                    }
+                                Ok(page) => {
+                                    catch_up = page.has_more;
+                                    pending = page.items.into_iter();
                                 }
                                 Err(error) => {
                                     eprintln!(
@@ -1720,16 +1762,17 @@ async fn session_events(
                             break;
                         }
                         match store
-                            .session_events_after_for_actor(&actor_user_id, &session_id, cursor)
+                            .session_event_page_for_actor(
+                                &actor_user_id,
+                                &session_id,
+                                cursor,
+                                protocol::EVENT_PAGE_DEFAULT_LIMIT,
+                            )
                             .await
                         {
-                            Ok(events) => {
-                                for event in events {
-                                    if event.sequence > cursor {
-                                        cursor = event.sequence;
-                                        yield Ok(session_sse_event(&event));
-                                    }
-                                }
+                            Ok(page) => {
+                                catch_up = page.has_more;
+                                pending = page.items.into_iter();
                             }
                             Err(error) => {
                                 eprintln!(
@@ -1746,16 +1789,17 @@ async fn session_events(
                         break;
                     }
                     match store
-                        .session_events_after_for_actor(&actor_user_id, &session_id, cursor)
+                        .session_event_page_for_actor(
+                            &actor_user_id,
+                            &session_id,
+                            cursor,
+                            protocol::EVENT_PAGE_DEFAULT_LIMIT,
+                        )
                         .await
                     {
-                        Ok(events) => {
-                            for event in events {
-                                if event.sequence > cursor {
-                                    cursor = event.sequence;
-                                    yield Ok(session_sse_event(&event));
-                                }
-                            }
+                        Ok(page) => {
+                            catch_up = page.has_more;
+                            pending = page.items.into_iter();
                         }
                         Err(error) => {
                             eprintln!("zeus SSE durable poll failed for a session: {error:?}");
@@ -1792,7 +1836,12 @@ async fn run_events(
     let sse_lease = acquire_sse_lease(&state.sse_capacity, &actor_user_id)?;
     let mut feed = state
         .store
-        .event_feed_for_actor(&actor_user_id, &id, after)
+        .event_page_feed_for_actor(
+            &actor_user_id,
+            &id,
+            after,
+            protocol::EVENT_PAGE_DEFAULT_LIMIT,
+        )
         .await?;
     let store = state.store.clone();
     let durable_ledger_poll_interval = state.durable_ledger_poll_interval;
@@ -1802,16 +1851,9 @@ async fn run_events(
     let stream = async_stream::stream! {
         let _sse_lease = sse_lease;
         let mut cursor = after;
-        for event in feed.replay {
-            cursor = cursor.max(event.sequence);
-            yield Ok::<Event, Infallible>(sse_event(&event));
-        }
-
-        // Flush a harmless SSE comment even when the client is already at the
-        // ledger head. Some development proxies buffer response headers until
-        // the first body chunk, which otherwise leaves the UI looking as if it
-        // is reconnecting until the first keep-alive interval.
-        yield Ok(Event::default().comment("stream-open"));
+        let mut pending = feed.replay.items.into_iter();
+        let mut catch_up = feed.replay.has_more;
+        let mut stream_opened = false;
 
         // Broadcast is a same-process latency hint only. Poll the durable
         // ledger at a bounded interval so commits without a local hint are
@@ -1822,7 +1864,53 @@ async fn run_events(
         );
         durable_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-        loop {
+        'stream: loop {
+            for event in pending.by_ref() {
+                if event.sequence <= cursor {
+                    eprintln!("zeus Run SSE page did not advance its durable cursor");
+                    break 'stream;
+                }
+                cursor = event.sequence;
+                yield Ok::<Event, Infallible>(sse_event(&event));
+            }
+            if catch_up {
+                tokio::task::yield_now().await;
+                if !sse_auth_is_current(&store, &current).await {
+                    break;
+                }
+                match store
+                    .run_event_page_for_actor(
+                        &actor_user_id,
+                        &run_id,
+                        cursor,
+                        protocol::EVENT_PAGE_DEFAULT_LIMIT,
+                    )
+                    .await
+                {
+                    Ok(page) => {
+                        if page.items.is_empty() {
+                            eprintln!("zeus Run SSE page reported more data without progress");
+                            break;
+                        }
+                        catch_up = page.has_more;
+                        pending = page.items.into_iter();
+                        continue;
+                    }
+                    Err(error) => {
+                        eprintln!("zeus SSE durable catch-up failed for run {run_id}: {error:?}");
+                        break;
+                    }
+                }
+            }
+
+            if !stream_opened {
+                // Flush a harmless SSE comment when the client is already at
+                // the ledger head. Historical events have already flushed the
+                // response while a paged replay was in progress.
+                yield Ok(Event::default().comment("stream-open"));
+                stream_opened = true;
+            }
+
             tokio::select! {
                 received = feed.receiver.recv(), if broadcast_hints_enabled => match received {
                     Ok(published) => {
@@ -1842,14 +1930,11 @@ async fn run_events(
                         )
                         .await
                         {
-                            Ok(events) => {
-                                for event in events {
-                                    if event.sequence > cursor {
-                                        cursor = event.sequence;
-                                        yield Ok(sse_event(&event));
-                                    }
-                                }
+                            Ok(Some(page)) => {
+                                catch_up = page.has_more;
+                                pending = page.items.into_iter();
                             }
+                            Ok(None) => {}
                             Err(error) => {
                                 eprintln!(
                                     "zeus SSE durable replay failed for run {run_id}: {error:?}"
@@ -1865,16 +1950,17 @@ async fn run_events(
                         // Recover a slow client from the append-only ledger
                         // instead of silently skipping events.
                         match store
-                            .events_after_for_actor(&actor_user_id, &run_id, cursor)
+                            .run_event_page_for_actor(
+                                &actor_user_id,
+                                &run_id,
+                                cursor,
+                                protocol::EVENT_PAGE_DEFAULT_LIMIT,
+                            )
                             .await
                         {
-                            Ok(events) => {
-                                for event in events {
-                                    if event.sequence > cursor {
-                                        cursor = event.sequence;
-                                        yield Ok(sse_event(&event));
-                                    }
-                                }
+                            Ok(page) => {
+                                catch_up = page.has_more;
+                                pending = page.items.into_iter();
                             }
                             Err(error) => {
                                 eprintln!(
@@ -1891,16 +1977,17 @@ async fn run_events(
                         break;
                     }
                     match store
-                        .events_after_for_actor(&actor_user_id, &run_id, cursor)
+                        .run_event_page_for_actor(
+                            &actor_user_id,
+                            &run_id,
+                            cursor,
+                            protocol::EVENT_PAGE_DEFAULT_LIMIT,
+                        )
                         .await
                     {
-                        Ok(events) => {
-                            for event in events {
-                                if event.sequence > cursor {
-                                    cursor = event.sequence;
-                                    yield Ok(sse_event(&event));
-                                }
-                            }
+                        Ok(page) => {
+                            catch_up = page.has_more;
+                            pending = page.items.into_iter();
                         }
                         Err(error) => {
                             eprintln!(
@@ -1939,13 +2026,19 @@ async fn run_events_for_hint(
     run_id: &str,
     cursor: u64,
     published: &PublishedEvent,
-) -> Result<Vec<protocol::RunEvent>, StoreError> {
+) -> Result<Option<protocol::RunEventPage>, StoreError> {
     if published.run_id != run_id || published.event.sequence <= cursor {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     store
-        .events_after_for_actor(actor_user_id, run_id, cursor)
+        .run_event_page_for_actor(
+            actor_user_id,
+            run_id,
+            cursor,
+            protocol::EVENT_PAGE_DEFAULT_LIMIT,
+        )
         .await
+        .map(Some)
 }
 
 fn sse_event(event: &protocol::RunEvent) -> Event {
@@ -1963,25 +2056,36 @@ fn session_sse_event(event: &SessionEvent) -> Event {
 }
 
 fn event_cursor(headers: &HeaderMap, query: EventsQuery) -> Result<u64, ApiError> {
-    let header_cursor = headers
-        .get("last-event-id")
+    let mut header_values = headers.get_all("last-event-id").iter();
+    let header_cursor = header_values
+        .next()
         .map(|value| {
             value
                 .to_str()
                 .map_err(|_| ())
                 .and_then(|value| value.parse::<u64>().map_err(|_| ()))
-                .map_err(|_| {
-                    ApiError::bad_request(
-                        "invalid_event_cursor",
-                        "Last-Event-ID must be an unsigned integer sequence",
-                    )
-                })
+                .map_err(|_| invalid_event_cursor("Last-Event-ID must be an unsigned integer"))
         })
         .transpose()?;
+    if header_values.next().is_some() {
+        return Err(invalid_event_cursor(
+            "Exactly one Last-Event-ID header is allowed",
+        ));
+    }
     // EventSource keeps the original query string when reconnecting but sends
     // its newer cursor in Last-Event-ID. Prefer that header so reconnects do
     // not repeatedly replay from the page's initial sequence.
-    Ok(header_cursor.or(query.after).unwrap_or(0))
+    let cursor = header_cursor.or(query.after).unwrap_or(0);
+    if cursor > i64::MAX as u64 {
+        return Err(invalid_event_cursor(
+            "The event cursor exceeds the supported sequence range",
+        ));
+    }
+    Ok(cursor)
+}
+
+fn invalid_event_cursor(detail: &'static str) -> ApiError {
+    ApiError::bad_request("invalid_event_cursor", detail)
 }
 
 async fn not_found() -> ApiError {
@@ -2262,6 +2366,15 @@ impl From<StoreError> for ApiError {
                 "concurrent_modification",
                 "Concurrent modification",
                 "The resource changed while the command was being committed; retry the request",
+            ),
+            StoreError::EventCursorOutOfRange { .. } => {
+                invalid_event_cursor("The event cursor exceeds the supported sequence range")
+            }
+            StoreError::EventCursorBeyondHead { .. } => Self::new(
+                StatusCode::CONFLICT,
+                "event_cursor_beyond_head",
+                "Event cursor is ahead of the ledger",
+                "The event cursor is ahead of the current durable ledger head",
             ),
             StoreError::PolicyBuild(_)
             | StoreError::ConnectorConfig(_)
@@ -3641,7 +3754,7 @@ mod tests {
         let cross_actor_sse = app
             .clone()
             .oneshot(
-                Request::get(format!("/api/v1/sessions/{session_id}/events?after=0"))
+                Request::get(format!("/api/v1/sessions/{session_id}/events?after=2"))
                     .header(header::COOKIE, &alice.cookie_header)
                     .body(Body::empty())
                     .unwrap(),
@@ -3754,7 +3867,7 @@ mod tests {
         let cross_actor_sse = app
             .clone()
             .oneshot(
-                Request::get(format!("/api/v1/runs/{DEMO_RUN_ID}/events?after=0"))
+                Request::get(format!("/api/v1/runs/{DEMO_RUN_ID}/events?after=9"))
                     .header(header::COOKIE, &alice.cookie_header)
                     .body(Body::empty())
                     .unwrap(),
@@ -3786,7 +3899,7 @@ mod tests {
         let sse = app
             .clone()
             .oneshot(
-                Request::get("/api/v1/sessions/session-ZR-1842/events?after=999")
+                Request::get("/api/v1/sessions/session-ZR-1842/events?after=2")
                     .header(header::COOKIE, &alice.cookie_header)
                     .body(Body::empty())
                     .unwrap(),
@@ -4231,6 +4344,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_sse_replays_multiple_bounded_pages_without_waiting_for_poll() {
+        let store = DemoStore::seeded().await.unwrap();
+        let app = app_with_event_feed_options(store, Duration::from_secs(30), true).await;
+        let session_id = "session-multi-page-replay";
+        create_test_session(&app, session_id).await;
+
+        let mut sequence = 1u64;
+        for index in 0..43 {
+            let turn_id = format!("turn-page-{index}");
+            let started = app
+                .clone()
+                .oneshot(
+                    Request::post(format!("/api/v1/sessions/{session_id}/turns"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header("idempotency-key", format!("start-page-{index}"))
+                        .body(Body::from(
+                            serde_json::json!({
+                                "turn_id": turn_id,
+                                "user_message": format!("page message {index}"),
+                                "expected_sequence": sequence,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(started.status(), StatusCode::OK);
+            let started: StartTurnResponse = response_json(started).await;
+            sequence = started.session.sequence;
+
+            let flushed = app
+                .clone()
+                .oneshot(
+                    Request::post(format!(
+                        "/api/v1/sessions/{session_id}/turns/{turn_id}/flush"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", format!("flush-page-{index}"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": turn_id,
+                            "assistant_message": format!("page reply {index}"),
+                            "expected_sequence": sequence,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(flushed.status(), StatusCode::OK);
+            let flushed: FlushSessionResponse = response_json(flushed).await;
+            sequence = flushed.session.sequence;
+        }
+        assert_eq!(sequence, 130);
+
+        let response = app
+            .oneshot(
+                Request::get(format!("/api/v1/sessions/{session_id}/events?after=0"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        let sequences = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut sequences = Vec::new();
+            while sequences.last().copied() != Some(sequence) {
+                let frame = body
+                    .frame()
+                    .await
+                    .expect("the paged replay must remain open")
+                    .expect("the paged replay frame must be valid");
+                let Ok(data) = frame.into_data() else {
+                    continue;
+                };
+                let payload = String::from_utf8(data.to_vec()).unwrap();
+                sequences.extend(payload.lines().filter_map(|line| {
+                    line.strip_prefix("id: ")
+                        .map(|value| value.parse::<u64>().unwrap())
+                }));
+            }
+            sequences
+        })
+        .await
+        .expect("the second event page must not wait for the 30-second poll");
+        assert_eq!(sequences, (1..=sequence).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
     async fn sse_replays_only_events_after_the_cursor() {
         let response = test_app()
             .await
@@ -4280,6 +4485,65 @@ mod tests {
         let payload = String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap();
         assert!(payload.contains("id: 5"));
         assert!(!payload.contains("id: 2"));
+    }
+
+    #[test]
+    fn event_cursor_rejects_duplicate_malformed_or_out_of_range_values() {
+        let mut duplicate = HeaderMap::new();
+        duplicate.append("last-event-id", HeaderValue::from_static("1"));
+        duplicate.append("last-event-id", HeaderValue::from_static("2"));
+        let duplicate_error = event_cursor(&duplicate, EventsQuery::default()).unwrap_err();
+        assert_eq!(duplicate_error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(duplicate_error.problem.code, "invalid_event_cursor");
+
+        for malformed in ["", "-1", "not-a-sequence"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("last-event-id", HeaderValue::from_str(malformed).unwrap());
+            let error = event_cursor(&headers, EventsQuery::default()).unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+            assert_eq!(error.problem.code, "invalid_event_cursor");
+        }
+        let mut non_utf8 = HeaderMap::new();
+        non_utf8.insert("last-event-id", HeaderValue::from_bytes(&[0xff]).unwrap());
+        let non_utf8_error = event_cursor(&non_utf8, EventsQuery::default()).unwrap_err();
+        assert_eq!(non_utf8_error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(non_utf8_error.problem.code, "invalid_event_cursor");
+
+        let out_of_range = (i64::MAX as u64 + 1).to_string();
+        let mut header = HeaderMap::new();
+        header.insert(
+            "last-event-id",
+            HeaderValue::from_str(&out_of_range).unwrap(),
+        );
+        let header_error = event_cursor(&header, EventsQuery::default()).unwrap_err();
+        assert_eq!(header_error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(header_error.problem.code, "invalid_event_cursor");
+
+        let query_error = event_cursor(
+            &HeaderMap::new(),
+            EventsQuery {
+                after: Some(i64::MAX as u64 + 1),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(query_error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(query_error.problem.code, "invalid_event_cursor");
+    }
+
+    #[tokio::test]
+    async fn owned_future_event_cursors_are_rejected_before_sse_opens() {
+        let app = test_app().await;
+        for uri in [
+            "/api/v1/sessions/session-ZR-1842/events?after=3".to_owned(),
+            format!("/api/v1/runs/{DEMO_RUN_ID}/events?after=9"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_problem(response, StatusCode::CONFLICT, "event_cursor_beyond_head").await;
+        }
     }
 
     #[tokio::test]
@@ -4385,9 +4649,12 @@ mod tests {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .expect("a newer matching hint must trigger one durable page");
+        assert!(!replay.has_more);
         assert_eq!(
             replay
+                .items
                 .iter()
                 .map(|event| event.sequence)
                 .collect::<Vec<_>>(),

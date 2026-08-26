@@ -23,8 +23,9 @@ use protocol::{
     CreateSessionResponse, FlushSessionRequest, FlushSessionResponse, NotDispatchedReason,
     OverviewResponse, PolicyDecision, ResourceEnvelopeError, ResumeSessionRequest,
     ResumeSessionResponse, ReviewDecision, ReviewRequest, ReviewResponse, RunDetail, RunEvent,
-    RunEventData, RunSummary, SessionDetail, SessionEvent, SessionEventData, SessionSummary,
-    StartTurnRequest, StartTurnResponse, ToolCall, ToolExecutorStatus, ToolOutcome,
+    RunEventData, RunEventPage, RunSummary, SessionDetail, SessionEvent, SessionEventData,
+    SessionEventPage, SessionSummary, StartTurnRequest, StartTurnResponse, ToolCall,
+    ToolExecutorStatus, ToolOutcome,
 };
 pub use storage::{
     AuthPrincipal, AuthSessionCommit, BootstrapOwnerCommit, ReplyClaimOutcome, ReplyCompletion,
@@ -79,6 +80,11 @@ pub struct EventFeed {
     pub receiver: broadcast::Receiver<PublishedEvent>,
 }
 
+pub struct EventPageFeed {
+    pub replay: RunEventPage,
+    pub receiver: broadcast::Receiver<PublishedEvent>,
+}
+
 #[derive(Clone, Debug)]
 pub struct PublishedSessionEvent {
     pub session_id: String,
@@ -87,6 +93,11 @@ pub struct PublishedSessionEvent {
 
 pub struct SessionEventFeed {
     pub replay: Vec<SessionEvent>,
+    pub receiver: broadcast::Receiver<PublishedSessionEvent>,
+}
+
+pub struct SessionEventPageFeed {
+    pub replay: SessionEventPage,
     pub receiver: broadcast::Receiver<PublishedSessionEvent>,
 }
 
@@ -134,6 +145,10 @@ pub enum StoreError {
     ConcurrentModification,
     #[error("the run sequence cannot advance any further")]
     SequenceOverflow,
+    #[error("event cursor {after} cannot be represented by SQLite")]
+    EventCursorOutOfRange { after: u64 },
+    #[error("event cursor {after} is ahead of durable ledger head {head_sequence}")]
+    EventCursorBeyondHead { after: u64, head_sequence: u64 },
     #[error(transparent)]
     Kernel(#[from] KernelError),
     #[error(transparent)]
@@ -168,6 +183,14 @@ impl From<StorageError> for StoreError {
             StorageError::EmptyIdempotencyKey => Self::EmptyIdempotencyKey,
             StorageError::IdempotencyConflict => Self::IdempotencyConflict,
             StorageError::ConcurrentModification => Self::ConcurrentModification,
+            StorageError::EventCursorOutOfRange { after } => Self::EventCursorOutOfRange { after },
+            StorageError::EventCursorBeyondHead {
+                after,
+                head_sequence,
+            } => Self::EventCursorBeyondHead {
+                after,
+                head_sequence,
+            },
             other => Self::Storage(other),
         }
     }
@@ -439,6 +462,30 @@ impl DemoStore {
             .await?)
     }
 
+    pub async fn run_event_page(
+        &self,
+        run_id: &str,
+        after: u64,
+        limit: usize,
+    ) -> Result<RunEventPage, StoreError> {
+        validate_durable_reference(run_id, "run ID")?;
+        Ok(self.storage.run_event_page(run_id, after, limit).await?)
+    }
+
+    pub async fn run_event_page_for_actor(
+        &self,
+        actor_user_id: &str,
+        run_id: &str,
+        after: u64,
+        limit: usize,
+    ) -> Result<RunEventPage, StoreError> {
+        validate_durable_reference(run_id, "run ID")?;
+        Ok(self
+            .storage
+            .run_event_page_for_actor(actor_user_id, run_id, after, limit)
+            .await?)
+    }
+
     /// Subscribes before taking the durable replay snapshot. Consumers discard
     /// broadcasts at or below their cursor, avoiding both gaps and duplicates.
     pub async fn event_feed(&self, run_id: &str, after: u64) -> Result<EventFeed, StoreError> {
@@ -460,6 +507,22 @@ impl DemoStore {
             .events_after_for_actor(actor_user_id, run_id, after)
             .await?;
         Ok(EventFeed { replay, receiver })
+    }
+
+    /// Subscribes before loading a bounded durable page so consumers cannot
+    /// miss a commit between the replay snapshot and the live wake channel.
+    pub async fn event_page_feed_for_actor(
+        &self,
+        actor_user_id: &str,
+        run_id: &str,
+        after: u64,
+        limit: usize,
+    ) -> Result<EventPageFeed, StoreError> {
+        let receiver = self.publisher.subscribe();
+        let replay = self
+            .run_event_page_for_actor(actor_user_id, run_id, after, limit)
+            .await?;
+        Ok(EventPageFeed { replay, receiver })
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, StoreError> {
@@ -514,6 +577,33 @@ impl DemoStore {
             .await?)
     }
 
+    pub async fn session_event_page(
+        &self,
+        session_id: &str,
+        after: u64,
+        limit: usize,
+    ) -> Result<SessionEventPage, StoreError> {
+        validate_durable_reference(session_id, "session ID")?;
+        Ok(self
+            .storage
+            .session_event_page(session_id, after, limit)
+            .await?)
+    }
+
+    pub async fn session_event_page_for_actor(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+        after: u64,
+        limit: usize,
+    ) -> Result<SessionEventPage, StoreError> {
+        validate_durable_reference(session_id, "session ID")?;
+        Ok(self
+            .storage
+            .session_event_page_for_actor(actor_user_id, session_id, after, limit)
+            .await?)
+    }
+
     /// Subscribes to the session channel before loading the durable replay.
     /// The session channel is intentionally independent from run dispatch and
     /// its event ledger. Receiver items are post-commit wake hints, not an
@@ -546,6 +636,22 @@ impl DemoStore {
             .session_events_after_for_actor(actor_user_id, session_id, after)
             .await?;
         Ok(SessionEventFeed { replay, receiver })
+    }
+
+    /// Actor-scoped bounded counterpart for authenticated SSE. Subscription
+    /// precedes the storage transaction that authorizes and builds the page.
+    pub async fn session_event_page_feed_for_actor(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+        after: u64,
+        limit: usize,
+    ) -> Result<SessionEventPageFeed, StoreError> {
+        let receiver = self.session_publisher.subscribe();
+        let replay = self
+            .session_event_page_for_actor(actor_user_id, session_id, after, limit)
+            .await?;
+        Ok(SessionEventPageFeed { replay, receiver })
     }
 
     pub async fn create_session(
@@ -1726,6 +1832,101 @@ mod tests {
                 .map(|event| event.sequence)
                 .collect::<Vec<_>>(),
             vec![5, 6, 7, 8]
+        );
+    }
+
+    #[tokio::test]
+    async fn actor_scoped_event_pages_and_paged_feeds_preserve_cursor_contracts() {
+        let store = production_store(false).await;
+
+        let first = store
+            .event_page_feed_for_actor(TEST_OWNER_ID, DEMO_RUN_ID, 0, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .replay
+                .items
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(first.replay.next_after, Some(3));
+        assert_eq!(first.replay.head_sequence, 8);
+        assert!(first.replay.has_more);
+
+        let last = store
+            .run_event_page_for_actor(TEST_OWNER_ID, DEMO_RUN_ID, 3, 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            last.items
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![4, 5, 6, 7, 8]
+        );
+        assert_eq!(last.next_after, None);
+        assert_eq!(last.head_sequence, 8);
+        assert!(!last.has_more);
+
+        assert!(matches!(
+            store
+                .run_event_page_for_actor(TEST_OWNER_ID, DEMO_RUN_ID, 9, 1)
+                .await,
+            Err(StoreError::EventCursorBeyondHead {
+                after: 9,
+                head_sequence: 8,
+            })
+        ));
+        assert!(matches!(
+            store
+                .run_event_page_for_actor(TEST_OWNER_ID, DEMO_RUN_ID, u64::MAX, 1)
+                .await,
+            Err(StoreError::EventCursorOutOfRange { after }) if after == u64::MAX
+        ));
+        assert!(matches!(
+            store
+                .run_event_page_for_actor(TEST_OWNER_ID, DEMO_RUN_ID, 0, 0)
+                .await,
+            Err(StoreError::Storage(StorageError::InvalidEventPageLimit {
+                limit: 0,
+                max: protocol::EVENT_PAGE_MAX_LIMIT,
+            }))
+        ));
+        assert!(matches!(
+            store
+                .run_event_page_for_actor("foreign-user", DEMO_RUN_ID, 9, 0)
+                .await,
+            Err(StoreError::RunNotFound(id)) if id == DEMO_RUN_ID
+        ));
+
+        let mut session_feed = store
+            .session_event_page_feed_for_actor(TEST_OWNER_ID, DEMO_SESSION_ID, 2, 1)
+            .await
+            .unwrap();
+        assert!(session_feed.replay.items.is_empty());
+        assert_eq!(session_feed.replay.next_after, None);
+        assert_eq!(session_feed.replay.head_sequence, 2);
+        assert!(!session_feed.replay.has_more);
+
+        let started = store
+            .start_turn_for_actor(
+                TEST_OWNER_ID,
+                DEMO_SESSION_ID,
+                StartTurnRequest {
+                    turn_id: "turn-paged-feed".into(),
+                    user_message: "Verify the bounded feed wake channel.".into(),
+                    expected_sequence: 2,
+                },
+                "runtime-paged-feed-start",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session_feed.receiver.recv().await.unwrap().event,
+            started.event
         );
     }
 

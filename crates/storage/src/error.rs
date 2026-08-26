@@ -52,6 +52,12 @@ pub enum StorageError {
     InvalidSessionTransition(String),
     #[error("invalid API resource envelope: {0}")]
     InvalidResourceEnvelope(String),
+    #[error("event page limit {limit} is invalid; expected 1..={max}")]
+    InvalidEventPageLimit { limit: usize, max: usize },
+    #[error("event cursor {after} cannot be represented by SQLite")]
+    EventCursorOutOfRange { after: u64 },
+    #[error("event cursor {after} is ahead of durable ledger head {head_sequence}")]
+    EventCursorBeyondHead { after: u64, head_sequence: u64 },
     #[error("unsupported schema version {found}; this binary supports up to {supported}")]
     UnsupportedSchemaVersion { found: i64, supported: i64 },
     #[error("unsupported event kind `{0}`")]

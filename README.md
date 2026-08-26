@@ -328,7 +328,8 @@ directly.
   state changes additionally require `X-CSRF-Token` to match the login and an
   exact same-origin request. Alpha+ deliberately rejects the schema-reserved
   `member` role. Actor isolation is now present, but member access remains
-  blocked until storage/queue quotas and bounded cursor pagination land.
+  blocked until bounded list/detail queries, internal point/batch reads, and
+  storage/queue quotas land.
 - `GET /api/v1/me/settings` returns the current safe preferences.
   `PATCH /api/v1/me/settings` accepts `theme`, optional allowlisted
   `preferred_model`, and `expected_revision`. Provider endpoints and API keys
@@ -359,7 +360,12 @@ directly.
   feeds, `Last-Event-ID` takes precedence over the query cursor when present.
   Run and Session streams share a limit of 64 open connections globally and 4
   per authenticated actor; the lease remains held until the response body is
-  closed. Event replay itself is not yet bounded and remains the next slice.
+  closed. Initial replay, broadcast reconciliation, lag recovery, and durable
+  polling read at most 128 events per SQL `LIMIT + 1` page, then continue
+  cooperatively without moving the cursor past an event actually sent. A
+  malformed, duplicate, or out-of-range cursor returns `400`; an authenticated
+  cursor ahead of the durable head returns `409`, while masked resources remain
+  `404`.
 - `POST /api/v1/runs/{run_id}/approvals/{approval_id}/decision` accepts
   `{"decision":"approve|reject","note":...}` and requires an
   `Idempotency-Key` header. Approval identity comes from the path, not a caller-
@@ -388,10 +394,11 @@ Session titles at 256 bytes; user messages at 64 KiB; and review notes at 8 KiB.
 New Session event IDs are ledger-local and bounded. Historical v8 durable IDs
 remain addressable so the stricter write envelope does not strand existing
 data. Shared validation runs before command fingerprinting or receipt lookup at
-the relevant API/runtime/storage entry points. Detail and event-feed queries
-still return the complete matching ledger without pagination, and SQLite usage
-quotas/retention are not present. Add the v9 storage budgets and bounded cursor
-pagination before any shared-network or multi-tenant deployment.
+the relevant API/runtime/storage entry points. Event feeds now use bounded
+pages, but Session list/detail, Run detail/overview, and several internal
+execution/recovery reads still load complete matching histories. SQLite usage
+quotas/retention are also not present. Bound those reads and add the v9 storage
+budgets before any shared-network or multi-tenant deployment.
 
 ## Container images
 
@@ -439,16 +446,17 @@ committed data. Use SQLite's backup/checkpoint facilities.
 
 ## Verification status
 
-Current Alpha+ plus Actor Boundary Foundation and API Resource Envelope host
-verification:
+Current Alpha+ plus Actor Boundary Foundation, API Resource Envelope, and
+Bounded Event Feed host verification:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --all-targets`: 168 tests passed, including the real
+- `cargo test --workspace --all-targets`: 177 tests passed, including the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,
   body/field/idempotency boundaries, atomic login limits, SSE lease capacity,
-  durable reply provenance, concurrent claim, restart recovery, and provider
+  bounded `LIMIT + 1` event pages and cooperative multi-page replay, durable
+  reply provenance, concurrent claim, restart recovery, and provider
   `outcome_unknown` semantics.
 - `pnpm --filter web test`: 19 tests passed for CSRF headers, stable command
   identity, active-Session restore, Session event merging, and theme behavior.
@@ -492,8 +500,9 @@ index inside BuildKit and was interrupted before any running container was
 replaced. Therefore the new image, `verify`, and named-volume `restart-verify`
 are not yet claimed as current Alpha+ acceptance. The earlier Alpha baseline
 container acceptance belongs to commit `9a89706`; the latest pushed host
-baseline before this slice is Actor Boundary commit `fb6eb46`. No replacement
-image containing Actor Boundary or API Resource Envelope is yet verified.
+baseline before this slice is API Resource Envelope commit `df96f3e`. No
+replacement image containing Actor Boundary, API Resource Envelope, or Bounded
+Event Feed is yet verified.
 
 Docker Compose configuration remains available for environments with Docker
 Compose v2; this machine currently has Apple `container` but no Docker CLI, so

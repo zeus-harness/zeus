@@ -11,13 +11,13 @@ use chrono::{SecondsFormat, Utc};
 use fs2::FileExt;
 use protocol::{
     ApprovalScope, ApprovalStatus, AssistantReplyProvenance, AttachRunRequest, AttachRunResponse,
-    CreateSessionRequest, CreateSessionResponse, EventType, FlushSessionRequest,
-    FlushSessionResponse, IncidentStatus, IncidentSummary, NotDispatchedReason,
-    ResourceEnvelopeError, ResumeSessionRequest, ResumeSessionResponse, ReviewDecision,
-    ReviewResponse, RunEvent, RunEventData, RunStatus, RunSummary, SandboxProfile, SessionDetail,
-    SessionEvent, SessionEventData, SessionFlushAck, SessionStatus, SessionSummary, SessionTurn,
-    SessionTurnStatus, Severity, StartTurnRequest, StartTurnResponse, ToolCallStatus, ToolEffect,
-    ToolOutcome,
+    CreateSessionRequest, CreateSessionResponse, EVENT_PAGE_MAX_LIMIT, EventType,
+    FlushSessionRequest, FlushSessionResponse, IncidentStatus, IncidentSummary,
+    NotDispatchedReason, ResourceEnvelopeError, ResumeSessionRequest, ResumeSessionResponse,
+    ReviewDecision, ReviewResponse, RunEvent, RunEventData, RunEventPage, RunStatus, RunSummary,
+    SandboxProfile, SessionDetail, SessionEvent, SessionEventData, SessionEventPage,
+    SessionFlushAck, SessionStatus, SessionSummary, SessionTurn, SessionTurnStatus, Severity,
+    StartTurnRequest, StartTurnResponse, ToolCallStatus, ToolEffect, ToolOutcome,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Serialize, de::DeserializeOwned};
@@ -205,6 +205,45 @@ impl SqliteStore {
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         self.with_connection(move |connection| {
             query_session_events_after_for_actor(connection, &actor_user_id, &session_id, after)
+        })
+        .await
+    }
+
+    /// System/test-only bounded read. Authenticated paths must use
+    /// [`Self::session_event_page_for_actor`].
+    pub async fn session_event_page(
+        &self,
+        session_id: &str,
+        after: u64,
+        limit: usize,
+    ) -> Result<SessionEventPage, StorageError> {
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        self.with_connection(move |connection| {
+            query_session_event_page(connection, &session_id, after, limit)
+        })
+        .await
+    }
+
+    /// Returns a bounded Session ledger page after authorizing the actor in
+    /// the same read transaction that observes the durable head and events.
+    pub async fn session_event_page_for_actor(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+        after: u64,
+        limit: usize,
+    ) -> Result<SessionEventPage, StorageError> {
+        let actor_user_id =
+            normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        self.with_connection(move |connection| {
+            query_session_event_page_for_actor(
+                connection,
+                &actor_user_id,
+                &session_id,
+                after,
+                limit,
+            )
         })
         .await
     }
@@ -701,6 +740,39 @@ impl SqliteStore {
         let run_id = validated_durable_reference(run_id, "run ID")?.to_owned();
         self.with_connection(move |connection| {
             events_after_for_actor(connection, &actor_user_id, &run_id, after)
+        })
+        .await
+    }
+
+    /// System/test-only bounded read. Authenticated paths must use
+    /// [`Self::run_event_page_for_actor`].
+    pub async fn run_event_page(
+        &self,
+        run_id: &str,
+        after: u64,
+        limit: usize,
+    ) -> Result<RunEventPage, StorageError> {
+        let run_id = validated_durable_reference(run_id, "run ID")?.to_owned();
+        self.with_connection(move |connection| {
+            query_run_event_page(connection, &run_id, after, limit)
+        })
+        .await
+    }
+
+    /// Returns a bounded Run ledger page after authorizing the actor in the
+    /// same read transaction that observes the durable head and events.
+    pub async fn run_event_page_for_actor(
+        &self,
+        actor_user_id: &str,
+        run_id: &str,
+        after: u64,
+        limit: usize,
+    ) -> Result<RunEventPage, StorageError> {
+        let actor_user_id =
+            normalized_account_value(actor_user_id, "run actor user ID", 128)?.to_owned();
+        let run_id = validated_durable_reference(run_id, "run ID")?.to_owned();
+        self.with_connection(move |connection| {
+            query_run_event_page_for_actor(connection, &actor_user_id, &run_id, after, limit)
         })
         .await
     }
@@ -2248,6 +2320,54 @@ fn query_session_events_after_for_actor(
     Ok(events)
 }
 
+fn query_session_event_page(
+    connection: &mut Connection,
+    session_id: &str,
+    after: u64,
+    limit: usize,
+) -> Result<SessionEventPage, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let head_sequence = query_session_summary(&transaction, session_id)?.sequence;
+    let (after_sql, fetch_limit) = validated_event_page_request(after, limit)?;
+    reject_cursor_beyond_head(after, head_sequence)?;
+    let page = query_session_events_page(
+        &transaction,
+        session_id,
+        after,
+        after_sql,
+        limit,
+        fetch_limit,
+        head_sequence,
+    )?;
+    transaction.commit()?;
+    Ok(page)
+}
+
+fn query_session_event_page_for_actor(
+    connection: &mut Connection,
+    actor_user_id: &str,
+    session_id: &str,
+    after: u64,
+    limit: usize,
+) -> Result<SessionEventPage, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    require_active_session_actor(&transaction, session_id, actor_user_id)?;
+    let head_sequence = query_session_summary(&transaction, session_id)?.sequence;
+    let (after_sql, fetch_limit) = validated_event_page_request(after, limit)?;
+    reject_cursor_beyond_head(after, head_sequence)?;
+    let page = query_session_events_page(
+        &transaction,
+        session_id,
+        after,
+        after_sql,
+        limit,
+        fetch_limit,
+        head_sequence,
+    )?;
+    transaction.commit()?;
+    Ok(page)
+}
+
 fn create_session(
     connection: &mut Connection,
     request: CreateSessionRequest,
@@ -3772,6 +3892,50 @@ fn query_session_events(
     Ok(events)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn query_session_events_page(
+    connection: &Connection,
+    session_id: &str,
+    after: u64,
+    after_sql: i64,
+    limit: usize,
+    fetch_limit: i64,
+    head_sequence: u64,
+) -> Result<SessionEventPage, StorageError> {
+    let mut statement = connection.prepare(
+        r#"SELECT sequence, event_id, event_kind, payload_version, payload_json,
+                  turn_id, created_at
+           FROM session_events
+           WHERE session_id = ?1 AND sequence > ?2
+           ORDER BY sequence LIMIT ?3"#,
+    )?;
+    let mut rows = statement.query(params![session_id, after_sql, fetch_limit])?;
+    let mut events = Vec::with_capacity(limit.saturating_add(1));
+    let mut expected = after_sql.checked_add(1);
+    while let Some(row) = rows.next()? {
+        let stored = StoredSessionEventRow {
+            sequence: row.get(0)?,
+            event_id: row.get(1)?,
+            event_kind: row.get(2)?,
+            payload_version: row.get(3)?,
+            payload_json: row.get(4)?,
+            turn_id: row.get(5)?,
+            created_at: row.get(6)?,
+        };
+        if let Some(expected_sequence) = expected
+            && stored.sequence != expected_sequence
+        {
+            return Err(StorageError::CorruptData(format!(
+                "session event sequence gap: expected {expected_sequence}, found {}",
+                stored.sequence
+            )));
+        }
+        expected = stored.sequence.checked_add(1);
+        events.push(stored.decode()?);
+    }
+    finish_session_event_page(events, after, limit, head_sequence)
+}
+
 fn insert_session_event(
     connection: &Connection,
     session_id: &str,
@@ -4276,6 +4440,71 @@ fn events_after_for_actor(
     Ok(events)
 }
 
+fn query_run_event_page(
+    connection: &mut Connection,
+    run_id: &str,
+    after: u64,
+    limit: usize,
+) -> Result<RunEventPage, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let head_sequence = query_run_head(&transaction, run_id)?;
+    let (after_sql, fetch_limit) = validated_event_page_request(after, limit)?;
+    reject_cursor_beyond_head(after, head_sequence)?;
+    let page = query_run_events_page(
+        &transaction,
+        run_id,
+        after,
+        after_sql,
+        limit,
+        fetch_limit,
+        head_sequence,
+    )?;
+    transaction.commit()?;
+    Ok(page)
+}
+
+fn query_run_event_page_for_actor(
+    connection: &mut Connection,
+    actor_user_id: &str,
+    run_id: &str,
+    after: u64,
+    limit: usize,
+) -> Result<RunEventPage, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    require_active_run_owner(&transaction, run_id, actor_user_id)?;
+    let head_sequence = query_run_head(&transaction, run_id)?;
+    let (after_sql, fetch_limit) = validated_event_page_request(after, limit)?;
+    reject_cursor_beyond_head(after, head_sequence)?;
+    let page = query_run_events_page(
+        &transaction,
+        run_id,
+        after,
+        after_sql,
+        limit,
+        fetch_limit,
+        head_sequence,
+    )?;
+    transaction.commit()?;
+    Ok(page)
+}
+
+fn query_run_head(connection: &Connection, run_id: &str) -> Result<u64, StorageError> {
+    let (head, projection_sequence) = connection
+        .query_row(
+            "SELECT sequence, projection_sequence FROM runs WHERE id = ?1",
+            [run_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| StorageError::RunNotFound(run_id.to_owned()))?;
+    if projection_sequence != head {
+        return Err(StorageError::CorruptData(format!(
+            "projection sequence {projection_sequence} does not match run head {head}"
+        )));
+    }
+    i64_to_u64(head, "run sequence")
+}
+
 fn query_events(
     connection: &Connection,
     run_id: &str,
@@ -4308,6 +4537,47 @@ fn query_events(
         events.push(stored.decode()?);
     }
     Ok(events)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn query_run_events_page(
+    connection: &Connection,
+    run_id: &str,
+    after: u64,
+    after_sql: i64,
+    limit: usize,
+    fetch_limit: i64,
+    head_sequence: u64,
+) -> Result<RunEventPage, StorageError> {
+    let mut statement = connection.prepare(
+        r#"SELECT sequence, event_id, event_kind, payload_version, payload_json
+           FROM run_events
+           WHERE run_id = ?1 AND sequence > ?2
+           ORDER BY sequence LIMIT ?3"#,
+    )?;
+    let mut rows = statement.query(params![run_id, after_sql, fetch_limit])?;
+    let mut events = Vec::with_capacity(limit.saturating_add(1));
+    let mut expected = after_sql.checked_add(1);
+    while let Some(row) = rows.next()? {
+        let stored = StoredEventRow {
+            sequence: row.get(0)?,
+            event_id: row.get(1)?,
+            event_kind: row.get(2)?,
+            payload_version: row.get(3)?,
+            payload_json: row.get(4)?,
+        };
+        if let Some(expected_sequence) = expected
+            && stored.sequence != expected_sequence
+        {
+            return Err(StorageError::CorruptData(format!(
+                "event sequence gap: expected {expected_sequence}, found {}",
+                stored.sequence
+            )));
+        }
+        expected = stored.sequence.checked_add(1);
+        events.push(stored.decode()?);
+    }
+    finish_run_event_page(events, after, limit, head_sequence)
 }
 
 fn load_review_receipt(
@@ -5404,6 +5674,101 @@ fn normalized_theme(value: &str) -> Result<&str, StorageError> {
 
 fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn validated_event_page_request(after: u64, limit: usize) -> Result<(i64, i64), StorageError> {
+    if limit == 0 || limit > EVENT_PAGE_MAX_LIMIT {
+        return Err(StorageError::InvalidEventPageLimit {
+            limit,
+            max: EVENT_PAGE_MAX_LIMIT,
+        });
+    }
+    let after_sql =
+        i64::try_from(after).map_err(|_| StorageError::EventCursorOutOfRange { after })?;
+    let fetch_limit = i64::try_from(limit + 1)
+        .expect("the bounded event page limit is always representable by SQLite");
+    Ok((after_sql, fetch_limit))
+}
+
+fn reject_cursor_beyond_head(after: u64, head_sequence: u64) -> Result<(), StorageError> {
+    if after > head_sequence {
+        Err(StorageError::EventCursorBeyondHead {
+            after,
+            head_sequence,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn finish_run_event_page(
+    mut items: Vec<RunEvent>,
+    after: u64,
+    limit: usize,
+    head_sequence: u64,
+) -> Result<RunEventPage, StorageError> {
+    if items.len() > limit + 1 {
+        return Err(StorageError::CorruptData(
+            "bounded run event query exceeded its SQL limit".into(),
+        ));
+    }
+    let has_more = items.len() == limit + 1;
+    let sentinel = has_more.then(|| items.pop().expect("limit is at least one"));
+    let observed_tail = items.last().map_or(after, |event| event.sequence);
+    if let Some(sentinel) = sentinel
+        && sentinel.sequence > head_sequence
+    {
+        return Err(StorageError::CorruptData(format!(
+            "run event {} is beyond durable head {head_sequence}",
+            sentinel.sequence
+        )));
+    }
+    if !has_more && observed_tail != head_sequence {
+        return Err(StorageError::CorruptData(format!(
+            "run page ended at {observed_tail}, before durable head {head_sequence}"
+        )));
+    }
+    Ok(RunEventPage {
+        next_after: has_more.then_some(observed_tail),
+        items,
+        head_sequence,
+        has_more,
+    })
+}
+
+fn finish_session_event_page(
+    mut items: Vec<SessionEvent>,
+    after: u64,
+    limit: usize,
+    head_sequence: u64,
+) -> Result<SessionEventPage, StorageError> {
+    if items.len() > limit + 1 {
+        return Err(StorageError::CorruptData(
+            "bounded session event query exceeded its SQL limit".into(),
+        ));
+    }
+    let has_more = items.len() == limit + 1;
+    let sentinel = has_more.then(|| items.pop().expect("limit is at least one"));
+    let observed_tail = items.last().map_or(after, |event| event.sequence);
+    if let Some(sentinel) = sentinel
+        && sentinel.sequence > head_sequence
+    {
+        return Err(StorageError::CorruptData(format!(
+            "session event {} is beyond durable head {head_sequence}",
+            sentinel.sequence
+        )));
+    }
+    if !has_more && observed_tail != head_sequence {
+        return Err(StorageError::CorruptData(format!(
+            "session page ended at {observed_tail}, before durable head {head_sequence}"
+        )));
+    }
+    Ok(SessionEventPage {
+        next_after: has_more.then_some(observed_tail),
+        items,
+        head_sequence,
+        has_more,
+    })
 }
 
 fn u64_to_i64(value: u64, field: &'static str) -> Result<i64, StorageError> {

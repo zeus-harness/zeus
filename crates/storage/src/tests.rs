@@ -423,6 +423,14 @@ async fn legacy_oversized_run_and_review_identifiers_remain_usable_after_reopen(
             .len(),
         6
     );
+    let legacy_page = reopened
+        .run_event_page_for_actor("user-owner", &long_run_id, 0, 3)
+        .await
+        .unwrap();
+    assert_eq!(legacy_page.items.len(), 3);
+    assert_eq!(legacy_page.next_after, Some(3));
+    assert_eq!(legacy_page.head_sequence, 6);
+    assert!(legacy_page.has_more);
 
     let mut commit = approved_commit(&snapshot, "legacy-long-run-review");
     commit.event.id.clone_from(&long_event_id);
@@ -1808,6 +1816,14 @@ async fn legacy_oversized_session_and_reply_settle_after_file_database_reopen() 
             .unwrap(),
         detail.events
     );
+    let legacy_page = reopened
+        .session_event_page_for_actor("user-owner", &session_id, 0, 2)
+        .await
+        .unwrap();
+    assert_eq!(legacy_page.items, detail.events);
+    assert_eq!(legacy_page.next_after, None);
+    assert_eq!(legacy_page.head_sequence, 2);
+    assert!(!legacy_page.has_more);
 
     let ReplyClaimOutcome::Claimed(claimed) = reopened.claim_next_reply().await.unwrap() else {
         panic!("the legacy queued reply must remain claimable");
@@ -1908,6 +1924,202 @@ async fn actor_scoped_session_and_run_reads_hide_foreign_or_disabled_resources()
     assert!(matches!(
         store.snapshot_for_actor("user-owner", RUN_ID).await,
         Err(StorageError::RunNotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn actor_scoped_run_event_pages_are_bounded_contiguous_and_cursor_safe() {
+    let total = protocol::EVENT_PAGE_MAX_LIMIT + 2;
+    let store = bounded_event_store(total).await;
+
+    let first = store
+        .run_event_page_for_actor("user-owner", RUN_ID, 0, protocol::EVENT_PAGE_MAX_LIMIT)
+        .await
+        .unwrap();
+    assert_eq!(first.items.len(), protocol::EVENT_PAGE_MAX_LIMIT);
+    assert_eq!(first.items.first().unwrap().sequence, 1);
+    assert_eq!(first.items.last().unwrap().sequence, 256);
+    assert_eq!(first.next_after, Some(256));
+    assert_eq!(first.head_sequence, total as u64);
+    assert!(first.has_more);
+
+    let second = store
+        .run_event_page_for_actor(
+            "user-owner",
+            RUN_ID,
+            first.next_after.unwrap(),
+            protocol::EVENT_PAGE_MAX_LIMIT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second
+            .items
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![257, 258]
+    );
+    assert_eq!(second.next_after, None);
+    assert_eq!(second.head_sequence, total as u64);
+    assert!(!second.has_more);
+
+    let empty = store
+        .run_event_page_for_actor(
+            "user-owner",
+            RUN_ID,
+            total as u64,
+            protocol::EVENT_PAGE_DEFAULT_LIMIT,
+        )
+        .await
+        .unwrap();
+    assert!(empty.items.is_empty());
+    assert_eq!(empty.next_after, None);
+    assert_eq!(empty.head_sequence, total as u64);
+    assert!(!empty.has_more);
+
+    assert!(matches!(
+        store
+            .run_event_page_for_actor("user-owner", RUN_ID, total as u64 + 1, 1)
+            .await,
+        Err(StorageError::EventCursorBeyondHead {
+            after,
+            head_sequence,
+        }) if after == total as u64 + 1 && head_sequence == total as u64
+    ));
+    assert!(matches!(
+        store
+            .run_event_page_for_actor("user-owner", RUN_ID, u64::MAX, 1)
+            .await,
+        Err(StorageError::EventCursorOutOfRange { after }) if after == u64::MAX
+    ));
+    for invalid_limit in [0, protocol::EVENT_PAGE_MAX_LIMIT + 1] {
+        assert!(matches!(
+            store
+                .run_event_page_for_actor("user-owner", RUN_ID, 0, invalid_limit)
+                .await,
+            Err(StorageError::InvalidEventPageLimit { limit, max })
+                if limit == invalid_limit && max == protocol::EVENT_PAGE_MAX_LIMIT
+        ));
+    }
+
+    assert!(matches!(
+        store
+            .run_event_page_for_actor("foreign-user", RUN_ID, total as u64 + 1, 1)
+            .await,
+        Err(StorageError::RunNotFound(id)) if id == RUN_ID
+    ));
+    assert!(matches!(
+        store
+            .run_event_page_for_actor("foreign-user", RUN_ID, 0, 0)
+            .await,
+        Err(StorageError::RunNotFound(id)) if id == RUN_ID
+    ));
+}
+
+#[tokio::test]
+async fn run_event_pages_fail_closed_when_the_projection_head_is_inconsistent() {
+    let database = TestDatabase::new();
+    let store = seeded_file_store(database.path()).await;
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute(
+            "UPDATE runs SET projection_sequence = sequence - 1 WHERE id = ?1",
+            [RUN_ID],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(matches!(
+        store.run_event_page(RUN_ID, 0, 1).await,
+        Err(StorageError::CorruptData(message))
+            if message.contains("projection sequence") && message.contains("run head")
+    ));
+}
+
+#[tokio::test]
+async fn actor_scoped_session_event_pages_authorize_before_page_validation() {
+    let store = seeded_store().await;
+    store
+        .seed_demo_session("session-ZR-1842", "Checkout API latency", RUN_ID)
+        .await
+        .unwrap();
+    bootstrap_test_owner(&store).await;
+
+    let first = store
+        .session_event_page_for_actor("user-owner", "session-ZR-1842", 0, 1)
+        .await
+        .unwrap();
+    assert_eq!(first.items.len(), 1);
+    assert_eq!(first.items[0].sequence, 1);
+    assert_eq!(first.next_after, Some(1));
+    assert_eq!(first.head_sequence, 2);
+    assert!(first.has_more);
+
+    let last = store
+        .session_event_page_for_actor("user-owner", "session-ZR-1842", 1, 1)
+        .await
+        .unwrap();
+    assert_eq!(last.items.len(), 1);
+    assert_eq!(last.items[0].sequence, 2);
+    assert_eq!(last.next_after, None);
+    assert_eq!(last.head_sequence, 2);
+    assert!(!last.has_more);
+
+    assert!(matches!(
+        store
+            .session_event_page_for_actor("user-owner", "session-ZR-1842", 3, 1)
+            .await,
+        Err(StorageError::EventCursorBeyondHead {
+            after: 3,
+            head_sequence: 2,
+        })
+    ));
+    assert!(matches!(
+        store
+            .session_event_page_for_actor("foreign-user", "session-ZR-1842", 3, 0)
+            .await,
+        Err(StorageError::SessionNotFound(id)) if id == "session-ZR-1842"
+    ));
+}
+
+#[tokio::test]
+async fn run_event_page_does_not_decode_past_limit_plus_one() {
+    let database = TestDatabase::new();
+    let total = protocol::EVENT_PAGE_MAX_LIMIT + 2;
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    seed_event_count(&store, total).await;
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute_batch("DROP TRIGGER run_events_reject_update;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE run_events SET payload_json = ?1 WHERE run_id = ?2 AND sequence = ?3",
+            params!["{}", RUN_ID, total as i64],
+        )
+        .unwrap();
+    drop(connection);
+
+    let first = store
+        .run_event_page(RUN_ID, 0, protocol::EVENT_PAGE_MAX_LIMIT)
+        .await
+        .unwrap();
+    assert_eq!(first.items.len(), protocol::EVENT_PAGE_MAX_LIMIT);
+    assert_eq!(first.next_after, Some(256));
+    assert!(first.has_more);
+
+    assert!(matches!(
+        store
+            .run_event_page(
+                RUN_ID,
+                first.next_after.unwrap(),
+                protocol::EVENT_PAGE_MAX_LIMIT,
+            )
+            .await,
+        Err(StorageError::Json(_))
     ));
 }
 
@@ -3000,6 +3212,30 @@ async fn seeded_file_store(path: &Path) -> SqliteStore {
     let (snapshot, events) = seed_fixture();
     assert!(store.seed_if_empty(snapshot, events).await.unwrap());
     store
+}
+
+async fn seeded_store() -> SqliteStore {
+    let store = SqliteStore::open(":memory:").await.unwrap();
+    let (snapshot, events) = seed_fixture();
+    assert!(store.seed_if_empty(snapshot, events).await.unwrap());
+    store
+}
+
+async fn bounded_event_store(count: usize) -> SqliteStore {
+    let store = SqliteStore::open(":memory:").await.unwrap();
+    seed_event_count(&store, count).await;
+    bootstrap_test_owner(&store).await;
+    store
+}
+
+async fn seed_event_count(store: &SqliteStore, count: usize) {
+    let (mut snapshot, _) = seed_fixture();
+    let events = (1..=count)
+        .map(|sequence| event(sequence as u64, EventType::Step, "bounded page event"))
+        .collect::<Vec<_>>();
+    snapshot.run.sequence = count as u64;
+    snapshot.run.status = RunStatus::Active;
+    assert!(store.seed_if_empty(snapshot, events).await.unwrap());
 }
 
 fn seed_fixture() -> (RunSnapshot, Vec<RunEvent>) {

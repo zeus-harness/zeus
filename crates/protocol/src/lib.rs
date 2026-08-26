@@ -27,6 +27,10 @@ pub const USER_MESSAGE_MAX_BYTES: usize = 64 * 1024;
 pub const REVIEW_NOTE_MAX_BYTES: usize = 8 * 1024;
 /// Maximum byte length of an idempotency key.
 pub const IDEMPOTENCY_KEY_MAX_BYTES: usize = 128;
+/// Default number of durable ledger events returned by one event page.
+pub const EVENT_PAGE_DEFAULT_LIMIT: usize = 128;
+/// Maximum number of durable ledger events returned by one event page.
+pub const EVENT_PAGE_MAX_LIMIT: usize = 256;
 
 /// A pure Resource Envelope validation failure shared by every application
 /// boundary. All length checks refer to UTF-8 bytes, not Unicode scalar values.
@@ -586,6 +590,17 @@ pub struct SessionEvent {
     pub data: SessionEventData,
 }
 
+/// One bounded, strictly ordered page from a Session event ledger.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionEventPage {
+    pub items: Vec<SessionEvent>,
+    /// The last returned sequence when another page exists; otherwise `None`.
+    pub next_after: Option<u64>,
+    /// The durable ledger head observed in the same read transaction.
+    pub head_sequence: u64,
+    pub has_more: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionDetail {
     pub session: SessionSummary,
@@ -782,6 +797,17 @@ pub struct RunEvent {
     pub approval: Option<Approval>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<RunEventData>,
+}
+
+/// One bounded, strictly ordered page from a Run event ledger.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RunEventPage {
+    pub items: Vec<RunEvent>,
+    /// The last returned sequence when another page exists; otherwise `None`.
+    pub next_after: Option<u64>,
+    /// The durable ledger head observed in the same read transaction.
+    pub head_sequence: u64,
+    pub has_more: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1151,5 +1177,42 @@ mod tests {
             serde_json::to_value(SessionTurnStatus::Flushed).unwrap(),
             "flushed"
         );
+    }
+
+    #[test]
+    fn bounded_event_page_contract_keeps_all_cursor_fields() {
+        let run_page = RunEventPage {
+            items: Vec::new(),
+            next_after: None,
+            head_sequence: 0,
+            has_more: false,
+        };
+        let session_page = SessionEventPage {
+            items: Vec::new(),
+            next_after: None,
+            head_sequence: 0,
+            has_more: false,
+        };
+
+        assert_eq!(
+            serde_json::to_value(run_page).unwrap(),
+            json!({
+                "items": [],
+                "next_after": null,
+                "head_sequence": 0,
+                "has_more": false,
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(session_page).unwrap(),
+            json!({
+                "items": [],
+                "next_after": null,
+                "head_sequence": 0,
+                "has_more": false,
+            })
+        );
+        assert_eq!(EVENT_PAGE_DEFAULT_LIMIT, 128);
+        assert_eq!(EVENT_PAGE_MAX_LIMIT, 256);
     }
 }
