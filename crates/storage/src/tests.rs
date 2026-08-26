@@ -9,20 +9,22 @@ use std::{
 };
 
 use protocol::{
-    Approval, ApprovalScope, ApprovalStatus, AttachRunRequest, CreateSessionRequest, EventType,
-    EvidenceSummary, FlushSessionRequest, IncidentStatus, IncidentSummary, Metric, MetricTone,
-    ResumeSessionRequest, ReviewDecision, ReviewResponse, RunEvent, RunEventData, RunStatus,
-    RunSummary, SandboxProfile, SessionEventData, SessionStatus, SessionTurnStatus, Severity,
-    StartTurnRequest, ToolCall, ToolCallStatus, ToolEffect, ToolExecutorStatus, ToolOutcome,
-    ToolPolicySummary,
+    Approval, ApprovalScope, ApprovalStatus, AssistantReplyKind, AssistantReplyProvenance,
+    AttachRunRequest, CreateSessionRequest, EventType, EvidenceSummary, FlushSessionRequest,
+    IncidentStatus, IncidentSummary, Metric, MetricTone, ResumeSessionRequest, ReviewDecision,
+    ReviewResponse, RunEvent, RunEventData, RunStatus, RunSummary, SandboxProfile,
+    SessionEventData, SessionStatus, SessionTurnStatus, Severity, StartTurnRequest, ToolCall,
+    ToolCallStatus, ToolEffect, ToolExecutorStatus, ToolOutcome, ToolPolicySummary,
 };
 use rusqlite::params;
 use serde_json::json;
 
 use crate::{
-    ClaimOutcome, CommitOutcome, DispatchCompleteCommit, DispatchJobSpec, DispatchRecoveryCommit,
-    DispatchStartCommit, DispatchStatus, ReviewCommit, RunSnapshot, RuntimeIdentity, SqliteStore,
-    StorageError,
+    AuthSessionCommit, BootstrapOwnerCommit, ClaimOutcome, CommitOutcome, DispatchCompleteCommit,
+    DispatchJobSpec, DispatchRecoveryCommit, DispatchStartCommit, DispatchStatus,
+    ReplyClaimOutcome, ReplyFailureCommit, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
+    ReplySuccessCommit, ReviewCommit, RunSnapshot, RuntimeIdentity, SqliteStore, StorageError,
+    StoredUserRole, StoredUserStatus,
 };
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
@@ -455,7 +457,18 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, vec![1, 2, 3, 4]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
+    let owner: Option<String> = connection
+        .query_row(
+            "SELECT owner_user_id FROM runs WHERE id = ?1",
+            [RUN_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        owner, None,
+        "legacy state is claimed only during owner bootstrap"
+    );
     let run_event_parent: String = connection
         .query_row(
             "SELECT \"table\" FROM pragma_foreign_key_list('run_events') LIMIT 1",
@@ -484,6 +497,128 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
     assert!(matches!(
         session.events[1].data,
         SessionEventData::RunAttached { .. }
+    ));
+}
+
+#[tokio::test]
+async fn owner_bootstrap_claims_legacy_state_and_auth_sessions_are_revocable() {
+    let database = TestDatabase::new();
+    let store = seeded_file_store(database.path()).await;
+    store
+        .seed_demo_session("session-ZR-1842", "Checkout API latency", RUN_ID)
+        .await
+        .unwrap();
+    assert!(!store.has_users().await.unwrap());
+
+    let bootstrap_hash = "a".repeat(64);
+    let session_hash = "b".repeat(64);
+    let csrf_hash = "c".repeat(64);
+    let expiry = (chrono::Utc::now() + chrono::Duration::hours(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    store
+        .replace_bootstrap_token(&bootstrap_hash, &expiry)
+        .await
+        .unwrap();
+    let (owner, preferences) = store
+        .bootstrap_owner(BootstrapOwnerCommit {
+            bootstrap_token_hash: bootstrap_hash.clone(),
+            user_id: "user-owner".into(),
+            username: "owner".into(),
+            password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA".into(),
+            session_token_hash: session_hash.clone(),
+            csrf_hash: csrf_hash.clone(),
+            session_expires_at: expiry.clone(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(owner.role, StoredUserRole::Owner);
+    assert_eq!(owner.status, StoredUserStatus::Active);
+    assert_eq!(preferences.theme, "system");
+    assert_eq!(preferences.revision, 1);
+    assert!(store.has_users().await.unwrap());
+
+    let credential = store
+        .credential_for_username("OWNER")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(credential.user.id, owner.id);
+    assert!(credential.password_hash.starts_with("$argon2id$"));
+    let principal = store.authenticate(&session_hash).await.unwrap().unwrap();
+    assert_eq!(principal.user, owner);
+    assert_eq!(principal.csrf_hash, csrf_hash);
+
+    let updated = store
+        .update_preferences("user-owner", 1, "dark", Some("local-fallback"))
+        .await
+        .unwrap();
+    assert_eq!(updated.theme, "dark");
+    assert_eq!(updated.revision, 2);
+    assert!(matches!(
+        store
+            .update_preferences("user-owner", 1, "light", None)
+            .await,
+        Err(StorageError::ConcurrentModification)
+    ));
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let run_owner: String = connection
+        .query_row(
+            "SELECT owner_user_id FROM runs WHERE id = ?1",
+            [RUN_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let session_owner: String = connection
+        .query_row(
+            "SELECT owner_user_id FROM sessions WHERE id = 'session-ZR-1842'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(run_owner, "user-owner");
+    assert_eq!(session_owner, "user-owner");
+
+    assert!(store.revoke_auth_session(&session_hash).await.unwrap());
+    assert!(store.authenticate(&session_hash).await.unwrap().is_none());
+    assert!(matches!(
+        store
+            .replace_bootstrap_token(&"d".repeat(64), &expiry)
+            .await,
+        Err(StorageError::AccountAlreadyConfigured)
+    ));
+    assert!(matches!(
+        store
+            .bootstrap_owner(BootstrapOwnerCommit {
+                bootstrap_token_hash: bootstrap_hash,
+                user_id: "other-owner".into(),
+                username: "other".into(),
+                password_hash: "$argon2id$unused".into(),
+                session_token_hash: "e".repeat(64),
+                csrf_hash: "f".repeat(64),
+                session_expires_at: expiry,
+            })
+            .await,
+        Err(StorageError::AccountAlreadyConfigured)
+    ));
+}
+
+#[tokio::test]
+async fn auth_session_creation_rejects_unknown_users() {
+    let store = SqliteStore::open(":memory:").await.unwrap();
+    let expiry = (chrono::Utc::now() + chrono::Duration::hours(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    assert!(matches!(
+        store
+            .create_auth_session(AuthSessionCommit {
+                user_id: "missing-user".into(),
+                session_token_hash: "a".repeat(64),
+                csrf_hash: "b".repeat(64),
+                expires_at: expiry,
+            })
+            .await,
+        Err(StorageError::UserNotFound(id)) if id == "missing-user"
     ));
 }
 
@@ -975,6 +1110,400 @@ async fn concurrent_session_commands_use_receipt_replay_and_sequence_cas() {
 }
 
 #[tokio::test]
+async fn reply_start_is_atomic_actor_scoped_and_success_is_idempotent() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    let request = StartTurnRequest {
+        turn_id: "turn-reply-success".into(),
+        user_message: "Summarize the durable evidence".into(),
+        expected_sequence: 1,
+    };
+    let spec = reply_job_spec("reply-success", "turn-reply-success");
+
+    assert!(matches!(
+        store
+            .start_turn_and_enqueue_reply_with_failure(
+                "session-alpha",
+                request.clone(),
+                "reply-start-atomic",
+                spec.clone(),
+            )
+            .await,
+        Err(StorageError::InjectedFailure)
+    ));
+    assert!(store.reply_job(&spec.id).await.unwrap().is_none());
+    let unchanged = store.get_session("session-alpha").await.unwrap();
+    assert_eq!(unchanged.session.sequence, 1);
+    assert!(unchanged.turns.is_empty());
+
+    let enqueued = store
+        .start_turn_and_enqueue_reply(
+            "session-alpha",
+            request.clone(),
+            "reply-start-atomic",
+            spec.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(!enqueued.start.replayed);
+    assert_eq!(enqueued.start.session.sequence, 2);
+    assert_eq!(enqueued.job.status, ReplyJobStatus::Queued);
+    let replay = store
+        .start_turn_and_enqueue_reply("session-alpha", request, "reply-start-atomic", spec.clone())
+        .await
+        .unwrap();
+    assert!(replay.start.replayed);
+    assert_eq!(replay.job, enqueued.job);
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let actor_scope: String = connection
+        .query_row(
+            r#"SELECT actor_scope FROM session_command_receipts
+               WHERE operation = 'start_turn' AND idempotency_key = 'reply-start-atomic'"#,
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(actor_scope, "user-owner");
+    drop(connection);
+
+    let ReplyClaimOutcome::Claimed(claimed) = store.claim_next_reply().await.unwrap() else {
+        panic!("the queued reply must be claimable");
+    };
+    assert_eq!(claimed.id, spec.id);
+    assert_eq!(claimed.status, ReplyJobStatus::Started);
+    let commit = ReplySuccessCommit {
+        job_id: spec.id,
+        expected_sequence: 2,
+        assistant_message: "The evidence is durable and internally consistent.".into(),
+        provenance: AssistantReplyProvenance {
+            provider_id: "test-provider".into(),
+            model: Some("test-model".into()),
+            reply_kind: AssistantReplyKind::Model,
+        },
+        response_json: json!({"id": "provider-response-1", "model": "test-model"}),
+    };
+    assert!(matches!(
+        store
+            .complete_reply_success_with_failure(commit.clone())
+            .await,
+        Err(StorageError::InjectedFailure)
+    ));
+    assert_eq!(
+        store
+            .reply_job(&commit.job_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        ReplyJobStatus::Started
+    );
+    let open = store.get_session("session-alpha").await.unwrap();
+    assert_eq!(open.session.sequence, 2);
+    assert_eq!(open.turns[0].status, SessionTurnStatus::Open);
+
+    let completed = store.complete_reply_success(commit.clone()).await.unwrap();
+    assert!(!completed.replayed);
+    assert_eq!(completed.job.status, ReplyJobStatus::Succeeded);
+    assert_eq!(completed.session.status, SessionStatus::Ready);
+    assert_eq!(completed.session.sequence, 4);
+    assert_eq!(completed.events.len(), 2);
+    assert_eq!(
+        completed.events[0].data,
+        SessionEventData::AssistantMessage {
+            turn_id: "turn-reply-success".into(),
+            content: "The evidence is durable and internally consistent.".into(),
+            provenance: Some(AssistantReplyProvenance {
+                provider_id: "test-provider".into(),
+                model: Some("test-model".into()),
+                reply_kind: AssistantReplyKind::Model,
+            }),
+        }
+    );
+    assert!(matches!(
+        completed.events[1].data,
+        SessionEventData::TurnFlushed { .. }
+    ));
+    let replay = store.complete_reply_success(commit.clone()).await.unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.events, completed.events);
+    let mut conflicting = commit;
+    conflicting.response_json = json!({"id": "different"});
+    assert!(matches!(
+        store.complete_reply_success(conflicting).await,
+        Err(StorageError::IdempotencyConflict)
+    ));
+    assert_eq!(
+        store
+            .get_session("session-alpha")
+            .await
+            .unwrap()
+            .events
+            .len(),
+        4
+    );
+}
+
+#[tokio::test]
+async fn actor_scoped_session_creation_sets_owner_required_by_reply_enqueue() {
+    let store = SqliteStore::open(":memory:").await.unwrap();
+    bootstrap_test_owner(&store).await;
+    let request = alpha_session_request();
+    let created = store
+        .create_session_for_actor("user-owner", request.clone(), "actor-create-session")
+        .await
+        .unwrap();
+    assert!(!created.replayed);
+    assert!(
+        store
+            .create_session_for_actor("user-owner", request, "actor-create-session")
+            .await
+            .unwrap()
+            .replayed
+    );
+    let enqueued = store
+        .start_turn_and_enqueue_reply(
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-owned".into(),
+                user_message: "The actor owns this session".into(),
+                expected_sequence: 1,
+            },
+            "start-owned",
+            reply_job_spec("reply-owned", "turn-owned"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(enqueued.job.actor_user_id, "user-owner");
+
+    let legacy_request = CreateSessionRequest {
+        id: "session-unowned".into(),
+        title: "Unowned after bootstrap".into(),
+    };
+    store
+        .create_session(legacy_request, "legacy-create-after-bootstrap")
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .start_turn_and_enqueue_reply(
+                "session-unowned",
+                StartTurnRequest {
+                    turn_id: "turn-unowned".into(),
+                    user_message: "Must fail closed".into(),
+                    expected_sequence: 1,
+                },
+                "start-unowned",
+                reply_job_spec("reply-unowned", "turn-unowned"),
+            )
+            .await,
+        Err(StorageError::InvalidReplyTransition(_))
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_reply_claims_execute_one_job_at_most_once() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    store
+        .start_turn_and_enqueue_reply(
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-concurrent-reply".into(),
+                user_message: "Only one worker may execute this".into(),
+                expected_sequence: 1,
+            },
+            "start-concurrent-reply",
+            reply_job_spec("reply-concurrent", "turn-concurrent-reply"),
+        )
+        .await
+        .unwrap();
+
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let store = store.clone();
+        tasks.push(tokio::spawn(async move { store.claim_next_reply().await }));
+    }
+    let mut claimed = 0;
+    let mut unavailable = 0;
+    for task in tasks {
+        match task.await.unwrap().unwrap() {
+            ReplyClaimOutcome::Claimed(job) => {
+                claimed += 1;
+                assert_eq!(job.id, "reply-concurrent");
+            }
+            ReplyClaimOutcome::NotAvailable => unavailable += 1,
+        }
+    }
+    assert_eq!(claimed, 1);
+    assert_eq!(unavailable, 7);
+    let stored = store.reply_job("reply-concurrent").await.unwrap().unwrap();
+    assert_eq!(stored.status, ReplyJobStatus::Started);
+    assert_eq!(stored.attempt, 1);
+}
+
+#[tokio::test]
+async fn queued_reply_survives_restart_and_started_reply_recovers_outcome_unknown_once() {
+    let database = TestDatabase::new();
+    {
+        let store = created_owned_file_session_store(database.path()).await;
+        store
+            .start_turn_and_enqueue_reply(
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: "turn-reply-recovery".into(),
+                    user_message: "Survive a process restart".into(),
+                    expected_sequence: 1,
+                },
+                "start-reply-recovery",
+                reply_job_spec("reply-recovery", "turn-reply-recovery"),
+            )
+            .await
+            .unwrap();
+    }
+
+    {
+        let reopened = SqliteStore::open(database.path()).await.unwrap();
+        assert!(reopened.recover_open_turns().await.unwrap().is_empty());
+        assert!(reopened.recover_started_replies().await.unwrap().is_empty());
+        let ReplyClaimOutcome::Claimed(job) = reopened.claim_next_reply().await.unwrap() else {
+            panic!("queued work must remain claimable after restart");
+        };
+        assert_eq!(job.id, "reply-recovery");
+    }
+
+    let reopened = SqliteStore::open(database.path()).await.unwrap();
+    let recovered = reopened.recover_started_replies().await.unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].job.status, ReplyJobStatus::OutcomeUnknown);
+    assert_eq!(recovered[0].session.status, SessionStatus::NeedsAttention);
+    assert_eq!(recovered[0].session.sequence, 3);
+    assert!(matches!(
+        recovered[0].events[0].data,
+        SessionEventData::TurnInterrupted { .. }
+    ));
+    assert!(reopened.recover_started_replies().await.unwrap().is_empty());
+    assert!(reopened.recover_open_turns().await.unwrap().is_empty());
+    assert!(matches!(
+        reopened.claim_next_reply().await.unwrap(),
+        ReplyClaimOutcome::NotAvailable
+    ));
+}
+
+#[tokio::test]
+async fn reply_failure_commits_interruption_and_replays_without_duplicate_events() {
+    let store = created_owned_session_store().await;
+    store
+        .start_turn_and_enqueue_reply(
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-reply-failure".into(),
+                user_message: "The provider will fail".into(),
+                expected_sequence: 1,
+            },
+            "start-reply-failure",
+            reply_job_spec("reply-failure", "turn-reply-failure"),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.claim_next_reply().await.unwrap(),
+        ReplyClaimOutcome::Claimed(_)
+    ));
+    let commit = ReplyFailureCommit {
+        job_id: "reply-failure".into(),
+        expected_sequence: 2,
+        error_json: json!({"code": "provider_unauthorized"}),
+    };
+    let failed = store.complete_reply_failure(commit.clone()).await.unwrap();
+    assert_eq!(failed.job.status, ReplyJobStatus::Failed);
+    assert_eq!(failed.session.status, SessionStatus::NeedsAttention);
+    assert_eq!(failed.turn.status, SessionTurnStatus::Interrupted);
+    assert_eq!(failed.events.len(), 1);
+    assert!(
+        store
+            .complete_reply_failure(commit.clone())
+            .await
+            .unwrap()
+            .replayed
+    );
+    let mut conflicting = commit;
+    conflicting.error_json = json!({"code": "different"});
+    assert!(matches!(
+        store.complete_reply_failure(conflicting).await,
+        Err(StorageError::IdempotencyConflict)
+    ));
+    assert_eq!(
+        store
+            .get_session("session-alpha")
+            .await
+            .unwrap()
+            .events
+            .len(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn reply_outcome_unknown_commits_once_and_is_never_claimable_again() {
+    let store = created_owned_session_store().await;
+    store
+        .start_turn_and_enqueue_reply(
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-reply-unknown".into(),
+                user_message: "The transport outcome cannot be proven".into(),
+                expected_sequence: 1,
+            },
+            "start-reply-unknown",
+            reply_job_spec("reply-unknown", "turn-reply-unknown"),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.claim_next_reply().await.unwrap(),
+        ReplyClaimOutcome::Claimed(_)
+    ));
+    let commit = ReplyOutcomeUnknownCommit {
+        job_id: "reply-unknown".into(),
+        expected_sequence: 2,
+        error_json: json!({"code": "provider_timeout"}),
+    };
+
+    let unknown = store
+        .complete_reply_outcome_unknown(commit.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(unknown.job.status, ReplyJobStatus::OutcomeUnknown);
+    assert_eq!(unknown.session.status, SessionStatus::NeedsAttention);
+    assert_eq!(unknown.turn.status, SessionTurnStatus::Interrupted);
+    assert_eq!(unknown.events.len(), 1);
+    assert!(matches!(
+        &unknown.events[0].data,
+        SessionEventData::TurnInterrupted { reason, .. }
+            if reason == "assistant reply provider outcome is unknown"
+    ));
+    assert!(
+        store
+            .complete_reply_outcome_unknown(commit.clone())
+            .await
+            .unwrap()
+            .replayed
+    );
+    let mut conflicting = commit;
+    conflicting.error_json = json!({"code": "provider_transport_failed"});
+    assert!(matches!(
+        store.complete_reply_outcome_unknown(conflicting).await,
+        Err(StorageError::IdempotencyConflict)
+    ));
+    assert!(matches!(
+        store.claim_next_reply().await.unwrap(),
+        ReplyClaimOutcome::NotAvailable
+    ));
+}
+
+#[tokio::test]
 async fn one_session_can_own_multiple_runs_but_each_run_has_one_owner() {
     let database = TestDatabase::new();
     let store = seeded_file_store(database.path()).await;
@@ -1368,6 +1897,55 @@ async fn created_session_store() -> SqliteStore {
         .await
         .unwrap();
     store
+}
+
+async fn bootstrap_test_owner(store: &SqliteStore) {
+    let expiry = (chrono::Utc::now() + chrono::Duration::hours(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    store
+        .replace_bootstrap_token(&"a".repeat(64), &expiry)
+        .await
+        .unwrap();
+    store
+        .bootstrap_owner(BootstrapOwnerCommit {
+            bootstrap_token_hash: "a".repeat(64),
+            user_id: "user-owner".into(),
+            username: "owner".into(),
+            password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA".into(),
+            session_token_hash: "b".repeat(64),
+            csrf_hash: "c".repeat(64),
+            session_expires_at: expiry,
+        })
+        .await
+        .unwrap();
+}
+
+async fn created_owned_session_store() -> SqliteStore {
+    let store = created_session_store().await;
+    bootstrap_test_owner(&store).await;
+    store
+}
+
+async fn created_owned_file_session_store(path: &Path) -> SqliteStore {
+    let store = SqliteStore::open(path).await.unwrap();
+    store
+        .create_session(alpha_session_request(), "create-session-alpha")
+        .await
+        .unwrap();
+    bootstrap_test_owner(&store).await;
+    store
+}
+
+fn reply_job_spec(id: &str, turn_id: &str) -> ReplyJobSpec {
+    ReplyJobSpec {
+        id: id.into(),
+        actor_user_id: "user-owner".into(),
+        provider_name: "test-provider".into(),
+        model_name: Some("test-model".into()),
+        request_json: json!({
+            "messages": [{"role": "user", "content": format!("reply to {turn_id}")}]
+        }),
+    }
 }
 
 fn production_identity() -> RuntimeIdentity {

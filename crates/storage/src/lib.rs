@@ -7,13 +7,217 @@
 mod error;
 mod sqlite;
 
+use std::fmt;
+
 pub use error::StorageError;
 use protocol::{
     EvidenceSummary, IncidentSummary, Metric, ReviewResponse, RunEvent, RunSummary, SandboxProfile,
-    ToolEffect, ToolPolicySummary,
+    SessionEvent, SessionSummary, SessionTurn, StartTurnResponse, ToolEffect, ToolPolicySummary,
 };
+use serde::Serialize;
 use serde_json::Value;
 pub use sqlite::SqliteStore;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StoredUserRole {
+    Owner,
+    Member,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StoredUserStatus {
+    Active,
+    Disabled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredUser {
+    pub id: String,
+    pub username: String,
+    pub role: StoredUserRole,
+    pub status: StoredUserStatus,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct StoredCredential {
+    pub user: StoredUser,
+    pub password_hash: String,
+}
+
+impl fmt::Debug for StoredCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StoredCredential")
+            .field("user", &self.user)
+            .field("password_hash", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredPreferences {
+    pub user_id: String,
+    pub theme: String,
+    pub preferred_model: Option<String>,
+    pub revision: u64,
+    pub updated_at: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct AuthPrincipal {
+    pub user: StoredUser,
+    pub csrf_hash: String,
+    pub expires_at: String,
+}
+
+impl fmt::Debug for AuthPrincipal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthPrincipal")
+            .field("user", &self.user)
+            .field("csrf_hash", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct BootstrapOwnerCommit {
+    pub bootstrap_token_hash: String,
+    pub user_id: String,
+    pub username: String,
+    pub password_hash: String,
+    pub session_token_hash: String,
+    pub csrf_hash: String,
+    pub session_expires_at: String,
+}
+
+impl fmt::Debug for BootstrapOwnerCommit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BootstrapOwnerCommit")
+            .field("bootstrap_token_hash", &"[REDACTED]")
+            .field("user_id", &self.user_id)
+            .field("username", &self.username)
+            .field("password_hash", &"[REDACTED]")
+            .field("session_token_hash", &"[REDACTED]")
+            .field("csrf_hash", &"[REDACTED]")
+            .field("session_expires_at", &self.session_expires_at)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct AuthSessionCommit {
+    pub user_id: String,
+    pub session_token_hash: String,
+    pub csrf_hash: String,
+    pub expires_at: String,
+}
+
+impl fmt::Debug for AuthSessionCommit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthSessionCommit")
+            .field("user_id", &self.user_id)
+            .field("session_token_hash", &"[REDACTED]")
+            .field("csrf_hash", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// Immutable inputs for one durable assistant reply.
+///
+/// The provider request is persisted in the same transaction as the user turn.
+/// Provider execution must not begin until [`SqliteStore::claim_next_reply`]
+/// returns this job as claimed.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ReplyJobSpec {
+    pub id: String,
+    pub actor_user_id: String,
+    pub provider_name: String,
+    pub model_name: Option<String>,
+    pub request_json: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplyJobStatus {
+    Queued,
+    Started,
+    Succeeded,
+    Failed,
+    OutcomeUnknown,
+}
+
+/// Durable at-most-once reply queue record.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReplyJob {
+    pub id: String,
+    pub actor_user_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub provider_name: String,
+    pub model_name: Option<String>,
+    pub status: ReplyJobStatus,
+    pub attempt: u32,
+    pub request_json: Value,
+    pub response_json: Option<Value>,
+    pub error_json: Option<Value>,
+    pub queued_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub assistant_event_sequence: Option<u64>,
+    pub terminal_event_sequence: Option<u64>,
+}
+
+/// Result of atomically appending a user turn and its reply work item.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReplyJobEnqueueResponse {
+    pub start: StartTurnResponse,
+    pub job: ReplyJob,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReplyClaimOutcome {
+    Claimed(Box<ReplyJob>),
+    NotAvailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ReplySuccessCommit {
+    pub job_id: String,
+    pub expected_sequence: u64,
+    pub assistant_message: String,
+    pub provenance: protocol::AssistantReplyProvenance,
+    pub response_json: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ReplyFailureCommit {
+    pub job_id: String,
+    pub expected_sequence: u64,
+    pub error_json: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ReplyOutcomeUnknownCommit {
+    pub job_id: String,
+    pub expected_sequence: u64,
+    pub error_json: Value,
+}
+
+/// Durable terminal result and the exact ledger events committed with it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReplyCompletion {
+    pub job: ReplyJob,
+    pub session: SessionSummary,
+    pub turn: SessionTurn,
+    pub events: Vec<SessionEvent>,
+    pub replayed: bool,
+}
 
 /// Immutable runtime boundary attached to one persistent database.
 ///

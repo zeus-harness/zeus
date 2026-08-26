@@ -7,7 +7,6 @@ import {
 	loadTurnAttempt,
 	mergeSessionEvents,
 	orderTimelineEvents,
-	rebaseOwnedTurnAttempt,
 	saveTurnAttempt,
 	turnAttemptDisposition,
 	type AttemptStorage
@@ -35,9 +34,7 @@ function attempt(): TurnAttempt {
 		text: 'hello',
 		turnId: 'turn-1',
 		startKey: 'start-key',
-		flushKey: 'flush-key',
 		expectedSequence: 3,
-		flushExpectedSequence: 4,
 		started: {
 			session: {
 				id: 'session-1',
@@ -130,9 +127,7 @@ test('stores command identity but not a stale start response', () => {
 		text: 'hello',
 		turnId: 'turn-1',
 		startKey: 'start-key',
-		flushKey: 'flush-key',
-		expectedSequence: 3,
-		flushExpectedSequence: 4
+		expectedSequence: 3
 	});
 
 	clearTurnAttempt(storage, 'session-1');
@@ -162,16 +157,6 @@ test('only the matching open turn is owned by the restored tab attempt', () => {
 		turnAttemptDisposition(sessionDetail('ready', undefined, 'flushed'), saved),
 		'completed'
 	);
-});
-
-test('rebases only the flush command after an explicit state conflict', () => {
-	const rebased = rebaseOwnedTurnAttempt(attempt(), 9, () => 'new-flush-key');
-
-	assert.equal(rebased.turnId, 'turn-1');
-	assert.equal(rebased.startKey, 'start-key');
-	assert.equal(rebased.expectedSequence, 3);
-	assert.equal(rebased.flushKey, 'new-flush-key');
-	assert.equal(rebased.flushExpectedSequence, 9);
 });
 
 test('merges durable session events by ID and sequence', () => {

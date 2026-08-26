@@ -21,9 +21,9 @@
 	}
 </script>
 
-<section class="bg-white px-4 sm:px-6 pt-2 shrink-0 pb-[max(14px,env(safe-area-inset-bottom))]">
+<section class="bg-zeus-bg px-4 sm:px-6 pt-2 shrink-0 pb-[max(14px,env(safe-area-inset-bottom))]">
 	<div
-		class="border-zeus-amber/55 bg-white mx-auto w-full max-w-[748px] overflow-hidden rounded-[18px] border shadow-[0_8px_28px_rgb(0_0_0/0.06)]"
+		class="border-zeus-amber/55 bg-zeus-bg mx-auto w-full max-w-[748px] overflow-hidden rounded-[18px] border shadow-[0_8px_28px_var(--zeus-shadow)]"
 	>
 		<div
 			class="bg-zeus-amber/[0.08] border-zeus-amber/20 px-4 py-2.5 gap-2 text-xs font-medium text-zeus-amber flex items-center border-b"
@@ -94,7 +94,7 @@
 			<div class="mt-4 gap-2 flex justify-end">
 				<Button
 					variant="outline"
-					class="h-11 rounded-lg bg-white px-4 text-sm sm:h-9"
+					class="bg-zeus-bg h-11 rounded-lg px-4 text-sm sm:h-9"
 					disabled={pendingDecision !== null}
 					onclick={() => onReview('reject')}
 				>

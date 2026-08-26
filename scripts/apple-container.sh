@@ -23,6 +23,10 @@ NETWORK="${PROJECT}-net"
 DATA_VOLUME="${PROJECT}-data"
 
 HTTP_PORT="${ZEUS_CONTAINER_HTTP_PORT:-18088}"
+COOKIE_SECURE="${ZEUS_COOKIE_SECURE:-false}"
+LLM_ENDPOINT="${ZEUS_LLM_ENDPOINT:-}"
+LLM_MODEL="${ZEUS_LLM_MODEL:-}"
+LLM_API_KEY="${ZEUS_LLM_API_KEY:-}"
 
 MANAGED_LABEL_KEY='dev.zeus-harness.managed'
 PROJECT_LABEL_KEY='dev.zeus-harness.project'
@@ -428,6 +432,10 @@ start_api() {
 		--env ZEUS_DATABASE_PATH=/var/lib/zeus/zeus.db \
 		--env ZEUS_DEMO_PROFILE=production-guarded \
 		--env ZEUS_LOCAL_MARKER_ROOT=/var/lib/zeus/local-markers \
+		--env "ZEUS_COOKIE_SECURE=${COOKIE_SECURE}" \
+		--env "ZEUS_LLM_ENDPOINT=${LLM_ENDPOINT}" \
+		--env "ZEUS_LLM_MODEL=${LLM_MODEL}" \
+		--env "ZEUS_LLM_API_KEY=${LLM_API_KEY}" \
 		"${API_IMAGE}" >/dev/null
 	local direct_url
 	direct_url="$(container_direct_url "${API_CONTAINER}" 8081)" \
@@ -601,138 +609,60 @@ show_logs() {
 	container logs --follow "${name}"
 }
 
-capture_overview() {
-	local gateway_url="$1"
-	curl --noproxy '*' --fail --silent --show-error \
-		--connect-timeout 2 --max-time 10 \
-		"${gateway_url}/api/v1/overview"
-}
-
-validate_overview() {
-	local overview="$1"
-	jq -e '
-		(.run.id | type == "string" and length > 0)
-		and (.run.sequence | type == "number" and floor == . and . >= 0)
-		and (.primary_session_id | type == "string" and length > 0)
-		and (.recent_events | type == "array")
-	' <<<"${overview}" >/dev/null || die 'overview response did not match the expected run schema'
-}
-
-capture_session() {
-	local session_id="$1"
-	local gateway_url="$2"
-	curl --noproxy '*' --fail --silent --show-error \
-		--connect-timeout 2 --max-time 10 \
-		"${gateway_url}/api/v1/sessions/${session_id}"
-}
-
-validate_session() {
-	local detail="$1"
-	local expected_id="$2"
-	jq -e --arg id "${expected_id}" '
-		.session.id == $id
-		and (.session.sequence | type == "number" and floor == . and . >= 0)
-		and (.turns | type == "array")
-		and (.events | type == "array")
-	' <<<"${detail}" >/dev/null || die 'session response did not match the expected durable schema'
-}
-
 verify() {
 	preflight
 	local gateway_url
+	local auth_status
+	local protected_status
 	gateway_url="$(gateway_effective_url)" \
 		|| die 'could not reach the gateway through localhost or its container IP'
 	wait_http "${gateway_url}/health/ready" 'Zeus gateway API route' 5
 	wait_http "${gateway_url}/" 'Zeus gateway Web route' 5
+	auth_status="$(curl --noproxy '*' --fail --silent --show-error \
+		--connect-timeout 2 --max-time 5 \
+		"${gateway_url}/api/v1/auth/status")"
+	jq -e '
+		(.configured | type == "boolean")
+		and .authenticated == false
+	' <<<"${auth_status}" >/dev/null \
+		|| die 'anonymous auth status did not match the expected schema'
+	protected_status="$(curl --noproxy '*' --silent --show-error \
+		--output /dev/null --write-out '%{http_code}' \
+		--connect-timeout 2 --max-time 5 \
+		"${gateway_url}/api/v1/overview")"
+	[[ "${protected_status}" == '401' ]] \
+		|| die "anonymous overview returned ${protected_status}, expected 401"
 
-	local overview
-	local run_id
-	local run_sequence
-	local session_id
-	local run_sse
-	local session_sse
-	overview="$(capture_overview "${gateway_url}")"
-	validate_overview "${overview}"
-	run_id="$(jq -r '.run.id' <<<"${overview}")"
-	run_sequence="$(jq -r '.run.sequence' <<<"${overview}")"
-	session_id="$(jq -r '.primary_session_id' <<<"${overview}")"
-	[[ -n "${run_id}" && "${run_id}" != 'null' ]] || die 'overview did not contain a run id'
-	[[ "${run_sequence}" =~ ^[0-9]+$ ]] || die 'overview did not contain a numeric run sequence'
-	validate_session "$(capture_session "${session_id}" "${gateway_url}")" "${session_id}"
-
-	run_sse="$(curl --noproxy '*' --silent --show-error --no-buffer \
-		--connect-timeout 2 --max-time 2 \
-		"${gateway_url}/api/v1/runs/${run_id}/events?after=0" 2>/dev/null || true)"
-	[[ "${run_sse}" == *'event: run.event'* ]] || die 'SSE replay did not contain a run.event frame'
-	session_sse="$(curl --noproxy '*' --silent --show-error --no-buffer \
-		--connect-timeout 2 --max-time 2 \
-		"${gateway_url}/api/v1/sessions/${session_id}/events?after=0" 2>/dev/null || true)"
-	[[ "${session_sse}" == *'event: session.event'* ]] \
-		|| die 'SSE replay did not contain a session.event frame'
-
-	log "verified Web, API, gateway and Run/Session SSE replay for run ${run_id} at sequence ${run_sequence}"
+	log 'verified Web, API, gateway, auth status and the anonymous protection boundary'
 }
 
 restart_verify() {
 	preflight
 	local gateway_url
-	local before
-	local after
-	local before_run
-	local before_sequence
-	local before_session
-	local before_session_detail
-	local before_session_sequence
-	local after_run
-	local after_sequence
-	local after_session
-	local after_session_detail
-	local after_session_sequence
-	local event_id
+	local before_configured
+	local after_configured
 
 	gateway_url="$(gateway_effective_url)" \
 		|| die 'could not reach the gateway before restart verification'
-	before="$(capture_overview "${gateway_url}")"
-	validate_overview "${before}"
-	before_run="$(jq -r '.run.id' <<<"${before}")"
-	before_sequence="$(jq -r '.run.sequence' <<<"${before}")"
-	before_session="$(jq -r '.primary_session_id' <<<"${before}")"
-	before_session_detail="$(capture_session "${before_session}" "${gateway_url}")"
-	validate_session "${before_session_detail}" "${before_session}"
-	before_session_sequence="$(jq -r '.session.sequence' <<<"${before_session_detail}")"
+	before_configured="$(curl --noproxy '*' --fail --silent --show-error \
+		--connect-timeout 2 --max-time 5 \
+		"${gateway_url}/api/v1/auth/status" | jq -r '.configured')"
+	[[ "${before_configured}" == 'true' || "${before_configured}" == 'false' ]] \
+		|| die 'auth status did not contain a boolean configured value before restart'
 
 	down
 	up
 
 	gateway_url="$(gateway_effective_url)" \
 		|| die 'could not reach the gateway after restart verification'
-	after="$(capture_overview "${gateway_url}")"
-	validate_overview "${after}"
-	after_run="$(jq -r '.run.id' <<<"${after}")"
-	after_sequence="$(jq -r '.run.sequence' <<<"${after}")"
-	after_session="$(jq -r '.primary_session_id' <<<"${after}")"
-	after_session_detail="$(capture_session "${after_session}" "${gateway_url}")"
-	validate_session "${after_session_detail}" "${after_session}"
-	after_session_sequence="$(jq -r '.session.sequence' <<<"${after_session_detail}")"
-
-	[[ "${after_run}" == "${before_run}" ]] || die "run identity changed across restart: ${before_run} -> ${after_run}"
-	((after_sequence >= before_sequence)) || die "run sequence regressed: ${before_sequence} -> ${after_sequence}"
-	[[ "${after_session}" == "${before_session}" ]] || die "session identity changed across restart: ${before_session} -> ${after_session}"
-	((after_session_sequence >= before_session_sequence)) \
-		|| die "session sequence regressed: ${before_session_sequence} -> ${after_session_sequence}"
-	while IFS= read -r event_id; do
-		[[ -z "${event_id}" || "${event_id}" == 'null' ]] && continue
-		jq -e --arg id "${event_id}" '.recent_events | any(.id == $id)' <<<"${after}" >/dev/null \
-			|| die "run event disappeared across restart: ${event_id}"
-	done < <(jq -r '.recent_events[].id' <<<"${before}")
-	while IFS= read -r event_id; do
-		[[ -z "${event_id}" || "${event_id}" == 'null' ]] && continue
-		jq -e --arg id "${event_id}" '.events | any(.id == $id)' <<<"${after_session_detail}" >/dev/null \
-			|| die "session event disappeared across restart: ${event_id}"
-	done < <(jq -r '.events[].id' <<<"${before_session_detail}")
+	after_configured="$(curl --noproxy '*' --fail --silent --show-error \
+		--connect-timeout 2 --max-time 5 \
+		"${gateway_url}/api/v1/auth/status" | jq -r '.configured')"
+	[[ "${after_configured}" == "${before_configured}" ]] \
+		|| die "owner configuration changed across restart: ${before_configured} -> ${after_configured}"
 
 	verify
-	log "verified named-volume restart recovery for run ${after_run} and session ${after_session}"
+	log "verified named-volume owner-state recovery (configured=${after_configured})"
 }
 
 reset_data() {
@@ -757,8 +687,8 @@ Commands:
   down             Stop/delete Zeus containers and network; retain the volume.
   status           Show Zeus container and volume state.
   logs [service]   Follow api, web or gateway logs (default: api).
-  verify           Check Web, API, gateway and SSE replay.
-  restart-verify   Recreate the stack and prove run/event persistence.
+  verify           Check Web, API, gateway and anonymous auth protection.
+  restart-verify   Recreate the stack and prove owner setup state persists.
   reset            Delete persistent data; confirmation must equal the exact volume name.
 
 Useful overrides:

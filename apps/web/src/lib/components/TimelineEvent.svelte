@@ -249,10 +249,18 @@
 	{/if}
 {:else if event.type === 'step'}
 	<article class="gap-3 grid grid-cols-[28px_1fr]">
-		<span class="bg-zeus-text text-white mt-0.5 size-7 grid place-items-center rounded-full">
+		<span class="bg-zeus-text text-zeus-bg mt-0.5 size-7 grid place-items-center rounded-full">
 			<Lightning size={14} weight="fill" aria-hidden="true" />
 		</span>
 		<div class="min-w-0">
+			<div class="mb-1 gap-2 flex items-baseline">
+				<p class="font-medium text-zeus-text text-xs">{event.title}</p>
+				{#if event.metadata?.model}
+					<p class="text-zeus-muted truncate text-[10px]">
+						Model {formatMetadata(event.metadata.model)}
+					</p>
+				{/if}
+			</div>
 			{#if event.summary}<p class="leading-6 text-zeus-text text-[15px]">{event.summary}</p>{/if}
 			{#if event.content}<p class="mt-1 leading-6 text-zeus-muted text-[14px]">
 					{event.content}

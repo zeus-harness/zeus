@@ -20,6 +20,18 @@ pub enum StorageError {
     SessionTurnNotFound(String),
     #[error("session `{0}` already exists")]
     SessionAlreadyExists(String),
+    #[error("the local owner account is already configured")]
+    AccountAlreadyConfigured,
+    #[error("the bootstrap credential is invalid, expired, or already used")]
+    InvalidBootstrapToken,
+    #[error("user `{0}` was not found")]
+    UserNotFound(String),
+    #[error("user `{0}` is disabled")]
+    UserDisabled(String),
+    #[error("the authentication session was not found or has expired")]
+    AuthSessionNotFound,
+    #[error("invalid account data: {0}")]
+    InvalidAccountData(String),
     #[error("run `{run_id}` already belongs to session `{session_id}`")]
     RunAlreadyAttached { run_id: String, session_id: String },
     #[error("the idempotency key is empty")]
@@ -30,8 +42,12 @@ pub enum StorageError {
     ConcurrentModification,
     #[error("dispatch job `{0}` was not found")]
     DispatchJobNotFound(String),
+    #[error("reply job `{0}` was not found")]
+    ReplyJobNotFound(String),
     #[error("invalid dispatch state transition: {0}")]
     InvalidDispatchTransition(String),
+    #[error("invalid reply state transition: {0}")]
+    InvalidReplyTransition(String),
     #[error("invalid session state transition: {0}")]
     InvalidSessionTransition(String),
     #[error("unsupported schema version {found}; this binary supports up to {supported}")]

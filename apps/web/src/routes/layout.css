@@ -5,7 +5,7 @@ html,
 body {
 	margin: 0;
 	min-width: 320px;
-	background: #fff;
+	background: var(--zeus-bg);
 }
 
 button,
@@ -20,10 +20,10 @@ a {
 }
 
 ::selection {
-	background: rgb(65 118 230 / 18%);
+	background: color-mix(in srgb, var(--zeus-cyan) 20%, transparent);
 }
 
 * {
-	scrollbar-color: #d2d2d5 transparent;
+	scrollbar-color: var(--zeus-border) transparent;
 	scrollbar-width: thin;
 }

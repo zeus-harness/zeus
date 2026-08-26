@@ -10,7 +10,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use runtime::DemoStore;
+use runtime::{BootstrapOwnerCommit, DemoStore};
+use tenancy::{BootstrapToken, CsrfToken, Password, SessionToken, UserId, Username, hash_password};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(8);
@@ -21,17 +22,20 @@ fn sigterm_with_active_sse_is_bounded_and_releases_the_database() {
     fs::create_dir_all(&fixture_root).unwrap();
     let database = fixture_root.join("zeus.db");
     let address = unused_local_address();
+    let session_token = seed_authenticated_owner(&database);
     let mut child = ChildGuard::spawn(&database, address);
 
     let _session_sse = open_sse(
         &mut child.child,
         address,
         "/api/v1/sessions/session-ZR-1842/events?after=2",
+        session_token.expose_secret(),
     );
     let _run_sse = open_sse(
         &mut child.child,
         address,
         "/api/v1/runs/ZR-1842/events?after=8",
+        session_token.expose_secret(),
     );
 
     let shutdown_started = Instant::now();
@@ -63,7 +67,47 @@ fn sigterm_with_active_sse_is_bounded_and_releases_the_database() {
     drop(reopened);
 }
 
-fn open_sse(child: &mut Child, address: SocketAddr, path: &str) -> TcpStream {
+fn seed_authenticated_owner(database: &Path) -> SessionToken {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let store = DemoStore::open(database).await.unwrap();
+        let bootstrap_token = BootstrapToken::generate().unwrap();
+        let session_token = SessionToken::generate().unwrap();
+        let csrf_token = CsrfToken::generate().unwrap();
+        let user_id = UserId::generate().unwrap();
+        let username = Username::parse("shutdown-owner").unwrap();
+        let password = Password::new("shutdown test owner password").unwrap();
+        let password_hash = hash_password(&password).unwrap();
+        let expires_at = (chrono::Utc::now() + chrono::Duration::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+        store
+            .replace_bootstrap_token(&bootstrap_token.digest().to_persistence(), &expires_at)
+            .await
+            .unwrap();
+        store
+            .bootstrap_owner(BootstrapOwnerCommit {
+                bootstrap_token_hash: bootstrap_token.digest().to_persistence(),
+                user_id: user_id.to_string(),
+                username: username.to_string(),
+                password_hash: password_hash.as_phc().to_owned(),
+                session_token_hash: session_token.digest().to_persistence(),
+                csrf_hash: csrf_token.digest().to_persistence(),
+                session_expires_at: expires_at,
+            })
+            .await
+            .unwrap();
+
+        // Release the process-wide database lease before the child starts.
+        drop(store);
+        session_token
+    })
+}
+
+fn open_sse(child: &mut Child, address: SocketAddr, path: &str, session_token: &str) -> TcpStream {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -78,7 +122,7 @@ fn open_sse(child: &mut Child, address: SocketAddr, path: &str) -> TcpStream {
                 .set_write_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
             let request = format!(
-                "GET {path} HTTP/1.1\r\nHost: {address}\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n\r\n"
+                "GET {path} HTTP/1.1\r\nHost: {address}\r\nAccept: text/event-stream\r\nCookie: zeus_session={session_token}\r\nConnection: keep-alive\r\n\r\n"
             );
             if stream.write_all(request.as_bytes()).is_ok() {
                 let mut response = Vec::new();

@@ -1,35 +1,42 @@
 <script lang="ts">
 	import { resolve } from '$app/paths';
 	import { Lightning, PlayCircle, SlidersHorizontal, X } from '@zeus/ui/icons';
-	import type { DataSource, IncidentOverview, RunOverview } from '$lib/types';
+	import type { SessionStatus, SessionSummary } from '$lib/types';
 
 	interface Props {
 		open: boolean;
-		incident: IncidentOverview;
-		run: RunOverview;
-		source: DataSource;
+		sessions: SessionSummary[];
+		activeSessionId: string;
+		creatingSession: boolean;
+		sessionActionError?: string;
 		onClose: () => void;
+		onCreateSession: () => void;
+		onSelectSession: (sessionId: string) => void;
+		onOpenSettings: (trigger: HTMLButtonElement) => void;
 	}
 
-	let { open, incident, run, source, onClose }: Props = $props();
-	const statusTone = $derived.by(() => {
-		switch (run.status) {
-			case 'succeeded':
+	let {
+		open,
+		sessions,
+		activeSessionId,
+		creatingSession,
+		sessionActionError = '',
+		onClose,
+		onCreateSession,
+		onSelectSession,
+		onOpenSettings
+	}: Props = $props();
+
+	function statusTone(status: SessionStatus): string {
+		switch (status) {
+			case 'ready':
 				return 'bg-zeus-green';
-			case 'failed':
-			case 'cancelled':
-				return 'bg-zeus-red';
-			case 'waiting_for_approval':
-			case 'blocked':
+			case 'running':
+				return 'bg-zeus-cyan';
 			case 'needs_attention':
 				return 'bg-zeus-amber';
-			case 'running':
-			case 'active':
-				return 'bg-zeus-cyan';
-			case 'queued':
-				return 'bg-zeus-muted';
 		}
-	});
+	}
 
 	function humanize(value: string): string {
 		return value.replaceAll('_', ' ');
@@ -47,14 +54,14 @@
 
 <aside
 	class={`inset-y-0 left-0 border-zeus-border bg-zeus-surface lg:static lg:translate-x-0 fixed z-50 flex w-[236px] shrink-0 flex-col border-r transition-transform duration-200 ${open ? 'translate-x-0' : '-translate-x-full'}`}
-	aria-label="Run navigation"
+	aria-label="Session navigation"
 >
 	<div class="px-5 h-16 flex items-center justify-between">
 		<a
 			href={resolve('/')}
 			class="gap-2.5 font-bold text-zeus-text flex items-center text-[15px] tracking-[0.16em]"
 		>
-			<span class="size-7 bg-zeus-text text-white grid place-items-center rounded-full">
+			<span class="size-7 bg-zeus-text text-zeus-bg grid place-items-center rounded-full">
 				<Lightning size={16} weight="fill" aria-hidden="true" />
 			</span>
 			ZEUS
@@ -72,42 +79,55 @@
 	<div class="px-3 pt-3">
 		<button
 			type="button"
-			disabled
-			title="Run creation is not available in the local MVP"
-			class="border-zeus-border bg-white text-zeus-text h-10 gap-2 px-3 text-sm rounded-xl shadow-sm flex w-full items-center border disabled:cursor-not-allowed disabled:opacity-70"
+			disabled={creatingSession}
+			class="border-zeus-border bg-zeus-bg text-zeus-text hover:bg-zeus-surface-2 h-10 gap-2 px-3 text-sm rounded-xl shadow-sm flex w-full items-center border transition-colors disabled:cursor-wait disabled:opacity-70"
+			onclick={onCreateSession}
 		>
 			<PlayCircle size={17} aria-hidden="true" />
-			New run
+			{creatingSession ? 'Creating…' : 'New session'}
 		</button>
+		{#if sessionActionError}
+			<p class="text-zeus-red mt-2 px-2 leading-4 text-[10px]" role="alert">
+				{sessionActionError}
+			</p>
+		{/if}
 	</div>
 
-	<nav class="px-3 pt-8 flex flex-1 flex-col" aria-label="Recent runs">
+	<nav class="px-3 pt-8 min-h-0 flex flex-1 flex-col" aria-label="Sessions">
 		<p class="px-2 pb-2 font-semibold text-zeus-muted text-[10px] tracking-[0.12em]">RECENT</p>
-		<a
-			href={resolve('/')}
-			aria-current="page"
-			class="bg-zeus-surface-2 px-3 py-2.5 min-w-0 gap-3 rounded-xl flex items-start"
-			onclick={onClose}
-		>
-			<div class="min-w-0 flex-1">
-				<p class="text-sm font-medium text-zeus-text truncate">{incident.title}</p>
-				<p class="mt-1 text-zeus-muted truncate text-[11px]">{run.id} · {run.environment}</p>
-			</div>
-			<span
-				class={`mt-1.5 size-2 shrink-0 rounded-full ${statusTone}`}
-				title={`Run status: ${humanize(run.status)}`}
-			></span>
-		</a>
+		<div class="min-h-0 space-y-1 overflow-y-auto">
+			{#each sessions as session (session.id)}
+				<button
+					type="button"
+					aria-current={session.id === activeSessionId ? 'page' : undefined}
+					class={`hover:bg-zeus-surface-2 px-3 py-2.5 min-w-0 gap-3 rounded-xl flex w-full items-start text-left transition-colors ${
+						session.id === activeSessionId ? 'bg-zeus-surface-2' : ''
+					}`}
+					onclick={() => {
+						onSelectSession(session.id);
+						onClose();
+					}}
+				>
+					<div class="min-w-0 flex-1">
+						<p class="text-sm font-medium text-zeus-text truncate">{session.title}</p>
+						<p class="mt-1 text-zeus-muted truncate text-[11px]">
+							{humanize(session.status)} · event {session.sequence}
+						</p>
+					</div>
+					<span
+						class={`mt-1.5 size-2 shrink-0 rounded-full ${statusTone(session.status)}`}
+						title={`Session status: ${humanize(session.status)}`}
+					></span>
+				</button>
+			{/each}
+		</div>
 	</nav>
 
 	<div class="px-3 pb-4">
-		{#if source === 'demo'}
-			<p class="mb-2 px-3 text-zeus-amber text-[10px]">Demo data · API offline</p>
-		{/if}
 		<button
 			type="button"
-			disabled
-			class="h-10 gap-3 px-3 text-sm text-zeus-muted rounded-xl flex w-full items-center disabled:opacity-80"
+			class="text-zeus-muted hover:bg-zeus-surface-2 hover:text-zeus-text h-10 gap-3 px-3 text-sm rounded-xl flex w-full items-center transition-colors"
+			onclick={(event) => onOpenSettings(event.currentTarget)}
 		>
 			<SlidersHorizontal size={17} aria-hidden="true" />
 			Settings

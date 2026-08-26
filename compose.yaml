@@ -89,6 +89,10 @@ services:
       ZEUS_DATABASE_PATH: ${ZEUS_DATABASE_PATH:-/var/lib/zeus/zeus.db}
       ZEUS_DEMO_PROFILE: ${ZEUS_DEMO_PROFILE:-production-guarded}
       ZEUS_LOCAL_MARKER_ROOT: ${ZEUS_LOCAL_MARKER_ROOT:-/var/lib/zeus/local-markers}
+      ZEUS_COOKIE_SECURE: ${ZEUS_COOKIE_SECURE:-false}
+      ZEUS_LLM_ENDPOINT: ${ZEUS_LLM_ENDPOINT:-}
+      ZEUS_LLM_MODEL: ${ZEUS_LLM_MODEL:-}
+      ZEUS_LLM_API_KEY: ${ZEUS_LLM_API_KEY:-}
       RESTATE_INGRESS_URL: ${RESTATE_INGRESS_URL:-http://restate:8080}
       RESTATE_ADMIN_URL: ${RESTATE_ADMIN_URL:-http://restate:9070}
       S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}

@@ -3,7 +3,7 @@
 //! These types deliberately describe the product boundary only. Persistence and
 //! orchestration implementations belong in other crates.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,6 +16,126 @@ pub const LOCAL_DEMO_SESSION_ID: &str = "session-ZR-DEV-1";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountRole {
+    Owner,
+    Member,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountStatus {
+    Active,
+    Disabled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountUser {
+    pub id: String,
+    pub username: String,
+    pub role: AccountRole,
+    pub status: AccountStatus,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemePreference {
+    System,
+    Light,
+    Dark,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserPreferences {
+    pub theme: ThemePreference,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_model: Option<String>,
+    pub revision: u64,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthStatusResponse {
+    pub configured: bool,
+    pub authenticated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<AccountUser>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferences: Option<UserPreferences>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapRequest {
+    pub bootstrap_token: String,
+    pub username: String,
+    pub password: String,
+}
+
+impl fmt::Debug for BootstrapRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BootstrapRequest")
+            .field("bootstrap_token", &"[REDACTED]")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoginRequest {
+    pub username: String,
+    pub password: String,
+}
+
+impl fmt::Debug for LoginRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoginRequest")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthenticationResponse {
+    pub user: AccountUser,
+    pub preferences: UserPreferences,
+    pub csrf_token: String,
+    pub expires_at: String,
+}
+
+impl fmt::Debug for AuthenticationResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthenticationResponse")
+            .field("user", &self.user)
+            .field("preferences", &self.preferences)
+            .field("csrf_token", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdatePreferencesRequest {
+    pub theme: ThemePreference,
+    #[serde(default)]
+    pub preferred_model: Option<String>,
+    pub expected_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogoutResponse {
+    pub status: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,15 +391,49 @@ pub struct SessionTurn {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantReplyKind {
+    Model,
+    NonModelFallback,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssistantReplyProvenance {
+    pub provider_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub reply_kind: AssistantReplyKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionEventData {
-    SessionCreated { title: String },
-    RunAttached { run_id: String },
-    SessionResumed { from_status: SessionStatus },
-    UserMessage { turn_id: String, content: String },
-    AssistantMessage { turn_id: String, content: String },
-    TurnFlushed { turn_id: String },
-    TurnInterrupted { turn_id: String, reason: String },
+    SessionCreated {
+        title: String,
+    },
+    RunAttached {
+        run_id: String,
+    },
+    SessionResumed {
+        from_status: SessionStatus,
+    },
+    UserMessage {
+        turn_id: String,
+        content: String,
+    },
+    AssistantMessage {
+        turn_id: String,
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provenance: Option<AssistantReplyProvenance>,
+    },
+    TurnFlushed {
+        turn_id: String,
+    },
+    TurnInterrupted {
+        turn_id: String,
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -609,6 +763,28 @@ mod tests {
     }
 
     #[test]
+    fn legacy_assistant_message_without_provenance_still_deserializes() {
+        let legacy = json!({
+            "kind": "assistant_message",
+            "turn_id": "turn-old",
+            "content": "legacy reply"
+        });
+
+        let event: SessionEventData = serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(
+            event,
+            SessionEventData::AssistantMessage {
+                turn_id: "turn-old".into(),
+                content: "legacy reply".into(),
+                provenance: None,
+            }
+        );
+        let value = serde_json::to_value(event).unwrap();
+        assert!(!value.as_object().unwrap().contains_key("provenance"));
+    }
+
+    #[test]
     fn tool_call_without_version_recovers_but_preserves_missing_version() {
         let value = json!({
             "call_id": "call-old",
@@ -652,6 +828,27 @@ mod tests {
         );
         assert!(RunStatus::NeedsAttention.is_terminal());
         assert!(!RunStatus::Queued.is_terminal());
+    }
+
+    #[test]
+    fn authentication_debug_output_redacts_bearer_and_password_values() {
+        let bootstrap = BootstrapRequest {
+            bootstrap_token: "raw-bootstrap-secret".into(),
+            username: "owner".into(),
+            password: "raw-password-secret".into(),
+        };
+        let login = LoginRequest {
+            username: "owner".into(),
+            password: "raw-password-secret".into(),
+        };
+
+        let bootstrap_debug = format!("{bootstrap:?}");
+        let login_debug = format!("{login:?}");
+        assert!(!bootstrap_debug.contains("raw-bootstrap-secret"));
+        assert!(!bootstrap_debug.contains("raw-password-secret"));
+        assert!(!login_debug.contains("raw-password-secret"));
+        assert!(bootstrap_debug.contains("[REDACTED]"));
+        assert!(login_debug.contains("[REDACTED]"));
     }
 
     #[test]

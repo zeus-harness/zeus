@@ -9,25 +9,28 @@ use std::{
 use chrono::{SecondsFormat, Utc};
 use fs2::FileExt;
 use protocol::{
-    ApprovalScope, ApprovalStatus, AttachRunRequest, AttachRunResponse, CreateSessionRequest,
-    CreateSessionResponse, EventType, FlushSessionRequest, FlushSessionResponse, IncidentStatus,
-    IncidentSummary, ResumeSessionRequest, ResumeSessionResponse, ReviewDecision, ReviewResponse,
-    RunEvent, RunEventData, RunStatus, RunSummary, SandboxProfile, SessionDetail, SessionEvent,
-    SessionEventData, SessionFlushAck, SessionStatus, SessionSummary, SessionTurn,
-    SessionTurnStatus, Severity, StartTurnRequest, StartTurnResponse, ToolCallStatus, ToolEffect,
-    ToolOutcome,
+    ApprovalScope, ApprovalStatus, AssistantReplyProvenance, AttachRunRequest, AttachRunResponse,
+    CreateSessionRequest, CreateSessionResponse, EventType, FlushSessionRequest,
+    FlushSessionResponse, IncidentStatus, IncidentSummary, ResumeSessionRequest,
+    ResumeSessionResponse, ReviewDecision, ReviewResponse, RunEvent, RunEventData, RunStatus,
+    RunSummary, SandboxProfile, SessionDetail, SessionEvent, SessionEventData, SessionFlushAck,
+    SessionStatus, SessionSummary, SessionTurn, SessionTurnStatus, Severity, StartTurnRequest,
+    StartTurnResponse, ToolCallStatus, ToolEffect, ToolOutcome,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 use crate::{
-    ClaimOutcome, CommitOutcome, DispatchCompleteCommit, DispatchJob, DispatchJobSpec,
-    DispatchRecoveryCommit, DispatchStartCommit, DispatchStatus, ReviewCommit, ReviewReceipt,
-    RunSnapshot, RuntimeIdentity, StorageError, StoredRun,
+    AuthPrincipal, AuthSessionCommit, BootstrapOwnerCommit, ClaimOutcome, CommitOutcome,
+    DispatchCompleteCommit, DispatchJob, DispatchJobSpec, DispatchRecoveryCommit,
+    DispatchStartCommit, DispatchStatus, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit,
+    ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
+    ReplySuccessCommit, ReviewCommit, ReviewReceipt, RunSnapshot, RuntimeIdentity, StorageError,
+    StoredCredential, StoredPreferences, StoredRun, StoredUser, StoredUserRole, StoredUserStatus,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 4;
+const CURRENT_SCHEMA_VERSION: i64 = 7;
 const EVENT_PAYLOAD_VERSION_V1: i64 = 1;
 const EVENT_PAYLOAD_VERSION_V2: i64 = 2;
 const SESSION_EVENT_PAYLOAD_VERSION_V1: i64 = 1;
@@ -36,6 +39,9 @@ const MIGRATION_0001: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_0002: &str = include_str!("../migrations/0002_tool_execution.sql");
 const MIGRATION_0003: &str = include_str!("../migrations/0003_runtime_identity.sql");
 const MIGRATION_0004: &str = include_str!("../migrations/0004_sessions.sql");
+const MIGRATION_0005: &str = include_str!("../migrations/0005_accounts.sql");
+const MIGRATION_0006: &str = include_str!("../migrations/0006_actor_receipts.sql");
+const MIGRATION_0007: &str = include_str!("../migrations/0007_reply_jobs.sql");
 
 #[derive(Clone)]
 pub struct SqliteStore {
@@ -158,8 +164,25 @@ impl SqliteStore {
         idempotency_key: &str,
     ) -> Result<CreateSessionResponse, StorageError> {
         let key = normalized_key(idempotency_key)?.to_owned();
-        self.with_connection(move |connection| create_session(connection, request, &key))
+        self.with_connection(move |connection| create_session(connection, request, &key, None))
             .await
+    }
+
+    /// Creates a session owned by the authenticated actor and stores the
+    /// idempotency receipt in that actor's scope.
+    pub async fn create_session_for_actor(
+        &self,
+        actor_user_id: &str,
+        request: CreateSessionRequest,
+        idempotency_key: &str,
+    ) -> Result<CreateSessionResponse, StorageError> {
+        let actor_user_id =
+            normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
+        let key = normalized_key(idempotency_key)?.to_owned();
+        self.with_connection(move |connection| {
+            create_session(connection, request, &key, Some(&actor_user_id))
+        })
+        .await
     }
 
     pub async fn attach_run(
@@ -182,8 +205,87 @@ impl SqliteStore {
     ) -> Result<StartTurnResponse, StorageError> {
         let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
-        self.with_connection(move |connection| start_turn(connection, &session_id, request, &key))
+        self.with_connection(move |connection| {
+            start_turn(connection, &session_id, request, &key, None, false)
+                .map(|(response, _)| response)
+        })
+        .await
+    }
+
+    /// Atomically persists the user turn and its provider work item.
+    ///
+    /// Replaying the same idempotency key returns the original turn and queue
+    /// record. Changing either the turn request or immutable job input is an
+    /// idempotency conflict.
+    pub async fn start_turn_and_enqueue_reply(
+        &self,
+        session_id: &str,
+        request: StartTurnRequest,
+        idempotency_key: &str,
+        job: ReplyJobSpec,
+    ) -> Result<ReplyJobEnqueueResponse, StorageError> {
+        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
+        let key = normalized_key(idempotency_key)?.to_owned();
+        self.with_connection(move |connection| {
+            start_turn(connection, &session_id, request, &key, Some(job), false).and_then(
+                |(start, job)| {
+                    job.map(|job| ReplyJobEnqueueResponse { start, job })
+                        .ok_or_else(|| {
+                            StorageError::CorruptData(
+                                "reply enqueue committed without a queue record".into(),
+                            )
+                        })
+                },
+            )
+        })
+        .await
+    }
+
+    pub async fn reply_job(&self, job_id: &str) -> Result<Option<ReplyJob>, StorageError> {
+        let job_id = normalized_reply_value(job_id, "reply job ID")?.to_owned();
+        self.with_connection(move |connection| query_reply_job_optional(connection, &job_id))
             .await
+    }
+
+    /// Claims at most one queued reply. The committed `started` transition is
+    /// the authorization boundary for provider execution.
+    pub async fn claim_next_reply(&self) -> Result<ReplyClaimOutcome, StorageError> {
+        self.with_connection(claim_next_reply).await
+    }
+
+    /// Commits provider output, assistant/flush ledger events, and the ready
+    /// session projection in one transaction.
+    pub async fn complete_reply_success(
+        &self,
+        commit: ReplySuccessCommit,
+    ) -> Result<ReplyCompletion, StorageError> {
+        self.with_connection(move |connection| complete_reply_success(connection, commit, false))
+            .await
+    }
+
+    /// Commits a terminal provider failure together with interruption evidence.
+    pub async fn complete_reply_failure(
+        &self,
+        commit: ReplyFailureCommit,
+    ) -> Result<ReplyCompletion, StorageError> {
+        self.with_connection(move |connection| complete_reply_failure(connection, commit))
+            .await
+    }
+
+    /// Commits an indeterminate provider outcome together with interruption
+    /// evidence. This terminal state must never be retried automatically.
+    pub async fn complete_reply_outcome_unknown(
+        &self,
+        commit: ReplyOutcomeUnknownCommit,
+    ) -> Result<ReplyCompletion, StorageError> {
+        self.with_connection(move |connection| complete_reply_outcome_unknown(connection, commit))
+            .await
+    }
+
+    /// Converts every reply durably claimed by a previous process into
+    /// `outcome_unknown`. Queued work is deliberately left claimable.
+    pub async fn recover_started_replies(&self) -> Result<Vec<ReplyCompletion>, StorageError> {
+        self.with_connection(recover_started_replies).await
     }
 
     pub async fn flush_turn(
@@ -218,6 +320,118 @@ impl SqliteStore {
     /// appends `turn_interrupted`; it never manufactures a flush acknowledgement.
     pub async fn recover_open_turns(&self) -> Result<Vec<SessionEvent>, StorageError> {
         self.with_connection(recover_open_turns).await
+    }
+
+    pub async fn has_users(&self) -> Result<bool, StorageError> {
+        self.with_connection(|connection| {
+            Ok(
+                connection.query_row("SELECT EXISTS(SELECT 1 FROM users)", [], |row| {
+                    row.get::<_, i64>(0)
+                })? != 0,
+            )
+        })
+        .await
+    }
+
+    /// Replaces any previously printed, unused bootstrap token.
+    ///
+    /// The raw token is never persisted. Rotating at startup guarantees an
+    /// operator cannot be permanently locked out after losing terminal output.
+    pub async fn replace_bootstrap_token(
+        &self,
+        token_hash: &str,
+        expires_at: &str,
+    ) -> Result<(), StorageError> {
+        let token_hash = normalized_token_hash(token_hash, "bootstrap token hash")?.to_owned();
+        let expires_at = normalized_timestamp(expires_at, "bootstrap token expiry")?.to_owned();
+        self.with_connection(move |connection| {
+            replace_bootstrap_token(connection, &token_hash, &expires_at)
+        })
+        .await
+    }
+
+    /// Atomically creates the first owner, consumes the bootstrap token, claims
+    /// every legacy Alpha resource/receipt, and creates the first login session.
+    pub async fn bootstrap_owner(
+        &self,
+        commit: BootstrapOwnerCommit,
+    ) -> Result<(StoredUser, StoredPreferences), StorageError> {
+        self.with_connection(move |connection| bootstrap_owner(connection, commit))
+            .await
+    }
+
+    pub async fn credential_for_username(
+        &self,
+        username: &str,
+    ) -> Result<Option<StoredCredential>, StorageError> {
+        let username = normalized_account_value(username, "username", 64)?.to_owned();
+        self.with_connection(move |connection| query_credential(connection, &username))
+            .await
+    }
+
+    pub async fn create_auth_session(
+        &self,
+        commit: AuthSessionCommit,
+    ) -> Result<AuthPrincipal, StorageError> {
+        self.with_connection(move |connection| create_auth_session(connection, commit))
+            .await
+    }
+
+    pub async fn authenticate(
+        &self,
+        session_token_hash: &str,
+    ) -> Result<Option<AuthPrincipal>, StorageError> {
+        let session_token_hash =
+            normalized_token_hash(session_token_hash, "session token hash")?.to_owned();
+        self.with_connection(move |connection| {
+            query_auth_principal(connection, &session_token_hash, &now())
+        })
+        .await
+    }
+
+    pub async fn revoke_auth_session(
+        &self,
+        session_token_hash: &str,
+    ) -> Result<bool, StorageError> {
+        let session_token_hash =
+            normalized_token_hash(session_token_hash, "session token hash")?.to_owned();
+        self.with_connection(move |connection| {
+            Ok(connection.execute(
+                "DELETE FROM auth_sessions WHERE token_hash = ?1",
+                [&session_token_hash],
+            )? == 1)
+        })
+        .await
+    }
+
+    pub async fn preferences(&self, user_id: &str) -> Result<StoredPreferences, StorageError> {
+        let user_id = normalized_account_value(user_id, "user ID", 128)?.to_owned();
+        self.with_connection(move |connection| query_preferences(connection, &user_id))
+            .await
+    }
+
+    pub async fn update_preferences(
+        &self,
+        user_id: &str,
+        expected_revision: u64,
+        theme: &str,
+        preferred_model: Option<&str>,
+    ) -> Result<StoredPreferences, StorageError> {
+        let user_id = normalized_account_value(user_id, "user ID", 128)?.to_owned();
+        let theme = normalized_theme(theme)?.to_owned();
+        let preferred_model = preferred_model
+            .map(|model| normalized_account_value(model, "preferred model", 128).map(str::to_owned))
+            .transpose()?;
+        self.with_connection(move |connection| {
+            update_preferences(
+                connection,
+                &user_id,
+                expected_revision,
+                &theme,
+                preferred_model.as_deref(),
+            )
+        })
+        .await
     }
 
     pub async fn readiness(&self) -> Result<(), StorageError> {
@@ -353,6 +567,40 @@ impl SqliteStore {
             flush_turn(connection, &session_id, request, &key, true)
         })
         .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn start_turn_and_enqueue_reply_with_failure(
+        &self,
+        session_id: &str,
+        request: StartTurnRequest,
+        idempotency_key: &str,
+        job: ReplyJobSpec,
+    ) -> Result<ReplyJobEnqueueResponse, StorageError> {
+        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
+        let key = normalized_key(idempotency_key)?.to_owned();
+        self.with_connection(move |connection| {
+            start_turn(connection, &session_id, request, &key, Some(job), true).and_then(
+                |(start, job)| {
+                    job.map(|job| ReplyJobEnqueueResponse { start, job })
+                        .ok_or_else(|| {
+                            StorageError::CorruptData(
+                                "reply enqueue committed without a queue record".into(),
+                            )
+                        })
+                },
+            )
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn complete_reply_success_with_failure(
+        &self,
+        commit: ReplySuccessCommit,
+    ) -> Result<ReplyCompletion, StorageError> {
+        self.with_connection(move |connection| complete_reply_success(connection, commit, true))
+            .await
     }
 
     async fn with_connection<T, F>(&self, operation: F) -> Result<T, StorageError>
@@ -517,6 +765,27 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
             params![4, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 5 {
+        transaction.execute_batch(MIGRATION_0005)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![5, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
+    if current < 6 {
+        transaction.execute_batch(MIGRATION_0006)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![6, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
+    if current < 7 {
+        transaction.execute_batch(MIGRATION_0007)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![7, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -557,12 +826,14 @@ fn readiness(connection: &mut Connection, expects_wal: bool) -> Result<(), Stora
            WHERE type = 'table' AND name IN (
                'schema_migrations', 'incidents', 'runs', 'run_events', 'idempotency_receipts',
                'dispatch_jobs', 'runtime_identity', 'sessions', 'session_runs',
-               'session_turns', 'session_events', 'session_command_receipts'
+               'session_turns', 'session_events', 'session_command_receipts',
+               'users', 'auth_sessions', 'bootstrap_tokens', 'user_preferences',
+               'reply_jobs'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if table_count != 12 {
+    if table_count != 17 {
         return Err(StorageError::CorruptData(
             "one or more required tables are missing".into(),
         ));
@@ -609,12 +880,25 @@ fn readiness(connection: &mut Connection, expects_wal: bool) -> Result<(), Stora
                'session_turns_enforce_terminal_transition',
                'session_turns_reject_delete',
                'session_command_receipts_reject_update',
-               'session_command_receipts_reject_delete'
+               'session_command_receipts_reject_delete',
+               'idempotency_receipts_reject_update',
+               'idempotency_receipts_reject_delete',
+               'users_reject_identity_update',
+               'users_reject_delete_with_history',
+               'auth_sessions_reject_update',
+               'bootstrap_tokens_enforce_single_use',
+               'bootstrap_tokens_reject_delete',
+               'user_preferences_enforce_revision',
+               'sessions_owner_is_write_once',
+               'runs_owner_is_write_once',
+               'reply_jobs_reject_input_update',
+               'reply_jobs_enforce_forward_transition',
+               'reply_jobs_reject_delete'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 17 {
+    if trigger_count != 30 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
         ));
@@ -640,6 +924,385 @@ fn readiness(connection: &mut Connection, expects_wal: bool) -> Result<(), Stora
         ));
     }
     Ok(())
+}
+
+fn replace_bootstrap_token(
+    connection: &mut Connection,
+    token_hash: &str,
+    expires_at: &str,
+) -> Result<(), StorageError> {
+    let timestamp = now();
+    if expires_at <= timestamp.as_str() {
+        return Err(StorageError::InvalidAccountData(
+            "bootstrap token expiry must be in the future".into(),
+        ));
+    }
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let configured: i64 =
+        transaction.query_row("SELECT EXISTS(SELECT 1 FROM users)", [], |row| row.get(0))?;
+    if configured != 0 {
+        return Err(StorageError::AccountAlreadyConfigured);
+    }
+    transaction.execute(
+        "UPDATE bootstrap_tokens SET used_at = ?1 WHERE used_at IS NULL",
+        [&timestamp],
+    )?;
+    transaction.execute(
+        r#"INSERT INTO bootstrap_tokens(token_hash, created_at, expires_at, used_at)
+           VALUES (?1, ?2, ?3, NULL)"#,
+        params![token_hash, timestamp, expires_at],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn bootstrap_owner(
+    connection: &mut Connection,
+    commit: BootstrapOwnerCommit,
+) -> Result<(StoredUser, StoredPreferences), StorageError> {
+    let bootstrap_token_hash =
+        normalized_token_hash(&commit.bootstrap_token_hash, "bootstrap token hash")?;
+    let user_id = normalized_account_value(&commit.user_id, "user ID", 128)?;
+    let username = normalized_account_value(&commit.username, "username", 64)?;
+    let password_hash = normalized_password_hash(&commit.password_hash)?;
+    let session_token_hash =
+        normalized_token_hash(&commit.session_token_hash, "session token hash")?;
+    let csrf_hash = normalized_token_hash(&commit.csrf_hash, "CSRF token hash")?;
+    let session_expires_at = normalized_timestamp(&commit.session_expires_at, "session expiry")?;
+    let timestamp = now();
+    if session_expires_at <= timestamp.as_str() {
+        return Err(StorageError::InvalidAccountData(
+            "session expiry must be in the future".into(),
+        ));
+    }
+
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let configured: i64 =
+        transaction.query_row("SELECT EXISTS(SELECT 1 FROM users)", [], |row| row.get(0))?;
+    if configured != 0 {
+        return Err(StorageError::AccountAlreadyConfigured);
+    }
+    let bootstrap_expiry = transaction
+        .query_row(
+            r#"SELECT expires_at FROM bootstrap_tokens
+               WHERE token_hash = ?1 AND used_at IS NULL"#,
+            [bootstrap_token_hash],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if bootstrap_expiry
+        .as_deref()
+        .is_none_or(|expiry| expiry <= timestamp.as_str())
+    {
+        return Err(StorageError::InvalidBootstrapToken);
+    }
+
+    transaction.execute(
+        r#"INSERT INTO users(
+               id, username, role, status, password_hash, created_at, updated_at
+           ) VALUES (?1, ?2, 'owner', 'active', ?3, ?4, ?4)"#,
+        params![user_id, username, password_hash, timestamp],
+    )?;
+    transaction.execute(
+        r#"INSERT INTO user_preferences(
+               user_id, theme, preferred_model, revision, updated_at
+           ) VALUES (?1, 'system', NULL, 1, ?2)"#,
+        params![user_id, timestamp],
+    )?;
+
+    transaction.execute(
+        "UPDATE sessions SET owner_user_id = ?1 WHERE owner_user_id IS NULL",
+        [user_id],
+    )?;
+    transaction.execute(
+        "UPDATE runs SET owner_user_id = ?1 WHERE owner_user_id IS NULL",
+        [user_id],
+    )?;
+    transaction.execute(
+        "UPDATE session_command_receipts SET actor_scope = ?1 WHERE actor_scope = '__legacy__'",
+        [user_id],
+    )?;
+    transaction.execute(
+        "UPDATE idempotency_receipts SET actor_scope = ?1 WHERE actor_scope = '__legacy__'",
+        [user_id],
+    )?;
+
+    let consumed = transaction.execute(
+        r#"UPDATE bootstrap_tokens SET used_at = ?1
+           WHERE token_hash = ?2 AND used_at IS NULL"#,
+        params![timestamp, bootstrap_token_hash],
+    )?;
+    if consumed != 1 {
+        return Err(StorageError::InvalidBootstrapToken);
+    }
+    insert_auth_session(
+        &transaction,
+        user_id,
+        session_token_hash,
+        csrf_hash,
+        session_expires_at,
+        &timestamp,
+    )?;
+
+    let user = query_user(&transaction, user_id)?;
+    let preferences = query_preferences(&transaction, user_id)?;
+    transaction.commit()?;
+    Ok((user, preferences))
+}
+
+fn query_credential(
+    connection: &Connection,
+    username: &str,
+) -> Result<Option<StoredCredential>, StorageError> {
+    let row = connection
+        .query_row(
+            r#"SELECT id, username, role, status, password_hash, created_at, updated_at
+               FROM users WHERE username = ?1 COLLATE NOCASE"#,
+            [username],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(id, username, role, status, password_hash, created_at, updated_at)| {
+            Ok(StoredCredential {
+                user: decode_user(id, username, role, status, created_at, updated_at)?,
+                password_hash,
+            })
+        },
+    )
+    .transpose()
+}
+
+fn create_auth_session(
+    connection: &mut Connection,
+    commit: AuthSessionCommit,
+) -> Result<AuthPrincipal, StorageError> {
+    let user_id = normalized_account_value(&commit.user_id, "user ID", 128)?;
+    let token_hash = normalized_token_hash(&commit.session_token_hash, "session token hash")?;
+    let csrf_hash = normalized_token_hash(&commit.csrf_hash, "CSRF token hash")?;
+    let expires_at = normalized_timestamp(&commit.expires_at, "session expiry")?;
+    let timestamp = now();
+    if expires_at <= timestamp.as_str() {
+        return Err(StorageError::InvalidAccountData(
+            "session expiry must be in the future".into(),
+        ));
+    }
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let user = query_user(&transaction, user_id)?;
+    if user.status != StoredUserStatus::Active {
+        return Err(StorageError::UserDisabled(user_id.to_owned()));
+    }
+    insert_auth_session(
+        &transaction,
+        user_id,
+        token_hash,
+        csrf_hash,
+        expires_at,
+        &timestamp,
+    )?;
+    transaction.commit()?;
+    Ok(AuthPrincipal {
+        user,
+        csrf_hash: csrf_hash.to_owned(),
+        expires_at: expires_at.to_owned(),
+    })
+}
+
+fn insert_auth_session(
+    connection: &Connection,
+    user_id: &str,
+    token_hash: &str,
+    csrf_hash: &str,
+    expires_at: &str,
+    timestamp: &str,
+) -> Result<(), StorageError> {
+    connection.execute(
+        r#"INSERT INTO auth_sessions(
+               token_hash, user_id, csrf_hash, created_at, expires_at, last_seen_at
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?4)"#,
+        params![token_hash, user_id, csrf_hash, timestamp, expires_at],
+    )?;
+    Ok(())
+}
+
+fn query_auth_principal(
+    connection: &Connection,
+    token_hash: &str,
+    timestamp: &str,
+) -> Result<Option<AuthPrincipal>, StorageError> {
+    let row = connection
+        .query_row(
+            r#"SELECT u.id, u.username, u.role, u.status, u.created_at, u.updated_at,
+                      a.csrf_hash, a.expires_at
+               FROM auth_sessions a
+               JOIN users u ON u.id = a.user_id
+               WHERE a.token_hash = ?1 AND a.expires_at > ?2 AND u.status = 'active'"#,
+            params![token_hash, timestamp],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(id, username, role, status, created_at, updated_at, csrf_hash, expires_at)| {
+            Ok(AuthPrincipal {
+                user: decode_user(id, username, role, status, created_at, updated_at)?,
+                csrf_hash,
+                expires_at,
+            })
+        },
+    )
+    .transpose()
+}
+
+fn query_user(connection: &Connection, user_id: &str) -> Result<StoredUser, StorageError> {
+    let row = connection
+        .query_row(
+            r#"SELECT id, username, role, status, created_at, updated_at
+               FROM users WHERE id = ?1"#,
+            [user_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((id, username, role, status, created_at, updated_at)) = row else {
+        return Err(StorageError::UserNotFound(user_id.to_owned()));
+    };
+    decode_user(id, username, role, status, created_at, updated_at)
+}
+
+fn decode_user(
+    id: String,
+    username: String,
+    role: String,
+    status: String,
+    created_at: String,
+    updated_at: String,
+) -> Result<StoredUser, StorageError> {
+    let role = match role.as_str() {
+        "owner" => StoredUserRole::Owner,
+        "member" => StoredUserRole::Member,
+        other => {
+            return Err(StorageError::CorruptData(format!(
+                "unsupported stored user role `{other}`"
+            )));
+        }
+    };
+    let status = match status.as_str() {
+        "active" => StoredUserStatus::Active,
+        "disabled" => StoredUserStatus::Disabled,
+        other => {
+            return Err(StorageError::CorruptData(format!(
+                "unsupported stored user status `{other}`"
+            )));
+        }
+    };
+    Ok(StoredUser {
+        id,
+        username,
+        role,
+        status,
+        created_at,
+        updated_at,
+    })
+}
+
+fn query_preferences(
+    connection: &Connection,
+    user_id: &str,
+) -> Result<StoredPreferences, StorageError> {
+    let row = connection
+        .query_row(
+            r#"SELECT user_id, theme, preferred_model, revision, updated_at
+               FROM user_preferences WHERE user_id = ?1"#,
+            [user_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((user_id, theme, preferred_model, revision, updated_at)) = row else {
+        return Err(StorageError::UserNotFound(user_id.to_owned()));
+    };
+    normalized_theme(&theme)?;
+    Ok(StoredPreferences {
+        user_id,
+        theme,
+        preferred_model,
+        revision: i64_to_u64(revision, "preference revision")?,
+        updated_at,
+    })
+}
+
+fn update_preferences(
+    connection: &mut Connection,
+    user_id: &str,
+    expected_revision: u64,
+    theme: &str,
+    preferred_model: Option<&str>,
+) -> Result<StoredPreferences, StorageError> {
+    let expected_revision = u64_to_i64(expected_revision, "expected preference revision")?;
+    let timestamp = now();
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let changed = transaction.execute(
+        r#"UPDATE user_preferences
+           SET theme = ?1, preferred_model = ?2, revision = revision + 1, updated_at = ?3
+           WHERE user_id = ?4 AND revision = ?5"#,
+        params![
+            theme,
+            preferred_model,
+            timestamp,
+            user_id,
+            expected_revision
+        ],
+    )?;
+    if changed != 1 {
+        if transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM user_preferences WHERE user_id = ?1)",
+            [user_id],
+            |row| row.get::<_, i64>(0),
+        )? == 0
+        {
+            return Err(StorageError::UserNotFound(user_id.to_owned()));
+        }
+        return Err(StorageError::ConcurrentModification);
+    }
+    let preferences = query_preferences(&transaction, user_id)?;
+    transaction.commit()?;
+    Ok(preferences)
 }
 
 fn bind_runtime_identity(
@@ -1114,15 +1777,26 @@ fn create_session(
     connection: &mut Connection,
     request: CreateSessionRequest,
     idempotency_key: &str,
+    actor_user_id: Option<&str>,
 ) -> Result<CreateSessionResponse, StorageError> {
     let fingerprint = session_command_fingerprint(None, &request)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if let Some(mut response) = load_session_command_receipt::<CreateSessionResponse>(
-        &transaction,
-        idempotency_key,
-        "create_session",
-        &fingerprint,
-    )? {
+    let stored_response = match actor_user_id {
+        Some(actor_user_id) => load_session_command_receipt_for_actor::<CreateSessionResponse>(
+            &transaction,
+            actor_user_id,
+            idempotency_key,
+            "create_session",
+            &fingerprint,
+        )?,
+        None => load_session_command_receipt::<CreateSessionResponse>(
+            &transaction,
+            idempotency_key,
+            "create_session",
+            &fingerprint,
+        )?,
+    };
+    if let Some(mut response) = stored_response {
         response.replayed = true;
         transaction.commit()?;
         return Ok(response);
@@ -1130,6 +1804,9 @@ fn create_session(
 
     normalized_session_value(&request.id, "session ID")?;
     normalized_session_value(&request.title, "session title")?;
+    if let Some(actor_user_id) = actor_user_id {
+        require_active_user(&transaction, actor_user_id)?;
+    }
     if query_session_summary_optional(&transaction, &request.id)?.is_some() {
         return Err(StorageError::SessionAlreadyExists(request.id));
     }
@@ -1137,9 +1814,9 @@ fn create_session(
     transaction.execute(
         r#"INSERT INTO sessions(
                id, title, status, created_at, updated_at, sequence,
-               projection_sequence, active_turn_id
-           ) VALUES (?1, ?2, 'ready', ?3, ?3, 0, 0, NULL)"#,
-        params![request.id, request.title, timestamp],
+               projection_sequence, active_turn_id, owner_user_id
+           ) VALUES (?1, ?2, 'ready', ?3, ?3, 0, 0, NULL, ?4)"#,
+        params![request.id, request.title, timestamp, actor_user_id],
     )?;
     let event = build_session_event(
         &request.id,
@@ -1164,15 +1841,28 @@ fn create_session(
         event,
         replayed: false,
     };
-    insert_session_command_receipt(
-        &transaction,
-        idempotency_key,
-        "create_session",
-        &fingerprint,
-        &response,
-        &request.id,
-        response.event.sequence,
-    )?;
+    if let Some(actor_user_id) = actor_user_id {
+        insert_session_command_receipt_for_actor(
+            &transaction,
+            actor_user_id,
+            idempotency_key,
+            "create_session",
+            &fingerprint,
+            &response,
+            &request.id,
+            response.event.sequence,
+        )?;
+    } else {
+        insert_session_command_receipt(
+            &transaction,
+            idempotency_key,
+            "create_session",
+            &fingerprint,
+            &response,
+            &request.id,
+            response.event.sequence,
+        )?;
+    }
     transaction.commit()?;
     Ok(response)
 }
@@ -1270,22 +1960,49 @@ fn start_turn(
     session_id: &str,
     request: StartTurnRequest,
     idempotency_key: &str,
-) -> Result<StartTurnResponse, StorageError> {
-    let fingerprint = session_command_fingerprint(Some(session_id), &request)?;
+    reply_job: Option<ReplyJobSpec>,
+    fail_after_enqueue: bool,
+) -> Result<(StartTurnResponse, Option<ReplyJob>), StorageError> {
+    let fingerprint = match &reply_job {
+        Some(job) => reply_start_fingerprint(session_id, &request, job)?,
+        None => session_command_fingerprint(Some(session_id), &request)?,
+    };
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if let Some(mut response) = load_session_command_receipt::<StartTurnResponse>(
-        &transaction,
-        idempotency_key,
-        "start_turn",
-        &fingerprint,
-    )? {
+    let stored_response = match &reply_job {
+        Some(job) => load_session_command_receipt_for_actor::<StartTurnResponse>(
+            &transaction,
+            &job.actor_user_id,
+            idempotency_key,
+            "start_turn",
+            &fingerprint,
+        )?,
+        None => load_session_command_receipt::<StartTurnResponse>(
+            &transaction,
+            idempotency_key,
+            "start_turn",
+            &fingerprint,
+        )?,
+    };
+    if let Some(mut response) = stored_response {
         response.replayed = true;
+        let stored_job = match &reply_job {
+            Some(spec) => {
+                let job = query_reply_job_for_turn(&transaction, session_id, &request.turn_id)?;
+                require_reply_job_matches_spec(&job, spec)?;
+                Some(job)
+            }
+            None => None,
+        };
         transaction.commit()?;
-        return Ok(response);
+        return Ok((response, stored_job));
     }
 
     normalized_session_value(&request.turn_id, "turn ID")?;
     validate_message(&request.user_message, "user message")?;
+    if let Some(job) = &reply_job {
+        validate_reply_job_spec(job)?;
+        require_active_reply_actor(&transaction, session_id, &job.actor_user_id)?;
+    }
     let summary = query_session_summary(&transaction, session_id)?;
     require_session_sequence(&summary, request.expected_sequence)?;
     if summary.status != SessionStatus::Ready || summary.active_turn_id.is_some() {
@@ -1345,23 +2062,412 @@ fn start_turn(
         sequence,
         &timestamp,
     )?;
+    let stored_job = if let Some(job) = reply_job {
+        insert_reply_job(&transaction, session_id, &request.turn_id, &job, &timestamp)?;
+        Some(query_reply_job(&transaction, &job.id)?)
+    } else {
+        None
+    };
+
+    #[cfg(test)]
+    if fail_after_enqueue {
+        return Err(StorageError::InjectedFailure);
+    }
+    #[cfg(not(test))]
+    let _ = fail_after_enqueue;
+
     let response = StartTurnResponse {
         session: query_session_summary(&transaction, session_id)?,
         turn: query_session_turn(&transaction, session_id, &request.turn_id)?,
         event,
         replayed: false,
     };
-    insert_session_command_receipt(
+    if let Some(job) = &stored_job {
+        insert_session_command_receipt_for_actor(
+            &transaction,
+            &job.actor_user_id,
+            idempotency_key,
+            "start_turn",
+            &fingerprint,
+            &response,
+            session_id,
+            response.event.sequence,
+        )?;
+    } else {
+        insert_session_command_receipt(
+            &transaction,
+            idempotency_key,
+            "start_turn",
+            &fingerprint,
+            &response,
+            session_id,
+            response.event.sequence,
+        )?;
+    }
+    transaction.commit()?;
+    Ok((response, stored_job))
+}
+
+fn insert_reply_job(
+    connection: &Connection,
+    session_id: &str,
+    turn_id: &str,
+    job: &ReplyJobSpec,
+    queued_at: &str,
+) -> Result<(), StorageError> {
+    connection.execute(
+        r#"INSERT INTO reply_jobs(
+               id, actor_user_id, session_id, turn_id, provider_name, model_name,
+               status, attempt, request_json, response_json, error_json,
+               completion_fingerprint, assistant_event_sequence,
+               terminal_event_sequence, queued_at, started_at, finished_at
+           ) VALUES (
+               ?1, ?2, ?3, ?4, ?5, ?6, 'queued', 0, ?7, NULL, NULL,
+               NULL, NULL, NULL, ?8, NULL, NULL
+           )"#,
+        params![
+            job.id,
+            job.actor_user_id,
+            session_id,
+            turn_id,
+            job.provider_name,
+            job.model_name,
+            serde_json::to_string(&job.request_json)?,
+            queued_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn claim_next_reply(connection: &mut Connection) -> Result<ReplyClaimOutcome, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let job_id = transaction
+        .query_row(
+            r#"SELECT id FROM reply_jobs
+               WHERE status = 'queued' ORDER BY queued_at, id LIMIT 1"#,
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(job_id) = job_id else {
+        transaction.commit()?;
+        return Ok(ReplyClaimOutcome::NotAvailable);
+    };
+
+    let job = query_reply_job(&transaction, &job_id)?;
+    require_open_reply_turn(&transaction, &job)?;
+    let changed = transaction.execute(
+        r#"UPDATE reply_jobs
+           SET status = 'started', attempt = 1, started_at = ?1
+           WHERE id = ?2 AND status = 'queued' AND attempt = 0"#,
+        params![now(), job_id],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::ConcurrentModification);
+    }
+    let claimed = query_reply_job(&transaction, &job_id)?;
+    transaction.commit()?;
+    Ok(ReplyClaimOutcome::Claimed(Box::new(claimed)))
+}
+
+fn complete_reply_success(
+    connection: &mut Connection,
+    commit: ReplySuccessCommit,
+    fail_before_flush_event: bool,
+) -> Result<ReplyCompletion, StorageError> {
+    normalized_reply_value(&commit.job_id, "reply job ID")?;
+    validate_message(&commit.assistant_message, "assistant message")?;
+    validate_reply_provenance(&commit.provenance)?;
+    let fingerprint = reply_completion_fingerprint("succeeded", &commit)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let job = query_reply_job(&transaction, &commit.job_id)?;
+    require_reply_provenance_matches_job(&job, &commit.provenance)?;
+    if job.status != ReplyJobStatus::Started {
+        let replay =
+            replay_reply_completion(&transaction, job, ReplyJobStatus::Succeeded, &fingerprint)?;
+        transaction.commit()?;
+        return Ok(replay);
+    }
+
+    let mut summary = require_open_reply_turn(&transaction, &job)?;
+    require_session_sequence(&summary, commit.expected_sequence)?;
+    let timestamp = now();
+    let assistant_sequence = next_session_sequence(summary.sequence)?;
+    let assistant_event = build_session_event(
+        &job.session_id,
+        assistant_sequence,
+        &timestamp,
+        SessionEventData::AssistantMessage {
+            turn_id: job.turn_id.clone(),
+            content: commit.assistant_message.clone(),
+            provenance: Some(commit.provenance.clone()),
+        },
+    );
+    insert_session_event(&transaction, &job.session_id, &assistant_event)?;
+    update_session_projection(
         &transaction,
-        idempotency_key,
-        "start_turn",
+        &job.session_id,
+        summary.sequence,
+        SessionStatus::Running,
+        Some(&job.turn_id),
+        assistant_sequence,
+        &timestamp,
+    )?;
+    summary.sequence = assistant_sequence;
+    summary.updated_at.clone_from(&timestamp);
+
+    let changed = transaction.execute(
+        r#"UPDATE session_turns
+           SET status = 'flushed', assistant_message = ?1, completed_at = ?2
+           WHERE session_id = ?3 AND id = ?4 AND status = 'open'"#,
+        params![
+            commit.assistant_message,
+            timestamp,
+            job.session_id,
+            job.turn_id
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::ConcurrentModification);
+    }
+
+    #[cfg(test)]
+    if fail_before_flush_event {
+        return Err(StorageError::InjectedFailure);
+    }
+    #[cfg(not(test))]
+    let _ = fail_before_flush_event;
+
+    let terminal_sequence = next_session_sequence(summary.sequence)?;
+    let flush_event = build_session_event(
+        &job.session_id,
+        terminal_sequence,
+        &timestamp,
+        SessionEventData::TurnFlushed {
+            turn_id: job.turn_id.clone(),
+        },
+    );
+    insert_session_event(&transaction, &job.session_id, &flush_event)?;
+    update_session_projection(
+        &transaction,
+        &job.session_id,
+        summary.sequence,
+        SessionStatus::Ready,
+        None,
+        terminal_sequence,
+        &timestamp,
+    )?;
+
+    let changed = transaction.execute(
+        r#"UPDATE reply_jobs
+           SET status = 'succeeded', response_json = ?1,
+               completion_fingerprint = ?2, assistant_event_sequence = ?3,
+               terminal_event_sequence = ?4, finished_at = ?5
+           WHERE id = ?6 AND status = 'started' AND attempt = 1"#,
+        params![
+            serde_json::to_string(&commit.response_json)?,
+            fingerprint,
+            u64_to_i64(assistant_sequence, "assistant reply event sequence")?,
+            u64_to_i64(terminal_sequence, "reply terminal event sequence")?,
+            timestamp,
+            job.id,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::ConcurrentModification);
+    }
+    let completion = query_reply_completion(&transaction, &job.id, false)?;
+    transaction.commit()?;
+    Ok(completion)
+}
+
+fn complete_reply_failure(
+    connection: &mut Connection,
+    commit: ReplyFailureCommit,
+) -> Result<ReplyCompletion, StorageError> {
+    normalized_reply_value(&commit.job_id, "reply job ID")?;
+    let fingerprint = reply_completion_fingerprint("failed", &commit)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let job = query_reply_job(&transaction, &commit.job_id)?;
+    if job.status != ReplyJobStatus::Started {
+        let replay =
+            replay_reply_completion(&transaction, job, ReplyJobStatus::Failed, &fingerprint)?;
+        transaction.commit()?;
+        return Ok(replay);
+    }
+    let completion = interrupt_reply_job(
+        &transaction,
+        job,
+        commit.expected_sequence,
+        ReplyJobStatus::Failed,
+        &commit.error_json,
         &fingerprint,
-        &response,
-        session_id,
-        response.event.sequence,
+        "assistant reply provider failed",
     )?;
     transaction.commit()?;
-    Ok(response)
+    Ok(completion)
+}
+
+fn complete_reply_outcome_unknown(
+    connection: &mut Connection,
+    commit: ReplyOutcomeUnknownCommit,
+) -> Result<ReplyCompletion, StorageError> {
+    normalized_reply_value(&commit.job_id, "reply job ID")?;
+    let fingerprint = reply_completion_fingerprint("outcome_unknown", &commit)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let job = query_reply_job(&transaction, &commit.job_id)?;
+    if job.status != ReplyJobStatus::Started {
+        let replay = replay_reply_completion(
+            &transaction,
+            job,
+            ReplyJobStatus::OutcomeUnknown,
+            &fingerprint,
+        )?;
+        transaction.commit()?;
+        return Ok(replay);
+    }
+    let completion = interrupt_reply_job(
+        &transaction,
+        job,
+        commit.expected_sequence,
+        ReplyJobStatus::OutcomeUnknown,
+        &commit.error_json,
+        &fingerprint,
+        "assistant reply provider outcome is unknown",
+    )?;
+    transaction.commit()?;
+    Ok(completion)
+}
+
+fn recover_started_replies(
+    connection: &mut Connection,
+) -> Result<Vec<ReplyCompletion>, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut statement = transaction.prepare(
+        r#"SELECT id FROM reply_jobs
+           WHERE status = 'started' ORDER BY started_at, id"#,
+    )?;
+    let job_ids = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    let mut recovered = Vec::with_capacity(job_ids.len());
+    for job_id in job_ids {
+        let job = query_reply_job(&transaction, &job_id)?;
+        let summary = require_open_reply_turn(&transaction, &job)?;
+        let error_json = json!({
+            "code": "process_restarted",
+            "message": "reply execution was started but no durable result was committed"
+        });
+        let fingerprint = serde_json::to_string(&json!({
+            "kind": "outcome_unknown",
+            "job_id": job.id,
+            "expected_sequence": summary.sequence,
+            "error_json": error_json,
+        }))?;
+        recovered.push(interrupt_reply_job(
+            &transaction,
+            job,
+            summary.sequence,
+            ReplyJobStatus::OutcomeUnknown,
+            &error_json,
+            &fingerprint,
+            "process restarted after reply execution was claimed",
+        )?);
+    }
+    transaction.commit()?;
+    Ok(recovered)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn interrupt_reply_job(
+    connection: &Connection,
+    job: ReplyJob,
+    expected_sequence: u64,
+    terminal_status: ReplyJobStatus,
+    error_json: &Value,
+    fingerprint: &str,
+    reason: &str,
+) -> Result<ReplyCompletion, StorageError> {
+    if !matches!(
+        terminal_status,
+        ReplyJobStatus::Failed | ReplyJobStatus::OutcomeUnknown
+    ) {
+        return Err(StorageError::InvalidReplyTransition(
+            "an interrupted reply must end as failed or outcome_unknown".into(),
+        ));
+    }
+    let summary = require_open_reply_turn(connection, &job)?;
+    require_session_sequence(&summary, expected_sequence)?;
+    let timestamp = now();
+    let changed = connection.execute(
+        r#"UPDATE session_turns
+           SET status = 'interrupted', completed_at = ?1
+           WHERE session_id = ?2 AND id = ?3 AND status = 'open'"#,
+        params![timestamp, job.session_id, job.turn_id],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::ConcurrentModification);
+    }
+
+    let terminal_sequence = next_session_sequence(summary.sequence)?;
+    let event = build_session_event(
+        &job.session_id,
+        terminal_sequence,
+        &timestamp,
+        SessionEventData::TurnInterrupted {
+            turn_id: job.turn_id.clone(),
+            reason: reason.to_owned(),
+        },
+    );
+    insert_session_event(connection, &job.session_id, &event)?;
+    update_session_projection(
+        connection,
+        &job.session_id,
+        summary.sequence,
+        SessionStatus::NeedsAttention,
+        None,
+        terminal_sequence,
+        &timestamp,
+    )?;
+    let changed = connection.execute(
+        r#"UPDATE reply_jobs
+           SET status = ?1, error_json = ?2, completion_fingerprint = ?3,
+               terminal_event_sequence = ?4, finished_at = ?5
+           WHERE id = ?6 AND status = 'started' AND attempt = 1"#,
+        params![
+            reply_status_to_db(&terminal_status),
+            serde_json::to_string(error_json)?,
+            fingerprint,
+            u64_to_i64(terminal_sequence, "reply terminal event sequence")?,
+            timestamp,
+            job.id,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::ConcurrentModification);
+    }
+    query_reply_completion(connection, &job.id, false)
+}
+
+fn replay_reply_completion(
+    connection: &Connection,
+    job: ReplyJob,
+    expected_status: ReplyJobStatus,
+    expected_fingerprint: &str,
+) -> Result<ReplyCompletion, StorageError> {
+    if job.status != expected_status {
+        return Err(StorageError::InvalidReplyTransition(format!(
+            "reply job `{}` is already {:?}",
+            job.id, job.status
+        )));
+    }
+    let stored_fingerprint = query_reply_completion_fingerprint(connection, &job.id)?;
+    if stored_fingerprint.as_deref() != Some(expected_fingerprint) {
+        return Err(StorageError::IdempotencyConflict);
+    }
+    query_reply_completion(connection, &job.id, true)
 }
 
 fn flush_turn(
@@ -1421,6 +2527,7 @@ fn flush_turn(
             SessionEventData::AssistantMessage {
                 turn_id: request.turn_id.clone(),
                 content: message.clone(),
+                provenance: None,
             },
         );
         insert_session_event(&transaction, session_id, &event)?;
@@ -1572,8 +2679,14 @@ fn resume_session(
 fn recover_open_turns(connection: &mut Connection) -> Result<Vec<SessionEvent>, StorageError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut statement = transaction.prepare(
-        r#"SELECT session_id, id FROM session_turns
-           WHERE status = 'open' ORDER BY session_id, ordinal"#,
+        r#"SELECT t.session_id, t.id FROM session_turns t
+           WHERE t.status = 'open'
+             AND NOT EXISTS (
+                 SELECT 1 FROM reply_jobs j
+                 WHERE j.session_id = t.session_id AND j.turn_id = t.id
+                   AND j.status IN ('queued', 'started')
+             )
+           ORDER BY t.session_id, t.ordinal"#,
     )?;
     let open_turns = statement
         .query_map([], |row| {
@@ -1626,6 +2739,274 @@ fn recover_open_turns(connection: &mut Connection) -> Result<Vec<SessionEvent>, 
     }
     transaction.commit()?;
     Ok(recovered)
+}
+
+fn query_reply_job_optional(
+    connection: &Connection,
+    job_id: &str,
+) -> Result<Option<ReplyJob>, StorageError> {
+    connection
+        .query_row(
+            r#"SELECT id, actor_user_id, session_id, turn_id, provider_name, model_name,
+                      status, attempt, request_json, response_json, error_json,
+                      queued_at, started_at, finished_at, completion_fingerprint,
+                      assistant_event_sequence, terminal_event_sequence
+               FROM reply_jobs WHERE id = ?1"#,
+            [job_id],
+            decode_reply_job_row,
+        )
+        .optional()?
+        .map(StoredReplyJobRow::decode)
+        .transpose()
+}
+
+fn query_reply_job(connection: &Connection, job_id: &str) -> Result<ReplyJob, StorageError> {
+    query_reply_job_optional(connection, job_id)?
+        .ok_or_else(|| StorageError::ReplyJobNotFound(job_id.to_owned()))
+}
+
+fn query_reply_job_for_turn(
+    connection: &Connection,
+    session_id: &str,
+    turn_id: &str,
+) -> Result<ReplyJob, StorageError> {
+    connection
+        .query_row(
+            r#"SELECT id, actor_user_id, session_id, turn_id, provider_name, model_name,
+                      status, attempt, request_json, response_json, error_json,
+                      queued_at, started_at, finished_at, completion_fingerprint,
+                      assistant_event_sequence, terminal_event_sequence
+               FROM reply_jobs WHERE session_id = ?1 AND turn_id = ?2"#,
+            params![session_id, turn_id],
+            decode_reply_job_row,
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StorageError::CorruptData(format!(
+                "reply-backed turn `{turn_id}` in session `{session_id}` has no queue record"
+            ))
+        })?
+        .decode()
+}
+
+fn decode_reply_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredReplyJobRow> {
+    Ok(StoredReplyJobRow {
+        id: row.get(0)?,
+        actor_user_id: row.get(1)?,
+        session_id: row.get(2)?,
+        turn_id: row.get(3)?,
+        provider_name: row.get(4)?,
+        model_name: row.get(5)?,
+        status: row.get(6)?,
+        attempt: row.get(7)?,
+        request_json: row.get(8)?,
+        response_json: row.get(9)?,
+        error_json: row.get(10)?,
+        queued_at: row.get(11)?,
+        started_at: row.get(12)?,
+        finished_at: row.get(13)?,
+        completion_fingerprint: row.get(14)?,
+        assistant_event_sequence: row.get(15)?,
+        terminal_event_sequence: row.get(16)?,
+    })
+}
+
+fn query_reply_completion_fingerprint(
+    connection: &Connection,
+    job_id: &str,
+) -> Result<Option<String>, StorageError> {
+    connection
+        .query_row(
+            "SELECT completion_fingerprint FROM reply_jobs WHERE id = ?1",
+            [job_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| StorageError::ReplyJobNotFound(job_id.to_owned()))
+}
+
+fn query_reply_completion(
+    connection: &Connection,
+    job_id: &str,
+    replayed: bool,
+) -> Result<ReplyCompletion, StorageError> {
+    let job = query_reply_job(connection, job_id)?;
+    let terminal_sequence = job.terminal_event_sequence.ok_or_else(|| {
+        StorageError::CorruptData(format!(
+            "terminal reply job `{job_id}` has no terminal event sequence"
+        ))
+    })?;
+    let terminal_event = query_session_event(connection, &job.session_id, terminal_sequence)?;
+    let mut events = Vec::with_capacity(if job.status == ReplyJobStatus::Succeeded {
+        2
+    } else {
+        1
+    });
+    match job.status {
+        ReplyJobStatus::Succeeded => {
+            let assistant_sequence = job.assistant_event_sequence.ok_or_else(|| {
+                StorageError::CorruptData(format!(
+                    "succeeded reply job `{job_id}` has no assistant event sequence"
+                ))
+            })?;
+            let assistant_event =
+                query_session_event(connection, &job.session_id, assistant_sequence)?;
+            if !matches!(
+                &assistant_event.data,
+                SessionEventData::AssistantMessage { turn_id, .. } if turn_id == &job.turn_id
+            ) || !matches!(
+                &terminal_event.data,
+                SessionEventData::TurnFlushed { turn_id } if turn_id == &job.turn_id
+            ) {
+                return Err(StorageError::CorruptData(format!(
+                    "succeeded reply job `{job_id}` points at incompatible ledger events"
+                )));
+            }
+            events.push(assistant_event);
+            events.push(terminal_event);
+        }
+        ReplyJobStatus::Failed | ReplyJobStatus::OutcomeUnknown => {
+            if !matches!(
+                &terminal_event.data,
+                SessionEventData::TurnInterrupted { turn_id, .. } if turn_id == &job.turn_id
+            ) {
+                return Err(StorageError::CorruptData(format!(
+                    "interrupted reply job `{job_id}` points at an incompatible ledger event"
+                )));
+            }
+            events.push(terminal_event);
+        }
+        ReplyJobStatus::Queued | ReplyJobStatus::Started => {
+            return Err(StorageError::InvalidReplyTransition(format!(
+                "reply job `{job_id}` is not terminal"
+            )));
+        }
+    }
+    Ok(ReplyCompletion {
+        session: query_session_summary(connection, &job.session_id)?,
+        turn: query_session_turn(connection, &job.session_id, &job.turn_id)?,
+        job,
+        events,
+        replayed,
+    })
+}
+
+fn query_session_event(
+    connection: &Connection,
+    session_id: &str,
+    sequence: u64,
+) -> Result<SessionEvent, StorageError> {
+    let sequence = u64_to_i64(sequence, "session event sequence")?;
+    connection
+        .query_row(
+            r#"SELECT sequence, event_id, event_kind, payload_version, payload_json,
+                      turn_id, created_at
+               FROM session_events WHERE session_id = ?1 AND sequence = ?2"#,
+            params![session_id, sequence],
+            |row| {
+                Ok(StoredSessionEventRow {
+                    sequence: row.get(0)?,
+                    event_id: row.get(1)?,
+                    event_kind: row.get(2)?,
+                    payload_version: row.get(3)?,
+                    payload_json: row.get(4)?,
+                    turn_id: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StorageError::CorruptData(format!(
+                "session `{session_id}` has no event at sequence {sequence}"
+            ))
+        })?
+        .decode()
+}
+
+fn require_open_reply_turn(
+    connection: &Connection,
+    job: &ReplyJob,
+) -> Result<SessionSummary, StorageError> {
+    let summary = query_session_summary(connection, &job.session_id)?;
+    if summary.status != SessionStatus::Running
+        || summary.active_turn_id.as_deref() != Some(job.turn_id.as_str())
+    {
+        return Err(StorageError::CorruptData(format!(
+            "reply job `{}` disagrees with session `{}` projection",
+            job.id, job.session_id
+        )));
+    }
+    let turn = query_session_turn(connection, &job.session_id, &job.turn_id)?;
+    if turn.status != SessionTurnStatus::Open {
+        return Err(StorageError::CorruptData(format!(
+            "reply job `{}` targets a non-open turn",
+            job.id
+        )));
+    }
+    Ok(summary)
+}
+
+fn require_reply_job_matches_spec(job: &ReplyJob, spec: &ReplyJobSpec) -> Result<(), StorageError> {
+    if job.id != spec.id
+        || job.actor_user_id != spec.actor_user_id
+        || job.provider_name != spec.provider_name
+        || job.model_name != spec.model_name
+        || job.request_json != spec.request_json
+    {
+        return Err(StorageError::IdempotencyConflict);
+    }
+    Ok(())
+}
+
+fn require_reply_provenance_matches_job(
+    job: &ReplyJob,
+    provenance: &AssistantReplyProvenance,
+) -> Result<(), StorageError> {
+    if job.provider_name != provenance.provider_id || job.model_name != provenance.model {
+        return Err(StorageError::InvalidReplyTransition(format!(
+            "reply provenance does not match immutable job `{}` configuration",
+            job.id
+        )));
+    }
+    Ok(())
+}
+
+fn require_active_reply_actor(
+    connection: &Connection,
+    session_id: &str,
+    actor_user_id: &str,
+) -> Result<(), StorageError> {
+    require_active_user(connection, actor_user_id)?;
+    let owner = connection
+        .query_row(
+            "SELECT owner_user_id FROM sessions WHERE id = ?1",
+            [session_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .ok_or_else(|| StorageError::SessionNotFound(session_id.to_owned()))?;
+    if owner.as_deref() != Some(actor_user_id) {
+        return Err(StorageError::InvalidReplyTransition(format!(
+            "user `{actor_user_id}` does not own session `{session_id}`"
+        )));
+    }
+    Ok(())
+}
+
+fn require_active_user(connection: &Connection, actor_user_id: &str) -> Result<(), StorageError> {
+    let status = connection
+        .query_row(
+            "SELECT status FROM users WHERE id = ?1",
+            [actor_user_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| StorageError::UserNotFound(actor_user_id.to_owned()))?;
+    if status != "active" {
+        return Err(StorageError::UserDisabled(actor_user_id.to_owned()));
+    }
+    Ok(())
 }
 
 fn query_session_summary(
@@ -1860,6 +3241,28 @@ fn session_command_fingerprint<T: Serialize>(
     }))?)
 }
 
+fn reply_start_fingerprint(
+    session_id: &str,
+    request: &StartTurnRequest,
+    job: &ReplyJobSpec,
+) -> Result<String, StorageError> {
+    Ok(serde_json::to_string(&json!({
+        "session_id": session_id,
+        "request": request,
+        "reply_job": job,
+    }))?)
+}
+
+fn reply_completion_fingerprint<T: Serialize>(
+    kind: &str,
+    commit: &T,
+) -> Result<String, StorageError> {
+    Ok(serde_json::to_string(&json!({
+        "kind": kind,
+        "commit": commit,
+    }))?)
+}
+
 fn load_session_command_receipt<T: DeserializeOwned>(
     connection: &Connection,
     idempotency_key: &str,
@@ -1869,8 +3272,10 @@ fn load_session_command_receipt<T: DeserializeOwned>(
     let stored = connection
         .query_row(
             r#"SELECT operation, request_fingerprint, response_json
-               FROM session_command_receipts WHERE idempotency_key = ?1"#,
-            [idempotency_key],
+               FROM session_command_receipts
+               WHERE actor_scope = '__legacy__' AND operation = ?1
+                 AND idempotency_key = ?2"#,
+            params![operation, idempotency_key],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -1884,6 +3289,37 @@ fn load_session_command_receipt<T: DeserializeOwned>(
         return Ok(None);
     };
     if stored_operation != operation || stored_fingerprint != request_fingerprint {
+        return Err(StorageError::IdempotencyConflict);
+    }
+    let value: Value = serde_json::from_str(&response_json)?;
+    if value.get("replayed") != Some(&Value::Bool(false)) {
+        return Err(StorageError::CorruptData(
+            "stored session command receipt must contain the original response".into(),
+        ));
+    }
+    Ok(Some(serde_json::from_value(value)?))
+}
+
+fn load_session_command_receipt_for_actor<T: DeserializeOwned>(
+    connection: &Connection,
+    actor_scope: &str,
+    idempotency_key: &str,
+    operation: &str,
+    request_fingerprint: &str,
+) -> Result<Option<T>, StorageError> {
+    let stored = connection
+        .query_row(
+            r#"SELECT request_fingerprint, response_json
+               FROM session_command_receipts
+               WHERE actor_scope = ?1 AND operation = ?2 AND idempotency_key = ?3"#,
+            params![actor_scope, operation, idempotency_key],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((stored_fingerprint, response_json)) = stored else {
+        return Ok(None);
+    };
+    if stored_fingerprint != request_fingerprint {
         return Err(StorageError::IdempotencyConflict);
     }
     let value: Value = serde_json::from_str(&response_json)?;
@@ -1911,6 +3347,36 @@ fn insert_session_command_receipt<T: Serialize>(
                session_id, event_sequence, created_at
            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
         params![
+            idempotency_key,
+            operation,
+            request_fingerprint,
+            serde_json::to_string(response)?,
+            session_id,
+            u64_to_i64(event_sequence, "session receipt event sequence")?,
+            now(),
+        ],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_session_command_receipt_for_actor<T: Serialize>(
+    connection: &Connection,
+    actor_scope: &str,
+    idempotency_key: &str,
+    operation: &str,
+    request_fingerprint: &str,
+    response: &T,
+    session_id: &str,
+    event_sequence: u64,
+) -> Result<(), StorageError> {
+    connection.execute(
+        r#"INSERT INTO session_command_receipts(
+               actor_scope, idempotency_key, operation, request_fingerprint,
+               response_json, session_id, event_sequence, created_at
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+        params![
+            actor_scope,
             idempotency_key,
             operation,
             request_fingerprint,
@@ -1960,6 +3426,37 @@ fn validate_message(value: &str, field: &'static str) -> Result<(), StorageError
         )))
     } else {
         Ok(())
+    }
+}
+
+fn validate_reply_job_spec(job: &ReplyJobSpec) -> Result<(), StorageError> {
+    normalized_reply_value(&job.id, "reply job ID")?;
+    normalized_account_value(&job.actor_user_id, "reply actor user ID", 128)?;
+    normalized_reply_value(&job.provider_name, "reply provider name")?;
+    if let Some(model_name) = &job.model_name {
+        normalized_reply_value(model_name, "reply model name")?;
+    }
+    Ok(())
+}
+
+fn validate_reply_provenance(provenance: &AssistantReplyProvenance) -> Result<(), StorageError> {
+    normalized_reply_value(&provenance.provider_id, "assistant reply provider ID")?;
+    if let Some(model) = &provenance.model {
+        normalized_reply_value(model, "assistant reply model")?;
+    }
+    Ok(())
+}
+
+fn normalized_reply_value<'a>(
+    value: &'a str,
+    field: &'static str,
+) -> Result<&'a str, StorageError> {
+    if value.is_empty() || value.trim() != value || value.chars().any(char::is_control) {
+        Err(StorageError::InvalidReplyTransition(format!(
+            "{field} must be non-empty, canonical, and control-free"
+        )))
+    } else {
+        Ok(value)
     }
 }
 
@@ -2797,6 +4294,63 @@ fn normalized_identifier<'a>(value: &'a str, field: &'static str) -> Result<&'a 
     }
 }
 
+fn normalized_account_value<'a>(
+    value: &'a str,
+    field: &'static str,
+    max_bytes: usize,
+) -> Result<&'a str, StorageError> {
+    if value.is_empty()
+        || value.trim() != value
+        || value.len() > max_bytes
+        || value.chars().any(char::is_control)
+    {
+        return Err(StorageError::InvalidAccountData(format!(
+            "{field} must be canonical, control-free, and at most {max_bytes} bytes"
+        )));
+    }
+    Ok(value)
+}
+
+fn normalized_token_hash<'a>(value: &'a str, field: &'static str) -> Result<&'a str, StorageError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(StorageError::InvalidAccountData(format!(
+            "{field} must be a lowercase SHA-256 hex digest"
+        )));
+    }
+    Ok(value)
+}
+
+fn normalized_password_hash(value: &str) -> Result<&str, StorageError> {
+    if !value.starts_with("$argon2id$") || value.len() > 1024 || value.chars().any(char::is_control)
+    {
+        return Err(StorageError::InvalidAccountData(
+            "password hash must be a bounded Argon2id PHC string".into(),
+        ));
+    }
+    Ok(value)
+}
+
+fn normalized_timestamp<'a>(value: &'a str, field: &'static str) -> Result<&'a str, StorageError> {
+    chrono::DateTime::parse_from_rfc3339(value).map_err(|_| {
+        StorageError::InvalidAccountData(format!("{field} must be an RFC 3339 timestamp"))
+    })?;
+    Ok(value)
+}
+
+fn normalized_theme(value: &str) -> Result<&str, StorageError> {
+    if matches!(value, "system" | "light" | "dark") {
+        Ok(value)
+    } else {
+        Err(StorageError::InvalidAccountData(format!(
+            "unsupported theme `{value}`"
+        )))
+    }
+}
+
 fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
@@ -2960,6 +4514,29 @@ fn session_turn_status_from_db(value: &str) -> Result<SessionTurnStatus, Storage
         "interrupted" => Ok(SessionTurnStatus::Interrupted),
         other => Err(StorageError::CorruptData(format!(
             "unknown session turn status `{other}`"
+        ))),
+    }
+}
+
+fn reply_status_to_db(status: &ReplyJobStatus) -> &'static str {
+    match status {
+        ReplyJobStatus::Queued => "queued",
+        ReplyJobStatus::Started => "started",
+        ReplyJobStatus::Succeeded => "succeeded",
+        ReplyJobStatus::Failed => "failed",
+        ReplyJobStatus::OutcomeUnknown => "outcome_unknown",
+    }
+}
+
+fn reply_status_from_db(value: &str) -> Result<ReplyJobStatus, StorageError> {
+    match value {
+        "queued" => Ok(ReplyJobStatus::Queued),
+        "started" => Ok(ReplyJobStatus::Started),
+        "succeeded" => Ok(ReplyJobStatus::Succeeded),
+        "failed" => Ok(ReplyJobStatus::Failed),
+        "outcome_unknown" => Ok(ReplyJobStatus::OutcomeUnknown),
+        other => Err(StorageError::CorruptData(format!(
+            "unknown reply job status `{other}`"
         ))),
     }
 }
@@ -3191,6 +4768,124 @@ impl StoredSnapshotRow {
                 .tool_policy_json
                 .map(|value| serde_json::from_str(&value))
                 .transpose()?,
+        })
+    }
+}
+
+struct StoredReplyJobRow {
+    id: String,
+    actor_user_id: String,
+    session_id: String,
+    turn_id: String,
+    provider_name: String,
+    model_name: Option<String>,
+    status: String,
+    attempt: i64,
+    request_json: String,
+    response_json: Option<String>,
+    error_json: Option<String>,
+    queued_at: String,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+    completion_fingerprint: Option<String>,
+    assistant_event_sequence: Option<i64>,
+    terminal_event_sequence: Option<i64>,
+}
+
+impl StoredReplyJobRow {
+    fn decode(self) -> Result<ReplyJob, StorageError> {
+        let status = reply_status_from_db(&self.status)?;
+        let attempt = u32::try_from(self.attempt)
+            .map_err(|_| StorageError::IntegerOutOfRange("reply job attempt"))?;
+        let assistant_event_sequence = self
+            .assistant_event_sequence
+            .map(|value| i64_to_u64(value, "assistant reply event sequence"))
+            .transpose()?;
+        let terminal_event_sequence = self
+            .terminal_event_sequence
+            .map(|value| i64_to_u64(value, "reply terminal event sequence"))
+            .transpose()?;
+        let shape_is_valid = match status {
+            ReplyJobStatus::Queued => {
+                attempt == 0
+                    && self.response_json.is_none()
+                    && self.error_json.is_none()
+                    && self.completion_fingerprint.is_none()
+                    && self.started_at.is_none()
+                    && self.finished_at.is_none()
+                    && assistant_event_sequence.is_none()
+                    && terminal_event_sequence.is_none()
+            }
+            ReplyJobStatus::Started => {
+                attempt == 1
+                    && self.response_json.is_none()
+                    && self.error_json.is_none()
+                    && self.completion_fingerprint.is_none()
+                    && self.started_at.is_some()
+                    && self.finished_at.is_none()
+                    && assistant_event_sequence.is_none()
+                    && terminal_event_sequence.is_none()
+            }
+            ReplyJobStatus::Succeeded => {
+                attempt == 1
+                    && self.response_json.is_some()
+                    && self.error_json.is_none()
+                    && self.completion_fingerprint.is_some()
+                    && self.started_at.is_some()
+                    && self.finished_at.is_some()
+                    && assistant_event_sequence.is_some()
+                    && terminal_event_sequence
+                        == assistant_event_sequence.and_then(|sequence| sequence.checked_add(1))
+            }
+            ReplyJobStatus::Failed | ReplyJobStatus::OutcomeUnknown => {
+                attempt == 1
+                    && self.response_json.is_none()
+                    && self.error_json.is_some()
+                    && self.completion_fingerprint.is_some()
+                    && self.started_at.is_some()
+                    && self.finished_at.is_some()
+                    && assistant_event_sequence.is_none()
+                    && terminal_event_sequence.is_some()
+            }
+        };
+        if !shape_is_valid {
+            return Err(StorageError::CorruptData(format!(
+                "reply job `{}` status disagrees with its durable fields",
+                self.id
+            )));
+        }
+        if let Some(fingerprint) = &self.completion_fingerprint {
+            let value: Value = serde_json::from_str(fingerprint)?;
+            if !value.is_object() {
+                return Err(StorageError::CorruptData(format!(
+                    "reply job `{}` has a non-object completion fingerprint",
+                    self.id
+                )));
+            }
+        }
+        Ok(ReplyJob {
+            id: self.id,
+            actor_user_id: self.actor_user_id,
+            session_id: self.session_id,
+            turn_id: self.turn_id,
+            provider_name: self.provider_name,
+            model_name: self.model_name,
+            status,
+            attempt,
+            request_json: serde_json::from_str(&self.request_json)?,
+            response_json: self
+                .response_json
+                .map(|value| serde_json::from_str(&value))
+                .transpose()?,
+            error_json: self
+                .error_json
+                .map(|value| serde_json::from_str(&value))
+                .transpose()?,
+            queued_at: self.queued_at,
+            started_at: self.started_at,
+            finished_at: self.finished_at,
+            assistant_event_sequence,
+            terminal_event_sequence,
         })
     }
 }

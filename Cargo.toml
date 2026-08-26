@@ -28,11 +28,14 @@ rusqlite = { version = "0.37.0", features = ["bundled"] }
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tower = { version = "0.5.2", features = ["util"] }
+zeroize = "1.8.1"
 
 authz = { path = "crates/authz" }
 connectors = { path = "crates/connectors" }
 kernel = { path = "crates/kernel" }
+llm = { path = "crates/llm" }
 protocol = { path = "crates/protocol" }
 runtime = { path = "crates/runtime" }
 storage = { path = "crates/storage" }
+tenancy = { path = "crates/tenancy" }
 tools = { path = "crates/tools" }

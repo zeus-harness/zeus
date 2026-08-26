@@ -1,10 +1,11 @@
 # Zeus Harness
 
 Zeus Harness is an early Rust and SvelteKit vertical slice toward an auditable
-agent runtime. The current Alpha slice demonstrates a durable conversation
+agent runtime. The current Alpha+ slice demonstrates a durable conversation
 Session attached to an incident Run, independent ordered Session and Run event
-streams, a guarded approval flow, and local recovery through SQLite. Messages
-are persisted as durable turns with an explicit `session/flush` barrier. Its web
+streams, a guarded approval flow, local owner authentication, and recovery
+through SQLite. A user message and its reply job commit atomically; only the
+server-side worker may append assistant output and close the turn. Its web
 interface deliberately follows the compact, conversation-first shape of
 DeepSeek Harness rather than a dense operations dashboard.
 
@@ -16,9 +17,10 @@ real, path-constrained marker executor for testing the complete loop. Restate,
 MinIO, the networkless tool sandbox, and optional PostgreSQL are development
 topology for later milestones; they are not application state authorities.
 
-This Alpha has no user authentication or tenant isolation. Keep its HTTP/SSE
-endpoints on an isolated workstation; do not expose the host, Compose, or Apple
-Container addresses through a public or shared-network reverse proxy.
+Alpha+ supports exactly one local owner. A future `member` role is reserved in
+the schema but cannot authenticate through this build; multi-user resource
+isolation is not enabled yet. Keep the service loopback/private-network only,
+and do not expose it as a shared or Internet-facing deployment.
 
 ## Prerequisites
 
@@ -54,6 +56,25 @@ cargo run -p zeus-api
 ZEUS_API_URL=http://127.0.0.1:8081 \
 pnpm --filter web dev --host 127.0.0.1 --port 3000
 ```
+
+On every startup while a database is still unconfigured, the API rotates the
+owner setup token, invalidates the previous token, and prints the new bearer
+once to that process's terminal. Open the Web UI, enter the current token, and
+choose a username plus a password of at least 12 characters. After owner setup,
+later restarts preserve the owner and no longer print a setup token.
+
+With no model configuration, the durable reply worker returns an explicit
+non-model local message. Configure an OpenAI-compatible Chat Completions
+provider by setting all three variables together:
+
+```sh
+ZEUS_LLM_ENDPOINT=https://provider.example/v1/chat/completions
+ZEUS_LLM_MODEL=your-model
+ZEUS_LLM_API_KEY=your-secret
+```
+
+Partial provider configuration fails startup. The endpoint and key are never
+writable through the browser Settings API.
 
 To exercise the only executable Alpha connector, use a separate database and
 an explicit fixed root. The caller supplies marker text only; it cannot choose
@@ -169,6 +190,12 @@ open the printed `gateway direct URL` when the published URL is unavailable.
 All local probes bypass proxy environment variables and have bounded connect
 and response timeouts.
 
+`verify` checks the Web/API/gateway paths, the public auth status contract, and
+that an anonymous request cannot reach the protected overview. Because the
+helper does not retain an owner's password, `restart-verify` checks that the
+configured/unconfigured owner state survives named-volume recreation; the
+authenticated ledger and reply flow are covered by host and storage tests.
+
 For image builds, the helper copies a filtered context to a physical path under
 the repository and removes it afterward. This avoids Apple's reported
 [empty temporary build context](https://github.com/apple/container/issues/2037)
@@ -210,20 +237,21 @@ and bounded memory, CPU, and PID resources.
 - Session and Run each have their own contiguous sequence and append-only
   ledger. Their sequence numbers order replay within that ledger only and must
   not be compared with each other or used as idempotency keys.
-- Session creation writes the projection, `session_created` event, and first
-  response receipt in one `BEGIN IMMEDIATE` transaction.
+- Authenticated Session creation writes the owner, projection,
+  `session_created` event, and actor-scoped response receipt in one
+  `BEGIN IMMEDIATE` transaction.
 - Starting a turn requires the expected Session sequence. It atomically creates
-  the open turn, appends `user_message`, advances the Session to `running`, and
-  stores the first response receipt.
-- Flushing the active turn also uses Session sequence compare-and-swap. One
-  transaction stores an optional assistant message, closes the turn, appends
-  `turn_flushed`, returns the Session to `ready`, stores the response receipt,
-  and returns `ack.durability_sequence` for the committed barrier.
-- A Session left with an open turn at process restart is atomically marked
-  `interrupted`; Zeus appends `turn_interrupted` and moves the Session to
-  `needs_attention`. Recovery never manufactures a flush acknowledgement. An
-  idempotent, sequence-checked resume command must return it to `ready` before
-  another turn starts.
+  the open turn, appends `user_message`, advances the Session to `running`,
+  stores the actor-scoped response receipt, and enqueues immutable reply work.
+- The worker commits a `started` checkpoint before calling a provider. Success
+  atomically stores the assistant message, appends `assistant_message` and
+  `turn_flushed`, marks the job succeeded, and returns the Session to `ready`.
+  Provider failure appends `turn_interrupted`, marks the job failed, and moves
+  the Session to `needs_attention` without fabricating assistant content.
+- Queued replies survive restart and remain claimable. A reply already marked
+  `started` becomes `outcome_unknown` exactly once and is never automatically
+  replayed, because the provider call may have incurred an external effect.
+  Other open turns follow the same interruption/resume contract.
 - Session commands do not change the Run ledger or wake the dispatch worker.
   Session and Run are joined by durable ownership, not by sharing an event
   sequence or transaction stream.
@@ -242,7 +270,8 @@ and bounded memory, CPU, and PID resources.
 - Events become visible to live subscribers only after the transaction commits.
   Process-local broadcast is a latency hint; SSE also polls the durable ledger
   every two seconds from its last sequence cursor so a missed hint cannot leave
-  the stream permanently behind.
+  the stream permanently behind. Authenticated streams revalidate the login
+  session on each wake/poll and close after logout, expiry, or disablement.
 - Unknown event kinds or payload versions fail closed during recovery.
 - SQLite runs with foreign keys, a busy timeout, WAL for file databases, and
   full synchronous durability.
@@ -252,12 +281,12 @@ and bounded memory, CPU, and PID resources.
 - SIGINT or SIGTERM first starts graceful HTTP draining, then closes any
   remaining long-lived SSE connection after five seconds. This bound ensures
   every store clone and the SQLite lease are released during container stop.
-- Schema v4 adds durable Sessions, Session-to-Run ownership, turns, Session
-  events, command receipts, and an immutable `primary_session_id`. Each pre-v4
-  Run is attached to a generated `session-{run_id}` without rewriting or
-  discarding its Run events. Runtime identity binds profile, environment,
-  primary Session and Run, policy ID, and policy revision; a mismatch fails
-  startup.
+- Schema v4 adds durable Sessions and their ledger. Schema v5 adds local users,
+  auth sessions, owner references, bootstrap credentials, and preferences;
+  v6 migrates command receipts to actor scopes; v7 adds the forward-only reply
+  queue. Existing Runs and events are migrated in place without rewriting
+  history. Runtime identity still binds profile, environment, primary Session
+  and Run, policy ID, and policy revision; a mismatch fails startup.
 
 SQLite is the authoritative store for this local single-instance Alpha. Do not
 place it on NFS or share one database volume between multiple Zeus replicas.
@@ -271,6 +300,22 @@ directly.
 
 ## HTTP contract
 
+- `GET /health/live` and `GET /health/ready` are public. The remaining public
+  surface is limited to `GET /api/v1/auth/status`, first-owner
+  `POST /api/v1/auth/bootstrap`, and `POST /api/v1/auth/login`.
+- Bootstrap and login require an exact same-origin `Origin`/`Host` pair. A
+  successful bootstrap or login issues an opaque `HttpOnly; SameSite=Strict`
+  login cookie plus a separate CSRF cookie. When the browser-facing origin is
+  HTTPS, the operator must set `ZEUS_COOKIE_SECURE=true`; then both cookies are
+  emitted with `Secure`.
+- Every business REST/SSE route requires the active local owner. Protected
+  state changes additionally require `X-CSRF-Token` to match the login and an
+  exact same-origin request. Alpha+ deliberately rejects the schema-reserved
+  `member` role until every storage command and query is actor-scoped.
+- `GET /api/v1/me/settings` returns the current safe preferences.
+  `PATCH /api/v1/me/settings` accepts `theme`, optional allowlisted
+  `preferred_model`, and `expected_revision`. Provider endpoints and API keys
+  are server-only configuration and never cross this API.
 - `GET /api/v1/overview` returns `primary_session_id`, the current profile's
   primary Run, and its complete recent Run ledger.
 - `GET /api/v1/sessions` lists Session summaries. `POST /api/v1/sessions`
@@ -279,10 +324,14 @@ directly.
 - `GET /api/v1/sessions/{session_id}` returns its summary, attached Run IDs,
   turns, and ordered Session events.
 - `POST /api/v1/sessions/{session_id}/turns` accepts
-  `{"turn_id":...,"user_message":...,"expected_sequence":...}`.
-- `POST /api/v1/sessions/{session_id}/turns/{turn_id}/flush` accepts the same
-  `turn_id`, optional `assistant_message`, and `expected_sequence`. Path and
-  body IDs must match; success returns `ack.durability_sequence`.
+  `{"turn_id":...,"user_message":...,"expected_sequence":...}`, atomically
+  persists the user turn and a durable reply job, and returns `202`. The
+  server-side worker later commits either the assistant reply or an explicit
+  interrupted/needs-attention event through Session SSE.
+- Browsers cannot submit assistant content. The legacy
+  `POST /api/v1/sessions/{session_id}/turns/{turn_id}/flush` route exists only
+  in the unauthenticated storage/runtime contract-test router and is absent
+  from the real authenticated server.
 - `POST /api/v1/sessions/{session_id}/resume` accepts
   `{"expected_sequence":...}` and only resumes a Session in
   `needs_attention`.
@@ -295,17 +344,20 @@ directly.
   `{"decision":"approve|reject","note":...}` and requires an
   `Idempotency-Key` header. Approval identity comes from the path, not a caller-
   selected tool payload.
-- Every POST requires a non-empty `Idempotency-Key`. Invalid input returns 400;
-  missing resources return 404; duplicate identity, idempotency conflict,
-  invalid state, or sequence conflict returns 409 as
+- Session creation, turn start, resume, and approval-decision commands require
+  a non-empty `Idempotency-Key`. Authentication/logout and optimistic settings
+  updates use their own replay/concurrency rules. Invalid input returns 400;
+  missing or unowned resources return 404; unauthenticated requests return
+  401; CSRF/origin rejection returns 403; duplicate identity, idempotency
+  conflict, invalid state, or sequence conflict returns 409 as
   `application/problem+json`.
 - Internal execution-invariant failures return a stable, redacted
   `500 runtime_unavailable`. Storage, policy-build, connector-configuration, or
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Schema v4 supports durable Run attachment during migration and demo seeding,
-but Alpha does not expose a public attach-Run HTTP route.
+Schema v7 retains durable Run attachment during migration and demo seeding,
+but Alpha+ does not expose a public attach-Run HTTP route.
 
 Session identifiers, titles, and messages currently have canonical/non-empty
 validation but no explicit per-field byte quota, and detail routes return the
@@ -358,57 +410,41 @@ committed data. Use SQLite's backup/checkpoint facilities.
 
 ## Verification status
 
-Current automated host verification:
+Current Alpha+ host verification:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --all-targets` (99 tests, including real
-  child-process database-lock and active-SSE SIGTERM checks plus out-of-order
-  Run broadcast reconciliation)
-- `pnpm --filter web test` (10 tests covering stable and rebased command
-  identity, lost-response retries, persisted-attempt validation and ownership,
-  Session event merging, and cross-ledger timeline ordering)
-- `pnpm --filter web check`, `lint`, and `build`
+- `cargo test --workspace --all-targets`: 130 tests passed, including the real
+  child-process database lease and active-SSE SIGTERM checks, authentication,
+  durable reply provenance, concurrent claim, restart recovery, and provider
+  `outcome_unknown` semantics.
+- `pnpm --filter web test`: 19 tests passed for CSRF headers, stable command
+  identity, active-Session restore, Session event merging, and theme behavior.
+- `pnpm --filter web check`: zero errors and zero warnings.
+- `pnpm --filter web lint` and `pnpm --filter web build`: passed; the Node
+  adapter production artifact was generated.
+- Svelte autofixer reported no issues or suggestions for the changed login,
+  sidebar, settings, header, timeline, and page components.
 
-Earlier live host acceptance retained for the Run and connector path:
+Live Alpha+ acceptance on the host covered first-owner setup, login/logout,
+real Session creation and selection, refresh restore, dark mode, and a
+server-side local-fallback reply delivered through the durable worker/SSE path.
+The final API replay at `127.0.0.1:8081` committed a user message at sequence 2,
+an `assistant_message` carrying `local-fallback/non_model_fallback` provenance
+at sequence 3, and `turn_flushed` at sequence 4. Settings revision and revoked
+session rejection were also verified. The page at `127.0.0.1:3001` had no
+browser console errors.
 
-- Svelte autofixer on all eight Web components: no issues or suggestions
-- real production-profile HTTP/SSE: approval event `9`, checkpoint `10`, and
-  `not_dispatched / executor_unavailable` result `11`; a process stop/start
-  preserved all 11 events, and the same key replay added no event `12`
-- real local-development HTTP: allow-once advanced through sequence `7` to
-  `succeeded`, created one marker, and an idempotent replay still left one file
-- simulated restart after a committed checkpoint but before connector execution:
-  durable `outcome_unknown`, `needs_attention`, attempt count `1`, and no marker
-- schema v1/v3 to v4 live migration preserved the Run ledger; Session
-  start/flush advanced `2 → 3 → 5`, returned durability acknowledgement `5`,
-  replayed the same command without another event, and left the Run unchanged
-- a forced process death with an open turn recovered exactly one
-  `turn_interrupted`, moved the Session to `needs_attention`, and required an
-  idempotent explicit resume; no fabricated flush acknowledgement was emitted
-- SIGTERM with live Run and Session SSE connections exited at the five-second
-  bound, closed both streams, released `.zeus.lock`, and left SQLite integrity
-  `ok`
-- browser verification at `127.0.0.1:3001`: Live API data, explicit queued /
-  running / not-dispatched labels, persisted Session messages in one compact
-  timeline, `Saved through session event 7` in the single composer, and no
-  console warnings or errors; terminal unavailable state remains amber, not
-  success green
+Apple `container` remains a supported local debug path. `bash -n` passes for
+the helper, and the pre-existing labeled API/Web/gateway containers plus
+`zeus-alpha-data` volume remained healthy and untouched during this change.
+The Alpha+ image rebuild on this machine stalled while updating the crates.io
+index inside BuildKit and was interrupted before any running container was
+replaced. Therefore the new image, `verify`, and named-volume `restart-verify`
+are not yet claimed as current Alpha+ acceptance. The earlier Alpha baseline
+container acceptance belongs to commit `9a89706`, not to these uncommitted
+Alpha+ changes.
 
-Apple `container` acceptance passed on macOS `26.6.2` with CLI `1.0.0`: all
-three runtime images built, `up` reached healthy API/Web/gateway routes,
-`verify` replayed both Run and Session SSE feeds, and a real Session turn
-committed through durability sequence `5`. `restart-verify` deleted and
-recreated all three containers and their network while retaining
-`zeus-alpha-data`; the same Run, Session, turn, and every pre-restart event
-remained present. This machine intermittently exhibited Apple localhost
-forwarder resets (a later rebuild reported the published URL healthy), so
-acceptance deliberately used the helper's stable direct gateway probe. The
-script reports current loopback reachability instead of inferring it from an
-earlier successful check.
-
-The Compose and Docker configuration has been statically inspected. The machine
-used for this implementation did not have Docker, Podman, Colima, nerdctl, or
-Finch installed, so image pulls, builds, container health checks, named-volume
-restart recovery, and end-to-end Compose startup remain unverified until run on
-a machine with Docker Compose v2.
+Docker Compose configuration remains available for environments with Docker
+Compose v2; this machine currently has Apple `container` but no Docker CLI, so
+Compose startup is statically configured rather than live-verified here.

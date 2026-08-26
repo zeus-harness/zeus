@@ -30,6 +30,7 @@ dist-ssr
 .env
 .zeus/
 .cache
+.playwright-cli/
 server/dist
 public/dist
 .zeus-container-build.*/

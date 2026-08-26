@@ -13,6 +13,9 @@ export type RunStatus =
 	| 'cancelled';
 export type SessionStatus = 'ready' | 'running' | 'needs_attention';
 export type SessionTurnStatus = 'open' | 'flushed' | 'interrupted';
+export type AccountRole = 'owner' | 'member';
+export type AccountStatus = 'active' | 'disabled';
+export type ThemePreference = 'system' | 'light' | 'dark';
 
 export type EventType =
 	'user' | 'reasoning' | 'step' | 'tool_call' | 'evidence' | 'approval' | 'context' | 'system';
@@ -172,12 +175,25 @@ export interface SessionTurn {
 	completed_at?: string;
 }
 
+export type AssistantReplyKind = 'model' | 'non_model_fallback';
+
+export interface AssistantReplyProvenance {
+	provider_id: string;
+	model?: string;
+	reply_kind: AssistantReplyKind;
+}
+
 export type SessionEventData =
 	| { kind: 'session_created'; title: string }
 	| { kind: 'run_attached'; run_id: string }
 	| { kind: 'session_resumed'; from_status: SessionStatus }
 	| { kind: 'user_message'; turn_id: string; content: string }
-	| { kind: 'assistant_message'; turn_id: string; content: string }
+	| {
+			kind: 'assistant_message';
+			turn_id: string;
+			content: string;
+			provenance?: AssistantReplyProvenance;
+	  }
 	| { kind: 'turn_flushed'; turn_id: string }
 	| { kind: 'turn_interrupted'; turn_id: string; reason: string };
 
@@ -193,6 +209,17 @@ export interface SessionDetail {
 	run_ids: string[];
 	turns: SessionTurn[];
 	events: SessionEvent[];
+}
+
+export interface CreateSessionRequest {
+	id: string;
+	title: string;
+}
+
+export interface CreateSessionResponse {
+	session: SessionSummary;
+	event: SessionEvent;
+	replayed: boolean;
 }
 
 export interface StartTurnRequest {
@@ -285,6 +312,50 @@ export interface OverviewResponse {
 	recent_events: RunEvent[];
 	evidence?: EvidenceItem[];
 	tool_policy?: ToolPolicy;
+}
+
+export interface AccountUser {
+	id: string;
+	username: string;
+	role: AccountRole;
+	status: AccountStatus;
+	created_at: string;
+}
+
+export interface UserPreferences {
+	theme: ThemePreference;
+	preferred_model?: string;
+	revision: number;
+	updated_at: string;
+}
+
+export interface AuthStatusResponse {
+	configured: boolean;
+	authenticated: boolean;
+	user?: AccountUser;
+	preferences?: UserPreferences;
+}
+
+export interface BootstrapRequest {
+	bootstrap_token: string;
+	username: string;
+	password: string;
+}
+
+export interface LoginRequest {
+	username: string;
+	password: string;
+}
+
+export interface AuthenticationResponse {
+	user: AccountUser;
+	preferences: UserPreferences;
+	csrf_token: string;
+	expires_at: string;
+}
+
+export interface LogoutResponse {
+	status: string;
 }
 
 export interface ReviewRequest {

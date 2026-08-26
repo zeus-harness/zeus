@@ -22,7 +22,9 @@ export default defineConfig(({ mode }) => {
 			proxy: {
 				'/api': {
 					target: apiUrl,
-					changeOrigin: true
+					// Preserve the browser-facing authority. The API compares
+					// Origin and Host on every credential or state-changing request.
+					changeOrigin: false
 				}
 			}
 		}

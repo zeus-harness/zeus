@@ -1,5 +1,11 @@
 import type {
-	FlushSessionResponse,
+	AuthenticationResponse,
+	AuthStatusResponse,
+	BootstrapRequest,
+	CreateSessionRequest,
+	CreateSessionResponse,
+	LoginRequest,
+	LogoutResponse,
 	OverviewResponse,
 	ResumeSessionResponse,
 	ReviewDecision,
@@ -8,8 +14,10 @@ import type {
 	RunEvent,
 	SessionDetail,
 	SessionEvent,
+	SessionSummary,
 	StartTurnResponse
 } from './types';
+import { apiFetch } from './http';
 
 export type StreamStatus = 'connected' | 'reconnecting';
 
@@ -61,7 +69,7 @@ export function mergeEvents(current: RunEvent[], incoming: RunEvent[]): RunEvent
 }
 
 export async function getOverview(signal?: AbortSignal): Promise<OverviewResponse> {
-	const response = await fetch('/api/v1/overview', {
+	const response = await apiFetch('/api/v1/overview', {
 		headers: { Accept: 'application/json' },
 		signal
 	});
@@ -70,7 +78,7 @@ export async function getOverview(signal?: AbortSignal): Promise<OverviewRespons
 }
 
 export async function getSession(sessionId: string, signal?: AbortSignal): Promise<SessionDetail> {
-	const response = await fetch(`/api/v1/sessions/${encodeURIComponent(sessionId)}`, {
+	const response = await apiFetch(`/api/v1/sessions/${encodeURIComponent(sessionId)}`, {
 		headers: { Accept: 'application/json' },
 		signal
 	});
@@ -83,7 +91,7 @@ export async function startSessionTurn(
 	request: { turn_id: string; user_message: string; expected_sequence: number },
 	idempotencyKey: string
 ): Promise<StartTurnResponse> {
-	const response = await fetch(`/api/v1/sessions/${encodeURIComponent(sessionId)}/turns`, {
+	const response = await apiFetch(`/api/v1/sessions/${encodeURIComponent(sessionId)}/turns`, {
 		method: 'POST',
 		headers: {
 			'Content-Type': 'application/json',
@@ -96,26 +104,68 @@ export async function startSessionTurn(
 	return response.json() as Promise<StartTurnResponse>;
 }
 
-export async function flushSessionTurn(
-	sessionId: string,
-	turnId: string,
-	expectedSequence: number,
+export async function getAuthStatus(signal?: AbortSignal): Promise<AuthStatusResponse> {
+	const response = await apiFetch('/api/v1/auth/status', {
+		headers: { Accept: 'application/json' },
+		signal
+	});
+	if (!response.ok) throw await responseError(response, 'Authentication status API');
+	return response.json() as Promise<AuthStatusResponse>;
+}
+
+export async function bootstrapOwner(request: BootstrapRequest): Promise<AuthenticationResponse> {
+	const response = await apiFetch('/api/v1/auth/bootstrap', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+		body: JSON.stringify(request)
+	});
+	if (!response.ok) throw await responseError(response, 'Owner setup API');
+	return response.json() as Promise<AuthenticationResponse>;
+}
+
+export async function login(request: LoginRequest): Promise<AuthenticationResponse> {
+	const response = await apiFetch('/api/v1/auth/login', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+		body: JSON.stringify(request)
+	});
+	if (!response.ok) throw await responseError(response, 'Login API');
+	return response.json() as Promise<AuthenticationResponse>;
+}
+
+export async function logout(): Promise<LogoutResponse> {
+	const response = await apiFetch('/api/v1/auth/logout', {
+		method: 'POST',
+		headers: { Accept: 'application/json' }
+	});
+	if (!response.ok) throw await responseError(response, 'Logout API');
+	return response.json() as Promise<LogoutResponse>;
+}
+
+export async function listSessions(signal?: AbortSignal): Promise<SessionSummary[]> {
+	const response = await apiFetch('/api/v1/sessions', {
+		headers: { Accept: 'application/json' },
+		signal
+	});
+	if (!response.ok) throw await responseError(response, 'Sessions API');
+	return response.json() as Promise<SessionSummary[]>;
+}
+
+export async function createSession(
+	request: CreateSessionRequest,
 	idempotencyKey: string
-): Promise<FlushSessionResponse> {
-	const response = await fetch(
-		`/api/v1/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/flush`,
-		{
-			method: 'POST',
-			headers: {
-				'Content-Type': 'application/json',
-				Accept: 'application/json',
-				'Idempotency-Key': idempotencyKey
-			},
-			body: JSON.stringify({ turn_id: turnId, expected_sequence: expectedSequence })
-		}
-	);
-	if (!response.ok) throw await responseError(response, 'Flush session API');
-	return response.json() as Promise<FlushSessionResponse>;
+): Promise<CreateSessionResponse> {
+	const response = await apiFetch('/api/v1/sessions', {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json',
+			Accept: 'application/json',
+			'Idempotency-Key': idempotencyKey
+		},
+		body: JSON.stringify(request)
+	});
+	if (!response.ok) throw await responseError(response, 'Create session API');
+	return response.json() as Promise<CreateSessionResponse>;
 }
 
 export async function resumeSession(
@@ -123,7 +173,7 @@ export async function resumeSession(
 	expectedSequence: number,
 	idempotencyKey: string
 ): Promise<ResumeSessionResponse> {
-	const response = await fetch(`/api/v1/sessions/${encodeURIComponent(sessionId)}/resume`, {
+	const response = await apiFetch(`/api/v1/sessions/${encodeURIComponent(sessionId)}/resume`, {
 		method: 'POST',
 		headers: {
 			'Content-Type': 'application/json',
@@ -144,7 +194,7 @@ export async function reviewRun(
 	note: string | null = null
 ): Promise<ReviewResponse> {
 	const request: ReviewRequest = { decision, note };
-	const response = await fetch(
+	const response = await apiFetch(
 		`/api/v1/runs/${encodeURIComponent(runId)}/approvals/${encodeURIComponent(approvalId)}/decision`,
 		{
 			method: 'POST',

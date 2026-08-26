@@ -61,10 +61,10 @@
 	}
 </script>
 
-<section class="bg-white px-4 sm:px-6 pt-2 shrink-0 pb-[max(14px,env(safe-area-inset-bottom))]">
+<section class="bg-zeus-bg px-4 sm:px-6 pt-2 shrink-0 pb-[max(14px,env(safe-area-inset-bottom))]">
 	<div class="mx-auto w-full max-w-[780px]">
 		<div
-			class="border-zeus-border bg-white p-2.5 rounded-[18px] border shadow-[0_8px_28px_rgb(0_0_0/0.06)]"
+			class="border-zeus-border bg-zeus-bg p-2.5 rounded-[18px] border shadow-[0_8px_28px_var(--zeus-shadow)]"
 		>
 			<Textarea
 				bind:value

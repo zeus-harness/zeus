@@ -1,7 +1,7 @@
 import type { TurnAttempt } from './session-command.js';
 import type { RunEvent, SessionDetail, SessionEvent, SessionTurn } from './types.js';
 
-const STORED_ATTEMPT_VERSION = 1;
+const STORED_ATTEMPT_VERSION = 2;
 
 export interface AttemptStorage {
 	getItem(key: string): string | null;
@@ -14,9 +14,7 @@ interface StoredTurnAttempt {
 	text: string;
 	turnId: string;
 	startKey: string;
-	flushKey: string;
 	expectedSequence: number;
-	flushExpectedSequence?: number;
 }
 
 export type TurnAttemptDisposition = 'owned_running' | 'completed' | 'not_owned';
@@ -35,15 +33,13 @@ function isSequence(value: unknown): value is number {
 
 function decodeStoredAttempt(value: unknown): TurnAttempt | null {
 	if (!value || typeof value !== 'object') return null;
-	const stored = value as Partial<StoredTurnAttempt>;
+	const stored = value as Record<string, unknown>;
 	if (
-		stored.version !== STORED_ATTEMPT_VERSION ||
+		(stored.version !== 1 && stored.version !== STORED_ATTEMPT_VERSION) ||
 		!isNonEmptyString(stored.text) ||
 		!isNonEmptyString(stored.turnId) ||
 		!isNonEmptyString(stored.startKey) ||
-		!isNonEmptyString(stored.flushKey) ||
-		!isSequence(stored.expectedSequence) ||
-		(stored.flushExpectedSequence !== undefined && !isSequence(stored.flushExpectedSequence))
+		!isSequence(stored.expectedSequence)
 	) {
 		return null;
 	}
@@ -51,9 +47,7 @@ function decodeStoredAttempt(value: unknown): TurnAttempt | null {
 		text: stored.text,
 		turnId: stored.turnId,
 		startKey: stored.startKey,
-		flushKey: stored.flushKey,
-		expectedSequence: stored.expectedSequence,
-		flushExpectedSequence: stored.flushExpectedSequence
+		expectedSequence: stored.expectedSequence
 	};
 }
 
@@ -90,9 +84,7 @@ export function saveTurnAttempt(
 		text: attempt.text,
 		turnId: attempt.turnId,
 		startKey: attempt.startKey,
-		flushKey: attempt.flushKey,
-		expectedSequence: attempt.expectedSequence,
-		flushExpectedSequence: attempt.flushExpectedSequence
+		expectedSequence: attempt.expectedSequence
 	};
 	try {
 		storage.setItem(attemptStorageKey(sessionId), JSON.stringify(stored));
@@ -124,18 +116,6 @@ export function turnAttemptDisposition(
 		return 'owned_running';
 	}
 	return 'not_owned';
-}
-
-export function rebaseOwnedTurnAttempt(
-	attempt: TurnAttempt,
-	expectedSequence: number,
-	createId: () => string
-): TurnAttempt {
-	return {
-		...attempt,
-		flushKey: createId(),
-		flushExpectedSequence: expectedSequence
-	};
 }
 
 export function mergeSessionEvents(

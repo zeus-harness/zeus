@@ -1,15 +1,30 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { Button } from '@zeus/ui/button';
+	import { Lightning } from '@zeus/ui/icons';
 	import AppSidebar from '$lib/components/AppSidebar.svelte';
 	import ApprovalPrompt from '$lib/components/ApprovalPrompt.svelte';
+	import AuthGate from '$lib/components/AuthGate.svelte';
 	import Composer from '$lib/components/Composer.svelte';
 	import IncidentHeader from '$lib/components/IncidentHeader.svelte';
+	import SettingsPanel from '$lib/components/SettingsPanel.svelte';
 	import Timeline from '$lib/components/Timeline.svelte';
 	import {
+		readActiveSessionId,
+		resolveInitialSessionId,
+		saveActiveSessionId,
+		type ActiveSessionStorage
+	} from '$lib/active-session';
+	import {
 		ApiError,
-		flushSessionTurn,
+		bootstrapOwner,
+		createSession,
+		getAuthStatus,
 		getOverview,
 		getSession,
+		listSessions,
+		login,
+		logout as logoutOwner,
 		mergeEvents,
 		resumeSession,
 		reviewRun,
@@ -30,36 +45,49 @@
 		loadTurnAttempt,
 		mergeSessionEvents,
 		orderTimelineEvents,
-		rebaseOwnedTurnAttempt,
 		saveTurnAttempt,
 		turnAttemptDisposition,
 		upsertTurn,
 		type AttemptStorage
 	} from '$lib/session-state';
 	import type {
+		AuthenticationResponse,
+		AuthStatusResponse,
+		BootstrapRequest,
 		DataSource,
-		FlushSessionResponse,
+		LoginRequest,
 		OverviewResponse,
 		ReviewDecision,
 		RunEvent,
 		SessionDetail,
 		SessionEvent,
+		SessionSummary,
 		StartTurnResponse
 	} from '$lib/types';
 
-	const sessionCommandClient: SessionCommandClient = {
-		start: startSessionTurn,
-		flush: flushSessionTurn
-	};
+	const sessionCommandClient: SessionCommandClient = { start: startSessionTurn };
 
+	let authStatus = $state.raw<AuthStatusResponse | null>(null);
+	let authLoading = $state(true);
+	let authLoadError = $state('');
+	let workspaceLoading = $state(false);
+	let workspaceReady = $state(false);
+	let workspaceError = $state('');
 	let overview = $state.raw<OverviewResponse>(demoOverview);
-	let events = $state.raw<RunEvent[]>(demoOverview.recent_events);
+	let events = $state.raw<RunEvent[]>([]);
+	let sessions = $state.raw<SessionSummary[]>([]);
+	let activeSessionId = $state('');
 	let sessionDetail = $state.raw<SessionDetail | null>(null);
 	let sessionEvents = $state.raw<SessionEvent[]>([]);
 	let source = $state<DataSource>('demo');
 	let runStreamStatus = $state<'idle' | StreamStatus>('idle');
 	let sessionStreamStatus = $state<'idle' | StreamStatus>('idle');
 	let navOpen = $state(false);
+	let settingsOpen = $state(false);
+	let settingsTrigger = $state.raw<HTMLButtonElement | null>(null);
+	let creatingSession = $state(false);
+	let createSessionAttempt = $state.raw<{ id: string; key: string } | null>(null);
+	let sessionActionError = $state('');
 	let pendingDecision = $state<ReviewDecision | null>(null);
 	let reviewError = $state('');
 	let reviewAttempt = $state<{
@@ -74,8 +102,24 @@
 	let turnCommandInFlight = $state(false);
 	let resumeAttemptKey = $state<string | null>(null);
 	let attemptStorage: AttemptStorage | null = null;
+	let activeSessionStorage: ActiveSessionStorage | null = null;
+	let pageController: AbortController | null = null;
+	let stopRunStream: () => void = () => {};
+	let stopSessionStream: () => void = () => {};
+	let sessionSelectionEpoch = 0;
 
-	const latestApprovalEvent = $derived(events.findLast((event) => event.approval !== undefined));
+	const currentUser = $derived(
+		authStatus?.authenticated && authStatus.user ? authStatus.user : null
+	);
+	const activeSession = $derived(
+		sessionDetail?.session ?? sessions.find((session) => session.id === activeSessionId) ?? null
+	);
+	const attachedToRun = $derived(
+		sessionDetail ? sessionDetail.run_ids.includes(overview.run.id) : true
+	);
+	const latestApprovalEvent = $derived(
+		attachedToRun ? events.findLast((event) => event.approval !== undefined) : undefined
+	);
 	const pendingApprovalEvent = $derived(
 		latestApprovalEvent?.approval?.status === 'pending' ? latestApprovalEvent : undefined
 	);
@@ -85,21 +129,82 @@
 			return mapped ? [mapped] : [];
 		})
 	);
-	const renderedEvents = $derived(orderTimelineEvents([...events, ...sessionTimelineEvents]));
+	const renderedEvents = $derived(
+		orderTimelineEvents([...(attachedToRun ? events : []), ...sessionTimelineEvents])
+	);
 	const composerSessionStatus = $derived(sessionDetail?.session.status ?? 'running');
 	const composerCanRetry = $derived(
 		!turnCommandInFlight &&
 			pendingTurnAttempt !== null &&
-			sessionDetail?.session.status === 'running' &&
-			sessionDetail.session.active_turn_id === pendingTurnAttempt.turnId
+			pendingTurnAttempt.started === undefined &&
+			sessionDetail?.session.status === 'ready'
 	);
 	const streamStatus = $derived.by((): 'idle' | StreamStatus => {
-		if (runStreamStatus === 'reconnecting' || sessionStreamStatus === 'reconnecting') {
+		if (
+			sessionStreamStatus === 'reconnecting' ||
+			(attachedToRun && runStreamStatus === 'reconnecting')
+		) {
 			return 'reconnecting';
 		}
-		if (runStreamStatus === 'connected' && sessionStreamStatus === 'connected') return 'connected';
+		if (
+			sessionStreamStatus === 'connected' &&
+			(!attachedToRun || runStreamStatus === 'connected')
+		) {
+			return 'connected';
+		}
 		return 'idle';
 	});
+	const pageTitle = $derived(
+		activeSession && !attachedToRun ? activeSession.title : overview.incident.title
+	);
+	const documentTitle = $derived(
+		currentUser && workspaceReady ? `${pageTitle} · Zeus Harness` : 'Zeus Harness'
+	);
+
+	function isAbortError(error: unknown): boolean {
+		return error instanceof DOMException && error.name === 'AbortError';
+	}
+
+	function authenticatedStatus(response: AuthenticationResponse): AuthStatusResponse {
+		return {
+			configured: true,
+			authenticated: true,
+			user: response.user,
+			preferences: response.preferences
+		};
+	}
+
+	function upsertSessionSummary(summary: SessionSummary) {
+		sessions = [summary, ...sessions.filter((session) => session.id !== summary.id)];
+	}
+
+	function stopWorkspaceStreams() {
+		stopRunStream();
+		stopSessionStream();
+		stopRunStream = () => {};
+		stopSessionStream = () => {};
+		runStreamStatus = 'idle';
+		sessionStreamStatus = 'idle';
+	}
+
+	function clearWorkspace() {
+		sessionSelectionEpoch += 1;
+		stopWorkspaceStreams();
+		workspaceReady = false;
+		workspaceLoading = false;
+		workspaceError = '';
+		overview = demoOverview;
+		events = [];
+		sessions = [];
+		activeSessionId = '';
+		sessionDetail = null;
+		sessionEvents = [];
+		pendingTurnAttempt = null;
+		createSessionAttempt = null;
+		composerDraft = '';
+		composerError = '';
+		source = 'demo';
+	}
 
 	async function refreshOverview() {
 		const payload = await getOverview();
@@ -123,25 +228,26 @@
 		};
 		switch (event.data.kind) {
 			case 'user_message':
-				return {
-					...common,
-					type: 'context',
-					title: 'Session message',
-					summary: event.data.content
-				};
+				return { ...common, type: 'context', title: 'You', summary: event.data.content };
 			case 'assistant_message':
 				return {
 					...common,
 					type: 'step',
-					title: 'Zeus',
-					summary: event.data.content
+					title:
+						event.data.provenance?.reply_kind === 'non_model_fallback'
+							? 'Zeus · local fallback'
+							: 'Zeus',
+					summary: event.data.content,
+					metadata: event.data.provenance?.model
+						? { model: event.data.provenance.model }
+						: undefined
 				};
 			case 'turn_interrupted':
 				return {
 					...common,
 					type: 'system',
 					title: 'Turn interrupted',
-					summary: 'The previous turn stopped before its durable flush. Resume to continue.'
+					summary: 'The reply stopped before its durable flush. Resume to continue.'
 				};
 			default:
 				return null;
@@ -170,10 +276,12 @@
 		) {
 			const preserved = { ...current, events: mergedEvents };
 			sessionDetail = preserved;
+			upsertSessionSummary(preserved.session);
 			return preserved;
 		}
 		const canonical = { ...detail, events: mergedEvents };
 		sessionDetail = canonical;
+		upsertSessionSummary(canonical.session);
 		composerStatusText = `Saved through session event ${canonical.session.sequence}`;
 		return canonical;
 	}
@@ -190,20 +298,7 @@
 			turns: upsertTurn(current.turns, started.turn),
 			events: mergedEvents
 		};
-	}
-
-	function applyFlushedResponse(flushed: FlushSessionResponse) {
-		const current = sessionDetail;
-		if (!current || current.session.id !== flushed.session.id) return;
-		const mergedEvents = mergeSessionEvents(sessionEvents, flushed.events);
-		sessionEvents = mergedEvents;
-		sessionDetail = {
-			...current,
-			session:
-				flushed.session.sequence >= current.session.sequence ? flushed.session : current.session,
-			turns: upsertTurn(current.turns, flushed.turn),
-			events: mergedEvents
-		};
+		upsertSessionSummary(sessionDetail.session);
 	}
 
 	function settlePendingAttempt(detail: SessionDetail) {
@@ -214,7 +309,11 @@
 			forgetTurnAttempt(detail.session.id, true);
 			composerError = '';
 			composerStatusText = `Saved through session event ${detail.session.sequence}`;
-		} else if (disposition === 'not_owned' && !turnCommandInFlight) {
+		} else if (disposition === 'owned_running') {
+			composerDraft = '';
+			composerError = '';
+			composerStatusText = 'Awaiting Zeus reply…';
+		} else if (!turnCommandInFlight) {
 			forgetTurnAttempt(detail.session.id, false);
 			composerDraft = attempt.text;
 		}
@@ -225,38 +324,213 @@
 		signal?: AbortSignal,
 		settleAttempt = true
 	): Promise<SessionDetail> {
-		const detail = applySessionDetail(await getSession(sessionId, signal));
+		const fetched = await getSession(sessionId, signal);
+		if (activeSessionId !== sessionId) return fetched;
+		const detail = applySessionDetail(fetched);
 		if (settleAttempt) settlePendingAttempt(detail);
 		return detail;
 	}
 
-	async function loadSession(
-		sessionId: string,
-		signal?: AbortSignal
-	): Promise<{ detail: SessionDetail; recoverOwnedTurn: boolean }> {
+	async function loadSession(sessionId: string, signal?: AbortSignal): Promise<SessionDetail> {
 		const detail = await refreshSession(sessionId, signal, false);
+		if (activeSessionId !== sessionId) return detail;
 		const storedAttempt = loadTurnAttempt(attemptStorage, sessionId);
-		if (!storedAttempt) return { detail, recoverOwnedTurn: false };
+		if (!storedAttempt) return detail;
 
-		composerDraft = storedAttempt.text;
 		const disposition = turnAttemptDisposition(detail, storedAttempt);
 		if (disposition === 'completed') {
 			clearTurnAttempt(attemptStorage, sessionId);
-			composerDraft = '';
-			return { detail, recoverOwnedTurn: false };
+			return detail;
 		}
 		if (disposition === 'owned_running') {
 			rememberTurnAttempt(sessionId, storedAttempt);
-			composerStatusText = 'Recovering this tab’s saved turn…';
-			return { detail, recoverOwnedTurn: true };
+			composerDraft = '';
+			composerStatusText = 'Awaiting Zeus reply…';
+			return detail;
 		}
 
 		clearTurnAttempt(attemptStorage, sessionId);
+		composerDraft = storedAttempt.text;
 		composerStatusText =
 			detail.session.status === 'ready'
 				? 'A saved draft was restored; send it again when ready.'
 				: `Saved through session event ${detail.session.sequence}`;
-		return { detail, recoverOwnedTurn: false };
+		return detail;
+	}
+
+	async function selectSession(sessionId: string, signal = pageController?.signal) {
+		if (!signal || signal.aborted) return;
+		const selectionEpoch = ++sessionSelectionEpoch;
+		stopSessionStream();
+		stopSessionStream = () => {};
+		sessionStreamStatus = 'idle';
+		activeSessionId = sessionId;
+		sessionDetail = null;
+		sessionEvents = [];
+		pendingTurnAttempt = null;
+		composerDraft = '';
+		composerError = '';
+		composerStatusText = 'Loading session…';
+
+		const detail = await loadSession(sessionId, signal);
+		if (signal.aborted || selectionEpoch !== sessionSelectionEpoch) return;
+		saveActiveSessionId(activeSessionStorage, sessionId);
+		stopSessionStream = subscribeToSession(
+			sessionId,
+			detail.session.sequence,
+			(event) => {
+				if (activeSessionId !== sessionId) return;
+				sessionEvents = mergeSessionEvents(sessionEvents, [event]);
+				void refreshSession(sessionId, signal).catch((error) => {
+					if (isAbortError(error)) return;
+				});
+			},
+			(status) => {
+				if (activeSessionId === sessionId) sessionStreamStatus = status;
+			}
+		);
+	}
+
+	function connectRunStream(payload: OverviewResponse) {
+		stopRunStream();
+		runStreamStatus = 'idle';
+		stopRunStream = subscribeToRun(
+			payload.run.id,
+			payload.run.sequence,
+			(event) => {
+				events = mergeEvents(events, [{ ...event, source: 'api' }]);
+				if (
+					event.data?.kind === 'approval_decided' ||
+					event.data?.kind === 'tool_dispatch_started' ||
+					event.data?.kind === 'tool_result'
+				) {
+					void refreshOverview().catch(() => undefined);
+				}
+			},
+			(status) => (runStreamStatus = status)
+		);
+	}
+
+	async function initializeWorkspace(signal = pageController?.signal) {
+		if (!signal || signal.aborted) return;
+		workspaceLoading = true;
+		workspaceReady = false;
+		workspaceError = '';
+		stopWorkspaceStreams();
+		try {
+			const [payload, listedSessions] = await Promise.all([
+				getOverview(signal),
+				listSessions(signal)
+			]);
+			if (signal.aborted) return;
+			overview = payload;
+			events = payload.recent_events.map((event) => ({ ...event, source: 'api' }));
+			sessions = listedSessions;
+			source = 'api';
+			connectRunStream(payload);
+			const initialSessionId = resolveInitialSessionId(
+				listedSessions,
+				payload.primary_session_id,
+				readActiveSessionId(activeSessionStorage)
+			);
+			try {
+				await selectSession(initialSessionId, signal);
+			} catch (error) {
+				if (initialSessionId === payload.primary_session_id) throw error;
+				await selectSession(payload.primary_session_id, signal);
+			}
+			if (signal.aborted) return;
+			workspaceReady = true;
+		} catch (error) {
+			if (isAbortError(error)) return;
+			stopWorkspaceStreams();
+			workspaceError =
+				error instanceof Error ? error.message : 'The workspace could not be loaded.';
+		} finally {
+			workspaceLoading = false;
+		}
+	}
+
+	async function loadAuthentication(signal = pageController?.signal) {
+		if (!signal || signal.aborted) return;
+		authLoading = true;
+		authLoadError = '';
+		try {
+			const status = await getAuthStatus(signal);
+			if (signal.aborted) return;
+			authStatus = status;
+			if (status.authenticated && status.user) {
+				await initializeWorkspace(signal);
+			} else {
+				clearWorkspace();
+			}
+		} catch (error) {
+			if (isAbortError(error)) return;
+			authStatus = null;
+			authLoadError =
+				error instanceof Error ? error.message : 'Authentication status could not be loaded.';
+		} finally {
+			authLoading = false;
+		}
+	}
+
+	async function handleBootstrap(request: BootstrapRequest) {
+		const response = await bootstrapOwner(request);
+		authStatus = authenticatedStatus(response);
+		await initializeWorkspace();
+	}
+
+	async function handleLogin(request: LoginRequest) {
+		const response = await login(request);
+		authStatus = authenticatedStatus(response);
+		await initializeWorkspace();
+	}
+
+	async function handleLogout() {
+		try {
+			await logoutOwner();
+		} catch (error) {
+			if (!(error instanceof ApiError && error.status === 401)) throw error;
+		}
+		settingsOpen = false;
+		clearWorkspace();
+		authStatus = { configured: true, authenticated: false };
+	}
+
+	async function createNewSession() {
+		if (creatingSession) return;
+		creatingSession = true;
+		sessionActionError = '';
+		createSessionAttempt ??= {
+			id: `session-${crypto.randomUUID()}`,
+			key: crypto.randomUUID()
+		};
+		try {
+			const created = await createSession(
+				{ id: createSessionAttempt.id, title: 'New session' },
+				createSessionAttempt.key
+			);
+			createSessionAttempt = null;
+			upsertSessionSummary(created.session);
+			await selectSession(created.session.id);
+		} catch (error) {
+			sessionActionError =
+				error instanceof Error ? error.message : 'The session could not be created.';
+		} finally {
+			creatingSession = false;
+		}
+	}
+
+	async function handleSelectSession(sessionId: string) {
+		if (sessionId === activeSessionId && sessionDetail) return;
+		sessionActionError = '';
+		try {
+			await selectSession(sessionId);
+		} catch (error) {
+			if (isAbortError(error)) return;
+			sessionActionError =
+				error instanceof Error ? error.message : 'The session could not be loaded.';
+		}
 	}
 
 	async function handleReview(approvalId: string, decision: ReviewDecision) {
@@ -323,14 +597,11 @@
 			return true;
 		}
 		if (disposition === 'owned_running' && error.code !== 'idempotency_conflict') {
-			const rebased = rebaseOwnedTurnAttempt(attempt, detail.session.sequence, () =>
-				crypto.randomUUID()
-			);
-			rememberTurnAttempt(sessionId, rebased);
-			composerDraft = attempt.text;
-			composerError = 'The session changed while saving. Retry with the latest durable state.';
-			composerStatusText = 'This tab still owns the open turn.';
-			return false;
+			rememberTurnAttempt(sessionId, attempt);
+			composerDraft = '';
+			composerError = '';
+			composerStatusText = 'Awaiting Zeus reply…';
+			return true;
 		}
 
 		forgetTurnAttempt(sessionId, false);
@@ -347,16 +618,16 @@
 		if (turnCommandInFlight) return false;
 		turnCommandInFlight = true;
 		composerError = '';
-		composerStatusText = attempt.started ? 'Retrying the saved turn…' : 'Saving the turn…';
+		composerStatusText = attempt.started ? 'Checking the saved turn…' : 'Starting the turn…';
 		try {
-			const flushed = await persistTurn(sessionId, attempt, sessionCommandClient, (started) => {
-				rememberTurnAttempt(sessionId, attempt);
-				applyStartedResponse(started);
+			const started = await persistTurn(sessionId, attempt, sessionCommandClient, (response) => {
+				applyStartedResponse(response);
 			});
-			applyFlushedResponse(flushed);
-			forgetTurnAttempt(sessionId, true);
+			applyStartedResponse(started);
+			rememberTurnAttempt(sessionId, attempt);
+			composerDraft = '';
 			composerError = '';
-			composerStatusText = `Saved through session event ${flushed.ack.durability_sequence}`;
+			composerStatusText = 'Awaiting Zeus reply…';
 			return true;
 		} catch (error) {
 			const current = sessionDetail;
@@ -386,7 +657,7 @@
 		let attempt = pendingTurnAttempt;
 		if (attempt && attempt.text !== value) {
 			composerDraft = attempt.text;
-			composerError = 'A previous message may still be saving; its original draft was restored.';
+			composerError = 'A previous message may still be starting; its original draft was restored.';
 			return false;
 		}
 		if (!attempt) {
@@ -400,20 +671,24 @@
 		const detail = sessionDetail;
 		const attempt = pendingTurnAttempt;
 		if (!detail || !attempt) return false;
-		if (turnAttemptDisposition(detail, attempt) === 'completed') {
+		const disposition = turnAttemptDisposition(detail, attempt);
+		if (disposition === 'completed') {
 			forgetTurnAttempt(detail.session.id, true);
 			return true;
 		}
-		if (turnAttemptDisposition(detail, attempt) !== 'owned_running') {
-			try {
-				await refreshSession(detail.session.id);
-			} catch (error) {
-				composerError =
-					error instanceof Error ? error.message : 'The session could not be refreshed.';
-			}
-			return false;
+		if (disposition === 'owned_running') {
+			composerDraft = '';
+			composerStatusText = 'Awaiting Zeus reply…';
+			return true;
 		}
-		return commitTurnAttempt(detail.session.id, attempt);
+		if (detail.session.status === 'ready') return commitTurnAttempt(detail.session.id, attempt);
+		try {
+			await refreshSession(detail.session.id);
+		} catch (error) {
+			composerError =
+				error instanceof Error ? error.message : 'The session could not be refreshed.';
+		}
+		return false;
 	}
 
 	async function resumeCurrentSession() {
@@ -436,6 +711,7 @@
 					resumed.session.sequence >= current.session.sequence ? resumed.session : current.session,
 				events: mergedEvents
 			};
+			upsertSessionSummary(sessionDetail.session);
 			composerStatusText = `Resumed · saved through session event ${resumed.session.sequence}`;
 			resumeAttemptKey = null;
 		} catch (error) {
@@ -461,116 +737,157 @@
 		}
 	}
 
+	function openSettings(trigger: HTMLButtonElement) {
+		settingsTrigger = trigger;
+		settingsOpen = true;
+		navOpen = false;
+	}
+
+	function closeSettings() {
+		settingsOpen = false;
+		const trigger = settingsTrigger;
+		queueMicrotask(() => trigger?.focus());
+	}
+
 	onMount(() => {
-		const controller = new AbortController();
-		let stopRunStream: () => void = () => {};
-		let stopSessionStream: () => void = () => {};
+		pageController = new AbortController();
 		try {
 			attemptStorage = window.sessionStorage;
 		} catch {
 			attemptStorage = null;
 		}
-
-		void getOverview(controller.signal)
-			.then(async (payload) => {
-				overview = payload;
-				events = payload.recent_events.map((event) => ({ ...event, source: 'api' }));
-				source = 'api';
-				const loaded = await loadSession(payload.primary_session_id, controller.signal);
-				if (controller.signal.aborted) return;
-				stopRunStream = subscribeToRun(
-					payload.run.id,
-					payload.run.sequence,
-					(event) => {
-						events = mergeEvents(events, [{ ...event, source: 'api' }]);
-						if (
-							event.data?.kind === 'approval_decided' ||
-							event.data?.kind === 'tool_dispatch_started' ||
-							event.data?.kind === 'tool_result'
-						) {
-							void refreshOverview().catch(() => undefined);
-						}
-					},
-					(status) => (runStreamStatus = status)
-				);
-				stopSessionStream = subscribeToSession(
-					payload.primary_session_id,
-					loaded.detail.session.sequence,
-					(event) => {
-						sessionEvents = mergeSessionEvents(sessionEvents, [event]);
-						void refreshSession(payload.primary_session_id, controller.signal).catch((error) => {
-							if (error instanceof DOMException && error.name === 'AbortError') return;
-						});
-					},
-					(status) => (sessionStreamStatus = status)
-				);
-				if (loaded.recoverOwnedTurn) void retryPendingTurn();
-			})
-			.catch((error) => {
-				if (error instanceof DOMException && error.name === 'AbortError') return;
-				source = 'demo';
-				runStreamStatus = 'idle';
-				sessionStreamStatus = 'idle';
-				composerError = 'API unavailable; messages are not accepted in demo mode.';
-			});
+		try {
+			activeSessionStorage = window.localStorage;
+		} catch {
+			activeSessionStorage = null;
+		}
+		void loadAuthentication(pageController.signal);
 
 		return () => {
-			controller.abort();
-			stopRunStream();
-			stopSessionStream();
+			pageController?.abort();
+			stopWorkspaceStreams();
+			pageController = null;
 		};
 	});
 </script>
 
 <svelte:head>
-	<title>{overview.incident.title} · Zeus Harness</title>
+	<title>{documentTitle}</title>
 	<meta
 		name="description"
 		content="Zeus Harness incident response conversation and guarded approval workspace"
 	/>
 </svelte:head>
 
-<div class="bg-zeus-bg text-zeus-text min-h-0 flex h-dvh overflow-hidden">
-	<AppSidebar
-		open={navOpen}
-		incident={overview.incident}
-		run={overview.run}
-		{source}
-		onClose={() => (navOpen = false)}
-	/>
-
-	<div class="min-w-0 flex flex-1 flex-col overflow-hidden">
-		<IncidentHeader
-			incident={overview.incident}
-			run={overview.run}
-			{source}
-			{streamStatus}
-			onToggleNav={() => (navOpen = true)}
+{#if authLoading}
+	<main class="bg-zeus-bg text-zeus-text grid min-h-dvh place-items-center" aria-busy="true">
+		<div class="gap-3 text-zeus-muted text-sm flex items-center">
+			<span class="size-8 bg-zeus-text text-zeus-bg grid place-items-center rounded-full">
+				<Lightning size={18} weight="fill" aria-hidden="true" />
+			</span>
+			Checking this Zeus instance…
+		</div>
+	</main>
+{:else if authLoadError}
+	<main class="bg-zeus-bg text-zeus-text px-5 grid min-h-dvh place-items-center">
+		<section class="w-full max-w-[380px] text-center">
+			<h1 class="font-semibold text-lg">Zeus is unavailable</h1>
+			<p class="text-zeus-muted mt-2 text-sm leading-6" role="alert">{authLoadError}</p>
+			<Button class="mt-5 rounded-xl" variant="outline" onclick={() => void loadAuthentication()}>
+				Try again
+			</Button>
+		</section>
+	</main>
+{:else if authStatus && !authStatus.authenticated}
+	{#key authStatus.configured}
+		<AuthGate
+			configured={authStatus.configured}
+			onBootstrap={handleBootstrap}
+			onLogin={handleLogin}
 		/>
-
-		<main class="min-h-0 flex flex-1 flex-col overflow-hidden">
-			<Timeline events={renderedEvents} />
-			{#if pendingApprovalEvent?.approval}
-				<ApprovalPrompt
-					approval={pendingApprovalEvent.approval}
-					summary={pendingApprovalEvent.summary ?? pendingApprovalEvent.approval.action}
-					policy={overview.tool_policy}
-					{pendingDecision}
-					error={reviewError}
-					onReview={handlePendingReview}
-				/>
+	{/key}
+{:else if currentUser}
+	{#if !workspaceReady}
+		<main class="bg-zeus-bg text-zeus-text px-5 grid min-h-dvh place-items-center">
+			{#if workspaceLoading}
+				<p class="text-zeus-muted text-sm" aria-busy="true">Loading your workspace…</p>
 			{:else}
-				<Composer
-					bind:value={composerDraft}
-					onSubmit={persistSessionMessage}
-					status={composerSessionStatus}
-					statusText={composerStatusText}
-					error={composerError}
-					canRetry={composerCanRetry}
-					onRetry={retryPendingTurn}
-					onResume={resumeCurrentSession}
-				/>
+				<section class="w-full max-w-[380px] text-center">
+					<h1 class="font-semibold text-lg">Workspace unavailable</h1>
+					<p class="text-zeus-muted mt-2 text-sm leading-6" role="alert">
+						{workspaceError || 'The workspace did not finish loading.'}
+					</p>
+					<div class="mt-5 gap-2 flex justify-center">
+						<Button class="rounded-xl" variant="outline" onclick={() => void initializeWorkspace()}>
+							Try again
+						</Button>
+						<Button class="rounded-xl" variant="ghost" onclick={() => void handleLogout()}>
+							Sign out
+						</Button>
+					</div>
+				</section>
 			{/if}
 		</main>
-	</div>
-</div>
+	{:else}
+		<div class="bg-zeus-bg text-zeus-text min-h-0 flex h-dvh overflow-hidden">
+			<AppSidebar
+				open={navOpen}
+				{sessions}
+				{activeSessionId}
+				{creatingSession}
+				{sessionActionError}
+				onClose={() => (navOpen = false)}
+				onCreateSession={() => void createNewSession()}
+				onSelectSession={(sessionId) => void handleSelectSession(sessionId)}
+				onOpenSettings={openSettings}
+			/>
+			<SettingsPanel
+				open={settingsOpen}
+				user={currentUser}
+				onClose={closeSettings}
+				onLogout={handleLogout}
+			/>
+
+			<div class="min-w-0 flex flex-1 flex-col overflow-hidden">
+				<IncidentHeader
+					incident={overview.incident}
+					run={overview.run}
+					session={activeSession}
+					{attachedToRun}
+					{source}
+					{streamStatus}
+					onToggleNav={() => (navOpen = true)}
+				/>
+
+				<main class="min-h-0 flex flex-1 flex-col overflow-hidden">
+					<Timeline events={renderedEvents} />
+					{#if pendingApprovalEvent?.approval}
+						<ApprovalPrompt
+							approval={pendingApprovalEvent.approval}
+							summary={pendingApprovalEvent.summary ?? pendingApprovalEvent.approval.action}
+							policy={overview.tool_policy}
+							{pendingDecision}
+							error={reviewError}
+							onReview={handlePendingReview}
+						/>
+					{:else}
+						<Composer
+							bind:value={composerDraft}
+							onSubmit={persistSessionMessage}
+							status={composerSessionStatus}
+							statusText={composerStatusText}
+							error={composerError}
+							canRetry={composerCanRetry}
+							onRetry={retryPendingTurn}
+							onResume={resumeCurrentSession}
+						/>
+					{/if}
+				</main>
+			</div>
+		</div>
+	{/if}
+{:else}
+	<main class="bg-zeus-bg text-zeus-text px-5 grid min-h-dvh place-items-center">
+		<p class="text-zeus-red text-sm">The authentication response was incomplete.</p>
+	</main>
+{/if}

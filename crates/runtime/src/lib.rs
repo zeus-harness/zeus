@@ -25,6 +25,12 @@ use protocol::{
     RunDetail, RunEvent, RunEventData, RunSummary, SessionDetail, SessionEvent, SessionEventData,
     SessionSummary, StartTurnRequest, StartTurnResponse, ToolCall, ToolExecutorStatus, ToolOutcome,
 };
+pub use storage::{
+    AuthPrincipal, AuthSessionCommit, BootstrapOwnerCommit, ReplyClaimOutcome, ReplyCompletion,
+    ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus,
+    ReplyOutcomeUnknownCommit, ReplySuccessCommit, StoredCredential, StoredPreferences, StoredUser,
+    StoredUserRole, StoredUserStatus,
+};
 use storage::{
     ClaimOutcome, CommitOutcome, DispatchCompleteCommit, DispatchJob, DispatchJobSpec,
     DispatchRecoveryCommit, DispatchStartCommit, ReviewCommit, ReviewReceipt, RunSnapshot,
@@ -93,6 +99,16 @@ pub enum StoreError {
     SessionTurnNotFound(String),
     #[error("session {0} already exists")]
     SessionAlreadyExists(String),
+    #[error("the local owner account is already configured")]
+    AccountAlreadyConfigured,
+    #[error("the bootstrap credential is invalid, expired, or already used")]
+    InvalidBootstrapToken,
+    #[error("user {0} was not found")]
+    UserNotFound(String),
+    #[error("user {0} is disabled")]
+    UserDisabled(String),
+    #[error("invalid account data: {0}")]
+    InvalidAccountData(String),
     #[error("run {run_id} already belongs to session {session_id}")]
     RunAlreadyAttached { run_id: String, session_id: String },
     #[error("invalid session request: {0}")]
@@ -136,6 +152,11 @@ impl From<StorageError> for StoreError {
             StorageError::SessionNotFound(id) => Self::SessionNotFound(id),
             StorageError::SessionTurnNotFound(id) => Self::SessionTurnNotFound(id),
             StorageError::SessionAlreadyExists(id) => Self::SessionAlreadyExists(id),
+            StorageError::AccountAlreadyConfigured => Self::AccountAlreadyConfigured,
+            StorageError::InvalidBootstrapToken => Self::InvalidBootstrapToken,
+            StorageError::UserNotFound(id) => Self::UserNotFound(id),
+            StorageError::UserDisabled(id) => Self::UserDisabled(id),
+            StorageError::InvalidAccountData(detail) => Self::InvalidAccountData(detail),
             StorageError::RunAlreadyAttached { run_id, session_id } => {
                 Self::RunAlreadyAttached { run_id, session_id }
             }
@@ -246,6 +267,11 @@ impl DemoStore {
             auto_dispatch,
         };
 
+        // A claimed reply is a potentially billable external operation, so a
+        // missing result becomes outcome_unknown before generic turn recovery.
+        // Queued reply turns are deliberately left open and claimable.
+        store.recover_started_reply_jobs().await?;
+
         // Session recovery precedes run-dispatch recovery. Started calls are
         // settled next and never re-executed. Only then are queued calls safe
         // to resume because they have no dispatch checkpoint yet.
@@ -260,6 +286,70 @@ impl DemoStore {
     pub async fn readiness(&self) -> Result<(), StoreError> {
         self.storage.readiness().await?;
         Ok(())
+    }
+
+    pub async fn has_users(&self) -> Result<bool, StoreError> {
+        Ok(self.storage.has_users().await?)
+    }
+
+    pub async fn replace_bootstrap_token(
+        &self,
+        token_hash: &str,
+        expires_at: &str,
+    ) -> Result<(), StoreError> {
+        Ok(self
+            .storage
+            .replace_bootstrap_token(token_hash, expires_at)
+            .await?)
+    }
+
+    pub async fn bootstrap_owner(
+        &self,
+        commit: BootstrapOwnerCommit,
+    ) -> Result<(StoredUser, StoredPreferences), StoreError> {
+        Ok(self.storage.bootstrap_owner(commit).await?)
+    }
+
+    pub async fn credential_for_username(
+        &self,
+        username: &str,
+    ) -> Result<Option<StoredCredential>, StoreError> {
+        Ok(self.storage.credential_for_username(username).await?)
+    }
+
+    pub async fn create_auth_session(
+        &self,
+        commit: AuthSessionCommit,
+    ) -> Result<AuthPrincipal, StoreError> {
+        Ok(self.storage.create_auth_session(commit).await?)
+    }
+
+    pub async fn authenticate(
+        &self,
+        session_token_hash: &str,
+    ) -> Result<Option<AuthPrincipal>, StoreError> {
+        Ok(self.storage.authenticate(session_token_hash).await?)
+    }
+
+    pub async fn revoke_auth_session(&self, session_token_hash: &str) -> Result<bool, StoreError> {
+        Ok(self.storage.revoke_auth_session(session_token_hash).await?)
+    }
+
+    pub async fn preferences(&self, user_id: &str) -> Result<StoredPreferences, StoreError> {
+        Ok(self.storage.preferences(user_id).await?)
+    }
+
+    pub async fn update_preferences(
+        &self,
+        user_id: &str,
+        expected_revision: u64,
+        theme: &str,
+        preferred_model: Option<&str>,
+    ) -> Result<StoredPreferences, StoreError> {
+        Ok(self
+            .storage
+            .update_preferences(user_id, expected_revision, theme, preferred_model)
+            .await?)
     }
 
     pub async fn overview(&self) -> Result<OverviewResponse, StoreError> {
@@ -354,6 +444,25 @@ impl DemoStore {
         Ok(response)
     }
 
+    pub async fn create_session_for_actor(
+        &self,
+        actor_user_id: &str,
+        request: CreateSessionRequest,
+        idempotency_key: &str,
+    ) -> Result<CreateSessionResponse, StoreError> {
+        validate_canonical_session_value(&request.id, "session ID")?;
+        validate_canonical_session_value(&request.title, "session title")?;
+        let idempotency_key = normalized_idempotency_key(idempotency_key)?;
+        let response = self
+            .storage
+            .create_session_for_actor(actor_user_id, request, idempotency_key)
+            .await?;
+        if !response.replayed {
+            self.publish_session_event(&response.session.id, response.event.clone());
+        }
+        Ok(response)
+    }
+
     pub async fn resume_session(
         &self,
         session_id: &str,
@@ -392,6 +501,75 @@ impl DemoStore {
             self.publish_session_event(session_id, response.event.clone());
         }
         Ok(response)
+    }
+
+    pub async fn start_turn_and_enqueue_reply(
+        &self,
+        session_id: &str,
+        request: StartTurnRequest,
+        idempotency_key: &str,
+        job: ReplyJobSpec,
+    ) -> Result<ReplyJobEnqueueResponse, StoreError> {
+        validate_canonical_session_value(session_id, "session ID")?;
+        validate_canonical_session_value(&request.turn_id, "turn ID")?;
+        validate_session_message(&request.user_message, "user message")?;
+        validate_session_sequence(request.expected_sequence, "expected session sequence")?;
+        let idempotency_key = normalized_idempotency_key(idempotency_key)?;
+        let response = self
+            .storage
+            .start_turn_and_enqueue_reply(session_id, request, idempotency_key, job)
+            .await?;
+        if !response.start.replayed {
+            self.publish_session_event(session_id, response.start.event.clone());
+        }
+        Ok(response)
+    }
+
+    pub async fn claim_next_reply(&self) -> Result<ReplyClaimOutcome, StoreError> {
+        Ok(self.storage.claim_next_reply().await?)
+    }
+
+    pub async fn reply_job(&self, job_id: &str) -> Result<Option<ReplyJob>, StoreError> {
+        Ok(self.storage.reply_job(job_id).await?)
+    }
+
+    pub async fn complete_reply_success(
+        &self,
+        commit: ReplySuccessCommit,
+    ) -> Result<ReplyCompletion, StoreError> {
+        let completion = self.storage.complete_reply_success(commit).await?;
+        if !completion.replayed {
+            for event in &completion.events {
+                self.publish_session_event(&completion.session.id, event.clone());
+            }
+        }
+        Ok(completion)
+    }
+
+    pub async fn complete_reply_failure(
+        &self,
+        commit: ReplyFailureCommit,
+    ) -> Result<ReplyCompletion, StoreError> {
+        let completion = self.storage.complete_reply_failure(commit).await?;
+        if !completion.replayed {
+            for event in &completion.events {
+                self.publish_session_event(&completion.session.id, event.clone());
+            }
+        }
+        Ok(completion)
+    }
+
+    pub async fn complete_reply_outcome_unknown(
+        &self,
+        commit: ReplyOutcomeUnknownCommit,
+    ) -> Result<ReplyCompletion, StoreError> {
+        let completion = self.storage.complete_reply_outcome_unknown(commit).await?;
+        if !completion.replayed {
+            for event in &completion.events {
+                self.publish_session_event(&completion.session.id, event.clone());
+            }
+        }
+        Ok(completion)
     }
 
     pub async fn flush_turn(
@@ -539,6 +717,21 @@ impl DemoStore {
 
     pub async fn current_run(&self) -> Result<RunSummary, StoreError> {
         Ok(self.storage.snapshot(&self.primary_run_id).await?.run)
+    }
+
+    async fn recover_started_reply_jobs(&self) -> Result<(), StoreError> {
+        let recovered = self.storage.recover_started_replies().await?;
+        for completion in recovered {
+            for event in completion.events {
+                if !matches!(event.data, SessionEventData::TurnInterrupted { .. }) {
+                    return Err(StoreError::ExecutionInvariant(
+                        "started-reply recovery returned a non-interruption event".into(),
+                    ));
+                }
+                self.publish_session_event(&completion.session.id, event);
+            }
+        }
+        Ok(())
     }
 
     async fn recover_open_session_turns(&self) -> Result<(), StoreError> {

@@ -1,32 +1,49 @@
 //! HTTP composition for the durable Zeus Alpha slice.
 
-use std::{convert::Infallible, time::Duration};
+use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{
-        Path, Query, State,
+        Path, Query, Request, State,
         rejection::{JsonRejection, QueryRejection},
     },
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
+    middleware::{self, Next},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
     routing::{get, post},
 };
-use protocol::{
-    CreateSessionRequest, CreateSessionResponse, FlushSessionRequest, FlushSessionResponse,
-    HealthResponse, ProblemDetails, ResumeSessionRequest, ResumeSessionResponse, ReviewRequest,
-    ReviewResponse, RunDetail, SessionDetail, SessionEvent, SessionSummary, StartTurnRequest,
-    StartTurnResponse,
+use llm::{
+    LocalFallbackProvider, ProviderError, ReplyKind, ReplyMessage, ReplyProvider, ReplyRequest,
+    ReplyRole,
 };
-use runtime::{DemoStore, PublishedEvent, StoreError};
+use protocol::{
+    AccountRole, AccountStatus, AccountUser, AssistantReplyKind, AssistantReplyProvenance,
+    AuthStatusResponse, AuthenticationResponse, BootstrapRequest, CreateSessionRequest,
+    CreateSessionResponse, FlushSessionRequest, FlushSessionResponse, HealthResponse, LoginRequest,
+    LogoutResponse, ProblemDetails, ResumeSessionRequest, ResumeSessionResponse, ReviewRequest,
+    ReviewResponse, RunDetail, SessionDetail, SessionEvent, SessionSummary, StartTurnRequest,
+    ThemePreference, UpdatePreferencesRequest, UserPreferences,
+};
+use runtime::{
+    AuthPrincipal, AuthSessionCommit, BootstrapOwnerCommit, DemoStore, PublishedEvent,
+    ReplyClaimOutcome, ReplyFailureCommit, ReplyJob, ReplyJobSpec, ReplyOutcomeUnknownCommit,
+    ReplySuccessCommit, StoreError, StoredPreferences, StoredUser, StoredUserRole,
+    StoredUserStatus,
+};
 use serde::Deserialize;
+use tenancy::{
+    BootstrapTokenDigest, CsrfToken, CsrfTokenDigest, Password, PasswordAuthenticator,
+    PasswordHashRecord, SessionToken, SessionTokenDigest, UserId, Username, hash_password,
+};
 use tokio::{
-    sync::broadcast,
+    sync::{Mutex, Semaphore, broadcast},
     time::{Instant, MissedTickBehavior},
 };
+use zeroize::{Zeroize, Zeroizing};
 
 const DURABLE_LEDGER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -35,6 +52,25 @@ struct ApiState {
     store: DemoStore,
     durable_ledger_poll_interval: Duration,
     broadcast_hints_enabled: bool,
+    auth: Option<Arc<AuthConfig>>,
+    reply: Option<Arc<ReplyExecutor>>,
+}
+
+struct AuthConfig {
+    authenticator: Arc<PasswordAuthenticator>,
+    password_workers: Arc<Semaphore>,
+    cookie_secure: bool,
+}
+
+struct ReplyExecutor {
+    provider: Arc<dyn ReplyProvider>,
+    drain: Mutex<()>,
+}
+
+#[derive(Clone)]
+struct CurrentAuth {
+    principal: AuthPrincipal,
+    session_token_hash: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -46,40 +82,117 @@ pub fn app(store: DemoStore) -> Router {
     app_with_event_feed_options(store, DURABLE_LEDGER_POLL_INTERVAL, true)
 }
 
+pub fn authenticated_app(
+    store: DemoStore,
+    cookie_secure: bool,
+) -> Result<Router, tenancy::CredentialError> {
+    authenticated_app_with_provider(store, cookie_secure, Arc::new(LocalFallbackProvider::new()))
+}
+
+pub fn authenticated_app_with_provider(
+    store: DemoStore,
+    cookie_secure: bool,
+    provider: Arc<dyn ReplyProvider>,
+) -> Result<Router, tenancy::CredentialError> {
+    let auth = Arc::new(AuthConfig {
+        authenticator: Arc::new(PasswordAuthenticator::new()?),
+        password_workers: Arc::new(Semaphore::new(2)),
+        cookie_secure,
+    });
+    let reply = Arc::new(ReplyExecutor {
+        provider,
+        drain: Mutex::new(()),
+    });
+    Ok(build_app(
+        store,
+        DURABLE_LEDGER_POLL_INTERVAL,
+        true,
+        Some(auth),
+        Some(reply),
+    ))
+}
+
 fn app_with_event_feed_options(
     store: DemoStore,
     durable_ledger_poll_interval: Duration,
     broadcast_hints_enabled: bool,
 ) -> Router {
+    build_app(
+        store,
+        durable_ledger_poll_interval,
+        broadcast_hints_enabled,
+        None,
+        None,
+    )
+}
+
+fn build_app(
+    store: DemoStore,
+    durable_ledger_poll_interval: Duration,
+    broadcast_hints_enabled: bool,
+    auth: Option<Arc<AuthConfig>>,
+    reply: Option<Arc<ReplyExecutor>>,
+) -> Router {
     assert!(
         !durable_ledger_poll_interval.is_zero(),
         "the durable ledger poll interval must be positive"
     );
-    Router::new()
-        .route("/health/live", get(liveness))
-        .route("/health/ready", get(readiness))
+    let state = ApiState {
+        store,
+        durable_ledger_poll_interval,
+        broadcast_hints_enabled,
+        auth,
+        reply,
+    };
+
+    let mut protected = Router::new()
         .route("/api/v1/overview", get(overview))
         .route("/api/v1/sessions", get(list_sessions).post(create_session))
         .route("/api/v1/sessions/{id}", get(session_detail))
         .route("/api/v1/sessions/{id}/resume", post(resume_session))
         .route("/api/v1/sessions/{id}/turns", post(start_turn))
-        .route(
-            "/api/v1/sessions/{id}/turns/{turn_id}/flush",
-            post(flush_turn),
-        )
         .route("/api/v1/sessions/{id}/events", get(session_events))
         .route("/api/v1/runs/{id}", get(run_detail))
         .route(
             "/api/v1/runs/{id}/approvals/{approval_id}/decision",
             post(review_decision),
         )
-        .route("/api/v1/runs/{id}/events", get(run_events))
+        .route("/api/v1/runs/{id}/events", get(run_events));
+
+    if state.auth.is_some() {
+        protected = protected
+            .route("/api/v1/auth/logout", post(logout))
+            .route(
+                "/api/v1/me/settings",
+                get(get_preferences).patch(patch_preferences),
+            )
+            .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
+    } else {
+        // Kept only for the existing storage/runtime contract tests. The real
+        // server uses `authenticated_app`, where assistant content is owned by
+        // the reply worker and this route is absent.
+        protected = protected.route(
+            "/api/v1/sessions/{id}/turns/{turn_id}/flush",
+            post(flush_turn),
+        );
+    }
+
+    let mut public = Router::new()
+        .route("/health/live", get(liveness))
+        .route("/health/ready", get(readiness));
+    if state.auth.is_some() {
+        public = public
+            .route("/api/v1/auth/status", get(auth_status))
+            .route("/api/v1/auth/bootstrap", post(bootstrap))
+            .route("/api/v1/auth/login", post(login));
+    }
+
+    let router = public
+        .merge(protected)
         .fallback(not_found)
-        .with_state(ApiState {
-            store,
-            durable_ledger_poll_interval,
-            broadcast_hints_enabled,
-        })
+        .with_state(state.clone());
+    kick_reply_worker(&state);
+    router
 }
 
 async fn liveness() -> Json<HealthResponse> {
@@ -89,6 +202,654 @@ async fn liveness() -> Json<HealthResponse> {
 async fn readiness(State(state): State<ApiState>) -> Result<Json<HealthResponse>, ApiError> {
     state.store.readiness().await?;
     Ok(Json(HealthResponse { status: "ready" }))
+}
+
+async fn auth_status(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let configured = state.store.has_users().await?;
+    let principal = if configured {
+        authenticate_headers(&state, &headers).await?
+    } else {
+        None
+    };
+    let (user, preferences) = if let Some(principal) = principal {
+        let preferences = state.store.preferences(&principal.user.id).await?;
+        (
+            Some(account_user(&principal.user)),
+            Some(user_preferences(&preferences)?),
+        )
+    } else {
+        (None, None)
+    };
+    let mut response = Json(AuthStatusResponse {
+        configured,
+        authenticated: user.is_some(),
+        user,
+        preferences,
+    })
+    .into_response();
+    no_store(response.headers_mut());
+    Ok(response)
+}
+
+async fn bootstrap(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    payload: Result<Json<BootstrapRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    enforce_same_origin(&headers)?;
+    if state.store.has_users().await? {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "account_already_configured",
+            "Owner already configured",
+            "This Zeus instance already has an owner account",
+        ));
+    }
+    let Json(mut request) = payload.map_err(ApiError::invalid_json)?;
+    let bootstrap_digest = BootstrapTokenDigest::from_presented(&request.bootstrap_token);
+    request.bootstrap_token.zeroize();
+    let bootstrap_hash = bootstrap_digest
+        .map_err(|_| ApiError::invalid_bootstrap())?
+        .to_persistence();
+    let password = Password::new(request.password)
+        .map_err(|error| ApiError::bad_request("invalid_password", error.to_string()))?;
+    let username = Username::parse(request.username)
+        .map_err(|error| ApiError::bad_request("invalid_username", error.to_string()))?;
+    let auth = auth_config(&state)?;
+    let permit = auth
+        .password_workers
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::auth_unavailable("password workers are busy"))?;
+    let password_hash = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        hash_password(&password)
+    })
+    .await
+    .map_err(|error| ApiError::auth_unavailable(&error))?
+    .map_err(|error| ApiError::auth_unavailable(&error))?;
+
+    let user_id = UserId::generate().map_err(|error| ApiError::auth_unavailable(&error))?;
+    let (session_token, csrf_token, expires_at) = fresh_auth_tokens()?;
+    let (user, preferences) = state
+        .store
+        .bootstrap_owner(BootstrapOwnerCommit {
+            bootstrap_token_hash: bootstrap_hash,
+            user_id: user_id.as_str().to_owned(),
+            username: username.as_str().to_owned(),
+            password_hash: password_hash.as_phc().to_owned(),
+            session_token_hash: session_token.digest().to_persistence(),
+            csrf_hash: csrf_token.digest().to_persistence(),
+            session_expires_at: expires_at.clone(),
+        })
+        .await
+        .map_err(|error| match error {
+            StoreError::InvalidBootstrapToken => ApiError::invalid_bootstrap(),
+            other => other.into(),
+        })?;
+
+    authentication_response(
+        &state,
+        &session_token,
+        &csrf_token,
+        &expires_at,
+        user,
+        preferences,
+    )
+}
+
+async fn login(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    payload: Result<Json<LoginRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    enforce_same_origin(&headers)?;
+    if !state.store.has_users().await? {
+        return Err(ApiError::new(
+            StatusCode::PRECONDITION_REQUIRED,
+            "setup_required",
+            "Owner setup required",
+            "Bootstrap the local owner account before signing in",
+        ));
+    }
+    let Json(request) = payload.map_err(ApiError::invalid_json)?;
+    let normalized_username = Username::parse(&request.username).ok();
+    let password = Zeroizing::new(request.password);
+    let credential = if let Some(username) = &normalized_username {
+        state
+            .store
+            .credential_for_username(username.as_str())
+            .await?
+    } else {
+        None
+    };
+    let record = credential
+        .as_ref()
+        .map(|credential| PasswordHashRecord::parse(&credential.password_hash))
+        .transpose()
+        .map_err(|error| ApiError::auth_unavailable(&error))?;
+    let auth = auth_config(&state)?;
+    let authenticator = Arc::clone(&auth.authenticator);
+    let permit = auth
+        .password_workers
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::auth_unavailable("password workers are busy"))?;
+    let verified = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        authenticator.verify(record.as_ref(), password.as_str())
+    })
+    .await
+    .map_err(|error| ApiError::auth_unavailable(&error))?
+    .map_err(|error| ApiError::auth_unavailable(&error))?;
+    let credential = credential.filter(|credential| {
+        verified
+            && credential.user.status == StoredUserStatus::Active
+            && credential.user.role == StoredUserRole::Owner
+    });
+    let Some(credential) = credential else {
+        return Err(ApiError::invalid_login());
+    };
+
+    let (session_token, csrf_token, expires_at) = fresh_auth_tokens()?;
+    state
+        .store
+        .create_auth_session(AuthSessionCommit {
+            user_id: credential.user.id.clone(),
+            session_token_hash: session_token.digest().to_persistence(),
+            csrf_hash: csrf_token.digest().to_persistence(),
+            expires_at: expires_at.clone(),
+        })
+        .await?;
+    let preferences = state.store.preferences(&credential.user.id).await?;
+    authentication_response(
+        &state,
+        &session_token,
+        &csrf_token,
+        &expires_at,
+        credential.user,
+        preferences,
+    )
+}
+
+async fn logout(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+) -> Result<Response, ApiError> {
+    state
+        .store
+        .revoke_auth_session(&current.session_token_hash)
+        .await?;
+    let mut response = Json(LogoutResponse {
+        status: "signed_out".into(),
+    })
+    .into_response();
+    clear_auth_cookies(response.headers_mut(), auth_config(&state)?.cookie_secure)?;
+    no_store(response.headers_mut());
+    Ok(response)
+}
+
+async fn get_preferences(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+) -> Result<Json<UserPreferences>, ApiError> {
+    let preferences = state.store.preferences(&current.principal.user.id).await?;
+    Ok(Json(user_preferences(&preferences)?))
+}
+
+async fn patch_preferences(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    payload: Result<Json<UpdatePreferencesRequest>, JsonRejection>,
+) -> Result<Json<UserPreferences>, ApiError> {
+    let Json(request) = payload.map_err(ApiError::invalid_json)?;
+    let theme = match request.theme {
+        ThemePreference::System => "system",
+        ThemePreference::Light => "light",
+        ThemePreference::Dark => "dark",
+    };
+    let preferred_model = request
+        .preferred_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty());
+    if preferred_model.is_some()
+        && preferred_model != reply_executor(&state)?.provider.metadata().model.as_deref()
+    {
+        return Err(ApiError::bad_request(
+            "unsupported_model",
+            "The preferred model must match the server-configured provider model",
+        ));
+    }
+    let preferences = state
+        .store
+        .update_preferences(
+            &current.principal.user.id,
+            request.expected_revision,
+            theme,
+            preferred_model,
+        )
+        .await?;
+    Ok(Json(user_preferences(&preferences)?))
+}
+
+async fn require_auth(State(state): State<ApiState>, mut request: Request, next: Next) -> Response {
+    let result = async {
+        let headers = request.headers();
+        let token = cookie_value(headers, SESSION_COOKIE).ok_or_else(ApiError::unauthorized)?;
+        let digest = SessionTokenDigest::from_presented(&token)
+            .map_err(|_| ApiError::unauthorized())?
+            .to_persistence();
+        let principal = state
+            .store
+            .authenticate(&digest)
+            .await?
+            .ok_or_else(ApiError::unauthorized)?;
+        if principal.user.role != StoredUserRole::Owner {
+            return Err(ApiError::unauthorized());
+        }
+
+        if is_unsafe_method(request.method()) {
+            enforce_same_origin(headers)?;
+            let presented = headers
+                .get(CSRF_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(ApiError::invalid_csrf)?;
+            let stored = CsrfTokenDigest::from_persistence(&principal.csrf_hash)
+                .map_err(|error| ApiError::auth_unavailable(&error))?;
+            if !stored.verify(presented) {
+                return Err(ApiError::invalid_csrf());
+            }
+        }
+
+        request.extensions_mut().insert(CurrentAuth {
+            principal,
+            session_token_hash: digest,
+        });
+        Ok::<_, ApiError>(next.run(request).await)
+    }
+    .await;
+    result.unwrap_or_else(IntoResponse::into_response)
+}
+
+const SESSION_COOKIE: &str = "zeus_session";
+const CSRF_COOKIE: &str = "zeus_csrf";
+const CSRF_HEADER: &str = "x-csrf-token";
+const AUTH_SESSION_SECONDS: i64 = 30 * 24 * 60 * 60;
+
+fn auth_config(state: &ApiState) -> Result<&AuthConfig, ApiError> {
+    state
+        .auth
+        .as_deref()
+        .ok_or_else(|| ApiError::auth_unavailable("authentication is not configured"))
+}
+
+fn fresh_auth_tokens() -> Result<(SessionToken, CsrfToken, String), ApiError> {
+    let session = SessionToken::generate().map_err(|error| ApiError::auth_unavailable(&error))?;
+    let csrf = CsrfToken::generate().map_err(|error| ApiError::auth_unavailable(&error))?;
+    let expires_at = (chrono::Utc::now() + chrono::Duration::seconds(AUTH_SESSION_SECONDS))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    Ok((session, csrf, expires_at))
+}
+
+fn authentication_response(
+    state: &ApiState,
+    session_token: &SessionToken,
+    csrf_token: &CsrfToken,
+    expires_at: &str,
+    user: StoredUser,
+    preferences: StoredPreferences,
+) -> Result<Response, ApiError> {
+    let mut response = Json(AuthenticationResponse {
+        user: account_user(&user),
+        preferences: user_preferences(&preferences)?,
+        csrf_token: csrf_token.expose_secret().to_owned(),
+        expires_at: expires_at.to_owned(),
+    })
+    .into_response();
+    set_auth_cookies(
+        response.headers_mut(),
+        session_token.expose_secret(),
+        csrf_token.expose_secret(),
+        auth_config(state)?.cookie_secure,
+    )?;
+    no_store(response.headers_mut());
+    Ok(response)
+}
+
+async fn authenticate_headers(
+    state: &ApiState,
+    headers: &HeaderMap,
+) -> Result<Option<AuthPrincipal>, ApiError> {
+    let Some(token) = cookie_value(headers, SESSION_COOKIE) else {
+        return Ok(None);
+    };
+    let Ok(digest) = SessionTokenDigest::from_presented(&token) else {
+        return Ok(None);
+    };
+    Ok(state
+        .store
+        .authenticate(&digest.to_persistence())
+        .await?
+        .filter(|principal| principal.user.role == StoredUserRole::Owner))
+}
+
+fn account_user(user: &StoredUser) -> AccountUser {
+    AccountUser {
+        id: user.id.clone(),
+        username: user.username.clone(),
+        role: match user.role {
+            StoredUserRole::Owner => AccountRole::Owner,
+            StoredUserRole::Member => AccountRole::Member,
+        },
+        status: match user.status {
+            StoredUserStatus::Active => AccountStatus::Active,
+            StoredUserStatus::Disabled => AccountStatus::Disabled,
+        },
+        created_at: user.created_at.clone(),
+    }
+}
+
+fn user_preferences(preferences: &StoredPreferences) -> Result<UserPreferences, ApiError> {
+    let theme = match preferences.theme.as_str() {
+        "system" => ThemePreference::System,
+        "light" => ThemePreference::Light,
+        "dark" => ThemePreference::Dark,
+        other => {
+            return Err(ApiError::auth_unavailable(&format!(
+                "invalid stored theme {other}"
+            )));
+        }
+    };
+    Ok(UserPreferences {
+        theme,
+        preferred_model: preferences.preferred_model.clone(),
+        revision: preferences.revision,
+        updated_at: preferences.updated_at.clone(),
+    })
+}
+
+fn enforce_same_origin(headers: &HeaderMap) -> Result<(), ApiError> {
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(ApiError::invalid_origin)?;
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(ApiError::invalid_origin)?;
+    let uri = origin
+        .parse::<Uri>()
+        .map_err(|_| ApiError::invalid_origin())?;
+    if !matches!(uri.scheme_str(), Some("http" | "https"))
+        || uri.path() != "/"
+        || uri.query().is_some()
+    {
+        return Err(ApiError::invalid_origin());
+    }
+    let authority = uri
+        .authority()
+        .map(|authority| authority.as_str())
+        .ok_or_else(ApiError::invalid_origin)?;
+    if !authority.eq_ignore_ascii_case(host) {
+        return Err(ApiError::invalid_origin());
+    }
+    Ok(())
+}
+
+fn is_unsafe_method(method: &Method) -> bool {
+    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+}
+
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers.get_all(header::COOKIE).iter().find_map(|header| {
+        header.to_str().ok()?.split(';').find_map(|part| {
+            let (cookie_name, value) = part.trim().split_once('=')?;
+            (cookie_name == name).then(|| value.to_owned())
+        })
+    })
+}
+
+fn set_auth_cookies(
+    headers: &mut HeaderMap,
+    session_token: &str,
+    csrf_token: &str,
+    secure: bool,
+) -> Result<(), ApiError> {
+    let secure_attribute = if secure { "; Secure" } else { "" };
+    append_cookie(
+        headers,
+        format!(
+            "{SESSION_COOKIE}={session_token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={AUTH_SESSION_SECONDS}{}",
+            secure_attribute
+        ),
+    )?;
+    append_cookie(
+        headers,
+        format!(
+            "{CSRF_COOKIE}={csrf_token}; Path=/; SameSite=Strict; Max-Age={AUTH_SESSION_SECONDS}{}",
+            secure_attribute
+        ),
+    )
+}
+
+fn clear_auth_cookies(headers: &mut HeaderMap, secure: bool) -> Result<(), ApiError> {
+    let secure = if secure { "; Secure" } else { "" };
+    append_cookie(
+        headers,
+        format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}"),
+    )?;
+    append_cookie(
+        headers,
+        format!("{CSRF_COOKIE}=; Path=/; SameSite=Strict; Max-Age=0{secure}"),
+    )
+}
+
+fn append_cookie(headers: &mut HeaderMap, value: String) -> Result<(), ApiError> {
+    let value =
+        HeaderValue::from_str(&value).map_err(|error| ApiError::auth_unavailable(&error))?;
+    headers.append(header::SET_COOKIE, value);
+    Ok(())
+}
+
+fn no_store(headers: &mut HeaderMap) {
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+}
+
+fn reply_executor(state: &ApiState) -> Result<&ReplyExecutor, ApiError> {
+    state
+        .reply
+        .as_deref()
+        .ok_or_else(|| ApiError::auth_unavailable("reply execution is not configured"))
+}
+
+fn kick_reply_worker(state: &ApiState) {
+    if state.reply.is_none() {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let state = state.clone();
+    runtime.spawn(async move {
+        if let Err(error) = drain_reply_jobs(&state).await {
+            eprintln!("zeus reply worker stopped: {error}");
+        }
+    });
+}
+
+async fn drain_reply_jobs(state: &ApiState) -> Result<(), StoreError> {
+    let reply = state
+        .reply
+        .as_ref()
+        .expect("reply worker is only started when a provider exists");
+    let _drain = reply.drain.lock().await;
+    loop {
+        let job = match state.store.claim_next_reply().await? {
+            ReplyClaimOutcome::Claimed(job) => *job,
+            ReplyClaimOutcome::NotAvailable => return Ok(()),
+        };
+        process_reply_job(state, job).await?;
+    }
+}
+
+async fn process_reply_job(state: &ApiState, job: ReplyJob) -> Result<(), StoreError> {
+    let reply = state
+        .reply
+        .as_ref()
+        .expect("a claimed reply requires a configured provider");
+    let metadata = reply.provider.metadata();
+    if job.provider_name != metadata.provider_id || job.model_name != metadata.model {
+        return fail_reply_job(
+            state,
+            &job,
+            "provider_configuration_changed",
+            "The queued reply no longer matches the configured provider",
+        )
+        .await;
+    }
+
+    let request = match serde_json::from_value::<ReplyRequest>(job.request_json.clone()) {
+        Ok(request) => request,
+        Err(_) => {
+            return fail_reply_job(
+                state,
+                &job,
+                "invalid_persisted_request",
+                "The persisted reply request could not be decoded safely",
+            )
+            .await;
+        }
+    };
+    let response = match reply.provider.reply(request).await {
+        Ok(response) => response,
+        Err(error) => {
+            if matches!(&error, ProviderError::Timeout | ProviderError::Transport) {
+                return mark_reply_outcome_unknown(
+                    state,
+                    &job,
+                    provider_error_code(&error),
+                    &error.to_string(),
+                )
+                .await;
+            }
+            return fail_reply_job(state, &job, provider_error_code(&error), &error.to_string())
+                .await;
+        }
+    };
+    if &response.provider != metadata {
+        return fail_reply_job(
+            state,
+            &job,
+            "provider_metadata_mismatch",
+            "The reply provider returned inconsistent provenance",
+        )
+        .await;
+    }
+
+    let expected_sequence = state
+        .store
+        .get_session(&job.session_id)
+        .await?
+        .session
+        .sequence;
+    let response_json = match serde_json::to_value(&response) {
+        Ok(value) => value,
+        Err(_) => {
+            return fail_reply_job(
+                state,
+                &job,
+                "invalid_provider_response",
+                "The reply provider response could not be persisted safely",
+            )
+            .await;
+        }
+    };
+    state
+        .store
+        .complete_reply_success(ReplySuccessCommit {
+            job_id: job.id,
+            expected_sequence,
+            assistant_message: response.content,
+            provenance: AssistantReplyProvenance {
+                provider_id: response.provider.provider_id,
+                model: response.provider.model,
+                reply_kind: match response.provider.reply_kind {
+                    ReplyKind::Model => AssistantReplyKind::Model,
+                    ReplyKind::NonModelFallback => AssistantReplyKind::NonModelFallback,
+                },
+            },
+            response_json,
+        })
+        .await?;
+    Ok(())
+}
+
+async fn fail_reply_job(
+    state: &ApiState,
+    job: &ReplyJob,
+    code: &str,
+    message: &str,
+) -> Result<(), StoreError> {
+    let expected_sequence = state
+        .store
+        .get_session(&job.session_id)
+        .await?
+        .session
+        .sequence;
+    state
+        .store
+        .complete_reply_failure(ReplyFailureCommit {
+            job_id: job.id.clone(),
+            expected_sequence,
+            error_json: serde_json::json!({
+                "code": code,
+                "message": message,
+            }),
+        })
+        .await?;
+    Ok(())
+}
+
+async fn mark_reply_outcome_unknown(
+    state: &ApiState,
+    job: &ReplyJob,
+    code: &str,
+    message: &str,
+) -> Result<(), StoreError> {
+    let expected_sequence = state
+        .store
+        .get_session(&job.session_id)
+        .await?
+        .session
+        .sequence;
+    state
+        .store
+        .complete_reply_outcome_unknown(ReplyOutcomeUnknownCommit {
+            job_id: job.id.clone(),
+            expected_sequence,
+            error_json: serde_json::json!({
+                "code": code,
+                "message": message,
+            }),
+        })
+        .await?;
+    Ok(())
+}
+
+fn provider_error_code(error: &ProviderError) -> &'static str {
+    match error {
+        ProviderError::InvalidConfiguration(_) => "provider_configuration_invalid",
+        ProviderError::InvalidRequest(_) => "provider_request_invalid",
+        ProviderError::Timeout => "provider_timeout",
+        ProviderError::Transport => "provider_transport_failed",
+        ProviderError::HttpStatus { .. } => "provider_http_error",
+        ProviderError::ResponseTooLarge { .. } => "provider_response_too_large",
+        ProviderError::InvalidResponse => "provider_response_invalid",
+    }
 }
 
 async fn overview(
@@ -105,20 +866,28 @@ async fn list_sessions(
 
 async fn create_session(
     State(state): State<ApiState>,
+    current: Option<Extension<CurrentAuth>>,
     headers: HeaderMap,
     payload: Result<Json<CreateSessionRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
     let idempotency_key = required_idempotency_key(&headers)?;
     let Json(request) = payload.map_err(ApiError::invalid_json)?;
-    Ok((
-        StatusCode::CREATED,
-        Json(
+    let response = match current {
+        Some(Extension(current)) => {
+            state
+                .store
+                .create_session_for_actor(&current.principal.user.id, request, &idempotency_key)
+                .await?
+        }
+        None if state.auth.is_none() => {
             state
                 .store
                 .create_session(request, &idempotency_key)
-                .await?,
-        ),
-    ))
+                .await?
+        }
+        None => return Err(ApiError::unauthorized()),
+    };
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 async fn session_detail(
@@ -146,18 +915,44 @@ async fn resume_session(
 
 async fn start_turn(
     State(state): State<ApiState>,
+    current: Option<Extension<CurrentAuth>>,
     Path(id): Path<String>,
     headers: HeaderMap,
     payload: Result<Json<StartTurnRequest>, JsonRejection>,
-) -> Result<Json<StartTurnResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let idempotency_key = required_idempotency_key(&headers)?;
     let Json(request) = payload.map_err(ApiError::invalid_json)?;
-    Ok(Json(
-        state
+    let Some(Extension(current)) = current else {
+        if state.auth.is_some() {
+            return Err(ApiError::unauthorized());
+        }
+        let response = state
             .store
             .start_turn(&id, request, &idempotency_key)
-            .await?,
-    ))
+            .await?;
+        return Ok(Json(response).into_response());
+    };
+
+    let reply = reply_executor(&state)?;
+    let metadata = reply.provider.metadata();
+    let reply_request = ReplyRequest::new([ReplyMessage::new(
+        ReplyRole::User,
+        request.user_message.clone(),
+    )]);
+    let job = ReplyJobSpec {
+        id: format!("reply:{id}:{}", request.turn_id),
+        actor_user_id: current.principal.user.id,
+        provider_name: metadata.provider_id.clone(),
+        model_name: metadata.model.clone(),
+        request_json: serde_json::to_value(reply_request)
+            .map_err(|error| ApiError::auth_unavailable(&error))?,
+    };
+    let response = state
+        .store
+        .start_turn_and_enqueue_reply(&id, request, &idempotency_key, job)
+        .await?;
+    kick_reply_worker(&state);
+    Ok((StatusCode::ACCEPTED, Json(response.start)).into_response())
 }
 
 async fn flush_turn(
@@ -240,6 +1035,7 @@ fn required_idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {
 
 async fn session_events(
     State(state): State<ApiState>,
+    current: Option<Extension<CurrentAuth>>,
     Path(id): Path<String>,
     headers: HeaderMap,
     query: Result<Query<EventsQuery>, QueryRejection>,
@@ -250,6 +1046,7 @@ async fn session_events(
     let store = state.store.clone();
     let durable_ledger_poll_interval = state.durable_ledger_poll_interval;
     let broadcast_hints_enabled = state.broadcast_hints_enabled;
+    let auth_session_token_hash = current.map(|Extension(current)| current.session_token_hash);
     let session_id = id;
 
     let stream = async_stream::stream! {
@@ -271,6 +1068,9 @@ async fn session_events(
             tokio::select! {
                 received = feed.receiver.recv(), if broadcast_hints_enabled => match received {
                     Ok(published) => {
+                        if !sse_auth_is_current(&store, auth_session_token_hash.as_deref()).await {
+                            break;
+                        }
                         if published.session_id == session_id && published.event.sequence > cursor {
                             // A post-commit broadcast is only a wake hint: two
                             // commits can publish out of order. Always advance
@@ -295,6 +1095,9 @@ async fn session_events(
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if !sse_auth_is_current(&store, auth_session_token_hash.as_deref()).await {
+                            break;
+                        }
                         match store.session_events_after(&session_id, cursor).await {
                             Ok(events) => {
                                 for event in events {
@@ -315,6 +1118,9 @@ async fn session_events(
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
                 _ = durable_poll.tick() => {
+                    if !sse_auth_is_current(&store, auth_session_token_hash.as_deref()).await {
+                        break;
+                    }
                     match store.session_events_after(&session_id, cursor).await {
                         Ok(events) => {
                             for event in events {
@@ -345,6 +1151,7 @@ async fn session_events(
 
 async fn run_events(
     State(state): State<ApiState>,
+    current: Option<Extension<CurrentAuth>>,
     Path(id): Path<String>,
     headers: HeaderMap,
     query: Result<Query<EventsQuery>, QueryRejection>,
@@ -355,6 +1162,7 @@ async fn run_events(
     let store = state.store.clone();
     let durable_ledger_poll_interval = state.durable_ledger_poll_interval;
     let broadcast_hints_enabled = state.broadcast_hints_enabled;
+    let auth_session_token_hash = current.map(|Extension(current)| current.session_token_hash);
     let run_id = id;
 
     let stream = async_stream::stream! {
@@ -383,6 +1191,9 @@ async fn run_events(
             tokio::select! {
                 received = feed.receiver.recv(), if broadcast_hints_enabled => match received {
                     Ok(published) => {
+                        if !sse_auth_is_current(&store, auth_session_token_hash.as_deref()).await {
+                            break;
+                        }
                         // Broadcast is only a wake hint. Separate commits can
                         // publish out of order, so advancing directly to the
                         // hinted sequence could permanently skip an earlier
@@ -405,6 +1216,9 @@ async fn run_events(
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if !sse_auth_is_current(&store, auth_session_token_hash.as_deref()).await {
+                            break;
+                        }
                         // Recover a slow client from the append-only ledger
                         // instead of silently skipping events.
                         match store.events_after(&run_id, cursor).await {
@@ -427,6 +1241,9 @@ async fn run_events(
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
                 _ = durable_poll.tick() => {
+                    if !sse_auth_is_current(&store, auth_session_token_hash.as_deref()).await {
+                        break;
+                    }
                     match store.events_after(&run_id, cursor).await {
                         Ok(events) => {
                             for event in events {
@@ -455,6 +1272,13 @@ async fn run_events(
                 .text("keep-alive"),
         )
         .into_response())
+}
+
+async fn sse_auth_is_current(store: &DemoStore, session_token_hash: Option<&str>) -> bool {
+    let Some(session_token_hash) = session_token_hash else {
+        return true;
+    };
+    matches!(store.authenticate(session_token_hash).await, Ok(Some(_)))
 }
 
 async fn run_events_for_hint(
@@ -545,6 +1369,61 @@ impl ApiError {
         Self::bad_request("invalid_query", rejection.body_text())
     }
 
+    fn unauthorized() -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "authentication_required",
+            "Authentication required",
+            "Sign in to access this Zeus resource",
+        )
+    }
+
+    fn invalid_login() -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credentials",
+            "Sign-in failed",
+            "The username or password is invalid",
+        )
+    }
+
+    fn invalid_bootstrap() -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_bootstrap_token",
+            "Owner setup failed",
+            "The bootstrap token is invalid, expired, or already used",
+        )
+    }
+
+    fn invalid_csrf() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "invalid_csrf_token",
+            "Request verification failed",
+            "Refresh the page and retry the request",
+        )
+    }
+
+    fn invalid_origin() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "invalid_origin",
+            "Request origin rejected",
+            "The request must originate from this Zeus host",
+        )
+    }
+
+    fn auth_unavailable(error: &(impl std::fmt::Display + ?Sized)) -> Self {
+        eprintln!("zeus authentication subsystem failed: {error}");
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication_unavailable",
+            "Authentication is unavailable",
+            "The authentication subsystem could not process the request safely",
+        )
+    }
+
     fn internal_runtime_error(error: &StoreError) -> Self {
         eprintln!("zeus request failed an internal runtime invariant: {error:?}");
         Self::new(
@@ -593,6 +1472,17 @@ impl From<StoreError> for ApiError {
                 "Session already exists",
                 format!("Session `{id}` already exists"),
             ),
+            StoreError::AccountAlreadyConfigured => Self::new(
+                StatusCode::CONFLICT,
+                "account_already_configured",
+                "Owner already configured",
+                "This Zeus instance already has an owner account",
+            ),
+            StoreError::InvalidBootstrapToken => Self::invalid_bootstrap(),
+            StoreError::UserNotFound(_) | StoreError::UserDisabled(_) => Self::invalid_login(),
+            StoreError::InvalidAccountData(reason) => {
+                Self::bad_request("invalid_account_data", reason.clone())
+            }
             StoreError::RunAlreadyAttached { run_id, session_id } => Self::new(
                 StatusCode::CONFLICT,
                 "run_already_attached",
@@ -674,14 +1564,154 @@ mod tests {
         http::{Request, header},
     };
     use http_body_util::BodyExt;
+    use llm::{ProviderMetadata, ReplyFuture};
     use protocol::{
         CreateSessionResponse, DEMO_RUN_ID, FlushSessionResponse, OverviewResponse, ReviewDecision,
         ReviewRequest, ReviewResponse, SessionDetail, SessionStatus, SessionSummary,
         StartTurnResponse,
     };
+    use tenancy::BootstrapToken;
     use tower::ServiceExt;
 
     use super::*;
+
+    #[derive(Clone, Copy)]
+    enum IndeterminateFailure {
+        Timeout,
+        Transport,
+    }
+
+    struct IndeterminateProvider {
+        metadata: ProviderMetadata,
+        failure: IndeterminateFailure,
+    }
+
+    impl IndeterminateProvider {
+        fn new(failure: IndeterminateFailure) -> Self {
+            Self {
+                metadata: ProviderMetadata {
+                    provider_id: "test-indeterminate-provider".into(),
+                    model: Some("test-model".into()),
+                    reply_kind: ReplyKind::Model,
+                },
+                failure,
+            }
+        }
+    }
+
+    impl ReplyProvider for IndeterminateProvider {
+        fn metadata(&self) -> &ProviderMetadata {
+            &self.metadata
+        }
+
+        fn reply(&self, _request: ReplyRequest) -> ReplyFuture<'_> {
+            let failure = self.failure;
+            Box::pin(async move {
+                Err(match failure {
+                    IndeterminateFailure::Timeout => ProviderError::Timeout,
+                    IndeterminateFailure::Transport => ProviderError::Transport,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn indeterminate_provider_failures_settle_durably_as_outcome_unknown() {
+        for (suffix, failure, expected_code) in [
+            ("timeout", IndeterminateFailure::Timeout, "provider_timeout"),
+            (
+                "transport",
+                IndeterminateFailure::Transport,
+                "provider_transport_failed",
+            ),
+        ] {
+            let store = DemoStore::seeded().await.unwrap();
+            let bootstrap_hash = "d".repeat(64);
+            let expires_at = (chrono::Utc::now() + chrono::Duration::hours(1))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            store
+                .replace_bootstrap_token(&bootstrap_hash, &expires_at)
+                .await
+                .unwrap();
+            store
+                .bootstrap_owner(BootstrapOwnerCommit {
+                    bootstrap_token_hash: bootstrap_hash,
+                    user_id: "user-owner".into(),
+                    username: "owner".into(),
+                    password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA".into(),
+                    session_token_hash: "e".repeat(64),
+                    csrf_hash: "f".repeat(64),
+                    session_expires_at: expires_at,
+                })
+                .await
+                .unwrap();
+            let session_id = format!("session-{suffix}");
+            let turn_id = format!("turn-{suffix}");
+            let job_id = format!("reply-{suffix}");
+            store
+                .create_session_for_actor(
+                    "user-owner",
+                    CreateSessionRequest {
+                        id: session_id.clone(),
+                        title: format!("Indeterminate {suffix}"),
+                    },
+                    &format!("create-{suffix}"),
+                )
+                .await
+                .unwrap();
+            let provider: Arc<dyn ReplyProvider> = Arc::new(IndeterminateProvider::new(failure));
+            let metadata = provider.metadata();
+            store
+                .start_turn_and_enqueue_reply(
+                    &session_id,
+                    StartTurnRequest {
+                        turn_id: turn_id.clone(),
+                        user_message: "settle this reply safely".into(),
+                        expected_sequence: 1,
+                    },
+                    &format!("start-{suffix}"),
+                    ReplyJobSpec {
+                        id: job_id.clone(),
+                        actor_user_id: "user-owner".into(),
+                        provider_name: metadata.provider_id.clone(),
+                        model_name: metadata.model.clone(),
+                        request_json: serde_json::to_value(ReplyRequest::new([ReplyMessage::new(
+                            ReplyRole::User,
+                            "settle this reply safely",
+                        )]))
+                        .unwrap(),
+                    },
+                )
+                .await
+                .unwrap();
+            let ReplyClaimOutcome::Claimed(job) = store.claim_next_reply().await.unwrap() else {
+                panic!("the reply must be claimable");
+            };
+            let state = ApiState {
+                store: store.clone(),
+                durable_ledger_poll_interval: DURABLE_LEDGER_POLL_INTERVAL,
+                broadcast_hints_enabled: false,
+                auth: None,
+                reply: Some(Arc::new(ReplyExecutor {
+                    provider,
+                    drain: Mutex::new(()),
+                })),
+            };
+
+            process_reply_job(&state, *job).await.unwrap();
+
+            let stored = store.reply_job(&job_id).await.unwrap().unwrap();
+            assert_eq!(stored.status, runtime::ReplyJobStatus::OutcomeUnknown);
+            assert_eq!(stored.error_json.unwrap()["code"], expected_code);
+            let detail = store.get_session(&session_id).await.unwrap();
+            assert_eq!(detail.session.status, SessionStatus::NeedsAttention);
+            assert!(matches!(
+                &detail.events.last().unwrap().data,
+                protocol::SessionEventData::TurnInterrupted { reason, .. }
+                    if reason == "assistant reply provider outcome is unknown"
+            ));
+        }
+    }
 
     #[tokio::test]
     async fn health_and_overview_are_available() {
@@ -707,6 +1737,331 @@ mod tests {
         assert_eq!(overview.run.id, DEMO_RUN_ID);
         assert_eq!(overview.run.sequence, 8);
         assert_eq!(overview.recent_events.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn authenticated_app_bootstraps_once_and_enforces_session_csrf_and_logout() {
+        let store = DemoStore::seeded().await.unwrap();
+        let bootstrap_token = BootstrapToken::generate().unwrap();
+        let expires_at = (chrono::Utc::now() + chrono::Duration::minutes(15))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        store
+            .replace_bootstrap_token(&bootstrap_token.digest().to_persistence(), &expires_at)
+            .await
+            .unwrap();
+        let app = authenticated_app(store, false).unwrap();
+
+        let health = app
+            .clone()
+            .oneshot(Request::get("/health/ready").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let protected = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/overview")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(protected.status(), StatusCode::UNAUTHORIZED);
+
+        let bootstrap = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/bootstrap")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "bootstrap_token": bootstrap_token.expose_secret(),
+                            "username": "owner",
+                            "password": "Owner-password-2026",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bootstrap.status(), StatusCode::OK);
+        assert_eq!(bootstrap.headers()[header::CACHE_CONTROL], "no-store");
+        let cookie_header = authentication_cookie_header(bootstrap.headers());
+        let set_cookies = bootstrap
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(set_cookies.len(), 2);
+        assert!(
+            set_cookies
+                .iter()
+                .all(|value| value.contains("SameSite=Strict"))
+        );
+        assert!(set_cookies.iter().all(|value| !value.contains("; Secure")));
+        assert!(
+            set_cookies
+                .iter()
+                .find(|value| value.starts_with("zeus_session="))
+                .unwrap()
+                .contains("HttpOnly")
+        );
+        assert!(
+            !set_cookies
+                .iter()
+                .find(|value| value.starts_with("zeus_csrf="))
+                .unwrap()
+                .contains("HttpOnly")
+        );
+        let authentication: AuthenticationResponse = response_json(bootstrap).await;
+        assert_eq!(authentication.user.username, "owner");
+
+        let second_bootstrap = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/bootstrap")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "bootstrap_token": bootstrap_token.expose_secret(),
+                            "username": "other-owner",
+                            "password": "Other-password-2026",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second_bootstrap.status(), StatusCode::CONFLICT);
+
+        let authenticated = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/overview")
+                    .header(header::COOKIE, &cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authenticated.status(), StatusCode::OK);
+
+        let missing_csrf = app
+            .clone()
+            .oneshot(
+                Request::patch("/api/v1/me/settings")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &cookie_header)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "theme": "dark",
+                            "preferred_model": null,
+                            "expected_revision": authentication.preferences.revision,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
+
+        let settings = app
+            .clone()
+            .oneshot(
+                Request::patch("/api/v1/me/settings")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &cookie_header)
+                    .header(CSRF_HEADER, &authentication.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "theme": "dark",
+                            "preferred_model": null,
+                            "expected_revision": authentication.preferences.revision,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(settings.status(), StatusCode::OK);
+        let settings: UserPreferences = response_json(settings).await;
+        assert_eq!(settings.theme, ThemePreference::Dark);
+        assert_eq!(settings.revision, authentication.preferences.revision + 1);
+
+        let created = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &cookie_header)
+                    .header(CSRF_HEADER, &authentication.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "authenticated-create-session")
+                    .body(Body::from(
+                        r#"{"id":"session-auth-reply","title":"Authenticated reply"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created: CreateSessionResponse = response_json(created).await;
+        assert_eq!(created.session.sequence, 1);
+
+        let started = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-auth-reply/turns")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &cookie_header)
+                    .header(CSRF_HEADER, &authentication.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "authenticated-start-turn")
+                    .body(Body::from(
+                        r#"{"turn_id":"turn-auth-reply","user_message":"Reply to me","expected_sequence":1}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+
+        let replied = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::get("/api/v1/sessions/session-auth-reply")
+                            .header(header::COOKIE, &cookie_header)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let detail: SessionDetail = response_json(response).await;
+                if detail.session.status == SessionStatus::Ready {
+                    break detail;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the local fallback reply should settle durably");
+        assert_eq!(replied.turns.len(), 1);
+        assert_eq!(
+            replied.turns[0].assistant_message.as_deref(),
+            Some("Your message was saved, but no model provider is configured.")
+        );
+        assert_eq!(replied.events.len(), 4);
+        assert!(matches!(
+            &replied.events[2].data,
+            protocol::SessionEventData::AssistantMessage {
+                provenance: Some(AssistantReplyProvenance {
+                    provider_id,
+                    model: None,
+                    reply_kind: AssistantReplyKind::NonModelFallback,
+                }),
+                ..
+            } if provider_id == "local-fallback"
+        ));
+        assert!(matches!(
+            replied.events[3].data,
+            protocol::SessionEventData::TurnFlushed { .. }
+        ));
+
+        let browser_flush = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-ZR-1842/turns/turn-1/flush")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &cookie_header)
+                    .header(CSRF_HEADER, &authentication.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "forged-browser-flush")
+                    .body(Body::from(
+                        r#"{"turn_id":"turn-1","assistant_message":"forged","expected_sequence":2}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(browser_flush.status(), StatusCode::NOT_FOUND);
+
+        let sse = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/sessions/session-ZR-1842/events?after=2")
+                    .header(header::COOKIE, &cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sse.status(), StatusCode::OK);
+        let mut sse_body = sse.into_body();
+        let opened = tokio::time::timeout(Duration::from_secs(1), sse_body.frame())
+            .await
+            .expect("authenticated SSE should open immediately")
+            .expect("authenticated SSE should produce an opening frame")
+            .expect("authenticated SSE opening frame should be valid");
+        assert!(
+            String::from_utf8(opened.into_data().unwrap().to_vec())
+                .unwrap()
+                .contains("stream-open")
+        );
+
+        let logout = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/logout")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &cookie_header)
+                    .header(CSRF_HEADER, &authentication.csrf_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::OK);
+        assert_eq!(
+            logout.headers().get_all(header::SET_COOKIE).iter().count(),
+            2
+        );
+
+        let ended = tokio::time::timeout(Duration::from_secs(3), sse_body.frame())
+            .await
+            .expect("revoked SSE should close by the next durable auth poll");
+        assert!(ended.is_none(), "revoked SSE emitted another frame");
+
+        let revoked = app
+            .oneshot(
+                Request::get("/api/v1/overview")
+                    .header(header::COOKIE, cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -1323,5 +2678,14 @@ mod tests {
     async fn response_json<T: serde::de::DeserializeOwned>(response: Response) -> T {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn authentication_cookie_header(headers: &HeaderMap) -> String {
+        headers
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().split(';').next().unwrap())
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 }
