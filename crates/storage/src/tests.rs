@@ -13,8 +13,8 @@ use protocol::{
     AttachRunRequest, CreateSessionRequest, EventType, EvidenceSummary, FlushSessionRequest,
     IncidentStatus, IncidentSummary, Metric, MetricTone, NotDispatchedReason, ResumeSessionRequest,
     ReviewDecision, ReviewResponse, RunEvent, RunEventData, RunStatus, RunSummary, SandboxProfile,
-    SessionEventData, SessionStatus, SessionTurnStatus, Severity, StartTurnRequest, ToolCall,
-    ToolCallStatus, ToolEffect, ToolExecutorStatus, ToolOutcome, ToolPolicySummary,
+    SessionEvent, SessionEventData, SessionStatus, SessionTurnStatus, Severity, StartTurnRequest,
+    ToolCall, ToolCallStatus, ToolEffect, ToolExecutorStatus, ToolOutcome, ToolPolicySummary,
 };
 use rusqlite::params;
 use serde_json::json;
@@ -334,6 +334,166 @@ async fn same_key_is_idempotent_and_a_different_fingerprint_conflicts() {
         Err(StorageError::IdempotencyConflict)
     ));
     assert_eq!(store.load_run(RUN_ID).await.unwrap().events.len(), 7);
+}
+
+#[tokio::test]
+async fn review_note_envelope_rejects_before_receipt_or_ledger_side_effects() {
+    let database = TestDatabase::new();
+    let store = seeded_file_store(database.path()).await;
+    bootstrap_test_owner(&store).await;
+    let (snapshot, _) = seed_fixture();
+
+    let oversized_note = "🙂".repeat(protocol::REVIEW_NOTE_MAX_BYTES / 4 + 1);
+    let mut oversized = approved_commit(&snapshot, "oversized-review-note");
+    oversized.event.content = Some(oversized_note.clone());
+    oversized.response.event = oversized.event.clone();
+    oversized.request_fingerprint = serde_json::to_string(&json!({
+        "approval_id": "APR-901",
+        "decision": "approve",
+        "note": oversized_note,
+        "run_id": RUN_ID,
+    }))
+    .unwrap();
+    assert!(matches!(
+        store.commit_review_for_actor("user-owner", oversized).await,
+        Err(StorageError::InvalidResourceEnvelope(_))
+    ));
+    assert!(
+        store
+            .review_receipt_for_actor("user-owner", RUN_ID, "oversized-review-note")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let unchanged = store.load_run(RUN_ID).await.unwrap();
+    assert_eq!(unchanged.snapshot.run.sequence, snapshot.run.sequence);
+    assert_eq!(unchanged.events.len(), 6);
+
+    let boundary_note = "🙂".repeat(protocol::REVIEW_NOTE_MAX_BYTES / 4);
+    let mut boundary = approved_commit(&snapshot, "boundary-review-note");
+    boundary.event.content = Some(boundary_note.clone());
+    boundary.response.event = boundary.event.clone();
+    boundary.request_fingerprint = serde_json::to_string(&json!({
+        "approval_id": "APR-901",
+        "decision": "approve",
+        "note": boundary_note,
+        "run_id": RUN_ID,
+    }))
+    .unwrap();
+    assert_eq!(
+        store
+            .commit_review_for_actor("user-owner", boundary)
+            .await
+            .unwrap(),
+        CommitOutcome::Committed
+    );
+}
+
+#[tokio::test]
+async fn legacy_oversized_run_and_review_identifiers_remain_usable_after_reopen() {
+    let database = TestDatabase::new();
+    let long_run_id = "r".repeat(protocol::RESOURCE_ID_MAX_BYTES + 1);
+    let long_event_id = "e".repeat(protocol::RESOURCE_ID_MAX_BYTES + 1);
+    let long_approval_id = "a".repeat(protocol::RESOURCE_ID_MAX_BYTES + 1);
+    let (mut snapshot, events) = seed_fixture();
+    snapshot.run.id.clone_from(&long_run_id);
+
+    {
+        let store = SqliteStore::open(database.path()).await.unwrap();
+        assert!(store.seed_if_empty(snapshot.clone(), events).await.unwrap());
+        bootstrap_test_owner(&store).await;
+    }
+
+    let reopened = SqliteStore::open(database.path()).await.unwrap();
+    assert_eq!(
+        reopened
+            .load_run_for_actor("user-owner", &long_run_id)
+            .await
+            .unwrap()
+            .snapshot
+            .run
+            .id,
+        long_run_id
+    );
+    assert_eq!(
+        reopened
+            .events_after_for_actor("user-owner", &long_run_id, 0)
+            .await
+            .unwrap()
+            .len(),
+        6
+    );
+
+    let mut commit = approved_commit(&snapshot, "legacy-long-run-review");
+    commit.event.id.clone_from(&long_event_id);
+    commit.event.approval.as_mut().unwrap().id = long_approval_id.clone();
+    commit.response.event = commit.event.clone();
+    commit.request_fingerprint = serde_json::to_string(&json!({
+        "approval_id": long_approval_id,
+        "decision": "approve",
+        "note": "ship it",
+        "run_id": long_run_id,
+    }))
+    .unwrap();
+    assert_eq!(
+        reopened
+            .commit_review_for_actor("user-owner", commit.clone())
+            .await
+            .unwrap(),
+        CommitOutcome::Committed
+    );
+    let receipt = reopened
+        .review_receipt_for_actor(
+            "user-owner",
+            &commit.snapshot.run.id,
+            "legacy-long-run-review",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.response.event.id, long_event_id);
+
+    let legacy_note = "n".repeat(protocol::REVIEW_NOTE_MAX_BYTES + 1);
+    let legacy_fingerprint = serde_json::to_string(&json!({
+        "approval_id": "legacy-approval",
+        "decision": "approve",
+        "note": legacy_note,
+        "run_id": &commit.snapshot.run.id,
+    }))
+    .unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO idempotency_receipts(
+                   actor_scope, idempotency_key, operation, request_fingerprint,
+                   response_json, run_id, event_sequence, created_at
+               ) VALUES (
+                   'user-owner', 'legacy-long-note-receipt', 'review', ?1,
+                   ?2, ?3, 7, '2026-08-27T00:00:00.000Z'
+               )"#,
+            params![
+                legacy_fingerprint,
+                serde_json::to_string(&commit.response).unwrap(),
+                &commit.snapshot.run.id,
+            ],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(
+        reopened
+            .review_receipt_for_actor(
+                "user-owner",
+                &commit.snapshot.run.id,
+                "legacy-long-note-receipt",
+            )
+            .await
+            .unwrap()
+            .is_some(),
+        "legacy oversized review fingerprints must remain decodable"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -770,6 +930,264 @@ async fn create_list_get_and_receipt_replay_are_durable_and_conflict_safe() {
             .unwrap()
             .replayed
     );
+}
+
+#[tokio::test]
+async fn resource_envelope_rejects_noncanonical_keys_without_receipts_or_sessions() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    let invalid_keys = [
+        "".to_owned(),
+        " leading".to_owned(),
+        "trailing ".to_owned(),
+        "two words".to_owned(),
+        "line\nbreak".to_owned(),
+        "clé".to_owned(),
+        "x".repeat(protocol::IDEMPOTENCY_KEY_MAX_BYTES + 1),
+    ];
+
+    for (index, key) in invalid_keys.iter().enumerate() {
+        let result = store
+            .create_session(
+                CreateSessionRequest {
+                    id: format!("session-invalid-key-{index}"),
+                    title: "Must not be persisted".into(),
+                },
+                key,
+            )
+            .await;
+        if key.is_empty() {
+            assert!(matches!(result, Err(StorageError::EmptyIdempotencyKey)));
+        } else {
+            assert!(matches!(
+                result,
+                Err(StorageError::InvalidResourceEnvelope(_))
+            ));
+        }
+    }
+
+    assert!(store.list_sessions().await.unwrap().is_empty());
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let receipts: i64 = connection
+        .query_row("SELECT COUNT(*) FROM session_command_receipts", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(receipts, 0);
+
+    let max_key = "k".repeat(protocol::IDEMPOTENCY_KEY_MAX_BYTES);
+    store
+        .create_session(
+            CreateSessionRequest {
+                id: "session-max-key".into(),
+                title: "Exact key boundary".into(),
+            },
+            &max_key,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn create_envelope_is_validated_before_fingerprint_and_receipt_lookup() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    store
+        .create_session(
+            CreateSessionRequest {
+                id: "session-existing".into(),
+                title: "Existing receipt".into(),
+            },
+            "shared-create-envelope",
+        )
+        .await
+        .unwrap();
+
+    let oversized_title = "🙂".repeat(protocol::SESSION_TITLE_MAX_BYTES / 4 + 1);
+    assert!(matches!(
+        store
+            .create_session(
+                CreateSessionRequest {
+                    id: "session-oversized-title".into(),
+                    title: oversized_title,
+                },
+                "shared-create-envelope",
+            )
+            .await,
+        Err(StorageError::InvalidResourceEnvelope(_))
+    ));
+    assert!(matches!(
+        store.get_session("session-oversized-title").await,
+        Err(StorageError::SessionNotFound(_))
+    ));
+
+    store
+        .create_session(
+            CreateSessionRequest {
+                id: "session-max-title".into(),
+                title: "🙂".repeat(protocol::SESSION_TITLE_MAX_BYTES / 4),
+            },
+            "max-title-envelope",
+        )
+        .await
+        .unwrap();
+    let max_session_id = "s".repeat(protocol::SESSION_ID_MAX_BYTES);
+    let created_at_max_id = store
+        .create_session(
+            CreateSessionRequest {
+                id: max_session_id.clone(),
+                title: "Exact session ID boundary".into(),
+            },
+            "max-session-id-envelope",
+        )
+        .await
+        .unwrap();
+    assert!(created_at_max_id.event.id.len() <= protocol::RESOURCE_ID_MAX_BYTES);
+    let started_at_max_id = store
+        .start_turn(
+            &max_session_id,
+            StartTurnRequest {
+                turn_id: "t".repeat(protocol::TURN_ID_MAX_BYTES),
+                user_message: "Event IDs stay ledger-local".into(),
+                expected_sequence: 1,
+            },
+            "max-session-id-start-envelope",
+        )
+        .await
+        .unwrap();
+    assert!(started_at_max_id.event.id.len() <= protocol::RESOURCE_ID_MAX_BYTES);
+    assert!(
+        store
+            .get_session(&max_session_id)
+            .await
+            .unwrap()
+            .events
+            .iter()
+            .all(|event| event.id.len() <= protocol::RESOURCE_ID_MAX_BYTES)
+    );
+    assert!(matches!(
+        store
+            .create_session(
+                CreateSessionRequest {
+                    id: "s".repeat(protocol::SESSION_ID_MAX_BYTES + 1),
+                    title: "Too long".into(),
+                },
+                "oversized-session-id-envelope",
+            )
+            .await,
+        Err(StorageError::InvalidResourceEnvelope(_))
+    ));
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let shared_receipts: i64 = connection
+        .query_row(
+            r#"SELECT COUNT(*) FROM session_command_receipts
+               WHERE operation = 'create_session'
+                 AND idempotency_key = 'shared-create-envelope'"#,
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(shared_receipts, 1);
+}
+
+#[tokio::test]
+async fn start_turn_envelope_is_validated_before_fingerprint_and_receipt_lookup() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    for (id, key) in [
+        ("session-envelope-a", "create-envelope-a"),
+        ("session-envelope-b", "create-envelope-b"),
+        ("session-envelope-c", "create-envelope-c"),
+    ] {
+        store
+            .create_session(
+                CreateSessionRequest {
+                    id: id.into(),
+                    title: format!("Envelope fixture {id}"),
+                },
+                key,
+            )
+            .await
+            .unwrap();
+    }
+
+    store
+        .start_turn(
+            "session-envelope-a",
+            StartTurnRequest {
+                turn_id: "turn-envelope-a".into(),
+                user_message: "Persist the first receipt".into(),
+                expected_sequence: 1,
+            },
+            "shared-start-envelope",
+        )
+        .await
+        .unwrap();
+
+    let oversized_message = "🙂".repeat(protocol::USER_MESSAGE_MAX_BYTES / 4 + 1);
+    assert!(matches!(
+        store
+            .start_turn(
+                "session-envelope-b",
+                StartTurnRequest {
+                    turn_id: "turn-envelope-b".into(),
+                    user_message: oversized_message,
+                    expected_sequence: 1,
+                },
+                "shared-start-envelope",
+            )
+            .await,
+        Err(StorageError::InvalidResourceEnvelope(_))
+    ));
+
+    let untouched = store.get_session("session-envelope-b").await.unwrap();
+    assert_eq!(untouched.session.sequence, 1);
+    assert!(untouched.turns.is_empty());
+    assert_eq!(untouched.events.len(), 1);
+
+    store
+        .start_turn(
+            "session-envelope-c",
+            StartTurnRequest {
+                turn_id: "🙂".repeat(protocol::TURN_ID_MAX_BYTES / 4),
+                user_message: "🙂".repeat(protocol::USER_MESSAGE_MAX_BYTES / 4),
+                expected_sequence: 1,
+            },
+            "max-start-envelope",
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        store
+            .start_turn(
+                "session-envelope-b",
+                StartTurnRequest {
+                    turn_id: "🙂".repeat(protocol::TURN_ID_MAX_BYTES / 4 + 1),
+                    user_message: "Must remain side-effect free".into(),
+                    expected_sequence: 1,
+                },
+                "oversized-turn-id-envelope",
+            )
+            .await,
+        Err(StorageError::InvalidResourceEnvelope(_))
+    ));
+    let still_untouched = store.get_session("session-envelope-b").await.unwrap();
+    assert_eq!(still_untouched.session.sequence, 1);
+    assert!(still_untouched.turns.is_empty());
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let shared_receipts: i64 = connection
+        .query_row(
+            r#"SELECT COUNT(*) FROM session_command_receipts
+               WHERE operation = 'start_turn'
+                 AND idempotency_key = 'shared-start-envelope'"#,
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(shared_receipts, 1);
 }
 
 #[tokio::test]
@@ -1338,6 +1756,91 @@ async fn actor_scoped_session_creation_sets_owner_required_by_reply_enqueue() {
             .await,
         Err(StorageError::SessionNotFound(_))
     ));
+}
+
+#[tokio::test]
+async fn legacy_oversized_session_and_reply_settle_after_file_database_reopen() {
+    let database = TestDatabase::new();
+    let session_id = "s".repeat(protocol::SESSION_ID_MAX_BYTES + 1);
+    let turn_id = "t".repeat(protocol::TURN_ID_MAX_BYTES + 1);
+    let user_message = "x".repeat(protocol::USER_MESSAGE_MAX_BYTES + 1);
+    let job_id = "reply-legacy-resource-envelope";
+
+    {
+        let store = SqliteStore::open(database.path()).await.unwrap();
+        bootstrap_test_owner(&store).await;
+    }
+    insert_legacy_oversized_reply_fixture(
+        database.path(),
+        &session_id,
+        &turn_id,
+        &user_message,
+        job_id,
+    );
+
+    let reopened = SqliteStore::open(database.path()).await.unwrap();
+    reopened.readiness().await.unwrap();
+    assert!(
+        reopened
+            .list_sessions_for_actor("user-owner")
+            .await
+            .unwrap()
+            .iter()
+            .any(|session| session.id == session_id)
+    );
+    let detail = reopened
+        .get_session_for_actor("user-owner", &session_id)
+        .await
+        .unwrap();
+    assert_eq!(detail.session.sequence, 2);
+    assert_eq!(detail.turns[0].id, turn_id);
+    assert_eq!(detail.turns[0].user_message, user_message);
+    assert!(
+        detail.events[..2]
+            .iter()
+            .all(|event| event.id.len() > protocol::RESOURCE_ID_MAX_BYTES),
+        "legacy derived event IDs must remain readable"
+    );
+    assert_eq!(
+        reopened
+            .session_events_after_for_actor("user-owner", &session_id, 0)
+            .await
+            .unwrap(),
+        detail.events
+    );
+
+    let ReplyClaimOutcome::Claimed(claimed) = reopened.claim_next_reply().await.unwrap() else {
+        panic!("the legacy queued reply must remain claimable");
+    };
+    assert_eq!(claimed.session_id, session_id);
+    assert_eq!(claimed.turn_id, turn_id);
+    assert_eq!(claimed.status, ReplyJobStatus::Started);
+    let completion = reopened
+        .complete_reply_failure(ReplyFailureCommit {
+            job_id: job_id.into(),
+            expected_sequence: 2,
+            error_json: json!({
+                "code": "persisted_request_exceeds_resource_envelope",
+                "message": "legacy provider input was rejected before execution",
+            }),
+        })
+        .await
+        .unwrap();
+    assert_eq!(completion.job.status, ReplyJobStatus::Failed);
+    assert_eq!(completion.session.status, SessionStatus::NeedsAttention);
+    assert_eq!(completion.turn.status, SessionTurnStatus::Interrupted);
+    assert_eq!(completion.events.len(), 1);
+    assert_eq!(completion.events[0].id, "sev-3");
+    assert!(completion.events[0].id.len() <= protocol::RESOURCE_ID_MAX_BYTES);
+    assert!(matches!(
+        completion.events[0].data,
+        SessionEventData::TurnInterrupted { .. }
+    ));
+
+    let settled = reopened.get_session(&session_id).await.unwrap();
+    assert_eq!(settled.session.status, SessionStatus::NeedsAttention);
+    assert_eq!(settled.events.len(), 3);
+    assert_eq!(settled.events.last().unwrap().id, "sev-3");
 }
 
 #[tokio::test]
@@ -2326,6 +2829,128 @@ fn insert_test_member(path: &Path, user_id: &str, username: &str) {
                 username,
                 "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA",
                 "2026-08-27T00:00:00.000Z",
+            ],
+        )
+        .unwrap();
+}
+
+fn insert_legacy_oversized_reply_fixture(
+    path: &Path,
+    session_id: &str,
+    turn_id: &str,
+    user_message: &str,
+    job_id: &str,
+) {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .unwrap();
+    let timestamp = "2026-08-27T00:00:00.000Z";
+    let title = "Legacy oversized Session";
+    connection
+        .execute(
+            r#"INSERT INTO sessions(
+                   id, title, status, created_at, updated_at, sequence,
+                   projection_sequence, active_turn_id, owner_user_id
+               ) VALUES (?1, ?2, 'ready', ?3, ?3, 0, 0, NULL, 'user-owner')"#,
+            params![session_id, title, timestamp],
+        )
+        .unwrap();
+
+    let created = SessionEvent {
+        sequence: 1,
+        id: format!("{session_id}:event:1"),
+        at: timestamp.into(),
+        data: SessionEventData::SessionCreated {
+            title: title.into(),
+        },
+    };
+    connection
+        .execute(
+            r#"INSERT INTO session_events(
+                   session_id, sequence, event_id, event_kind, payload_version,
+                   payload_json, turn_id, created_at
+               ) VALUES (?1, 1, ?2, 'session_created', 1, ?3, NULL, ?4)"#,
+            params![
+                session_id,
+                created.id,
+                serde_json::to_string(&created).unwrap(),
+                timestamp,
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE sessions
+               SET sequence = 1, projection_sequence = 1
+               WHERE id = ?1"#,
+            [session_id],
+        )
+        .unwrap();
+
+    connection
+        .execute(
+            r#"INSERT INTO session_turns(
+                   id, session_id, ordinal, status, user_message, assistant_message,
+                   started_at, completed_at
+               ) VALUES (?1, ?2, 1, 'open', ?3, NULL, ?4, NULL)"#,
+            params![turn_id, session_id, user_message, timestamp],
+        )
+        .unwrap();
+    let user_event = SessionEvent {
+        sequence: 2,
+        id: format!("{session_id}:event:2"),
+        at: timestamp.into(),
+        data: SessionEventData::UserMessage {
+            turn_id: turn_id.into(),
+            content: user_message.into(),
+        },
+    };
+    connection
+        .execute(
+            r#"INSERT INTO session_events(
+                   session_id, sequence, event_id, event_kind, payload_version,
+                   payload_json, turn_id, created_at
+               ) VALUES (?1, 2, ?2, 'user_message', 1, ?3, ?4, ?5)"#,
+            params![
+                session_id,
+                user_event.id,
+                serde_json::to_string(&user_event).unwrap(),
+                turn_id,
+                timestamp,
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE sessions
+               SET status = 'running', active_turn_id = ?1,
+                   sequence = 2, projection_sequence = 2, updated_at = ?2
+               WHERE id = ?3"#,
+            params![turn_id, timestamp, session_id],
+        )
+        .unwrap();
+
+    connection
+        .execute(
+            r#"INSERT INTO reply_jobs(
+                   id, actor_user_id, session_id, turn_id, provider_name, model_name,
+                   status, attempt, request_json, response_json, error_json,
+                   completion_fingerprint, assistant_event_sequence,
+                   terminal_event_sequence, queued_at, started_at, finished_at
+               ) VALUES (
+                   ?1, 'user-owner', ?2, ?3, 'test-provider', 'test-model',
+                   'queued', 0, ?4, NULL, NULL, NULL, NULL, NULL, ?5, NULL, NULL
+               )"#,
+            params![
+                job_id,
+                session_id,
+                turn_id,
+                serde_json::to_string(&json!({
+                    "messages": [{"role": "user", "content": user_message}],
+                }))
+                .unwrap(),
+                timestamp,
             ],
         )
         .unwrap();

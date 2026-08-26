@@ -97,9 +97,12 @@ async fn serve_with_bounded_shutdown(
         shutdown_signal().await;
         let _ = shutdown_started_tx.send(());
     };
-    let server = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .into_future();
+    let server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .into_future();
     tokio::pin!(server);
 
     tokio::select! {

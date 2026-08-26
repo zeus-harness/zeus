@@ -50,6 +50,8 @@ pub enum StorageError {
     InvalidReplyTransition(String),
     #[error("invalid session state transition: {0}")]
     InvalidSessionTransition(String),
+    #[error("invalid API resource envelope: {0}")]
+    InvalidResourceEnvelope(String),
     #[error("unsupported schema version {found}; this binary supports up to {supported}")]
     UnsupportedSchemaVersion { found: i64, supported: i64 },
     #[error("unsupported event kind `{0}`")]

@@ -13,9 +13,9 @@ use protocol::{
     ApprovalScope, ApprovalStatus, AssistantReplyProvenance, AttachRunRequest, AttachRunResponse,
     CreateSessionRequest, CreateSessionResponse, EventType, FlushSessionRequest,
     FlushSessionResponse, IncidentStatus, IncidentSummary, NotDispatchedReason,
-    ResumeSessionRequest, ResumeSessionResponse, ReviewDecision, ReviewResponse, RunEvent,
-    RunEventData, RunStatus, RunSummary, SandboxProfile, SessionDetail, SessionEvent,
-    SessionEventData, SessionFlushAck, SessionStatus, SessionSummary, SessionTurn,
+    ResourceEnvelopeError, ResumeSessionRequest, ResumeSessionResponse, ReviewDecision,
+    ReviewResponse, RunEvent, RunEventData, RunStatus, RunSummary, SandboxProfile, SessionDetail,
+    SessionEvent, SessionEventData, SessionFlushAck, SessionStatus, SessionSummary, SessionTurn,
     SessionTurnStatus, Severity, StartTurnRequest, StartTurnResponse, ToolCallStatus, ToolEffect,
     ToolOutcome,
 };
@@ -131,9 +131,9 @@ impl SqliteStore {
         title: &str,
         run_id: &str,
     ) -> Result<bool, StorageError> {
-        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
-        let title = normalized_session_value(title, "session title")?.to_owned();
-        let run_id = normalized_session_value(run_id, "run ID")?.to_owned();
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        let title = title.to_owned();
+        let run_id = validated_durable_reference(run_id, "run ID")?.to_owned();
         self.with_connection(move |connection| {
             seed_demo_session(connection, &session_id, &title, &run_id)
         })
@@ -161,7 +161,7 @@ impl SqliteStore {
     /// System/test-only unscoped read. Authenticated paths must use
     /// [`Self::get_session_for_actor`].
     pub async fn get_session(&self, session_id: &str) -> Result<SessionDetail, StorageError> {
-        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         self.with_connection(move |connection| query_session_detail(connection, &session_id))
             .await
     }
@@ -173,7 +173,7 @@ impl SqliteStore {
     ) -> Result<SessionDetail, StorageError> {
         let actor_user_id =
             normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
-        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         self.with_connection(move |connection| {
             query_session_detail_for_actor(connection, &actor_user_id, &session_id)
         })
@@ -187,7 +187,7 @@ impl SqliteStore {
         session_id: &str,
         after: u64,
     ) -> Result<Vec<SessionEvent>, StorageError> {
-        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         self.with_connection(move |connection| {
             query_session_events_after(connection, &session_id, after)
         })
@@ -202,7 +202,7 @@ impl SqliteStore {
     ) -> Result<Vec<SessionEvent>, StorageError> {
         let actor_user_id =
             normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
-        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         self.with_connection(move |connection| {
             query_session_events_after_for_actor(connection, &actor_user_id, &session_id, after)
         })
@@ -246,7 +246,7 @@ impl SqliteStore {
         request: AttachRunRequest,
         idempotency_key: &str,
     ) -> Result<AttachRunResponse, StorageError> {
-        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         self.with_connection(move |connection| {
             attach_run(connection, &session_id, request, &key, None)
@@ -263,7 +263,7 @@ impl SqliteStore {
     ) -> Result<AttachRunResponse, StorageError> {
         let actor_user_id =
             normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
-        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         self.with_connection(move |connection| {
             attach_run(connection, &session_id, request, &key, Some(&actor_user_id))
@@ -279,7 +279,7 @@ impl SqliteStore {
         request: StartTurnRequest,
         idempotency_key: &str,
     ) -> Result<StartTurnResponse, StorageError> {
-        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         self.with_connection(move |connection| {
             start_turn(connection, &session_id, request, &key, None, None, false)
@@ -297,7 +297,7 @@ impl SqliteStore {
     ) -> Result<StartTurnResponse, StorageError> {
         let actor_user_id =
             normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
-        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         self.with_connection(move |connection| {
             start_turn(
@@ -328,7 +328,7 @@ impl SqliteStore {
         idempotency_key: &str,
         job: ReplyJobSpec,
     ) -> Result<ReplyJobEnqueueResponse, StorageError> {
-        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         let actor_user_id = job.actor_user_id.clone();
         self.with_connection(move |connection| {
@@ -366,7 +366,7 @@ impl SqliteStore {
         if job.actor_user_id != actor_user_id {
             return Err(StorageError::SessionNotFound(session_id.to_owned()));
         }
-        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         self.with_connection(move |connection| {
             start_turn(
@@ -445,7 +445,7 @@ impl SqliteStore {
         request: FlushSessionRequest,
         idempotency_key: &str,
     ) -> Result<FlushSessionResponse, StorageError> {
-        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         self.with_connection(move |connection| {
             flush_turn(connection, &session_id, request, &key, None, false)
@@ -462,7 +462,7 @@ impl SqliteStore {
     ) -> Result<FlushSessionResponse, StorageError> {
         let actor_user_id =
             normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
-        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         self.with_connection(move |connection| {
             flush_turn(
@@ -485,7 +485,7 @@ impl SqliteStore {
         request: ResumeSessionRequest,
         idempotency_key: &str,
     ) -> Result<ResumeSessionResponse, StorageError> {
-        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         self.with_connection(move |connection| {
             resume_session(connection, &session_id, request, &key, None)
@@ -502,7 +502,7 @@ impl SqliteStore {
     ) -> Result<ResumeSessionResponse, StorageError> {
         let actor_user_id =
             normalized_account_value(actor_user_id, "session actor user ID", 128)?.to_owned();
-        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         self.with_connection(move |connection| {
             resume_session(connection, &session_id, request, &key, Some(&actor_user_id))
@@ -637,7 +637,7 @@ impl SqliteStore {
     /// System/test-only unscoped read. Authenticated paths must use
     /// [`Self::snapshot_for_actor`].
     pub async fn snapshot(&self, run_id: &str) -> Result<RunSnapshot, StorageError> {
-        let run_id = run_id.to_owned();
+        let run_id = validated_durable_reference(run_id, "run ID")?.to_owned();
         self.with_connection(move |connection| load_snapshot(connection, &run_id))
             .await
     }
@@ -649,7 +649,7 @@ impl SqliteStore {
     ) -> Result<RunSnapshot, StorageError> {
         let actor_user_id =
             normalized_account_value(actor_user_id, "run actor user ID", 128)?.to_owned();
-        let run_id = normalized_identifier(run_id, "run ID")?.to_owned();
+        let run_id = validated_durable_reference(run_id, "run ID")?.to_owned();
         self.with_connection(move |connection| {
             load_snapshot_for_actor(connection, &actor_user_id, &run_id)
         })
@@ -659,7 +659,7 @@ impl SqliteStore {
     /// System/test-only unscoped read. Authenticated paths must use
     /// [`Self::load_run_for_actor`].
     pub async fn load_run(&self, run_id: &str) -> Result<StoredRun, StorageError> {
-        let run_id = run_id.to_owned();
+        let run_id = validated_durable_reference(run_id, "run ID")?.to_owned();
         self.with_connection(move |connection| load_run(connection, &run_id))
             .await
     }
@@ -671,7 +671,7 @@ impl SqliteStore {
     ) -> Result<StoredRun, StorageError> {
         let actor_user_id =
             normalized_account_value(actor_user_id, "run actor user ID", 128)?.to_owned();
-        let run_id = normalized_identifier(run_id, "run ID")?.to_owned();
+        let run_id = validated_durable_reference(run_id, "run ID")?.to_owned();
         self.with_connection(move |connection| {
             load_run_for_actor(connection, &actor_user_id, &run_id)
         })
@@ -685,7 +685,7 @@ impl SqliteStore {
         run_id: &str,
         after: u64,
     ) -> Result<Vec<RunEvent>, StorageError> {
-        let run_id = run_id.to_owned();
+        let run_id = validated_durable_reference(run_id, "run ID")?.to_owned();
         self.with_connection(move |connection| events_after(connection, &run_id, after))
             .await
     }
@@ -698,7 +698,7 @@ impl SqliteStore {
     ) -> Result<Vec<RunEvent>, StorageError> {
         let actor_user_id =
             normalized_account_value(actor_user_id, "run actor user ID", 128)?.to_owned();
-        let run_id = normalized_identifier(run_id, "run ID")?.to_owned();
+        let run_id = validated_durable_reference(run_id, "run ID")?.to_owned();
         self.with_connection(move |connection| {
             events_after_for_actor(connection, &actor_user_id, &run_id, after)
         })
@@ -724,7 +724,7 @@ impl SqliteStore {
     ) -> Result<Option<ReviewReceipt>, StorageError> {
         let actor_user_id =
             normalized_account_value(actor_user_id, "review actor user ID", 128)?.to_owned();
-        let run_id = normalized_identifier(run_id, "run ID")?.to_owned();
+        let run_id = validated_durable_reference(run_id, "run ID")?.to_owned();
         let idempotency_key = normalized_key(idempotency_key)?.to_owned();
         self.with_connection(move |connection| {
             load_review_receipt_for_actor(connection, &actor_user_id, &run_id, &idempotency_key)
@@ -837,7 +837,7 @@ impl SqliteStore {
         request: FlushSessionRequest,
         idempotency_key: &str,
     ) -> Result<FlushSessionResponse, StorageError> {
-        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         self.with_connection(move |connection| {
             flush_turn(connection, &session_id, request, &key, None, true)
@@ -853,7 +853,7 @@ impl SqliteStore {
         idempotency_key: &str,
         job: ReplyJobSpec,
     ) -> Result<ReplyJobEnqueueResponse, StorageError> {
-        let session_id = normalized_session_value(session_id, "session ID")?.to_owned();
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         let key = normalized_key(idempotency_key)?.to_owned();
         let actor_user_id = job.actor_user_id.clone();
         self.with_connection(move |connection| {
@@ -2000,6 +2000,8 @@ fn seed_demo_session(
     title: &str,
     run_id: &str,
 ) -> Result<bool, StorageError> {
+    validated_durable_reference(session_id, "session ID")?;
+    validated_durable_reference(run_id, "run ID")?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let run_exists = transaction
         .query_row("SELECT 1 FROM runs WHERE id = ?1", [run_id], |row| {
@@ -2030,6 +2032,8 @@ fn seed_demo_session(
 
     let mut summary = query_session_summary_optional(&transaction, session_id)?;
     if summary.is_none() {
+        validated_new_session_id(session_id, "session ID")?;
+        validated_new_session_title(title, "session title")?;
         let timestamp = now();
         transaction.execute(
             r#"INSERT INTO sessions(
@@ -2250,11 +2254,13 @@ fn create_session(
     idempotency_key: &str,
     actor_user_id: Option<&str>,
 ) -> Result<CreateSessionResponse, StorageError> {
-    let fingerprint = session_command_fingerprint(None, &request)?;
+    normalized_key(idempotency_key)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if let Some(actor_user_id) = actor_user_id {
         require_active_user(&transaction, actor_user_id)?;
     }
+    validate_create_session_request(&request)?;
+    let fingerprint = session_command_fingerprint(None, &request)?;
     let stored_response = match actor_user_id {
         Some(actor_user_id) => load_session_command_receipt_for_actor::<CreateSessionResponse>(
             &transaction,
@@ -2275,9 +2281,6 @@ fn create_session(
         transaction.commit()?;
         return Ok(response);
     }
-
-    normalized_session_value(&request.id, "session ID")?;
-    normalized_session_value(&request.title, "session title")?;
     if query_session_summary_optional(&transaction, &request.id)?.is_some() {
         return Err(StorageError::SessionAlreadyExists(request.id));
     }
@@ -2345,11 +2348,14 @@ fn attach_run(
     idempotency_key: &str,
     actor_user_id: Option<&str>,
 ) -> Result<AttachRunResponse, StorageError> {
-    let fingerprint = session_command_fingerprint(Some(session_id), &request)?;
+    validated_durable_reference(session_id, "session ID")?;
+    normalized_key(idempotency_key)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if let Some(actor_user_id) = actor_user_id {
         require_active_session_actor(&transaction, session_id, actor_user_id)?;
     }
+    validated_durable_reference(&request.run_id, "run ID")?;
+    let fingerprint = session_command_fingerprint(Some(session_id), &request)?;
     let stored_response = match actor_user_id {
         Some(actor_user_id) => load_session_command_receipt_for_actor::<AttachRunResponse>(
             &transaction,
@@ -2370,8 +2376,6 @@ fn attach_run(
         transaction.commit()?;
         return Ok(response);
     }
-
-    normalized_session_value(&request.run_id, "run ID")?;
     let summary = query_session_summary(&transaction, session_id)?;
     require_session_sequence(&summary, request.expected_sequence)?;
     let run_exists = match actor_user_id {
@@ -2471,20 +2475,23 @@ fn start_turn(
     reply_job: Option<ReplyJobSpec>,
     fail_after_enqueue: bool,
 ) -> Result<(StartTurnResponse, Option<ReplyJob>), StorageError> {
-    let fingerprint = match &reply_job {
-        Some(job) => reply_start_fingerprint(session_id, &request, job)?,
-        None => session_command_fingerprint(Some(session_id), &request)?,
-    };
+    validated_durable_reference(session_id, "session ID")?;
+    normalized_key(idempotency_key)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(actor_user_id) = actor_user_id {
+        require_active_session_actor(&transaction, session_id, actor_user_id)?;
+    }
+    validate_start_turn_request(&request)?;
     if let Some(job) = &reply_job {
         validate_reply_job_spec(job)?;
         if actor_user_id != Some(job.actor_user_id.as_str()) {
             return Err(StorageError::SessionNotFound(session_id.to_owned()));
         }
     }
-    if let Some(actor_user_id) = actor_user_id {
-        require_active_session_actor(&transaction, session_id, actor_user_id)?;
-    }
+    let fingerprint = match &reply_job {
+        Some(job) => reply_start_fingerprint(session_id, &request, job)?,
+        None => session_command_fingerprint(Some(session_id), &request)?,
+    };
     let stored_response = match actor_user_id {
         Some(actor_user_id) => load_session_command_receipt_for_actor::<StartTurnResponse>(
             &transaction,
@@ -2513,9 +2520,6 @@ fn start_turn(
         transaction.commit()?;
         return Ok((response, stored_job));
     }
-
-    normalized_session_value(&request.turn_id, "turn ID")?;
-    validate_message(&request.user_message, "user message")?;
     let summary = query_session_summary(&transaction, session_id)?;
     require_session_sequence(&summary, request.expected_sequence)?;
     if summary.status != SessionStatus::Ready || summary.active_turn_id.is_some() {
@@ -3034,11 +3038,17 @@ fn flush_turn(
     actor_user_id: Option<&str>,
     fail_before_flush_event: bool,
 ) -> Result<FlushSessionResponse, StorageError> {
-    let fingerprint = session_command_fingerprint(Some(session_id), &request)?;
+    validated_durable_reference(session_id, "session ID")?;
+    normalized_key(idempotency_key)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if let Some(actor_user_id) = actor_user_id {
         require_active_session_actor(&transaction, session_id, actor_user_id)?;
     }
+    validated_durable_reference(&request.turn_id, "turn ID")?;
+    if let Some(message) = &request.assistant_message {
+        validate_message(message, "assistant message")?;
+    }
+    let fingerprint = session_command_fingerprint(Some(session_id), &request)?;
     let stored_response = match actor_user_id {
         Some(actor_user_id) => load_session_command_receipt_for_actor::<FlushSessionResponse>(
             &transaction,
@@ -3058,11 +3068,6 @@ fn flush_turn(
         response.replayed = true;
         transaction.commit()?;
         return Ok(response);
-    }
-
-    normalized_session_value(&request.turn_id, "turn ID")?;
-    if let Some(message) = &request.assistant_message {
-        validate_message(message, "assistant message")?;
     }
     let mut summary = query_session_summary(&transaction, session_id)?;
     require_session_sequence(&summary, request.expected_sequence)?;
@@ -3202,11 +3207,13 @@ fn resume_session(
     idempotency_key: &str,
     actor_user_id: Option<&str>,
 ) -> Result<ResumeSessionResponse, StorageError> {
-    let fingerprint = session_command_fingerprint(Some(session_id), &request)?;
+    validated_durable_reference(session_id, "session ID")?;
+    normalized_key(idempotency_key)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if let Some(actor_user_id) = actor_user_id {
         require_active_session_actor(&transaction, session_id, actor_user_id)?;
     }
+    let fingerprint = session_command_fingerprint(Some(session_id), &request)?;
     let stored_response = match actor_user_id {
         Some(actor_user_id) => load_session_command_receipt_for_actor::<ResumeSessionResponse>(
             &transaction,
@@ -3791,14 +3798,17 @@ fn insert_session_event(
 }
 
 fn build_session_event(
-    session_id: &str,
+    _session_id: &str,
     sequence: u64,
     at: &str,
     data: SessionEventData,
 ) -> SessionEvent {
     SessionEvent {
         sequence,
-        id: format!("{session_id}:event:{sequence}"),
+        // Session event IDs are unique only within their ledger. Keeping the
+        // parent ID out of this value prevents a valid 128-byte Session ID
+        // from producing an oversized child resource ID.
+        id: format!("sev-{sequence}"),
         at: at.to_owned(),
         data,
     }
@@ -4039,17 +4049,57 @@ fn next_session_sequence(sequence: u64) -> Result<u64, StorageError> {
         .ok_or(StorageError::IntegerOutOfRange("session sequence"))
 }
 
-fn normalized_session_value<'a>(
+fn validated_new_session_id<'a>(
+    value: &'a str,
+    field: &'static str,
+) -> Result<&'a str, StorageError> {
+    protocol::validate_session_id(value)
+        .map_err(|error| invalid_resource_envelope(field, error))?;
+    Ok(value)
+}
+
+fn validated_new_turn_id<'a>(value: &'a str, field: &'static str) -> Result<&'a str, StorageError> {
+    protocol::validate_turn_id(value).map_err(|error| invalid_resource_envelope(field, error))?;
+    Ok(value)
+}
+
+fn validated_new_session_title<'a>(
+    value: &'a str,
+    field: &'static str,
+) -> Result<&'a str, StorageError> {
+    protocol::validate_session_title(value)
+        .map_err(|error| invalid_resource_envelope(field, error))?;
+    Ok(value)
+}
+
+fn validate_create_session_request(request: &CreateSessionRequest) -> Result<(), StorageError> {
+    validated_new_session_id(&request.id, "session ID")?;
+    validated_new_session_title(&request.title, "session title")?;
+    Ok(())
+}
+
+fn validate_start_turn_request(request: &StartTurnRequest) -> Result<(), StorageError> {
+    validated_new_turn_id(&request.turn_id, "turn ID")?;
+    protocol::validate_user_message(&request.user_message)
+        .map_err(|error| invalid_resource_envelope("user message", error))?;
+    Ok(())
+}
+
+fn validated_durable_reference<'a>(
     value: &'a str,
     field: &'static str,
 ) -> Result<&'a str, StorageError> {
     if value.is_empty() || value.trim() != value {
-        Err(StorageError::InvalidSessionTransition(format!(
+        Err(StorageError::InvalidResourceEnvelope(format!(
             "{field} must be non-empty and canonical"
         )))
     } else {
         Ok(value)
     }
+}
+
+fn validate_review_note_value(value: &str, field: &'static str) -> Result<(), StorageError> {
+    protocol::validate_review_note(value).map_err(|error| invalid_resource_envelope(field, error))
 }
 
 fn validate_message(value: &str, field: &'static str) -> Result<(), StorageError> {
@@ -4060,6 +4110,10 @@ fn validate_message(value: &str, field: &'static str) -> Result<(), StorageError
     } else {
         Ok(())
     }
+}
+
+fn invalid_resource_envelope(field: &'static str, error: ResourceEnvelopeError) -> StorageError {
+    StorageError::InvalidResourceEnvelope(format!("{field} {error}"))
 }
 
 fn validate_reply_job_spec(job: &ReplyJobSpec) -> Result<(), StorageError> {
@@ -4286,7 +4340,7 @@ fn load_review_receipt(
     if operation != "review" {
         return Err(StorageError::IdempotencyConflict);
     }
-    validate_fingerprint(&request_fingerprint)?;
+    validate_stored_review_fingerprint(&request_fingerprint)?;
     let response: ReviewResponse = serde_json::from_str(&response_json)?;
     if response.replayed {
         return Err(StorageError::CorruptData(
@@ -4399,7 +4453,7 @@ fn decode_review_receipt(
     run_id: String,
     event_sequence: i64,
 ) -> Result<ReviewReceipt, StorageError> {
-    validate_fingerprint(&request_fingerprint)?;
+    validate_stored_review_fingerprint(&request_fingerprint)?;
     let response: ReviewResponse = serde_json::from_str(&response_json)?;
     if response.replayed {
         return Err(StorageError::CorruptData(
@@ -4426,11 +4480,8 @@ fn commit_review(
     actor_user_id: Option<&str>,
     fail_after_event: bool,
 ) -> Result<CommitOutcome, StorageError> {
-    validate_commit(&commit)?;
+    validated_durable_reference(&commit.snapshot.run.id, "run ID")?;
     let key = normalized_key(&commit.idempotency_key)?.to_owned();
-    let new_sequence = u64_to_i64(commit.snapshot.run.sequence, "run sequence")?;
-    let response_json = serde_json::to_string(&commit.response)?;
-
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if let Some(actor_user_id) = actor_user_id {
         require_active_run_owner(&transaction, &commit.snapshot.run.id, actor_user_id)?;
@@ -4442,6 +4493,9 @@ fn commit_review(
             return Err(StorageError::RunNotFound(commit.snapshot.run.id.clone()));
         }
     }
+    validate_commit(&commit)?;
+    let new_sequence = u64_to_i64(commit.snapshot.run.sequence, "run sequence")?;
+    let response_json = serde_json::to_string(&commit.response)?;
     let stored_receipt = match actor_user_id {
         Some(actor_user_id) => load_review_receipt_for_actor_in_transaction(
             &transaction,
@@ -5102,7 +5156,7 @@ fn validate_seed(snapshot: &RunSnapshot, events: &[RunEvent]) -> Result<(), Stor
 }
 
 fn validate_commit(commit: &ReviewCommit) -> Result<(), StorageError> {
-    validate_fingerprint(&commit.request_fingerprint)?;
+    validate_new_review_fingerprint(&commit.request_fingerprint, commit.event.content.as_deref())?;
     let expected_next = commit
         .expected_sequence
         .checked_add(1)
@@ -5164,9 +5218,9 @@ fn validate_commit(commit: &ReviewCommit) -> Result<(), StorageError> {
 }
 
 fn validate_dispatch_spec(job: &DispatchJobSpec) -> Result<(), StorageError> {
+    validated_durable_reference(&job.call_id, "call ID")?;
+    validated_durable_reference(&job.approval_id, "approval ID")?;
     for (value, field) in [
-        (&job.call_id, "call ID"),
-        (&job.approval_id, "approval ID"),
         (&job.approving_actor_user_id, "approving actor user ID"),
         (&job.tool_name, "tool name"),
         (&job.tool_version, "tool version"),
@@ -5223,7 +5277,7 @@ fn validate_completion_status(status: &RunStatus) -> Result<(), StorageError> {
     Ok(())
 }
 
-fn validate_fingerprint(fingerprint: &str) -> Result<(), StorageError> {
+fn validate_stored_review_fingerprint(fingerprint: &str) -> Result<(), StorageError> {
     let value: Value = serde_json::from_str(fingerprint)?;
     if !value.is_object() {
         return Err(StorageError::CorruptData(
@@ -5233,12 +5287,50 @@ fn validate_fingerprint(fingerprint: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
+fn validate_new_review_fingerprint(
+    fingerprint: &str,
+    event_content: Option<&str>,
+) -> Result<(), StorageError> {
+    let value: Value = serde_json::from_str(fingerprint)?;
+    let object = value.as_object().ok_or_else(|| {
+        StorageError::CorruptData("review request fingerprint must be a JSON object".into())
+    })?;
+    for (field, label) in [("run_id", "run ID"), ("approval_id", "approval ID")] {
+        if let Some(value) = object.get(field) {
+            let value = value.as_str().ok_or_else(|| {
+                StorageError::CorruptData(format!(
+                    "review request fingerprint {field} must be a string"
+                ))
+            })?;
+            validated_durable_reference(value, label)?;
+        }
+    }
+    if let Some(value) = object.get("note") {
+        let fingerprint_note = if value.is_null() {
+            None
+        } else {
+            let note = value.as_str().ok_or_else(|| {
+                StorageError::CorruptData(
+                    "review request fingerprint note must be a string or null".into(),
+                )
+            })?;
+            validate_review_note_value(note, "review note")?;
+            Some(note)
+        };
+        if fingerprint_note != event_content {
+            return Err(StorageError::CorruptData(
+                "review request fingerprint note does not match event content".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn normalized_key(key: &str) -> Result<&str, StorageError> {
-    let key = key.trim();
-    if key.is_empty() {
-        Err(StorageError::EmptyIdempotencyKey)
-    } else {
-        Ok(key)
+    match protocol::validate_idempotency_key(key) {
+        Ok(()) => Ok(key),
+        Err(ResourceEnvelopeError::Empty) => Err(StorageError::EmptyIdempotencyKey),
+        Err(error) => Err(invalid_resource_envelope("idempotency key", error)),
     }
 }
 

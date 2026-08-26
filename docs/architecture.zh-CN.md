@@ -166,8 +166,18 @@ exactly-once 语义。
   session cookie 为 opaque、`HttpOnly; SameSite=Strict`；HTTPS 部署必须显式设置
   `ZEUS_COOKIE_SECURE=true` 才附加 `Secure`。
 - Alpha+ 明确拒绝 schema 预留的 `member` 登录。正式 Run/Session 查询、SSE、resume、turn、
-  review 和 receipt 已全部 actor-scoped，并有 Alice/Bob 隔离测试；member 仍须等待字段/队列
-  配额、分页、SSE 上限和登录限速，不能仅因数据面已隔离就开放。
+  review 和 receipt 已全部 actor-scoped，并有 Alice/Bob 隔离测试；字段/HTTP/SSE 连接边界
+  已落地，但 member 仍须等待 SQLite 存储/队列配额与有界 cursor pagination，不能仅因数据面
+  已隔离就开放。
+- auth JSON 明确限制为 8 KiB、command JSON 为 512 KiB；新建 Session/turn ID、title、
+  user message、review note 与严格幂等键分别按 UTF-8 bytes 设置硬上限。新 Session event
+  使用有界 ledger-local ID；旧 v8 durable reference 继续可寻址。共享纯校验在相关 API、
+  runtime、storage 入口的 fingerprint 和 receipt 前执行，超限不得产生持久副作用。
+- bootstrap/login 的 fixed-window limiter 在 Argon2 前一次锁内完成 prune/check/charge；默认只认
+  `ConnectInfo` 的直连 `IpAddr`，不读取不可信 proxy header。key map 上限为 4096，满表时
+  fail closed，定时清理避免由新来源触发逐请求全表扫描。
+- Run/Session SSE 共用 global 64、每 actor 4 条连接配额；owned permit 被移动进 response
+  stream，只有 body drop 或流结束才释放。该配额不限制单次 replay 的事件数。
 - 未知工具、缺失策略、重复/冲突规则、effect 或 environment 不匹配：默认拒绝。
 - Approval 只能解除 `require_approval`，不能覆盖显式 deny。
 - dispatch 前用同一 policy revision 和不可绕过 guard 再检查一次。
@@ -244,18 +254,20 @@ exactly-once 语义。
 - 生产 RDS 路径只能得到 executor unavailable，不能得到伪造成功。
 - Session/Run SSE 重连都严格从各自大于 cursor 的 sequence 补齐事件。请求同时携带 query
   cursor 和 `Last-Event-ID` 时，后者优先。
-- 请求或状态错误返回 400/404/409 problem details；内部执行不变量返回脱敏的
+- 请求或状态错误按 400/401/403/404/409/413/415/422/429 返回 problem details；内部执行不变量返回脱敏的
   `500 runtime_unavailable`；storage/config/registry 不可用返回脱敏的
   `503 runtime_unavailable`。内部错误只写服务端日志。
-- 本地 Alpha+ 只校验 Session ID/title/message 非空与 canonical，detail 仍一次返回完整 ledger；
-  对外或多租户部署前必须增加字段字节上限、保留策略和 cursor pagination。
+- 本地 Alpha+ 已按 UTF-8 bytes 限制 Session ID/title/message/review note 与幂等键；detail 和
+  SSE replay 仍一次返回 cursor 后的完整 ledger。对外或多租户部署前必须增加 SQLite usage
+  quota、保留策略和 `LIMIT + 1` cursor pagination，不能先全量读取再 truncate。
 - Web 保持紧凑时间线、一个内联审批卡和一个 composer；支持真实 New Session、活动 Session
   刷新恢复、owner 设置/退出和 system/light/dark。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化结果是 145 个 Rust 测试和 19 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化结果是 168 个 Rust 测试和 19 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
-Apple `container` 的 Alpha 基线验收属于提交 `9a89706`。Alpha+ 本轮已通过 helper shell
-语法和现有 labeled container/volume 状态检查，但新镜像构建停在 BuildKit 内 crates.io 索引
-更新，并在替换运行容器前安全中止；因此不声明 Alpha+ 的 `up/verify/restart-verify` 已通过。
+Apple `container` 的 Alpha 基线验收属于提交 `9a89706`。Actor Boundary 的已推送主机基线为
+`fb6eb46`；当前 helper shell 和现有 labeled container/volume 状态检查通过，但包含 Actor
+Boundary/API Resource Envelope 的新镜像构建仍受 BuildKit 内 crates.io 索引更新阻塞，并在替换
+运行容器前安全中止；因此不声明当前 `up/verify/restart-verify` 已通过。
 Docker Compose 当前只有静态配置检查；本机缺少 Docker CLI 时不声明 Compose build/up 已通过。

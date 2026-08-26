@@ -13,6 +13,147 @@ pub const LOCAL_DEMO_RUN_ID: &str = "ZR-DEV-1";
 pub const DEMO_SESSION_ID: &str = "session-ZR-1842";
 pub const LOCAL_DEMO_SESSION_ID: &str = "session-ZR-DEV-1";
 
+/// Maximum UTF-8 byte length of a Session identifier.
+pub const SESSION_ID_MAX_BYTES: usize = 128;
+/// Maximum UTF-8 byte length of a turn identifier.
+pub const TURN_ID_MAX_BYTES: usize = 128;
+/// Maximum UTF-8 byte length of any other API resource identifier.
+pub const RESOURCE_ID_MAX_BYTES: usize = 128;
+/// Maximum UTF-8 byte length of a Session title.
+pub const SESSION_TITLE_MAX_BYTES: usize = 256;
+/// Maximum UTF-8 byte length of one user-authored Session message.
+pub const USER_MESSAGE_MAX_BYTES: usize = 64 * 1024;
+/// Maximum UTF-8 byte length of an approval review note.
+pub const REVIEW_NOTE_MAX_BYTES: usize = 8 * 1024;
+/// Maximum byte length of an idempotency key.
+pub const IDEMPOTENCY_KEY_MAX_BYTES: usize = 128;
+
+/// A pure Resource Envelope validation failure shared by every application
+/// boundary. All length checks refer to UTF-8 bytes, not Unicode scalar values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceEnvelopeError {
+    Empty,
+    Blank,
+    NotCanonical,
+    TooLong { max_bytes: usize },
+    NotAsciiGraphic,
+    ContainsWhitespace,
+    ContainsControl,
+}
+
+impl fmt::Display for ResourceEnvelopeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("cannot be empty"),
+            Self::Blank => formatter.write_str("cannot be blank"),
+            Self::NotCanonical => formatter.write_str("must not have surrounding whitespace"),
+            Self::TooLong { max_bytes } => {
+                write!(formatter, "cannot exceed {max_bytes} UTF-8 bytes")
+            }
+            Self::NotAsciiGraphic => {
+                formatter.write_str("must contain only ASCII graphic characters")
+            }
+            Self::ContainsWhitespace => formatter.write_str("cannot contain whitespace"),
+            Self::ContainsControl => formatter.write_str("cannot contain control characters"),
+        }
+    }
+}
+
+impl std::error::Error for ResourceEnvelopeError {}
+
+/// Validates a canonical, non-empty Session identifier.
+pub fn validate_session_id(value: &str) -> Result<(), ResourceEnvelopeError> {
+    validate_identifier_bounded(value, SESSION_ID_MAX_BYTES)
+}
+
+/// Validates a canonical, non-empty turn identifier.
+pub fn validate_turn_id(value: &str) -> Result<(), ResourceEnvelopeError> {
+    validate_identifier_bounded(value, TURN_ID_MAX_BYTES)
+}
+
+/// Validates a canonical, non-empty non-Session resource identifier.
+pub fn validate_resource_id(value: &str) -> Result<(), ResourceEnvelopeError> {
+    validate_identifier_bounded(value, RESOURCE_ID_MAX_BYTES)
+}
+
+/// Validates a canonical, non-empty Session title.
+pub fn validate_session_title(value: &str) -> Result<(), ResourceEnvelopeError> {
+    validate_canonical_bounded(value, SESSION_TITLE_MAX_BYTES)?;
+    if value.chars().any(char::is_control) {
+        return Err(ResourceEnvelopeError::ContainsControl);
+    }
+    Ok(())
+}
+
+/// Validates a non-blank user message without altering its contents.
+pub fn validate_user_message(value: &str) -> Result<(), ResourceEnvelopeError> {
+    if value.len() > USER_MESSAGE_MAX_BYTES {
+        return Err(ResourceEnvelopeError::TooLong {
+            max_bytes: USER_MESSAGE_MAX_BYTES,
+        });
+    }
+    if value.trim().is_empty() {
+        return Err(ResourceEnvelopeError::Blank);
+    }
+    Ok(())
+}
+
+/// Validates an optional review note's contents without trimming or otherwise
+/// normalizing it. Empty notes remain compatible with the existing protocol.
+pub fn validate_review_note(value: &str) -> Result<(), ResourceEnvelopeError> {
+    if value.len() > REVIEW_NOTE_MAX_BYTES {
+        Err(ResourceEnvelopeError::TooLong {
+            max_bytes: REVIEW_NOTE_MAX_BYTES,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// Validates an exactly canonical idempotency key.
+///
+/// The accepted alphabet is ASCII `!` through `~`. In particular, this rejects
+/// spaces, all other whitespace, control bytes, and non-ASCII input. Callers
+/// must never trim or otherwise reinterpret a rejected key.
+pub fn validate_idempotency_key(value: &str) -> Result<(), ResourceEnvelopeError> {
+    if value.is_empty() {
+        return Err(ResourceEnvelopeError::Empty);
+    }
+    if value.len() > IDEMPOTENCY_KEY_MAX_BYTES {
+        return Err(ResourceEnvelopeError::TooLong {
+            max_bytes: IDEMPOTENCY_KEY_MAX_BYTES,
+        });
+    }
+    if !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(ResourceEnvelopeError::NotAsciiGraphic);
+    }
+    Ok(())
+}
+
+fn validate_canonical_bounded(value: &str, max_bytes: usize) -> Result<(), ResourceEnvelopeError> {
+    if value.is_empty() {
+        return Err(ResourceEnvelopeError::Empty);
+    }
+    if value.len() > max_bytes {
+        return Err(ResourceEnvelopeError::TooLong { max_bytes });
+    }
+    if value.trim() != value {
+        return Err(ResourceEnvelopeError::NotCanonical);
+    }
+    Ok(())
+}
+
+fn validate_identifier_bounded(value: &str, max_bytes: usize) -> Result<(), ResourceEnvelopeError> {
+    validate_canonical_bounded(value, max_bytes)?;
+    if value.chars().any(char::is_control) {
+        return Err(ResourceEnvelopeError::ContainsControl);
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err(ResourceEnvelopeError::ContainsWhitespace);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,
@@ -454,6 +595,7 @@ pub struct SessionDetail {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateSessionRequest {
     pub id: String,
     pub title: String,
@@ -480,6 +622,7 @@ pub struct AttachRunResponse {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StartTurnRequest {
     pub turn_id: String,
     pub user_message: String,
@@ -520,6 +663,7 @@ pub struct FlushSessionResponse {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResumeSessionRequest {
     pub expected_sequence: u64,
 }
@@ -668,6 +812,7 @@ pub enum ReviewDecision {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewRequest {
     pub decision: ReviewDecision,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -718,6 +863,120 @@ impl ProblemDetails {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn resource_envelope_limits_count_utf8_bytes() {
+        assert!(validate_session_id(&"界".repeat(42)).is_ok());
+        assert_eq!(
+            validate_session_id(&"界".repeat(43)),
+            Err(ResourceEnvelopeError::TooLong {
+                max_bytes: SESSION_ID_MAX_BYTES,
+            })
+        );
+
+        assert!(validate_turn_id(&"🙂".repeat(32)).is_ok());
+        assert!(validate_resource_id(&"🙂".repeat(32)).is_ok());
+        assert_eq!(
+            validate_turn_id(&"🙂".repeat(33)),
+            Err(ResourceEnvelopeError::TooLong {
+                max_bytes: TURN_ID_MAX_BYTES,
+            })
+        );
+
+        assert!(validate_session_title(&"🙂".repeat(64)).is_ok());
+        assert_eq!(
+            validate_session_title(&"🙂".repeat(65)),
+            Err(ResourceEnvelopeError::TooLong {
+                max_bytes: SESSION_TITLE_MAX_BYTES,
+            })
+        );
+
+        assert!(validate_user_message(&"🙂".repeat(USER_MESSAGE_MAX_BYTES / 4)).is_ok());
+        assert_eq!(
+            validate_user_message(&"🙂".repeat(USER_MESSAGE_MAX_BYTES / 4 + 1)),
+            Err(ResourceEnvelopeError::TooLong {
+                max_bytes: USER_MESSAGE_MAX_BYTES,
+            })
+        );
+
+        assert!(validate_review_note(&"🙂".repeat(REVIEW_NOTE_MAX_BYTES / 4)).is_ok());
+        assert_eq!(
+            validate_review_note(&"🙂".repeat(REVIEW_NOTE_MAX_BYTES / 4 + 1)),
+            Err(ResourceEnvelopeError::TooLong {
+                max_bytes: REVIEW_NOTE_MAX_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn identifiers_and_titles_reject_ambiguous_control_or_whitespace() {
+        assert_eq!(
+            validate_session_id("session with space"),
+            Err(ResourceEnvelopeError::ContainsWhitespace)
+        );
+        assert_eq!(
+            validate_turn_id("turn\0id"),
+            Err(ResourceEnvelopeError::ContainsControl)
+        );
+        assert_eq!(
+            validate_session_title("two\nlines"),
+            Err(ResourceEnvelopeError::ContainsControl)
+        );
+        assert!(validate_session_title("Normal title 🙂").is_ok());
+    }
+
+    #[test]
+    fn idempotency_keys_are_exact_ascii_graphic_values() {
+        assert!(validate_idempotency_key("a").is_ok());
+        assert!(validate_idempotency_key(&"x".repeat(IDEMPOTENCY_KEY_MAX_BYTES)).is_ok());
+        for rejected in ["", " key", "key ", "two keys", "key\n", "clé"] {
+            assert!(
+                validate_idempotency_key(rejected).is_err(),
+                "`{rejected:?}` must be rejected"
+            );
+        }
+        assert_eq!(
+            validate_idempotency_key(&"x".repeat(IDEMPOTENCY_KEY_MAX_BYTES + 1)),
+            Err(ResourceEnvelopeError::TooLong {
+                max_bytes: IDEMPOTENCY_KEY_MAX_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn resource_envelope_requests_reject_unknown_fields() {
+        assert!(
+            serde_json::from_value::<CreateSessionRequest>(json!({
+                "id": "session-1",
+                "title": "Session",
+                "unexpected": true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<StartTurnRequest>(json!({
+                "turn_id": "turn-1",
+                "user_message": "Hello",
+                "expected_sequence": 1,
+                "unexpected": true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ResumeSessionRequest>(json!({
+                "expected_sequence": 1,
+                "unexpected": true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ReviewRequest>(json!({
+                "decision": "approve",
+                "unexpected": true
+            }))
+            .is_err()
+        );
+    }
 
     #[test]
     fn legacy_approval_without_binding_fields_still_deserializes() {

@@ -1,11 +1,17 @@
 //! HTTP composition for the durable Zeus Alpha slice.
 
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, Mutex as StdMutex},
+    time::{Duration, Instant as StdInstant},
+};
 
 use axum::{
     Extension, Json, Router,
     extract::{
-        Path, Query, Request, State,
+        ConnectInfo, DefaultBodyLimit, Path, Query, Request, State,
         rejection::{JsonRejection, QueryRejection},
     },
     http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
@@ -40,12 +46,42 @@ use tenancy::{
     PasswordHashRecord, SessionToken, SessionTokenDigest, UserId, Username, hash_password,
 };
 use tokio::{
-    sync::{Mutex, Semaphore, broadcast},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, broadcast},
     time::{Instant, MissedTickBehavior},
 };
 use zeroize::{Zeroize, Zeroizing};
 
 const DURABLE_LEDGER_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const AUTH_JSON_BODY_MAX_BYTES: usize = 8 * 1024;
+const COMMAND_JSON_BODY_MAX_BYTES: usize = 512 * 1024;
+const PASSWORD_WORKER_LIMIT: usize = 2;
+const AUTH_RATE_WINDOW: Duration = Duration::from_secs(60);
+const AUTH_RATE_KEY_CAPACITY: usize = 4_096;
+const AUTH_RATE_ENTRY_TTL: Duration = Duration::from_secs(15 * 60);
+const AUTH_RATE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+const INVALID_LOGIN_ACCOUNT_KEY: &str = "<invalid-username>";
+const SSE_GLOBAL_CONNECTION_LIMIT: usize = 64;
+const SSE_ACTOR_CONNECTION_LIMIT: usize = 4;
+const SSE_CAPACITY_RETRY_AFTER: Duration = Duration::from_secs(2);
+const PERSISTED_REPLY_REQUEST_MAX_MESSAGES: usize = 64;
+
+const LOGIN_RATE_POLICY: RateLimitPolicy = RateLimitPolicy {
+    global_limit: 60,
+    source_limit: 10,
+    account_limit: Some(5),
+    window: AUTH_RATE_WINDOW,
+    key_capacity: AUTH_RATE_KEY_CAPACITY,
+    entry_ttl: AUTH_RATE_ENTRY_TTL,
+};
+
+const BOOTSTRAP_RATE_POLICY: RateLimitPolicy = RateLimitPolicy {
+    global_limit: 10,
+    source_limit: 3,
+    account_limit: None,
+    window: AUTH_RATE_WINDOW,
+    key_capacity: AUTH_RATE_KEY_CAPACITY,
+    entry_ttl: AUTH_RATE_ENTRY_TTL,
+};
 
 #[derive(Clone)]
 struct ApiState {
@@ -54,12 +90,344 @@ struct ApiState {
     broadcast_hints_enabled: bool,
     auth: Option<Arc<AuthConfig>>,
     reply: Option<Arc<ReplyExecutor>>,
+    sse_capacity: SseCapacity,
 }
 
 struct AuthConfig {
     authenticator: Arc<PasswordAuthenticator>,
     password_workers: Arc<Semaphore>,
+    rate_limits: AuthRateLimits,
     cookie_secure: bool,
+}
+
+trait RateLimitClock: Send + Sync {
+    fn now(&self) -> StdInstant;
+}
+
+struct SystemRateLimitClock;
+
+impl RateLimitClock for SystemRateLimitClock {
+    fn now(&self) -> StdInstant {
+        StdInstant::now()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RateLimitPolicy {
+    global_limit: usize,
+    source_limit: usize,
+    account_limit: Option<usize>,
+    window: Duration,
+    key_capacity: usize,
+    entry_ttl: Duration,
+}
+
+struct AuthRateLimits {
+    login: AttemptRateLimiter,
+    bootstrap: AttemptRateLimiter,
+}
+
+impl AuthRateLimits {
+    fn new(clock: Arc<dyn RateLimitClock>) -> Self {
+        Self::with_policies(clock, LOGIN_RATE_POLICY, BOOTSTRAP_RATE_POLICY)
+    }
+
+    fn with_policies(
+        clock: Arc<dyn RateLimitClock>,
+        login: RateLimitPolicy,
+        bootstrap: RateLimitPolicy,
+    ) -> Self {
+        Self {
+            login: AttemptRateLimiter::new(login, Arc::clone(&clock)),
+            bootstrap: AttemptRateLimiter::new(bootstrap, clock),
+        }
+    }
+}
+
+struct AttemptRateLimiter {
+    policy: RateLimitPolicy,
+    clock: Arc<dyn RateLimitClock>,
+    state: StdMutex<RateLimitState>,
+}
+
+#[derive(Default)]
+struct RateLimitState {
+    global: Option<RateLimitCounter>,
+    sources: HashMap<IpAddr, RateLimitCounter>,
+    accounts: HashMap<String, RateLimitCounter>,
+    next_sweep_at: Option<StdInstant>,
+}
+
+#[derive(Clone, Copy)]
+struct RateLimitCounter {
+    window_started_at: StdInstant,
+    count: usize,
+    last_seen_at: StdInstant,
+}
+
+#[derive(Debug)]
+enum RateLimitError {
+    Limited(Duration),
+    Unavailable,
+}
+
+impl AttemptRateLimiter {
+    fn new(policy: RateLimitPolicy, clock: Arc<dyn RateLimitClock>) -> Self {
+        assert!(
+            policy.global_limit > 0,
+            "global auth rate limit must be positive"
+        );
+        assert!(
+            policy.source_limit > 0,
+            "source auth rate limit must be positive"
+        );
+        assert!(
+            policy.account_limit.is_none_or(|limit| limit > 0),
+            "account auth rate limit must be positive"
+        );
+        assert!(
+            !policy.window.is_zero(),
+            "auth rate window must be positive"
+        );
+        assert!(
+            policy.key_capacity > 0,
+            "auth rate key capacity must be positive"
+        );
+        assert!(
+            !policy.entry_ttl.is_zero(),
+            "auth rate entry TTL must be positive"
+        );
+        Self {
+            policy,
+            clock,
+            state: StdMutex::new(RateLimitState::default()),
+        }
+    }
+
+    fn charge(&self, source: IpAddr, account: Option<&str>) -> Result<(), RateLimitError> {
+        self.charge_at(source, account, self.clock.now())
+    }
+
+    fn charge_at(
+        &self,
+        source: IpAddr,
+        account: Option<&str>,
+        now: StdInstant,
+    ) -> Result<(), RateLimitError> {
+        // This is deliberately a fixed-window limiter. The bounded burst at a
+        // window boundary is accepted for the local single-instance Alpha; all
+        // dimensions are still checked and charged atomically under one lock.
+        let mut state = self.state.lock().map_err(|_| RateLimitError::Unavailable)?;
+        maybe_prune_rate_limit_keys(&mut state, now, self.policy.entry_ttl);
+
+        let mut retry_after = state.global.as_ref().and_then(|counter| {
+            rate_limit_retry_after(counter, now, self.policy.global_limit, self.policy.window)
+        });
+        retry_after = max_retry_after(
+            retry_after,
+            state.sources.get(&source).and_then(|counter| {
+                rate_limit_retry_after(counter, now, self.policy.source_limit, self.policy.window)
+            }),
+        );
+        if let (Some(account_limit), Some(account)) = (self.policy.account_limit, account) {
+            retry_after = max_retry_after(
+                retry_after,
+                state.accounts.get(account).and_then(|counter| {
+                    rate_limit_retry_after(counter, now, account_limit, self.policy.window)
+                }),
+            );
+        }
+        if let Some(retry_after) = retry_after {
+            return Err(RateLimitError::Limited(retry_after));
+        }
+
+        if rate_limit_key_count_after_insert(&state, source, account, self.policy.account_limit)
+            > self.policy.key_capacity
+        {
+            // Fail closed until the next scheduled sweep. Do not scan the
+            // complete key map for every attacker-controlled new source once
+            // capacity is full; that would turn the memory bound into an O(n)
+            // CPU amplification path.
+            return Err(RateLimitError::Limited(
+                self.policy.entry_ttl.min(AUTH_RATE_SWEEP_INTERVAL),
+            ));
+        }
+
+        increment_rate_limit_counter(
+            state.global.get_or_insert(RateLimitCounter {
+                window_started_at: now,
+                count: 0,
+                last_seen_at: now,
+            }),
+            now,
+            self.policy.window,
+        );
+        increment_rate_limit_counter(
+            state.sources.entry(source).or_insert(RateLimitCounter {
+                window_started_at: now,
+                count: 0,
+                last_seen_at: now,
+            }),
+            now,
+            self.policy.window,
+        );
+        if let (Some(_), Some(account)) = (self.policy.account_limit, account) {
+            increment_rate_limit_counter(
+                state
+                    .accounts
+                    .entry(account.to_owned())
+                    .or_insert(RateLimitCounter {
+                        window_started_at: now,
+                        count: 0,
+                        last_seen_at: now,
+                    }),
+                now,
+                self.policy.window,
+            );
+        }
+        Ok(())
+    }
+}
+
+fn elapsed_since(now: StdInstant, then: StdInstant) -> Duration {
+    now.checked_duration_since(then).unwrap_or_default()
+}
+
+fn maybe_prune_rate_limit_keys(state: &mut RateLimitState, now: StdInstant, ttl: Duration) {
+    if state
+        .next_sweep_at
+        .is_some_and(|next_sweep_at| now < next_sweep_at)
+    {
+        return;
+    }
+    state
+        .sources
+        .retain(|_, counter| elapsed_since(now, counter.last_seen_at) < ttl);
+    state
+        .accounts
+        .retain(|_, counter| elapsed_since(now, counter.last_seen_at) < ttl);
+    state.next_sweep_at = now.checked_add(ttl.min(AUTH_RATE_SWEEP_INTERVAL));
+}
+
+fn rate_limit_key_count_after_insert(
+    state: &RateLimitState,
+    source: IpAddr,
+    account: Option<&str>,
+    account_limit: Option<usize>,
+) -> usize {
+    let new_source_key = usize::from(!state.sources.contains_key(&source));
+    let new_account_key = usize::from(
+        account_limit.is_some()
+            && account.is_some_and(|account| !state.accounts.contains_key(account)),
+    );
+    state.sources.len() + state.accounts.len() + new_source_key + new_account_key
+}
+
+fn rate_limit_retry_after(
+    counter: &RateLimitCounter,
+    now: StdInstant,
+    limit: usize,
+    window: Duration,
+) -> Option<Duration> {
+    let elapsed = elapsed_since(now, counter.window_started_at);
+    (elapsed < window && counter.count >= limit).then(|| window - elapsed)
+}
+
+fn max_retry_after(left: Option<Duration>, right: Option<Duration>) -> Option<Duration> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn increment_rate_limit_counter(counter: &mut RateLimitCounter, now: StdInstant, window: Duration) {
+    if elapsed_since(now, counter.window_started_at) >= window {
+        counter.window_started_at = now;
+        counter.count = 0;
+    }
+    counter.count += 1;
+    counter.last_seen_at = now;
+}
+
+#[derive(Clone)]
+struct SseCapacity {
+    inner: Arc<SseCapacityInner>,
+}
+
+struct SseCapacityInner {
+    global: Arc<Semaphore>,
+    actor_counts: StdMutex<HashMap<String, usize>>,
+    per_actor_limit: usize,
+}
+
+struct SseLease {
+    capacity: SseCapacity,
+    actor_user_id: String,
+    _global_permit: OwnedSemaphorePermit,
+}
+
+impl SseCapacity {
+    fn new(global_limit: usize, per_actor_limit: usize) -> Self {
+        assert!(
+            global_limit > 0,
+            "global SSE connection limit must be positive"
+        );
+        assert!(
+            per_actor_limit > 0 && per_actor_limit <= global_limit,
+            "per-actor SSE limit must be positive and no larger than the global limit"
+        );
+        Self {
+            inner: Arc::new(SseCapacityInner {
+                global: Arc::new(Semaphore::new(global_limit)),
+                actor_counts: StdMutex::new(HashMap::new()),
+                per_actor_limit,
+            }),
+        }
+    }
+
+    fn production() -> Self {
+        Self::new(SSE_GLOBAL_CONNECTION_LIMIT, SSE_ACTOR_CONNECTION_LIMIT)
+    }
+
+    fn try_acquire(&self, actor_user_id: &str) -> Result<SseLease, RateLimitError> {
+        let global_permit = Arc::clone(&self.inner.global)
+            .try_acquire_owned()
+            .map_err(|_| RateLimitError::Limited(SSE_CAPACITY_RETRY_AFTER))?;
+        let mut actor_counts = self
+            .inner
+            .actor_counts
+            .lock()
+            .map_err(|_| RateLimitError::Unavailable)?;
+        let actor_count = actor_counts.entry(actor_user_id.to_owned()).or_default();
+        if *actor_count >= self.inner.per_actor_limit {
+            return Err(RateLimitError::Limited(SSE_CAPACITY_RETRY_AFTER));
+        }
+        *actor_count += 1;
+        drop(actor_counts);
+        Ok(SseLease {
+            capacity: self.clone(),
+            actor_user_id: actor_user_id.to_owned(),
+            _global_permit: global_permit,
+        })
+    }
+}
+
+impl Drop for SseLease {
+    fn drop(&mut self) {
+        let mut actor_counts = self
+            .capacity
+            .inner
+            .actor_counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(actor_count) = actor_counts.get_mut(&self.actor_user_id) {
+            *actor_count = actor_count.saturating_sub(1);
+            if *actor_count == 0 {
+                actor_counts.remove(&self.actor_user_id);
+            }
+        }
+    }
 }
 
 struct ReplyExecutor {
@@ -98,11 +466,7 @@ pub fn authenticated_app_with_provider(
     cookie_secure: bool,
     provider: Arc<dyn ReplyProvider>,
 ) -> Result<Router, tenancy::CredentialError> {
-    let auth = Arc::new(AuthConfig {
-        authenticator: Arc::new(PasswordAuthenticator::new()?),
-        password_workers: Arc::new(Semaphore::new(2)),
-        cookie_secure,
-    });
+    let auth = auth_config_with_clock(cookie_secure, Arc::new(SystemRateLimitClock))?;
     let reply = Arc::new(ReplyExecutor {
         provider,
         drain: Mutex::new(()),
@@ -113,8 +477,21 @@ pub fn authenticated_app_with_provider(
         broadcast_hints_enabled: true,
         auth: Some(auth),
         reply: Some(reply),
+        sse_capacity: SseCapacity::production(),
     };
     Ok(build_authenticated_app(state))
+}
+
+fn auth_config_with_clock(
+    cookie_secure: bool,
+    clock: Arc<dyn RateLimitClock>,
+) -> Result<Arc<AuthConfig>, tenancy::CredentialError> {
+    Ok(Arc::new(AuthConfig {
+        authenticator: Arc::new(PasswordAuthenticator::new()?),
+        password_workers: Arc::new(Semaphore::new(PASSWORD_WORKER_LIMIT)),
+        rate_limits: AuthRateLimits::new(clock),
+        cookie_secure,
+    }))
 }
 
 fn build_authenticated_app(state: ApiState) -> Router {
@@ -145,14 +522,16 @@ fn build_authenticated_app(state: ApiState) -> Router {
             "/api/v1/me/settings",
             get(get_preferences).patch(patch_preferences),
         )
-        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
+        .layer(DefaultBodyLimit::max(COMMAND_JSON_BODY_MAX_BYTES));
 
     let public = Router::new()
         .route("/health/live", get(liveness))
         .route("/health/ready", get(readiness))
         .route("/api/v1/auth/status", get(auth_status))
         .route("/api/v1/auth/bootstrap", post(bootstrap))
-        .route("/api/v1/auth/login", post(login));
+        .route("/api/v1/auth/login", post(login))
+        .layer(DefaultBodyLimit::max(AUTH_JSON_BODY_MAX_BYTES));
 
     let router = public
         .merge(protected)
@@ -178,17 +557,14 @@ async fn app_with_event_feed_options(
         "the durable ledger poll interval must be positive"
     );
     let request_auth = configure_test_actor(&store).await;
-    let auth = Arc::new(AuthConfig {
-        authenticator: Arc::new(PasswordAuthenticator::new().unwrap()),
-        password_workers: Arc::new(Semaphore::new(2)),
-        cookie_secure: false,
-    });
+    let auth = auth_config_with_clock(false, Arc::new(SystemRateLimitClock)).unwrap();
     let state = ApiState {
         store,
         durable_ledger_poll_interval,
         broadcast_hints_enabled,
         auth: Some(auth),
         reply: None,
+        sse_capacity: SseCapacity::production(),
     };
     build_test_app(state, request_auth)
 }
@@ -212,7 +588,8 @@ fn build_test_app(state: ApiState, request_auth: TestRequestAuth) -> Router {
             post(review_decision),
         )
         .route("/api/v1/runs/{id}/events", get(run_events))
-        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
+        .layer(DefaultBodyLimit::max(COMMAND_JSON_BODY_MAX_BYTES));
     let public = Router::new()
         .route("/health/live", get(liveness))
         .route("/health/ready", get(readiness));
@@ -321,6 +698,7 @@ async fn auth_status(
 
 async fn bootstrap(
     State(state): State<ApiState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     payload: Result<Json<BootstrapRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
@@ -333,17 +711,28 @@ async fn bootstrap(
             "This Zeus instance already has an owner account",
         ));
     }
-    let Json(mut request) = payload.map_err(ApiError::invalid_json)?;
-    let bootstrap_digest = BootstrapTokenDigest::from_presented(&request.bootstrap_token);
-    request.bootstrap_token.zeroize();
+    let Json(request) = payload.map_err(ApiError::invalid_json)?;
+    let mut bootstrap_token = Zeroizing::new(request.bootstrap_token);
+    let mut presented_password = Zeroizing::new(request.password);
+    let auth = auth_config(&state)?;
+    charge_auth_rate_limit(
+        &auth.rate_limits.bootstrap,
+        peer.ip(),
+        None,
+        "bootstrap_rate_limited",
+        "Owner setup temporarily limited",
+    )?;
+    let bootstrap_digest = BootstrapTokenDigest::from_presented(bootstrap_token.as_str());
+    bootstrap_token.zeroize();
     let bootstrap_hash = bootstrap_digest
         .map_err(|_| ApiError::invalid_bootstrap())?
         .to_persistence();
-    let password = Password::new(request.password)
+    let password_value = presented_password.as_str().to_owned();
+    presented_password.zeroize();
+    let password = Password::new(password_value)
         .map_err(|error| ApiError::bad_request("invalid_password", error.to_string()))?;
     let username = Username::parse(request.username)
         .map_err(|error| ApiError::bad_request("invalid_username", error.to_string()))?;
-    let auth = auth_config(&state)?;
     let permit = auth
         .password_workers
         .clone()
@@ -388,6 +777,7 @@ async fn bootstrap(
 
 async fn login(
     State(state): State<ApiState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     payload: Result<Json<LoginRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
@@ -401,8 +791,20 @@ async fn login(
         ));
     }
     let Json(request) = payload.map_err(ApiError::invalid_json)?;
-    let normalized_username = Username::parse(&request.username).ok();
     let password = Zeroizing::new(request.password);
+    let normalized_username = Username::parse(&request.username).ok();
+    let account_key = normalized_username
+        .as_ref()
+        .map(Username::as_str)
+        .unwrap_or(INVALID_LOGIN_ACCOUNT_KEY);
+    let auth = auth_config(&state)?;
+    charge_auth_rate_limit(
+        &auth.rate_limits.login,
+        peer.ip(),
+        Some(account_key),
+        "login_rate_limited",
+        "Sign-in temporarily limited",
+    )?;
     let credential = if let Some(username) = &normalized_username {
         state
             .store
@@ -416,7 +818,6 @@ async fn login(
         .map(|credential| PasswordHashRecord::parse(&credential.password_hash))
         .transpose()
         .map_err(|error| ApiError::auth_unavailable(&error))?;
-    let auth = auth_config(&state)?;
     let authenticator = Arc::clone(&auth.authenticator);
     let permit = auth
         .password_workers
@@ -570,6 +971,36 @@ fn auth_config(state: &ApiState) -> Result<&AuthConfig, ApiError> {
         .auth
         .as_deref()
         .ok_or_else(|| ApiError::auth_unavailable("authentication is not configured"))
+}
+
+fn charge_auth_rate_limit(
+    limiter: &AttemptRateLimiter,
+    source: IpAddr,
+    account: Option<&str>,
+    code: &'static str,
+    title: &'static str,
+) -> Result<(), ApiError> {
+    match limiter.charge(source, account) {
+        Ok(()) => Ok(()),
+        Err(RateLimitError::Limited(retry_after)) => {
+            Err(ApiError::rate_limited(code, title, retry_after))
+        }
+        Err(RateLimitError::Unavailable) => Err(ApiError::auth_unavailable(
+            "authentication rate limiter state is unavailable",
+        )),
+    }
+}
+
+fn acquire_sse_lease(capacity: &SseCapacity, actor_user_id: &str) -> Result<SseLease, ApiError> {
+    match capacity.try_acquire(actor_user_id) {
+        Ok(lease) => Ok(lease),
+        Err(RateLimitError::Limited(retry_after)) => {
+            Err(ApiError::sse_capacity_exceeded(retry_after))
+        }
+        Err(RateLimitError::Unavailable) => Err(ApiError::unavailable_message(
+            "SSE connection capacity is temporarily unavailable",
+        )),
+    }
 }
 
 fn fresh_auth_tokens() -> Result<(SessionToken, CsrfToken, String), ApiError> {
@@ -810,6 +1241,15 @@ async fn process_reply_job(state: &ApiState, job: ReplyJob) -> Result<(), StoreE
             .await;
         }
     };
+    if !persisted_reply_request_fits_envelope(&request) {
+        return fail_reply_job(
+            state,
+            &job,
+            "persisted_request_exceeds_resource_envelope",
+            "The persisted reply request exceeds the configured resource envelope",
+        )
+        .await;
+    }
     let response = match reply.provider.reply(request).await {
         Ok(response) => response,
         Err(error) => {
@@ -872,6 +1312,28 @@ async fn process_reply_job(state: &ApiState, job: ReplyJob) -> Result<(), StoreE
         })
         .await?;
     Ok(())
+}
+
+fn persisted_reply_request_fits_envelope(request: &ReplyRequest) -> bool {
+    if request.messages.is_empty() || request.messages.len() > PERSISTED_REPLY_REQUEST_MAX_MESSAGES
+    {
+        return false;
+    }
+
+    let mut total_bytes = 0usize;
+    for message in &request.messages {
+        if protocol::validate_user_message(&message.content).is_err() {
+            return false;
+        }
+        let Some(updated_total) = total_bytes.checked_add(message.content.len()) else {
+            return false;
+        };
+        if updated_total > protocol::USER_MESSAGE_MAX_BYTES {
+            return false;
+        }
+        total_bytes = updated_total;
+    }
+    true
 }
 
 async fn fail_reply_job(
@@ -968,8 +1430,8 @@ async fn create_session(
     headers: HeaderMap,
     payload: Result<Json<CreateSessionRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
-    let idempotency_key = required_idempotency_key(&headers)?;
     let Json(request) = payload.map_err(ApiError::invalid_json)?;
+    let idempotency_key = required_idempotency_key(&headers)?;
     let response = state
         .store
         .create_session_for_actor(&current.principal.user.id, request, &idempotency_key)
@@ -997,8 +1459,8 @@ async fn resume_session(
     headers: HeaderMap,
     payload: Result<Json<ResumeSessionRequest>, JsonRejection>,
 ) -> Result<Json<ResumeSessionResponse>, ApiError> {
-    let idempotency_key = required_idempotency_key(&headers)?;
     let Json(request) = payload.map_err(ApiError::invalid_json)?;
+    let idempotency_key = required_idempotency_key(&headers)?;
     Ok(Json(
         state
             .store
@@ -1014,8 +1476,9 @@ async fn start_turn(
     headers: HeaderMap,
     payload: Result<Json<StartTurnRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    let idempotency_key = required_idempotency_key(&headers)?;
     let Json(request) = payload.map_err(ApiError::invalid_json)?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    validate_start_turn_envelope(&request)?;
     let reply = reply_executor(&state)?;
     let metadata = reply.provider.metadata();
     let reply_request = ReplyRequest::new([ReplyMessage::new(
@@ -1052,8 +1515,8 @@ async fn test_start_turn(
     headers: HeaderMap,
     payload: Result<Json<StartTurnRequest>, JsonRejection>,
 ) -> Result<Json<protocol::StartTurnResponse>, ApiError> {
-    let idempotency_key = required_idempotency_key(&headers)?;
     let Json(request) = payload.map_err(ApiError::invalid_json)?;
+    let idempotency_key = required_idempotency_key(&headers)?;
     Ok(Json(
         state
             .store
@@ -1070,8 +1533,8 @@ async fn test_flush_turn(
     headers: HeaderMap,
     payload: Result<Json<protocol::FlushSessionRequest>, JsonRejection>,
 ) -> Result<Json<protocol::FlushSessionResponse>, ApiError> {
-    let idempotency_key = required_idempotency_key(&headers)?;
     let Json(request) = payload.map_err(ApiError::invalid_json)?;
+    let idempotency_key = required_idempotency_key(&headers)?;
     if turn_id != request.turn_id {
         return Err(ApiError::bad_request(
             "turn_id_mismatch",
@@ -1106,8 +1569,8 @@ async fn review_decision(
     headers: HeaderMap,
     payload: Result<Json<ReviewRequest>, JsonRejection>,
 ) -> Result<Json<ReviewResponse>, ApiError> {
-    let header_key = required_idempotency_key(&headers)?;
     let Json(request) = payload.map_err(ApiError::invalid_json)?;
+    let header_key = required_idempotency_key(&headers)?;
 
     if let Some(body_key) = &request.idempotency_key
         && &header_key != body_key
@@ -1133,26 +1596,47 @@ async fn review_decision(
 }
 
 fn required_idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {
-    let value = headers.get("idempotency-key").ok_or_else(|| {
+    let mut values = headers.get_all("idempotency-key").iter();
+    let value = values.next().ok_or_else(|| {
         ApiError::bad_request(
             "missing_idempotency_key",
             "Idempotency-Key header is required for POST requests",
         )
     })?;
+    if values.next().is_some() {
+        return Err(ApiError::bad_request(
+            "invalid_idempotency_key",
+            "Exactly one Idempotency-Key header is required",
+        ));
+    }
     let key = value.to_str().map_err(|_| {
         ApiError::bad_request(
             "invalid_idempotency_key",
-            "Idempotency-Key must be valid UTF-8",
+            "Idempotency-Key must contain visible ASCII characters only",
         )
     })?;
-    let key = key.trim();
-    if key.is_empty() {
-        return Err(ApiError::bad_request(
+    protocol::validate_idempotency_key(key).map_err(|error| {
+        ApiError::bad_request(
             "invalid_idempotency_key",
-            "Idempotency-Key cannot be empty",
-        ));
-    }
+            format!("Idempotency-Key {error}"),
+        )
+    })?;
     Ok(key.to_owned())
+}
+
+fn validate_start_turn_envelope(request: &StartTurnRequest) -> Result<(), ApiError> {
+    for (field, result) in [
+        ("turn ID", protocol::validate_turn_id(&request.turn_id)),
+        (
+            "user message",
+            protocol::validate_user_message(&request.user_message),
+        ),
+    ] {
+        result.map_err(|error| {
+            ApiError::bad_request("invalid_session_request", format!("{field} {error}"))
+        })?;
+    }
+    Ok(())
 }
 
 async fn session_events(
@@ -1168,6 +1652,7 @@ async fn session_events(
         return Err(ApiError::unauthorized());
     }
     let actor_user_id = current.principal.user.id.clone();
+    let sse_lease = acquire_sse_lease(&state.sse_capacity, &actor_user_id)?;
     let mut feed = state
         .store
         .session_event_feed_for_actor(&actor_user_id, &id, after)
@@ -1178,6 +1663,7 @@ async fn session_events(
     let session_id = id;
 
     let stream = async_stream::stream! {
+        let _sse_lease = sse_lease;
         let mut cursor = after;
         for event in feed.replay {
             cursor = cursor.max(event.sequence);
@@ -1303,6 +1789,7 @@ async fn run_events(
         return Err(ApiError::unauthorized());
     }
     let actor_user_id = current.principal.user.id.clone();
+    let sse_lease = acquire_sse_lease(&state.sse_capacity, &actor_user_id)?;
     let mut feed = state
         .store
         .event_feed_for_actor(&actor_user_id, &id, after)
@@ -1313,6 +1800,7 @@ async fn run_events(
     let run_id = id;
 
     let stream = async_stream::stream! {
+        let _sse_lease = sse_lease;
         let mut cursor = after;
         for event in feed.replay {
             cursor = cursor.max(event.sequence);
@@ -1509,6 +1997,7 @@ async fn not_found() -> ApiError {
 struct ApiError {
     status: StatusCode,
     problem: Box<ProblemDetails>,
+    headers: HeaderMap,
 }
 
 impl ApiError {
@@ -1521,6 +2010,7 @@ impl ApiError {
         Self {
             status,
             problem: Box::new(ProblemDetails::new(status.as_u16(), code, title, detail)),
+            headers: HeaderMap::new(),
         }
     }
 
@@ -1529,7 +2019,27 @@ impl ApiError {
     }
 
     fn invalid_json(rejection: JsonRejection) -> Self {
-        Self::bad_request("invalid_json", rejection.body_text())
+        match rejection.status() {
+            StatusCode::PAYLOAD_TOO_LARGE => Self::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_body_too_large",
+                "Request body too large",
+                "The JSON request body exceeds the allowed size",
+            ),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE => Self::new(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_media_type",
+                "Unsupported media type",
+                "Content-Type must be application/json",
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_json_data",
+                "Invalid JSON data",
+                "The JSON body does not match the request schema",
+            ),
+            _ => Self::bad_request("invalid_json", "The request body must contain valid JSON"),
+        }
     }
 
     fn invalid_query(rejection: QueryRejection) -> Self {
@@ -1552,6 +2062,7 @@ impl ApiError {
             "Sign-in failed",
             "The username or password is invalid",
         )
+        .with_no_store()
     }
 
     fn invalid_bootstrap() -> Self {
@@ -1561,6 +2072,7 @@ impl ApiError {
             "Owner setup failed",
             "The bootstrap token is invalid, expired, or already used",
         )
+        .with_no_store()
     }
 
     fn invalid_csrf() -> Self {
@@ -1589,6 +2101,52 @@ impl ApiError {
             "Authentication is unavailable",
             "The authentication subsystem could not process the request safely",
         )
+    }
+
+    fn rate_limited(code: &'static str, title: &'static str, retry_after: Duration) -> Self {
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            code,
+            title,
+            "Too many authentication attempts were received; retry later",
+        )
+        .with_retry_after(retry_after)
+        .with_no_store()
+    }
+
+    fn sse_capacity_exceeded(retry_after: Duration) -> Self {
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "sse_capacity_exceeded",
+            "Event stream capacity exceeded",
+            "Too many event streams are open; retry later",
+        )
+        .with_retry_after(retry_after)
+        .with_no_store()
+    }
+
+    fn unavailable_message(detail: &'static str) -> Self {
+        eprintln!("zeus API capacity state is unavailable");
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_unavailable",
+            "Service is unavailable",
+            detail,
+        )
+    }
+
+    fn with_no_store(mut self) -> Self {
+        self.headers
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        self
+    }
+
+    fn with_retry_after(mut self, retry_after: Duration) -> Self {
+        let seconds = retry_after.as_secs() + u64::from(retry_after.subsec_nanos() > 0);
+        let value = HeaderValue::from_str(&seconds.max(1).to_string())
+            .expect("Retry-After seconds must form a valid header value");
+        self.headers.insert(header::RETRY_AFTER, value);
+        self
     }
 
     fn internal_runtime_error(error: &StoreError) -> Self {
@@ -1715,21 +2273,35 @@ impl From<StoreError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
-            self.status,
+        let Self {
+            status,
+            problem,
+            headers,
+        } = self;
+        let mut response = (
+            status,
             [(header::CONTENT_TYPE, "application/problem+json")],
-            Json(*self.problem),
+            Json(*problem),
         )
-            .into_response()
+            .into_response();
+        response.headers_mut().extend(headers);
+        response
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::{
+        path::{Path, PathBuf},
+        sync::{
+            Barrier,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use axum::{
         body::Body,
+        extract::connect_info::MockConnectInfo,
         http::{Request, header},
     };
     use http_body_util::BodyExt;
@@ -1744,6 +2316,544 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    struct ManualRateLimitClock {
+        now: StdMutex<StdInstant>,
+    }
+
+    impl ManualRateLimitClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                now: StdMutex::new(StdInstant::now()),
+            })
+        }
+
+        fn advance(&self, duration: Duration) {
+            let mut now = self.now.lock().unwrap();
+            *now += duration;
+        }
+    }
+
+    impl RateLimitClock for ManualRateLimitClock {
+        fn now(&self) -> StdInstant {
+            *self.now.lock().unwrap()
+        }
+    }
+
+    fn test_rate_policy(
+        global_limit: usize,
+        source_limit: usize,
+        account_limit: Option<usize>,
+    ) -> RateLimitPolicy {
+        RateLimitPolicy {
+            global_limit,
+            source_limit,
+            account_limit,
+            window: AUTH_RATE_WINDOW,
+            key_capacity: 32,
+            entry_ttl: AUTH_RATE_ENTRY_TTL,
+        }
+    }
+
+    #[test]
+    fn auth_rate_limiter_is_windowed_and_memory_bounded() {
+        let clock = ManualRateLimitClock::new();
+        let limiter = AttemptRateLimiter::new(test_rate_policy(10, 2, Some(10)), clock.clone());
+        let source = "192.0.2.10".parse().unwrap();
+        assert!(limiter.charge(source, Some("first")).is_ok());
+        assert!(limiter.charge(source, Some("second")).is_ok());
+        assert!(matches!(
+            limiter.charge(source, Some("third")),
+            Err(RateLimitError::Limited(retry_after)) if retry_after == AUTH_RATE_WINDOW
+        ));
+
+        clock.advance(AUTH_RATE_WINDOW);
+        assert!(limiter.charge(source, Some("third")).is_ok());
+
+        let account_limiter =
+            AttemptRateLimiter::new(test_rate_policy(10, 10, Some(2)), clock.clone());
+        assert!(
+            account_limiter
+                .charge("192.0.2.21".parse().unwrap(), Some("owner"))
+                .is_ok()
+        );
+        assert!(
+            account_limiter
+                .charge("192.0.2.22".parse().unwrap(), Some("owner"))
+                .is_ok()
+        );
+        assert!(matches!(
+            account_limiter.charge("192.0.2.23".parse().unwrap(), Some("owner")),
+            Err(RateLimitError::Limited(_))
+        ));
+
+        let global_limiter =
+            AttemptRateLimiter::new(test_rate_policy(2, 10, Some(10)), clock.clone());
+        assert!(
+            global_limiter
+                .charge("192.0.2.31".parse().unwrap(), Some("first"))
+                .is_ok()
+        );
+        assert!(
+            global_limiter
+                .charge("192.0.2.32".parse().unwrap(), Some("second"))
+                .is_ok()
+        );
+        assert!(matches!(
+            global_limiter.charge("192.0.2.33".parse().unwrap(), Some("third")),
+            Err(RateLimitError::Limited(_))
+        ));
+
+        let mut bounded_policy = test_rate_policy(100, 1, None);
+        bounded_policy.key_capacity = 2;
+        let bounded = AttemptRateLimiter::new(bounded_policy, clock.clone());
+        assert!(bounded.charge("192.0.2.11".parse().unwrap(), None).is_ok());
+        assert!(bounded.charge("192.0.2.12".parse().unwrap(), None).is_ok());
+        assert!(matches!(
+            bounded.charge("192.0.2.13".parse().unwrap(), None),
+            Err(RateLimitError::Limited(retry_after))
+                if retry_after == AUTH_RATE_SWEEP_INTERVAL
+        ));
+        assert!(matches!(
+            bounded.charge("192.0.2.11".parse().unwrap(), None),
+            Err(RateLimitError::Limited(_))
+        ));
+        clock.advance(AUTH_RATE_ENTRY_TTL);
+        assert!(bounded.charge("192.0.2.13".parse().unwrap(), None).is_ok());
+    }
+
+    #[test]
+    fn auth_rate_limiter_check_and_charge_are_atomic_under_concurrency() {
+        const ATTEMPTS: usize = 20;
+        const ACCEPTED: usize = 5;
+        let clock = ManualRateLimitClock::new();
+        let limiter = Arc::new(AttemptRateLimiter::new(
+            test_rate_policy(ACCEPTED, ATTEMPTS, None),
+            clock,
+        ));
+        let barrier = Arc::new(Barrier::new(ATTEMPTS));
+        let accepted = AtomicUsize::new(0);
+
+        std::thread::scope(|scope| {
+            for index in 0..ATTEMPTS {
+                let limiter = Arc::clone(&limiter);
+                let barrier = Arc::clone(&barrier);
+                let accepted = &accepted;
+                scope.spawn(move || {
+                    let source = IpAddr::from([192, 0, 2, (index + 1) as u8]);
+                    barrier.wait();
+                    if limiter.charge(source, None).is_ok() {
+                        accepted.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(accepted.load(Ordering::Relaxed), ACCEPTED);
+        let state = limiter.state.lock().unwrap();
+        assert_eq!(state.global.unwrap().count, ACCEPTED);
+        assert_eq!(state.sources.len(), ACCEPTED);
+        assert!(state.sources.len() + state.accounts.len() <= limiter.policy.key_capacity);
+    }
+
+    #[test]
+    fn sse_capacity_enforces_global_and_actor_limits_until_lease_drop() {
+        let capacity = SseCapacity::new(2, 2);
+        let alice_one = capacity.try_acquire("alice").unwrap();
+        let alice_two = capacity.try_acquire("alice").unwrap();
+        assert!(matches!(
+            capacity.try_acquire("bob"),
+            Err(RateLimitError::Limited(retry_after)) if retry_after == SSE_CAPACITY_RETRY_AFTER
+        ));
+        drop(alice_one);
+        let bob = capacity.try_acquire("bob").unwrap();
+        assert!(matches!(
+            capacity.try_acquire("alice"),
+            Err(RateLimitError::Limited(retry_after)) if retry_after == SSE_CAPACITY_RETRY_AFTER
+        ));
+        drop(alice_two);
+        drop(bob);
+        assert!(capacity.try_acquire("alice").is_ok());
+    }
+
+    #[tokio::test]
+    async fn json_body_limits_and_rejections_keep_distinct_problem_statuses() {
+        let app = test_app().await;
+
+        let unsupported = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions")
+                    .header("idempotency-key", "unsupported-json")
+                    .body(Body::from(r#"{"id":"s","title":"t"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            unsupported,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+        )
+        .await;
+
+        let malformed = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "malformed-json")
+                    .body(Body::from("{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(malformed, StatusCode::BAD_REQUEST, "invalid_json").await;
+
+        let invalid_data = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "invalid-json-data")
+                    .body(Body::from(r#"{"id":1,"title":"t"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            invalid_data,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_json_data",
+        )
+        .await;
+
+        let oversized_command = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "oversized-command")
+                    .body(Body::from("x".repeat(COMMAND_JSON_BODY_MAX_BYTES + 1)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            oversized_command,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_body_too_large",
+        )
+        .await;
+
+        let oversized_without_key = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("x".repeat(COMMAND_JSON_BODY_MAX_BYTES + 1)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            oversized_without_key,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_body_too_large",
+        )
+        .await;
+
+        let invalid_data_without_key = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"id":"s","title":"t","unknown":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            invalid_data_without_key,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_json_data",
+        )
+        .await;
+
+        create_test_session(&app, "session-command-envelope").await;
+        let medium_message = "m".repeat(AUTH_JSON_BODY_MAX_BYTES * 2);
+        let medium_command = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-command-envelope/turns")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "medium-command")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-medium-command",
+                            "user_message": medium_message,
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(medium_command.status(), StatusCode::OK);
+
+        let auth_app = authenticated_app(DemoStore::seeded().await.unwrap(), false)
+            .unwrap()
+            .layer(MockConnectInfo(test_peer()));
+        let oversized_auth = auth_app
+            .oneshot(
+                Request::post("/api/v1/auth/bootstrap")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("x".repeat(AUTH_JSON_BODY_MAX_BYTES + 1)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            oversized_auth,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_body_too_large",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn forwarded_headers_cannot_evade_the_direct_peer_login_limit() {
+        let login_policy = test_rate_policy(10, 2, Some(10));
+        let fixture = configured_auth_test_app("xff-rate", login_policy).await;
+
+        for (index, expected) in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::TOO_MANY_REQUESTS,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut request = login_request(&format!("missing-{index}"), "Wrong-password-2026");
+            request.headers_mut().insert(
+                "x-forwarded-for",
+                HeaderValue::from_str(&format!("198.51.100.{}", index + 1)).unwrap(),
+            );
+            request.headers_mut().insert(
+                "forwarded",
+                HeaderValue::from_str(&format!("for=203.0.113.{}", index + 1)).unwrap(),
+            );
+            let response = fixture.app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected);
+            if expected == StatusCode::TOO_MANY_REQUESTS {
+                assert_eq!(response.headers()[header::RETRY_AFTER], "60");
+                assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+                let problem: ProblemDetails = response_json(response).await;
+                assert_eq!(problem.code, "login_rate_limited");
+            }
+        }
+
+        fixture.cleanup();
+    }
+
+    #[tokio::test]
+    async fn login_limit_is_charged_before_argon_worker_acquisition() {
+        let login_policy = test_rate_policy(10, 1, Some(10));
+        let fixture = configured_auth_test_app("argon-order", login_policy).await;
+        let held_workers = fixture
+            .auth
+            .password_workers
+            .clone()
+            .acquire_many_owned(PASSWORD_WORKER_LIMIT as u32)
+            .await
+            .unwrap();
+
+        let unavailable = fixture
+            .app
+            .clone()
+            .oneshot(login_request("missing-first", "Wrong-password-2026"))
+            .await
+            .unwrap();
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let limited = fixture
+            .app
+            .clone()
+            .oneshot(login_request("missing-second", "Wrong-password-2026"))
+            .await
+            .unwrap();
+        assert_problem(limited, StatusCode::TOO_MANY_REQUESTS, "login_rate_limited").await;
+
+        drop(held_workers);
+        fixture.cleanup();
+    }
+
+    #[tokio::test]
+    async fn bootstrap_limit_is_charged_before_argon_worker_acquisition() {
+        let store = DemoStore::seeded().await.unwrap();
+        let clock = ManualRateLimitClock::new();
+        let rate_clock: Arc<dyn RateLimitClock> = clock;
+        let auth = Arc::new(AuthConfig {
+            authenticator: Arc::new(PasswordAuthenticator::new().unwrap()),
+            password_workers: Arc::new(Semaphore::new(0)),
+            rate_limits: AuthRateLimits::with_policies(
+                rate_clock,
+                LOGIN_RATE_POLICY,
+                test_rate_policy(10, 1, None),
+            ),
+            cookie_secure: false,
+        });
+        let state = ApiState {
+            store,
+            durable_ledger_poll_interval: DURABLE_LEDGER_POLL_INTERVAL,
+            broadcast_hints_enabled: true,
+            auth: Some(auth),
+            reply: Some(Arc::new(ReplyExecutor {
+                provider: Arc::new(LocalFallbackProvider::new()),
+                drain: Mutex::new(()),
+            })),
+            sse_capacity: SseCapacity::production(),
+        };
+        let app = build_authenticated_app(state).layer(MockConnectInfo(test_peer()));
+        let presented = BootstrapToken::generate().unwrap();
+
+        let unavailable = app
+            .clone()
+            .oneshot(bootstrap_request(presented.expose_secret()))
+            .await
+            .unwrap();
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let limited = app
+            .oneshot(bootstrap_request(presented.expose_secret()))
+            .await
+            .unwrap();
+        assert_eq!(limited.headers()[header::RETRY_AFTER], "60");
+        assert_eq!(limited.headers()[header::CACHE_CONTROL], "no-store");
+        assert_problem(
+            limited,
+            StatusCode::TOO_MANY_REQUESTS,
+            "bootstrap_rate_limited",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unknown_wrong_disabled_and_member_login_failures_are_indistinguishable() {
+        let fixture = configured_auth_test_app("login-equivalence", LOGIN_RATE_POLICY).await;
+        let mut failures = Vec::new();
+
+        failures.push(
+            fixture
+                .app
+                .clone()
+                .oneshot(login_request("owner", "Wrong-password-2026"))
+                .await
+                .unwrap(),
+        );
+        failures.push(
+            fixture
+                .app
+                .clone()
+                .oneshot(login_request("missing-owner", TEST_OWNER_PASSWORD))
+                .await
+                .unwrap(),
+        );
+
+        update_test_user_access(&fixture.path, "member", "active");
+        failures.push(
+            fixture
+                .app
+                .clone()
+                .oneshot(login_request("owner", TEST_OWNER_PASSWORD))
+                .await
+                .unwrap(),
+        );
+        update_test_user_access(&fixture.path, "owner", "disabled");
+        failures.push(
+            fixture
+                .app
+                .clone()
+                .oneshot(login_request("owner", TEST_OWNER_PASSWORD))
+                .await
+                .unwrap(),
+        );
+
+        let mut expected_problem = None;
+        for response in failures {
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            let problem: ProblemDetails = response_json(response).await;
+            assert_eq!(problem.code, "invalid_credentials");
+            if let Some(expected) = &expected_problem {
+                assert_eq!(&problem, expected);
+            } else {
+                expected_problem = Some(problem);
+            }
+        }
+
+        update_test_user_access(&fixture.path, "owner", "active");
+        let success = fixture
+            .app
+            .clone()
+            .oneshot(login_request("owner", TEST_OWNER_PASSWORD))
+            .await
+            .unwrap();
+        assert_eq!(success.status(), StatusCode::OK);
+
+        fixture.cleanup();
+    }
+
+    #[tokio::test]
+    async fn sse_actor_capacity_is_held_by_the_response_body_and_released_on_drop() {
+        let app = test_app().await;
+        let mut streams = Vec::new();
+        for index in 0..SSE_ACTOR_CONNECTION_LIMIT {
+            let uri = if index % 2 == 0 {
+                format!("/api/v1/runs/{DEMO_RUN_ID}/events?after=8")
+            } else {
+                format!(
+                    "/api/v1/sessions/{}/events?after=0",
+                    protocol::DEMO_SESSION_ID
+                )
+            };
+            let response = app
+                .clone()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            streams.push(response);
+        }
+
+        let limited = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/runs/{DEMO_RUN_ID}/events?after=8"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(limited.headers()[header::RETRY_AFTER], "2");
+        let problem: ProblemDetails = response_json(limited).await;
+        assert_eq!(problem.code, "sse_capacity_exceeded");
+
+        drop(streams.pop());
+        let reopened = app
+            .oneshot(
+                Request::get(format!("/api/v1/runs/{DEMO_RUN_ID}/events?after=8"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reopened.status(), StatusCode::OK);
+    }
 
     #[derive(Clone, Copy)]
     enum IndeterminateFailure {
@@ -1783,6 +2893,182 @@ mod tests {
                 })
             })
         }
+    }
+
+    struct CountingProvider {
+        metadata: ProviderMetadata,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingProvider {
+        fn new(calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                metadata: ProviderMetadata {
+                    provider_id: "test-counting-provider".into(),
+                    model: Some("test-model".into()),
+                    reply_kind: ReplyKind::Model,
+                },
+                calls,
+            }
+        }
+    }
+
+    impl ReplyProvider for CountingProvider {
+        fn metadata(&self) -> &ProviderMetadata {
+            &self.metadata
+        }
+
+        fn reply(&self, _request: ReplyRequest) -> ReplyFuture<'_> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {
+                Err(ProviderError::InvalidRequest(
+                    "the counting provider must not be called",
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_oversized_session_path_accepts_a_new_bounded_turn() {
+        let (app, store, owner, path) = authenticated_file_app("legacy-session-turn").await;
+        let session_id = "s".repeat(protocol::SESSION_ID_MAX_BYTES + 1);
+        insert_legacy_ready_session(&path, &session_id, &owner.user_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/sessions/{session_id}/turns"))
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "legacy-session-new-turn")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-after-upgrade",
+                            "user_message": "Continue this legacy Session safely",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let detail = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let detail = store
+                    .get_session_for_actor(&owner.user_id, &session_id)
+                    .await
+                    .unwrap();
+                if detail.session.status == SessionStatus::Ready {
+                    break detail;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the legacy Session reply should settle durably");
+        assert_eq!(detail.turns.len(), 1);
+        assert_eq!(detail.turns[0].id, "turn-after-upgrade");
+        assert!(detail.events[0].id.len() > protocol::RESOURCE_ID_MAX_BYTES);
+        assert!(
+            detail.events[1..]
+                .iter()
+                .all(|event| event.id.len() <= protocol::RESOURCE_ID_MAX_BYTES)
+        );
+
+        drop(app);
+        drop(store);
+        cleanup_test_database(&path);
+    }
+
+    #[tokio::test]
+    async fn legacy_oversized_reply_request_fails_durably_before_provider_execution() {
+        let store = DemoStore::seeded().await.unwrap();
+        let identity = provision_test_owner(&store, "user-owner", "owner").await;
+        let session_id = "session-legacy-oversized-reply";
+        let turn_id = "turn-legacy-oversized-reply";
+        let job_id = "reply-legacy-oversized-reply";
+        store
+            .create_session_for_actor(
+                &identity.user_id,
+                CreateSessionRequest {
+                    id: session_id.into(),
+                    title: "Legacy oversized reply".into(),
+                },
+                "create-legacy-oversized-reply",
+            )
+            .await
+            .unwrap();
+
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn ReplyProvider> =
+            Arc::new(CountingProvider::new(Arc::clone(&provider_calls)));
+        let metadata = provider.metadata().clone();
+        store
+            .start_turn_and_enqueue_reply_for_actor(
+                &identity.user_id,
+                session_id,
+                StartTurnRequest {
+                    turn_id: turn_id.into(),
+                    user_message: "valid legacy placeholder".into(),
+                    expected_sequence: 1,
+                },
+                "start-legacy-oversized-reply",
+                ReplyJobSpec {
+                    id: job_id.into(),
+                    actor_user_id: identity.user_id.clone(),
+                    provider_name: metadata.provider_id,
+                    model_name: metadata.model,
+                    request_json: serde_json::to_value(ReplyRequest::new([ReplyMessage::new(
+                        ReplyRole::User,
+                        "valid legacy placeholder",
+                    )]))
+                    .unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        let ReplyClaimOutcome::Claimed(mut job) = store.claim_next_reply().await.unwrap() else {
+            panic!("the legacy reply must be claimable");
+        };
+        job.request_json = serde_json::to_value(ReplyRequest::new([ReplyMessage::new(
+            ReplyRole::User,
+            "x".repeat(protocol::USER_MESSAGE_MAX_BYTES + 1),
+        )]))
+        .unwrap();
+        let state = ApiState {
+            store: store.clone(),
+            durable_ledger_poll_interval: DURABLE_LEDGER_POLL_INTERVAL,
+            broadcast_hints_enabled: false,
+            auth: None,
+            reply: Some(Arc::new(ReplyExecutor {
+                provider,
+                drain: Mutex::new(()),
+            })),
+            sse_capacity: SseCapacity::production(),
+        };
+
+        process_reply_job(&state, *job).await.unwrap();
+
+        assert_eq!(provider_calls.load(Ordering::Relaxed), 0);
+        let stored = store.reply_job(job_id).await.unwrap().unwrap();
+        assert_eq!(stored.status, runtime::ReplyJobStatus::Failed);
+        assert_eq!(
+            stored.error_json.unwrap()["code"],
+            "persisted_request_exceeds_resource_envelope"
+        );
+        let detail = store.get_session(session_id).await.unwrap();
+        assert_eq!(detail.session.status, SessionStatus::NeedsAttention);
+        assert!(matches!(
+            &detail.events.last().unwrap().data,
+            protocol::SessionEventData::TurnInterrupted { reason, .. }
+                if reason == "assistant reply provider failed"
+        ));
     }
 
     #[tokio::test]
@@ -1867,6 +3153,7 @@ mod tests {
                     provider,
                     drain: Mutex::new(()),
                 })),
+                sse_capacity: SseCapacity::production(),
             };
 
             process_reply_job(&state, *job).await.unwrap();
@@ -1920,7 +3207,9 @@ mod tests {
             .replace_bootstrap_token(&bootstrap_token.digest().to_persistence(), &expires_at)
             .await
             .unwrap();
-        let app = authenticated_app(store, false).unwrap();
+        let app = authenticated_app(store, false)
+            .unwrap()
+            .layer(MockConnectInfo(test_peer()));
 
         let health = app
             .clone()
@@ -2641,7 +3930,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_create_rejects_missing_and_conflicting_idempotency_keys() {
+    async fn session_create_rejects_missing_invalid_and_conflicting_idempotency_keys() {
         let app = test_app().await;
         let missing = app
             .clone()
@@ -2658,6 +3947,47 @@ mod tests {
         assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
         let problem: ProblemDetails = response_json(missing).await;
         assert_eq!(problem.code, "missing_idempotency_key");
+
+        for invalid in [
+            " key-with-spaces ".to_owned(),
+            "x".repeat(protocol::IDEMPOTENCY_KEY_MAX_BYTES + 1),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/v1/sessions")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header("idempotency-key", invalid)
+                        .body(Body::from(
+                            r#"{"id":"session-invalid-key","title":"Invalid key"}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_problem(response, StatusCode::BAD_REQUEST, "invalid_idempotency_key").await;
+        }
+
+        let duplicate = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "duplicate-one")
+                    .header("idempotency-key", "duplicate-two")
+                    .body(Body::from(
+                        r#"{"id":"session-duplicate-key","title":"Duplicate key"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            duplicate,
+            StatusCode::BAD_REQUEST,
+            "invalid_idempotency_key",
+        )
+        .await;
 
         let first = app
             .clone()
@@ -3130,6 +4460,165 @@ mod tests {
         assert_eq!(problem.code, "missing_idempotency_key");
     }
 
+    const TEST_OWNER_PASSWORD: &str = "Owner-password-2026";
+
+    struct ConfiguredAuthFixture {
+        app: Router,
+        store: DemoStore,
+        auth: Arc<AuthConfig>,
+        path: PathBuf,
+    }
+
+    impl ConfiguredAuthFixture {
+        fn cleanup(self) {
+            let Self {
+                app,
+                store,
+                auth,
+                path,
+            } = self;
+            drop(app);
+            drop(auth);
+            drop(store);
+            cleanup_test_database(&path);
+        }
+    }
+
+    async fn configured_auth_test_app(
+        label: &str,
+        login_policy: RateLimitPolicy,
+    ) -> ConfiguredAuthFixture {
+        let unique = UserId::generate().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "zeus-api-{label}-{}.db",
+            unique.as_str().replace(':', "-")
+        ));
+        let store = DemoStore::open(&path).await.unwrap();
+        let bootstrap_token = BootstrapToken::generate().unwrap();
+        let expires_at = (chrono::Utc::now() + chrono::Duration::minutes(15))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        store
+            .replace_bootstrap_token(&bootstrap_token.digest().to_persistence(), &expires_at)
+            .await
+            .unwrap();
+
+        let clock = ManualRateLimitClock::new();
+        let rate_clock: Arc<dyn RateLimitClock> = clock;
+        let auth = Arc::new(AuthConfig {
+            authenticator: Arc::new(PasswordAuthenticator::new().unwrap()),
+            password_workers: Arc::new(Semaphore::new(PASSWORD_WORKER_LIMIT)),
+            rate_limits: AuthRateLimits::with_policies(
+                rate_clock,
+                login_policy,
+                BOOTSTRAP_RATE_POLICY,
+            ),
+            cookie_secure: false,
+        });
+        let state = ApiState {
+            store: store.clone(),
+            durable_ledger_poll_interval: DURABLE_LEDGER_POLL_INTERVAL,
+            broadcast_hints_enabled: true,
+            auth: Some(Arc::clone(&auth)),
+            reply: Some(Arc::new(ReplyExecutor {
+                provider: Arc::new(LocalFallbackProvider::new()),
+                drain: Mutex::new(()),
+            })),
+            sse_capacity: SseCapacity::production(),
+        };
+        let app = build_authenticated_app(state).layer(MockConnectInfo(test_peer()));
+        let bootstrap = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/bootstrap")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "bootstrap_token": bootstrap_token.expose_secret(),
+                            "username": "owner",
+                            "password": TEST_OWNER_PASSWORD,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bootstrap.status(), StatusCode::OK);
+
+        ConfiguredAuthFixture {
+            app,
+            store,
+            auth,
+            path,
+        }
+    }
+
+    fn login_request(username: &str, password: &str) -> Request<Body> {
+        Request::post("/api/v1/auth/login")
+            .header(header::HOST, "zeus.test")
+            .header(header::ORIGIN, "http://zeus.test")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "username": username,
+                    "password": password,
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    fn bootstrap_request(bootstrap_token: &str) -> Request<Body> {
+        Request::post("/api/v1/auth/bootstrap")
+            .header(header::HOST, "zeus.test")
+            .header(header::ORIGIN, "http://zeus.test")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "bootstrap_token": bootstrap_token,
+                    "username": "owner",
+                    "password": TEST_OWNER_PASSWORD,
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    fn update_test_user_access(path: &Path, role: &str, status: &str) {
+        let connection = Connection::open(path).unwrap();
+        connection.busy_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE users SET role = ?1, status = ?2, updated_at = ?3 WHERE username = 'owner'",
+                    params![
+                        role,
+                        status,
+                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    ],
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    async fn assert_problem(response: Response, status: StatusCode, code: &str) {
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/problem+json"
+        );
+        let problem: ProblemDetails = response_json(response).await;
+        assert_eq!(problem.status, status.as_u16());
+        assert_eq!(problem.code, code);
+    }
+
+    fn test_peer() -> SocketAddr {
+        "127.0.0.1:41000".parse().unwrap()
+    }
+
     struct TestIdentity {
         user_id: String,
         cookie_header: String,
@@ -3146,6 +4635,58 @@ mod tests {
         let identity = provision_test_owner(&store, "user-alice", "alice").await;
         let app = authenticated_app(store.clone(), false).unwrap();
         (app, store, identity, path)
+    }
+
+    fn insert_legacy_ready_session(path: &Path, session_id: &str, owner_user_id: &str) {
+        let connection = Connection::open(path).unwrap();
+        connection.busy_timeout(Duration::from_secs(1)).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let title = "Legacy oversized Session";
+        connection
+            .execute(
+                r#"INSERT INTO sessions(
+                       id, title, status, created_at, updated_at, sequence,
+                       projection_sequence, active_turn_id, owner_user_id
+                   ) VALUES (?1, ?2, 'ready', ?3, ?3, 0, 0, NULL, ?4)"#,
+                params![session_id, title, timestamp, owner_user_id],
+            )
+            .unwrap();
+        let event = SessionEvent {
+            sequence: 1,
+            id: format!("{session_id}:event:1"),
+            at: timestamp.clone(),
+            data: protocol::SessionEventData::SessionCreated {
+                title: title.into(),
+            },
+        };
+        connection
+            .execute(
+                r#"INSERT INTO session_events(
+                       session_id, sequence, event_id, event_kind, payload_version,
+                       payload_json, turn_id, created_at
+                   ) VALUES (?1, 1, ?2, 'session_created', 1, ?3, NULL, ?4)"#,
+                params![
+                    session_id,
+                    event.id,
+                    serde_json::to_string(&event).unwrap(),
+                    timestamp,
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            connection
+                .execute(
+                    r#"UPDATE sessions
+                       SET sequence = 1, projection_sequence = 1
+                       WHERE id = ?1"#,
+                    [session_id],
+                )
+                .unwrap(),
+            1
+        );
     }
 
     async fn provision_test_owner(

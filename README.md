@@ -318,11 +318,17 @@ directly.
   login cookie plus a separate CSRF cookie. When the browser-facing origin is
   HTTPS, the operator must set `ZEUS_COOKIE_SECURE=true`; then both cookies are
   emitted with `Secure`.
+- Bootstrap and login are charged before Argon2 work against bounded, in-memory
+  fixed-window limits. Login defaults to 60 attempts globally, 10 per direct
+  peer IP, and 5 per canonical account per minute; bootstrap defaults to 10
+  globally and 3 per direct peer IP. Zeus ignores `Forwarded` and
+  `X-Forwarded-For` unless a future explicit trusted-proxy contract is added.
+  Rejection is a generic `429` with `Retry-After` and `Cache-Control: no-store`.
 - Every business REST/SSE route requires the active local owner. Protected
   state changes additionally require `X-CSRF-Token` to match the login and an
   exact same-origin request. Alpha+ deliberately rejects the schema-reserved
   `member` role. Actor isolation is now present, but member access remains
-  blocked until quotas, pagination, SSE limits, and login rate limiting land.
+  blocked until storage/queue quotas and bounded cursor pagination land.
 - `GET /api/v1/me/settings` returns the current safe preferences.
   `PATCH /api/v1/me/settings` accepts `theme`, optional allowlisted
   `preferred_model`, and `expected_revision`. Provider endpoints and API keys
@@ -351,16 +357,22 @@ directly.
 - `GET /api/v1/runs/{run_id}` returns one run projection plus ordered events.
 - `GET /api/v1/runs/{run_id}/events?after={sequence}` streams Run SSE. For both
   feeds, `Last-Event-ID` takes precedence over the query cursor when present.
+  Run and Session streams share a limit of 64 open connections globally and 4
+  per authenticated actor; the lease remains held until the response body is
+  closed. Event replay itself is not yet bounded and remains the next slice.
 - `POST /api/v1/runs/{run_id}/approvals/{approval_id}/decision` accepts
   `{"decision":"approve|reject","note":...}` and requires an
   `Idempotency-Key` header. Approval identity comes from the path, not a caller-
   selected tool payload.
 - Session creation, turn start, resume, and approval-decision commands require
-  a non-empty `Idempotency-Key`. Authentication/logout and optimistic settings
-  updates use their own replay/concurrency rules. Invalid input returns 400;
-  missing or unowned resources return 404; unauthenticated requests return
-  401; CSRF/origin rejection returns 403; duplicate identity, idempotency
-  conflict, invalid state, or sequence conflict returns 409 as
+  exactly one canonical `Idempotency-Key`: 1–128 ASCII graphic bytes, with no
+  trimming or reinterpretation. Authentication/logout and optimistic settings
+  updates use their own replay/concurrency rules. Malformed input returns 400,
+  oversized JSON returns 413, a wrong content type returns 415, schema mismatch
+  or unknown fields return 422, and capacity/rate rejection returns 429.
+  Missing or unowned resources return 404; unauthenticated requests return 401;
+  CSRF/origin rejection returns 403; duplicate identity, idempotency conflict,
+  invalid state, or sequence conflict returns 409 as
   `application/problem+json`.
 - Internal execution-invariant failures return a stable, redacted
   `500 runtime_unavailable`. Storage, policy-build, connector-configuration, or
@@ -370,9 +382,15 @@ directly.
 Schema v8 retains durable Run attachment during migration and demo seeding,
 but Alpha+ does not expose a public attach-Run HTTP route.
 
-Session identifiers, titles, and messages currently have canonical/non-empty
-validation but no explicit per-field byte quota, and detail routes return the
-complete local ledger without pagination. Add quotas, retention, and cursor
+The application boundary now caps auth JSON at 8 KiB and command JSON at
+512 KiB. Newly created Session and turn IDs are capped at 128 UTF-8 bytes;
+Session titles at 256 bytes; user messages at 64 KiB; and review notes at 8 KiB.
+New Session event IDs are ledger-local and bounded. Historical v8 durable IDs
+remain addressable so the stricter write envelope does not strand existing
+data. Shared validation runs before command fingerprinting or receipt lookup at
+the relevant API/runtime/storage entry points. Detail and event-feed queries
+still return the complete matching ledger without pagination, and SQLite usage
+quotas/retention are not present. Add the v9 storage budgets and bounded cursor
 pagination before any shared-network or multi-tenant deployment.
 
 ## Container images
@@ -421,13 +439,15 @@ committed data. Use SQLite's backup/checkpoint facilities.
 
 ## Verification status
 
-Current Alpha+ plus Actor Boundary Foundation host verification:
+Current Alpha+ plus Actor Boundary Foundation and API Resource Envelope host
+verification:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --all-targets`: 145 tests passed, including the real
+- `cargo test --workspace --all-targets`: 168 tests passed, including the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,
+  body/field/idempotency boundaries, atomic login limits, SSE lease capacity,
   durable reply provenance, concurrent claim, restart recovery, and provider
   `outcome_unknown` semantics.
 - `pnpm --filter web test`: 19 tests passed for CSRF headers, stable command
@@ -456,6 +476,14 @@ provenance, and ordered event ledger; an unknown or masked Session returned the
 same `404` surface. Cross-owner transfer, receipt collision, revocation, and
 live-SSE closure are covered by the automated actor-isolation tests.
 
+API Resource Envelope was live-smoked through a real TCP listener at
+`127.0.0.1:18082`, proving production `ConnectInfo` injection. An 8,193-byte
+auth body returned `413`; an unknown request field returned `422` without
+creating a Session; duplicate `Idempotency-Key` headers returned `400` without
+creating a Session; and a valid create/turn request still settled through the
+durable worker to sequence 4 with local-fallback provenance. Rate-window and
+SSE body-drop behavior are covered by deterministic automated tests.
+
 Apple `container` remains a supported local debug path. `bash -n` passes for
 the helper, and the pre-existing labeled API/Web/gateway containers plus
 `zeus-alpha-data` volume remained healthy and untouched during this change.
@@ -463,8 +491,9 @@ The Alpha+ image rebuild on this machine stalled while updating the crates.io
 index inside BuildKit and was interrupted before any running container was
 replaced. Therefore the new image, `verify`, and named-volume `restart-verify`
 are not yet claimed as current Alpha+ acceptance. The earlier Alpha baseline
-container acceptance belongs to commit `9a89706`; the committed Alpha+ host
-baseline is `4fede62`, whose replacement container image is still unverified.
+container acceptance belongs to commit `9a89706`; the latest pushed host
+baseline before this slice is Actor Boundary commit `fb6eb46`. No replacement
+image containing Actor Boundary or API Resource Envelope is yet verified.
 
 Docker Compose configuration remains available for environments with Docker
 Compose v2; this machine currently has Apple `container` but no Docker CLI, so

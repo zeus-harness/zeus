@@ -1,7 +1,7 @@
 # Zeus Harness Alpha+ 设计冻结
 
-状态：主机 Alpha+ 与 Actor Boundary Foundation 验收通过；Apple container 新镜像验收待完成
-基线：`4fede62`（Alpha+）
+状态：主机 Alpha+、Actor Boundary Foundation 与 API Resource Envelope 验收通过；Apple container 新镜像验收待完成
+基线：`fb6eb46`（Actor Boundary Foundation）
 
 ## 1. 产品术语
 
@@ -24,6 +24,9 @@ Alpha+ 只支持一个本地实例 owner，并为后续迁移保留 member 枚�
 5. 写请求要求同一登录会话的 CSRF token，并校验 `Origin`/`Host`。SSE 使用同源 Cookie 鉴权。
 6. 未登录业务 REST/SSE 返回 `401`。本阶段所有认证入口和中间件均拒绝
    member；不能把预留的 member 行理解为已支持多用户。
+7. bootstrap/login 在 Argon2 前按真实 TCP peer、canonical account 和全局固定窗口限速；
+   默认不信任 `Forwarded`/`X-Forwarded-For`。登录默认每分钟 global/source/account
+   为 60/10/5，bootstrap 为 10/3；超限统一返回带 `Retry-After` 的 `429`。
 
 Health 路由保持公开。公开注册、邮件找回、OAuth/SSO、WebAuthn 不属于本阶段。
 
@@ -42,8 +45,15 @@ Health 路由保持公开。公开注册、邮件找回、OAuth/SSO、WebAuthn �
   owner。授权在排队后被撤销时，任务在一个事务中进入 durable 拒绝终态并追加
   `authorization_revoked` 证据，provider/connector 调用次数必须为零。
 
-这些边界只是未来 member 能力的安全底座。当前 API 仍拒绝 member 登录；字段/队列配额、
-分页、SSE 连接上限和登录限速完成前不得开放 member。
+这些边界只是未来 member 能力的安全底座。当前 API 仍拒绝 member 登录；字段与 HTTP/SSE
+连接边界已经落地，但 SQLite 存储/队列配额和有界 cursor pagination 完成前不得开放 member。
+
+Resource Envelope 的固定边界：auth JSON 8 KiB、command JSON 512 KiB；新建 Session/turn
+ID 128 UTF-8 bytes、Session title 256 bytes、user message 64 KiB、review note 8 KiB；
+`Idempotency-Key` 必须是单一的 1–128 ASCII graphic bytes。新 Session event ID 是有界的
+ledger-local ID；旧 v8 durable ID 继续可寻址，避免升级后数据失联。字段校验发生在
+fingerprint/receipt 之前。Run/Session SSE 共用 global 64、每 actor 4 条连接配额，permit
+由 response body 持有。事件回放仍未分页，不能把连接配额描述为有界 replay。
 
 ## 4. 设置
 
@@ -99,4 +109,6 @@ POST /sessions/{id}/turns
 - reply job 的 queued/start/success/failure/outcome_unknown 和重启语义有存储测试。
 - disabled/降权/owner mismatch 的 reply 与 dispatch claim 不触达外部执行，并留下
   durable terminal evidence。
-- host 与 container 都通过完整 Rust/Web 测试和重启恢复检查。
+- body、字段和幂等键超限在 fingerprint/receipt/ledger/job 前失败；413/415/422/429
+  problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
+- host 通过完整 Rust/Web 测试；Apple container 的当前镜像验收状态按下文边界单独记录。

@@ -21,10 +21,10 @@ use kernel::{
 use protocol::{
     Approval, ApprovalStatus, AttachRunRequest, AttachRunResponse, CreateSessionRequest,
     CreateSessionResponse, FlushSessionRequest, FlushSessionResponse, NotDispatchedReason,
-    OverviewResponse, PolicyDecision, ResumeSessionRequest, ResumeSessionResponse, ReviewDecision,
-    ReviewRequest, ReviewResponse, RunDetail, RunEvent, RunEventData, RunSummary, SessionDetail,
-    SessionEvent, SessionEventData, SessionSummary, StartTurnRequest, StartTurnResponse, ToolCall,
-    ToolExecutorStatus, ToolOutcome,
+    OverviewResponse, PolicyDecision, ResourceEnvelopeError, ResumeSessionRequest,
+    ResumeSessionResponse, ReviewDecision, ReviewRequest, ReviewResponse, RunDetail, RunEvent,
+    RunEventData, RunSummary, SessionDetail, SessionEvent, SessionEventData, SessionSummary,
+    StartTurnRequest, StartTurnResponse, ToolCall, ToolExecutorStatus, ToolOutcome,
 };
 pub use storage::{
     AuthPrincipal, AuthSessionCommit, BootstrapOwnerCommit, ReplyClaimOutcome, ReplyCompletion,
@@ -164,6 +164,7 @@ impl From<StorageError> for StoreError {
             StorageError::InvalidSessionTransition(detail) => {
                 Self::InvalidSessionTransition(detail)
             }
+            StorageError::InvalidResourceEnvelope(detail) => Self::InvalidSessionRequest(detail),
             StorageError::EmptyIdempotencyKey => Self::EmptyIdempotencyKey,
             StorageError::IdempotencyConflict => Self::IdempotencyConflict,
             StorageError::ConcurrentModification => Self::ConcurrentModification,
@@ -390,6 +391,7 @@ impl DemoStore {
     }
 
     pub async fn run_detail(&self, run_id: &str) -> Result<RunDetail, StoreError> {
+        validate_durable_reference(run_id, "run ID")?;
         let stored = self.storage.load_run(run_id).await?;
         Ok(RunDetail {
             incident: stored.snapshot.incident,
@@ -403,6 +405,7 @@ impl DemoStore {
         actor_user_id: &str,
         run_id: &str,
     ) -> Result<RunDetail, StoreError> {
+        validate_durable_reference(run_id, "run ID")?;
         let stored = self
             .storage
             .load_run_for_actor(actor_user_id, run_id)
@@ -419,6 +422,7 @@ impl DemoStore {
         run_id: &str,
         after: u64,
     ) -> Result<Vec<RunEvent>, StoreError> {
+        validate_durable_reference(run_id, "run ID")?;
         Ok(self.storage.events_after(run_id, after).await?)
     }
 
@@ -428,6 +432,7 @@ impl DemoStore {
         run_id: &str,
         after: u64,
     ) -> Result<Vec<RunEvent>, StoreError> {
+        validate_durable_reference(run_id, "run ID")?;
         Ok(self
             .storage
             .events_after_for_actor(actor_user_id, run_id, after)
@@ -469,7 +474,7 @@ impl DemoStore {
     }
 
     pub async fn get_session(&self, session_id: &str) -> Result<SessionDetail, StoreError> {
-        validate_canonical_session_value(session_id, "session ID")?;
+        validate_durable_reference(session_id, "session ID")?;
         Ok(self.storage.get_session(session_id).await?)
     }
 
@@ -478,7 +483,7 @@ impl DemoStore {
         actor_user_id: &str,
         session_id: &str,
     ) -> Result<SessionDetail, StoreError> {
-        validate_canonical_session_value(session_id, "session ID")?;
+        validate_durable_reference(session_id, "session ID")?;
         Ok(self
             .storage
             .get_session_for_actor(actor_user_id, session_id)
@@ -490,7 +495,7 @@ impl DemoStore {
         session_id: &str,
         after: u64,
     ) -> Result<Vec<SessionEvent>, StoreError> {
-        validate_canonical_session_value(session_id, "session ID")?;
+        validate_durable_reference(session_id, "session ID")?;
         validate_session_sequence(after, "session event cursor")?;
         Ok(self.storage.session_events_after(session_id, after).await?)
     }
@@ -501,7 +506,7 @@ impl DemoStore {
         session_id: &str,
         after: u64,
     ) -> Result<Vec<SessionEvent>, StoreError> {
-        validate_canonical_session_value(session_id, "session ID")?;
+        validate_durable_reference(session_id, "session ID")?;
         validate_session_sequence(after, "session event cursor")?;
         Ok(self
             .storage
@@ -520,7 +525,7 @@ impl DemoStore {
         session_id: &str,
         after: u64,
     ) -> Result<SessionEventFeed, StoreError> {
-        validate_canonical_session_value(session_id, "session ID")?;
+        validate_durable_reference(session_id, "session ID")?;
         let receiver = self.session_publisher.subscribe();
         let replay = self.session_events_after(session_id, after).await?;
         Ok(SessionEventFeed { replay, receiver })
@@ -535,7 +540,7 @@ impl DemoStore {
         session_id: &str,
         after: u64,
     ) -> Result<SessionEventFeed, StoreError> {
-        validate_canonical_session_value(session_id, "session ID")?;
+        validate_durable_reference(session_id, "session ID")?;
         let receiver = self.session_publisher.subscribe();
         let replay = self
             .session_events_after_for_actor(actor_user_id, session_id, after)
@@ -548,8 +553,8 @@ impl DemoStore {
         request: CreateSessionRequest,
         idempotency_key: &str,
     ) -> Result<CreateSessionResponse, StoreError> {
-        validate_canonical_session_value(&request.id, "session ID")?;
-        validate_canonical_session_value(&request.title, "session title")?;
+        validate_new_session_id(&request.id, "session ID")?;
+        validate_new_session_title(&request.title, "session title")?;
         let idempotency_key = normalized_idempotency_key(idempotency_key)?;
         let response = self
             .storage
@@ -567,8 +572,8 @@ impl DemoStore {
         request: CreateSessionRequest,
         idempotency_key: &str,
     ) -> Result<CreateSessionResponse, StoreError> {
-        validate_canonical_session_value(&request.id, "session ID")?;
-        validate_canonical_session_value(&request.title, "session title")?;
+        validate_new_session_id(&request.id, "session ID")?;
+        validate_new_session_title(&request.title, "session title")?;
         let idempotency_key = normalized_idempotency_key(idempotency_key)?;
         let response = self
             .storage
@@ -587,8 +592,8 @@ impl DemoStore {
         request: AttachRunRequest,
         idempotency_key: &str,
     ) -> Result<AttachRunResponse, StoreError> {
-        validate_canonical_session_value(session_id, "session ID")?;
-        validate_canonical_session_value(&request.run_id, "run ID")?;
+        validate_durable_reference(session_id, "session ID")?;
+        validate_durable_reference(&request.run_id, "run ID")?;
         validate_session_sequence(request.expected_sequence, "expected session sequence")?;
         let idempotency_key = normalized_idempotency_key(idempotency_key)?;
         let response = self
@@ -607,7 +612,7 @@ impl DemoStore {
         request: ResumeSessionRequest,
         idempotency_key: &str,
     ) -> Result<ResumeSessionResponse, StoreError> {
-        validate_canonical_session_value(session_id, "session ID")?;
+        validate_durable_reference(session_id, "session ID")?;
         validate_session_sequence(request.expected_sequence, "expected session sequence")?;
         let idempotency_key = normalized_idempotency_key(idempotency_key)?;
         let response = self
@@ -627,7 +632,7 @@ impl DemoStore {
         request: ResumeSessionRequest,
         idempotency_key: &str,
     ) -> Result<ResumeSessionResponse, StoreError> {
-        validate_canonical_session_value(session_id, "session ID")?;
+        validate_durable_reference(session_id, "session ID")?;
         validate_session_sequence(request.expected_sequence, "expected session sequence")?;
         let idempotency_key = normalized_idempotency_key(idempotency_key)?;
         let response = self
@@ -646,9 +651,9 @@ impl DemoStore {
         request: StartTurnRequest,
         idempotency_key: &str,
     ) -> Result<StartTurnResponse, StoreError> {
-        validate_canonical_session_value(session_id, "session ID")?;
-        validate_canonical_session_value(&request.turn_id, "turn ID")?;
-        validate_session_message(&request.user_message, "user message")?;
+        validate_durable_reference(session_id, "session ID")?;
+        validate_new_turn_id(&request.turn_id, "turn ID")?;
+        validate_user_message_value(&request.user_message, "user message")?;
         validate_session_sequence(request.expected_sequence, "expected session sequence")?;
         let idempotency_key = normalized_idempotency_key(idempotency_key)?;
         let response = self
@@ -668,9 +673,9 @@ impl DemoStore {
         request: StartTurnRequest,
         idempotency_key: &str,
     ) -> Result<StartTurnResponse, StoreError> {
-        validate_canonical_session_value(session_id, "session ID")?;
-        validate_canonical_session_value(&request.turn_id, "turn ID")?;
-        validate_session_message(&request.user_message, "user message")?;
+        validate_durable_reference(session_id, "session ID")?;
+        validate_new_turn_id(&request.turn_id, "turn ID")?;
+        validate_user_message_value(&request.user_message, "user message")?;
         validate_session_sequence(request.expected_sequence, "expected session sequence")?;
         let idempotency_key = normalized_idempotency_key(idempotency_key)?;
         let response = self
@@ -690,9 +695,9 @@ impl DemoStore {
         idempotency_key: &str,
         job: ReplyJobSpec,
     ) -> Result<ReplyJobEnqueueResponse, StoreError> {
-        validate_canonical_session_value(session_id, "session ID")?;
-        validate_canonical_session_value(&request.turn_id, "turn ID")?;
-        validate_session_message(&request.user_message, "user message")?;
+        validate_durable_reference(session_id, "session ID")?;
+        validate_new_turn_id(&request.turn_id, "turn ID")?;
+        validate_user_message_value(&request.user_message, "user message")?;
         validate_session_sequence(request.expected_sequence, "expected session sequence")?;
         let idempotency_key = normalized_idempotency_key(idempotency_key)?;
         let response = self
@@ -713,9 +718,9 @@ impl DemoStore {
         idempotency_key: &str,
         job: ReplyJobSpec,
     ) -> Result<ReplyJobEnqueueResponse, StoreError> {
-        validate_canonical_session_value(session_id, "session ID")?;
-        validate_canonical_session_value(&request.turn_id, "turn ID")?;
-        validate_session_message(&request.user_message, "user message")?;
+        validate_durable_reference(session_id, "session ID")?;
+        validate_new_turn_id(&request.turn_id, "turn ID")?;
+        validate_user_message_value(&request.user_message, "user message")?;
         validate_session_sequence(request.expected_sequence, "expected session sequence")?;
         let idempotency_key = normalized_idempotency_key(idempotency_key)?;
         let response = self
@@ -800,8 +805,8 @@ impl DemoStore {
         request: FlushSessionRequest,
         idempotency_key: &str,
     ) -> Result<FlushSessionResponse, StoreError> {
-        validate_canonical_session_value(session_id, "session ID")?;
-        validate_canonical_session_value(&request.turn_id, "turn ID")?;
+        validate_durable_reference(session_id, "session ID")?;
+        validate_durable_reference(&request.turn_id, "turn ID")?;
         if let Some(message) = &request.assistant_message {
             validate_session_message(message, "assistant message")?;
         }
@@ -826,8 +831,8 @@ impl DemoStore {
         request: FlushSessionRequest,
         idempotency_key: &str,
     ) -> Result<FlushSessionResponse, StoreError> {
-        validate_canonical_session_value(session_id, "session ID")?;
-        validate_canonical_session_value(&request.turn_id, "turn ID")?;
+        validate_durable_reference(session_id, "session ID")?;
+        validate_durable_reference(&request.turn_id, "turn ID")?;
         if let Some(message) = &request.assistant_message {
             validate_session_message(message, "assistant message")?;
         }
@@ -889,17 +894,24 @@ impl DemoStore {
         request: ReviewRequest,
         idempotency_key: &str,
     ) -> Result<ReviewResponse, StoreError> {
-        let idempotency_key = idempotency_key.trim();
-        if idempotency_key.is_empty() {
-            return Err(StoreError::EmptyIdempotencyKey);
-        }
+        validate_durable_reference(run_id, "run ID")?;
+        validate_durable_reference(approval_id, "approval ID")?;
+        let idempotency_key = normalized_idempotency_key(idempotency_key)?;
+
+        // Authorization precedes payload fingerprinting and receipt lookup.
+        // This preserves the resource-not-found mask while ensuring an invalid
+        // payload can never be serialized or compared with a stored receipt.
+        let stored = if let Some(actor_user_id) = actor_user_id {
+            self.storage
+                .load_run_for_actor(actor_user_id, run_id)
+                .await?
+        } else {
+            self.storage.load_run(run_id).await?
+        };
+        validate_review_request_value(&request)?;
         let fingerprint = review_fingerprint(run_id, approval_id, &request)?;
 
-        let stored = if let Some(actor_user_id) = actor_user_id {
-            let stored = self
-                .storage
-                .load_run_for_actor(actor_user_id, run_id)
-                .await?;
+        if let Some(actor_user_id) = actor_user_id {
             if let Some(receipt) = self
                 .storage
                 .review_receipt_for_actor(actor_user_id, run_id, idempotency_key)
@@ -909,15 +921,11 @@ impl DemoStore {
                 self.kick_dispatcher();
                 return Ok(response);
             }
-            stored
-        } else {
-            if let Some(receipt) = self.storage.review_receipt(idempotency_key).await? {
-                let response = replay_receipt(receipt, &fingerprint)?;
-                self.kick_dispatcher();
-                return Ok(response);
-            }
-            self.storage.load_run(run_id).await?
-        };
+        } else if let Some(receipt) = self.storage.review_receipt(idempotency_key).await? {
+            let response = replay_receipt(receipt, &fingerprint)?;
+            self.kick_dispatcher();
+            return Ok(response);
+        }
         let (pending, call) = pending_approval_and_call(&stored, approval_id)?;
         let approving = request.decision == ReviewDecision::Approve;
         if approving {
@@ -1582,15 +1590,26 @@ fn now() -> String {
 }
 
 fn normalized_idempotency_key(key: &str) -> Result<&str, StoreError> {
-    let key = key.trim();
-    if key.is_empty() {
-        Err(StoreError::EmptyIdempotencyKey)
-    } else {
-        Ok(key)
+    match protocol::validate_idempotency_key(key) {
+        Ok(()) => Ok(key),
+        Err(ResourceEnvelopeError::Empty) => Err(StoreError::EmptyIdempotencyKey),
+        Err(error) => Err(invalid_resource_envelope("idempotency key", error)),
     }
 }
 
-fn validate_canonical_session_value(value: &str, field: &'static str) -> Result<(), StoreError> {
+fn validate_new_session_id(value: &str, field: &'static str) -> Result<(), StoreError> {
+    protocol::validate_session_id(value).map_err(|error| invalid_resource_envelope(field, error))
+}
+
+fn validate_new_turn_id(value: &str, field: &'static str) -> Result<(), StoreError> {
+    protocol::validate_turn_id(value).map_err(|error| invalid_resource_envelope(field, error))
+}
+
+fn validate_new_session_title(value: &str, field: &'static str) -> Result<(), StoreError> {
+    protocol::validate_session_title(value).map_err(|error| invalid_resource_envelope(field, error))
+}
+
+fn validate_durable_reference(value: &str, field: &'static str) -> Result<(), StoreError> {
     if value.is_empty() || value.trim() != value {
         Err(StoreError::InvalidSessionRequest(format!(
             "{field} must be non-empty and canonical"
@@ -1598,6 +1617,10 @@ fn validate_canonical_session_value(value: &str, field: &'static str) -> Result<
     } else {
         Ok(())
     }
+}
+
+fn validate_user_message_value(value: &str, field: &'static str) -> Result<(), StoreError> {
+    protocol::validate_user_message(value).map_err(|error| invalid_resource_envelope(field, error))
 }
 
 fn validate_session_message(value: &str, field: &'static str) -> Result<(), StoreError> {
@@ -1608,6 +1631,21 @@ fn validate_session_message(value: &str, field: &'static str) -> Result<(), Stor
     } else {
         Ok(())
     }
+}
+
+fn validate_review_request_value(request: &ReviewRequest) -> Result<(), StoreError> {
+    if let Some(note) = &request.note {
+        protocol::validate_review_note(note)
+            .map_err(|error| invalid_resource_envelope("review note", error))?;
+    }
+    if let Some(idempotency_key) = &request.idempotency_key {
+        normalized_idempotency_key(idempotency_key)?;
+    }
+    Ok(())
+}
+
+fn invalid_resource_envelope(field: &'static str, error: ResourceEnvelopeError) -> StoreError {
+    StoreError::InvalidSessionRequest(format!("{field} {error}"))
 }
 
 fn validate_session_sequence(value: u64, field: &'static str) -> Result<(), StoreError> {
@@ -2108,6 +2146,130 @@ mod tests {
                 Err(StoreError::RunNotFound(id)) if id == DEMO_RUN_ID
             ),
             "receipt possession must not bypass run authorization"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_envelope_rejections_leave_session_receipts_and_ledger_untouched() {
+        let store = production_store(false).await;
+        let before = store
+            .get_session_for_actor(TEST_OWNER_ID, DEMO_SESSION_ID)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .start_turn_for_actor(
+                    TEST_OWNER_ID,
+                    DEMO_SESSION_ID,
+                    StartTurnRequest {
+                        turn_id: "turn-runtime-over-message".into(),
+                        user_message: "🙂".repeat(protocol::USER_MESSAGE_MAX_BYTES / 4 + 1),
+                        expected_sequence: before.session.sequence,
+                    },
+                    "runtime-over-message",
+                )
+                .await,
+            Err(StoreError::InvalidSessionRequest(_))
+        ));
+        assert!(matches!(
+            store
+                .start_turn_for_actor(
+                    TEST_OWNER_ID,
+                    DEMO_SESSION_ID,
+                    StartTurnRequest {
+                        turn_id: "turn-runtime-key".into(),
+                        user_message: "This must not be persisted yet".into(),
+                        expected_sequence: before.session.sequence,
+                    },
+                    " runtime-key",
+                )
+                .await,
+            Err(StoreError::InvalidSessionRequest(_))
+        ));
+
+        let unchanged = store
+            .get_session_for_actor(TEST_OWNER_ID, DEMO_SESSION_ID)
+            .await
+            .unwrap();
+        assert_eq!(unchanged, before);
+        let started = store
+            .start_turn_for_actor(
+                TEST_OWNER_ID,
+                DEMO_SESSION_ID,
+                StartTurnRequest {
+                    turn_id: "turn-runtime-key".into(),
+                    user_message: "The exact canonical key remains unused".into(),
+                    expected_sequence: before.session.sequence,
+                },
+                "runtime-key",
+            )
+            .await
+            .unwrap();
+        assert!(!started.replayed);
+    }
+
+    #[tokio::test]
+    async fn runtime_review_note_envelope_rejects_before_fingerprint_receipt_and_ledger() {
+        let store = production_store(false).await;
+        let before = store
+            .run_detail_for_actor(TEST_OWNER_ID, DEMO_RUN_ID)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .review_for_actor(
+                    TEST_OWNER_ID,
+                    DEMO_RUN_ID,
+                    "APR-901",
+                    ReviewRequest {
+                        decision: ReviewDecision::Reject,
+                        note: Some("🙂".repeat(protocol::REVIEW_NOTE_MAX_BYTES / 4 + 1)),
+                        idempotency_key: None,
+                    },
+                    "runtime-review-envelope",
+                )
+                .await,
+            Err(StoreError::InvalidSessionRequest(_))
+        ));
+        assert!(matches!(
+            store
+                .review_for_actor(
+                    TEST_OWNER_ID,
+                    DEMO_RUN_ID,
+                    "APR-901",
+                    ReviewRequest {
+                        decision: ReviewDecision::Reject,
+                        note: Some("The body key is not canonical".into()),
+                        idempotency_key: Some(" body-review-key".into()),
+                    },
+                    "runtime-body-key-envelope",
+                )
+                .await,
+            Err(StoreError::InvalidSessionRequest(_))
+        ));
+        assert!(
+            store
+                .storage
+                .review_receipt_for_actor(TEST_OWNER_ID, DEMO_RUN_ID, "runtime-review-envelope",)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .storage
+                .review_receipt_for_actor(TEST_OWNER_ID, DEMO_RUN_ID, "runtime-body-key-envelope",)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .run_detail_for_actor(TEST_OWNER_ID, DEMO_RUN_ID)
+                .await
+                .unwrap(),
+            before
         );
     }
 
