@@ -1,3 +1,29 @@
-@import 'tailwindcss';
 @plugin '@tailwindcss/forms';
 @plugin '@tailwindcss/typography';
+
+html,
+body {
+	margin: 0;
+	min-width: 320px;
+	background: #fff;
+}
+
+button,
+a,
+textarea {
+	-webkit-tap-highlight-color: transparent;
+}
+
+button,
+a {
+	font: inherit;
+}
+
+::selection {
+	background: rgb(65 118 230 / 18%);
+}
+
+* {
+	scrollbar-color: #d2d2d5 transparent;
+	scrollbar-width: thin;
+}

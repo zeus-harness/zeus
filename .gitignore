@@ -28,6 +28,9 @@ dist
 dist-ssr
 *.local
 .env
+.zeus/
 .cache
 server/dist
 public/dist
+.zeus-container-build.*/
+zeus-container-build.*/

@@ -11,12 +11,15 @@
     "build": "turbo run build",
     "dev": "turbo run dev",
     "lint": "turbo run lint",
+    "check": "turbo run check",
+    "test": "turbo run test",
     "format": "prettier --write \"**/*.{ts,tsx,md}\""
   },
   "packageManager": "pnpm@10.33.0",
   "devDependencies": {
     "eslint": "^10.9.1",
     "prettier": "^3.9.6",
-    "turbo": "^2.10.11"
+    "turbo": "^2.10.11",
+    "typescript": "6.0.3"
   }
 }

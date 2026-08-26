@@ -1,0 +1,17 @@
+.git
+.github
+.idea
+.DS_Store
+.env
+.zeus
+.zeus-container-build.*
+.turbo
+.pnpm-store
+**/.svelte-kit
+**/build
+**/dist
+**/node_modules
+node_modules
+target
+zeus-container-build.*
+*.log
