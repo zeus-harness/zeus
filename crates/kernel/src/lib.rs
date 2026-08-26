@@ -425,6 +425,8 @@ pub enum KernelError {
     InvalidToolCall,
     #[error("executor name must not be empty")]
     InvalidExecutor,
+    #[error("tool outcome exceeds the durable resource envelope")]
+    InvalidToolOutcome,
     #[error("next event sequence must be exactly one greater than the run sequence")]
     InvalidSequence,
 }
@@ -517,7 +519,11 @@ pub fn start_tool_dispatch(
     validate_next_sequence(run, next_sequence)?;
 
     let executor = executor.into();
-    if executor.trim().is_empty() {
+    if executor.trim().is_empty()
+        || executor.trim() != executor
+        || executor.len() > 256
+        || executor.chars().any(char::is_control)
+    {
         return Err(KernelError::InvalidExecutor);
     }
 
@@ -574,6 +580,9 @@ pub fn apply_tool_result(
     }
     validate_tool_call(call)?;
     validate_next_sequence(run, next_sequence)?;
+    outcome
+        .validate_resource_envelope()
+        .map_err(|_| KernelError::InvalidToolOutcome)?;
 
     let (run_status, title, summary) = match &outcome {
         ToolOutcome::Succeeded { summary, .. } => (

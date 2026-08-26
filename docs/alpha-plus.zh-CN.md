@@ -1,6 +1,6 @@
 # Zeus Harness Alpha+ 设计冻结
 
-状态：主机 Alpha+、Actor Boundary Foundation、API Resource Envelope、Bounded Event Feed、Point-query Durable Context、Bounded Read Models 与 SQLite Capacity Slice 1 已实现并通过主机全量验收；Apple container 新镜像验收待完成
+状态：主机 Alpha+、Actor Boundary Foundation、API/Terminal Payload Resource Envelope、Bounded Event Feed、Point-query Durable Context、Bounded Read Models 与 SQLite Capacity Slice 1 已实现并通过主机全量验收；Apple container 新镜像验收待完成
 前置基线：`8656e52`（Bounded Read Models）
 
 ## 1. 产品术语
@@ -52,12 +52,19 @@ terminal payload byte reservation、tenant/account membership scope、SQLite 主
 应急余量，以及 bootstrap audit 的明确保留期。
 
 Resource Envelope 的固定边界：auth JSON 8 KiB、command JSON 512 KiB；新建 Session/turn
-ID 128 UTF-8 bytes、Session title 256 bytes、user message 64 KiB、review note 8 KiB；
+ID 128 UTF-8 bytes、Session title 256 bytes、user/assistant message 64 KiB、review note 8 KiB；
 `Idempotency-Key` 必须是单一的 1–128 ASCII graphic bytes。新 Session event ID 是有界的
 ledger-local ID；pre-v9 durable ID 继续可寻址，避免升级后数据失联。字段校验发生在
 fingerprint/receipt 之前。Run/Session SSE 共用 global 64、每 actor 4 条连接配额，permit
 由 response body 持有。initial/hint/lag/poll 每次只从 SQLite 读取最多 128 条事件的
 `LIMIT + 1` page；积压通过 cooperative continuation 分页补齐，cursor 只随已发送事件推进。
+
+终端载荷进一步固定：typed reply response 512 KiB；provider/model/finish reason、reply
+failure code、tool digest/code 各 128 bytes；reply/tool diagnostic 4 KiB；compact tool output
+与 dispatch arguments JSON 各 64 KiB。超限 provider/executor 结果只结算一次为固定、脱敏、
+有界的 durable failure，原始超限内容不进入 ledger 或 job result。dispatch admission 在同一
+事务重新读取 runtime identity 与此前 immutable `ToolCallRequested`，严格比对 policy、
+tool/version/effect、arguments/digest 和 sandbox；错误任务不能占住 queue head 与 reservation。
 
 生产读取同样固定为 indexed `LIMIT + 1` keyset page：Session 列表默认 50、最大 100，
 保持裸数组响应并通过 `X-Zeus-Next-Cursor` 返回续页 cursor；Session detail 的 Run ID/turn
@@ -159,4 +166,6 @@ POST /sessions/{id}/turns
   durable terminal evidence。
 - body、字段和幂等键超限在 fingerprint/receipt/ledger/job 前失败；413/415/422/429
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
+- assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
+  provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
 - host 通过完整 Rust/Web 测试；Apple container 的当前镜像验收状态按下文边界单独记录。

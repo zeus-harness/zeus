@@ -22,6 +22,10 @@ use thiserror::Error;
 const MAX_TOOL_NAME_BYTES: usize = 96;
 const MAX_CALL_ID_BYTES: usize = 160;
 const MAX_ENVIRONMENT_BYTES: usize = 64;
+/// Maximum compact-JSON bytes accepted from one executor result value.
+pub const TOOL_OUTPUT_MAX_SERIALIZED_BYTES: usize = 64 * 1024;
+/// Maximum bytes accepted for an opaque executor request identifier.
+pub const PROVIDER_REQUEST_ID_MAX_BYTES: usize = 128;
 
 /// The JSON value type accepted for a declared argument.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,10 +107,9 @@ impl ObjectSchema {
         let object = value.as_object().ok_or_else(|| {
             RegistryError::InvalidArguments("tool arguments must be a JSON object".into())
         })?;
-        let serialized_len = canonical_json(value).len();
-        if serialized_len > self.max_serialized_bytes {
+        if serialized_json_len_bounded(value, self.max_serialized_bytes).is_none() {
             return Err(RegistryError::InvalidArguments(format!(
-                "tool arguments are {serialized_len} bytes; limit is {} bytes",
+                "tool arguments exceed the {}-byte limit",
                 self.max_serialized_bytes
             )));
         }
@@ -210,6 +213,12 @@ pub enum RegistryError {
     ContractMismatch { field: &'static str },
     #[error("tool `{0}` is marked unavailable")]
     ExecutorUnavailable(String),
+    #[error("tool executor output exceeded the {limit_bytes}-byte limit")]
+    ExecutorOutputTooLarge { limit_bytes: usize },
+    #[error("tool executor output contains an invalid {field}")]
+    InvalidExecutorOutput { field: &'static str },
+    #[error("tool executor diagnostic contains an invalid {field}")]
+    InvalidExecutorDiagnostic { field: &'static str },
     #[error(transparent)]
     Executor(#[from] ExecutorError),
 }
@@ -322,16 +331,66 @@ impl ToolRegistry {
         }
 
         let provider_idempotency_key = provider_idempotency_key(&call.call_id)?;
-        entry
+        let result = entry
             .executor
             .execute(ExecutionRequest {
                 call,
                 environment: environment.to_owned(),
                 provider_idempotency_key,
             })
-            .await
-            .map_err(RegistryError::from)
+            .await;
+        match result {
+            Ok(output) => {
+                validate_tool_output(&output)?;
+                Ok(output)
+            }
+            Err(error) => {
+                validate_executor_error(&error)?;
+                Err(RegistryError::Executor(error))
+            }
+        }
     }
+}
+
+fn validate_tool_output(output: &ToolOutput) -> Result<(), RegistryError> {
+    if serialized_json_len_bounded(&output.value, TOOL_OUTPUT_MAX_SERIALIZED_BYTES).is_none() {
+        return Err(RegistryError::ExecutorOutputTooLarge {
+            limit_bytes: TOOL_OUTPUT_MAX_SERIALIZED_BYTES,
+        });
+    }
+    if let Some(provider_request_id) = &output.provider_request_id
+        && protocol::validate_tool_outcome_code(provider_request_id).is_err()
+    {
+        return Err(RegistryError::InvalidExecutorOutput {
+            field: "provider_request_id",
+        });
+    }
+    Ok(())
+}
+
+fn validate_executor_error(error: &ExecutorError) -> Result<(), RegistryError> {
+    match error {
+        ExecutorError::Unavailable { reason } => {
+            protocol::validate_tool_outcome_summary(reason).map_err(|_| {
+                RegistryError::InvalidExecutorDiagnostic {
+                    field: "unavailable reason",
+                }
+            })?;
+        }
+        ExecutorError::Failed { code, message, .. } => {
+            protocol::validate_tool_outcome_code(code).map_err(|_| {
+                RegistryError::InvalidExecutorDiagnostic {
+                    field: "failure code",
+                }
+            })?;
+            protocol::validate_tool_outcome_summary(message).map_err(|_| {
+                RegistryError::InvalidExecutorDiagnostic {
+                    field: "failure message",
+                }
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Deterministically identifies a logical run step. Retries must reuse it.
@@ -366,6 +425,58 @@ pub fn canonical_json(value: &Value) -> Vec<u8> {
     let mut output = Vec::new();
     write_canonical(value, &mut output);
     output
+}
+
+fn serialized_json_len_bounded(value: &Value, max_bytes: usize) -> Option<usize> {
+    fn add(total: &mut usize, amount: usize, max_bytes: usize) -> Option<()> {
+        *total = total.checked_add(amount)?;
+        (*total <= max_bytes).then_some(())
+    }
+
+    fn string_len(value: &str) -> Option<usize> {
+        let mut length = 2usize;
+        for character in value.chars() {
+            let encoded = match character {
+                '"' | '\\' | '\u{8}' | '\t' | '\n' | '\u{c}' | '\r' => 2,
+                character if character <= '\u{1f}' => 6,
+                character => character.len_utf8(),
+            };
+            length = length.checked_add(encoded)?;
+        }
+        Some(length)
+    }
+
+    let mut total = 0usize;
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Null => add(&mut total, 4, max_bytes)?,
+            Value::Bool(true) => add(&mut total, 4, max_bytes)?,
+            Value::Bool(false) => add(&mut total, 5, max_bytes)?,
+            Value::Number(number) => add(&mut total, number.to_string().len(), max_bytes)?,
+            Value::String(string) => add(&mut total, string_len(string)?, max_bytes)?,
+            Value::Array(values) => {
+                add(
+                    &mut total,
+                    2usize.checked_add(values.len().saturating_sub(1))?,
+                    max_bytes,
+                )?;
+                pending.extend(values);
+            }
+            Value::Object(values) => {
+                add(
+                    &mut total,
+                    2usize.checked_add(values.len().saturating_sub(1))?,
+                    max_bytes,
+                )?;
+                for (key, value) in values {
+                    add(&mut total, string_len(key)?.checked_add(1)?, max_bytes)?;
+                    pending.push(value);
+                }
+            }
+        }
+    }
+    Some(total)
 }
 
 /// SHA-256 binding used by approvals and persisted tool calls.
@@ -559,43 +670,76 @@ fn validate_parameter_value(
 }
 
 fn write_canonical(value: &Value, output: &mut Vec<u8>) {
-    match value {
-        Value::Null => output.extend_from_slice(b"null"),
-        Value::Bool(true) => output.extend_from_slice(b"true"),
-        Value::Bool(false) => output.extend_from_slice(b"false"),
-        Value::Number(number) => output.extend_from_slice(number.to_string().as_bytes()),
-        Value::String(string) => output.extend_from_slice(
-            serde_json::to_string(string)
-                .expect("serializing a JSON string cannot fail")
-                .as_bytes(),
-        ),
-        Value::Array(values) => {
-            output.push(b'[');
-            for (index, value) in values.iter().enumerate() {
-                if index != 0 {
-                    output.push(b',');
+    enum Token<'a> {
+        Value(&'a Value),
+        Byte(u8),
+        String(&'a str),
+    }
+
+    fn write_string(value: &str, output: &mut Vec<u8>) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        output.push(b'"');
+        for character in value.chars() {
+            match character {
+                '"' => output.extend_from_slice(br#"\""#),
+                '\\' => output.extend_from_slice(br#"\\"#),
+                '\u{8}' => output.extend_from_slice(br"\b"),
+                '\t' => output.extend_from_slice(br"\t"),
+                '\n' => output.extend_from_slice(br"\n"),
+                '\u{c}' => output.extend_from_slice(br"\f"),
+                '\r' => output.extend_from_slice(br"\r"),
+                character if character <= '\u{1f}' => {
+                    let byte = character as u8;
+                    output.extend_from_slice(br"\u00");
+                    output.push(HEX[(byte >> 4) as usize]);
+                    output.push(HEX[(byte & 0x0f) as usize]);
                 }
-                write_canonical(value, output);
+                character => {
+                    let mut encoded = [0u8; 4];
+                    output.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+                }
             }
-            output.push(b']');
         }
-        Value::Object(values) => {
-            output.push(b'{');
-            let mut entries = values.iter().collect::<Vec<_>>();
-            entries.sort_unstable_by_key(|(key, _)| *key);
-            for (index, (key, value)) in entries.into_iter().enumerate() {
-                if index != 0 {
-                    output.push(b',');
-                }
-                output.extend_from_slice(
-                    serde_json::to_string(key)
-                        .expect("serializing a JSON key cannot fail")
-                        .as_bytes(),
-                );
-                output.push(b':');
-                write_canonical(value, output);
+        output.push(b'"');
+    }
+
+    let mut pending = vec![Token::Value(value)];
+    while let Some(token) = pending.pop() {
+        match token {
+            Token::Byte(byte) => output.push(byte),
+            Token::String(string) => write_string(string, output),
+            Token::Value(Value::Null) => output.extend_from_slice(b"null"),
+            Token::Value(Value::Bool(true)) => output.extend_from_slice(b"true"),
+            Token::Value(Value::Bool(false)) => output.extend_from_slice(b"false"),
+            Token::Value(Value::Number(number)) => {
+                output.extend_from_slice(number.to_string().as_bytes());
             }
-            output.push(b'}');
+            Token::Value(Value::String(string)) => write_string(string, output),
+            Token::Value(Value::Array(values)) => {
+                output.push(b'[');
+                pending.push(Token::Byte(b']'));
+                for index in (0..values.len()).rev() {
+                    if index < values.len() - 1 {
+                        pending.push(Token::Byte(b','));
+                    }
+                    pending.push(Token::Value(&values[index]));
+                }
+            }
+            Token::Value(Value::Object(values)) => {
+                output.push(b'{');
+                pending.push(Token::Byte(b'}'));
+                let mut entries = values.iter().collect::<Vec<_>>();
+                entries.sort_unstable_by_key(|(key, _)| *key);
+                for index in (0..entries.len()).rev() {
+                    if index < entries.len() - 1 {
+                        pending.push(Token::Byte(b','));
+                    }
+                    let (key, value) = entries[index];
+                    pending.push(Token::Value(value));
+                    pending.push(Token::Byte(b':'));
+                    pending.push(Token::String(key));
+                }
+            }
         }
     }
 }
@@ -629,6 +773,16 @@ mod tests {
             effect: ToolEffect::ReadOnly,
             sandbox_profile: SandboxProfile::ReadOnly,
             executor_status: ToolExecutorStatus::Available,
+        }
+    }
+
+    #[derive(Clone)]
+    struct FailingExecutor(ExecutorError);
+
+    impl ToolExecutor for FailingExecutor {
+        fn execute(&self, _request: ExecutionRequest) -> ExecutionFuture<'_> {
+            let error = self.0.clone();
+            Box::pin(async move { Err(error) })
         }
     }
 
@@ -746,5 +900,152 @@ mod tests {
             error,
             RegistryError::Executor(ExecutorError::Unavailable { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn executor_output_is_bounded_before_digest_or_persistence() {
+        let exact = RecordingExecutor::new(Value::String(
+            "x".repeat(TOOL_OUTPUT_MAX_SERIALIZED_BYTES - 2),
+        ));
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(descriptor("exact.query"), exact.clone())
+            .unwrap();
+        registry
+            .dispatch(
+                call("exact.query", json!({"query": "safe"})),
+                "local-development",
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact.calls().len(), 1);
+
+        let oversized = RecordingExecutor::new(Value::String(
+            "x".repeat(TOOL_OUTPUT_MAX_SERIALIZED_BYTES - 1),
+        ));
+        registry
+            .register(descriptor("large.query"), oversized.clone())
+            .unwrap();
+        assert_eq!(
+            registry
+                .dispatch(
+                    call("large.query", json!({"query": "safe"})),
+                    "local-development",
+                )
+                .await,
+            Err(RegistryError::ExecutorOutputTooLarge {
+                limit_bytes: TOOL_OUTPUT_MAX_SERIALIZED_BYTES,
+            })
+        );
+        assert_eq!(oversized.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn executor_diagnostics_are_bounded_after_invocation() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(
+                descriptor("bad.query"),
+                FailingExecutor(ExecutorError::Failed {
+                    code: "executor_failed".into(),
+                    message: "x".repeat(protocol::TOOL_OUTCOME_SUMMARY_MAX_BYTES + 1),
+                    retryable: false,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            registry
+                .dispatch(
+                    call("bad.query", json!({"query": "safe"})),
+                    "local-development",
+                )
+                .await,
+            Err(RegistryError::InvalidExecutorDiagnostic {
+                field: "failure message",
+            })
+        );
+
+        registry
+            .register(
+                descriptor("bad-code.query"),
+                FailingExecutor(ExecutorError::Failed {
+                    code: "x".repeat(protocol::TOOL_OUTCOME_CODE_MAX_BYTES + 1),
+                    message: "bounded failure".into(),
+                    retryable: false,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            registry
+                .dispatch(
+                    call("bad-code.query", json!({"query": "safe"})),
+                    "local-development",
+                )
+                .await,
+            Err(RegistryError::InvalidExecutorDiagnostic {
+                field: "failure code",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_request_id_is_bounded_and_ascii_graphic() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let exact = RecordingExecutor {
+            calls: Arc::clone(&calls),
+            output: ToolOutput {
+                value: json!({"ok": true}),
+                replayed: false,
+                provider_request_id: Some("x".repeat(PROVIDER_REQUEST_ID_MAX_BYTES)),
+            },
+        };
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(descriptor("request-id.query"), exact)
+            .unwrap();
+        registry
+            .dispatch(
+                call("request-id.query", json!({"query": "safe"})),
+                "local-development",
+            )
+            .await
+            .unwrap();
+
+        let oversized = RecordingExecutor {
+            calls,
+            output: ToolOutput {
+                value: json!({"ok": true}),
+                replayed: false,
+                provider_request_id: Some("x".repeat(PROVIDER_REQUEST_ID_MAX_BYTES + 1)),
+            },
+        };
+        registry
+            .register(descriptor("large-request-id.query"), oversized)
+            .unwrap();
+        assert_eq!(
+            registry
+                .dispatch(
+                    call("large-request-id.query", json!({"query": "safe"})),
+                    "local-development",
+                )
+                .await,
+            Err(RegistryError::InvalidExecutorOutput {
+                field: "provider_request_id",
+            })
+        );
+    }
+
+    #[test]
+    fn iterative_json_length_matches_compact_serde_for_escape_heavy_values() {
+        let value = json!({
+            "quote\"": ["\0\n\\\"", true, false, null, 123],
+            "unicode": "界🙂",
+        });
+        let expected = serde_json::to_vec(&value).unwrap().len();
+        assert_eq!(
+            serialized_json_len_bounded(&value, expected),
+            Some(expected)
+        );
+        assert_eq!(serialized_json_len_bounded(&value, expected - 1), None);
     }
 }

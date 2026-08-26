@@ -175,7 +175,9 @@ exactly-once 语义。
   tenant/account scope、DB/WAL/disk 应急余量和 bootstrap audit retention，不能仅因数据面
   已隔离就开放。
 - auth JSON 明确限制为 8 KiB、command JSON 为 512 KiB；新建 Session/turn ID、title、
-  user message、review note 与严格幂等键分别按 UTF-8 bytes 设置硬上限。新 Session event
+  user/assistant message、review note 与严格幂等键分别按 UTF-8 bytes 设置硬上限。typed
+  reply response 为 512 KiB，compact tool output 与 dispatch arguments JSON 为 64 KiB，
+  provider/model/finish/code/digest 和 diagnostic 也分别具有 128 bytes/4 KiB 固定边界。新 Session event
   使用有界 ledger-local ID；pre-v9 durable reference 继续可寻址。共享纯校验在相关 API、
   runtime、storage 入口的 fingerprint 和 receipt 前执行，超限不得产生持久副作用。
 - bootstrap/login 的 fixed-window limiter 在 Argon2 前一次锁内完成 prune/check/charge；默认只认
@@ -199,6 +201,9 @@ exactly-once 语义。
 - 未知工具、缺失策略、重复/冲突规则、effect 或 environment 不匹配：默认拒绝。
 - Approval 只能解除 `require_approval`，不能覆盖显式 deny。
 - dispatch 前用同一 policy revision 和不可绕过 guard 再检查一次。
+- dispatch admission 在 `BEGIN IMMEDIATE` 内重新读取 bound runtime identity 与 durable
+  `ToolCallRequested`，严格比对 policy、tool/version/effect、arguments/digest 和 sandbox；
+  任何不匹配都在 projection、receipt、job 与 reservation 写入前失败，不能形成永久阻塞队首。
 - SQLite schema v4 增加 Session ledger；v5 增加用户、认证会话、偏好和 write-once owner；
   v6 把命令 receipt 主键迁移为 actor scope；v7 增加 immutable、forward-only reply job。
   v8 为 dispatch 持久化 approving actor，并增加 Session/Run/reply/receipt owner 一致性 trigger
@@ -222,6 +227,8 @@ exactly-once 语义。
   这些槽不等于 payload byte、SQLite 主库、WAL 或宿主磁盘保证。
 - OpenAI-compatible reply endpoint 默认只接受 HTTPS 或 loopback HTTP，禁止 redirect，限制连接/
   总超时和响应体；queued job 绑定 endpoint/model/limits 的非秘密配置 digest，API key 不入 ledger。
+- provider assistant 或 executor output/diagnostic 超过终端字段边界时，runtime 使用固定、脱敏、
+  有界 failure 一次性结算；原始超限载荷不进入 event、reply/dispatch job，也不会自动重试。
 - sandbox 或 executor 不可用：写入 `NotDispatched`，禁止回退到宿主机裸执行。
 - `production-guarded` profile 即使 owner 已认证，仍因真实生产 connector 缺失而保持执行禁用。
 - `dev.marker.write` 仅在 `local-development` profile 注册，只能在服务端固定目录写服务器生成的
@@ -286,16 +293,17 @@ exactly-once 语义。
 - 请求或状态错误按 400/401/403/404/409/413/415/422/429 返回 problem details；内部执行不变量返回脱敏的
   `500 runtime_unavailable`；storage/config/registry 不可用返回脱敏的
   `503 runtime_unavailable`。内部错误只写服务端日志。
-- 本地 Alpha+ 已按 UTF-8 bytes 限制 Session ID/title/message/review note 与幂等键；SSE
+- 本地 Alpha+ 已按 UTF-8 bytes 限制 Session ID/title/user+assistant message/review note、
+  typed reply/tool terminal payload 与幂等键；SSE
   replay 已在 storage 层分页，future cursor 对已授权资源返回 `409`，foreign resource 仍为
   `404`。审批、派发、reply completion、attachment 和启动恢复已改为 typed point query 或
   固定 64 行 batch；Session list/detail 与 Run detail/overview 也已改为 indexed bounded read
-  model。SQLite row/active/event-slot quota 已落地；对外或多租户部署前仍必须完成 byte/
-  physical capacity guarantee 与完整 audit retention。
+  model。SQLite row/active/event-slot quota 已落地；对外或多租户部署前仍必须完成 aggregate
+  event-payload byte reservation、physical capacity guarantee 与完整 audit retention。
 - Web 保持紧凑时间线、一个内联审批卡和一个 composer；支持真实 New Session、活动 Session
   刷新恢复、owner 设置/退出和 system/light/dark。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化结果是 213 个 Rust 测试和 25 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化结果是 229 个 Rust 测试和 25 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
 Apple `container` 的 Alpha 基线验收属于提交 `9a89706`。Bounded Read Models 的已推送

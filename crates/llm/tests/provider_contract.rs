@@ -292,6 +292,35 @@ async fn openai_compatible_refuses_oversized_response_before_json_parsing() {
 }
 
 #[tokio::test]
+async fn openai_compatible_rejects_oversized_content_inside_a_bounded_http_body() {
+    let response = serde_json::json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "x".repeat(protocol::ASSISTANT_MESSAGE_MAX_BYTES + 1),
+            },
+            "finish_reason": "stop",
+        }]
+    });
+    let mock = spawn_mock(
+        "200 OK",
+        &[("Content-Type", "application/json".to_owned())],
+        serde_json::to_vec(&response).unwrap(),
+        Duration::ZERO,
+    )
+    .await;
+    let provider =
+        OpenAiCompatibleProvider::new(&mock.endpoint, "mock-model", "test-api-key").unwrap();
+
+    assert_eq!(
+        provider.reply(request_with_secret("private prompt")).await,
+        Err(ProviderError::TerminalPayloadTooLarge {
+            limit_bytes: protocol::ASSISTANT_MESSAGE_MAX_BYTES,
+        })
+    );
+}
+
+#[tokio::test]
 async fn openai_compatible_never_follows_redirects() {
     let mut target = spawn_mock(
         "200 OK",

@@ -1768,10 +1768,23 @@ fn registry_error_outcome(error: RegistryError) -> ToolOutcome {
             NotDispatchedReason::PolicyChanged,
             "The registered tool contract no longer matches the approved call.",
         ),
-        RegistryError::Executor(ExecutorError::Unavailable { reason }) => ToolOutcome::Failed {
-            summary: format!(
-                "The executor was invoked after the checkpoint but reported unavailable: {reason}"
-            ),
+        RegistryError::ExecutorOutputTooLarge { .. } => ToolOutcome::Failed {
+            summary: "The executor returned a result larger than the allowed inline envelope."
+                .into(),
+            error_code: Some("executor_output_too_large".into()),
+        },
+        RegistryError::InvalidExecutorOutput { .. } => ToolOutcome::Failed {
+            summary: "The executor returned output that does not satisfy the durable contract."
+                .into(),
+            error_code: Some("executor_output_invalid".into()),
+        },
+        RegistryError::InvalidExecutorDiagnostic { .. } => ToolOutcome::Failed {
+            summary: "The executor returned an invalid or oversized failure diagnostic.".into(),
+            error_code: Some("executor_diagnostic_invalid".into()),
+        },
+        RegistryError::Executor(ExecutorError::Unavailable { .. }) => ToolOutcome::Failed {
+            summary: "The executor was invoked after the checkpoint but reported unavailable."
+                .into(),
             error_code: Some("executor_unavailable_after_dispatch".into()),
         },
         RegistryError::Executor(ExecutorError::Failed { code, message, .. }) => {
@@ -1784,10 +1797,13 @@ fn registry_error_outcome(error: RegistryError) -> ToolOutcome {
 }
 
 fn not_dispatched(reason: NotDispatchedReason, summary: impl Into<String>) -> ToolOutcome {
-    ToolOutcome::NotDispatched {
-        reason,
-        summary: summary.into(),
-    }
+    let summary = summary.into();
+    let summary = if protocol::validate_tool_outcome_summary(&summary).is_ok() {
+        summary
+    } else {
+        "The tool was not dispatched because a bounded diagnostic was unavailable.".into()
+    };
+    ToolOutcome::NotDispatched { reason, summary }
 }
 
 fn next_sequence(sequence: u64) -> Result<u64, StoreError> {
@@ -1833,13 +1849,8 @@ fn validate_user_message_value(value: &str, field: &'static str) -> Result<(), S
 }
 
 fn validate_session_message(value: &str, field: &'static str) -> Result<(), StoreError> {
-    if value.trim().is_empty() {
-        Err(StoreError::InvalidSessionRequest(format!(
-            "{field} cannot be empty"
-        )))
-    } else {
-        Ok(())
-    }
+    protocol::validate_assistant_message(value)
+        .map_err(|error| invalid_resource_envelope(field, error))
 }
 
 fn validate_review_request_value(request: &ReviewRequest) -> Result<(), StoreError> {
@@ -1907,6 +1918,7 @@ mod tests {
     };
     use rusqlite::{Connection, params};
     use storage::DispatchStatus;
+    use tools::{RecordingExecutor, TOOL_OUTPUT_MAX_SERIALIZED_BYTES};
 
     use super::*;
 
@@ -2042,7 +2054,8 @@ mod tests {
             PRODUCTION_POLICY_REVISION,
             "runtime-session-isolation-queue",
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(queued.status, DispatchStatus::Queued);
         assert_eq!(queued.attempt, 0);
         // Make an accidental `kick_dispatcher` observable without draining the
@@ -2888,6 +2901,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_executor_output_settles_once_without_persisting_the_payload() {
+        let paths = TestPaths::new("local-oversized-output");
+        let mut store = local_store(&paths, false).await;
+        let descriptor = store
+            .registry
+            .descriptor(connectors::DEV_MARKER_TOOL_NAME)
+            .unwrap()
+            .clone();
+        let payload_marker = "SECRET-EXECUTOR-OVERSIZE";
+        let executor = RecordingExecutor::new(serde_json::json!({
+            "payload": format!(
+                "{payload_marker}{}",
+                "x".repeat(TOOL_OUTPUT_MAX_SERIALIZED_BYTES)
+            ),
+        }));
+        let calls = executor.clone();
+        let mut registry = ToolRegistry::new();
+        registry.register(descriptor, executor).unwrap();
+        store.registry = Arc::new(registry);
+
+        let approved = store
+            .review_for_actor(
+                TEST_OWNER_ID,
+                LOCAL_DEMO_RUN_ID,
+                "APR-DEV-1",
+                approval_request(ReviewDecision::Approve),
+                "local-oversized-output-review",
+            )
+            .await
+            .unwrap();
+        assert_eq!(approved.run.status, RunStatus::Queued);
+
+        store.dispatch_pending().await.unwrap();
+        assert_eq!(calls.calls().len(), 1);
+        let detail = store.run_detail(LOCAL_DEMO_RUN_ID).await.unwrap();
+        assert_eq!(detail.run.status, RunStatus::Failed);
+        assert!(matches!(
+            detail.events.last().and_then(|event| event.data.as_ref()),
+            Some(RunEventData::ToolResult {
+                outcome: ToolOutcome::Failed {
+                    summary,
+                    error_code: Some(error_code),
+                },
+                status: ToolCallStatus::Failed,
+                ..
+            }) if summary == "The executor returned a result larger than the allowed inline envelope."
+                && error_code == "executor_output_too_large"
+        ));
+        let job = store
+            .storage
+            .dispatch_job(LOCAL_MARKER_CALL_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, DispatchStatus::Finished);
+        assert_eq!(job.attempt, 1);
+        assert!(
+            !serde_json::to_string(&detail)
+                .unwrap()
+                .contains(payload_marker)
+        );
+        assert!(
+            !job.result_json
+                .as_ref()
+                .is_some_and(|value| value.to_string().contains(payload_marker))
+        );
+
+        store.dispatch_pending().await.unwrap();
+        assert_eq!(calls.calls().len(), 1, "terminal jobs must never retry");
+    }
+
+    #[tokio::test]
     async fn execution_point_queries_do_not_decode_unrelated_history() {
         let paths = TestPaths::new("point-query-history");
         let store = local_store(&paths, false).await;
@@ -3236,54 +3321,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mismatched_queued_job_is_rejected_before_claim() {
+    async fn mismatched_policy_id_is_rejected_before_dispatch_admission() {
         let store = production_store(false).await;
-        let job = enqueue_job_with_identity(
+        let error = enqueue_job_with_identity(
             &store,
             "local-development",
             PRODUCTION_POLICY_REVISION,
             "wrong-policy-id",
         )
-        .await;
-
-        let error = store.dispatch_pending().await.unwrap_err();
-        assert!(matches!(error, StoreError::ExecutionInvariant(_)));
-        let unchanged = store
-            .storage
-            .dispatch_job(&job.call_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(unchanged.status, DispatchStatus::Queued);
-        assert_eq!(unchanged.attempt, 0);
-        assert_eq!(store.current_run().await.unwrap().status, RunStatus::Queued);
+        .await
+        .unwrap_err();
+        assert!(matches!(error, StorageError::InvalidDispatchTransition(_)));
+        assert!(
+            store
+                .storage
+                .dispatch_job(PRODUCTION_DEMO_CALL_ID)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.current_run().await.unwrap().status,
+            RunStatus::WaitingForApproval
+        );
     }
 
     #[tokio::test]
-    async fn mismatched_started_job_is_rejected_before_recovery() {
+    async fn mismatched_policy_revision_is_rejected_before_dispatch_admission() {
         let store = production_store(false).await;
-        let job = enqueue_job_with_identity(
+        let error = enqueue_job_with_identity(
             &store,
             PRODUCTION_POLICY_ID,
             "production-guarded/v0",
             "wrong-policy-revision",
         )
-        .await;
-        claim_job_directly(&store, &job).await;
-
-        let error = store.recover_started_dispatches().await.unwrap_err();
-        assert!(matches!(error, StoreError::ExecutionInvariant(_)));
-        let unchanged = store
-            .storage
-            .dispatch_job(&job.call_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(unchanged.status, DispatchStatus::Started);
-        assert_eq!(unchanged.attempt, 1);
+        .await
+        .unwrap_err();
+        assert!(matches!(error, StorageError::InvalidDispatchTransition(_)));
+        assert!(
+            store
+                .storage
+                .dispatch_job(PRODUCTION_DEMO_CALL_ID)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             store.current_run().await.unwrap().status,
-            RunStatus::Running
+            RunStatus::WaitingForApproval
         );
     }
 
@@ -3292,7 +3377,7 @@ mod tests {
         policy_id: &str,
         policy_revision: &str,
         idempotency_key: &str,
-    ) -> DispatchJob {
+    ) -> Result<DispatchJob, StorageError> {
         let context = store
             .storage
             .review_context(protocol::DEMO_RUN_ID, "APR-901")
@@ -3343,45 +3428,13 @@ mod tests {
                     }),
                 },
             )
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(outcome, CommitOutcome::Committed);
-        store
+        Ok(store
             .storage
             .dispatch_job(&call.call_id)
-            .await
-            .unwrap()
-            .unwrap()
-    }
-
-    async fn claim_job_directly(store: &DemoStore, job: &DispatchJob) {
-        let context = store.storage.dispatch_context(job).await.unwrap();
-        let (call, approval) = bindings_for_job(&context, job).unwrap();
-        let expected_sequence = context.snapshot.run.sequence;
-        let transition = start_tool_dispatch(
-            &context.snapshot.run,
-            &approval,
-            &call,
-            "identity-guard-test",
-            next_sequence(expected_sequence).unwrap(),
-            now(),
-        )
-        .unwrap();
-        let mut snapshot = context.snapshot;
-        snapshot.run = transition.run;
-        assert!(matches!(
-            store
-                .storage
-                .claim_next_dispatch(DispatchStartCommit {
-                    call_id: job.call_id.clone(),
-                    expected_sequence,
-                    snapshot,
-                    event: transition.event,
-                })
-                .await
-                .unwrap(),
-            ClaimOutcome::Claimed(_)
-        ));
+            .await?
+            .expect("committed dispatch job must be readable"))
     }
 
     async fn production_store(auto_dispatch: bool) -> DemoStore {

@@ -24,7 +24,7 @@ use axum::{
 };
 use llm::{
     LocalFallbackProvider, ProviderError, ReplyKind, ReplyMessage, ReplyProvider, ReplyRequest,
-    ReplyRole,
+    ReplyRole, validate_provider_metadata, validate_reply_response,
 };
 use protocol::{
     AccountRole, AccountStatus, AccountUser, AssistantReplyKind, AssistantReplyProvenance,
@@ -924,14 +924,15 @@ async fn patch_preferences(
         ThemePreference::Light => "light",
         ThemePreference::Dark => "dark",
     };
-    let preferred_model = request
-        .preferred_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty());
-    if preferred_model.is_some()
-        && preferred_model != reply_executor(&state)?.provider.metadata().model.as_deref()
-    {
+    let preferred_model = request.preferred_model.as_deref();
+    if let Some(preferred_model) = preferred_model {
+        protocol::validate_reply_model_id(preferred_model).map_err(|error| {
+            ApiError::bad_request("unsupported_model", format!("The preferred model {error}"))
+        })?;
+    }
+    let metadata = reply_executor(&state)?.provider.metadata();
+    validate_provider_metadata(metadata).map_err(ApiError::reply_unavailable)?;
+    if preferred_model.is_some() && preferred_model != metadata.model.as_deref() {
         return Err(ApiError::bad_request(
             "unsupported_model",
             "The preferred model must match the server-configured provider model",
@@ -1246,6 +1247,15 @@ async fn process_reply_job(state: &ApiState, job: ReplyJob) -> Result<(), StoreE
         .as_ref()
         .expect("a claimed reply requires a configured provider");
     let metadata = reply.provider.metadata();
+    if validate_provider_metadata(metadata).is_err() {
+        return fail_reply_job(
+            state,
+            &job,
+            "provider_configuration_invalid",
+            "The configured reply provider exceeds the durable resource envelope",
+        )
+        .await;
+    }
     if job.provider_name != metadata.provider_id || job.model_name != metadata.model {
         return fail_reply_job(
             state,
@@ -1285,14 +1295,28 @@ async fn process_reply_job(state: &ApiState, job: ReplyJob) -> Result<(), StoreE
                     state,
                     &job,
                     provider_error_code(&error),
-                    &error.to_string(),
+                    provider_error_message(&error),
                 )
                 .await;
             }
-            return fail_reply_job(state, &job, provider_error_code(&error), &error.to_string())
-                .await;
+            return fail_reply_job(
+                state,
+                &job,
+                provider_error_code(&error),
+                provider_error_message(&error),
+            )
+            .await;
         }
     };
+    if let Err(error) = validate_reply_response(&response) {
+        return fail_reply_job(
+            state,
+            &job,
+            provider_error_code(&error),
+            provider_error_message(&error),
+        )
+        .await;
+    }
     if &response.provider != metadata {
         return fail_reply_job(
             state,
@@ -1408,7 +1432,25 @@ fn provider_error_code(error: &ProviderError) -> &'static str {
         ProviderError::Transport => "provider_transport_failed",
         ProviderError::HttpStatus { .. } => "provider_http_error",
         ProviderError::ResponseTooLarge { .. } => "provider_response_too_large",
+        ProviderError::TerminalPayloadTooLarge { .. } => "provider_reply_too_large",
         ProviderError::InvalidResponse => "provider_response_invalid",
+    }
+}
+
+fn provider_error_message(error: &ProviderError) -> &'static str {
+    match error {
+        ProviderError::InvalidConfiguration(_) => "The reply provider configuration is invalid",
+        ProviderError::InvalidRequest(_) => "The reply provider rejected the request contract",
+        ProviderError::Timeout => "The reply provider request timed out",
+        ProviderError::Transport => "The reply provider transport failed",
+        ProviderError::HttpStatus { .. } => "The reply provider returned an HTTP error",
+        ProviderError::ResponseTooLarge { .. } => {
+            "The reply provider HTTP response exceeded its byte limit"
+        }
+        ProviderError::TerminalPayloadTooLarge { .. } => {
+            "The reply provider output exceeded the durable terminal limit"
+        }
+        ProviderError::InvalidResponse => "The reply provider returned an invalid response",
     }
 }
 
@@ -1529,6 +1571,7 @@ async fn start_turn(
     validate_start_turn_envelope(&request)?;
     let reply = reply_executor(&state)?;
     let metadata = reply.provider.metadata();
+    validate_provider_metadata(metadata).map_err(ApiError::reply_unavailable)?;
     let reply_request = ReplyRequest::new([ReplyMessage::new(
         ReplyRole::User,
         request.user_message.clone(),
@@ -2260,6 +2303,18 @@ impl ApiError {
             "Authentication is unavailable",
             "The authentication subsystem could not process the request safely",
         )
+        .with_no_store()
+    }
+
+    fn reply_unavailable(error: ProviderError) -> Self {
+        eprintln!("zeus reply provider configuration failed closed: {error}");
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "reply_provider_unavailable",
+            "Reply provider is unavailable",
+            "The reply provider configuration cannot be persisted safely",
+        )
+        .with_no_store()
     }
 
     fn rate_limited(code: &'static str, title: &'static str, retry_after: Duration) -> Self {
@@ -2345,6 +2400,7 @@ impl ApiError {
             "Service is unavailable",
             detail,
         )
+        .with_no_store()
     }
 
     fn with_no_store(mut self) -> Self {
@@ -2369,6 +2425,7 @@ impl ApiError {
             "Runtime is unavailable",
             "The runtime could not process the request safely",
         )
+        .with_no_store()
     }
 
     fn unavailable(error: &StoreError) -> Self {
@@ -2379,6 +2436,7 @@ impl ApiError {
             "Runtime is unavailable",
             "The runtime is temporarily unavailable",
         )
+        .with_no_store()
     }
 }
 
@@ -2543,7 +2601,7 @@ mod tests {
         http::{Request, header},
     };
     use http_body_util::BodyExt;
-    use llm::{ProviderMetadata, ReplyFuture};
+    use llm::{ProviderMetadata, ReplyFuture, ReplyResponse};
     use protocol::{
         CreateSessionResponse, DEMO_RUN_ID, FlushSessionResponse, OverviewResponse, ReviewDecision,
         ReviewRequest, ReviewResponse, SessionDetail, SessionStatus, SessionSummary,
@@ -3138,6 +3196,42 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    struct OversizedReplyProvider {
+        metadata: ProviderMetadata,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl OversizedReplyProvider {
+        fn new(calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                metadata: ProviderMetadata {
+                    provider_id: "test-oversized-provider".into(),
+                    model: Some("test-model".into()),
+                    reply_kind: ReplyKind::Model,
+                },
+                calls,
+            }
+        }
+    }
+
+    impl ReplyProvider for OversizedReplyProvider {
+        fn metadata(&self) -> &ProviderMetadata {
+            &self.metadata
+        }
+
+        fn reply(&self, _request: ReplyRequest) -> ReplyFuture<'_> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let provider = self.metadata.clone();
+            Box::pin(async move {
+                Ok(ReplyResponse {
+                    content: "x".repeat(protocol::ASSISTANT_MESSAGE_MAX_BYTES + 1),
+                    finish_reason: Some("stop".into()),
+                    provider,
+                })
+            })
+        }
+    }
+
     impl CountingProvider {
         fn new(calls: Arc<AtomicUsize>) -> Self {
             Self {
@@ -3316,6 +3410,92 @@ mod tests {
             protocol::SessionEventData::TurnInterrupted { reason, .. }
                 if reason == "assistant reply provider failed"
         ));
+    }
+
+    #[tokio::test]
+    async fn oversized_custom_provider_reply_settles_once_as_a_bounded_failure() {
+        let store = DemoStore::seeded().await.unwrap();
+        let identity = provision_test_owner(&store, "user-owner", "owner").await;
+        let session_id = "session-oversized-provider-reply";
+        let turn_id = "turn-oversized-provider-reply";
+        let job_id = "reply-oversized-provider-reply";
+        store
+            .create_session_for_actor(
+                &identity.user_id,
+                CreateSessionRequest {
+                    id: session_id.into(),
+                    title: "Oversized provider reply".into(),
+                },
+                "create-oversized-provider-reply",
+            )
+            .await
+            .unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn ReplyProvider> =
+            Arc::new(OversizedReplyProvider::new(Arc::clone(&calls)));
+        let metadata = provider.metadata().clone();
+        store
+            .start_turn_and_enqueue_reply_for_actor(
+                &identity.user_id,
+                session_id,
+                StartTurnRequest {
+                    turn_id: turn_id.into(),
+                    user_message: "Return a bounded reply".into(),
+                    expected_sequence: 1,
+                },
+                "start-oversized-provider-reply",
+                ReplyJobSpec {
+                    id: job_id.into(),
+                    actor_user_id: identity.user_id.clone(),
+                    provider_name: metadata.provider_id,
+                    model_name: metadata.model,
+                    request_json: serde_json::to_value(ReplyRequest::new([ReplyMessage::new(
+                        ReplyRole::User,
+                        "Return a bounded reply",
+                    )]))
+                    .unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        let ReplyClaimOutcome::Claimed(job) = store.claim_next_reply().await.unwrap() else {
+            panic!("the reply must be claimable");
+        };
+        let state = ApiState {
+            store: store.clone(),
+            durable_ledger_poll_interval: DURABLE_LEDGER_POLL_INTERVAL,
+            broadcast_hints_enabled: false,
+            auth: None,
+            reply: Some(Arc::new(ReplyExecutor {
+                provider,
+                drain: Mutex::new(()),
+            })),
+            sse_capacity: SseCapacity::production(),
+        };
+
+        process_reply_job(&state, *job).await.unwrap();
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let stored = store.reply_job(job_id).await.unwrap().unwrap();
+        assert_eq!(stored.status, runtime::ReplyJobStatus::Failed);
+        let error = stored.error_json.unwrap();
+        assert_eq!(error["code"], "provider_reply_too_large");
+        assert!(
+            error["message"].as_str().unwrap().len() <= protocol::REPLY_ERROR_MESSAGE_MAX_BYTES
+        );
+        let detail = store.get_session(session_id).await.unwrap();
+        assert_eq!(detail.session.status, SessionStatus::NeedsAttention);
+        assert!(detail.turns[0].assistant_message.is_none());
+        assert!(detail.events.iter().all(|event| !matches!(
+            &event.data,
+            protocol::SessionEventData::AssistantMessage { .. }
+        )));
+        assert!(matches!(
+            store.claim_next_reply().await.unwrap(),
+            ReplyClaimOutcome::NotAvailable
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

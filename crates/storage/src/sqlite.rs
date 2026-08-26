@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     ffi::OsString,
     fs::{self, File, OpenOptions},
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -53,6 +54,15 @@ const MIGRATION_0009: &str = include_str!("../migrations/0009_point_queries.sql"
 const MIGRATION_0010: &str = include_str!("../migrations/0010_capacity.sql");
 const RECOVERY_BATCH_LIMIT: i64 = 64;
 const AUTH_SESSION_CLEANUP_BATCH_LIMIT: i64 = 64;
+const REPLY_JOB_ID_MAX_BYTES: usize = 384;
+const REPLY_REQUEST_JSON_MAX_BYTES: usize = 512 * 1024;
+const REPLY_RESPONSE_JSON_MAX_BYTES: usize = 512 * 1024;
+const REPLY_ERROR_JSON_MAX_BYTES: usize = 32 * 1024;
+const DISPATCH_CALL_ID_MAX_BYTES: usize = 160;
+const DISPATCH_IDENTIFIER_MAX_BYTES: usize = 128;
+const DISPATCH_TOOL_NAME_MAX_BYTES: usize = 96;
+const DISPATCH_TOOL_VERSION_MAX_BYTES: usize = 64;
+const DISPATCH_ARGS_JSON_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct SqliteStore {
@@ -4472,6 +4482,11 @@ fn complete_reply_success(
     normalized_reply_value(&commit.job_id, "reply job ID")?;
     validate_message(&commit.assistant_message, "assistant message")?;
     validate_reply_provenance(&commit.provenance)?;
+    validate_reply_success_json(
+        &commit.response_json,
+        &commit.assistant_message,
+        &commit.provenance,
+    )?;
     let fingerprint = reply_completion_fingerprint("succeeded", &commit)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let job = query_reply_job(&transaction, &commit.job_id)?;
@@ -4584,6 +4599,7 @@ fn complete_reply_failure(
     commit: ReplyFailureCommit,
 ) -> Result<ReplyCompletion, StorageError> {
     normalized_reply_value(&commit.job_id, "reply job ID")?;
+    validate_reply_error_json(&commit.error_json, "reply failure JSON")?;
     let fingerprint = reply_completion_fingerprint("failed", &commit)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let job = query_reply_job(&transaction, &commit.job_id)?;
@@ -4611,6 +4627,7 @@ fn complete_reply_outcome_unknown(
     commit: ReplyOutcomeUnknownCommit,
 ) -> Result<ReplyCompletion, StorageError> {
     normalized_reply_value(&commit.job_id, "reply job ID")?;
+    validate_reply_error_json(&commit.error_json, "reply outcome-unknown JSON")?;
     let fingerprint = reply_completion_fingerprint("outcome_unknown", &commit)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let job = query_reply_job(&transaction, &commit.job_id)?;
@@ -5926,13 +5943,8 @@ fn validate_review_note_value(value: &str, field: &'static str) -> Result<(), St
 }
 
 fn validate_message(value: &str, field: &'static str) -> Result<(), StorageError> {
-    if value.trim().is_empty() {
-        Err(StorageError::InvalidSessionTransition(format!(
-            "{field} cannot be empty"
-        )))
-    } else {
-        Ok(())
-    }
+    protocol::validate_assistant_message(value)
+        .map_err(|error| StorageError::InvalidSessionTransition(format!("{field} {error}")))
 }
 
 fn invalid_resource_envelope(field: &'static str, error: ResourceEnvelopeError) -> StorageError {
@@ -5941,20 +5953,171 @@ fn invalid_resource_envelope(field: &'static str, error: ResourceEnvelopeError) 
 
 fn validate_reply_job_spec(job: &ReplyJobSpec) -> Result<(), StorageError> {
     normalized_reply_value(&job.id, "reply job ID")?;
-    normalized_account_value(&job.actor_user_id, "reply actor user ID", 128)?;
-    normalized_reply_value(&job.provider_name, "reply provider name")?;
-    if let Some(model_name) = &job.model_name {
-        normalized_reply_value(model_name, "reply model name")?;
+    if job.id.len() > REPLY_JOB_ID_MAX_BYTES {
+        return Err(StorageError::InvalidReplyTransition(format!(
+            "reply job ID cannot exceed {REPLY_JOB_ID_MAX_BYTES} UTF-8 bytes"
+        )));
     }
+    normalized_account_value(&job.actor_user_id, "reply actor user ID", 128)?;
+    protocol::validate_reply_provider_id(&job.provider_name)
+        .map_err(|error| invalid_resource_envelope("reply provider name", error))?;
+    if let Some(model_name) = &job.model_name {
+        protocol::validate_reply_model_id(model_name)
+            .map_err(|error| invalid_resource_envelope("reply model name", error))?;
+    }
+    validate_reply_json(
+        &job.request_json,
+        "reply request JSON",
+        REPLY_REQUEST_JSON_MAX_BYTES,
+    )?;
     Ok(())
 }
 
 fn validate_reply_provenance(provenance: &AssistantReplyProvenance) -> Result<(), StorageError> {
-    normalized_reply_value(&provenance.provider_id, "assistant reply provider ID")?;
+    protocol::validate_reply_provider_id(&provenance.provider_id)
+        .map_err(|error| invalid_resource_envelope("assistant reply provider ID", error))?;
     if let Some(model) = &provenance.model {
-        normalized_reply_value(model, "assistant reply model")?;
+        protocol::validate_reply_model_id(model)
+            .map_err(|error| invalid_resource_envelope("assistant reply model", error))?;
+    }
+    if !matches!(
+        (&provenance.reply_kind, &provenance.model),
+        (protocol::AssistantReplyKind::Model, Some(_))
+            | (protocol::AssistantReplyKind::NonModelFallback, None)
+    ) {
+        return Err(StorageError::InvalidReplyTransition(
+            "model provenance must declare a model and non-model provenance must omit it".into(),
+        ));
     }
     Ok(())
+}
+
+fn validate_reply_success_json(
+    value: &Value,
+    assistant_message: &str,
+    provenance: &AssistantReplyProvenance,
+) -> Result<(), StorageError> {
+    validate_reply_json(value, "reply response JSON", REPLY_RESPONSE_JSON_MAX_BYTES)?;
+    let object = value.as_object().expect("validated as an object");
+    if object.len() != 3
+        || object.get("content").and_then(Value::as_str) != Some(assistant_message)
+        || !object.contains_key("finish_reason")
+    {
+        return Err(StorageError::InvalidReplyTransition(
+            "reply response JSON must match the assistant message and typed response shape".into(),
+        ));
+    }
+    match object.get("finish_reason") {
+        Some(Value::Null) => {}
+        Some(Value::String(reason)) => protocol::validate_reply_finish_reason(reason)
+            .map_err(|error| invalid_resource_envelope("reply finish reason", error))?,
+        _ => {
+            return Err(StorageError::InvalidReplyTransition(
+                "reply finish reason must be a string or null".into(),
+            ));
+        }
+    }
+
+    let provider = object
+        .get("provider")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            StorageError::InvalidReplyTransition(
+                "reply response JSON must contain typed provider metadata".into(),
+            )
+        })?;
+    let expected_kind = match provenance.reply_kind {
+        protocol::AssistantReplyKind::Model => "model",
+        protocol::AssistantReplyKind::NonModelFallback => "non_model_fallback",
+    };
+    let model_matches = match (&provenance.model, provider.get("model")) {
+        (Some(expected), Some(Value::String(actual))) => expected == actual,
+        (None, Some(Value::Null)) => true,
+        _ => false,
+    };
+    if provider.len() != 3
+        || provider.get("provider_id").and_then(Value::as_str)
+            != Some(provenance.provider_id.as_str())
+        || provider.get("reply_kind").and_then(Value::as_str) != Some(expected_kind)
+        || !model_matches
+    {
+        return Err(StorageError::InvalidReplyTransition(
+            "reply response provider metadata must match durable provenance".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_reply_error_json(value: &Value, field: &'static str) -> Result<(), StorageError> {
+    validate_reply_json(value, field, REPLY_ERROR_JSON_MAX_BYTES)?;
+    let object = value.as_object().expect("validated as an object");
+    let code = object.get("code").and_then(Value::as_str);
+    let message = object.get("message").and_then(Value::as_str);
+    if object.len() != 2 || code.is_none() || message.is_none() {
+        return Err(StorageError::InvalidReplyTransition(format!(
+            "{field} must contain only string code and message fields"
+        )));
+    }
+    protocol::validate_reply_error_code(code.expect("checked above"))
+        .map_err(|error| invalid_resource_envelope("reply error code", error))?;
+    protocol::validate_reply_error_message(message.expect("checked above"))
+        .map_err(|error| invalid_resource_envelope("reply error message", error))?;
+    Ok(())
+}
+
+fn validate_reply_json(
+    value: &Value,
+    field: &'static str,
+    max_bytes: usize,
+) -> Result<(), StorageError> {
+    if !value.is_object() {
+        return Err(StorageError::InvalidReplyTransition(format!(
+            "{field} must be a JSON object"
+        )));
+    }
+    let mut writer = BoundedJsonWriter::new(max_bytes);
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => Ok(()),
+        Err(_) if writer.exceeded => Err(StorageError::InvalidReplyTransition(format!(
+            "{field} cannot exceed {max_bytes} serialized bytes"
+        ))),
+        Err(error) => Err(StorageError::Json(error)),
+    }
+}
+
+struct BoundedJsonWriter {
+    written: usize,
+    max_bytes: usize,
+    exceeded: bool,
+}
+
+impl BoundedJsonWriter {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            written: 0,
+            max_bytes,
+            exceeded: false,
+        }
+    }
+}
+
+impl Write for BoundedJsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let Some(next) = self.written.checked_add(bytes.len()) else {
+            self.exceeded = true;
+            return Err(io::Error::other("serialized JSON size overflow"));
+        };
+        if next > self.max_bytes {
+            self.exceeded = true;
+            return Err(io::Error::other("serialized JSON exceeds its limit"));
+        }
+        self.written = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn normalized_reply_value<'a>(
@@ -6968,6 +7131,15 @@ fn commit_review(
         return Ok(CommitOutcome::Replayed(Box::new(receipt)));
     }
 
+    if let Some(dispatch) = &commit.dispatch {
+        validate_dispatch_admission_binding(
+            &transaction,
+            &commit.snapshot.run.id,
+            commit.event.sequence,
+            dispatch,
+        )?;
+    }
+
     let scope_id = run_scope_id(&transaction, &commit.snapshot.run.id)?;
     if commit.dispatch.is_some() {
         require_dispatch_queue_capacity(&transaction, &scope_id, limits)?;
@@ -7172,6 +7344,7 @@ fn claim_next_dispatch(
             "queue head does not match the supplied run projection".into(),
         ));
     }
+    validate_canonical_dispatch_start(&transaction, &job, &commit)?;
     match commit.event.data.as_ref() {
         Some(RunEventData::ToolDispatchStarted {
             call_id,
@@ -7419,6 +7592,7 @@ fn complete_dispatch(
             "only the matching started dispatch may be completed".into(),
         ));
     }
+    validate_canonical_dispatch_completion(&transaction, &job, &commit)?;
     require_dispatch_finalization_slots(&transaction, &job.run_id, &job.call_id, 1)?;
     match commit.event.data.as_ref() {
         Some(RunEventData::ToolResult {
@@ -7753,21 +7927,290 @@ fn validate_commit(commit: &ReviewCommit) -> Result<(), StorageError> {
 }
 
 fn validate_dispatch_spec(job: &DispatchJobSpec) -> Result<(), StorageError> {
-    validated_durable_reference(&job.call_id, "call ID")?;
-    validated_durable_reference(&job.approval_id, "approval ID")?;
-    for (value, field) in [
-        (&job.approving_actor_user_id, "approving actor user ID"),
-        (&job.tool_name, "tool name"),
-        (&job.tool_version, "tool version"),
-        (&job.args_digest, "argument digest"),
-        (&job.policy_id, "policy ID"),
-        (&job.policy_revision, "policy revision"),
-    ] {
-        normalized_identifier(value, field)?;
-    }
+    validate_new_dispatch_text(&job.call_id, "call ID", DISPATCH_CALL_ID_MAX_BYTES)?;
+    validate_new_dispatch_text(
+        &job.approval_id,
+        "approval ID",
+        DISPATCH_IDENTIFIER_MAX_BYTES,
+    )?;
+    validate_new_dispatch_text(
+        &job.approving_actor_user_id,
+        "approving actor user ID",
+        DISPATCH_IDENTIFIER_MAX_BYTES,
+    )?;
+    validate_new_dispatch_tool_name(&job.tool_name)?;
+    validate_new_dispatch_id_component(
+        &job.tool_version,
+        "tool version",
+        DISPATCH_TOOL_VERSION_MAX_BYTES,
+    )?;
+    validate_sha256_digest(&job.args_digest)?;
+    validate_new_dispatch_text(&job.policy_id, "policy ID", DISPATCH_IDENTIFIER_MAX_BYTES)?;
+    validate_new_dispatch_text(
+        &job.policy_revision,
+        "policy revision",
+        DISPATCH_IDENTIFIER_MAX_BYTES,
+    )?;
     if !job.args_json.is_object() {
         return Err(StorageError::InvalidDispatchTransition(
             "tool arguments must be a JSON object".into(),
+        ));
+    }
+    let mut writer = BoundedJsonWriter::new(DISPATCH_ARGS_JSON_MAX_BYTES);
+    match serde_json::to_writer(&mut writer, &job.args_json) {
+        Ok(()) => {}
+        Err(_) if writer.exceeded => {
+            return Err(StorageError::InvalidDispatchTransition(format!(
+                "tool arguments cannot exceed {DISPATCH_ARGS_JSON_MAX_BYTES} serialized bytes"
+            )));
+        }
+        Err(error) => return Err(StorageError::Json(error)),
+    }
+    Ok(())
+}
+
+fn validate_dispatch_admission_binding(
+    connection: &Connection,
+    run_id: &str,
+    approval_event_sequence: u64,
+    job: &DispatchJobSpec,
+) -> Result<(), StorageError> {
+    let runtime_identity = connection
+        .query_row(
+            r#"SELECT primary_run_id, policy_id, policy_revision
+               FROM runtime_identity WHERE singleton = 1"#,
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((primary_run_id, policy_id, policy_revision)) = runtime_identity
+        && (run_id != primary_run_id
+            || job.policy_id != policy_id
+            || job.policy_revision != policy_revision)
+    {
+        return Err(StorageError::InvalidDispatchTransition(
+            "dispatch policy must match the bound runtime identity".into(),
+        ));
+    }
+
+    let (call_sequence, call) = query_requested_call(connection, run_id, &job.call_id)?
+        .ok_or_else(|| {
+            StorageError::InvalidDispatchTransition(
+                "dispatch requires an earlier durable requested tool call".into(),
+            )
+        })?;
+    if call_sequence >= approval_event_sequence {
+        return Err(StorageError::InvalidDispatchTransition(
+            "dispatch approval must follow its durable requested tool call".into(),
+        ));
+    }
+    if job.tool_name != call.tool
+        || job.tool_version != call.tool_version
+        || job.effect != call.effect
+        || job.args_json != call.arguments
+        || job.args_digest != call.arguments_digest
+        || job.sandbox_profile != call.sandbox_profile
+    {
+        return Err(StorageError::InvalidDispatchTransition(
+            "dispatch must exactly match its durable requested tool call".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_new_dispatch_text(
+    value: &str,
+    field: &'static str,
+    max_bytes: usize,
+) -> Result<(), StorageError> {
+    if value.is_empty()
+        || value.trim() != value
+        || value.len() > max_bytes
+        || value.chars().any(char::is_control)
+    {
+        return Err(StorageError::InvalidDispatchTransition(format!(
+            "{field} must be canonical, control-free, and at most {max_bytes} UTF-8 bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_new_dispatch_id_component(
+    value: &str,
+    field: &'static str,
+    max_bytes: usize,
+) -> Result<(), StorageError> {
+    validate_new_dispatch_text(value, field, max_bytes)?;
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(StorageError::InvalidDispatchTransition(format!(
+            "{field} contains unsupported characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_new_dispatch_tool_name(value: &str) -> Result<(), StorageError> {
+    validate_new_dispatch_text(value, "tool name", DISPATCH_TOOL_NAME_MAX_BYTES)?;
+    if value.starts_with('.')
+        || value.ends_with('.')
+        || value.split('.').any(str::is_empty)
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+    {
+        return Err(StorageError::InvalidDispatchTransition(
+            "tool name must use lowercase ASCII segments separated by dots".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sha256_digest(value: &str) -> Result<(), StorageError> {
+    let valid = value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    });
+    if !valid {
+        return Err(StorageError::InvalidDispatchTransition(
+            "argument digest must be canonical lowercase SHA-256".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_canonical_dispatch_start(
+    connection: &Connection,
+    job: &DispatchJob,
+    commit: &DispatchStartCommit,
+) -> Result<(), StorageError> {
+    let current = canonical_dispatch_context(connection, job, commit.expected_sequence)?;
+    let executor = match commit.event.data.as_ref() {
+        Some(RunEventData::ToolDispatchStarted { executor, .. }) => executor,
+        _ => {
+            return Err(StorageError::InvalidDispatchTransition(
+                "dispatch start event is missing typed executor data".into(),
+            ));
+        }
+    };
+    validate_dispatch_timestamp(&commit.event.at)?;
+    let transition = kernel::start_tool_dispatch(
+        &current.snapshot.run,
+        &current.approval,
+        &current.call,
+        executor.clone(),
+        commit.event.sequence,
+        commit.event.at.clone(),
+    )
+    .map_err(|_| {
+        StorageError::InvalidDispatchTransition(
+            "dispatch start does not satisfy the canonical kernel transition".into(),
+        )
+    })?;
+    let mut expected_snapshot = current.snapshot;
+    expected_snapshot.run = transition.run;
+    if commit.snapshot != expected_snapshot || commit.event != transition.event {
+        return Err(StorageError::InvalidDispatchTransition(
+            "dispatch start projection and event must equal the canonical transition".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_canonical_dispatch_completion(
+    connection: &Connection,
+    job: &DispatchJob,
+    commit: &DispatchCompleteCommit,
+) -> Result<(), StorageError> {
+    let current = canonical_dispatch_context(connection, job, commit.expected_sequence)?;
+    let outcome: ToolOutcome =
+        serde_json::from_value(commit.result_json.clone()).map_err(|_| {
+            StorageError::InvalidDispatchTransition(
+                "dispatch result JSON must contain a typed tool outcome".into(),
+            )
+        })?;
+    outcome.validate_resource_envelope().map_err(|error| {
+        StorageError::InvalidDispatchTransition(format!(
+            "dispatch result exceeds the durable resource envelope: {error}"
+        ))
+    })?;
+    validate_dispatch_timestamp(&commit.event.at)?;
+    let transition = kernel::apply_tool_result(
+        &current.snapshot.run,
+        &current.call,
+        outcome,
+        commit.event.sequence,
+        commit.event.at.clone(),
+    )
+    .map_err(|_| {
+        StorageError::InvalidDispatchTransition(
+            "dispatch result does not satisfy the canonical kernel transition".into(),
+        )
+    })?;
+    let mut expected_snapshot = current.snapshot;
+    expected_snapshot.run = transition.run;
+    if commit.snapshot != expected_snapshot || commit.event != transition.event {
+        return Err(StorageError::InvalidDispatchTransition(
+            "dispatch result projection and event must equal the canonical transition".into(),
+        ));
+    }
+    Ok(())
+}
+
+struct CanonicalDispatchContext {
+    snapshot: RunSnapshot,
+    approval: protocol::Approval,
+    call: protocol::ToolCall,
+}
+
+fn canonical_dispatch_context(
+    connection: &Connection,
+    job: &DispatchJob,
+    expected_sequence: u64,
+) -> Result<CanonicalDispatchContext, StorageError> {
+    let snapshot = query_snapshot(connection, &job.run_id)?;
+    validate_run_event_tail(connection, &snapshot)?;
+    if snapshot.run.sequence != expected_sequence {
+        return Err(StorageError::ConcurrentModification);
+    }
+    let approval_event = query_run_event_at(
+        connection,
+        &job.run_id,
+        u64_to_i64(job.approval_event_sequence, "approval event sequence")?,
+    )?;
+    validate_dispatch_approval_event(&approval_event, &job.approval_id, &job.call_id)?;
+    let (_, call) =
+        query_requested_call(connection, &job.run_id, &job.call_id)?.ok_or_else(|| {
+            StorageError::CorruptData("dispatch job has no requested-call event".into())
+        })?;
+    validate_dispatch_job_binding(job, &snapshot, &approval_event, &call)?;
+    let approval = approval_event.approval.ok_or_else(|| {
+        StorageError::CorruptData("dispatch approval event lost its approval binding".into())
+    })?;
+    Ok(CanonicalDispatchContext {
+        snapshot,
+        approval,
+        call,
+    })
+}
+
+fn validate_dispatch_timestamp(value: &str) -> Result<(), StorageError> {
+    if value.len() > 64
+        || value.trim() != value
+        || chrono::DateTime::parse_from_rfc3339(value).is_err()
+    {
+        return Err(StorageError::InvalidDispatchTransition(
+            "dispatch event timestamp must be bounded RFC 3339".into(),
         ));
     }
     Ok(())

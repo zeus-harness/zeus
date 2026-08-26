@@ -23,6 +23,25 @@ pub const RESOURCE_ID_MAX_BYTES: usize = 128;
 pub const SESSION_TITLE_MAX_BYTES: usize = 256;
 /// Maximum UTF-8 byte length of one user-authored Session message.
 pub const USER_MESSAGE_MAX_BYTES: usize = 64 * 1024;
+/// Maximum UTF-8 byte length of one durable assistant message.
+///
+/// Terminal reply reservation uses this hard envelope rather than assuming an
+/// HTTP response-body limit equals the bytes duplicated across durable rows.
+pub const ASSISTANT_MESSAGE_MAX_BYTES: usize = 64 * 1024;
+/// Maximum UTF-8 byte length of a durable reply provider identifier.
+pub const REPLY_PROVIDER_ID_MAX_BYTES: usize = 128;
+/// Maximum UTF-8 byte length of a durable reply model identifier.
+pub const REPLY_MODEL_ID_MAX_BYTES: usize = 128;
+/// Maximum UTF-8 byte length of a durable provider finish reason.
+pub const REPLY_FINISH_REASON_MAX_BYTES: usize = 128;
+/// Maximum byte length of a durable reply failure code.
+pub const REPLY_ERROR_CODE_MAX_BYTES: usize = 128;
+/// Maximum UTF-8 byte length of a durable reply failure message.
+pub const REPLY_ERROR_MESSAGE_MAX_BYTES: usize = 4 * 1024;
+/// Maximum UTF-8 byte length of a durable tool-outcome summary.
+pub const TOOL_OUTCOME_SUMMARY_MAX_BYTES: usize = 4 * 1024;
+/// Maximum byte length of a durable tool error code or output digest.
+pub const TOOL_OUTCOME_CODE_MAX_BYTES: usize = 128;
 /// Maximum UTF-8 byte length of an approval review note.
 pub const REVIEW_NOTE_MAX_BYTES: usize = 8 * 1024;
 /// Maximum byte length of an idempotency key.
@@ -106,6 +125,84 @@ pub fn validate_user_message(value: &str) -> Result<(), ResourceEnvelopeError> {
     Ok(())
 }
 
+/// Validates a non-blank assistant message before it crosses the durable
+/// terminal boundary.
+pub fn validate_assistant_message(value: &str) -> Result<(), ResourceEnvelopeError> {
+    if value.len() > ASSISTANT_MESSAGE_MAX_BYTES {
+        return Err(ResourceEnvelopeError::TooLong {
+            max_bytes: ASSISTANT_MESSAGE_MAX_BYTES,
+        });
+    }
+    if value.trim().is_empty() {
+        return Err(ResourceEnvelopeError::Blank);
+    }
+    Ok(())
+}
+
+/// Validates the stable, secret-free provider identifier copied into jobs and
+/// assistant-message provenance.
+pub fn validate_reply_provider_id(value: &str) -> Result<(), ResourceEnvelopeError> {
+    validate_canonical_bounded(value, REPLY_PROVIDER_ID_MAX_BYTES)?;
+    if value.chars().any(char::is_control) {
+        return Err(ResourceEnvelopeError::ContainsControl);
+    }
+    Ok(())
+}
+
+/// Validates a model identifier copied into durable reply provenance.
+pub fn validate_reply_model_id(value: &str) -> Result<(), ResourceEnvelopeError> {
+    validate_canonical_bounded(value, REPLY_MODEL_ID_MAX_BYTES)?;
+    if value.chars().any(char::is_control) {
+        return Err(ResourceEnvelopeError::ContainsControl);
+    }
+    Ok(())
+}
+
+/// Validates a provider finish reason copied into the typed reply receipt.
+pub fn validate_reply_finish_reason(value: &str) -> Result<(), ResourceEnvelopeError> {
+    validate_canonical_bounded(value, REPLY_FINISH_REASON_MAX_BYTES)?;
+    if value.chars().any(char::is_control) {
+        return Err(ResourceEnvelopeError::ContainsControl);
+    }
+    Ok(())
+}
+
+/// Validates a compact ASCII reply failure code.
+pub fn validate_reply_error_code(value: &str) -> Result<(), ResourceEnvelopeError> {
+    validate_ascii_graphic_bounded(value, REPLY_ERROR_CODE_MAX_BYTES)
+}
+
+/// Validates a non-blank diagnostic admitted to a durable reply failure.
+pub fn validate_reply_error_message(value: &str) -> Result<(), ResourceEnvelopeError> {
+    if value.len() > REPLY_ERROR_MESSAGE_MAX_BYTES {
+        return Err(ResourceEnvelopeError::TooLong {
+            max_bytes: REPLY_ERROR_MESSAGE_MAX_BYTES,
+        });
+    }
+    if value.trim().is_empty() {
+        return Err(ResourceEnvelopeError::Blank);
+    }
+    Ok(())
+}
+
+/// Validates a non-blank terminal tool summary without altering its contents.
+pub fn validate_tool_outcome_summary(value: &str) -> Result<(), ResourceEnvelopeError> {
+    if value.len() > TOOL_OUTCOME_SUMMARY_MAX_BYTES {
+        return Err(ResourceEnvelopeError::TooLong {
+            max_bytes: TOOL_OUTCOME_SUMMARY_MAX_BYTES,
+        });
+    }
+    if value.trim().is_empty() {
+        return Err(ResourceEnvelopeError::Blank);
+    }
+    Ok(())
+}
+
+/// Validates a compact ASCII code or digest copied into a tool outcome.
+pub fn validate_tool_outcome_code(value: &str) -> Result<(), ResourceEnvelopeError> {
+    validate_ascii_graphic_bounded(value, TOOL_OUTCOME_CODE_MAX_BYTES)
+}
+
 /// Validates an optional review note's contents without trimming or otherwise
 /// normalizing it. Empty notes remain compatible with the existing protocol.
 pub fn validate_review_note(value: &str) -> Result<(), ResourceEnvelopeError> {
@@ -147,6 +244,22 @@ fn validate_canonical_bounded(value: &str, max_bytes: usize) -> Result<(), Resou
     }
     if value.trim() != value {
         return Err(ResourceEnvelopeError::NotCanonical);
+    }
+    Ok(())
+}
+
+fn validate_ascii_graphic_bounded(
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), ResourceEnvelopeError> {
+    if value.is_empty() {
+        return Err(ResourceEnvelopeError::Empty);
+    }
+    if value.len() > max_bytes {
+        return Err(ResourceEnvelopeError::TooLong { max_bytes });
+    }
+    if !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(ResourceEnvelopeError::NotAsciiGraphic);
     }
     Ok(())
 }
@@ -475,6 +588,34 @@ impl ToolOutcome {
             Self::NotDispatched { .. } => ToolCallStatus::NotDispatched,
             Self::OutcomeUnknown { .. } => ToolCallStatus::OutcomeUnknown,
         }
+    }
+
+    /// Validates every string copied into the durable Run ledger.
+    pub fn validate_resource_envelope(&self) -> Result<(), ResourceEnvelopeError> {
+        let summary = match self {
+            Self::Succeeded {
+                summary,
+                output_digest,
+            } => {
+                if let Some(output_digest) = output_digest {
+                    validate_tool_outcome_code(output_digest)?;
+                }
+                summary
+            }
+            Self::Failed {
+                summary,
+                error_code,
+            } => {
+                if let Some(error_code) = error_code {
+                    validate_tool_outcome_code(error_code)?;
+                }
+                summary
+            }
+            Self::Cancelled { summary }
+            | Self::NotDispatched { summary, .. }
+            | Self::OutcomeUnknown { summary } => summary,
+        };
+        validate_tool_outcome_summary(summary)
     }
 }
 
@@ -955,6 +1096,24 @@ mod tests {
             })
         );
 
+        assert!(validate_assistant_message(&"🙂".repeat(ASSISTANT_MESSAGE_MAX_BYTES / 4)).is_ok());
+        assert_eq!(
+            validate_assistant_message(&"🙂".repeat(ASSISTANT_MESSAGE_MAX_BYTES / 4 + 1)),
+            Err(ResourceEnvelopeError::TooLong {
+                max_bytes: ASSISTANT_MESSAGE_MAX_BYTES,
+            })
+        );
+
+        assert!(
+            validate_tool_outcome_summary(&"🙂".repeat(TOOL_OUTCOME_SUMMARY_MAX_BYTES / 4)).is_ok()
+        );
+        assert_eq!(
+            validate_tool_outcome_summary(&"🙂".repeat(TOOL_OUTCOME_SUMMARY_MAX_BYTES / 4 + 1)),
+            Err(ResourceEnvelopeError::TooLong {
+                max_bytes: TOOL_OUTCOME_SUMMARY_MAX_BYTES,
+            })
+        );
+
         assert!(validate_review_note(&"🙂".repeat(REVIEW_NOTE_MAX_BYTES / 4)).is_ok());
         assert_eq!(
             validate_review_note(&"🙂".repeat(REVIEW_NOTE_MAX_BYTES / 4 + 1)),
@@ -979,6 +1138,113 @@ mod tests {
             Err(ResourceEnvelopeError::ContainsControl)
         );
         assert!(validate_session_title("Normal title 🙂").is_ok());
+    }
+
+    #[test]
+    fn reply_provenance_and_tool_codes_are_canonical_and_bounded() {
+        assert!(validate_reply_provider_id(&"p".repeat(REPLY_PROVIDER_ID_MAX_BYTES)).is_ok());
+        assert!(validate_reply_model_id(&"m".repeat(REPLY_MODEL_ID_MAX_BYTES)).is_ok());
+        assert_eq!(
+            validate_reply_provider_id(&"p".repeat(REPLY_PROVIDER_ID_MAX_BYTES + 1)),
+            Err(ResourceEnvelopeError::TooLong {
+                max_bytes: REPLY_PROVIDER_ID_MAX_BYTES,
+            })
+        );
+        assert_eq!(
+            validate_reply_model_id(" model "),
+            Err(ResourceEnvelopeError::NotCanonical)
+        );
+        assert_eq!(
+            validate_reply_model_id("model\nname"),
+            Err(ResourceEnvelopeError::ContainsControl)
+        );
+        assert!(validate_reply_finish_reason(&"f".repeat(REPLY_FINISH_REASON_MAX_BYTES)).is_ok());
+        assert_eq!(
+            validate_reply_finish_reason(&"f".repeat(REPLY_FINISH_REASON_MAX_BYTES + 1)),
+            Err(ResourceEnvelopeError::TooLong {
+                max_bytes: REPLY_FINISH_REASON_MAX_BYTES,
+            })
+        );
+        assert!(validate_reply_error_code(&"e".repeat(REPLY_ERROR_CODE_MAX_BYTES)).is_ok());
+        assert_eq!(
+            validate_reply_error_code(&"e".repeat(REPLY_ERROR_CODE_MAX_BYTES + 1)),
+            Err(ResourceEnvelopeError::TooLong {
+                max_bytes: REPLY_ERROR_CODE_MAX_BYTES,
+            })
+        );
+        assert!(validate_reply_error_message(&"m".repeat(REPLY_ERROR_MESSAGE_MAX_BYTES)).is_ok());
+        assert_eq!(
+            validate_reply_error_message(&"m".repeat(REPLY_ERROR_MESSAGE_MAX_BYTES + 1)),
+            Err(ResourceEnvelopeError::TooLong {
+                max_bytes: REPLY_ERROR_MESSAGE_MAX_BYTES,
+            })
+        );
+
+        assert!(validate_tool_outcome_code(&"x".repeat(TOOL_OUTCOME_CODE_MAX_BYTES)).is_ok());
+        assert_eq!(
+            validate_tool_outcome_code(&"x".repeat(TOOL_OUTCOME_CODE_MAX_BYTES + 1)),
+            Err(ResourceEnvelopeError::TooLong {
+                max_bytes: TOOL_OUTCOME_CODE_MAX_BYTES,
+            })
+        );
+        for rejected in ["", "two words", "line\n", "clé"] {
+            assert!(validate_tool_outcome_code(rejected).is_err());
+        }
+    }
+
+    #[test]
+    fn every_tool_outcome_variant_enforces_the_terminal_envelope() {
+        let summary = "x".repeat(TOOL_OUTCOME_SUMMARY_MAX_BYTES);
+        for valid in [
+            ToolOutcome::Succeeded {
+                summary: summary.clone(),
+                output_digest: Some("sha256:output".into()),
+            },
+            ToolOutcome::Failed {
+                summary: summary.clone(),
+                error_code: Some("executor_failed".into()),
+            },
+            ToolOutcome::Cancelled {
+                summary: summary.clone(),
+            },
+            ToolOutcome::NotDispatched {
+                reason: NotDispatchedReason::PolicyDenied,
+                summary: summary.clone(),
+            },
+            ToolOutcome::OutcomeUnknown {
+                summary: summary.clone(),
+            },
+        ] {
+            assert!(valid.validate_resource_envelope().is_ok());
+        }
+
+        let oversized = ToolOutcome::OutcomeUnknown {
+            summary: "x".repeat(TOOL_OUTCOME_SUMMARY_MAX_BYTES + 1),
+        };
+        assert_eq!(
+            oversized.validate_resource_envelope(),
+            Err(ResourceEnvelopeError::TooLong {
+                max_bytes: TOOL_OUTCOME_SUMMARY_MAX_BYTES,
+            })
+        );
+
+        for invalid_code in [
+            ToolOutcome::Succeeded {
+                summary: "bounded".into(),
+                output_digest: Some("x".repeat(TOOL_OUTCOME_CODE_MAX_BYTES + 1)),
+            },
+            ToolOutcome::Failed {
+                summary: "bounded".into(),
+                error_code: Some("x".repeat(TOOL_OUTCOME_CODE_MAX_BYTES + 1)),
+            },
+        ] {
+            assert_eq!(
+                invalid_code.validate_resource_envelope(),
+                Err(ResourceEnvelopeError::TooLong {
+                    max_bytes: TOOL_OUTCOME_CODE_MAX_BYTES,
+                })
+            );
+        }
     }
 
     #[test]

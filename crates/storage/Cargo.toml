@@ -13,6 +13,7 @@ publish.workspace = true
 base64.workspace = true
 chrono.workspace = true
 fs2.workspace = true
+kernel.workspace = true
 protocol.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

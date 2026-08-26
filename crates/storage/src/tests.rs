@@ -17,7 +17,7 @@ use protocol::{
     ToolCall, ToolCallStatus, ToolEffect, ToolExecutorStatus, ToolOutcome, ToolPolicySummary,
 };
 use rusqlite::{OptionalExtension, params};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::{
     AuthSessionCommit, BootstrapOwnerCommit, ClaimOutcome, CommitOutcome, DispatchCompleteCommit,
@@ -2171,7 +2171,7 @@ async fn reply_start_is_atomic_actor_scoped_and_success_is_idempotent() {
             model: Some("test-model".into()),
             reply_kind: AssistantReplyKind::Model,
         },
-        response_json: json!({"id": "provider-response-1", "model": "test-model"}),
+        response_json: model_reply_json("The evidence is durable and internally consistent."),
     };
     assert!(matches!(
         store
@@ -2218,7 +2218,7 @@ async fn reply_start_is_atomic_actor_scoped_and_success_is_idempotent() {
     assert!(replay.replayed);
     assert_eq!(replay.events, completed.events);
     let mut conflicting = commit;
-    conflicting.response_json = json!({"id": "different"});
+    conflicting.response_json["finish_reason"] = json!("length");
     assert!(matches!(
         store.complete_reply_success(conflicting).await,
         Err(StorageError::IdempotencyConflict)
@@ -3591,7 +3591,10 @@ async fn reply_failure_commits_interruption_and_replays_without_duplicate_events
     let commit = ReplyFailureCommit {
         job_id: "reply-failure".into(),
         expected_sequence: 2,
-        error_json: json!({"code": "provider_unauthorized"}),
+        error_json: json!({
+            "code": "provider_unauthorized",
+            "message": "The reply provider rejected the request",
+        }),
     };
     let failed = store.complete_reply_failure(commit.clone()).await.unwrap();
     assert_eq!(failed.job.status, ReplyJobStatus::Failed);
@@ -3606,7 +3609,10 @@ async fn reply_failure_commits_interruption_and_replays_without_duplicate_events
             .replayed
     );
     let mut conflicting = commit;
-    conflicting.error_json = json!({"code": "different"});
+    conflicting.error_json = json!({
+        "code": "different",
+        "message": "The reply provider rejected the request",
+    });
     assert!(matches!(
         store.complete_reply_failure(conflicting).await,
         Err(StorageError::IdempotencyConflict)
@@ -3645,7 +3651,10 @@ async fn reply_outcome_unknown_commits_once_and_is_never_claimable_again() {
     let commit = ReplyOutcomeUnknownCommit {
         job_id: "reply-unknown".into(),
         expected_sequence: 2,
-        error_json: json!({"code": "provider_timeout"}),
+        error_json: json!({
+            "code": "provider_timeout",
+            "message": "The reply provider request timed out",
+        }),
     };
 
     let unknown = store
@@ -3670,7 +3679,10 @@ async fn reply_outcome_unknown_commits_once_and_is_never_claimable_again() {
             .replayed
     );
     let mut conflicting = commit;
-    conflicting.error_json = json!({"code": "provider_transport_failed"});
+    conflicting.error_json = json!({
+        "code": "provider_transport_failed",
+        "message": "The reply provider transport failed",
+    });
     assert!(matches!(
         store.complete_reply_outcome_unknown(conflicting).await,
         Err(StorageError::IdempotencyConflict)
@@ -3678,6 +3690,162 @@ async fn reply_outcome_unknown_commits_once_and_is_never_claimable_again() {
     assert!(matches!(
         store.claim_next_reply().await.unwrap(),
         ReplyClaimOutcome::NotAvailable
+    ));
+}
+
+#[tokio::test]
+async fn reply_terminal_envelope_rejects_before_any_completion_mutation() {
+    let store = created_owned_session_store().await;
+    store
+        .start_turn_and_enqueue_reply(
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-reply-envelope".into(),
+                user_message: "Enforce the terminal envelope".into(),
+                expected_sequence: 1,
+            },
+            "start-reply-envelope",
+            reply_job_spec("reply-envelope", "turn-reply-envelope"),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.claim_next_reply().await.unwrap(),
+        ReplyClaimOutcome::Claimed(_)
+    ));
+
+    let mut mismatched = ReplySuccessCommit {
+        job_id: "reply-envelope".into(),
+        expected_sequence: 2,
+        assistant_message: "Bounded assistant output".into(),
+        provenance: AssistantReplyProvenance {
+            provider_id: "test-provider".into(),
+            model: Some("test-model".into()),
+            reply_kind: AssistantReplyKind::Model,
+        },
+        response_json: model_reply_json("Different assistant output"),
+    };
+    assert!(matches!(
+        store.complete_reply_success(mismatched.clone()).await,
+        Err(StorageError::InvalidReplyTransition(_))
+    ));
+
+    mismatched.assistant_message = "x".repeat(protocol::ASSISTANT_MESSAGE_MAX_BYTES + 1);
+    mismatched.response_json = model_reply_json(&mismatched.assistant_message);
+    assert!(matches!(
+        store.complete_reply_success(mismatched).await,
+        Err(StorageError::InvalidSessionTransition(_))
+    ));
+
+    let mut invalid_provenance = ReplySuccessCommit {
+        job_id: "reply-envelope".into(),
+        expected_sequence: 2,
+        assistant_message: "Bounded assistant output".into(),
+        provenance: AssistantReplyProvenance {
+            provider_id: "test-provider".into(),
+            model: None,
+            reply_kind: AssistantReplyKind::Model,
+        },
+        response_json: model_reply_json("Bounded assistant output"),
+    };
+    invalid_provenance.response_json["provider"]["model"] = Value::Null;
+    assert!(matches!(
+        store.complete_reply_success(invalid_provenance).await,
+        Err(StorageError::InvalidReplyTransition(_))
+    ));
+
+    let invalid_non_model = ReplySuccessCommit {
+        job_id: "reply-envelope".into(),
+        expected_sequence: 2,
+        assistant_message: "Bounded assistant output".into(),
+        provenance: AssistantReplyProvenance {
+            provider_id: "test-provider".into(),
+            model: Some("test-model".into()),
+            reply_kind: AssistantReplyKind::NonModelFallback,
+        },
+        response_json: json!({
+            "content": "Bounded assistant output",
+            "finish_reason": "stop",
+            "provider": {
+                "provider_id": "test-provider",
+                "model": "test-model",
+                "reply_kind": "non_model_fallback",
+            },
+        }),
+    };
+    assert!(matches!(
+        store.complete_reply_success(invalid_non_model).await,
+        Err(StorageError::InvalidReplyTransition(_))
+    ));
+
+    assert!(matches!(
+        store
+            .complete_reply_failure(ReplyFailureCommit {
+                job_id: "reply-envelope".into(),
+                expected_sequence: 2,
+                error_json: json!({"code": "provider_failed"}),
+            })
+            .await,
+        Err(StorageError::InvalidReplyTransition(_))
+    ));
+    let job = store.reply_job("reply-envelope").await.unwrap().unwrap();
+    assert_eq!(job.status, ReplyJobStatus::Started);
+    assert!(job.response_json.is_none());
+    assert!(job.error_json.is_none());
+    let detail = store.get_session("session-alpha").await.unwrap();
+    assert_eq!(detail.session.sequence, 2);
+    assert_eq!(detail.turns[0].status, SessionTurnStatus::Open);
+}
+
+#[tokio::test]
+async fn non_model_reply_without_a_model_is_a_valid_terminal_provenance() {
+    let store = created_owned_session_store().await;
+    let mut job = reply_job_spec("reply-non-model", "turn-reply-non-model");
+    job.model_name = None;
+    store
+        .start_turn_and_enqueue_reply(
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-reply-non-model".into(),
+                user_message: "Use the bounded local fallback".into(),
+                expected_sequence: 1,
+            },
+            "start-reply-non-model",
+            job,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.claim_next_reply().await.unwrap(),
+        ReplyClaimOutcome::Claimed(_)
+    ));
+
+    let completion = store
+        .complete_reply_success(ReplySuccessCommit {
+            job_id: "reply-non-model".into(),
+            expected_sequence: 2,
+            assistant_message: "The local fallback completed safely.".into(),
+            provenance: AssistantReplyProvenance {
+                provider_id: "test-provider".into(),
+                model: None,
+                reply_kind: AssistantReplyKind::NonModelFallback,
+            },
+            response_json: json!({
+                "content": "The local fallback completed safely.",
+                "finish_reason": "stop",
+                "provider": {
+                    "provider_id": "test-provider",
+                    "model": null,
+                    "reply_kind": "non_model_fallback",
+                },
+            }),
+        })
+        .await
+        .unwrap();
+    assert_eq!(completion.job.status, ReplyJobStatus::Succeeded);
+    assert!(matches!(
+        completion.events[0].data,
+        SessionEventData::AssistantMessage { .. }
     ));
 }
 
@@ -3841,6 +4009,140 @@ async fn approval_projection_receipt_and_dispatch_enqueue_commit_atomically() {
 }
 
 #[tokio::test]
+async fn dispatch_admission_rejects_unclaimable_jobs_without_any_durable_side_effect() {
+    let database = TestDatabase::new();
+    let store = seeded_file_store(database.path()).await;
+    bootstrap_test_owner(&store).await;
+    store
+        .bind_runtime_identity(production_identity())
+        .await
+        .unwrap();
+    let (snapshot, _) = seed_fixture();
+    let before = store.load_run(RUN_ID).await.unwrap();
+
+    let mut valid = approved_dispatch_commit(&snapshot, "dispatch-admission-valid");
+    let dispatch = valid.dispatch.as_mut().unwrap();
+    dispatch.policy_id = "production-guarded".into();
+    dispatch.policy_revision = "production-guarded/v1".into();
+    valid.event.approval.as_mut().unwrap().policy_revision = Some(dispatch.policy_revision.clone());
+    valid.response.event = valid.event.clone();
+
+    let mut cases = Vec::new();
+
+    let mut wrong_policy = valid.clone();
+    wrong_policy.idempotency_key = "dispatch-admission-policy".into();
+    wrong_policy.dispatch.as_mut().unwrap().policy_id = "local-development".into();
+    cases.push(("wrong policy", wrong_policy));
+
+    let mut wrong_version = valid.clone();
+    wrong_version.idempotency_key = "dispatch-admission-version".into();
+    wrong_version.dispatch.as_mut().unwrap().tool_version = "2.0.0".into();
+    cases.push(("mismatched version", wrong_version));
+
+    let mut wrong_arguments = valid.clone();
+    wrong_arguments.idempotency_key = "dispatch-admission-arguments".into();
+    wrong_arguments.dispatch.as_mut().unwrap().args_json = json!({"message": "changed"});
+    cases.push(("mismatched arguments", wrong_arguments));
+
+    let mut wrong_effect = valid.clone();
+    wrong_effect.idempotency_key = "dispatch-admission-effect".into();
+    wrong_effect.dispatch.as_mut().unwrap().effect = ToolEffect::ProductionWrite;
+    cases.push(("mismatched effect", wrong_effect));
+
+    let mut wrong_sandbox = valid.clone();
+    wrong_sandbox.idempotency_key = "dispatch-admission-sandbox".into();
+    wrong_sandbox.dispatch.as_mut().unwrap().sandbox_profile = SandboxProfile::ReadOnly;
+    wrong_sandbox
+        .event
+        .approval
+        .as_mut()
+        .unwrap()
+        .sandbox_profile = Some(SandboxProfile::ReadOnly);
+    wrong_sandbox.response.event = wrong_sandbox.event.clone();
+    cases.push(("mismatched sandbox", wrong_sandbox));
+
+    let mut malformed_digest = valid.clone();
+    malformed_digest.idempotency_key = "dispatch-admission-digest".into();
+    malformed_digest.dispatch.as_mut().unwrap().args_digest = "sha256:not-a-digest".into();
+    malformed_digest
+        .event
+        .approval
+        .as_mut()
+        .unwrap()
+        .arguments_digest = Some("sha256:not-a-digest".into());
+    malformed_digest.response.event = malformed_digest.event.clone();
+    cases.push(("malformed digest", malformed_digest));
+
+    let mut invalid_tool_name = valid.clone();
+    invalid_tool_name.idempotency_key = "dispatch-admission-tool".into();
+    invalid_tool_name.dispatch.as_mut().unwrap().tool_name = "Invalid Tool".into();
+    invalid_tool_name.event.approval.as_mut().unwrap().tool = "Invalid Tool".into();
+    invalid_tool_name.response.event = invalid_tool_name.event.clone();
+    cases.push(("invalid tool name", invalid_tool_name));
+
+    let mut oversized_arguments = valid.clone();
+    oversized_arguments.idempotency_key = "dispatch-admission-size".into();
+    oversized_arguments.dispatch.as_mut().unwrap().args_json =
+        json!({"payload": "x".repeat(64 * 1024)});
+    cases.push(("oversized arguments", oversized_arguments));
+
+    let mut missing_call = valid.clone();
+    missing_call.idempotency_key = "dispatch-admission-missing-call".into();
+    missing_call.dispatch.as_mut().unwrap().call_id = "call-missing".into();
+    let approval = missing_call.event.approval.as_mut().unwrap();
+    approval.call_id = Some("call-missing".into());
+    let Some(RunEventData::ApprovalDecided { call_id, .. }) = missing_call.event.data.as_mut()
+    else {
+        panic!("dispatch fixture has typed approval data");
+    };
+    *call_id = "call-missing".into();
+    missing_call
+        .event
+        .metadata
+        .insert("call_id".into(), json!("call-missing"));
+    missing_call.response.event = missing_call.event.clone();
+    cases.push(("missing requested call", missing_call));
+
+    for (label, commit) in cases {
+        let key = commit.idempotency_key.clone();
+        let call_id = commit.dispatch.as_ref().unwrap().call_id.clone();
+        assert!(
+            matches!(
+                store.commit_review(commit).await,
+                Err(StorageError::InvalidDispatchTransition(_))
+            ),
+            "{label} must fail before admission"
+        );
+        assert_eq!(store.load_run(RUN_ID).await.unwrap(), before, "{label}");
+        assert!(
+            store.review_receipt(&key).await.unwrap().is_none(),
+            "{label}"
+        );
+        assert!(
+            store.dispatch_job(&call_id).await.unwrap().is_none(),
+            "{label}"
+        );
+        assert_eq!(
+            finalization_reservation_count(database.path()),
+            0,
+            "{label}"
+        );
+    }
+
+    assert_eq!(
+        store.commit_review(valid.clone()).await.unwrap(),
+        CommitOutcome::Committed
+    );
+    assert!(matches!(
+        store
+            .claim_next_dispatch(start_commit(&valid.snapshot))
+            .await
+            .unwrap(),
+        ClaimOutcome::Claimed(_)
+    ));
+}
+
+#[tokio::test]
 async fn database_rejects_dispatch_input_mutation_deletion_and_state_skips() {
     let database = TestDatabase::new();
     let store = seeded_file_store(database.path()).await;
@@ -3972,6 +4274,45 @@ async fn complete_is_atomic_and_persists_the_typed_result() {
     let loaded = store.load_run(RUN_ID).await.unwrap();
     assert_eq!(loaded.snapshot.run.status, RunStatus::Succeeded);
     assert_eq!(loaded.events.last(), Some(&completion.event));
+}
+
+#[tokio::test]
+async fn dispatch_storage_rejects_noncanonical_event_and_projection_without_partial_writes() {
+    let store = seeded_memory_store().await;
+    bootstrap_test_owner(&store).await;
+    let (snapshot, _) = seed_fixture();
+    let review = approved_dispatch_commit(&snapshot, "canonical-dispatch-review");
+    store.commit_review(review.clone()).await.unwrap();
+
+    let start = start_commit(&review.snapshot);
+    let mut injected_start = start.clone();
+    injected_start.event.content = Some("caller-injected content".into());
+    assert!(matches!(
+        store.claim_next_dispatch(injected_start).await,
+        Err(StorageError::InvalidDispatchTransition(_))
+    ));
+    assert_eq!(
+        store
+            .dispatch_job("call-local-001")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        DispatchStatus::Queued
+    );
+    assert_eq!(store.load_run(RUN_ID).await.unwrap().events.len(), 7);
+
+    store.claim_next_dispatch(start.clone()).await.unwrap();
+    let mut injected_completion = completion_commit(&start.snapshot);
+    injected_completion.snapshot.metrics[0].value = "x".repeat(8 * 1024);
+    assert!(matches!(
+        store.complete_dispatch(injected_completion).await,
+        Err(StorageError::InvalidDispatchTransition(_))
+    ));
+    let job = store.dispatch_job("call-local-001").await.unwrap().unwrap();
+    assert_eq!(job.status, DispatchStatus::Started);
+    assert!(job.result_json.is_none());
+    assert_eq!(store.load_run(RUN_ID).await.unwrap().events.len(), 8);
 }
 
 #[tokio::test]
@@ -4257,7 +4598,7 @@ async fn reply_reservations_cover_success_failure_and_missing_claim_fail_closed(
                 model: Some("test-model".into()),
                 reply_kind: AssistantReplyKind::Model,
             },
-            response_json: json!({"id": "reserved-success"}),
+            response_json: model_reply_json("The reserved reply completed."),
         })
         .await
         .unwrap();
@@ -4296,7 +4637,10 @@ async fn reply_reservations_cover_success_failure_and_missing_claim_fail_closed(
         .complete_reply_failure(ReplyFailureCommit {
             job_id: "reply-reserved-failure".into(),
             expected_sequence: 2,
-            error_json: json!({"code": "fixture_provider_failure"}),
+            error_json: json!({
+                "code": "fixture_provider_failure",
+                "message": "The fixture reply provider failed",
+            }),
         })
         .await
         .unwrap();
@@ -4984,6 +5328,18 @@ fn reply_job_spec(id: &str, turn_id: &str) -> ReplyJobSpec {
     }
 }
 
+fn model_reply_json(content: &str) -> Value {
+    json!({
+        "content": content,
+        "finish_reason": "stop",
+        "provider": {
+            "provider_id": "test-provider",
+            "model": "test-model",
+            "reply_kind": "model",
+        },
+    })
+}
+
 fn production_identity() -> RuntimeIdentity {
     RuntimeIdentity {
         profile: "production-guarded".into(),
@@ -5162,7 +5518,7 @@ fn dispatch_fixture_call() -> ToolCall {
         tool: "local.echo".into(),
         tool_version: "1.0.0".into(),
         arguments: json!({"message": "raise the local fixture ceiling"}),
-        arguments_digest: "sha256:args-local-001".into(),
+        arguments_digest: format!("sha256:{}", "a".repeat(64)),
         effect: ToolEffect::LocalWrite,
         sandbox_profile: SandboxProfile::WorkspaceWrite,
         executor_status: ToolExecutorStatus::Available,
@@ -5232,7 +5588,7 @@ fn approved_dispatch_commit(seed: &RunSnapshot, key: &str) -> ReviewCommit {
         tool_version: "1.0.0".into(),
         effect: ToolEffect::LocalWrite,
         args_json: json!({"message": "raise the local fixture ceiling"}),
-        args_digest: "sha256:args-local-001".into(),
+        args_digest: format!("sha256:{}", "a".repeat(64)),
         policy_id: "local-alpha".into(),
         policy_revision: "rev-2026-08-26".into(),
         sandbox_profile: SandboxProfile::WorkspaceWrite,
@@ -5266,102 +5622,142 @@ fn approved_dispatch_commit(seed: &RunSnapshot, key: &str) -> ReviewCommit {
 }
 
 fn start_commit(queued: &RunSnapshot) -> DispatchStartCommit {
-    let mut snapshot = queued.clone();
-    snapshot.run.status = RunStatus::Running;
-    snapshot.run.sequence += 1;
-    let event = RunEvent {
-        sequence: snapshot.run.sequence,
-        id: format!("evt-{:06}", snapshot.run.sequence),
-        turn: 1,
-        step: 5,
-        event_type: EventType::ToolCall,
-        title: "Local tool dispatch started".into(),
-        at: "2026-08-26T01:20:01Z".into(),
-        summary: Some("The durable queue claim committed before execution.".into()),
-        content: None,
-        metadata: BTreeMap::from([("call_id".into(), json!("call-local-001"))]),
-        approval: None,
-        data: Some(RunEventData::ToolDispatchStarted {
+    let call = dispatch_fixture_call();
+    let approval = Approval {
+        id: "APR-901".into(),
+        status: ApprovalStatus::Approved,
+        action: "update connection ceiling".into(),
+        tool: call.tool.clone(),
+        change: "connections: 80 -> 120".into(),
+        requires_approval: true,
+        call_id: Some(call.call_id.clone()),
+        policy_revision: Some("rev-2026-08-26".into()),
+        arguments_digest: Some(call.arguments_digest.clone()),
+        sandbox_profile: Some(call.sandbox_profile.clone()),
+        scope: Some(ApprovalScope::AllowOnce),
+    };
+    let transition = kernel::start_tool_dispatch(
+        &queued.run,
+        &approval,
+        &call,
+        "local-dev",
+        queued.run.sequence + 1,
+        "2026-08-26T01:20:01Z",
+    )
+    .unwrap();
+    assert_eq!(transition.run.status, RunStatus::Running);
+    assert_eq!(transition.event.step, 4);
+    assert_eq!(transition.event.title, "Tool dispatch checkpoint recorded");
+    assert_eq!(
+        transition.event.summary.as_deref(),
+        Some("The durable dispatch checkpoint was recorded. A tool result is still required.")
+    );
+    assert_eq!(
+        transition.event.metadata,
+        BTreeMap::from([
+            ("durable".into(), json!(true)),
+            ("side_effect_claimed".into(), json!(false)),
+        ])
+    );
+    assert_eq!(
+        transition.event.data,
+        Some(RunEventData::ToolDispatchStarted {
             call_id: "call-local-001".into(),
             executor: "local-dev".into(),
             executor_status: ToolExecutorStatus::Available,
             sandbox_profile: SandboxProfile::WorkspaceWrite,
             status: ToolCallStatus::Running,
-        }),
-    };
+        })
+    );
+    let mut snapshot = queued.clone();
+    snapshot.run = transition.run;
     DispatchStartCommit {
         call_id: "call-local-001".into(),
         expected_sequence: queued.run.sequence,
         snapshot,
-        event,
+        event: transition.event,
     }
 }
 
 fn completion_commit(running: &RunSnapshot) -> DispatchCompleteCommit {
-    let mut snapshot = running.clone();
-    snapshot.run.status = RunStatus::Succeeded;
-    snapshot.run.sequence += 1;
     let outcome = ToolOutcome::Succeeded {
         summary: "Local fixture updated".into(),
         output_digest: Some("sha256:output-local-001".into()),
     };
-    let event = RunEvent {
-        sequence: snapshot.run.sequence,
-        id: format!("evt-{:06}", snapshot.run.sequence),
-        turn: 1,
-        step: 5,
-        event_type: EventType::ToolCall,
-        title: "Local tool completed".into(),
-        at: "2026-08-26T01:20:02Z".into(),
-        summary: Some("The local tool returned a durable result.".into()),
-        content: None,
-        metadata: BTreeMap::from([("call_id".into(), json!("call-local-001"))]),
-        approval: None,
-        data: Some(RunEventData::ToolResult {
+    let transition = kernel::apply_tool_result(
+        &running.run,
+        &dispatch_fixture_call(),
+        outcome.clone(),
+        running.run.sequence + 1,
+        "2026-08-26T01:20:02Z",
+    )
+    .unwrap();
+    assert_eq!(transition.run.status, RunStatus::Succeeded);
+    assert_eq!(transition.event.step, 4);
+    assert_eq!(transition.event.title, "Tool execution succeeded");
+    assert_eq!(
+        transition.event.metadata,
+        BTreeMap::from([
+            ("durable".into(), json!(true)),
+            ("outcome_known".into(), json!(true)),
+        ])
+    );
+    assert_eq!(
+        transition.event.data,
+        Some(RunEventData::ToolResult {
             call_id: "call-local-001".into(),
-            status: outcome.call_status(),
             outcome: outcome.clone(),
-        }),
-    };
+            status: ToolCallStatus::Succeeded,
+        })
+    );
+    let mut snapshot = running.clone();
+    snapshot.run = transition.run;
     DispatchCompleteCommit {
         call_id: "call-local-001".into(),
         expected_sequence: running.run.sequence,
         snapshot,
-        event,
+        event: transition.event,
         result_json: serde_json::to_value(outcome).unwrap(),
     }
 }
 
 fn recovery_commit(running: &RunSnapshot) -> DispatchRecoveryCommit {
-    let mut snapshot = running.clone();
-    snapshot.run.status = RunStatus::NeedsAttention;
-    snapshot.run.sequence += 1;
     let outcome = ToolOutcome::OutcomeUnknown {
         summary: "Process stopped after dispatch start; the side effect is unknown.".into(),
     };
-    let event = RunEvent {
-        sequence: snapshot.run.sequence,
-        id: format!("evt-{:06}", snapshot.run.sequence),
-        turn: 1,
-        step: 5,
-        event_type: EventType::ToolCall,
-        title: "Tool outcome requires attention".into(),
-        at: "2026-08-26T01:21:00Z".into(),
-        summary: Some("Started work is never automatically dispatched twice.".into()),
-        content: None,
-        metadata: BTreeMap::from([("call_id".into(), json!("call-local-001"))]),
-        approval: None,
-        data: Some(RunEventData::ToolResult {
+    let transition = kernel::apply_tool_result(
+        &running.run,
+        &dispatch_fixture_call(),
+        outcome.clone(),
+        running.run.sequence + 1,
+        "2026-08-26T01:21:00Z",
+    )
+    .unwrap();
+    assert_eq!(transition.run.status, RunStatus::NeedsAttention);
+    assert_eq!(transition.event.step, 4);
+    assert_eq!(transition.event.title, "Tool outcome is unknown");
+    assert_eq!(
+        transition.event.metadata,
+        BTreeMap::from([
+            ("durable".into(), json!(true)),
+            ("outcome_known".into(), json!(false)),
+        ])
+    );
+    assert_eq!(
+        transition.event.data,
+        Some(RunEventData::ToolResult {
             call_id: "call-local-001".into(),
-            status: outcome.call_status(),
             outcome: outcome.clone(),
-        }),
-    };
+            status: ToolCallStatus::OutcomeUnknown,
+        })
+    );
+    let mut snapshot = running.clone();
+    snapshot.run = transition.run;
     DispatchRecoveryCommit {
         call_id: "call-local-001".into(),
         expected_sequence: running.run.sequence,
         snapshot,
-        event,
+        event: transition.event,
         result_json: serde_json::to_value(outcome).unwrap(),
     }
 }

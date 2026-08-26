@@ -13,7 +13,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     ProviderError, ProviderMetadata, ReplyFuture, ReplyKind, ReplyMessage, ReplyProvider,
-    ReplyRequest, ReplyResponse,
+    ReplyRequest, ReplyResponse, validate_provider_metadata, validate_reply_response,
 };
 
 /// Default deadline for connection, upload, and response download.
@@ -98,11 +98,6 @@ impl OpenAiCompatibleProvider {
         }
 
         let model = model.into();
-        if model.trim().is_empty() {
-            return Err(ProviderError::InvalidConfiguration(
-                "model must not be blank",
-            ));
-        }
         let api_key = Zeroizing::new(api_key.into());
         if api_key.trim().is_empty() {
             return Err(ProviderError::InvalidConfiguration(
@@ -125,6 +120,7 @@ impl OpenAiCompatibleProvider {
             model: Some(model.clone()),
             reply_kind: ReplyKind::Model,
         };
+        validate_provider_metadata(&metadata)?;
 
         Ok(Self {
             client,
@@ -198,11 +194,13 @@ impl OpenAiCompatibleProvider {
         if choice.message.content.trim().is_empty() {
             return Err(ProviderError::InvalidResponse);
         }
-        Ok(ReplyResponse {
+        let response = ReplyResponse {
             content: choice.message.content,
             finish_reason: choice.finish_reason,
             provider: self.metadata.clone(),
-        })
+        };
+        validate_reply_response(&response)?;
+        Ok(response)
     }
 }
 

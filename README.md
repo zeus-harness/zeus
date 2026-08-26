@@ -292,7 +292,11 @@ and bounded memory, CPU, and PID resources.
   surface.
 - Approval is bound to one call ID, argument digest, policy revision, sandbox,
   and `allow_once` scope. Approve atomically appends the decision and enqueues
-  that exact immutable dispatch job; reject enqueues nothing.
+  that exact immutable dispatch job; reject enqueues nothing. Before any new
+  job is admitted, storage also reloads the durable requested call and bound
+  runtime identity in the same transaction. A mismatched policy, tool contract,
+  argument object, digest, or sandbox therefore cannot occupy the queue head or
+  its terminal reservation.
 - A worker commits `ToolDispatchStarted` before invoking a connector. A queued
   job can resume after restart; a started job without a durable result becomes
   `outcome_unknown` and is never retried automatically.
@@ -438,7 +442,13 @@ but Alpha+ does not expose a public attach-Run HTTP route.
 
 The application boundary now caps auth JSON at 8 KiB and command JSON at
 512 KiB. Newly created Session and turn IDs are capped at 128 UTF-8 bytes;
-Session titles at 256 bytes; user messages at 64 KiB; and review notes at 8 KiB.
+Session titles at 256 bytes; user and assistant messages at 64 KiB; and review
+notes at 8 KiB. A typed reply response is capped at 512 KiB; provider, model,
+finish-reason, failure-code, and tool digest/code fields are capped at 128
+bytes; reply/tool diagnostics at 4 KiB; compact tool output and dispatch
+argument JSON at 64 KiB. Provider and executor over-limit results settle once
+as fixed, bounded durable failures; the rejected payload is never copied into
+the ledger or job result.
 New Session event IDs are ledger-local and bounded. Historical v8 durable IDs
 remain addressable so the stricter write envelope does not strand existing
 data. Shared validation runs before command fingerprinting or receipt lookup at
@@ -453,9 +463,9 @@ idempotent replay is checked before capacity, while accepted work consumes its
 reserved terminal slots without ordinary admission. Expired auth sessions are
 deleted in deterministic batches of at most 64 on startup and before session
 creation; append-only ledgers, receipts, jobs, turns, and audit records are not
-silently pruned. Logical payload bytes, main DB/WAL/disk headroom, and a complete
-audit retention horizon remain unresolved, so shared-network and multi-tenant
-deployment is still out of scope.
+silently pruned. Aggregate event-payload byte accounting/reservation, main
+DB/WAL/disk headroom, and a complete audit retention horizon remain unresolved,
+so shared-network and multi-tenant deployment is still out of scope.
 
 ## Container images
 
@@ -503,13 +513,13 @@ committed data. Use SQLite's backup/checkpoint facilities.
 
 ## Verification status
 
-Current Alpha+ plus Actor Boundary Foundation, API Resource Envelope, Bounded
-Event Feed, Point-query Durable Context, Bounded Read Models, and SQLite
-Capacity Slice 1 host verification:
+Current Alpha+ plus Actor Boundary Foundation, API Resource Envelope, Terminal
+Payload Envelope, Bounded Event Feed, Point-query Durable Context, Bounded Read
+Models, and SQLite Capacity Slice 1 host verification:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --all-targets`: 213 tests passed, including the real
+- `cargo test --workspace --all-targets`: 229 tests passed, including the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,
   body/field/idempotency boundaries, atomic login limits, SSE lease capacity,
@@ -521,7 +531,9 @@ Capacity Slice 1 host verification:
   provider `outcome_unknown` semantics. Capacity coverage includes exact-limit
   and limit-plus-one admission, terminal event-slot reservation lifecycles,
   startup seed idempotency, over-limit legacy migration/recovery, bounded
-  expired-auth cleanup, and fail-closed environment parsing.
+  expired-auth cleanup, fail-closed environment parsing, typed reply/tool
+  payload envelopes, canonical dispatch admission, and one-shot oversized
+  provider/executor settlement without persisting the rejected payload.
 - `pnpm --filter web test`: 25 tests passed for CSRF headers, stable command
   identity, deep-page active-Session restore, Session-list cursor encoding and
   deduplication, bounded-tail retry reconciliation and Session-switch race
