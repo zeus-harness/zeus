@@ -371,6 +371,9 @@ pub struct ReplyJobSpec {
     pub authz: AuthzContext,
     pub provider_name: String,
     pub model_name: Option<String>,
+    /// Server-derived provider context. The first committed value is durable
+    /// authority; idempotent replay returns it instead of comparing a freshly
+    /// rebuilt context across process upgrades.
     pub request_json: Value,
 }
 

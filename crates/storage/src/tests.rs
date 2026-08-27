@@ -1623,7 +1623,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         .unwrap();
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     );
     let owner: Option<String> = connection
         .query_row(
@@ -1764,7 +1764,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
     assert_eq!(
         run_event_payloads(database.path(), &long_run_id),
         payloads_before,
-        "v9-v15 migrations must not rewrite immutable event payloads"
+        "v9-v16 migrations must not rewrite immutable event payloads"
     );
     let connection = rusqlite::Connection::open(database.path()).unwrap();
     let version: i64 = connection
@@ -1772,7 +1772,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
     let configured_account: (String, String, String, i64) = connection
         .query_row(
             r#"SELECT
@@ -2298,7 +2298,7 @@ async fn v12_identity_and_run_crash_prefix_migrates_then_recovers_the_primary_se
     assert_eq!(
         recovered,
         (
-            15,
+            16,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into()
@@ -4045,7 +4045,7 @@ async fn v5_configured_database_migrates_to_the_local_owner_membership() {
     assert_eq!(
         migrated,
         (
-            15,
+            16,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into(),
@@ -4171,7 +4171,7 @@ async fn v13_configured_active_work_migrates_with_account_authority_and_exact_vo
             },
         )
         .unwrap();
-    assert_eq!(migrated_counts, (15, 1, 1, 2, 1));
+    assert_eq!(migrated_counts, (16, 1, 1, 2, 1));
 }
 
 #[tokio::test]
@@ -4453,7 +4453,7 @@ async fn v14_rejects_a_disabled_legacy_owner_before_committing_any_schema_change
 }
 
 #[tokio::test]
-async fn v14_database_migrates_to_v15_with_member_and_audit_roots() {
+async fn v14_database_migrates_through_v16_with_member_and_audit_roots() {
     let database = TestDatabase::new();
     let store = SqliteStore::open(database.path()).await.unwrap();
     bootstrap_test_owner(&store).await;
@@ -4532,7 +4532,7 @@ async fn v14_database_migrates_to_v15_with_member_and_audit_roots() {
             },
         )
         .unwrap();
-    assert_eq!(state, (15, 1, 1, 1, 19));
+    assert_eq!(state, (16, 1, 1, 1, 19));
 }
 
 #[tokio::test]
@@ -4571,7 +4571,7 @@ async fn v15_migration_seeds_the_configured_audit_detail_limit() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (15, 2));
+    assert_eq!(state, (16, 2));
 }
 
 #[tokio::test]
@@ -4616,7 +4616,7 @@ async fn v15_reopen_rejects_a_lower_audit_detail_limit_without_mutating_policy()
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (15, 4));
+    assert_eq!(state, (16, 4));
     drop(connection);
 
     let reopened = SqliteStore::open_with_limits(database.path(), original_limits)
@@ -5544,6 +5544,46 @@ async fn reply_start_is_atomic_actor_scoped_and_success_is_idempotent() {
     assert!(!enqueued.start.replayed);
     assert_eq!(enqueued.start.session.sequence, 2);
     assert_eq!(enqueued.job.status, ReplyJobStatus::Queued);
+    let legacy_request_json = json!({
+        "messages": [{
+            "role": "user",
+            "content": &request.user_message,
+        }],
+    });
+    let legacy_fingerprint = serde_json::to_string(&json!({
+        "session_id": "session-alpha",
+        "request": &request,
+        "reply_job": {
+            "id": &spec.id,
+            "provider_name": &spec.provider_name,
+            "model_name": &spec.model_name,
+            "request_json": legacy_request_json,
+        },
+    }))
+    .unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let immutable_trigger: String = connection
+        .query_row(
+            r#"SELECT sql FROM sqlite_schema
+               WHERE type = 'trigger' AND name = 'session_command_receipts_reject_update'"#,
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    connection
+        .execute_batch("DROP TRIGGER session_command_receipts_reject_update;")
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE session_command_receipts
+               SET request_fingerprint = ?1
+               WHERE operation = 'start_turn' AND idempotency_key = 'reply-start-atomic'"#,
+            [legacy_fingerprint],
+        )
+        .unwrap();
+    connection.execute_batch(&immutable_trigger).unwrap();
+    drop(connection);
+
     let rotated_authz = owner_authz_with_session("asi_rotated_owner");
     let expiry = (chrono::Utc::now() + chrono::Duration::hours(1))
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -5558,6 +5598,13 @@ async fn reply_start_is_atomic_actor_scoped_and_success_is_idempotent() {
         .unwrap();
     let mut rotated_spec = spec.clone();
     rotated_spec.authz = rotated_authz.clone();
+    rotated_spec.request_json = json!({
+        "messages": [
+            {"role": "user", "content": "server context may evolve"},
+            {"role": "assistant", "content": "the stored job stays authoritative"},
+            {"role": "user", "content": "retry the same client command"}
+        ]
+    });
     let replay = store
         .start_turn_and_enqueue_reply_for_actor(
             &rotated_authz,
@@ -5657,6 +5704,183 @@ async fn reply_start_is_atomic_actor_scoped_and_success_is_idempotent() {
             .events
             .len(),
         4
+    );
+}
+
+#[tokio::test]
+async fn reply_context_is_complete_pair_only_and_stable_at_historical_sequence() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    store
+        .start_turn_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-context-legacy-empty".into(),
+                user_message: "legacy user-only turn".into(),
+                expected_sequence: 1,
+            },
+            "context-legacy-empty-start",
+        )
+        .await
+        .unwrap();
+    store
+        .flush_turn_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            FlushSessionRequest {
+                turn_id: "turn-context-legacy-empty".into(),
+                assistant_message: None,
+                expected_sequence: 2,
+            },
+            "context-legacy-empty-flush",
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .session_reply_turns_for_actor(&owner_authz(), "session-alpha", 3, 31)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a durable assistant-less flush is valid history but not model context"
+    );
+    let first_request = StartTurnRequest {
+        turn_id: "turn-context-first".into(),
+        user_message: "remember the first fact".into(),
+        expected_sequence: 3,
+    };
+    store
+        .start_turn_and_enqueue_reply_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            first_request,
+            "context-first",
+            reply_job_spec("reply-context-first", "turn-context-first"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .session_reply_turns_for_actor(&owner_authz(), "session-alpha", 3, 31)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let ReplyClaimOutcome::Claimed(_) = store.claim_next_reply().await.unwrap() else {
+        panic!("the first context reply must be claimable");
+    };
+    store
+        .complete_reply_success(ReplySuccessCommit {
+            job_id: "reply-context-first".into(),
+            expected_sequence: 4,
+            assistant_message: "the first fact is durable".into(),
+            provenance: AssistantReplyProvenance {
+                provider_id: "test-provider".into(),
+                model: Some("test-model".into()),
+                reply_kind: AssistantReplyKind::Model,
+            },
+            response_json: model_reply_json("the first fact is durable"),
+        })
+        .await
+        .unwrap();
+    assert!(
+        store
+            .session_reply_turns_for_actor(&owner_authz(), "session-alpha", 4, 31)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .session_reply_turns_for_actor(&owner_authz(), "session-alpha", 5, 31)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let at_first_flush = store
+        .session_reply_turns_for_actor(&owner_authz(), "session-alpha", 6, 31)
+        .await
+        .unwrap();
+    assert_eq!(at_first_flush.len(), 1);
+    assert_eq!(at_first_flush[0].id, "turn-context-first");
+
+    store
+        .start_turn_and_enqueue_reply_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-context-second".into(),
+                user_message: "recall it".into(),
+                expected_sequence: 6,
+            },
+            "context-second",
+            reply_job_spec("reply-context-second", "turn-context-second"),
+        )
+        .await
+        .unwrap();
+    let ReplyClaimOutcome::Claimed(_) = store.claim_next_reply().await.unwrap() else {
+        panic!("the second context reply must be claimable");
+    };
+    store
+        .complete_reply_success(ReplySuccessCommit {
+            job_id: "reply-context-second".into(),
+            expected_sequence: 7,
+            assistant_message: "recalled".into(),
+            provenance: AssistantReplyProvenance {
+                provider_id: "test-provider".into(),
+                model: Some("test-model".into()),
+                reply_kind: AssistantReplyKind::Model,
+            },
+            response_json: model_reply_json("recalled"),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .session_reply_turns_for_actor(&owner_authz(), "session-alpha", 6, 31)
+            .await
+            .unwrap(),
+        at_first_flush
+    );
+    let latest = store
+        .session_reply_turns_for_actor(&owner_authz(), "session-alpha", 9, 31)
+        .await
+        .unwrap();
+    assert_eq!(
+        latest
+            .iter()
+            .map(|turn| turn.id.as_str())
+            .collect::<Vec<_>>(),
+        ["turn-context-first", "turn-context-second"]
+    );
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let plan = explain_query_plan(
+        &connection,
+        r#"SELECT turn.id
+           FROM session_events AS assistant
+           JOIN session_events AS flushed
+             ON flushed.session_id = assistant.session_id
+            AND flushed.sequence = assistant.sequence + 1
+            AND flushed.turn_id = assistant.turn_id
+            AND flushed.event_kind = 'turn_flushed'
+           JOIN session_turns AS turn
+             ON turn.session_id = assistant.session_id
+            AND turn.id = assistant.turn_id
+           WHERE assistant.session_id = ?1
+             AND assistant.sequence < ?2
+             AND assistant.event_kind = 'assistant_message'
+             AND assistant.turn_id IS NOT NULL
+             AND flushed.sequence <= ?2
+             AND turn.status = 'flushed'
+             AND turn.assistant_message IS NOT NULL
+           ORDER BY assistant.sequence DESC LIMIT ?3"#,
+        params!["session-alpha", 9_i64, 31_i64],
+    );
+    assert!(
+        plan.contains("session_events_reply_context_idx"),
+        "reply context lookup must stay on its bounded partial index: {plan}"
     );
 }
 
@@ -9463,7 +9687,7 @@ async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempot
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, (1_i64..=15).collect::<Vec<_>>());
+    assert_eq!(versions, (1_i64..=16).collect::<Vec<_>>());
     assert_eq!(
         connection
             .query_row(
@@ -10267,6 +10491,10 @@ fn downgrade_account_foundation_fixture_to_v12(connection: &rusqlite::Connection
     if version < 13 {
         return;
     }
+    if version >= 16 {
+        drop_v16_fixture_objects(connection);
+        version = 15;
+    }
     if version >= 15 {
         drop_v15_fixture_objects(connection);
         version = 14;
@@ -10315,11 +10543,15 @@ fn downgrade_account_foundation_fixture_to_v12(connection: &rusqlite::Connection
 }
 
 fn downgrade_durable_authorization_fixture_to_v13(connection: &rusqlite::Connection) {
-    let version: i64 = connection
+    let mut version: i64 = connection
         .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
             row.get(0)
         })
         .unwrap();
+    if version >= 16 {
+        drop_v16_fixture_objects(connection);
+        version = 15;
+    }
     if version >= 15 {
         drop_v15_fixture_objects(connection);
     }
@@ -10607,6 +10839,15 @@ fn drop_v15_fixture_objects(connection: &rusqlite::Connection) {
                DROP TABLE account_audit_rollups;
                DROP TABLE member_setup_tokens;
                DELETE FROM schema_migrations WHERE version = 15;"#,
+        )
+        .unwrap();
+}
+
+fn drop_v16_fixture_objects(connection: &rusqlite::Connection) {
+    connection
+        .execute_batch(
+            r#"DROP INDEX session_events_reply_context_idx;
+               DELETE FROM schema_migrations WHERE version = 16;"#,
         )
         .unwrap();
 }

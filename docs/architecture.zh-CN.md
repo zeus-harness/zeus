@@ -27,7 +27,7 @@ Client / SvelteKit Web
 - `authz`：account capability matrix，以及精确工具名规则、策略 revision、环境和 effect guard；没有命中即拒绝。
 - `tools`：工具描述、注册表、参数验证和 object-safe executor 边界。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
-- `storage`：schema v15 migration、`acc_local` membership 权威、一次性 member setup、用户/偏好、
+- `storage`：schema v16 migration、`acc_local` membership 权威、一次性 member setup、用户/偏好、
   account audit/rollup/policy/archive state、独立 Session/Run ledger、typed event lookup、
   account+actor-scoped 回执、durable reply/dispatch queue，以及 actor/account/global logical
   capacity、physical capacity 和 operation capacity。
@@ -105,7 +105,11 @@ Session ledger 记录 `session_created`、`run_attached`、`user_message`、可�
 - create：写入 `ready` 投影、`session_created` 和完整响应回执。
 - start：只允许 actor 拥有的 `ready` Session；在一个事务中创建唯一 open turn、追加
   `user_message`、投影进入 `running`、保存 actor-scoped 响应回执，并插入 immutable queued
-  reply job。真实 API 返回 `202`。
+  reply job。provider request 以命令的 `expected_sequence` 为快照边界，由最新完整 flushed
+  user/assistant 对和当前 user message 组成；最多保留 31 对历史消息，总 UTF-8 内容不超过
+  64 KiB。interrupted、缺少 assistant 或尚未 flush 的 turn 不进入上下文。组装结果持久化在
+  job 中，迟到的幂等重试复用该 durable request，而不是从更晚的 Session 状态重新生成。
+  真实 API 返回 `202`。
 - reply worker：claim 事务先复验 active actor 与 Session owner，再把 queued job durable
   claim 为 `started`，随后在数据库锁之外调用 provider。
   成功事务追加带 `provider_id/model/reply_kind` 的 `assistant_message`、flush turn、追加
@@ -148,7 +152,7 @@ connector 在数据库事务和锁之外运行。
 
 API 监听端口之前按固定顺序完成：
 
-1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v15；按当前
+1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v16；按当前
    detailed-row limit 以最多 64 行 batch 压缩 bootstrap terminal audit prefix，再按稳定
    `(priority actor, expires_at, auth-session ID)` 顺序最多清理 64 个过期或绑定
    missing/disabled/suspended/stale-revision authority 的 auth session。
@@ -253,6 +257,9 @@ exactly-once 语义。
   `SHA256("zeus.member-setup-token.v1\0" || canonical_token)`，明文只在创建/轮换响应中出现。
   owner 的 role/status transition、auth/setup-token revoke、in-flight 摘要和审计事件在同一
   `BEGIN IMMEDIATE` 事务提交；最后一个 active owner 不能被禁用或降级。
+  v16 为 `assistant_message` Session event 增加 partial reply-context index；历史读取由索引按
+  `expected_sequence` 倒序限定后恢复为时间正序，只返回带相邻 `assistant_message` event 的
+  最新完整对话，assistant-less flush 合法但不进入模型上下文。
   每个 pre-v4 Run 会绑定到生成的 `session-{run_id}`，原 Run/Event 不重写、不丢弃。
 - runtime identity 持久绑定 profile、environment、primary Session/Run、policy ID 和
   revision；不一致时启动失败。Run attachment 当前用于 migration 和 demo seed，Alpha 不公开
@@ -432,9 +439,12 @@ volume，原地完成 v12→v13 migration；保留卷 `restart-verify` 通过。
 `memory.current=79,466,496`、`memory.peak=98,201,600`、Zeus RSS 9,824 KiB、
 `pids.current=6`，`memory.events` 为 `oom=0`、`oom_kill=0`；member 登录/API gate 当时仍关闭，
 Apple `pids.max=max`。
-当前 schema v15 镜像继续保留 now-v14 volume，在 `127.0.0.1:18089` 完成 v14→v15 migration；
+最近一次容器证据仍是 schema v15 镜像：它继续保留 now-v14 volume，在 `127.0.0.1:18089`
+完成 v14→v15 migration；
 `verify` 与保留卷 `restart-verify` 通过且 `configured=false` 保持一致。API 仍为 2 CPU/1 GiB，
 `memory.peak=99,479,552`、Zeus RSS 10,252 KiB、`pids.current=7`，OOM/kill 为 0。
+schema v16 已通过主机 migration、readiness、query-plan 与多轮上下文测试，未把该历史容器结果
+表述为 v16 运行证据。
 独立 fresh `zeus-audit-acceptance` 以 detail 2、每 account ceiling 8、progress reserve 2 完成真实
 member setup/reply、403、checkpoint、legal-hold 507、普通容量拒绝、disable reserve、session revoke、
 NDJSON manifest 与 release-hold readiness 验收；浏览器覆盖 New Session、消息回复、Settings、

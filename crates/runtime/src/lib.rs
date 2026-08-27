@@ -1087,6 +1087,24 @@ impl DemoStore {
             .await?)
     }
 
+    /// Reads the bounded, complete conversation history visible at a caller's
+    /// immutable pre-turn Session sequence.
+    pub async fn session_reply_turns_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        through_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionTurn>, StoreError> {
+        validate_durable_reference(session_id, "session ID")?;
+        self.authorize_session_for_actor(context, session_id)
+            .await?;
+        Ok(self
+            .storage
+            .session_reply_turns_for_actor(context, session_id, through_sequence, limit)
+            .await?)
+    }
+
     pub async fn session_events_after_for_actor(
         &self,
         context: &AuthzContext,

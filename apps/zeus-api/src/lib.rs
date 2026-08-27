@@ -27,9 +27,12 @@ use axum::{
     routing::{get, post},
 };
 use llm::{
-    LocalFallbackProvider, ProviderError, ReplyKind, ReplyMessage, ReplyProvider, ReplyRequest,
-    ReplyRole, validate_provider_metadata, validate_reply_response,
+    LocalFallbackProvider, ProviderError, REPLY_REQUEST_MAX_HISTORY_PAIRS, ReplyKind,
+    ReplyProvider, ReplyRequest, validate_provider_metadata, validate_reply_request,
+    validate_reply_response,
 };
+#[cfg(test)]
+use llm::{ReplyMessage, ReplyRole};
 use protocol::{
     ACCOUNT_AUDIT_EVENT_SCHEMA, ACCOUNT_AUDIT_EXPORT_MANIFEST_KIND,
     ACCOUNT_AUDIT_EXPORT_SCHEMA_VERSION,
@@ -82,7 +85,6 @@ const INVALID_LOGIN_ACCOUNT_KEY: &str = "<invalid-username>";
 const SSE_GLOBAL_CONNECTION_LIMIT: usize = 64;
 const SSE_ACTOR_CONNECTION_LIMIT: usize = 4;
 const SSE_CAPACITY_RETRY_AFTER: Duration = Duration::from_secs(2);
-const PERSISTED_REPLY_REQUEST_MAX_MESSAGES: usize = 64;
 const WORKER_ERROR_RETRY_DELAY: Duration = Duration::from_millis(25);
 const WORKER_IDLE: u8 = 0;
 const WORKER_RUNNING: u8 = 1;
@@ -2197,25 +2199,7 @@ async fn process_reply_job(state: &ApiState, job: ReplyJob) -> Result<(), StoreE
 }
 
 fn persisted_reply_request_fits_envelope(request: &ReplyRequest) -> bool {
-    if request.messages.is_empty() || request.messages.len() > PERSISTED_REPLY_REQUEST_MAX_MESSAGES
-    {
-        return false;
-    }
-
-    let mut total_bytes = 0usize;
-    for message in &request.messages {
-        if protocol::validate_user_message(&message.content).is_err() {
-            return false;
-        }
-        let Some(updated_total) = total_bytes.checked_add(message.content.len()) else {
-            return false;
-        };
-        if updated_total > protocol::USER_MESSAGE_MAX_BYTES {
-            return false;
-        }
-        total_bytes = updated_total;
-    }
-    true
+    validate_reply_request(request).is_ok()
 }
 
 async fn fail_reply_job(
@@ -2432,10 +2416,18 @@ async fn start_turn(
     let reply = reply_executor(&state)?;
     let metadata = reply.provider.metadata();
     validate_provider_metadata(metadata).map_err(ApiError::reply_unavailable)?;
-    let reply_request = ReplyRequest::new([ReplyMessage::new(
-        ReplyRole::User,
-        request.user_message.clone(),
-    )]);
+    let reply_turns = state
+        .store
+        .session_reply_turns_for_actor(
+            &current.principal.authz,
+            &id,
+            request.expected_sequence,
+            REPLY_REQUEST_MAX_HISTORY_PAIRS,
+        )
+        .await?;
+    let reply_request =
+        ReplyRequest::from_session_history(&reply_turns, request.user_message.clone())
+            .map_err(|error| ApiError::internal_contract(&error.to_string()))?;
     let job = ReplyJobSpec {
         id: format!("reply:{id}:{}", request.turn_id),
         authz: current.principal.authz.clone(),
@@ -5239,6 +5231,46 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    struct RecordingProvider {
+        metadata: ProviderMetadata,
+        requests: Arc<StdMutex<Vec<ReplyRequest>>>,
+    }
+
+    impl RecordingProvider {
+        fn new(requests: Arc<StdMutex<Vec<ReplyRequest>>>) -> Self {
+            Self {
+                metadata: ProviderMetadata {
+                    provider_id: "test-recording-provider".into(),
+                    model: Some("test-model".into()),
+                    reply_kind: ReplyKind::Model,
+                },
+                requests,
+            }
+        }
+    }
+
+    impl ReplyProvider for RecordingProvider {
+        fn metadata(&self) -> &ProviderMetadata {
+            &self.metadata
+        }
+
+        fn reply(&self, request: ReplyRequest) -> ReplyFuture<'_> {
+            let call = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(request);
+                requests.len()
+            };
+            let provider = self.metadata.clone();
+            Box::pin(async move {
+                Ok(ReplyResponse {
+                    content: format!("durable answer {call}"),
+                    finish_reason: Some("stop".into()),
+                    provider,
+                })
+            })
+        }
+    }
+
     struct OversizedReplyProvider {
         metadata: ProviderMetadata,
         calls: Arc<AtomicUsize>,
@@ -5301,6 +5333,128 @@ mod tests {
                 ))
             })
         }
+    }
+
+    #[tokio::test]
+    async fn durable_reply_context_is_multi_turn_and_stable_on_late_replay() {
+        let unique = UserId::generate().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "zeus-api-reply-context-{}.db",
+            unique.as_str().replace(':', "-")
+        ));
+        let store = DemoStore::open(&path).await.unwrap();
+        let owner = provision_test_owner(&store, "user-context", "context-owner").await;
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: "session-reply-context".into(),
+                    title: "Durable reply context".into(),
+                },
+                "create-reply-context",
+            )
+            .await
+            .unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(RecordingProvider::new(Arc::clone(&requests))),
+        )
+        .unwrap();
+
+        let send_turn =
+            |turn_id: &str, user_message: &str, expected_sequence: u64, idempotency_key: &str| {
+                Request::post("/api/v1/sessions/session-reply-context/turns")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", idempotency_key)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": turn_id,
+                            "user_message": user_message,
+                            "expected_sequence": expected_sequence,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap()
+            };
+
+        let first = app
+            .clone()
+            .oneshot(send_turn(
+                "turn-context-1",
+                "remember alpha",
+                1,
+                "context-1",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let after_first =
+            wait_for_ready_session(&store, &owner.authz, "session-reply-context").await;
+        assert_eq!(after_first.session.sequence, 4);
+
+        let second = app
+            .clone()
+            .oneshot(send_turn(
+                "turn-context-2",
+                "what did I say?",
+                after_first.session.sequence,
+                "context-2",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::ACCEPTED);
+        let after_second =
+            wait_for_ready_session(&store, &owner.authz, "session-reply-context").await;
+        assert_eq!(after_second.session.sequence, 7);
+
+        let replay = app
+            .clone()
+            .oneshot(send_turn(
+                "turn-context-2",
+                "what did I say?",
+                after_first.session.sequence,
+                "context-2",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        let replay: StartTurnResponse = response_json(replay).await;
+        assert!(replay.replayed);
+        let durable_job = store
+            .reply_job_for_actor(&owner.authz, "reply:session-reply-context:turn-context-2")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable_job.status, runtime::ReplyJobStatus::Succeeded);
+
+        let recorded = requests.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            2,
+            "idempotent replay must not call the provider"
+        );
+        assert_eq!(
+            recorded[0].messages,
+            vec![ReplyMessage::new(ReplyRole::User, "remember alpha")]
+        );
+        assert_eq!(
+            recorded[1].messages,
+            vec![
+                ReplyMessage::new(ReplyRole::User, "remember alpha"),
+                ReplyMessage::new(ReplyRole::Assistant, "durable answer 1"),
+                ReplyMessage::new(ReplyRole::User, "what did I say?"),
+            ]
+        );
+
+        drop(app);
+        drop(store);
+        cleanup_test_database(&path);
     }
 
     #[tokio::test]
@@ -8146,6 +8300,36 @@ mod tests {
         let identity = provision_test_owner(&store, "user-alice", "alice").await;
         let app = authenticated_app(store.clone(), false).unwrap();
         (app, store, identity, path)
+    }
+
+    async fn wait_for_ready_session(
+        store: &DemoStore,
+        authz: &AuthzContext,
+        session_id: &str,
+    ) -> SessionDetail {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let detail = store
+                    .get_session_for_actor(
+                        authz,
+                        session_id,
+                        None,
+                        protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                        None,
+                        protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                        None,
+                        protocol::EVENT_PAGE_DEFAULT_LIMIT,
+                    )
+                    .await
+                    .unwrap();
+                if detail.session.status == SessionStatus::Ready {
+                    break detail;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the durable assistant reply should settle")
     }
 
     fn insert_legacy_ready_session(path: &Path, session_id: &str, owner_user_id: &str) {

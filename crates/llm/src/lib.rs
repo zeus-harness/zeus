@@ -9,6 +9,7 @@ mod openai_compatible;
 
 use std::{future::Future, pin::Pin};
 
+use protocol::{SessionTurn, SessionTurnStatus};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -18,6 +19,12 @@ pub use openai_compatible::{
 
 /// Maximum serialized size of a typed reply admitted to durable storage.
 pub const REPLY_RESPONSE_MAX_SERIALIZED_BYTES: usize = 512 * 1024;
+/// Maximum number of ordered messages in one durable provider request.
+pub const REPLY_REQUEST_MAX_MESSAGES: usize = 64;
+/// Maximum number of complete historical user/assistant pairs in one request.
+pub const REPLY_REQUEST_MAX_HISTORY_PAIRS: usize = (REPLY_REQUEST_MAX_MESSAGES - 1) / 2;
+/// Maximum aggregate UTF-8 content admitted to one durable provider request.
+pub const REPLY_REQUEST_MAX_CONTENT_BYTES: usize = protocol::USER_MESSAGE_MAX_BYTES;
 /// Maximum UTF-8 byte length of a provider finish reason.
 pub const FINISH_REASON_MAX_BYTES: usize = protocol::REPLY_FINISH_REASON_MAX_BYTES;
 
@@ -69,6 +76,68 @@ impl ReplyRequest {
         Self {
             messages: messages.into_iter().collect(),
         }
+    }
+
+    /// Build a bounded conversational request from the latest durable turns.
+    ///
+    /// Only complete user/assistant pairs are eligible. The newest valid
+    /// history that fits the aggregate byte and message envelopes is retained,
+    /// then the new user message is appended. Legacy rows outside today's
+    /// per-message envelope are skipped so an upgrade cannot strand a Session.
+    pub fn from_session_history(
+        turns: &[SessionTurn],
+        user_message: impl Into<String>,
+    ) -> Result<Self, ProviderError> {
+        let user_message = user_message.into();
+        protocol::validate_user_message(&user_message)
+            .map_err(|_| ProviderError::InvalidRequest("invalid user message"))?;
+
+        let mut retained = Vec::new();
+        let mut content_bytes = user_message.len();
+        for turn in turns.iter().rev() {
+            if retained.len() >= REPLY_REQUEST_MAX_HISTORY_PAIRS {
+                break;
+            }
+            if turn.status != SessionTurnStatus::Flushed {
+                continue;
+            }
+            let Some(assistant_message) = turn.assistant_message.as_ref() else {
+                continue;
+            };
+            if protocol::validate_user_message(&turn.user_message).is_err()
+                || protocol::validate_assistant_message(assistant_message).is_err()
+            {
+                continue;
+            }
+            let pair_bytes = turn
+                .user_message
+                .len()
+                .checked_add(assistant_message.len())
+                .ok_or(ProviderError::InvalidRequest(
+                    "conversation context is too large",
+                ))?;
+            let Some(next_bytes) = content_bytes.checked_add(pair_bytes) else {
+                return Err(ProviderError::InvalidRequest(
+                    "conversation context is too large",
+                ));
+            };
+            if next_bytes > REPLY_REQUEST_MAX_CONTENT_BYTES {
+                break;
+            }
+            content_bytes = next_bytes;
+            retained.push((turn.user_message.clone(), assistant_message.clone()));
+        }
+
+        retained.reverse();
+        let mut messages = Vec::with_capacity(retained.len() * 2 + 1);
+        for (user, assistant) in retained {
+            messages.push(ReplyMessage::new(ReplyRole::User, user));
+            messages.push(ReplyMessage::new(ReplyRole::Assistant, assistant));
+        }
+        messages.push(ReplyMessage::new(ReplyRole::User, user_message));
+        let request = Self { messages };
+        validate_reply_request(&request)?;
+        Ok(request)
     }
 }
 
@@ -153,6 +222,65 @@ pub trait ReplyProvider: Send + Sync {
 
     /// Request one assistant reply.
     fn reply(&self, request: ReplyRequest) -> ReplyFuture<'_>;
+}
+
+/// Validate the complete provider-visible request and its aggregate envelope.
+pub fn validate_reply_request(request: &ReplyRequest) -> Result<(), ProviderError> {
+    if request.messages.is_empty() || request.messages.len() > REPLY_REQUEST_MAX_MESSAGES {
+        return Err(ProviderError::InvalidRequest(
+            "request must contain between 1 and 64 messages",
+        ));
+    }
+
+    let conversation_start = usize::from(
+        request
+            .messages
+            .first()
+            .is_some_and(|message| message.role == ReplyRole::System),
+    );
+    let conversation = &request.messages[conversation_start..];
+    if conversation.is_empty() || conversation.len().is_multiple_of(2) {
+        return Err(ProviderError::InvalidRequest(
+            "request must end with a user message",
+        ));
+    }
+    for (index, message) in conversation.iter().enumerate() {
+        let expected = if index.is_multiple_of(2) {
+            ReplyRole::User
+        } else {
+            ReplyRole::Assistant
+        };
+        if message.role != expected {
+            return Err(ProviderError::InvalidRequest(
+                "request roles must alternate user and assistant",
+            ));
+        }
+    }
+
+    let mut total_bytes = 0usize;
+    for message in &request.messages {
+        let valid = match message.role {
+            ReplyRole::Assistant => protocol::validate_assistant_message(&message.content),
+            ReplyRole::System | ReplyRole::User => {
+                protocol::validate_user_message(&message.content)
+            }
+        };
+        if valid.is_err() {
+            return Err(ProviderError::InvalidRequest("invalid message content"));
+        }
+        total_bytes =
+            total_bytes
+                .checked_add(message.content.len())
+                .ok_or(ProviderError::InvalidRequest(
+                    "request content is too large",
+                ))?;
+        if total_bytes > REPLY_REQUEST_MAX_CONTENT_BYTES {
+            return Err(ProviderError::InvalidRequest(
+                "request content is too large",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Validates stable provider metadata before it can be copied into a queued
@@ -257,9 +385,10 @@ impl ReplyProvider for LocalFallbackProvider {
         &self.metadata
     }
 
-    fn reply(&self, _request: ReplyRequest) -> ReplyFuture<'_> {
+    fn reply(&self, request: ReplyRequest) -> ReplyFuture<'_> {
         let provider = self.metadata.clone();
         Box::pin(async move {
+            validate_reply_request(&request)?;
             Ok(ReplyResponse {
                 content: "Your message was saved, but no model provider is configured.".to_owned(),
                 finish_reason: Some("local_fallback".to_owned()),
@@ -272,6 +401,24 @@ impl ReplyProvider for LocalFallbackProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn turn(
+        ordinal: u64,
+        status: SessionTurnStatus,
+        user: impl Into<String>,
+        assistant: Option<String>,
+    ) -> SessionTurn {
+        SessionTurn {
+            id: format!("turn-{ordinal}"),
+            session_id: "session-context".into(),
+            ordinal,
+            status,
+            user_message: user.into(),
+            assistant_message: assistant,
+            started_at: "2026-08-27T00:00:00.000Z".into(),
+            completed_at: Some("2026-08-27T00:00:01.000Z".into()),
+        }
+    }
 
     fn response(content: String) -> ReplyResponse {
         ReplyResponse {
@@ -331,5 +478,90 @@ mod tests {
         assert!(
             serde_json::to_vec(&response).unwrap().len() <= REPLY_RESPONSE_MAX_SERIALIZED_BYTES
         );
+    }
+
+    #[test]
+    fn session_history_becomes_chronological_provider_context() {
+        let turns = vec![
+            turn(1, SessionTurnStatus::Flushed, "first", Some("one".into())),
+            turn(2, SessionTurnStatus::Interrupted, "failed", None),
+            turn(3, SessionTurnStatus::Flushed, "second", Some("two".into())),
+        ];
+
+        let request = ReplyRequest::from_session_history(&turns, "third").unwrap();
+        assert_eq!(
+            request.messages,
+            vec![
+                ReplyMessage::new(ReplyRole::User, "first"),
+                ReplyMessage::new(ReplyRole::Assistant, "one"),
+                ReplyMessage::new(ReplyRole::User, "second"),
+                ReplyMessage::new(ReplyRole::Assistant, "two"),
+                ReplyMessage::new(ReplyRole::User, "third"),
+            ]
+        );
+    }
+
+    #[test]
+    fn session_history_is_bounded_to_the_latest_complete_pairs() {
+        let turns = (0..40)
+            .map(|ordinal| {
+                turn(
+                    ordinal,
+                    SessionTurnStatus::Flushed,
+                    format!("user-{ordinal}"),
+                    Some(format!("assistant-{ordinal}")),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let request = ReplyRequest::from_session_history(&turns, "current").unwrap();
+        assert_eq!(request.messages.len(), REPLY_REQUEST_MAX_MESSAGES - 1);
+        assert_eq!(request.messages[0].content, "user-9");
+        assert_eq!(request.messages.last().unwrap().content, "current");
+    }
+
+    #[test]
+    fn legacy_oversized_history_is_skipped_without_stranding_a_new_turn() {
+        let turns = vec![
+            turn(1, SessionTurnStatus::Flushed, "kept", Some("answer".into())),
+            turn(
+                2,
+                SessionTurnStatus::Flushed,
+                "x".repeat(protocol::USER_MESSAGE_MAX_BYTES + 1),
+                Some("legacy".into()),
+            ),
+        ];
+
+        let request = ReplyRequest::from_session_history(&turns, "continue").unwrap();
+        assert_eq!(
+            request.messages,
+            vec![
+                ReplyMessage::new(ReplyRole::User, "kept"),
+                ReplyMessage::new(ReplyRole::Assistant, "answer"),
+                ReplyMessage::new(ReplyRole::User, "continue"),
+            ]
+        );
+    }
+
+    #[test]
+    fn provider_requests_reject_non_conversational_role_shapes() {
+        let adjacent_users = ReplyRequest::new([
+            ReplyMessage::new(ReplyRole::User, "one"),
+            ReplyMessage::new(ReplyRole::User, "two"),
+        ]);
+        assert!(validate_reply_request(&adjacent_users).is_err());
+
+        let assistant_last = ReplyRequest::new([
+            ReplyMessage::new(ReplyRole::System, "Be concise"),
+            ReplyMessage::new(ReplyRole::User, "question"),
+            ReplyMessage::new(ReplyRole::Assistant, "answer"),
+        ]);
+        assert!(validate_reply_request(&assistant_last).is_err());
+
+        let valid = ReplyRequest::new([
+            ReplyMessage::new(ReplyRole::System, "Be concise"),
+            ReplyMessage::new(ReplyRole::User, "question"),
+        ]);
+        assert!(validate_reply_request(&valid).is_ok());
     }
 }

@@ -13,7 +13,8 @@ use zeroize::Zeroizing;
 
 use crate::{
     ProviderError, ProviderMetadata, ReplyFuture, ReplyKind, ReplyMessage, ReplyProvider,
-    ReplyRequest, ReplyResponse, validate_provider_metadata, validate_reply_response,
+    ReplyRequest, ReplyResponse, validate_provider_metadata, validate_reply_request,
+    validate_reply_response,
 };
 
 /// Default deadline for connection, upload, and response download.
@@ -133,7 +134,7 @@ impl OpenAiCompatibleProvider {
     }
 
     async fn request(&self, request: ReplyRequest) -> Result<ReplyResponse, ProviderError> {
-        validate_request(&request)?;
+        validate_reply_request(&request)?;
         let wire_request = ChatCompletionRequest {
             model: &self.model,
             messages: &request.messages,
@@ -257,24 +258,6 @@ impl ReplyProvider for OpenAiCompatibleProvider {
     fn reply(&self, request: ReplyRequest) -> ReplyFuture<'_> {
         Box::pin(self.request(request))
     }
-}
-
-fn validate_request(request: &ReplyRequest) -> Result<(), ProviderError> {
-    if request.messages.is_empty() {
-        return Err(ProviderError::InvalidRequest(
-            "at least one message is required",
-        ));
-    }
-    if request
-        .messages
-        .iter()
-        .any(|message| message.content.trim().is_empty())
-    {
-        return Err(ProviderError::InvalidRequest(
-            "message content must not be blank",
-        ));
-    }
-    Ok(())
 }
 
 fn map_transport_error(error: reqwest::Error) -> ProviderError {

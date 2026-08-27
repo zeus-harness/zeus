@@ -108,7 +108,7 @@ normal 和 low-memory 都必须在 fresh volume 上完成：
 8. 重启后 `configured=true`，原 auth session、Session、turn 和 reply 仍可读取；
 9. 重启后的 readiness、inspect 与 cgroup 约束仍全部成立。
 
-启动与 readiness 会检查 exact schema v15、migration、trigger/index、foreign key、ledger 和容量
+启动与 readiness 会检查 exact schema v16、migration、trigger/index、foreign key、ledger 和容量
 完整性。当前 runtime 镜像不携带 SQLite CLI；在增加受支持的离线数据库检查命令前，不把容器外
 临时安装 `sqlite3` 的结果当作本门禁前提。
 

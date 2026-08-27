@@ -87,6 +87,13 @@ ZEUS_LLM_API_KEY=your-secret
 Partial provider configuration fails startup. The endpoint and key are never
 writable through the browser Settings API.
 
+Each accepted turn builds the provider request from the newest complete,
+flushed user/assistant pairs that existed at the submitted
+`expected_sequence`, followed by the new user message. The request is bounded
+to 31 prior pairs and 64 KiB of total UTF-8 message content, then persisted in
+the immutable reply job. Retries therefore reuse the originally admitted
+context rather than rebuilding it from newer Session state.
+
 SQLite logical-capacity defaults can be reduced for local tests or raised only
 up to the compiled hard ceiling. Explicit values must be non-empty unsigned
 decimal integers; zero, non-UTF-8, actor values above their account value,
@@ -438,6 +445,9 @@ and bounded memory, CPU, and PID resources.
 - Starting a turn requires the expected Session sequence. It atomically creates
   the open turn, appends `user_message`, advances the Session to `running`,
   stores the actor-scoped response receipt, and enqueues immutable reply work.
+  That work contains a bounded provider request assembled from complete
+  historical turns through the submitted sequence plus the new user message;
+  interrupted or otherwise unflushed turns never enter model context.
 - The worker commits a `started` checkpoint before calling a provider. Success
   atomically stores the assistant message, appends `assistant_message` and
   `turn_flushed`, marks the job succeeded, and returns the Session to `ready`.
@@ -515,7 +525,9 @@ and bounded memory, CPU, and PID resources.
   and actor, and revalidates both dispatch subjects before worker claim. The
   product-level member login gate remains closed in v14. Schema v15 adds
   one-time member setup tokens, revisioned lifecycle transitions, account audit
-  state, and the final capability-gated member surface.
+  state, and the final capability-gated member surface. Schema v16 adds the
+  partial Session-event index used to read only the newest complete reply
+  context pairs at an immutable ledger boundary.
   Existing Runs and events are decoded, validated, and migrated in place without
   rewriting their payloads. Runtime identity still binds profile, environment,
   primary Session and Run, policy ID, and policy revision; a mismatch fails
@@ -660,7 +672,7 @@ directly.
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Current schema v15 retains durable Run attachment during migration and demo
+Current schema v16 retains durable Run attachment during migration and demo
 seeding, but Alpha+ does not expose a public attach-Run HTTP route.
 
 The application boundary now caps auth JSON at 8 KiB and command JSON at
@@ -680,7 +692,7 @@ approval, dispatch, reply completion, attachment checks, and startup recovery
 use typed point queries or fixed 64-row batches. Production Session list/detail,
 Run detail, and overview reads now use indexed `LIMIT + 1` keyset pages inside
 actor-authorized SQLite snapshots; no production HTTP read loads a complete
-ledger or collection. Current schema v15 retains bounded Session, open-turn,
+ledger or collection. Current schema v16 retains bounded Session, open-turn,
 active reply/dispatch, auth-session, bootstrap-audit, event-slot, and logical
 event-payload-byte admission. Exact idempotent replay is checked before capacity,
 while accepted work consumes its reserved terminal slots and payload bytes
@@ -758,13 +770,14 @@ Payload Envelope, Bounded Event Feed, Point-query Durable Context, Bounded Read
 Models, SQLite Capacity Slice 2, the SQLite Physical Capacity Slice, and the
 SQLite Operation Capacity Slice, Bootstrap Audit Retention, schema v13 Account
 Membership Foundation, schema v14 Account-scoped Durable Authorization, and
-schema v15 Member Lifecycle / Account Audit host verification:
+schema v15 Member Lifecycle / Account Audit plus schema v16 Session Reply
+Context Index host verification:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --all-features`: 342 tests passed under
-  the existing project counting convention, including 174 storage tests, 33
-  runtime tests, 51 API library tests, 6 API main/config tests, and the real
+- `cargo test --workspace --all-targets --all-features`: 348 tests passed under
+  the existing project counting convention, including 175 storage tests, 33
+  runtime tests, 52 API library tests, 6 API main/config tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,
   body/field/idempotency boundaries, atomic login limits, SSE lease capacity,

@@ -4,7 +4,7 @@
 Event Feed、Point-query Durable Context、Bounded Read Models、SQLite Capacity Slice 2、SQLite
 Physical/Operation Capacity、Bootstrap Audit Retention、schema v13 Account Membership
 Foundation、schema v14 Account-scoped Durable Authorization 与 schema v15 Member Lifecycle /
-Account Audit 已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
+Account Audit、schema v16 Session Reply Context Index 已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
 v11→v12→v13→v14 迁移证据，current-image 证据见本节验收结果，Linux Docker PID/OOM
 authoritative gate 待完成。
 
@@ -201,6 +201,11 @@ POST /sessions/{id}/turns
 
 安全与恢复规则：
 
+- 每次接受 turn 时，以请求中的 `expected_sequence` 为历史边界，只读取已经完整 flush 的
+  user/assistant 对，再追加当前 user message。上下文保留最新至多 31 对历史消息，总 UTF-8
+  内容不超过 64 KiB；interrupted 或尚未 flush 的 turn 不进入模型上下文。
+- 组装后的 provider request 随 immutable `reply_job` 持久化。相同命令的迟到重试返回首次
+  接受的 durable job，不根据 Session 的新状态重建上下文，也不会再次调用 provider。
 - Provider 调用前必须存在 durable `started` checkpoint。
 - `queued` job 可在重启后继续；`started` 且无持久结果的 job 变为 `outcome_unknown`，不得自动重放可能计费的模型请求。
 - Provider 失败必须形成明确的 durable failure/interrupted 状态，不能做空 flush，也不能伪造 assistant 成功。
@@ -245,6 +250,9 @@ POST /sessions/{id}/turns
   事务推进 membership revision、撤销 auth/setup token、返回已 claim 工作摘要并写入 audit。
   migration/readiness/deep integrity 校验 token、单调 sequence/hash、rollup/checkpoint 与 policy
   约束，完成后才开放 capability-gated member 路径。
+- `0016_session_reply_context_index.sql`：为 `assistant_message` Session event 增加 partial index，
+  使模型上下文按 `expected_sequence` 直接读取最新至多 31 个完整 user/assistant 对；合法的
+  assistant-less flush 被排除，查询不再收集完整 Session ledger。
 
 迁移必须原地保留 Alpha append-only ledger、事件外键与 runtime identity。任何一步失败都回滚整个 migration transaction。
 
@@ -330,10 +338,12 @@ POST /sessions/{id}/turns
   `memory.peak=98,201,600`、Zeus RSS 9,824 KiB、`pids.current=6`，`memory.events` 为
   `oom=0`、`oom_kill=0`。该历史验证证明 migration/reopen 与当时仍关闭的 member 产品 gate；Apple
   `pids.max=max`，不是 PID-limit 保证。
-- 当前 schema v15 镜像继续保留该 now-v14 volume；`up/verify/restart-verify` 通过 v14→v15 原地
+- 最近一次容器证据仍是 schema v15 镜像：它继续保留该 now-v14 volume，并通过 v14→v15 原地
   migration、再次打开与 `configured=false` 恢复。API 仍为 2 CPU/1 GiB，记录的
   `memory.current=80,617,472`、`memory.peak=99,479,552`、Zeus RSS 10,252 KiB、
   `pids.current=7`，OOM/kill 为 0。
+- schema v16 的 reply-context index 已通过主机 migration、readiness、query-plan 与多轮上下文
+  测试；尚未把上述历史容器证据改写为 v16 运行证据。
 - fresh `zeus-audit-acceptance` 在端口 `18090` 以 detail 2、每 account ceiling 8、progress reserve 2
   实测 member setup/reply、owner-only 403、checkpoint、legal-hold 507、普通容量拒绝、disable reserve、
   session revocation、完整 export manifest 与 hold release；浏览器验证 New Session、消息回复、

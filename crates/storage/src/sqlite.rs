@@ -47,7 +47,7 @@ use crate::{
     UpdateAccountAuditPolicyCommit,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 15;
+const CURRENT_SCHEMA_VERSION: i64 = 16;
 const LOCAL_ACCOUNT_ID: &str = "acc_local";
 const EVENT_PAYLOAD_VERSION_V1: i64 = 1;
 const EVENT_PAYLOAD_VERSION_V2: i64 = 2;
@@ -69,6 +69,7 @@ const MIGRATION_0013: &str = include_str!("../migrations/0013_account_membership
 const MIGRATION_0014: &str =
     include_str!("../migrations/0014_account_scoped_durable_authorization.sql");
 const MIGRATION_0015: &str = include_str!("../migrations/0015_member_lifecycle_account_audit.sql");
+const MIGRATION_0016: &str = include_str!("../migrations/0016_session_reply_context_index.sql");
 const RECOVERY_BATCH_LIMIT: i64 = 64;
 const AUTH_SESSION_CLEANUP_BATCH_LIMIT: i64 = 64;
 const BOOTSTRAP_AUDIT_ROLLUP_BATCH_LIMIT: i64 = 64;
@@ -491,6 +492,34 @@ impl SqliteStore {
         .await
     }
 
+    /// Returns the newest complete conversation turns visible at an immutable
+    /// Session ledger boundary.
+    ///
+    /// `through_sequence` is the caller's pre-command `expected_sequence`.
+    /// Reading against that historical boundary lets an idempotent retry
+    /// rebuild the exact same provider request after the original turn has
+    /// already advanced the live Session head.
+    pub async fn session_reply_turns_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        through_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionTurn>, StorageError> {
+        let context = validated_authz_context(context)?;
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        self.with_connection(move |connection| {
+            query_session_reply_turns_for_actor(
+                connection,
+                &context,
+                &session_id,
+                through_sequence,
+                limit,
+            )
+        })
+        .await
+    }
+
     /// Returns one projection after checking its durable event tail in the
     /// same read transaction. Unlike session detail, this never loads turns,
     /// attachments, or the complete event ledger.
@@ -761,8 +790,9 @@ impl SqliteStore {
     /// Atomically persists the user turn and its provider work item.
     ///
     /// Replaying the same idempotency key returns the original turn and queue
-    /// record. Changing either the turn request or immutable job input is an
-    /// idempotency conflict.
+    /// record. Changing the client turn request or stable provider/job identity
+    /// is an idempotency conflict; regenerated server context never replaces
+    /// the first durable `request_json`.
     /// System/test-only legacy write. Authenticated paths must use
     /// [`Self::start_turn_and_enqueue_reply_for_actor`].
     pub async fn start_turn_and_enqueue_reply(
@@ -2647,6 +2677,13 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
             params![15, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 16 {
+        transaction.execute_batch(MIGRATION_0016)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![16, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
     validate_configured_account_audit_policies(&transaction, limits)?;
     compact_existing_bootstrap_audit_to_capacity(&transaction, &now(), limits)?;
     transaction.commit()?;
@@ -3374,12 +3411,13 @@ fn readiness(
                'runs_account_incident_idx',
                'member_setup_tokens_expiry_idx',
                'account_audit_events_hash_idx',
-               'account_audit_events_time_idx'
+               'account_audit_events_time_idx',
+               'session_events_reply_context_idx'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if point_query_indexes != 39 {
+    if point_query_indexes != 40 {
         return Err(StorageError::CorruptData(
             "one or more point-query indexes are missing".into(),
         ));
@@ -8602,6 +8640,7 @@ fn create_session(
             idempotency_key,
             "create_session",
             &fingerprint,
+            None,
         )?,
         None => load_session_command_receipt::<CreateSessionResponse>(
             &transaction,
@@ -8721,6 +8760,7 @@ fn attach_run(
             idempotency_key,
             "attach_run",
             &fingerprint,
+            None,
         )?,
         None => load_session_command_receipt::<AttachRunResponse>(
             &transaction,
@@ -8872,9 +8912,17 @@ fn start_turn(
             return Err(StorageError::SessionNotFound(session_id.to_owned()));
         }
     }
-    let fingerprint = match &reply_job {
-        Some(job) => reply_start_fingerprint(session_id, &request, job)?,
-        None => session_command_fingerprint(Some(session_id), &request)?,
+    let (fingerprint, legacy_fingerprint) = match &reply_job {
+        Some(job) => (
+            reply_start_fingerprint(session_id, &request, job)?,
+            Some(legacy_reply_start_fingerprint_v1(
+                session_id, &request, job,
+            )?),
+        ),
+        None => (
+            session_command_fingerprint(Some(session_id), &request)?,
+            None,
+        ),
     };
     let stored_response = match authz {
         Some(context) => load_session_command_receipt_for_actor::<StartTurnResponse>(
@@ -8883,6 +8931,7 @@ fn start_turn(
             idempotency_key,
             "start_turn",
             &fingerprint,
+            legacy_fingerprint.as_deref(),
         )?,
         None => load_session_command_receipt::<StartTurnResponse>(
             &transaction,
@@ -9587,6 +9636,7 @@ fn flush_turn(
             idempotency_key,
             "flush_turn",
             &fingerprint,
+            None,
         )?,
         None => load_session_command_receipt::<FlushSessionResponse>(
             &transaction,
@@ -9812,6 +9862,7 @@ fn resume_session(
             idempotency_key,
             "resume_session",
             &fingerprint,
+            None,
         )?,
         None => load_session_command_receipt::<ResumeSessionResponse>(
             &transaction,
@@ -10243,12 +10294,14 @@ fn require_open_reply_turn(
 }
 
 fn require_reply_job_matches_spec(job: &ReplyJob, spec: &ReplyJobSpec) -> Result<(), StorageError> {
+    // request_json is server-derived durable context. On idempotent replay the
+    // stored job remains authoritative so an upgraded context builder cannot
+    // turn a lost response into a conflict.
     if job.id != spec.id
         || job.account_id != spec.authz.account_id
         || job.actor_user_id != spec.authz.user_id
         || job.provider_name != spec.provider_name
         || job.model_name != spec.model_name
-        || job.request_json != spec.request_json
     {
         return Err(StorageError::IdempotencyConflict);
     }
@@ -10489,6 +10542,75 @@ fn query_session_turn_for_actor(
     Ok(turn)
 }
 
+fn query_session_reply_turns_for_actor(
+    connection: &mut Connection,
+    context: &AuthzContext,
+    session_id: &str,
+    through_sequence: u64,
+    limit: usize,
+) -> Result<Vec<SessionTurn>, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    // Authorization deliberately precedes sequence and limit checks so a
+    // foreign Session cannot become a history-boundary oracle.
+    require_active_session_actor(&transaction, session_id, context)?;
+    let session = query_session_summary(&transaction, session_id)?;
+    validate_session_event_tail(&transaction, &session)?;
+    validate_active_turn_projection(&transaction, &session)?;
+    if through_sequence > session.sequence {
+        return Err(StorageError::ConcurrentModification);
+    }
+    if limit == 0 || limit > COLLECTION_PAGE_MAX_LIMIT {
+        return Err(StorageError::InvalidPageLimit {
+            limit,
+            max: COLLECTION_PAGE_MAX_LIMIT,
+        });
+    }
+    let through_sequence = u64_to_i64(through_sequence, "reply context sequence")?;
+    let limit = capacity_limit(limit)?;
+    // The partial index contains only assistant events, so legacy
+    // assistant-less flushes never become scan candidates. Joining the
+    // immediately following flush proves the pair was complete at this
+    // historical boundary while LIMIT can stop the index scan after `limit`
+    // complete pairs.
+    let mut statement = transaction.prepare(
+        r#"SELECT turn.id, turn.session_id, turn.ordinal, turn.status,
+                  turn.user_message, turn.assistant_message,
+                  turn.started_at, turn.completed_at
+           FROM session_events AS assistant
+           JOIN session_events AS flushed
+             ON flushed.session_id = assistant.session_id
+            AND flushed.sequence = assistant.sequence + 1
+            AND flushed.turn_id = assistant.turn_id
+            AND flushed.event_kind = 'turn_flushed'
+           JOIN session_turns AS turn
+             ON turn.session_id = assistant.session_id
+            AND turn.id = assistant.turn_id
+           WHERE assistant.session_id = ?1
+             AND assistant.sequence < ?2
+             AND assistant.event_kind = 'assistant_message'
+             AND assistant.turn_id IS NOT NULL
+             AND flushed.sequence <= ?2
+             AND turn.status = 'flushed'
+             AND turn.assistant_message IS NOT NULL
+           ORDER BY assistant.sequence DESC
+           LIMIT ?3"#,
+    )?;
+    let stored = statement
+        .query_map(
+            params![session_id, through_sequence, limit],
+            decode_session_turn_row,
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    let mut turns = stored
+        .into_iter()
+        .map(StoredSessionTurnRow::decode)
+        .collect::<Result<Vec<_>, _>>()?;
+    turns.reverse();
+    transaction.commit()?;
+    Ok(turns)
+}
+
 fn decode_session_turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredSessionTurnRow> {
     Ok(StoredSessionTurnRow {
         id: row.get(0)?,
@@ -10709,7 +10831,35 @@ fn reply_start_fingerprint(
             "id": job.id,
             "provider_name": job.provider_name,
             "model_name": job.model_name,
-            "request_json": job.request_json,
+        },
+    }))?)
+}
+
+/// Compatibility fingerprint emitted before durable multi-turn context.
+///
+/// The old API always persisted exactly one user message. Accepting this
+/// shape on replay lets an in-flight client cross the upgrade boundary while
+/// all newly written receipts use the server-derived-context-independent
+/// fingerprint above.
+fn legacy_reply_start_fingerprint_v1(
+    session_id: &str,
+    request: &StartTurnRequest,
+    job: &ReplyJobSpec,
+) -> Result<String, StorageError> {
+    let request_json = json!({
+        "messages": [{
+            "role": "user",
+            "content": request.user_message,
+        }],
+    });
+    Ok(serde_json::to_string(&json!({
+        "session_id": session_id,
+        "request": request,
+        "reply_job": {
+            "id": job.id,
+            "provider_name": job.provider_name,
+            "model_name": job.model_name,
+            "request_json": request_json,
         },
     }))?)
 }
@@ -10767,6 +10917,7 @@ fn load_session_command_receipt_for_actor<T: DeserializeOwned>(
     idempotency_key: &str,
     operation: &str,
     request_fingerprint: &str,
+    compatible_fingerprint: Option<&str>,
 ) -> Result<Option<T>, StorageError> {
     let stored = connection
         .query_row(
@@ -10786,7 +10937,9 @@ fn load_session_command_receipt_for_actor<T: DeserializeOwned>(
     let Some((stored_fingerprint, response_json)) = stored else {
         return Ok(None);
     };
-    if stored_fingerprint != request_fingerprint {
+    if stored_fingerprint != request_fingerprint
+        && compatible_fingerprint != Some(stored_fingerprint.as_str())
+    {
         return Err(StorageError::IdempotencyConflict);
     }
     let value: Value = serde_json::from_str(&response_json)?;
