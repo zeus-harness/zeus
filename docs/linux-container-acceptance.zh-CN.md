@@ -198,6 +198,7 @@ CI 应分别执行 normal 与 low-memory profile，并在成功或失败时都�
 project。仅有 Compose 静态解析、镜像 build 或 Apple `container` 结果，都不能替代 Linux live
 gate。
 
-Linux live gate 完成后，路线图的下一项才是 `v16 Trusted Single-Node Ingress`：canonical HTTPS
-origin、可信代理 client IP、强制 Secure Cookie 和同源公网入口。多 account 和多 API 副本继续
-属于更后的控制面与分布式权威阶段。
+`Trusted Single-Node Ingress` 的主机代码已独立落地：canonical HTTPS origin、可信代理 CIDR、
+严格单跳 client IP、强制 Secure Cookie 和同源公网入口。这里的 Linux live gate 仍是独立的部署
+验收项，不能由主机单元/路由测试替代；多 account 和多 API 副本继续属于更后的控制面与分布式
+权威阶段。

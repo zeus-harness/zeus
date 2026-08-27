@@ -334,11 +334,12 @@ schema v15 当前已完成的证据：
 provider 配置、tool policy、approval 与 connector dispatch 仍保持 owner-only。Apple
 `pids.max=max`，上述证据不是 Linux PID-limit/OOM authoritative acceptance。
 
-共享网络部署还必须另行完成 TLS/canonical origin、trusted proxy、Secure cookie、per-account
-provider secret/计费隔离与 Linux Docker PID/OOM gate；membership 完成本身不等于可以暴露到
-公网。
+single-node trusted ingress 的主机契约已实现 canonical HTTPS origin、trusted proxy CIDR、严格
+client IP 和强制 Secure Cookie；共享网络部署仍须独立证明真实 TLS/proxy 配置、listener 网络
+隔离、per-account provider secret/计费隔离与 Linux PID/OOM gate。membership 或主机测试本身
+都不等于可以直接暴露到公网。
 
 Linux PID/OOM gate 的独立 release-runtime Compose、normal/low-memory verifier 和 CI 证据契约
 已经落地，详见 `docs/linux-container-acceptance.zh-CN.md`；当前主机没有 Docker CLI，真实 Linux
-job 尚未运行，因此仍不得声明该 gate 已通过。该 gate 完成后先进入 single-node trusted ingress，
-而不是直接放开多 account 或多 API 副本。
+job 尚未运行，因此仍不得声明该 gate 已通过。single-node trusted ingress 与该部署 gate 相互
+独立；两者都不能直接放开多 account 或多 API 副本。

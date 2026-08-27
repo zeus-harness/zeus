@@ -5,7 +5,7 @@ Event Feed、Point-query Durable Context、Bounded Read Models、SQLite Capacity
 Physical/Operation Capacity、Bootstrap Audit Retention、schema v13 Account Membership
 Foundation、schema v14 Account-scoped Durable Authorization、schema v15 Member Lifecycle /
 Account Audit、schema v16 Session Reply Context Index 至 schema v25 Durable Session Context
-Compaction 已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
+Compaction，以及 Trusted Single-Node Ingress 主机代码已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
 v11→v12→v13→v14 迁移证据，current-image 证据见本节验收结果，Linux Docker PID/OOM
 authoritative gate 待完成。
 
@@ -28,17 +28,23 @@ Alpha+ 支持一个本地 `acc_local` account 内的 owner/member 协作：
 2. `POST /api/v1/auth/bootstrap` 使用 token、用户名和密码创建首位 owner，并在同一事务中认领 Alpha 遗留的 Session/Run。
 3. 密码使用 Argon2id PHC 字符串保存；不存在的用户名仍执行 dummy Argon2 校验，避免明显的用户名枚举时序差异。
 4. 登录返回 32-byte opaque session token。Cookie 为 `HttpOnly; SameSite=Strict; Path=/`；
-   浏览器入口为 HTTPS 时，部署必须显式设置 `ZEUS_COOKIE_SECURE=true` 才会附加 `Secure`。
-5. 写请求要求同一登录会话的 CSRF token，并校验 `Origin`/`Host`。SSE 使用同源 Cookie 鉴权。
+   direct ingress 由 `ZEUS_COOKIE_SECURE` 控制 `Secure`，trusted-proxy ingress 强制 session/CSRF
+   Cookie 都带 `Secure`，显式关闭会导致启动失败。
+5. 写请求要求同一登录会话的 CSRF token。direct ingress 校验 exact `Origin`/`Host`；
+   trusted-proxy ingress 校验 exact canonical HTTPS `ZEUS_PUBLIC_ORIGIN`，允许代理转向内部 Host。
+   SSE 使用同源 Cookie 鉴权。
 6. owner 创建 member 时只在一次响应中返回 32-byte opaque setup token；数据库保存域分离
    SHA-256 digest 和 24 小时过期时间。member 用 token 设置密码并登录，token 过期、轮换、重用
    或猜错都统一失败且不泄露状态。
 7. 未登录业务 REST/SSE 返回 `401`。member 可使用 Session/Run 与 reply，不能 approval、
    connector dispatch、成员管理或 audit 管理。
-8. bootstrap/login/member setup 在 Argon2 前按真实 TCP peer 和全局固定窗口限速；login 另按
-   canonical account 限速，setup token 不作为 rate-limit map key，避免持久化攻击者输入；
-   默认不信任 `Forwarded`/`X-Forwarded-For`。登录默认每分钟 global/source/account
-   为 60/10/5，bootstrap 为 10/3；超限统一返回带 `Retry-After` 的 `429`。
+8. bootstrap/login/member setup 在 Argon2 前按有效 client IP 和全局固定窗口限速；login 另按
+   canonical account 限速，setup token 不作为 rate-limit map key，避免持久化攻击者输入。
+   direct ingress 的有效地址始终是真实 TCP peer，并忽略 proxy header；只有同时配置 canonical
+   `ZEUS_PUBLIC_ORIGIN` 与 canonical `ZEUS_TRUSTED_PROXY_CIDRS` 时，allowlist 内 peer 提供的唯一
+   `Forwarded: for=<client-ip>;proto=https;host=<public-authority>` 才是权威。登录默认每分钟
+   global/source/account 为 60/10/5，bootstrap 为 10/3；IPv4 使用裸 `for`，IPv6 使用带双引号的
+   `[address]`；超限统一返回带 `Retry-After` 的 `429`。
 
 Health 路由保持公开。公开注册、邮件找回、OAuth/SSO、WebAuthn 不属于本阶段。
 
@@ -356,7 +362,9 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
 ## 7. Alpha+ 验收门槛
 
 - 首次 bootstrap 只能成功一次，token 过期/重用均失败。
-- 登录、登出、过期、禁用用户、CSRF、Origin 和 Cookie 属性有自动测试。
+- 登录、登出、过期、禁用用户、CSRF、Origin 和 Cookie 属性有自动测试；trusted ingress 的
+  CIDR allowlist、IPv4/IPv6 client IP、单跳 `Forwarded`、canonical public origin、强制 Secure
+  Cookie、伪造/歧义拒绝和真实 source-limit 分桶也有自动测试。
 - owner/member capability 门槛和 Alice/Bob 的 REST、SSE、receipt collision 隔离有自动测试；
   未拥有资源统一为 `404`，member 普通 Session/Run/reply 成功而 approval/admin 为 `403`。
 - New Session 创建、切换和刷新后恢复通过浏览器测试，旧 SSE 会被关闭。
@@ -406,8 +414,8 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 按项目既有统计口径通过 565 个 Rust 测试（connectors 18、deployment 8、knowledge 29、
-  storage 248、runtime 48、API library 71、API main/config 6）与 28 个 Web Node 测试。
+- host 按项目既有统计口径通过 600 个 Rust 测试（connectors 22、deployment 8、knowledge 29、
+  storage 252、runtime 48、API library 79、API main/config 8）与 28 个 Web Node 测试。
 - `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 
 ## 8. 容器与 OOM 验收边界

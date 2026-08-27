@@ -4,6 +4,7 @@ use llm::{LocalFallbackProvider, OpenAiCompatibleProvider, ReplyProvider};
 use runtime::{DemoStore, SqliteOperationLimits, SqlitePhysicalLimits, StorageLimits};
 use tenancy::BootstrapToken;
 use tokio::sync::oneshot;
+use zeus_api::IngressPolicy;
 
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const BOOTSTRAP_TOKEN_TTL: chrono::Duration = chrono::Duration::minutes(15);
@@ -17,6 +18,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let storage_limits = configured_storage_limits()?;
     let physical_limits = configured_sqlite_physical_limits()?;
     let operation_limits = configured_sqlite_operation_limits()?;
+    let ingress = configured_ingress_policy()?;
+    let ingress_mode = ingress.mode_name();
+    let public_origin = ingress.public_origin().unwrap_or("direct peer").to_owned();
     let store = match profile.as_str() {
         "production-guarded" => {
             DemoStore::open_with_limits_and_physical_and_operations(
@@ -79,14 +83,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bootstrap.expose_secret()
         );
     }
-    let cookie_secure = environment_flag("ZEUS_COOKIE_SECURE", false)?;
     let reply_provider = configured_reply_provider()?;
     let reply_provider_id = reply_provider.metadata().provider_id.clone();
     let listener = tokio::net::TcpListener::bind(address).await?;
-    let app = zeus_api::authenticated_app_with_provider(store, cookie_secure, reply_provider)?;
+    let app =
+        zeus_api::authenticated_app_with_provider_and_ingress(store, ingress, reply_provider)?;
 
     println!(
-        "zeus-api listening on http://{address} with profile {profile}, reply provider {reply_provider_id}, and SQLite at {database_path}"
+        "zeus-api listening on http://{address} with profile {profile}, ingress {ingress_mode} ({public_origin}), reply provider {reply_provider_id}, and SQLite at {database_path}"
     );
     serve_with_bounded_shutdown(listener, app).await?;
     Ok(())
@@ -407,9 +411,20 @@ async fn serve_with_bounded_shutdown(
     }
 }
 
-fn environment_flag(name: &str, default: bool) -> Result<bool, io::Error> {
-    let Ok(value) = std::env::var(name) else {
-        return Ok(default);
+fn parse_environment_flag(
+    name: &str,
+    value: Result<String, std::env::VarError>,
+    default: bool,
+) -> Result<bool, io::Error> {
+    let value = match value {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} must be valid UTF-8"),
+            ));
+        }
     };
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
@@ -417,6 +432,58 @@ fn environment_flag(name: &str, default: bool) -> Result<bool, io::Error> {
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{name} must be a boolean flag"),
+        )),
+    }
+}
+
+fn configured_ingress_policy() -> Result<IngressPolicy, io::Error> {
+    parse_ingress_policy(
+        std::env::var("ZEUS_PUBLIC_ORIGIN"),
+        std::env::var("ZEUS_TRUSTED_PROXY_CIDRS"),
+        std::env::var("ZEUS_COOKIE_SECURE"),
+    )
+}
+
+fn parse_ingress_policy(
+    public_origin: Result<String, std::env::VarError>,
+    trusted_proxies: Result<String, std::env::VarError>,
+    cookie_secure: Result<String, std::env::VarError>,
+) -> Result<IngressPolicy, io::Error> {
+    let public_origin = exact_optional_environment("ZEUS_PUBLIC_ORIGIN", public_origin)?;
+    let trusted_proxies = exact_optional_environment("ZEUS_TRUSTED_PROXY_CIDRS", trusted_proxies)?;
+    match (public_origin, trusted_proxies) {
+        (None, None) => Ok(IngressPolicy::direct(parse_environment_flag(
+            "ZEUS_COOKIE_SECURE",
+            cookie_secure,
+            false,
+        )?)),
+        (Some(public_origin), Some(trusted_proxies)) => {
+            if !parse_environment_flag("ZEUS_COOKIE_SECURE", cookie_secure, true)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "ZEUS_COOKIE_SECURE cannot be disabled when trusted ingress is configured",
+                ));
+            }
+            IngressPolicy::trusted_proxy_csv(public_origin, &trusted_proxies)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ZEUS_PUBLIC_ORIGIN and ZEUS_TRUSTED_PROXY_CIDRS must be set together",
+        )),
+    }
+}
+
+fn exact_optional_environment(
+    name: &str,
+    value: Result<String, std::env::VarError>,
+) -> Result<Option<String>, io::Error> {
+    match value {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be valid UTF-8"),
         )),
     }
 }
@@ -449,7 +516,7 @@ async fn shutdown_signal() {
 mod tests {
     use super::{
         parse_environment_capacity, parse_environment_capacity_with_legacy_alias,
-        parse_environment_u64,
+        parse_environment_flag, parse_environment_u64, parse_ingress_policy,
     };
     use std::{env::VarError, io};
 
@@ -462,6 +529,79 @@ mod tests {
         assert_eq!(
             parse_environment_capacity("ZEUS_TEST_LIMIT", Ok("23".into()), 17).unwrap(),
             23
+        );
+    }
+
+    #[test]
+    fn trusted_ingress_environment_is_paired_and_forces_secure_cookies() {
+        let direct = parse_ingress_policy(
+            Err(VarError::NotPresent),
+            Err(VarError::NotPresent),
+            Err(VarError::NotPresent),
+        )
+        .unwrap();
+        assert_eq!(direct.mode_name(), "direct");
+        assert!(!direct.cookie_secure());
+
+        let trusted = parse_ingress_policy(
+            Ok("https://zeus.example.com".into()),
+            Ok("127.0.0.1/32".into()),
+            Err(VarError::NotPresent),
+        )
+        .unwrap();
+        assert_eq!(trusted.mode_name(), "trusted-proxy");
+        assert!(trusted.cookie_secure());
+
+        assert!(
+            parse_ingress_policy(
+                Ok("https://zeus.example.com".into()),
+                Err(VarError::NotPresent),
+                Err(VarError::NotPresent),
+            )
+            .is_err()
+        );
+        assert!(
+            parse_ingress_policy(
+                Ok("https://zeus.example.com".into()),
+                Ok("127.0.0.1/32".into()),
+                Ok("false".into()),
+            )
+            .is_err()
+        );
+        assert!(
+            parse_ingress_policy(
+                Err(VarError::NotPresent),
+                Ok("127.0.0.1/32".into()),
+                Err(VarError::NotPresent),
+            )
+            .is_err()
+        );
+        assert!(
+            parse_ingress_policy(
+                Ok(String::new()),
+                Ok(String::new()),
+                Err(VarError::NotPresent),
+            )
+            .is_err()
+        );
+        assert!(
+            parse_ingress_policy(
+                Err(VarError::NotUnicode("invalid".into())),
+                Ok("127.0.0.1/32".into()),
+                Err(VarError::NotPresent),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn boolean_environment_rejects_non_utf8_and_ambiguous_values() {
+        assert!(parse_environment_flag("FLAG", Ok(" yes ".into()), false).unwrap());
+        assert!(!parse_environment_flag("FLAG", Ok("OFF".into()), true).unwrap());
+        assert!(parse_environment_flag("FLAG", Ok("maybe".into()), false).is_err());
+        assert!(
+            parse_environment_flag("FLAG", Err(VarError::NotUnicode("invalid".into())), false,)
+                .is_err()
         );
     }
 

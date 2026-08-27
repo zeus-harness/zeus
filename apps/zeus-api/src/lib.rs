@@ -3,7 +3,9 @@
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
+    fmt,
     net::{IpAddr, SocketAddr},
+    str::FromStr,
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicU8, Ordering as AtomicOrdering},
@@ -117,6 +119,225 @@ const AGENT_TOOL_WORKER_HOLDER_ID: &str = "zeus-api-agent-tool";
 const WORKER_IDLE: u8 = 0;
 const WORKER_RUNNING: u8 = 1;
 const WORKER_PENDING: u8 = 2;
+const TRUSTED_PROXY_NETWORK_LIMIT: usize = 32;
+const PUBLIC_ORIGIN_MAX_BYTES: usize = 2 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IngressPolicy {
+    Direct { cookie_secure: bool },
+    TrustedProxy(TrustedProxyIngress),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrustedProxyIngress {
+    public_origin: String,
+    public_authority: String,
+    trusted_proxies: Vec<TrustedProxyNetwork>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TrustedProxyNetwork {
+    network: IpAddr,
+    prefix: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IngressConfigError(String);
+
+impl fmt::Display for IngressConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for IngressConfigError {}
+
+impl IngressPolicy {
+    pub fn direct(cookie_secure: bool) -> Self {
+        Self::Direct { cookie_secure }
+    }
+
+    pub fn trusted_proxy(
+        public_origin: impl Into<String>,
+        trusted_proxy_cidrs: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<Self, IngressConfigError> {
+        let public_origin = public_origin.into();
+        if public_origin.is_empty() || public_origin.len() > PUBLIC_ORIGIN_MAX_BYTES {
+            return Err(IngressConfigError(format!(
+                "public origin must contain between 1 and {PUBLIC_ORIGIN_MAX_BYTES} bytes"
+            )));
+        }
+        let uri = public_origin
+            .parse::<Uri>()
+            .map_err(|_| IngressConfigError("public origin is not a valid URI".into()))?;
+        if uri.scheme_str() != Some("https") || uri.path() != "/" || uri.query().is_some() {
+            return Err(IngressConfigError(
+                "public origin must be a canonical HTTPS origin without a path or query".into(),
+            ));
+        }
+        let authority = uri
+            .authority()
+            .ok_or_else(|| IngressConfigError("public origin has no authority".into()))?;
+        if authority.host().is_empty() || authority.as_str().contains('@') {
+            return Err(IngressConfigError(
+                "public origin must contain a host and cannot contain user information".into(),
+            ));
+        }
+        let port_suffix = authority
+            .as_str()
+            .strip_prefix(authority.host())
+            .ok_or_else(|| IngressConfigError("public origin authority is invalid".into()))?;
+        if let Some(raw_port) = port_suffix.strip_prefix(':') {
+            let port = raw_port.parse::<u16>().map_err(|_| {
+                IngressConfigError(
+                    "public origin port must be a canonical unsigned 16-bit value".into(),
+                )
+            })?;
+            if port == 0 || raw_port != port.to_string() {
+                return Err(IngressConfigError(
+                    "public origin port must be a canonical non-zero unsigned 16-bit value".into(),
+                ));
+            }
+            if port == 443 {
+                return Err(IngressConfigError(
+                    "public origin must omit the default HTTPS port".into(),
+                ));
+            }
+        } else if !port_suffix.is_empty() {
+            return Err(IngressConfigError(
+                "public origin authority has an invalid port delimiter".into(),
+            ));
+        }
+        let public_authority = authority.as_str().to_ascii_lowercase();
+        let canonical = format!("https://{public_authority}");
+        if public_origin != canonical {
+            return Err(IngressConfigError(format!(
+                "public origin must use the canonical form `{canonical}`"
+            )));
+        }
+
+        let mut trusted_proxies = Vec::new();
+        for cidr in trusted_proxy_cidrs {
+            if trusted_proxies.len() == TRUSTED_PROXY_NETWORK_LIMIT {
+                return Err(IngressConfigError(format!(
+                    "trusted proxy list cannot exceed {TRUSTED_PROXY_NETWORK_LIMIT} networks"
+                )));
+            }
+            let network = TrustedProxyNetwork::from_str(cidr.as_ref())?;
+            if trusted_proxies.contains(&network) {
+                return Err(IngressConfigError(
+                    "trusted proxy networks must be unique".into(),
+                ));
+            }
+            trusted_proxies.push(network);
+        }
+        if trusted_proxies.is_empty() {
+            return Err(IngressConfigError(
+                "trusted proxy mode requires at least one proxy CIDR".into(),
+            ));
+        }
+        Ok(Self::TrustedProxy(TrustedProxyIngress {
+            public_origin,
+            public_authority,
+            trusted_proxies,
+        }))
+    }
+
+    pub fn trusted_proxy_csv(
+        public_origin: impl Into<String>,
+        trusted_proxy_cidrs: &str,
+    ) -> Result<Self, IngressConfigError> {
+        if trusted_proxy_cidrs.is_empty() {
+            return Err(IngressConfigError(
+                "trusted proxy CIDR list cannot be empty".into(),
+            ));
+        }
+        let cidrs = trusted_proxy_cidrs.split(',').collect::<Vec<_>>();
+        if cidrs
+            .iter()
+            .any(|cidr| cidr.is_empty() || cidr.trim() != *cidr)
+        {
+            return Err(IngressConfigError(
+                "trusted proxy CIDRs must be comma-separated without whitespace".into(),
+            ));
+        }
+        Self::trusted_proxy(public_origin, cidrs)
+    }
+
+    pub fn cookie_secure(&self) -> bool {
+        match self {
+            Self::Direct { cookie_secure } => *cookie_secure,
+            Self::TrustedProxy(_) => true,
+        }
+    }
+
+    pub fn mode_name(&self) -> &'static str {
+        match self {
+            Self::Direct { .. } => "direct",
+            Self::TrustedProxy(_) => "trusted-proxy",
+        }
+    }
+
+    pub fn public_origin(&self) -> Option<&str> {
+        match self {
+            Self::Direct { .. } => None,
+            Self::TrustedProxy(config) => Some(&config.public_origin),
+        }
+    }
+}
+
+impl FromStr for TrustedProxyNetwork {
+    type Err = IngressConfigError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (address, prefix) = value.split_once('/').ok_or_else(|| {
+            IngressConfigError("trusted proxy entries must use CIDR notation".into())
+        })?;
+        let network = address
+            .parse::<IpAddr>()
+            .map_err(|_| IngressConfigError("trusted proxy CIDR has an invalid address".into()))?;
+        let prefix = prefix
+            .parse::<u8>()
+            .map_err(|_| IngressConfigError("trusted proxy CIDR has an invalid prefix".into()))?;
+        let canonical = match network {
+            IpAddr::V4(address) if prefix <= 32 => {
+                let mask = u32::MAX.checked_shl(u32::from(32 - prefix)).unwrap_or(0);
+                u32::from(address) & mask == u32::from(address)
+            }
+            IpAddr::V6(address) if prefix <= 128 => {
+                let mask = u128::MAX.checked_shl(u32::from(128 - prefix)).unwrap_or(0);
+                u128::from(address) & mask == u128::from(address)
+            }
+            _ => false,
+        };
+        if !canonical {
+            return Err(IngressConfigError(
+                "trusted proxy CIDR must use a canonical network address and valid prefix".into(),
+            ));
+        }
+        Ok(Self { network, prefix })
+    }
+}
+
+impl TrustedProxyNetwork {
+    fn contains(&self, candidate: IpAddr) -> bool {
+        match (self.network, candidate) {
+            (IpAddr::V4(network), IpAddr::V4(candidate)) => {
+                let mask = u32::MAX
+                    .checked_shl(u32::from(32 - self.prefix))
+                    .unwrap_or(0);
+                u32::from(network) == u32::from(candidate) & mask
+            }
+            (IpAddr::V6(network), IpAddr::V6(candidate)) => {
+                let mask = u128::MAX
+                    .checked_shl(u32::from(128 - self.prefix))
+                    .unwrap_or(0);
+                u128::from(network) == u128::from(candidate) & mask
+            }
+            _ => false,
+        }
+    }
+}
 
 #[derive(Default)]
 struct WorkerWakeState {
@@ -307,7 +528,7 @@ struct AuthConfig {
     authenticator: Arc<PasswordAuthenticator>,
     password_workers: Arc<Semaphore>,
     rate_limits: AuthRateLimits,
-    cookie_secure: bool,
+    ingress: IngressPolicy,
 }
 
 trait RateLimitClock: Send + Sync {
@@ -695,6 +916,9 @@ struct CurrentAuth {
     session_token_hash: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EffectiveClientIp(IpAddr);
+
 #[cfg(test)]
 #[derive(Clone)]
 struct TestRequestAuth {
@@ -806,7 +1030,19 @@ pub fn authenticated_app_with_provider(
     cookie_secure: bool,
     provider: Arc<dyn ReplyProvider>,
 ) -> Result<Router, tenancy::CredentialError> {
-    let auth = auth_config_with_clock(cookie_secure, Arc::new(SystemRateLimitClock))?;
+    authenticated_app_with_provider_and_ingress(
+        store,
+        IngressPolicy::direct(cookie_secure),
+        provider,
+    )
+}
+
+pub fn authenticated_app_with_provider_and_ingress(
+    store: DemoStore,
+    ingress: IngressPolicy,
+    provider: Arc<dyn ReplyProvider>,
+) -> Result<Router, tenancy::CredentialError> {
+    let auth = auth_config_with_clock(ingress, Arc::new(SystemRateLimitClock))?;
     let reply = Arc::new(ReplyExecutor::new(provider));
     let state = ApiState {
         store,
@@ -820,14 +1056,14 @@ pub fn authenticated_app_with_provider(
 }
 
 fn auth_config_with_clock(
-    cookie_secure: bool,
+    ingress: IngressPolicy,
     clock: Arc<dyn RateLimitClock>,
 ) -> Result<Arc<AuthConfig>, tenancy::CredentialError> {
     Ok(Arc::new(AuthConfig {
         authenticator: Arc::new(PasswordAuthenticator::new()?),
         password_workers: Arc::new(Semaphore::new(PASSWORD_WORKER_LIMIT)),
         rate_limits: AuthRateLimits::new(clock),
-        cookie_secure,
+        ingress,
     }))
 }
 
@@ -968,12 +1204,39 @@ fn build_authenticated_app(state: ApiState) -> Router {
         .merge(knowledge_admin)
         .merge(agent_prompt_admin)
         .fallback(not_found)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_ingress,
+        ))
         .with_state(state.clone());
+    #[cfg(test)]
+    let router = router.layer(middleware::from_fn(inject_test_connect_info));
     kick_reply_worker(&state);
     kick_agent_model_worker(&state);
     kick_compaction_worker(&state);
     kick_agent_tool_worker(&state);
     router
+}
+
+#[cfg(test)]
+async fn inject_test_connect_info(mut request: Request, next: Next) -> Response {
+    if request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .is_none()
+    {
+        let peer = request
+            .headers_mut()
+            .remove("x-zeus-test-peer")
+            .and_then(|value| value.to_str().ok()?.parse::<SocketAddr>().ok())
+            .unwrap_or_else(|| {
+                "127.0.0.1:41000"
+                    .parse::<SocketAddr>()
+                    .expect("test peer is valid")
+            });
+        request.extensions_mut().insert(ConnectInfo(peer));
+    }
+    next.run(request).await
 }
 
 #[cfg(test)]
@@ -1012,7 +1275,8 @@ async fn app_with_event_feed_options_and_auth(
         "the durable ledger poll interval must be positive"
     );
     let request_auth = configure_test_actor(&store).await;
-    let auth = auth_config_with_clock(false, Arc::new(SystemRateLimitClock)).unwrap();
+    let auth = auth_config_with_clock(IngressPolicy::direct(false), Arc::new(SystemRateLimitClock))
+        .unwrap();
     let state = ApiState {
         store,
         durable_ledger_poll_interval,
@@ -1197,11 +1461,11 @@ async fn auth_status(
 
 async fn bootstrap(
     State(state): State<ApiState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(source): Extension<EffectiveClientIp>,
     headers: HeaderMap,
     payload: Result<Json<BootstrapRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    enforce_same_origin(&headers)?;
+    enforce_same_origin(&headers, &auth_config(&state)?.ingress)?;
     if state.store.has_users().await? {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -1216,7 +1480,7 @@ async fn bootstrap(
     let auth = auth_config(&state)?;
     charge_auth_rate_limit(
         &auth.rate_limits.bootstrap,
-        peer.ip(),
+        source.0,
         None,
         "bootstrap_rate_limited",
         "Owner setup temporarily limited",
@@ -1278,11 +1542,11 @@ async fn bootstrap(
 
 async fn login(
     State(state): State<ApiState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(source): Extension<EffectiveClientIp>,
     headers: HeaderMap,
     payload: Result<Json<LoginRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    enforce_same_origin(&headers)?;
+    enforce_same_origin(&headers, &auth_config(&state)?.ingress)?;
     if !state.store.has_users().await? {
         return Err(ApiError::new(
             StatusCode::PRECONDITION_REQUIRED,
@@ -1301,7 +1565,7 @@ async fn login(
     let auth = auth_config(&state)?;
     charge_auth_rate_limit(
         &auth.rate_limits.login,
-        peer.ip(),
+        source.0,
         Some(account_key),
         "login_rate_limited",
         "Sign-in temporarily limited",
@@ -1379,15 +1643,15 @@ async fn login(
 
 async fn member_setup(
     State(state): State<ApiState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(source): Extension<EffectiveClientIp>,
     headers: HeaderMap,
     payload: Result<Json<MemberSetupRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    enforce_same_origin(&headers)?;
+    enforce_same_origin(&headers, &auth_config(&state)?.ingress)?;
     let auth = auth_config(&state)?;
     charge_auth_rate_limit(
         &auth.rate_limits.member_setup,
-        peer.ip(),
+        source.0,
         None,
         "member_setup_rate_limited",
         "Member setup temporarily limited",
@@ -2070,7 +2334,10 @@ async fn logout(
         status: "signed_out".into(),
     })
     .into_response();
-    clear_auth_cookies(response.headers_mut(), auth_config(&state)?.cookie_secure)?;
+    clear_auth_cookies(
+        response.headers_mut(),
+        auth_config(&state)?.ingress.cookie_secure(),
+    )?;
     no_store(response.headers_mut());
     Ok(response)
 }
@@ -2120,6 +2387,121 @@ async fn patch_preferences(
     Ok(Json(user_preferences(&preferences)?))
 }
 
+async fn enforce_ingress(
+    State(state): State<ApiState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let result = auth_config(&state).and_then(|auth| {
+        effective_client_ip(&auth.ingress, peer.ip(), request.headers())
+            .map_err(ApiError::from_ingress_error)
+    });
+    match result {
+        Ok(source) => {
+            request.extensions_mut().insert(EffectiveClientIp(source));
+            next.run(request).await
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IngressRequestError {
+    UntrustedPeer,
+    InvalidForwarded,
+}
+
+fn effective_client_ip(
+    policy: &IngressPolicy,
+    peer: IpAddr,
+    headers: &HeaderMap,
+) -> Result<IpAddr, IngressRequestError> {
+    let IngressPolicy::TrustedProxy(config) = policy else {
+        return Ok(peer);
+    };
+    if !config
+        .trusted_proxies
+        .iter()
+        .any(|network| network.contains(peer))
+    {
+        return Err(IngressRequestError::UntrustedPeer);
+    }
+    parse_forwarded_client(headers, &config.public_authority)
+}
+
+fn parse_forwarded_client(
+    headers: &HeaderMap,
+    public_authority: &str,
+) -> Result<IpAddr, IngressRequestError> {
+    let forwarded =
+        exactly_one_header(headers, "forwarded").ok_or(IngressRequestError::InvalidForwarded)?;
+    if forwarded.contains(',') {
+        return Err(IngressRequestError::InvalidForwarded);
+    }
+    let mut client = None;
+    let mut proto = None;
+    let mut host = None;
+    for parameter in forwarded.split(';') {
+        if parameter.is_empty() || parameter.trim() != parameter {
+            return Err(IngressRequestError::InvalidForwarded);
+        }
+        let (name, raw_value) = parameter
+            .split_once('=')
+            .ok_or(IngressRequestError::InvalidForwarded)?;
+        let value =
+            canonical_forwarded_value(raw_value).ok_or(IngressRequestError::InvalidForwarded)?;
+        match name {
+            "for" if client.is_none() => {
+                let address =
+                    parse_forwarded_for(raw_value).ok_or(IngressRequestError::InvalidForwarded)?;
+                if address.is_unspecified() {
+                    return Err(IngressRequestError::InvalidForwarded);
+                }
+                client = Some(address);
+            }
+            "proto" if proto.is_none() => proto = Some(value),
+            "host" if host.is_none() => host = Some(value),
+            _ => return Err(IngressRequestError::InvalidForwarded),
+        }
+    }
+    if proto != Some("https") || host != Some(public_authority) {
+        return Err(IngressRequestError::InvalidForwarded);
+    }
+    client.ok_or(IngressRequestError::InvalidForwarded)
+}
+
+fn parse_forwarded_for(value: &str) -> Option<IpAddr> {
+    if let Ok(IpAddr::V4(address)) = value.parse::<IpAddr>() {
+        return Some(IpAddr::V4(address));
+    }
+    let address = value
+        .strip_prefix("\"[")?
+        .strip_suffix("]\"")?
+        .parse::<IpAddr>()
+        .ok()?;
+    matches!(address, IpAddr::V6(_)).then_some(address)
+}
+
+fn canonical_forwarded_value(value: &str) -> Option<&str> {
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(inner) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    {
+        return (!inner.is_empty() && !inner.contains(['"', '\\'])).then_some(inner);
+    }
+    (!value.contains(['"', '\\', ' ', '\t'])).then_some(value)
+}
+
+fn exactly_one_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?.to_str().ok()?;
+    values.next().is_none().then_some(value)
+}
+
 async fn require_auth(State(state): State<ApiState>, mut request: Request, next: Next) -> Response {
     let result = async {
         let headers = request.headers();
@@ -2133,7 +2515,7 @@ async fn require_auth(State(state): State<ApiState>, mut request: Request, next:
             .await?
             .ok_or_else(ApiError::unauthorized)?;
         if is_unsafe_method(request.method()) {
-            enforce_same_origin(headers)?;
+            enforce_same_origin(headers, &auth_config(&state)?.ingress)?;
             let presented = headers
                 .get(CSRF_HEADER)
                 .and_then(|value| value.to_str().ok())
@@ -2259,7 +2641,7 @@ fn authentication_response(
         response.headers_mut(),
         session_token.expose_secret(),
         csrf_token.expose_secret(),
-        auth_config(state)?.cookie_secure,
+        auth_config(state)?.ingress.cookie_secure(),
     )?;
     no_store(response.headers_mut());
     Ok(response)
@@ -2313,15 +2695,16 @@ fn user_preferences(preferences: &StoredPreferences) -> Result<UserPreferences, 
     })
 }
 
-fn enforce_same_origin(headers: &HeaderMap) -> Result<(), ApiError> {
-    let origin = headers
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
+fn enforce_same_origin(headers: &HeaderMap, policy: &IngressPolicy) -> Result<(), ApiError> {
+    let origin = exactly_one_header(headers, header::ORIGIN.as_str())
         .ok_or_else(ApiError::invalid_origin)?;
-    let host = headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(ApiError::invalid_origin)?;
+    if let IngressPolicy::TrustedProxy(config) = policy {
+        return (origin == config.public_origin)
+            .then_some(())
+            .ok_or_else(ApiError::invalid_origin);
+    }
+    let host =
+        exactly_one_header(headers, header::HOST.as_str()).ok_or_else(ApiError::invalid_origin)?;
     let uri = origin
         .parse::<Uri>()
         .map_err(|_| ApiError::invalid_origin())?;
@@ -4831,6 +5214,24 @@ impl ApiError {
         )
     }
 
+    fn from_ingress_error(error: IngressRequestError) -> Self {
+        match error {
+            IngressRequestError::UntrustedPeer => Self::new(
+                StatusCode::FORBIDDEN,
+                "untrusted_ingress_peer",
+                "Ingress peer rejected",
+                "This Zeus endpoint only accepts traffic from a configured trusted proxy",
+            ),
+            IngressRequestError::InvalidForwarded => Self::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_forwarded_request",
+                "Forwarded request rejected",
+                "The trusted proxy metadata is missing, ambiguous, or inconsistent with the public Zeus origin",
+            ),
+        }
+        .with_no_store()
+    }
+
     fn auth_unavailable(error: &(impl std::fmt::Display + ?Sized)) -> Self {
         eprintln!("zeus authentication subsystem failed: {error}");
         Self::new(
@@ -5293,6 +5694,210 @@ mod tests {
         assert!(!wake.complete_cycle());
         assert!(wake.request());
         assert!(!wake.complete_cycle());
+    }
+
+    fn trusted_ingress_policy() -> IngressPolicy {
+        IngressPolicy::trusted_proxy_csv("https://zeus.example.com", "127.0.0.0/8,2001:db8::/32")
+            .unwrap()
+    }
+
+    #[test]
+    fn trusted_ingress_configuration_is_canonical_bounded_and_secure() {
+        let policy = trusted_ingress_policy();
+        assert!(policy.cookie_secure());
+        assert_eq!(policy.mode_name(), "trusted-proxy");
+        assert_eq!(policy.public_origin(), Some("https://zeus.example.com"));
+
+        for origin in [
+            "http://zeus.example.com",
+            "https://ZEUS.example.com",
+            "https://zeus.example.com/",
+            "https://zeus.example.com:443",
+            "https://zeus.example.com:0",
+            "https://zeus.example.com:0443",
+            "https://zeus.example.com:99999",
+            "https://zeus.example.com/path",
+            "https://zeus.example.com?query=1",
+            "https://user@zeus.example.com",
+            "https://:8443",
+        ] {
+            assert!(IngressPolicy::trusted_proxy_csv(origin, "127.0.0.1/32").is_err());
+        }
+        assert!(
+            IngressPolicy::trusted_proxy_csv("https://zeus.example.com:8443", "127.0.0.1/32")
+                .is_ok()
+        );
+        for cidrs in [
+            "",
+            "127.0.0.1",
+            "127.0.0.1/24",
+            "127.0.0.1/33",
+            "127.0.0.1/32, 2001:db8::/32",
+            "127.0.0.1/32,127.0.0.1/32",
+        ] {
+            assert!(IngressPolicy::trusted_proxy_csv("https://zeus.example.com", cidrs).is_err());
+        }
+        let too_many_networks = (0..=TRUSTED_PROXY_NETWORK_LIMIT)
+            .map(|index| format!("192.0.2.{index}/32"))
+            .collect::<Vec<_>>();
+        assert!(
+            IngressPolicy::trusted_proxy("https://zeus.example.com", &too_many_networks).is_err()
+        );
+        assert!(
+            IngressPolicy::trusted_proxy(
+                format!(
+                    "https://{}.example.com",
+                    "a".repeat(PUBLIC_ORIGIN_MAX_BYTES)
+                ),
+                ["127.0.0.1/32"],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn trusted_ingress_uses_one_strict_forwarded_hop_and_direct_mode_ignores_spoofing() {
+        let policy = trusted_ingress_policy();
+        let peer = "127.0.0.42".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "forwarded",
+            HeaderValue::from_static("for=198.51.100.17;proto=https;host=zeus.example.com"),
+        );
+        assert_eq!(
+            effective_client_ip(&policy, peer, &headers).unwrap(),
+            "198.51.100.17".parse::<IpAddr>().unwrap()
+        );
+
+        headers.insert(
+            "forwarded",
+            HeaderValue::from_static(
+                "for=\"[2001:db8:ffff::17]\";proto=https;host=zeus.example.com",
+            ),
+        );
+        assert_eq!(
+            effective_client_ip(&policy, peer, &headers).unwrap(),
+            "2001:db8:ffff::17".parse::<IpAddr>().unwrap()
+        );
+        for forwarded in [
+            "for=198.51.100.1;proto=http;host=zeus.example.com",
+            "for=198.51.100.1;proto=https;host=internal.example",
+            "for=198.51.100.1,for=198.51.100.2;proto=https;host=zeus.example.com",
+            "for=198.51.100.1; proto=https;host=zeus.example.com",
+            "for=198.51.100.1;proto=https;host=zeus.example.com;by=127.0.0.1",
+            "for=2001:db8::17;proto=https;host=zeus.example.com",
+            "for=\"198.51.100.1\";proto=https;host=zeus.example.com",
+            "for=0.0.0.0;proto=https;host=zeus.example.com",
+        ] {
+            headers.insert("forwarded", HeaderValue::from_str(forwarded).unwrap());
+            assert_eq!(
+                effective_client_ip(&policy, peer, &headers),
+                Err(IngressRequestError::InvalidForwarded)
+            );
+        }
+        headers.insert(
+            "forwarded",
+            HeaderValue::from_static("for=198.51.100.18;proto=https;host=zeus.example.com"),
+        );
+        assert_eq!(
+            effective_client_ip(&policy, "2001:db8::42".parse().unwrap(), &headers).unwrap(),
+            "198.51.100.18".parse::<IpAddr>().unwrap()
+        );
+        headers.append(
+            "forwarded",
+            HeaderValue::from_static("for=198.51.100.19;proto=https;host=zeus.example.com"),
+        );
+        assert_eq!(
+            effective_client_ip(&policy, peer, &headers),
+            Err(IngressRequestError::InvalidForwarded)
+        );
+        assert_eq!(
+            effective_client_ip(&policy, "192.0.2.10".parse().unwrap(), &headers),
+            Err(IngressRequestError::UntrustedPeer)
+        );
+        assert_eq!(
+            effective_client_ip(&IngressPolicy::direct(false), peer, &headers,).unwrap(),
+            peer
+        );
+    }
+
+    #[test]
+    fn trusted_ingress_origin_and_cookie_contract_are_exact() {
+        let policy = trusted_ingress_policy();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://zeus.example.com"),
+        );
+        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:8081"));
+        enforce_same_origin(&headers, &policy).unwrap();
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://other.example.com"),
+        );
+        assert!(enforce_same_origin(&headers, &policy).is_err());
+
+        let mut cookies = HeaderMap::new();
+        set_auth_cookies(&mut cookies, "session", "csrf", policy.cookie_secure()).unwrap();
+        let values = cookies
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(values.len(), 2);
+        assert!(values.iter().all(|value| value.contains("; Secure")));
+        assert!(values.iter().all(|value| value.contains("SameSite=Strict")));
+    }
+
+    #[tokio::test]
+    async fn trusted_ingress_rejects_direct_and_ambiguous_requests_before_routing() {
+        let base = authenticated_app_with_provider_and_ingress(
+            DemoStore::seeded().await.unwrap(),
+            trusted_ingress_policy(),
+            Arc::new(LocalFallbackProvider::new()),
+        )
+        .unwrap();
+        let trusted = base.clone();
+        let missing = trusted
+            .clone()
+            .oneshot(Request::get("/health/live").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_problem(
+            missing,
+            StatusCode::BAD_REQUEST,
+            "invalid_forwarded_request",
+        )
+        .await;
+        let valid = trusted
+            .oneshot(
+                Request::get("/health/live")
+                    .header(
+                        "forwarded",
+                        "for=198.51.100.77;proto=https;host=zeus.example.com",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(valid.status(), StatusCode::OK);
+
+        let untrusted = base;
+        let rejected = untrusted
+            .oneshot(
+                Request::get("/health/live")
+                    .header("x-zeus-test-peer", "192.0.2.10:41000")
+                    .header(
+                        "forwarded",
+                        "for=198.51.100.77;proto=https;host=zeus.example.com",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(rejected, StatusCode::FORBIDDEN, "untrusted_ingress_peer").await;
     }
 
     #[test]
@@ -5800,6 +6405,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trusted_proxy_client_ip_drives_the_login_source_limit() {
+        let login_policy = test_rate_policy(10, 1, Some(10));
+        let ingress =
+            IngressPolicy::trusted_proxy("https://zeus.example.com", ["127.0.0.0/8", "::1/128"])
+                .unwrap();
+        let fixture =
+            configured_auth_test_app_with_ingress("trusted-proxy-rate", login_policy, ingress)
+                .await;
+
+        for (username, client_ip, expected) in [
+            ("missing-first", "198.51.100.10", StatusCode::UNAUTHORIZED),
+            (
+                "missing-second",
+                "198.51.100.10",
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            ("missing-third", "198.51.100.11", StatusCode::UNAUTHORIZED),
+        ] {
+            let mut request = login_request(username, "Wrong-password-2026");
+            request.headers_mut().insert(
+                header::ORIGIN,
+                HeaderValue::from_static("https://zeus.example.com"),
+            );
+            request.headers_mut().insert(
+                header::FORWARDED,
+                HeaderValue::from_str(&format!(
+                    "for={client_ip};proto=https;host=zeus.example.com"
+                ))
+                .unwrap(),
+            );
+            let response = fixture.app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected);
+            if expected == StatusCode::TOO_MANY_REQUESTS {
+                let problem: ProblemDetails = response_json(response).await;
+                assert_eq!(problem.code, "login_rate_limited");
+            }
+        }
+
+        fixture.cleanup();
+    }
+
+    #[tokio::test]
     async fn login_limit_is_charged_before_argon_worker_acquisition() {
         let login_policy = test_rate_policy(10, 1, Some(10));
         let fixture = configured_auth_test_app("argon-order", login_policy).await;
@@ -5844,7 +6491,7 @@ mod tests {
                 LOGIN_RATE_POLICY,
                 test_rate_policy(10, 1, None),
             ),
-            cookie_secure: false,
+            ingress: IngressPolicy::direct(false),
         });
         let state = ApiState {
             store,
@@ -5894,7 +6541,7 @@ mod tests {
                 BOOTSTRAP_RATE_POLICY,
                 test_rate_policy(10, 1, None),
             ),
-            cookie_secure: false,
+            ingress: IngressPolicy::direct(false),
         });
         let state = ApiState {
             store,
@@ -13421,6 +14068,15 @@ mod tests {
         label: &str,
         login_policy: RateLimitPolicy,
     ) -> ConfiguredAuthFixture {
+        configured_auth_test_app_with_ingress(label, login_policy, IngressPolicy::direct(false))
+            .await
+    }
+
+    async fn configured_auth_test_app_with_ingress(
+        label: &str,
+        login_policy: RateLimitPolicy,
+        ingress: IngressPolicy,
+    ) -> ConfiguredAuthFixture {
         let unique = UserId::generate().unwrap();
         let path = std::env::temp_dir().join(format!(
             "zeus-api-{label}-{}.db",
@@ -13435,6 +14091,19 @@ mod tests {
             .await
             .unwrap();
 
+        let bootstrap_origin = ingress
+            .public_origin()
+            .unwrap_or("http://zeus.test")
+            .to_owned();
+        let bootstrap_forwarded = ingress.public_origin().map(|origin| {
+            format!(
+                "for=198.51.100.1;proto=https;host={}",
+                origin
+                    .strip_prefix("https://")
+                    .expect("trusted ingress test origin must use HTTPS")
+            )
+        });
+
         let clock = ManualRateLimitClock::new();
         let rate_clock: Arc<dyn RateLimitClock> = clock;
         let auth = Arc::new(AuthConfig {
@@ -13445,7 +14114,7 @@ mod tests {
                 login_policy,
                 BOOTSTRAP_RATE_POLICY,
             ),
-            cookie_secure: false,
+            ingress,
         });
         let state = ApiState {
             store: store.clone(),
@@ -13458,25 +14127,26 @@ mod tests {
             sse_capacity: SseCapacity::production(),
         };
         let app = build_authenticated_app(state).layer(MockConnectInfo(test_peer()));
-        let bootstrap = app
-            .clone()
-            .oneshot(
-                Request::post("/api/v1/auth/bootstrap")
-                    .header(header::HOST, "zeus.test")
-                    .header(header::ORIGIN, "http://zeus.test")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "bootstrap_token": bootstrap_token.expose_secret(),
-                            "username": "owner",
-                            "password": TEST_OWNER_PASSWORD,
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
+        let mut bootstrap_request = Request::post("/api/v1/auth/bootstrap")
+            .header(header::HOST, "zeus.test")
+            .header(header::ORIGIN, &bootstrap_origin)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "bootstrap_token": bootstrap_token.expose_secret(),
+                    "username": "owner",
+                    "password": TEST_OWNER_PASSWORD,
+                })
+                .to_string(),
+            ))
             .unwrap();
+        if let Some(forwarded) = bootstrap_forwarded {
+            bootstrap_request.headers_mut().insert(
+                header::FORWARDED,
+                HeaderValue::from_str(&forwarded).unwrap(),
+            );
+        }
+        let bootstrap = app.clone().oneshot(bootstrap_request).await.unwrap();
         assert_eq!(bootstrap.status(), StatusCode::OK);
 
         ConfiguredAuthFixture {

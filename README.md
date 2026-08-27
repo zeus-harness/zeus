@@ -29,7 +29,10 @@ revocation, bounded account security audit, legal hold, and archive
 checkpoints. Members can use ordinary Session/Run and reply paths; approval,
 connector dispatch, member administration, and audit administration remain
 owner-only. Keep the service loopback/private-network only, and do not expose
-it as a shared or Internet-facing deployment.
+it directly as a shared or Internet-facing deployment. The optional trusted
+single-node ingress mode permits one canonical HTTPS origin through explicitly
+allowlisted reverse-proxy CIDRs; the API listener must still remain private and
+the proxy must be the only network path to it.
 
 The staged account/membership and audit-retention design is documented in
 [`docs/account-membership-audit-retention.zh-CN.md`](docs/account-membership-audit-retention.zh-CN.md).
@@ -77,6 +80,38 @@ owner setup token, invalidates the previous token, and prints the new bearer
 once to that process's terminal. Open the Web UI, enter the current token, and
 choose a username plus a password of at least 12 characters. After owner setup,
 later restarts preserve the owner and no longer print a setup token.
+
+The default direct ingress mode derives authentication rate-limit identity from
+the TCP peer and ignores client-supplied forwarding headers. To place one Zeus
+API instance behind a same-origin HTTPS reverse proxy, set both variables:
+
+```sh
+ZEUS_PUBLIC_ORIGIN=https://zeus.example.com
+ZEUS_TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128
+```
+
+The public origin must be canonical HTTPS with no path, query, uppercase host,
+or explicit default port. CIDRs must be canonical, unique, comma-separated
+without whitespace, contain at most 32 networks, and describe only the proxy
+peers that can reach the private API listener. In this mode the proxy must
+remove all inbound forwarding metadata and write exactly one header in this
+contract:
+
+```http
+Forwarded: for=198.51.100.17;proto=https;host=zeus.example.com
+```
+
+An IPv4 client uses the bare literal above; IPv6 uses the quoted bracketed form
+`for="[2001:db8::17]"`.
+
+Zeus rejects direct peers outside the allowlist, missing/duplicate/multi-hop or
+ambiguous `Forwarded` metadata, a non-HTTPS protocol, and a host different from
+the configured public authority before routing. The validated `for` address is
+the authentication source-limit identity. Browser write requests must use the
+exact configured public `Origin`; the reverse proxy may use an internal `Host`
+toward Zeus. `Secure` is forced on login and CSRF cookies, and explicitly
+setting `ZEUS_COOKIE_SECURE=false` fails startup. If neither ingress variable is
+set, the legacy `ZEUS_COOKIE_SECURE` direct-mode flag remains available.
 
 With no model configuration, the durable Agent model worker returns an explicit
 non-model local message. Configure an OpenAI-compatible Chat Completions
@@ -711,15 +746,18 @@ directly.
   compatibility alias).
 - Bootstrap and login require an exact same-origin `Origin`/`Host` pair. A
   successful bootstrap or login issues an opaque `HttpOnly; SameSite=Strict`
-  login cookie plus a separate CSRF cookie. When the browser-facing origin is
-  HTTPS, the operator must set `ZEUS_COOKIE_SECURE=true`; then both cookies are
-  emitted with `Secure`.
+  login cookie plus a separate CSRF cookie. Direct mode uses the request
+  `Origin`/`Host` pair and the explicit `ZEUS_COOKIE_SECURE` flag. Trusted-proxy
+  mode instead requires the exact configured HTTPS public origin and always
+  emits both cookies with `Secure`.
 - Bootstrap, login, and member setup are charged before Argon2 work against bounded, in-memory
   fixed-window limits. Login defaults to 60 attempts globally, 10 per direct
   peer IP, and 5 per canonical account per minute; bootstrap defaults to 10
   globally and 3 per direct peer IP; member setup defaults to 30 globally and
-  5 per direct peer IP. Zeus ignores `Forwarded` and
-  `X-Forwarded-For` unless a future explicit trusted-proxy contract is added.
+  5 per direct peer IP. Direct mode ignores `Forwarded` and
+  `X-Forwarded-For`; trusted-proxy mode accepts only the single-hop
+  `Forwarded` contract above from an allowlisted TCP peer and uses its validated
+  client IP. `X-Forwarded-For` is never authoritative.
   Rejection is a generic `429` with `Retry-After` and `Cache-Control: no-store`.
 - Every business REST/SSE route requires an active durable account membership.
   Protected state changes additionally require `X-CSRF-Token` to match the
@@ -983,14 +1021,15 @@ Index, schema v17 Durable Session Agent Loop, schema v18 exact tool-completion
 replay, schema v19 deployment-manifest binding, schema v20 execution-ledger,
 schema v21 prepared claims, schema v22 durable knowledge-context binding, and
 schema v23 account knowledge catalog ingestion, schema v24 account Agent prompt
-governance, and schema v25 durable Session context compaction:
+governance, schema v25 durable Session context compaction, and Trusted
+Single-Node Ingress:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 593 tests passed
+- `cargo test --workspace --all-targets --locked`: 600 tests passed
   across the top-level test targets, including 22 connector tests,
   8 deployment tests, 29 knowledge tests, 29 LLM unit and 13 provider-contract
-  tests, 252 storage tests, 48 runtime tests, 74 API library tests, 6 API main/config
+  tests, 252 storage tests, 48 runtime tests, 79 API library tests, 8 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,

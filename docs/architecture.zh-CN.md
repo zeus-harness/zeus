@@ -256,8 +256,17 @@ exactly-once 语义。
 - 除 health、auth status、首次 bootstrap、login 和一次性 member setup 外，真实服务的业务
   REST/SSE 都要求 active account membership。bootstrap/login/member setup 必须 exact
   same-origin；已认证写请求还要求与登录会话绑定的 CSRF token。
-  session cookie 为 opaque、`HttpOnly; SameSite=Strict`；HTTPS 部署必须显式设置
-  `ZEUS_COOKIE_SECURE=true` 才附加 `Secure`。
+  session cookie 为 opaque、`HttpOnly; SameSite=Strict`。默认 direct ingress 以请求的
+  `Origin`/`Host` 为同源权威，并由 `ZEUS_COOKIE_SECURE` 决定是否附加 `Secure`；trusted-proxy
+  ingress 则以唯一 canonical `ZEUS_PUBLIC_ORIGIN` 为权威，并强制 session/CSRF Cookie 都带
+  `Secure`。
+- `ZEUS_PUBLIC_ORIGIN` 与 `ZEUS_TRUSTED_PROXY_CIDRS` 必须成对配置。trusted-proxy 模式只接受
+  allowlist CIDR 内的 TCP peer，并要求代理覆盖为唯一、单跳、无歧义的
+  `Forwarded: for=<client-ip>;proto=https;host=<public-authority>`；validated `for` 才进入认证
+  source limiter，其中 IPv4 使用裸字面量，IPv6 使用带双引号的 `[address]`。缺失、重复、多跳、
+  非 HTTPS、host drift 在路由和认证之前 fail closed；direct
+  模式继续只认 TCP peer 并忽略 `Forwarded`/`X-Forwarded-For`。两种模式都不把 API listener
+  本身视为公网入口，trusted proxy 必须是私网 listener 的唯一网络路径。
 - Alpha+ 允许 `member` 登录并执行 Run/Session 查询、SSE、resume、turn 和 reply；review、
   connector dispatch、member/audit 管理保持 owner-only。正式业务路径已全部 account+actor-scoped，
   并有跨 account/actor 隔离测试；字段、HTTP/SSE 连接和
@@ -274,8 +283,8 @@ exactly-once 语义。
   使用有界 ledger-local ID；pre-v9 durable reference 继续可寻址。共享纯校验在相关 API、
   runtime、storage 入口的 fingerprint 和 receipt 前执行，超限不得产生持久副作用。
 - bootstrap/login 的 fixed-window limiter 在 Argon2 前一次锁内完成 prune/check/charge；默认只认
-  `ConnectInfo` 的直连 `IpAddr`，不读取不可信 proxy header。key map 上限为 4096，满表时
-  fail closed，定时清理避免由新来源触发逐请求全表扫描。
+  direct `ConnectInfo` 的直连 `IpAddr`；trusted-proxy 模式只使用上述已验证 client IP。key map
+  上限为 4096，满表时 fail closed，定时清理避免由新来源触发逐请求全表扫描。
 - Run/Session SSE 共用 global 64、每 actor 4 条连接配额；owned permit 被移动进 response
   stream，只有 body drop 或流结束才释放。initial replay、hint reconciliation、Lagged recovery
   和 durable poll 都使用 SQL `LIMIT + 1` page，默认 128、硬上限 256；`has_more` 通过页间
@@ -589,8 +598,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   刷新恢复、owner/member setup/登录、owner 成员与 audit 管理、设置/退出和
   system/light/dark。member 的审批卡只读。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化按项目既有统计口径是 565 个 Rust 测试（其中 connectors 18、deployment 8、knowledge 29、
-  storage 248、runtime 48、API library 71、API main/config 6）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化按项目既有统计口径是 600 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、
+  storage 252、runtime 48、API library 79、API main/config 8）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
 提交 `af29089` 曾构建并运行在独立 `zeus-operation-acceptance` project（端口 `18089`）；既有
