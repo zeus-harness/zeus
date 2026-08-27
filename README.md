@@ -16,9 +16,8 @@ recorded, then settles as `not_dispatched / executor_unavailable` without a
 production side effect. An explicit `local-development` profile provides a
 path-constrained marker executor and can additionally register rooted,
 read-only workspace discovery, literal text search, bounded whole-file and
-line-range reading, plus
-approval-gated exact text replacement and create-new-only file tools for
-testing a useful complete Agent loop. Restate,
+line-range reading, plus approval-gated exact text replacement, line insertion,
+and create-new-only file tools for testing a useful complete Agent loop. Restate,
 MinIO, the networkless tool sandbox, and optional PostgreSQL are development
 topology for later milestones; they are not application state authorities.
 
@@ -248,7 +247,12 @@ KiB and rejects a selected range larger than 8 KiB instead of clipping it.
 `workspace_replace_text`
 atomically replaces exactly one unique occurrence in an existing UTF-8 regular
 file of at most 64 KiB, preserves file permissions, and requires owner approval
-for its exact persisted arguments. `workspace_create_file` creates one UTF-8
+for its exact persisted arguments. `workspace_insert_text` inserts at an exact
+logical line boundary (`after_line=0` means the beginning), preserves file
+permissions, atomically rejects a changed target, limits inserted text to 4
+KiB and the result to 64 KiB, and requires owner approval. A final newline
+defines a trailing empty logical line consistently for line reads and inserts.
+`workspace_create_file` creates one UTF-8
 file of at most 12 KiB below an existing directory, publishes it atomically,
 never overwrites an existing path, and also requires owner approval for the
 exact persisted arguments. Same-process mutation retries replay a bounded
@@ -940,10 +944,10 @@ prompt governance:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 561 tests passed
-  under the existing project counting convention, including 16 connector tests,
+- `cargo test --workspace --all-targets --locked`: 563 tests passed
+  under the existing project counting convention, including 17 connector tests,
   8 deployment tests, 29 knowledge tests, 248 storage tests, 48 runtime tests,
-  69 API library tests, 6 API main/config
+  70 API library tests, 6 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,

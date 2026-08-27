@@ -45,6 +45,8 @@ pub const WORKSPACE_SEARCH_TEXT_TOOL_NAME: &str = "workspace_search_text";
 pub const WORKSPACE_SEARCH_TEXT_TOOL_VERSION: &str = "1";
 pub const WORKSPACE_REPLACE_TEXT_TOOL_NAME: &str = "workspace_replace_text";
 pub const WORKSPACE_REPLACE_TEXT_TOOL_VERSION: &str = "1";
+pub const WORKSPACE_INSERT_TEXT_TOOL_NAME: &str = "workspace_insert_text";
+pub const WORKSPACE_INSERT_TEXT_TOOL_VERSION: &str = "1";
 pub const WORKSPACE_CREATE_FILE_TOOL_NAME: &str = "workspace_create_file";
 pub const WORKSPACE_CREATE_FILE_TOOL_VERSION: &str = "1";
 pub const MAX_WORKSPACE_PATH_BYTES: usize = 512;
@@ -63,6 +65,7 @@ pub const MAX_WORKSPACE_SEARCH_DEPTH: usize = 12;
 pub const MAX_WORKSPACE_SEARCH_PREVIEW_BYTES: usize = 256;
 pub const MAX_WORKSPACE_EDIT_TEXT_BYTES: usize = 4 * 1024;
 pub const MAX_WORKSPACE_EDIT_FILE_BYTES: usize = 64 * 1024;
+pub const MAX_WORKSPACE_INSERT_TEXT_BYTES: usize = 4 * 1024;
 pub const MAX_WORKSPACE_CREATE_CONTENT_BYTES: usize = 12 * 1024;
 pub const MAX_WORKSPACE_MUTATION_RECEIPTS: usize = 1024;
 
@@ -143,6 +146,9 @@ pub fn register_local_workspace_connectors(
     let replace_executor = WorkspaceReplaceTextExecutor {
         roots: Arc::clone(&executor.roots),
     };
+    let insert_executor = WorkspaceInsertTextExecutor {
+        roots: Arc::clone(&executor.roots),
+    };
     let create_executor = WorkspaceCreateFileExecutor {
         roots: Arc::clone(&executor.roots),
     };
@@ -151,6 +157,7 @@ pub fn register_local_workspace_connectors(
     registry.register(workspace_list_directory_descriptor(), list_executor)?;
     registry.register(workspace_search_text_descriptor(), search_executor)?;
     registry.register(workspace_replace_text_descriptor(), replace_executor)?;
+    registry.register(workspace_insert_text_descriptor(), insert_executor)?;
     registry.register(workspace_create_file_descriptor(), create_executor)?;
     Ok(canonical_root)
 }
@@ -196,7 +203,7 @@ pub fn workspace_read_lines_descriptor() -> ToolDescriptor {
         name: WORKSPACE_READ_LINES_TOOL_NAME.into(),
         version: WORKSPACE_READ_LINES_TOOL_VERSION.into(),
         description: format!(
-            "Read an inclusive line range from one UTF-8 workspace file of at most {MAX_WORKSPACE_RANGE_FILE_BYTES} bytes; start_line and end_line are positive integers, the requested span is at most {MAX_WORKSPACE_RANGE_LINES} lines, end_line past EOF is clamped, and selected output over {MAX_WORKSPACE_RANGE_OUTPUT_BYTES} bytes fails"
+            "Read an inclusive line range from one UTF-8 workspace file of at most {MAX_WORKSPACE_RANGE_FILE_BYTES} bytes; a final newline defines a trailing empty logical line, the requested span is at most {MAX_WORKSPACE_RANGE_LINES} lines, end_line past EOF is clamped, and selected output over {MAX_WORKSPACE_RANGE_OUTPUT_BYTES} bytes fails"
         ),
         effect: ToolEffect::ReadOnly,
         sandbox_profile: SandboxProfile::ReadOnly,
@@ -302,6 +309,40 @@ pub fn workspace_replace_text_descriptor() -> ToolDescriptor {
                 (
                     "path".into(),
                     ParameterSpec::required_string(MAX_WORKSPACE_PATH_BYTES),
+                ),
+            ]),
+        },
+    }
+}
+
+pub fn workspace_insert_text_descriptor() -> ToolDescriptor {
+    ToolDescriptor {
+        name: WORKSPACE_INSERT_TEXT_TOOL_NAME.into(),
+        version: WORKSPACE_INSERT_TEXT_TOOL_VERSION.into(),
+        description: format!(
+            "Insert at most {MAX_WORKSPACE_INSERT_TEXT_BYTES} bytes of non-empty UTF-8 text at a line boundary in one existing workspace file whose result stays within {MAX_WORKSPACE_EDIT_FILE_BYTES} bytes; after_line 0 inserts at the beginning and positive values insert after that logical line, including a trailing empty line after a final newline"
+        ),
+        effect: ToolEffect::LocalWrite,
+        sandbox_profile: SandboxProfile::WorkspaceWrite,
+        input_schema: ObjectSchema {
+            max_serialized_bytes: 8 * 1024,
+            properties: BTreeMap::from([
+                (
+                    "after_line".into(),
+                    ParameterSpec {
+                        parameter_type: ParameterType::Integer,
+                        required: true,
+                        min_length: None,
+                        max_length: None,
+                    },
+                ),
+                (
+                    "path".into(),
+                    ParameterSpec::required_string(MAX_WORKSPACE_PATH_BYTES),
+                ),
+                (
+                    "text".into(),
+                    ParameterSpec::required_string(MAX_WORKSPACE_INSERT_TEXT_BYTES),
                 ),
             ]),
         },
@@ -610,6 +651,67 @@ impl ToolExecutor for WorkspaceReplaceTextExecutor {
 }
 
 #[derive(Clone)]
+struct WorkspaceInsertTextExecutor {
+    roots: Arc<WorkspaceRoots>,
+}
+
+impl ToolExecutor for WorkspaceInsertTextExecutor {
+    fn execute(&self, request: ExecutionRequest) -> ExecutionFuture<'_> {
+        let roots = Arc::clone(&self.roots);
+        Box::pin(async move {
+            if request.environment != LOCAL_DEV_ENVIRONMENT {
+                return Err(workspace_failure(
+                    "environment_denied",
+                    "Workspace inserts are restricted to local-development",
+                    false,
+                ));
+            }
+            let arguments: WorkspaceInsertTextArguments =
+                serde_json::from_value(request.call.arguments.clone()).map_err(|_| {
+                    workspace_failure(
+                        "invalid_arguments",
+                        "Workspace insert arguments are invalid",
+                        false,
+                    )
+                })?;
+            let path = validate_workspace_path(&arguments.path)?;
+            if arguments.after_line < 0 {
+                return Err(workspace_failure(
+                    "invalid_workspace_insert_line",
+                    "Workspace insert after_line must be zero or a positive integer",
+                    false,
+                ));
+            }
+            if arguments.text.is_empty() || arguments.text.len() > MAX_WORKSPACE_INSERT_TEXT_BYTES {
+                return Err(workspace_failure(
+                    "invalid_workspace_insert_text",
+                    "Workspace insert text must contain between 1 and 4096 UTF-8 bytes",
+                    false,
+                ));
+            }
+            let after_line = usize::try_from(arguments.after_line).map_err(|_| {
+                workspace_failure(
+                    "invalid_workspace_insert_line",
+                    "Workspace insert after_line cannot be represented on this host",
+                    false,
+                )
+            })?;
+            tokio::task::spawn_blocking(move || {
+                insert_workspace_text(&roots, &path, after_line, &arguments, &request.call)
+            })
+            .await
+            .map_err(|_| {
+                workspace_failure(
+                    "workspace_inserter_join_failed",
+                    "The workspace inserter stopped unexpectedly",
+                    false,
+                )
+            })?
+        })
+    }
+}
+
+#[derive(Clone)]
 struct WorkspaceCreateFileExecutor {
     roots: Arc<WorkspaceRoots>,
 }
@@ -683,6 +785,14 @@ struct WorkspaceReplaceTextArguments {
     path: String,
     old_text: String,
     new_text: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceInsertTextArguments {
+    path: String,
+    after_line: i64,
+    text: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -877,7 +987,8 @@ fn read_workspace_lines(
             false,
         )
     })?;
-    let total_lines = content.split_inclusive('\n').count();
+    let lines = content.split('\n').collect::<Vec<_>>();
+    let total_lines = lines.len();
     if start_line > total_lines {
         return Err(workspace_failure(
             "workspace_line_start_out_of_range",
@@ -886,11 +997,10 @@ fn read_workspace_lines(
         ));
     }
     let actual_end_line = end_line.min(total_lines);
-    let selected = content
-        .split_inclusive('\n')
-        .skip(start_line - 1)
-        .take(actual_end_line - start_line + 1)
-        .collect::<String>();
+    let mut selected = lines[start_line - 1..actual_end_line].join("\n");
+    if actual_end_line < total_lines {
+        selected.push('\n');
+    }
     if selected.len() > MAX_WORKSPACE_RANGE_OUTPUT_BYTES {
         return Err(workspace_failure(
             "workspace_line_output_too_large",
@@ -1537,6 +1647,134 @@ fn replace_workspace_text(
     Ok(output)
 }
 
+fn insert_workspace_text(
+    roots: &WorkspaceRoots,
+    path: &Path,
+    after_line: usize,
+    arguments: &WorkspaceInsertTextArguments,
+    call: &ToolCall,
+) -> Result<ToolOutput, ExecutorError> {
+    let mut mutation_state = roots.mutation_state.lock().map_err(|_| {
+        workspace_failure(
+            "workspace_mutation_state_poisoned",
+            "The workspace mutation state is unavailable",
+            false,
+        )
+    })?;
+    if let Some(receipt) = mutation_state.receipts.get(&call.call_id) {
+        if receipt.tool != call.tool || receipt.arguments_digest != call.arguments_digest {
+            return Err(workspace_failure(
+                "workspace_insert_idempotency_conflict",
+                "The workspace insert call id is already bound to a different tool or arguments",
+                false,
+            ));
+        }
+        let mut output = receipt.output.clone();
+        output.replayed = true;
+        return Ok(output);
+    }
+
+    reject_workspace_symlinks(&roots.inspection, path)?;
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().ok_or_else(invalid_workspace_path)?;
+    let parent = roots
+        .confined
+        .open_dir(parent_path)
+        .map_err(workspace_directory_error)?;
+    let (original_bytes, permissions) = read_workspace_edit_file(&parent, file_name)?;
+    let original = String::from_utf8(original_bytes.clone()).map_err(|_| {
+        workspace_failure(
+            "workspace_insert_file_not_utf8",
+            "The workspace insert target is not valid UTF-8 text",
+            false,
+        )
+    })?;
+    let lines = original.split('\n').collect::<Vec<_>>();
+    if after_line > lines.len() {
+        return Err(workspace_failure(
+            "workspace_insert_line_out_of_range",
+            "Workspace insert after_line is beyond the file's logical line count",
+            false,
+        ));
+    }
+    let updated_len = original
+        .len()
+        .checked_add(arguments.text.len())
+        .and_then(|length| length.checked_add(1))
+        .ok_or_else(workspace_edit_file_too_large)?;
+    if updated_len > MAX_WORKSPACE_EDIT_FILE_BYTES {
+        return Err(workspace_edit_file_too_large());
+    }
+    let inserted_lines = arguments.text.split('\n').count();
+    let mut updated_lines = Vec::with_capacity(lines.len() + inserted_lines);
+    updated_lines.extend_from_slice(&lines[..after_line]);
+    updated_lines.extend(arguments.text.split('\n'));
+    updated_lines.extend_from_slice(&lines[after_line..]);
+    let updated = updated_lines.join("\n");
+    debug_assert_eq!(updated.len(), updated_len);
+
+    let temp_sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp_name = format!(
+        ".zeus-tool-insert-{}-{}-{temp_sequence}.tmp",
+        call.call_id,
+        std::process::id()
+    );
+    let write_result = (|| -> Result<(), ExecutorError> {
+        let mut options = CapOpenOptions::new();
+        options.write(true).create_new(true);
+        let mut temp = parent
+            .open_with(&temp_name, &options)
+            .map_err(workspace_edit_io)?;
+        temp.write_all(updated.as_bytes())
+            .map_err(workspace_edit_io)?;
+        temp.set_permissions(permissions)
+            .map_err(workspace_edit_io)?;
+        temp.sync_all().map_err(workspace_edit_io)?;
+
+        let (current_bytes, _) = read_workspace_edit_file(&parent, file_name)?;
+        if current_bytes != original_bytes {
+            return Err(workspace_failure(
+                "workspace_insert_conflict",
+                "The workspace insert target changed before atomic replacement",
+                false,
+            ));
+        }
+        parent
+            .rename(&temp_name, &parent, file_name)
+            .map_err(workspace_edit_io)?;
+        sync_cap_directory(&parent).map_err(workspace_edit_io)
+    })();
+    if let Err(error) = write_result {
+        let _ = parent.remove_file(&temp_name);
+        return Err(error);
+    }
+
+    let output = ToolOutput {
+        value: json!({
+            "path": arguments.path,
+            "after_line": after_line,
+            "inserted_lines": inserted_lines,
+            "bytes_before": original.len(),
+            "bytes_after": updated.len(),
+        }),
+        replayed: false,
+        provider_request_id: Some(call.call_id.clone()),
+    };
+    remember_workspace_mutation_receipt(
+        &mut mutation_state,
+        call.call_id.clone(),
+        WorkspaceMutationReceipt {
+            tool: call.tool.clone(),
+            arguments_digest: call.arguments_digest.clone(),
+            output: output.clone(),
+        },
+    );
+    Ok(output)
+}
+
 fn remember_workspace_mutation_receipt(
     mutation_state: &mut WorkspaceMutationState,
     call_id: String,
@@ -2091,6 +2329,24 @@ mod tests {
         }
     }
 
+    fn workspace_insert_call(step: u32, path: &str, after_line: i64, text: &str) -> ToolCall {
+        let arguments = json!({
+            "path": path,
+            "after_line": after_line,
+            "text": text,
+        });
+        ToolCall {
+            call_id: stable_call_id("run-1", 1, step, WORKSPACE_INSERT_TEXT_TOOL_NAME).unwrap(),
+            tool: WORKSPACE_INSERT_TEXT_TOOL_NAME.into(),
+            tool_version: WORKSPACE_INSERT_TEXT_TOOL_VERSION.into(),
+            arguments_digest: arguments_digest(&arguments),
+            arguments,
+            effect: ToolEffect::LocalWrite,
+            sandbox_profile: SandboxProfile::WorkspaceWrite,
+            executor_status: ToolExecutorStatus::Available,
+        }
+    }
+
     fn workspace_create_call(step: u32, path: &str, content: &str) -> ToolCall {
         let arguments = json!({
             "path": path,
@@ -2195,6 +2451,11 @@ mod tests {
                 .descriptor(WORKSPACE_READ_LINES_TOOL_NAME)
                 .is_none()
         );
+        assert!(
+            registry
+                .descriptor(WORKSPACE_INSERT_TEXT_TOOL_NAME)
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2282,7 +2543,7 @@ mod tests {
                 "path": "src/large.rs",
                 "start_line": 198,
                 "end_line": 200,
-                "total_lines": 400,
+                "total_lines": 401,
                 "content": expected,
                 "bytes": expected_bytes,
             })
@@ -2296,8 +2557,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(clamped.value["start_line"], 399);
-        assert_eq!(clamped.value["end_line"], 400);
-        assert_eq!(clamped.value["total_lines"], 400);
+        assert_eq!(clamped.value["end_line"], 401);
+        assert_eq!(clamped.value["total_lines"], 401);
+
+        let empty = registry
+            .dispatch(
+                workspace_lines_call(40, "empty.txt", 1, 1),
+                LOCAL_DEV_ENVIRONMENT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            empty.value,
+            serde_json::json!({
+                "path": "empty.txt",
+                "start_line": 1,
+                "end_line": 1,
+                "total_lines": 1,
+                "content": "",
+                "bytes": 0,
+            })
+        );
 
         for (step, path, start, end, expected_code) in [
             (32, "src/large.rs", 0, 1, "invalid_workspace_line_range"),
@@ -2306,14 +2586,13 @@ mod tests {
             (
                 35,
                 "src/large.rs",
-                401,
-                401,
+                402,
+                402,
                 "workspace_line_start_out_of_range",
             ),
             (36, "wide.txt", 1, 1, "workspace_line_output_too_large"),
             (37, "too-large.txt", 1, 1, "workspace_range_file_too_large"),
             (38, "binary.dat", 1, 1, "workspace_file_not_utf8"),
-            (39, "empty.txt", 1, 1, "workspace_line_start_out_of_range"),
         ] {
             let error = registry
                 .dispatch(
@@ -2638,6 +2917,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_insert_is_atomic_line_bounded_and_idempotent() {
+        let temp = TestDirectory::new();
+        let sample_path = temp.0.join("sample.txt");
+        fs::write(&sample_path, "one\ntwo\nthree\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&sample_path, fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        fs::write(temp.0.join("tail.txt"), "tail").unwrap();
+        fs::write(
+            temp.0.join("full.txt"),
+            vec![b'a'; MAX_WORKSPACE_EDIT_FILE_BYTES],
+        )
+        .unwrap();
+        let mut registry = ToolRegistry::new();
+        register_local_workspace_connectors(&mut registry, LOCAL_DEV_ENVIRONMENT, &temp.0).unwrap();
+
+        let call = workspace_insert_call(50, "sample.txt", 1, "between");
+        let first = registry
+            .dispatch(call.clone(), LOCAL_DEV_ENVIRONMENT)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.value,
+            serde_json::json!({
+                "path": "sample.txt",
+                "after_line": 1,
+                "inserted_lines": 1,
+                "bytes_before": 14,
+                "bytes_after": 22,
+            })
+        );
+        assert_eq!(
+            fs::read_to_string(&sample_path).unwrap(),
+            "one\nbetween\ntwo\nthree\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&sample_path).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+        }
+
+        let replay = registry
+            .dispatch(call, LOCAL_DEV_ENVIRONMENT)
+            .await
+            .unwrap();
+        assert_eq!(replay.value, first.value);
+        assert!(replay.replayed);
+
+        let conflict = registry
+            .dispatch(
+                workspace_insert_call(50, "sample.txt", 1, "different"),
+                LOCAL_DEV_ENVIRONMENT,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            conflict,
+            RegistryError::Executor(ExecutorError::Failed { ref code, .. })
+                if code == "workspace_insert_idempotency_conflict"
+        ));
+
+        let at_start = registry
+            .dispatch(
+                workspace_insert_call(51, "tail.txt", 0, "zero\nstart"),
+                LOCAL_DEV_ENVIRONMENT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(at_start.value["inserted_lines"], 2);
+        assert_eq!(
+            fs::read_to_string(temp.0.join("tail.txt")).unwrap(),
+            "zero\nstart\ntail"
+        );
+
+        for (step, path, after_line, text, expected_code) in [
+            (
+                52,
+                "sample.txt",
+                6,
+                "outside",
+                "workspace_insert_line_out_of_range",
+            ),
+            (
+                53,
+                "sample.txt",
+                -1,
+                "outside",
+                "invalid_workspace_insert_line",
+            ),
+            (
+                54,
+                "sample.txt",
+                1,
+                &"界".repeat(1366),
+                "invalid_workspace_insert_text",
+            ),
+            (55, "full.txt", 1, "x", "workspace_edit_file_too_large"),
+        ] {
+            let error = registry
+                .dispatch(
+                    workspace_insert_call(step, path, after_line, text),
+                    LOCAL_DEV_ENVIRONMENT,
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                RegistryError::Executor(ExecutorError::Failed { ref code, .. })
+                    if code == expected_code
+            ));
+        }
+        assert!(fs::read_dir(&temp.0).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".zeus-tool-")
+        }));
+    }
+
+    #[tokio::test]
     async fn workspace_create_is_atomic_create_new_and_idempotent() {
         let temp = TestDirectory::new();
         fs::create_dir(temp.0.join("src")).unwrap();
@@ -2817,6 +3222,20 @@ mod tests {
             RegistryError::Executor(ExecutorError::Failed { ref code, .. })
                 if code == "workspace_symlink_denied"
         ));
+
+        let insert = registry
+            .dispatch(
+                workspace_insert_call(56, "linked-file", 0, "inside"),
+                LOCAL_DEV_ENVIRONMENT,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            insert,
+            RegistryError::Executor(ExecutorError::Failed { ref code, .. })
+                if code == "workspace_symlink_denied"
+        ));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside secret");
 
         for path in ["linked-file", "nested/linked-dir/outside.txt"] {
             let error = registry
