@@ -1494,6 +1494,7 @@ fn terminal_signal(value: &str) -> Result<TerminalSignal, ExecutorError> {
 fn terminal_executor_error(error: TerminalError, indeterminate: bool) -> ExecutorError {
     match error {
         TerminalError::BackendFailed
+        | TerminalError::BackendTimedOut
         | TerminalError::InvalidBackendResult
         | TerminalError::StateUnavailable
             if indeterminate =>
@@ -1503,11 +1504,11 @@ fn terminal_executor_error(error: TerminalError, indeterminate: bool) -> Executo
                     .into(),
             }
         }
-        TerminalError::InvalidBackendConfiguration | TerminalError::BackendUnavailable => {
-            ExecutorError::Unavailable {
-                reason: "No compatible isolated terminal backend is available".into(),
-            }
-        }
+        TerminalError::InvalidBackendConfiguration
+        | TerminalError::InvalidDeadlineConfiguration
+        | TerminalError::BackendUnavailable => ExecutorError::Unavailable {
+            reason: "No compatible isolated terminal backend is available".into(),
+        },
         TerminalError::InvalidRequest(_) => terminal_failed(
             "invalid_terminal_request",
             "The terminal request is invalid or exceeds a configured limit",
@@ -1537,6 +1538,7 @@ fn terminal_executor_error(error: TerminalError, indeterminate: bool) -> Executo
             "The terminal session already has a send operation in progress",
         ),
         TerminalError::BackendFailed
+        | TerminalError::BackendTimedOut
         | TerminalError::InvalidBackendResult
         | TerminalError::StateUnavailable => terminal_failed(
             "terminal_backend_failed",
@@ -3430,6 +3432,18 @@ mod tests {
             sandbox_profile: SandboxProfile::IsolatedContainer,
             executor_status: ToolExecutorStatus::Available,
         }
+    }
+
+    #[test]
+    fn terminal_deadline_preserves_mutation_uncertainty_but_not_read_uncertainty() {
+        assert!(matches!(
+            terminal_executor_error(TerminalError::BackendTimedOut, true),
+            ExecutorError::OutcomeUnknown { .. }
+        ));
+        assert!(matches!(
+            terminal_executor_error(TerminalError::BackendTimedOut, false),
+            ExecutorError::Failed { ref code, .. } if code == "terminal_backend_failed"
+        ));
     }
 
     #[test]

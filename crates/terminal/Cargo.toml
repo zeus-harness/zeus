@@ -12,7 +12,5 @@ publish.workspace = true
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
-tools.workspace = true
-
-[dev-dependencies]
 tokio.workspace = true
+tools.workspace = true

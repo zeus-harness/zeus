@@ -15,6 +15,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -30,9 +31,72 @@ pub const MAX_TERMINAL_READ_LINES: usize = 500;
 pub const MAX_TERMINAL_SESSIONS_PER_OWNER: usize = 4;
 pub const MAX_TERMINAL_SESSIONS: usize = 128;
 pub const MAX_TERMINAL_BACKENDS: usize = 8;
+pub const MAX_TERMINAL_DEADLINE: Duration = Duration::from_secs(5 * 60);
+pub const DEFAULT_TERMINAL_SPAWN_DEADLINE: Duration = Duration::from_secs(60);
+pub const DEFAULT_TERMINAL_SEND_DEADLINE: Duration = Duration::from_secs(45);
+pub const DEFAULT_TERMINAL_CONTROL_DEADLINE: Duration = Duration::from_secs(10);
+pub const DEFAULT_TERMINAL_CLEANUP_DEADLINE: Duration = Duration::from_secs(10);
 
 pub type TerminalFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, TerminalError>> + Send + 'a>>;
+
+/// Zeus-owned outer deadlines for calls into an isolated terminal backend.
+/// A backend may apply stricter readiness or process deadlines of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalDeadlines {
+    spawn: Duration,
+    send: Duration,
+    control: Duration,
+    cleanup: Duration,
+}
+
+impl TerminalDeadlines {
+    pub fn new(
+        spawn: Duration,
+        send: Duration,
+        control: Duration,
+        cleanup: Duration,
+    ) -> Result<Self, TerminalError> {
+        for deadline in [spawn, send, control, cleanup] {
+            if deadline.is_zero() || deadline > MAX_TERMINAL_DEADLINE {
+                return Err(TerminalError::InvalidDeadlineConfiguration);
+            }
+        }
+        Ok(Self {
+            spawn,
+            send,
+            control,
+            cleanup,
+        })
+    }
+
+    pub fn spawn(self) -> Duration {
+        self.spawn
+    }
+
+    pub fn send(self) -> Duration {
+        self.send
+    }
+
+    pub fn control(self) -> Duration {
+        self.control
+    }
+
+    pub fn cleanup(self) -> Duration {
+        self.cleanup
+    }
+}
+
+impl Default for TerminalDeadlines {
+    fn default() -> Self {
+        Self {
+            spawn: DEFAULT_TERMINAL_SPAWN_DEADLINE,
+            send: DEFAULT_TERMINAL_SEND_DEADLINE,
+            control: DEFAULT_TERMINAL_CONTROL_DEADLINE,
+            cleanup: DEFAULT_TERMINAL_CLEANUP_DEADLINE,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
@@ -134,6 +198,8 @@ pub struct TerminalReadRequest {
 pub enum TerminalError {
     #[error("terminal backend configuration is invalid")]
     InvalidBackendConfiguration,
+    #[error("terminal deadline configuration is invalid")]
+    InvalidDeadlineConfiguration,
     #[error("terminal request is invalid: {0}")]
     InvalidRequest(&'static str),
     #[error("terminal backend is unavailable")]
@@ -152,12 +218,16 @@ pub enum TerminalError {
     SendInProgress,
     #[error("terminal backend operation failed")]
     BackendFailed,
+    #[error("terminal backend operation exceeded its Zeus deadline")]
+    BackendTimedOut,
     #[error("terminal backend returned an invalid result")]
     InvalidBackendResult,
     #[error("terminal service state is unavailable")]
     StateUnavailable,
 }
 
+/// One live isolated terminal. Operation futures may be dropped when their
+/// Zeus deadline expires; the session must remain closeable afterward.
 pub trait TerminalBackendSession: Send + Sync {
     fn snapshot(&self) -> TerminalFuture<'_, TerminalStatus>;
     fn send(&self, request: TerminalSendRequest) -> TerminalFuture<'_, TerminalSendResult>;
@@ -168,6 +238,8 @@ pub trait TerminalBackendSession: Send + Sync {
 
 pub trait TerminalBackend: Send + Sync {
     fn backend_type(&self) -> &str;
+    /// Create one unpublished session. Dropping this future is cancellation;
+    /// the backend must reclaim any partial resources that it has not returned.
     fn spawn(
         &self,
         request: BackendSpawnRequest,
@@ -196,12 +268,26 @@ struct TerminalState {
 pub struct TerminalService {
     backends: BTreeMap<String, Arc<dyn TerminalBackend>>,
     state: Arc<Mutex<TerminalState>>,
+    deadlines: TerminalDeadlines,
 }
 
 impl TerminalService {
     pub fn new(
         backends: impl IntoIterator<Item = Arc<dyn TerminalBackend>>,
     ) -> Result<Self, TerminalError> {
+        Self::with_deadlines(backends, TerminalDeadlines::default())
+    }
+
+    pub fn with_deadlines(
+        backends: impl IntoIterator<Item = Arc<dyn TerminalBackend>>,
+        deadlines: TerminalDeadlines,
+    ) -> Result<Self, TerminalError> {
+        TerminalDeadlines::new(
+            deadlines.spawn,
+            deadlines.send,
+            deadlines.control,
+            deadlines.cleanup,
+        )?;
         let mut registered = BTreeMap::new();
         for backend in backends {
             let backend_type = backend.backend_type();
@@ -224,11 +310,16 @@ impl TerminalService {
                 next_session: 1,
                 ..TerminalState::default()
             })),
+            deadlines,
         })
     }
 
     pub fn backend_types(&self) -> Vec<String> {
         self.backends.keys().cloned().collect()
+    }
+
+    pub fn deadlines(&self) -> TerminalDeadlines {
+        self.deadlines
     }
 
     pub async fn spawn(
@@ -248,23 +339,25 @@ impl TerminalService {
             request.name.clone(),
         )?;
         let session_id = reservation.session_id.clone();
-        let session = backend
-            .spawn(BackendSpawnRequest {
+        let spawn_deadline = tokio::time::Instant::now() + self.deadlines.spawn;
+        let session = await_backend_at(
+            spawn_deadline,
+            backend.spawn(BackendSpawnRequest {
                 session_id: session_id.clone(),
                 owner: owner.clone(),
                 cwd: request.cwd,
-            })
-            .await
-            .map_err(|_| TerminalError::BackendFailed)?;
-        let status = match session.snapshot().await {
+            }),
+        )
+        .await?;
+        let status = match await_backend_at(spawn_deadline, session.snapshot()).await {
             Ok(status) if validate_status(&status).is_ok() => status,
             Ok(_) => {
-                let _ = session.close().await;
+                let _ = await_backend(self.deadlines.cleanup, session.close()).await;
                 return Err(TerminalError::InvalidBackendResult);
             }
-            Err(_) => {
-                let _ = session.close().await;
-                return Err(TerminalError::BackendFailed);
+            Err(error) => {
+                let _ = await_backend(self.deadlines.cleanup, session.close()).await;
+                return Err(error);
             }
         };
         let record = Arc::new(TerminalRecord {
@@ -276,9 +369,7 @@ impl TerminalService {
             closing: AtomicBool::new(false),
         });
         if let Err(error) = reservation.publish(Arc::clone(&record)) {
-            if record.session.close().await.is_err() {
-                return Err(TerminalError::BackendFailed);
-            }
+            await_backend(self.deadlines.cleanup, record.session.close()).await?;
             return Err(error);
         }
         Ok(snapshot_for(&session_id, &record, status))
@@ -302,18 +393,25 @@ impl TerminalService {
                 .map(|(id, record)| (id.clone(), Arc::clone(record)))
                 .collect::<Vec<_>>()
         };
-        let mut snapshots = Vec::with_capacity(records.len());
-        for (id, record) in records {
-            let status = record
-                .session
-                .snapshot()
-                .await
-                .map_err(|_| TerminalError::BackendFailed)?;
-            validate_status(&status)?;
-            snapshots.push(snapshot_for(&id, &record, status));
+        match tokio::time::timeout(self.deadlines.control, async {
+            let mut snapshots = Vec::with_capacity(records.len());
+            for (id, record) in records {
+                let status = record
+                    .session
+                    .snapshot()
+                    .await
+                    .map_err(|_| TerminalError::BackendFailed)?;
+                validate_status(&status)?;
+                snapshots.push(snapshot_for(&id, &record, status));
+            }
+            snapshots.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+            Ok(snapshots)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(TerminalError::BackendTimedOut),
         }
-        snapshots.sort_by(|left, right| left.session_id.cmp(&right.session_id));
-        Ok(snapshots)
     }
 
     pub async fn send(
@@ -331,11 +429,7 @@ impl TerminalService {
             return Err(TerminalError::SessionClosing);
         }
         let _send = SendGuard::acquire(&record.send_in_progress)?;
-        let result = record
-            .session
-            .send(request)
-            .await
-            .map_err(|_| TerminalError::BackendFailed)?;
+        let result = await_backend(self.deadlines.send, record.session.send(request)).await?;
         validate_send_result(&result)?;
         Ok(result)
     }
@@ -356,11 +450,7 @@ impl TerminalService {
         if record.closing.load(Ordering::Acquire) {
             return Err(TerminalError::SessionClosing);
         }
-        let result = record
-            .session
-            .read(request)
-            .await
-            .map_err(|_| TerminalError::BackendFailed)?;
+        let result = await_backend(self.deadlines.control, record.session.read(request)).await?;
         validate_read_result(&result, request.count)?;
         Ok(result)
     }
@@ -376,11 +466,7 @@ impl TerminalService {
         if record.closing.load(Ordering::Acquire) {
             return Err(TerminalError::SessionClosing);
         }
-        let status = record
-            .session
-            .signal(signal)
-            .await
-            .map_err(|_| TerminalError::BackendFailed)?;
+        let status = await_backend(self.deadlines.control, record.session.signal(signal)).await?;
         validate_status(&status)?;
         Ok(status)
     }
@@ -399,7 +485,7 @@ impl TerminalService {
         {
             return Ok(false);
         }
-        let result = record.session.close().await;
+        let result = await_backend(self.deadlines.cleanup, record.session.close()).await;
         let mut state = self
             .state
             .lock()
@@ -446,6 +532,7 @@ impl TerminalService {
             pending_cancelled: records.1,
             ..TerminalCleanupReport::default()
         };
+        let mut cleanups = tokio::task::JoinSet::new();
         for (_, record) in records.0 {
             if record
                 .closing
@@ -455,9 +542,22 @@ impl TerminalService {
                 continue;
             }
             report.close_attempted += 1;
-            match record.session.close().await {
-                Ok(()) => report.close_succeeded += 1,
-                Err(_) => report.close_failed += 1,
+            cleanups.spawn(async move { record.session.close().await });
+        }
+        let cleanup_deadline = tokio::time::Instant::now() + self.deadlines.cleanup;
+        while report.close_succeeded + report.close_failed < report.close_attempted {
+            match tokio::time::timeout_at(cleanup_deadline, cleanups.join_next()).await {
+                Ok(Some(Ok(Ok(())))) => report.close_succeeded += 1,
+                Ok(Some(Ok(Err(_))) | Some(Err(_))) => report.close_failed += 1,
+                Ok(None) => {
+                    report.close_failed = report.close_attempted - report.close_succeeded;
+                    break;
+                }
+                Err(_) => {
+                    report.close_failed = report.close_attempted - report.close_succeeded;
+                    cleanups.abort_all();
+                    break;
+                }
             }
         }
         Ok(report)
@@ -478,6 +578,24 @@ impl TerminalService {
             .filter(|record| record.owner == *owner)
             .ok_or(TerminalError::UnknownSession)?;
         Ok(Arc::clone(record))
+    }
+}
+
+async fn await_backend<T>(
+    deadline: Duration,
+    operation: impl Future<Output = Result<T, TerminalError>>,
+) -> Result<T, TerminalError> {
+    await_backend_at(tokio::time::Instant::now() + deadline, operation).await
+}
+
+async fn await_backend_at<T>(
+    deadline: tokio::time::Instant,
+    operation: impl Future<Output = Result<T, TerminalError>>,
+) -> Result<T, TerminalError> {
+    match tokio::time::timeout_at(deadline, operation).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(_)) => Err(TerminalError::BackendFailed),
+        Err(_) => Err(TerminalError::BackendTimedOut),
     }
 }
 
@@ -736,6 +854,17 @@ mod tests {
         sessions: Arc<Mutex<Vec<Arc<StubSession>>>>,
     }
 
+    struct HangingBackend {
+        session: Arc<HangingSession>,
+    }
+
+    struct HangingSession {
+        hang_snapshot: AtomicBool,
+        hang_send_once: AtomicBool,
+        hang_close: AtomicBool,
+        closes: AtomicUsize,
+    }
+
     impl TerminalBackend for BlockingSpawnBackend {
         fn backend_type(&self) -> &str {
             "blocking"
@@ -788,6 +917,20 @@ mod tests {
         }
     }
 
+    impl TerminalBackend for HangingBackend {
+        fn backend_type(&self) -> &str {
+            "hanging"
+        }
+
+        fn spawn(
+            &self,
+            _request: BackendSpawnRequest,
+        ) -> TerminalFuture<'_, Arc<dyn TerminalBackendSession>> {
+            let session: Arc<dyn TerminalBackendSession> = self.session.clone();
+            Box::pin(async move { Ok(session) })
+        }
+    }
+
     impl TerminalBackendSession for StubSession {
         fn snapshot(&self) -> TerminalFuture<'_, TerminalStatus> {
             Box::pin(async { Ok(TerminalStatus::Running) })
@@ -835,6 +978,63 @@ mod tests {
         }
     }
 
+    impl TerminalBackendSession for HangingSession {
+        fn snapshot(&self) -> TerminalFuture<'_, TerminalStatus> {
+            let hangs = self.hang_snapshot.load(Ordering::Acquire);
+            Box::pin(async move {
+                if hangs {
+                    std::future::pending::<Result<TerminalStatus, TerminalError>>().await
+                } else {
+                    Ok(TerminalStatus::Running)
+                }
+            })
+        }
+
+        fn send(&self, request: TerminalSendRequest) -> TerminalFuture<'_, TerminalSendResult> {
+            let hangs = self.hang_send_once.swap(false, Ordering::AcqRel);
+            Box::pin(async move {
+                if hangs {
+                    std::future::pending::<Result<TerminalSendResult, TerminalError>>().await
+                } else {
+                    Ok(TerminalSendResult {
+                        viewport: format!("ran:{}:{}", request.text, request.submit),
+                        wait_reason: TerminalWaitReason::InferredIdle,
+                        status: TerminalStatus::Running,
+                        truncated: false,
+                    })
+                }
+            })
+        }
+
+        fn read(&self, request: TerminalReadRequest) -> TerminalFuture<'_, TerminalReadResult> {
+            Box::pin(async move {
+                Ok(TerminalReadResult {
+                    text: "history".into(),
+                    total_lines: 1,
+                    line_begin: request.offset.min(1),
+                    line_end: 1,
+                    truncated: false,
+                })
+            })
+        }
+
+        fn signal(&self, _signal: TerminalSignal) -> TerminalFuture<'_, TerminalStatus> {
+            Box::pin(async { Ok(TerminalStatus::Running) })
+        }
+
+        fn close(&self) -> TerminalFuture<'_, ()> {
+            self.closes.fetch_add(1, Ordering::Relaxed);
+            let hangs = self.hang_close.load(Ordering::Acquire);
+            Box::pin(async move {
+                if hangs {
+                    std::future::pending::<Result<(), TerminalError>>().await
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
     fn owner(actor: &str) -> ExecutionScope {
         ExecutionScope::new("account-1", actor, "session-1", "turn-1", "agent-1").unwrap()
     }
@@ -846,6 +1046,16 @@ mod tests {
             fail_close: false,
         });
         (TerminalService::new([backend]).unwrap(), sessions)
+    }
+
+    fn test_deadlines() -> TerminalDeadlines {
+        TerminalDeadlines::new(
+            Duration::from_millis(25),
+            Duration::from_millis(25),
+            Duration::from_millis(25),
+            Duration::from_millis(25),
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -1181,6 +1391,166 @@ mod tests {
         assert_eq!(service.list(&owner).await.unwrap().len(), 1);
     }
 
+    #[tokio::test]
+    async fn spawn_deadline_releases_pending_name_and_capacity() {
+        let backend = Arc::new(BlockingSpawnBackend {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            block_first: AtomicBool::new(true),
+            sessions: Arc::new(Mutex::new(Vec::new())),
+        });
+        let service = TerminalService::with_deadlines(
+            [Arc::clone(&backend) as Arc<dyn TerminalBackend>],
+            test_deadlines(),
+        )
+        .unwrap();
+        let owner = owner("spawn-timeout");
+        let request = TerminalSpawnRequest {
+            backend_type: "blocking".into(),
+            name: Some("main".into()),
+            cwd: ".".into(),
+        };
+
+        assert_eq!(
+            service.spawn(owner.clone(), request.clone()).await,
+            Err(TerminalError::BackendTimedOut)
+        );
+        let replacement = service.spawn(owner.clone(), request).await.unwrap();
+        assert_eq!(replacement.name.as_deref(), Some("main"));
+        assert_eq!(service.list(&owner).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn send_deadline_releases_the_exclusive_send_slot() {
+        let session = Arc::new(HangingSession {
+            hang_snapshot: AtomicBool::new(false),
+            hang_send_once: AtomicBool::new(true),
+            hang_close: AtomicBool::new(false),
+            closes: AtomicUsize::new(0),
+        });
+        let service = TerminalService::with_deadlines(
+            [Arc::new(HangingBackend {
+                session: Arc::clone(&session),
+            }) as Arc<dyn TerminalBackend>],
+            test_deadlines(),
+        )
+        .unwrap();
+        let owner = owner("send-timeout");
+        let spawned = service
+            .spawn(
+                owner.clone(),
+                TerminalSpawnRequest {
+                    backend_type: "hanging".into(),
+                    name: None,
+                    cwd: ".".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let request = TerminalSendRequest {
+            text: "echo bounded".into(),
+            submit: true,
+        };
+
+        assert_eq!(
+            service
+                .send(&owner, &spawned.session_id, request.clone())
+                .await,
+            Err(TerminalError::BackendTimedOut)
+        );
+        assert_eq!(
+            service
+                .send(&owner, &spawned.session_id, request)
+                .await
+                .unwrap()
+                .viewport,
+            "ran:echo bounded:true"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_uses_one_control_deadline_and_recovers_after_a_read_only_timeout() {
+        let session = Arc::new(HangingSession {
+            hang_snapshot: AtomicBool::new(false),
+            hang_send_once: AtomicBool::new(false),
+            hang_close: AtomicBool::new(false),
+            closes: AtomicUsize::new(0),
+        });
+        let service = TerminalService::with_deadlines(
+            [Arc::new(HangingBackend {
+                session: Arc::clone(&session),
+            }) as Arc<dyn TerminalBackend>],
+            test_deadlines(),
+        )
+        .unwrap();
+        let owner = owner("list-timeout");
+        service
+            .spawn(
+                owner.clone(),
+                TerminalSpawnRequest {
+                    backend_type: "hanging".into(),
+                    name: None,
+                    cwd: ".".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        session.hang_snapshot.store(true, Ordering::Release);
+        assert_eq!(
+            service.list(&owner).await,
+            Err(TerminalError::BackendTimedOut)
+        );
+        session.hang_snapshot.store(false, Ordering::Release);
+        assert_eq!(service.list(&owner).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn owner_cleanup_has_one_total_deadline_for_all_backend_closes() {
+        let session = Arc::new(HangingSession {
+            hang_snapshot: AtomicBool::new(false),
+            hang_send_once: AtomicBool::new(false),
+            hang_close: AtomicBool::new(true),
+            closes: AtomicUsize::new(0),
+        });
+        let service = TerminalService::with_deadlines(
+            [Arc::new(HangingBackend {
+                session: Arc::clone(&session),
+            }) as Arc<dyn TerminalBackend>],
+            test_deadlines(),
+        )
+        .unwrap();
+        let owner = owner("cleanup-timeout");
+        service
+            .spawn(
+                owner.clone(),
+                TerminalSpawnRequest {
+                    backend_type: "hanging".into(),
+                    name: None,
+                    cwd: ".".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let report = tokio::time::timeout(Duration::from_millis(250), service.close_owner(&owner))
+            .await
+            .expect("owner cleanup must not inherit an unbounded backend wait")
+            .unwrap();
+        assert_eq!(
+            report,
+            TerminalCleanupReport {
+                removed: 1,
+                pending_cancelled: 0,
+                close_attempted: 1,
+                close_succeeded: 0,
+                close_failed: 1,
+            }
+        );
+        assert_eq!(session.closes.load(Ordering::Relaxed), 1);
+        assert!(service.list(&owner).await.unwrap().is_empty());
+    }
+
     #[test]
     fn configuration_and_cwd_validation_fail_closed() {
         assert!(matches!(
@@ -1199,5 +1569,23 @@ mod tests {
         }
         assert!(validate_cwd(".").is_ok());
         assert!(validate_cwd("src/nested").is_ok());
+        assert_eq!(
+            TerminalDeadlines::new(
+                Duration::ZERO,
+                DEFAULT_TERMINAL_SEND_DEADLINE,
+                DEFAULT_TERMINAL_CONTROL_DEADLINE,
+                DEFAULT_TERMINAL_CLEANUP_DEADLINE,
+            ),
+            Err(TerminalError::InvalidDeadlineConfiguration)
+        );
+        assert_eq!(
+            TerminalDeadlines::new(
+                MAX_TERMINAL_DEADLINE + Duration::from_millis(1),
+                DEFAULT_TERMINAL_SEND_DEADLINE,
+                DEFAULT_TERMINAL_CONTROL_DEADLINE,
+                DEFAULT_TERMINAL_CLEANUP_DEADLINE,
+            ),
+            Err(TerminalError::InvalidDeadlineConfiguration)
+        );
     }
 }

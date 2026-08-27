@@ -278,8 +278,16 @@ scope plus call ID. Each owner is limited to four sessions and the service has
 a 128-session global hard limit. After any durable Agent terminal state, Zeus
 removes and best-effort closes every terminal in that exact scope; backend close
 failures are reported but cannot retain internal capacity or reopen the Agent.
-An indeterminate backend result after the durable start checkpoint settles as
-`outcome_unknown` and is never retried automatically.
+Calls into a backend also have validated Zeus-owned outer deadlines: one shared
+60-second budget for spawn plus its initial snapshot, 45 seconds for send, 10
+seconds for read/list/signal, and one total
+10-second owner-cleanup budget by default. Embedding applications may lower or
+raise each value up to the five-minute hard ceiling when constructing the
+service. A backend `wait_reason=timeout` is a successful bounded send result and
+does not prove process exit; a Zeus service deadline means the backend call did
+not settle. A mutation that crosses that deadline after the durable start
+checkpoint settles as `outcome_unknown` and is never retried automatically,
+while a read-only timeout is a known `terminal_backend_failed` result.
 
 The rooted workspace connectors can be exercised with:
 

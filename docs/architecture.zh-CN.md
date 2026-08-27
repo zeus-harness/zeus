@@ -425,9 +425,15 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   硬上限，同一 session 不允许并发 send。任何 Agent durable terminal state 提交后，runtime 按 exact
   scope 移除并 best-effort close 全部 terminal；backend close 失败会记录，但不能占住 Zeus 内部容量，
   也不能重开已终止的 Agent。
+  Zeus 对 backend 调用另设经校验的外层 deadline：spawn 与 initial snapshot 默认共用 60 秒总预算、
+  send 45 秒、read/list/signal 10 秒，并为一个 owner 的全部并发 cleanup 共用 10 秒总预算；embedding application 构造 service
+  时可在 5 分钟 hard ceiling 内调整。backend 返回 `wait_reason=timeout` 仍是已结算的 send 结果，且不
+  证明进程退出；Zeus deadline 到期则表示 backend call 未结算。spawn timeout 会释放 pending name 与
+  容量，send timeout 会释放 exclusive send slot，cleanup timeout 也必须先移除内部记录。
   open/send/signal/close 为 approval-gated mutation，read/list 为 read-only allow；mutation receipt
   同时绑定 scope、call ID、tool 和 arguments digest。durable started 之后 backend 报告不确定结果
-  时结算 `outcome_unknown` 并中断 Agent turn，禁止自动重试可能已产生的副作用。
+  或 mutation 跨过 Zeus deadline 时结算 `outcome_unknown` 并中断 Agent turn，禁止自动重试可能已
+  产生的副作用；read/list deadline 是确定的 `terminal_backend_failed`。
 - `ZEUS_DEMO_PROFILE=production-guarded` 是默认值；切到 `local-development` 时必须使用独立
   SQLite 数据库，并由 `ZEUS_LOCAL_MARKER_ROOT` 固定写入根目录。只有显式设置
   `ZEUS_LOCAL_WORKSPACE_ROOT` 时才注册 workspace 工具；未设置时保留原 marker-only 行为。
@@ -544,9 +550,10 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   冲突、symlink 与 12 KiB 边界均 fail closed。
 - isolated terminal：显式注入 fake isolated backend 的真实 Agent loop 覆盖 open 与 send 两次
   exact-call approval、完整 server-owned execution scope、精确 tool-result 回灌，以及 backend
-  send 结果不确定时 durable `outcome_unknown`、Session `needs_attention` 且不重试外部操作；成功与
+  send 跨过 Zeus deadline 时 durable `outcome_unknown`、Session `needs_attention` 且不重试外部操作；成功与
   outcome-unknown 终态都会自动 close exact-scope terminal。单元测试另覆盖 4/128 容量、owner 隔离、
-  幂等 cleanup 与 backend close 失败时释放内部容量。
+  幂等 cleanup、spawn/send deadline、单一 cleanup 总 deadline，以及 backend close 失败或超时时释放
+  内部容量。
 - 生产 RDS 路径只能得到 executor unavailable，不能得到伪造成功。
 - Session/Run SSE 重连都严格从各自大于 cursor 的 sequence 补齐事件。请求同时携带 query
   cursor 和 `Last-Event-ID` 时，后者优先。

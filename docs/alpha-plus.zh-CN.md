@@ -243,8 +243,11 @@ POST /sessions/{id}/turns
   Agent durable terminal state 提交后必须按 exact scope 移除并 best-effort close 全部 session；close
   失败只记录 backend 泄漏风险，不能保留内部容量或重开 Agent。open/send/signal/close 必须逐次 owner
   approval，read/list 为 read-only allow；mutation receipt 绑定 scope、call ID、tool 与 arguments
-  digest。started checkpoint 后无法确认副作用结果时必须 durable settle 为 `outcome_unknown`，终止
-  当前 Agent turn 且不得自动重试。
+  digest。backend call 还必须受 Zeus 外层 deadline 约束：spawn 与 initial snapshot 默认共用 60 秒，
+  send/control/cleanup 分别为 45/10/10 秒，可在 5 分钟 hard ceiling 内由 embedding application 调整，cleanup 是一个 owner
+  全部 close 的总预算。backend 的 `wait_reason=timeout` 不等同 Zeus deadline，也不证明进程退出。
+  started checkpoint 后 mutation 跨过 deadline 或无法确认副作用结果时必须 durable settle 为
+  `outcome_unknown`，终止当前 Agent turn 且不得自动重试；read-only deadline 返回确定失败。
 - 本地 fallback 只说明“消息已保存但未配置模型”，事件必须标注 `local-fallback/non-model`，不能冒充智能回复。
 - OpenAI-compatible provider 限制连接/总超时、响应体大小，禁止重定向，并对非 2xx、畸形 JSON 和空 choices fail closed。
 

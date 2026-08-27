@@ -5083,7 +5083,7 @@ mod tests {
     use rusqlite::{Connection, params};
     use tenancy::BootstrapToken;
     use terminal::{
-        BackendSpawnRequest, TerminalBackend, TerminalBackendSession, TerminalError,
+        BackendSpawnRequest, TerminalBackend, TerminalBackendSession, TerminalDeadlines,
         TerminalFuture, TerminalReadRequest, TerminalReadResult, TerminalSendRequest,
         TerminalSendResult, TerminalService, TerminalSignal, TerminalStatus, TerminalWaitReason,
     };
@@ -6890,13 +6890,13 @@ mod tests {
 
     struct RecordingTerminalBackend {
         actions: Arc<StdMutex<Vec<RecordedTerminalAction>>>,
-        fail_send: bool,
+        hang_send: bool,
     }
 
     struct RecordingTerminalSession {
         session_id: String,
         actions: Arc<StdMutex<Vec<RecordedTerminalAction>>>,
-        fail_send: bool,
+        hang_send: bool,
     }
 
     impl TerminalBackend for RecordingTerminalBackend {
@@ -6915,7 +6915,7 @@ mod tests {
             let session: Arc<dyn TerminalBackendSession> = Arc::new(RecordingTerminalSession {
                 session_id: request.session_id,
                 actions: Arc::clone(&self.actions),
-                fail_send: self.fail_send,
+                hang_send: self.hang_send,
             });
             Box::pin(async move { Ok(session) })
         }
@@ -6934,8 +6934,8 @@ mod tests {
                     session_id: self.session_id.clone(),
                     request,
                 });
-            if self.fail_send {
-                return Box::pin(async { Err(TerminalError::BackendFailed) });
+            if self.hang_send {
+                return Box::pin(std::future::pending());
             }
             Box::pin(async {
                 Ok(TerminalSendResult {
@@ -8346,7 +8346,7 @@ mod tests {
         let terminal_service = Arc::new(
             TerminalService::new([Arc::new(RecordingTerminalBackend {
                 actions: Arc::clone(&backend_actions),
-                fail_send: false,
+                hang_send: false,
             }) as Arc<dyn TerminalBackend>])
             .unwrap(),
         );
@@ -8574,7 +8574,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn indeterminate_terminal_send_settles_outcome_unknown_without_retry() {
+    async fn terminal_send_deadline_settles_outcome_unknown_without_retry() {
         let unique = UserId::generate().unwrap();
         let root = std::env::temp_dir().join(format!(
             "zeus-api-terminal-unknown-{}",
@@ -8585,10 +8585,19 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let backend_actions = Arc::new(StdMutex::new(Vec::new()));
         let terminal_service = Arc::new(
-            TerminalService::new([Arc::new(RecordingTerminalBackend {
-                actions: Arc::clone(&backend_actions),
-                fail_send: true,
-            }) as Arc<dyn TerminalBackend>])
+            TerminalService::with_deadlines(
+                [Arc::new(RecordingTerminalBackend {
+                    actions: Arc::clone(&backend_actions),
+                    hang_send: true,
+                }) as Arc<dyn TerminalBackend>],
+                TerminalDeadlines::new(
+                    Duration::from_millis(100),
+                    Duration::from_millis(25),
+                    Duration::from_millis(100),
+                    Duration::from_millis(100),
+                )
+                .unwrap(),
+            )
             .unwrap(),
         );
         let store = DemoStore::open_local_with_terminal(&path, &marker_root, terminal_service)
