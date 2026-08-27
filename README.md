@@ -88,15 +88,21 @@ ZEUS_LLM_API_KEY=your-secret
 Partial provider configuration fails startup. The endpoint and key are never
 writable through the browser Settings API.
 
-Each accepted turn builds the initial provider request from the newest
-complete, flushed user/assistant pairs that existed at the submitted
-`expected_sequence`, followed by the new user message. The Agent entry request
-is bounded to 27 prior pairs and 64 KiB of UTF-8 message content, then persisted
-in the immutable model job. This reserves the complete fixed loop budget: at
-most eight model steps, four sequential tool calls, one pending approval,
-16 KiB of arguments per call, 64 KiB per known result, and 128 KiB of known
-results for the turn. Retries reuse the originally admitted request rather
-than rebuilding it from newer Session state.
+Each accepted turn builds the initial provider request from exactly one stable
+system message, the newest complete, flushed user/assistant pairs that existed
+at the submitted `expected_sequence`, and the new user message. The system
+prompt identity, revision, and domain-separated content digest are part of the
+canonical secret-free deployment manifest; its exact content is the first
+message in the durable request. The prompt shares the 64 KiB initial UTF-8
+content budget with at most 27 prior pairs and the current user message. That
+initial shape uses at most 56 of the Agent's 64-message budget, reserving the
+remaining eight messages for four sequential assistant tool calls and their
+results. The fixed loop also permits at most eight model steps, one pending
+approval, 16 KiB of arguments per call, 64 KiB per known result, and 128 KiB of
+known results for the turn. Retries reuse the originally admitted request
+rather than rebuilding it from newer Session state. A current user message that
+cannot fit beside the fixed prompt is rejected with `413
+agent_request_too_large` before any turn or job is written.
 
 SQLite logical-capacity defaults can be reduced for local tests or raised only
 up to the compiled hard ceiling. Explicit values must be non-empty unsigned
@@ -451,19 +457,27 @@ and bounded memory, CPU, and PID resources.
   stores the actor-scoped response receipt, creates the durable Agent state,
   binds that Agent to one canonical, secret-free deployment manifest, and
   enqueues its first immutable model job.
-  That work contains a bounded provider request assembled from complete
-  historical turns through the submitted sequence plus the new user message;
-  interrupted or otherwise unflushed turns never enter model context.
+  That work contains a bounded provider request whose first and only system
+  message is the exact manifest-bound prompt, followed by complete historical
+  turns through the submitted sequence and the new user message; interrupted
+  or otherwise unflushed turns never enter model context.
 - The deployment manifest fixes the profile, environment, provider/model
-  identity, policy revision, workflow limits, and exact versioned tool
-  contracts used for the turn. Model requests derive their visible tool list
-  from that same manifest. Before a queued model or tool operation can reach an
+  identity, policy revision, workflow limits, prompt ID/revision/content digest,
+  and exact versioned tool contracts used for the turn. The prompt content is
+  not copied into the secret-free manifest; it is persisted in the immutable
+  model request so the provider-visible input is reconstructable. Admission,
+  claim, tool continuation, and deep-integrity verification all require one
+  first-position system message whose content matches the manifest digest, and
+  the complete typed transcript/message/content envelope must be executable.
+  Model requests derive their visible tool list from that same manifest.
+  Invalid prompt or tool authority at admission rejects and rolls back the
+  complete command. Before already queued model or tool work can reach an
   external provider/executor, a durable `prepared` claim compares the persisted
   digest and binding with the current runtime without authorizing external I/O.
   The same worker can recover that exact claim after a transient storage error;
   an expired prepared claim advances to a new generation while the operation
-  remains queued. Missing, corrupted, or drifted authority settles durably as
-  `deployment_unavailable` with zero external calls.
+  remains queued. Missing, corrupted, promptless, or drifted queued authority
+  settles durably as `deployment_unavailable` with zero external calls.
 - The model worker atomically advances the exact prepared claim and its
   RunEpoch/workflow fact/job to `started` before calling a provider.
   Final text atomically stores the assistant message, appends
@@ -473,9 +487,11 @@ and bounded memory, CPU, and PID resources.
   a known policy-denied result before the next model step.
 - The tool worker rechecks the persisted descriptor, policy revision,
   authority, and approval after its `started` checkpoint. A known connector
-  result and the next immutable model request commit in one transaction. If the
-  bounded continuation cannot be represented, the known result remains known
-  and the Agent fails as `continuation_unavailable`; it is never rewritten as
+  result and the next immutable model request commit in one transaction. The
+  continuation preserves the exact persisted prompt and transcript instead of
+  resolving current prompt content or rebuilding model input. If the bounded
+  continuation cannot be represented, the known result remains known and the
+  Agent fails as `continuation_unavailable`; it is never rewritten as
   `outcome_unknown`.
 - Queued Agent jobs survive restart and remain claimable. Startup expires
   prepared-only claims without writing `outcome_unknown`, because they never
@@ -571,10 +587,20 @@ and bounded memory, CPU, and PID resources.
   generation-ordered prepared/start claims for model and tool operations;
   prepared claims are safely recoverable, while started claims are released
   only by a durable terminal result or conservative restart recovery.
+  Manifest-bound system-prompt v1 uses the existing optional manifest prompt
+  field and immutable request JSON, so it requires no database migration.
+  Previously queued promptless Agent work no longer matches the current
+  deployment and therefore fails closed as deployment drift; terminal history
+  remains readable.
   Existing Runs and events are decoded, validated, and migrated in place without
   rewriting their payloads. Runtime identity still binds profile, environment,
   primary Session and Run, policy ID, and policy revision; a mismatch fails
   startup.
+
+Dynamic knowledge is deliberately outside this prompt contract. A future
+knowledge feature must bind a separate, governed context snapshot rather than
+mutating the stable system prompt or reconstructing a queued request from live
+state.
 
 SQLite is the authoritative store for this local single-instance Alpha. Do not
 place it on NFS or share one database volume between multiple Zeus replicas.
@@ -833,9 +859,9 @@ and schema v21 prepared-claim host verification:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --all-targets -- --test-threads=1`: 478 tests passed
-  under the existing project counting convention, including 7 deployment tests,
-  225 storage tests, 48 runtime tests, 63 API library tests, 6 API main/config
+- `cargo test --workspace --all-targets -- --test-threads=1`: 490 tests passed
+  under the existing project counting convention, including 8 deployment tests,
+  232 storage tests, 48 runtime tests, 64 API library tests, 6 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,

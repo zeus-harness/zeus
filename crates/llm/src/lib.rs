@@ -32,8 +32,9 @@ pub const REPLY_REQUEST_MAX_MESSAGES: usize = 64;
 pub const REPLY_REQUEST_MAX_HISTORY_PAIRS: usize = (REPLY_REQUEST_MAX_MESSAGES - 1) / 2;
 /// Maximum historical pairs admitted when a request can enter the Agent loop.
 ///
-/// The initial 55 messages (27 pairs plus the current user message) reserve
-/// eight message slots for the four fixed tool-call/result pairs.
+/// A prompt-bound request contains at most 56 initial messages (one system
+/// message, 27 pairs, and the current user message), reserving eight message
+/// slots for the four fixed tool-call/result pairs.
 pub const AGENT_REQUEST_MAX_HISTORY_PAIRS: usize = 27;
 /// Maximum aggregate transcript bytes admitted to one durable provider request.
 ///
@@ -241,12 +242,43 @@ impl ReplyRequest {
         turns: &[SessionTurn],
         user_message: impl Into<String>,
     ) -> Result<Self, ProviderError> {
-        Self::from_session_history_with_limits(
+        let request = Self::from_session_history_with_limits(
             turns,
             user_message.into(),
             AGENT_REQUEST_MAX_HISTORY_PAIRS,
             AGENT_REQUEST_INITIAL_CONTENT_MAX_BYTES,
-        )
+        )?;
+        validate_initial_agent_reply_request(&request)?;
+        Ok(request)
+    }
+
+    /// Build a prompt-bound initial Agent request while reserving the complete
+    /// fixed tool-step budget. The system prompt is counted inside the same
+    /// initial content envelope as conversation history.
+    pub fn from_session_history_for_agent_with_system_prompt(
+        turns: &[SessionTurn],
+        user_message: impl Into<String>,
+        system_prompt: impl Into<String>,
+    ) -> Result<Self, ProviderError> {
+        let system_prompt = system_prompt.into();
+        protocol::validate_user_message(&system_prompt)
+            .map_err(|_| ProviderError::InvalidRequest("invalid system prompt"))?;
+        let conversation_budget = AGENT_REQUEST_INITIAL_CONTENT_MAX_BYTES
+            .checked_sub(system_prompt.len())
+            .ok_or(ProviderError::InvalidRequest(
+                "system prompt exceeds the initial Agent content budget",
+            ))?;
+        let mut request = Self::from_session_history_with_limits(
+            turns,
+            user_message.into(),
+            AGENT_REQUEST_MAX_HISTORY_PAIRS,
+            conversation_budget,
+        )?;
+        request
+            .messages
+            .insert(0, ReplyMessage::new(ReplyRole::System, system_prompt));
+        validate_initial_agent_reply_request(&request)?;
+        Ok(request)
     }
 
     fn from_session_history_with_limits(
@@ -761,6 +793,45 @@ pub fn validate_agent_reply_request(request: &ReplyRequest) -> Result<(), Provid
     Ok(())
 }
 
+/// Validate the first request in a durable Agent turn.
+///
+/// Initial requests may contain only a system prompt plus complete historical
+/// user/assistant pairs and the current user message. The tighter message and
+/// content envelopes reserve room for every fixed tool-call/result step.
+pub fn validate_initial_agent_reply_request(request: &ReplyRequest) -> Result<(), ProviderError> {
+    validate_agent_reply_request(request)?;
+    let system_messages = usize::from(
+        request
+            .messages
+            .first()
+            .is_some_and(|message| message.role == ReplyRole::System),
+    );
+    let max_messages = AGENT_REQUEST_MAX_HISTORY_PAIRS * 2 + 1 + system_messages;
+    if request.messages.len() > max_messages {
+        return Err(ProviderError::InvalidRequest(
+            "initial Agent request does not reserve the fixed tool-step message budget",
+        ));
+    }
+    if request.messages.iter().any(|message| {
+        message.role == ReplyRole::Tool
+            || message.tool_call.is_some()
+            || message.tool_call_id.is_some()
+    }) {
+        return Err(ProviderError::InvalidRequest(
+            "initial Agent request cannot contain a tool transcript",
+        ));
+    }
+    let content_bytes = request.messages.iter().try_fold(0usize, |total, message| {
+        total.checked_add(message.content.len())
+    });
+    if !matches!(content_bytes, Some(bytes) if bytes <= AGENT_REQUEST_INITIAL_CONTENT_MAX_BYTES) {
+        return Err(ProviderError::InvalidRequest(
+            "initial Agent request exceeds the reserved content budget",
+        ));
+    }
+    Ok(())
+}
+
 /// Validate one provider response against the durable Agent request and its
 /// reserved per-step argument budget.
 pub fn validate_agent_reply_response_for_request(
@@ -981,10 +1052,17 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let mut request = ReplyRequest::from_session_history_for_agent(&turns, "current").unwrap();
+        let mut request = ReplyRequest::from_session_history_for_agent_with_system_prompt(
+            &turns,
+            "current",
+            "You are Zeus.",
+        )
+        .unwrap();
         request.tools = vec![lookup_tool()];
-        assert_eq!(request.messages.len(), 55);
-        assert_eq!(request.messages[0].content, "user-13");
+        assert_eq!(request.messages.len(), 56);
+        assert_eq!(request.messages[0].role, ReplyRole::System);
+        assert_eq!(request.messages[0].content, "You are Zeus.");
+        assert_eq!(request.messages[1].content, "user-13");
 
         for index in 0..4 {
             let call_id = format!("call_{index}");
@@ -1000,8 +1078,74 @@ mod tests {
                 .push(ReplyMessage::tool_result(call_id, "known result"));
         }
 
-        assert_eq!(request.messages.len(), 63);
+        assert_eq!(request.messages.len(), 64);
         assert!(validate_agent_reply_request(&request).is_ok());
+    }
+
+    #[test]
+    fn agent_system_prompt_shares_the_reserved_initial_content_budget() {
+        let turns = vec![turn(
+            1,
+            SessionTurnStatus::Flushed,
+            "u".repeat(20 * 1024),
+            Some("a".repeat(20 * 1024)),
+        )];
+        let system_prompt = "system";
+        let request = ReplyRequest::from_session_history_for_agent_with_system_prompt(
+            &turns,
+            "c".repeat(AGENT_REQUEST_INITIAL_CONTENT_MAX_BYTES - system_prompt.len()),
+            system_prompt,
+        )
+        .unwrap();
+        assert_eq!(request.messages.len(), 2);
+        assert_eq!(request.messages[0].role, ReplyRole::System);
+        assert_eq!(request.messages[0].content, system_prompt);
+        assert_eq!(
+            request.messages[1].content.len(),
+            AGENT_REQUEST_INITIAL_CONTENT_MAX_BYTES - system_prompt.len()
+        );
+    }
+
+    #[test]
+    fn initial_agent_validator_rejects_full_loop_envelopes() {
+        let mut too_many_messages = vec![ReplyMessage::new(ReplyRole::System, "system")];
+        for index in 0..28 {
+            too_many_messages.push(ReplyMessage::new(ReplyRole::User, format!("user-{index}")));
+            too_many_messages.push(ReplyMessage::new(
+                ReplyRole::Assistant,
+                format!("assistant-{index}"),
+            ));
+        }
+        too_many_messages.push(ReplyMessage::new(ReplyRole::User, "current"));
+        let too_many = ReplyRequest::new(too_many_messages);
+        assert_eq!(too_many.messages.len(), 58);
+        assert!(validate_agent_reply_request(&too_many).is_ok());
+        assert!(validate_initial_agent_reply_request(&too_many).is_err());
+
+        let too_much_content = ReplyRequest::new([
+            ReplyMessage::new(ReplyRole::System, "system"),
+            ReplyMessage::new(ReplyRole::User, "u".repeat(30 * 1024)),
+            ReplyMessage::new(ReplyRole::Assistant, "a".repeat(30 * 1024)),
+            ReplyMessage::new(ReplyRole::User, "u".repeat(10 * 1024)),
+        ]);
+        assert!(validate_agent_reply_request(&too_much_content).is_ok());
+        assert!(validate_initial_agent_reply_request(&too_much_content).is_err());
+
+        let tool = lookup_tool();
+        let tool_transcript = ReplyRequest::with_tools(
+            [
+                ReplyMessage::new(ReplyRole::User, "lookup"),
+                ReplyMessage::assistant_tool_call(ReplyToolCall::new(
+                    "call_initial",
+                    tool.name.clone(),
+                    serde_json::json!({"query": "zeus"}),
+                )),
+                ReplyMessage::tool_result("call_initial", "known result"),
+            ],
+            [tool],
+        );
+        assert!(validate_agent_reply_request(&tool_transcript).is_ok());
+        assert!(validate_initial_agent_reply_request(&tool_transcript).is_err());
     }
 
     #[test]

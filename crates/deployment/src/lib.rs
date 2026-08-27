@@ -30,6 +30,7 @@ const MAX_ENVIRONMENT_BYTES: usize = 64;
 const MAX_TOOL_VERSION_BYTES: usize = 64;
 const SHA256_HEX_BYTES: usize = 64;
 const MANIFEST_DIGEST_DOMAIN: &[u8] = b"zeus.deployment-manifest.sha256.v1";
+const PROMPT_CONTENT_DIGEST_DOMAIN: &[u8] = b"zeus.agent-prompt.sha256.v1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -138,6 +139,41 @@ impl ManifestPromptBinding {
         validate_resource_identifier("prompt.revision", &self.revision)?;
         validate_sha256_hex("prompt.content_digest", &self.content_digest)
     }
+
+    /// Bind one prompt identity to the exact UTF-8 content supplied to a
+    /// provider. The content itself remains in the durable model request and
+    /// is intentionally excluded from the secret-free manifest.
+    pub fn from_content(
+        prompt_id: impl Into<String>,
+        revision: impl Into<String>,
+        content: &str,
+    ) -> Result<Self, ManifestError> {
+        Self::new(prompt_id, revision, prompt_content_digest(content))
+    }
+
+    /// Return whether model-visible prompt content matches this deployment
+    /// binding exactly.
+    pub fn matches_content(&self, content: &str) -> bool {
+        self.content_digest == prompt_content_digest(content)
+    }
+}
+
+/// Compute the domain-separated digest stored in a prompt binding.
+pub fn prompt_content_digest(content: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(
+        u64::try_from(PROMPT_CONTENT_DIGEST_DOMAIN.len())
+            .expect("the prompt digest domain length fits in u64")
+            .to_be_bytes(),
+    );
+    digest.update(PROMPT_CONTENT_DIGEST_DOMAIN);
+    digest.update(
+        u64::try_from(content.len())
+            .expect("an in-memory prompt length fits in u64")
+            .to_be_bytes(),
+    );
+    digest.update(content.as_bytes());
+    format!("{:x}", digest.finalize())
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -850,6 +886,23 @@ mod tests {
             Value::Array(values) => values.iter().for_each(assert_no_secret_fields),
             _ => {}
         }
+    }
+
+    #[test]
+    fn prompt_content_digest_is_domain_separated_and_content_bound() {
+        let binding =
+            ManifestPromptBinding::from_content("zeus-system-prompt", "1", "You are Zeus.")
+                .unwrap();
+        assert_eq!(
+            binding.content_digest,
+            "7ff600d9bc6be6597350d46b2ecb39a27d1478c314cf407890dc9993cbc11bb1"
+        );
+        assert!(binding.matches_content("You are Zeus."));
+        assert!(!binding.matches_content("You are Zeus!"));
+        assert_ne!(
+            binding.content_digest,
+            format!("{:x}", Sha256::digest(b"You are Zeus."))
+        );
     }
 
     #[test]

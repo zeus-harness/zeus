@@ -191,22 +191,32 @@ Provider endpoint 和 API key 只从服务端环境或后续 SecretRef 解析，
 
 ```text
 POST /sessions/{id}/turns
-  -> transaction: user_message + open turn + queued reply_job
+  -> transaction: user_message + open turn + Agent + manifest + queued model job
   -> 202 Accepted
-  -> worker claims queued job (started checkpoint)
+  -> worker prepares and exactly starts queued model job
   -> ReplyProvider
-  -> transaction: assistant_message + turn_flushed + job succeeded
+  -> transaction: assistant_message + turn_flushed + Agent/job succeeded
   -> Session SSE
 ```
 
 安全与恢复规则：
 
 - 每次接受 turn 时，以请求中的 `expected_sequence` 为历史边界，只读取已经完整 flush 的
-  user/assistant 对，再追加当前 user message。上下文保留最新至多 31 对历史消息，总 UTF-8
-  内容不超过 64 KiB；interrupted 或尚未 flush 的 turn 不进入模型上下文。
-- 组装后的 provider request 随 immutable `reply_job` 持久化。相同命令的迟到重试返回首次
-  接受的 durable job，不根据 Session 的新状态重建上下文，也不会再次调用 provider。
-- Provider 调用前必须存在 durable `started` checkpoint。
+  user/assistant 对，再追加当前 user message。Session-native Agent request 的第一条且唯一一条
+  system message 是稳定的 Zeus system prompt；其 ID、revision 与域分离 content digest 绑定在
+  canonical secret-free deployment manifest，精确内容只随 immutable request 持久化。
+- system prompt 与最新至多 27 对历史消息及当前 user message 共享 64 KiB 初始 UTF-8 内容
+  预算。初始最多 56 条 message；Agent 全程最多 64 条，为四组 assistant tool call / tool result
+  预留八条。当前 user message 无法与固定 prompt 一起装入该预算时，在任何 durable write 前
+  返回 `413 agent_request_too_large`。interrupted 或尚未 flush 的 turn 不进入模型上下文。
+- admission、model claim、tool continuation 与 deep-integrity 都要求 system message 首位唯一、
+  内容匹配 manifest digest。admission 发现 prompt 缺失、重复、位置或内容错误时拒绝命令并回滚
+  整个事务；已经 queued 的 work 在 claim 时发现持久化 authority 损坏、promptless 或与当前
+  manifest 漂移，才 durable settle 为 `deployment_unavailable`。两条路径都发生在 provider I/O 前。
+- 组装后的 provider request 随 immutable model job 持久化。相同命令的迟到重试、known tool
+  completion continuation 和重启恢复都复用 exact persisted request，不根据当前 prompt、知识或
+  Session 的新状态重建上下文，也不会再次调用 provider。
+- Provider 调用前必须存在同一 prepared claim 对应的 durable `started` checkpoint。
 - `queued` job 可在重启后继续；`started` 且无持久结果的 job 变为 `outcome_unknown`，不得自动重放可能计费的模型请求。
 - Provider 失败必须形成明确的 durable failure/interrupted 状态，不能做空 flush，也不能伪造 assistant 成功。
 - 本地 fallback 只说明“消息已保存但未配置模型”，事件必须标注 `local-fallback/non-model`，不能冒充智能回复。
@@ -265,6 +275,11 @@ POST /sessions/{id}/turns
   generation。prepared 可过期/重领且不写 unknown；started 不按 TTL 重放，只能由 durable
   terminal commit 或启动恢复释放。
 
+Manifest-bound system prompt v1 复用 `0019` 已有的可选 prompt 字段和 immutable request JSON，
+不增加 schema migration。升级后旧 queued promptless Agent work 与当前 deployment 不一致，首次
+进入 claim 时 fail closed；terminal history 保持可读。动态 knowledge 是后续独立的 governed
+context snapshot，不通过修改稳定 system prompt 或重建 queued request 注入。
+
 迁移必须原地保留 Alpha append-only ledger、事件外键与 runtime identity。任何一步失败都回滚整个 migration transaction。
 
 ## 7. Alpha+ 验收门槛
@@ -279,6 +294,9 @@ POST /sessions/{id}/turns
 - 51 个 turn 后，最旧 turn 即使离开默认 tail 仍可通过 actor-scoped point GET 恢复；Web
   使用 primary Session identity 判断主 Run 展示，不把 attachment tail 误当全集。
 - user message 之后由服务端产生 durable assistant/failure event；浏览器不能提交 assistant content。
+- Agent system prompt 的 manifest ID/revision/content digest、request 首位唯一性、64 KiB 初始
+  content 与 64-message 全程预算，以及 admission/claim/continuation/deep-integrity fail-closed
+  语义有自动测试；prompt drift 时 provider 调用数为零，恢复复用 exact persisted request。
 - `system/light/dark` 首屏无闪白，刷新后保持，系统主题变化可跟随。
 - reply job 的只读队首观察、固定 job ID 精确 start/replay、queued/start/success/failure/
   outcome_unknown 和重启语义有存储测试；模糊 start ACK 不会跳到下一条任务。
@@ -315,7 +333,7 @@ POST /sessions/{id}/turns
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 按项目既有统计口径通过 478 个 Rust 测试（storage 225、runtime 48、API library 63、API
+- host 按项目既有统计口径通过 490 个 Rust 测试（storage 232、runtime 48、API library 64、API
   main/config 6）与 28 个 Web Node 测试。
 - `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 

@@ -31,11 +31,11 @@ use execution::{AgentExecutionExplain, AgentRunEpochExplain};
 #[cfg(test)]
 use llm::ReplyRole;
 use llm::{
-    AGENT_REQUEST_MAX_HISTORY_PAIRS, LocalFallbackProvider, ProviderError, ReplyKind, ReplyMessage,
-    ReplyOutput, ReplyProvider, ReplyRequest, ReplyToolCall, ReplyToolDefinition,
-    persisted_agent_reply_request, validate_agent_reply_request,
-    validate_agent_reply_response_for_request, validate_provider_metadata, validate_reply_request,
-    validate_reply_response_for_request,
+    AGENT_REQUEST_INITIAL_CONTENT_MAX_BYTES, AGENT_REQUEST_MAX_HISTORY_PAIRS,
+    LocalFallbackProvider, ProviderError, ReplyKind, ReplyMessage, ReplyOutput, ReplyProvider,
+    ReplyRequest, ReplyToolCall, ReplyToolDefinition, persisted_agent_reply_request,
+    validate_agent_reply_request, validate_agent_reply_response_for_request,
+    validate_provider_metadata, validate_reply_request, validate_reply_response_for_request,
 };
 use protocol::{
     ACCOUNT_AUDIT_EVENT_SCHEMA, ACCOUNT_AUDIT_EXPORT_MANIFEST_KIND,
@@ -3415,6 +3415,8 @@ async fn start_turn(
     let Json(request) = payload.map_err(ApiError::invalid_json)?;
     let idempotency_key = required_idempotency_key(&headers)?;
     validate_start_turn_envelope(&request)?;
+    let system_prompt = state.store.session_agent_system_prompt();
+    validate_agent_initial_content_budget(system_prompt, &request.user_message)?;
     let executor = reply_executor(&state)?;
     let metadata = executor.provider.metadata();
     validate_provider_metadata(metadata).map_err(ApiError::reply_unavailable)?;
@@ -3428,9 +3430,12 @@ async fn start_turn(
             AGENT_REQUEST_MAX_HISTORY_PAIRS,
         )
         .await?;
-    let mut reply_request =
-        ReplyRequest::from_session_history_for_agent(&reply_turns, request.user_message.clone())
-            .map_err(|error| ApiError::internal_contract(&error.to_string()))?;
+    let mut reply_request = ReplyRequest::from_session_history_for_agent_with_system_prompt(
+        &reply_turns,
+        request.user_message.clone(),
+        system_prompt,
+    )
+    .map_err(agent_request_builder_error)?;
     reply_request.tools = agent_tools_from_manifest(&manifest);
     let request_json =
         persisted_agent_reply_request(&reply_request).map_err(ApiError::agent_request_too_large)?;
@@ -3674,6 +3679,36 @@ fn validate_start_turn_envelope(request: &StartTurnRequest) -> Result<(), ApiErr
         })?;
     }
     Ok(())
+}
+
+fn validate_agent_initial_content_budget(
+    system_prompt: &str,
+    user_message: &str,
+) -> Result<(), ApiError> {
+    let user_message_budget = AGENT_REQUEST_INITIAL_CONTENT_MAX_BYTES
+        .checked_sub(system_prompt.len())
+        .ok_or_else(|| {
+            ApiError::internal_contract(
+                "the configured Agent system prompt exceeds the initial content budget",
+            )
+        })?;
+    if user_message.len() > user_message_budget {
+        return Err(ApiError::agent_request_too_large(
+            ProviderError::InvalidRequest("conversation context is too large"),
+        ));
+    }
+    Ok(())
+}
+
+fn agent_request_builder_error(error: ProviderError) -> ApiError {
+    if matches!(
+        &error,
+        ProviderError::InvalidRequest(detail) if *detail == "conversation context is too large"
+    ) {
+        ApiError::agent_request_too_large(error)
+    } else {
+        ApiError::internal_contract(&error.to_string())
+    }
 }
 
 async fn session_events(
@@ -6690,6 +6725,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_initial_content_budget_rejects_before_durable_writes() {
+        let store = DemoStore::seeded().await.unwrap();
+        let owner = provision_test_owner(&store, "user-agent-budget", "agent-budget-owner").await;
+        let session_id = "session-agent-budget";
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: session_id.into(),
+                    title: "Agent initial content budget".into(),
+                },
+                "create-agent-budget",
+            )
+            .await
+            .unwrap();
+
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(RecordingProvider::new(Arc::clone(&requests))),
+        )
+        .unwrap();
+        let user_message_budget = AGENT_REQUEST_INITIAL_CONTENT_MAX_BYTES
+            .checked_sub(store.session_agent_system_prompt().len())
+            .unwrap();
+        assert!(user_message_budget < protocol::USER_MESSAGE_MAX_BYTES);
+
+        let send_turn =
+            |turn_id: &str, user_message: String, expected_sequence: u64, idempotency_key: &str| {
+                Request::post(format!("/api/v1/sessions/{session_id}/turns"))
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", idempotency_key)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": turn_id,
+                            "user_message": user_message,
+                            "expected_sequence": expected_sequence,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap()
+            };
+
+        let accepted = app
+            .clone()
+            .oneshot(send_turn(
+                "turn-agent-budget-exact",
+                "x".repeat(user_message_budget),
+                1,
+                "agent-budget-exact",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        let after_accepted = wait_for_ready_session(&store, &owner.authz, session_id).await;
+        {
+            let recorded = requests.lock().unwrap();
+            assert_eq!(recorded.len(), 1);
+            assert_eq!(recorded[0].messages[0].role, ReplyRole::System);
+            assert_eq!(recorded[0].messages[1].role, ReplyRole::User);
+            assert_eq!(recorded[0].messages[1].content.len(), user_message_budget);
+            assert_eq!(
+                recorded[0].messages[0].content.len() + recorded[0].messages[1].content.len(),
+                AGENT_REQUEST_INITIAL_CONTENT_MAX_BYTES
+            );
+        }
+
+        let sequence_before_rejection = after_accepted.session.sequence;
+        let turns_before_rejection = after_accepted.turns.len();
+        let rejected = app
+            .clone()
+            .oneshot(send_turn(
+                "turn-agent-budget-too-large",
+                "x".repeat(user_message_budget + 1),
+                sequence_before_rejection,
+                "agent-budget-too-large",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            rejected.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        let problem: ProblemDetails = response_json(rejected).await;
+        assert_eq!(problem.code, "agent_request_too_large");
+
+        let unchanged = store
+            .get_session_for_actor(
+                &owner.authz,
+                session_id,
+                None,
+                protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                None,
+                protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                None,
+                protocol::EVENT_PAGE_DEFAULT_LIMIT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(unchanged.session.sequence, sequence_before_rejection);
+        assert_eq!(unchanged.turns.len(), turns_before_rejection);
+        assert!(
+            unchanged
+                .turns
+                .iter()
+                .all(|turn| turn.id != "turn-agent-budget-too-large")
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn durable_reply_context_is_multi_turn_and_stable_on_late_replay() {
         let unique = UserId::generate().unwrap();
         let path = std::env::temp_dir().join(format!(
@@ -6951,11 +7103,15 @@ mod tests {
         );
         assert_eq!(
             recorded[0].messages,
-            vec![ReplyMessage::new(ReplyRole::User, "remember alpha")]
+            vec![
+                ReplyMessage::new(ReplyRole::System, store.session_agent_system_prompt(),),
+                ReplyMessage::new(ReplyRole::User, "remember alpha"),
+            ]
         );
         assert_eq!(
             recorded[1].messages,
             vec![
+                ReplyMessage::new(ReplyRole::System, store.session_agent_system_prompt(),),
                 ReplyMessage::new(ReplyRole::User, "remember alpha"),
                 ReplyMessage::new(ReplyRole::Assistant, "durable answer 1"),
                 ReplyMessage::new(ReplyRole::User, "what did I say?"),
@@ -6994,10 +7150,10 @@ mod tests {
             )
             .unwrap();
         let request = ReplyRequest::with_tools(
-            [ReplyMessage::new(
-                ReplyRole::User,
-                "do not execute after deployment drift",
-            )],
+            [
+                ReplyMessage::new(ReplyRole::System, store.session_agent_system_prompt()),
+                ReplyMessage::new(ReplyRole::User, "do not execute after deployment drift"),
+            ],
             agent_tools_from_manifest(&queued_manifest),
         );
         store
@@ -7204,17 +7360,19 @@ mod tests {
         assert_eq!(recorded.len(), 2);
         assert_eq!(
             recorded[0].messages,
-            vec![ReplyMessage::new(
-                ReplyRole::User,
-                "write the approved marker"
-            )]
+            vec![
+                ReplyMessage::new(ReplyRole::System, store.session_agent_system_prompt(),),
+                ReplyMessage::new(ReplyRole::User, "write the approved marker"),
+            ]
         );
-        assert_eq!(recorded[1].messages.len(), 3);
-        let provider_call = recorded[1].messages[1].tool_call.as_ref().unwrap();
+        assert_eq!(recorded[1].messages.len(), 4);
+        assert_eq!(recorded[1].messages[0], recorded[0].messages[0]);
+        assert_eq!(recorded[1].messages[1], recorded[0].messages[1]);
+        let provider_call = recorded[1].messages[2].tool_call.as_ref().unwrap();
         assert_eq!(provider_call.id, "provider-call-approved-1");
         assert_eq!(provider_call.name, agent.calls[0].tool);
         assert_eq!(provider_call.arguments, agent.calls[0].arguments);
-        let tool_result = &recorded[1].messages[2];
+        let tool_result = &recorded[1].messages[3];
         assert_eq!(tool_result.role, ReplyRole::Tool);
         assert_eq!(
             tool_result.tool_call_id.as_deref(),
@@ -7342,13 +7500,15 @@ mod tests {
 
         let recorded = requests.lock().unwrap().clone();
         assert_eq!(recorded.len(), 2);
-        assert_eq!(recorded[1].messages.len(), 3);
+        assert_eq!(recorded[1].messages.len(), 4);
+        assert_eq!(recorded[1].messages[0], recorded[0].messages[0]);
+        assert_eq!(recorded[1].messages[0].role, ReplyRole::System);
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&recorded[1].messages[2].content).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&recorded[1].messages[3].content).unwrap(),
             expected_result
         );
         assert_eq!(
-            recorded[1].messages[2].tool_call_id.as_deref(),
+            recorded[1].messages[3].tool_call_id.as_deref(),
             Some("provider-call-approved-1")
         );
 
@@ -7505,13 +7665,17 @@ mod tests {
         assert_eq!(recorded.len(), 4);
         assert_eq!(
             recorded[2].messages,
-            vec![ReplyMessage::new(ReplyRole::User, "write after trimming")],
+            vec![
+                ReplyMessage::new(ReplyRole::System, store.session_agent_system_prompt(),),
+                ReplyMessage::new(ReplyRole::User, "write after trimming"),
+            ],
             "the 80 KiB newest pair must be omitted to preserve the 64 KiB Agent budget"
         );
-        assert_eq!(recorded[3].messages.len(), 3);
+        assert_eq!(recorded[3].messages.len(), 4);
         assert_eq!(recorded[3].messages[0], recorded[2].messages[0]);
-        assert_eq!(recorded[3].messages[1].role, ReplyRole::Assistant);
-        assert_eq!(recorded[3].messages[2].role, ReplyRole::Tool);
+        assert_eq!(recorded[3].messages[1], recorded[2].messages[1]);
+        assert_eq!(recorded[3].messages[2].role, ReplyRole::Assistant);
+        assert_eq!(recorded[3].messages[3].role, ReplyRole::Tool);
         drop(recorded);
 
         drop(app);

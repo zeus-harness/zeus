@@ -12,7 +12,8 @@ use std::{
 };
 
 use deployment::{
-    AgentDeployment, AgentSpec, ManifestEnvelope, ManifestPolicy, ManifestProvider, ManifestTool,
+    AgentDeployment, AgentSpec, ManifestEnvelope, ManifestPolicy, ManifestPromptBinding,
+    ManifestProvider, ManifestTool,
 };
 use protocol::{
     AgentToolCallStatus, AgentTurnStatus, Approval, ApprovalScope, ApprovalStatus,
@@ -6137,6 +6138,498 @@ async fn v19_agent_manifest_request_tools_must_match_exactly() {
 }
 
 #[tokio::test]
+async fn agent_manifest_system_prompt_is_exact_and_fail_closed_at_admission() {
+    const PROMPT: &str = "You are the manifest-bound Zeus storage test agent.";
+
+    let exact_store = created_owned_session_store().await;
+    let exact_manifest = prompt_bound_test_agent_manifest(PROMPT);
+    exact_store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-prompt-exact".into(),
+                user_message: "Admit the exact system prompt".into(),
+                expected_sequence: 1,
+            },
+            "prompt-exact-start",
+            agent_turn_spec_with_system_prompt(
+                "agent-prompt-exact",
+                "turn-prompt-exact",
+                exact_manifest.clone(),
+                PROMPT,
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        exact_store
+            .claim_next_agent_model(&exact_manifest)
+            .await
+            .unwrap(),
+        AgentModelClaimOutcome::Claimed(_)
+    ));
+
+    let bound_manifest = prompt_bound_test_agent_manifest(PROMPT);
+    let cases = [
+        (
+            "tampered",
+            bound_manifest.clone(),
+            json!([
+                {"role": "system", "content": "tampered prompt"},
+                {"role": "user", "content": "reject this request"}
+            ]),
+        ),
+        (
+            "missing",
+            bound_manifest.clone(),
+            json!([{"role": "user", "content": "reject this request"}]),
+        ),
+        (
+            "unbound",
+            test_agent_manifest(),
+            json!([
+                {"role": "system", "content": PROMPT},
+                {"role": "user", "content": "reject this request"}
+            ]),
+        ),
+        (
+            "duplicate",
+            bound_manifest.clone(),
+            json!([
+                {"role": "system", "content": PROMPT},
+                {"role": "system", "content": PROMPT},
+                {"role": "user", "content": "reject this request"}
+            ]),
+        ),
+        (
+            "not-leading",
+            bound_manifest.clone(),
+            json!([
+                {"role": "user", "content": "reject this request"},
+                {"role": "system", "content": PROMPT}
+            ]),
+        ),
+        ("empty", bound_manifest.clone(), json!([])),
+        (
+            "malformed",
+            bound_manifest.clone(),
+            json!(["not a message"]),
+        ),
+        (
+            "system-tool-metadata",
+            bound_manifest.clone(),
+            json!([
+                {"role": "system", "content": PROMPT, "tool_call_id": null},
+                {"role": "user", "content": "reject this request"}
+            ]),
+        ),
+        (
+            "system-only",
+            bound_manifest,
+            json!([{"role": "system", "content": PROMPT}]),
+        ),
+    ];
+    for (case, manifest, messages) in cases {
+        let store = created_owned_session_store().await;
+        let turn_id = format!("turn-prompt-{case}");
+        let mut spec =
+            agent_turn_spec_with_manifest(&format!("agent-prompt-{case}"), &turn_id, manifest);
+        spec.request_json["messages"] = messages;
+        assert!(matches!(
+            store
+                .start_turn_and_enqueue_agent_for_actor(
+                    &owner_authz(),
+                    "session-alpha",
+                    StartTurnRequest {
+                        turn_id,
+                        user_message: "Reject a malformed prompt surface".into(),
+                        expected_sequence: 1,
+                    },
+                    &format!("prompt-{case}-start"),
+                    spec,
+                )
+                .await,
+            Err(StorageError::InvalidAgentTransition(_))
+        ));
+        assert_eq!(
+            store
+                .get_session_for_actor(&owner_authz(), "session-alpha")
+                .await
+                .unwrap()
+                .session
+                .sequence,
+            1,
+            "a {case} prompt request must not append a user turn"
+        );
+    }
+
+    let mut too_many_messages = vec![json!({"role": "system", "content": PROMPT})];
+    for index in 0..57 {
+        too_many_messages.push(json!({
+            "role": if index % 2 == 0 { "user" } else { "assistant" },
+            "content": format!("bounded message {index}"),
+        }));
+    }
+    let bounded_content = "x".repeat(24 * 1024);
+    let mut over_budget_messages = vec![json!({"role": "system", "content": PROMPT})];
+    over_budget_messages.push(json!({"role": "user", "content": bounded_content}));
+    over_budget_messages.push(json!({"role": "assistant", "content": bounded_content}));
+    over_budget_messages.push(json!({"role": "user", "content": bounded_content}));
+    for (case, messages) in [
+        ("message-count", too_many_messages),
+        ("content-budget", over_budget_messages),
+    ] {
+        let store = created_owned_session_store().await;
+        let turn_id = format!("turn-prompt-{case}");
+        let manifest = prompt_bound_test_agent_manifest(PROMPT);
+        let mut spec =
+            agent_turn_spec_with_manifest(&format!("agent-prompt-{case}"), &turn_id, manifest);
+        spec.request_json["messages"] = Value::Array(messages);
+        let typed_request =
+            serde_json::from_value::<llm::ReplyRequest>(spec.request_json.clone()).unwrap();
+        assert!(llm::validate_agent_reply_request(&typed_request).is_ok());
+        assert!(llm::validate_initial_agent_reply_request(&typed_request).is_err());
+        assert!(matches!(
+            store
+                .start_turn_and_enqueue_agent_for_actor(
+                    &owner_authz(),
+                    "session-alpha",
+                    StartTurnRequest {
+                        turn_id,
+                        user_message: "Reject a typed provider envelope overflow".into(),
+                        expected_sequence: 1,
+                    },
+                    &format!("prompt-{case}-start"),
+                    spec,
+                )
+                .await,
+            Err(StorageError::InvalidAgentTransition(_))
+        ));
+        assert_eq!(
+            store
+                .get_session_for_actor(&owner_authz(), "session-alpha")
+                .await
+                .unwrap()
+                .session
+                .sequence,
+            1,
+            "a typed {case} overflow must fail before admission"
+        );
+    }
+}
+
+#[tokio::test]
+async fn agent_continuation_keeps_the_manifest_bound_system_prompt() {
+    const PROMPT: &str = "You are the manifest-bound continuation agent.";
+
+    for case in ["exact", "tampered", "missing", "malformed"] {
+        let store = created_owned_session_store().await;
+        let manifest = prompt_bound_test_agent_manifest(PROMPT);
+        let turn_id = format!("turn-prompt-continuation-{case}");
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: turn_id.clone(),
+                    user_message: "Continue with the same prompt authority".into(),
+                    expected_sequence: 1,
+                },
+                &format!("prompt-continuation-{case}-start"),
+                agent_turn_spec_with_system_prompt(
+                    &format!("agent-prompt-continuation-{case}"),
+                    &turn_id,
+                    manifest.clone(),
+                    PROMPT,
+                ),
+            )
+            .await
+            .unwrap();
+        let AgentModelClaimOutcome::Claimed(job) =
+            store.claim_next_agent_model(&manifest).await.unwrap()
+        else {
+            panic!("the initial prompt-bound model job must be claimable");
+        };
+        let call_id = format!("agent-call-prompt-continuation-{case}");
+        let call = agent_tool_call_spec(&call_id, PolicyDecision::Allow);
+        store
+            .complete_agent_model_success(AgentModelSuccessCommit {
+                job_id: job.id,
+                response_json: agent_tool_response_json(&call),
+                resolution: AgentModelResolution::ToolCall { call: call.clone() },
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.claim_next_agent_tool(&manifest).await.unwrap(),
+            AgentToolClaimOutcome::Claimed(_)
+        ));
+        let mut messages = vec![
+            json!({
+                "role": "user",
+                "content": "Continue with the same prompt authority",
+            }),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_call": {
+                    "id": call.provider_call_id,
+                    "name": call.tool_name,
+                    "arguments": call.arguments_json,
+                },
+            }),
+            json!({
+                "role": "tool",
+                "content": "known prompt-bound result",
+                "tool_call_id": call.provider_call_id,
+            }),
+        ];
+        match case {
+            "exact" => messages.insert(
+                0,
+                json!({
+                    "role": "system",
+                    "content": PROMPT,
+                }),
+            ),
+            "tampered" => messages.insert(
+                0,
+                json!({
+                    "role": "system",
+                    "content": "tampered continuation prompt",
+                }),
+            ),
+            "missing" => {}
+            "malformed" => {
+                messages.remove(1);
+                messages.insert(
+                    0,
+                    json!({
+                        "role": "system",
+                        "content": PROMPT,
+                    }),
+                );
+            }
+            _ => unreachable!(),
+        }
+        let next_request = agent_request_with_tools(json!({"messages": messages}), &manifest);
+        if case == "exact" {
+            let typed_request =
+                serde_json::from_value::<llm::ReplyRequest>(next_request.clone()).unwrap();
+            assert!(llm::validate_agent_reply_request(&typed_request).is_ok());
+            assert!(llm::validate_initial_agent_reply_request(&typed_request).is_err());
+        }
+        let completion = store
+            .complete_agent_tool(AgentToolCompletionCommit {
+                call_id,
+                status: AgentToolCallStatus::Succeeded,
+                result_json: json!({"ok": true}),
+                provider_request_id: Some(format!("connector-prompt-{case}")),
+                next_request_json: Some(next_request),
+            })
+            .await;
+        if case == "exact" {
+            assert!(matches!(
+                completion.unwrap(),
+                AgentToolCompletion::ModelQueued { .. }
+            ));
+            let AgentModelClaimOutcome::Claimed(continuation) =
+                store.claim_next_agent_model(&manifest).await.unwrap()
+            else {
+                panic!("the exact prompt-bound continuation must be claimable");
+            };
+            assert_eq!(continuation.request_json["messages"][0]["content"], PROMPT);
+        } else {
+            assert!(matches!(
+                completion,
+                Err(StorageError::InvalidAgentTransition(_))
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn agent_model_claim_rejects_an_initial_envelope_violation_before_release() {
+    const PROMPT: &str = "You are the immutable model-claim prompt.";
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    let manifest = prompt_bound_test_agent_manifest(PROMPT);
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-prompt-claim-tamper".into(),
+                user_message: "Detect prompt tampering before release".into(),
+                expected_sequence: 1,
+            },
+            "prompt-claim-tamper-start",
+            agent_turn_spec_with_system_prompt(
+                "agent-prompt-claim-tamper",
+                "turn-prompt-claim-tamper",
+                manifest.clone(),
+                PROMPT,
+            ),
+        )
+        .await
+        .unwrap();
+    let mut messages = vec![json!({"role": "system", "content": PROMPT})];
+    for index in 0..57 {
+        messages.push(json!({
+            "role": if index % 2 == 0 { "user" } else { "assistant" },
+            "content": format!("generic-valid initial claim message {index}"),
+        }));
+    }
+    let invalid_initial_request =
+        agent_request_with_tools(json!({"messages": messages}), &manifest);
+    let typed_request =
+        serde_json::from_value::<llm::ReplyRequest>(invalid_initial_request.clone()).unwrap();
+    assert!(llm::validate_agent_reply_request(&typed_request).is_ok());
+    assert!(llm::validate_initial_agent_reply_request(&typed_request).is_err());
+    replace_queued_agent_model_request(
+        database.path(),
+        "agent-prompt-claim-tamper",
+        1,
+        &invalid_initial_request,
+    );
+
+    let AgentModelClaimOutcome::Rejected(completion) =
+        store.claim_next_agent_model(&manifest).await.unwrap()
+    else {
+        panic!("an initial-only envelope violation must be rejected before provider release");
+    };
+    assert_eq!(completion.agent.status, AgentTurnStatus::Failed);
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM agent_run_epochs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0,
+        "an initial-only envelope violation must not create a RunEpoch"
+    );
+}
+
+#[tokio::test]
+async fn prompt_identity_revision_cannot_rebind_to_different_content() {
+    const FIRST_PROMPT: &str = "You are the first immutable prompt revision.";
+    const CONFLICTING_PROMPT: &str = "You are conflicting content under the same revision.";
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    let first_manifest = prompt_bound_test_agent_manifest(FIRST_PROMPT);
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-prompt-identity-first".into(),
+                user_message: "Persist the first prompt identity".into(),
+                expected_sequence: 1,
+            },
+            "prompt-identity-first-start",
+            agent_turn_spec_with_system_prompt(
+                "agent-prompt-identity-first",
+                "turn-prompt-identity-first",
+                first_manifest.clone(),
+                FIRST_PROMPT,
+            ),
+        )
+        .await
+        .unwrap();
+    let AgentModelClaimOutcome::Claimed(job) =
+        store.claim_next_agent_model(&first_manifest).await.unwrap()
+    else {
+        panic!("the first prompt identity must be claimable");
+    };
+    let AgentModelCompletion::Final(first_completion) = store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: job.id,
+            response_json: agent_final_response_json("first prompt completed"),
+            resolution: AgentModelResolution::Final {
+                assistant_message: "first prompt completed".into(),
+                provenance: agent_model_provenance(),
+            },
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("the first prompt-bound turn must finish");
+    };
+
+    let conflicting_manifest = prompt_bound_test_agent_manifest(CONFLICTING_PROMPT);
+    let before_sequence = first_completion.session.sequence;
+    let error = store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-prompt-identity-conflict".into(),
+                user_message: "Reject prompt identity rebinding".into(),
+                expected_sequence: before_sequence,
+            },
+            "prompt-identity-conflict-start",
+            agent_turn_spec_with_system_prompt(
+                "agent-prompt-identity-conflict",
+                "turn-prompt-identity-conflict",
+                conflicting_manifest.clone(),
+                CONFLICTING_PROMPT,
+            ),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, StorageError::InvalidAgentTransition(message)
+            if message.contains("already bound to different content"))
+    );
+    assert_eq!(
+        store
+            .get_session_for_actor(&owner_authz(), "session-alpha")
+            .await
+            .unwrap()
+            .session
+            .sequence,
+        before_sequence,
+        "prompt identity conflict must roll back the entire turn admission"
+    );
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_deployment_manifests",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    drop(connection);
+    drop(store);
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO agent_deployment_manifests(
+                   digest, schema_version, envelope_json, created_at
+               ) VALUES (?1, ?2, ?3, '2026-08-27T00:00:00.000Z')"#,
+            params![
+                conflicting_manifest.digest,
+                i64::from(conflicting_manifest.schema_version),
+                String::from_utf8(conflicting_manifest.canonical_json_bytes().unwrap()).unwrap(),
+            ],
+        )
+        .unwrap();
+    drop(connection);
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("conflicting durable prompt identities must fail startup integrity"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StorageError::CorruptData(message)
+            if message.contains("conflicting durable content bindings")));
+}
+
+#[tokio::test]
 async fn agent_model_claim_rejects_provider_tool_policy_and_profile_manifest_drift() {
     let cases = [
         (
@@ -6440,6 +6933,149 @@ async fn v18_agents_migrate_unbound_terminal_readable_and_queued_fail_closed() {
     assert_eq!(
         serde_json::from_str::<Value>(&error_json).unwrap()["code"],
         "deployment_unavailable"
+    );
+}
+
+#[tokio::test]
+async fn v19_promptless_system_and_dotted_tool_terminal_history_reopens_readable() {
+    let database = TestDatabase::new();
+    let current_manifest = test_agent_manifest();
+    let store = created_owned_file_session_store(database.path()).await;
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-v19-dotted-terminal".into(),
+                user_message: "Preserve a historical dotted provider tool".into(),
+                expected_sequence: 1,
+            },
+            "v19-dotted-terminal-start",
+            agent_turn_spec_with_manifest(
+                "agent-v19-dotted-terminal",
+                "turn-v19-dotted-terminal",
+                current_manifest.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    let AgentModelClaimOutcome::Claimed(job) = store
+        .claim_next_agent_model(&current_manifest)
+        .await
+        .unwrap()
+    else {
+        panic!("the pre-v19-fixture model must be claimable");
+    };
+    store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: job.id,
+            response_json: agent_final_response_json("legacy dotted terminal reply"),
+            resolution: AgentModelResolution::Final {
+                assistant_message: "legacy dotted terminal reply".into(),
+                provenance: agent_model_provenance(),
+            },
+        })
+        .await
+        .unwrap();
+    drop(store);
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let dotted_manifest = rewrite_agent_as_v19_promptless_legacy(
+        &connection,
+        "agent-v19-dotted-terminal",
+        "Legacy provider prompt without a manifest binding",
+    );
+    drop(connection);
+
+    let reopened = SqliteStore::open(database.path()).await.unwrap();
+    assert_eq!(
+        reopened
+            .agent_deployment_manifest_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                "turn-v19-dotted-terminal",
+            )
+            .await
+            .unwrap(),
+        Some(dotted_manifest)
+    );
+    let detail = reopened
+        .agent_turn_detail_for_actor(&owner_authz(), "session-alpha", "turn-v19-dotted-terminal")
+        .await
+        .unwrap();
+    assert_eq!(detail.status, AgentTurnStatus::Succeeded);
+    reopened.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn v19_promptless_queued_request_fails_claim_before_run_epoch() {
+    let database = TestDatabase::new();
+    let current_manifest = test_agent_manifest();
+    let store = created_owned_file_session_store(database.path()).await;
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-v19-dotted-queued".into(),
+                user_message: "Reject a queued historical provider request".into(),
+                expected_sequence: 1,
+            },
+            "v19-dotted-queued-start",
+            agent_turn_spec_with_manifest(
+                "agent-v19-dotted-queued",
+                "turn-v19-dotted-queued",
+                current_manifest,
+            ),
+        )
+        .await
+        .unwrap();
+    drop(store);
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let dotted_manifest = rewrite_agent_as_v19_promptless_legacy(
+        &connection,
+        "agent-v19-dotted-queued",
+        "Legacy queued provider prompt without a manifest binding",
+    );
+    drop(connection);
+
+    let reopened = SqliteStore::open(database.path()).await.unwrap();
+    let AgentModelClaimOutcome::Rejected(completion) = reopened
+        .claim_next_agent_model(&dotted_manifest)
+        .await
+        .unwrap()
+    else {
+        panic!("a legacy provider request must fail closed at its current claim boundary");
+    };
+    assert_eq!(completion.agent.status, AgentTurnStatus::Failed);
+    assert_eq!(
+        completion
+            .agent
+            .last_error_json
+            .as_ref()
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_str),
+        Some("deployment_unavailable")
+    );
+    reopened.verify_integrity().await.unwrap();
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let (status, run_epochs): (String, i64) = connection
+        .query_row(
+            r#"SELECT job.status,
+                      (SELECT COUNT(*) FROM agent_run_epochs epoch
+                       WHERE epoch.agent_id = job.agent_id)
+               FROM agent_model_jobs job
+               WHERE job.agent_id = ?1 AND job.step = 1"#,
+            ["agent-v19-dotted-queued"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "failed");
+    assert_eq!(
+        run_epochs, 0,
+        "a rejected legacy claim must not create a RunEpoch"
     );
 }
 
@@ -16657,7 +17293,7 @@ fn test_agent_manifest() -> ManifestEnvelope {
     .unwrap();
     let policy = ManifestPolicy::new("local", "local/v1").unwrap();
     let tool = ManifestTool::new(
-        "workspace.list",
+        "workspace_list",
         "1.0.0",
         "List bounded workspace entries.",
         json!({
@@ -16697,6 +17333,138 @@ fn mutate_test_agent_manifest(mutate: impl FnOnce(&mut deployment::AgentSpec)) -
     ManifestEnvelope::new(manifest).unwrap()
 }
 
+fn prompt_bound_test_agent_manifest(prompt_content: &str) -> ManifestEnvelope {
+    mutate_test_agent_manifest(|spec| {
+        spec.prompt = Some(
+            ManifestPromptBinding::from_content(
+                "zeus-storage-test-system-prompt",
+                "1",
+                prompt_content,
+            )
+            .unwrap(),
+        );
+    })
+}
+
+fn legacy_dotted_test_agent_manifest() -> ManifestEnvelope {
+    mutate_test_agent_manifest(|spec| {
+        spec.tools[0].name = "workspace.list".into();
+    })
+}
+
+fn rewrite_agent_as_v19_promptless_legacy(
+    connection: &rusqlite::Connection,
+    agent_id: &str,
+    system_prompt: &str,
+) -> ManifestEnvelope {
+    let dotted_manifest = legacy_dotted_test_agent_manifest();
+    downgrade_agent_deployment_manifest_fixture_to_v18(connection);
+    connection
+        .execute_batch(include_str!(
+            "../migrations/0019_agent_deployment_manifest.sql"
+        ))
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (19, ?1)",
+            ["2026-08-27T00:00:19.000Z"],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO agent_deployment_manifests(
+                   digest, schema_version, envelope_json, created_at
+               ) VALUES (?1, ?2, ?3, ?4)"#,
+            params![
+                dotted_manifest.digest,
+                i64::from(dotted_manifest.schema_version),
+                String::from_utf8(dotted_manifest.canonical_json_bytes().unwrap()).unwrap(),
+                "2026-08-27T00:00:19.000Z",
+            ],
+        )
+        .unwrap();
+
+    let agent_identity = stored_trigger_sql(connection, "agent_turns_reject_identity_update");
+    let agent_forward = stored_trigger_sql(connection, "agent_turns_enforce_forward_revision");
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER agent_turns_reject_identity_update;
+               DROP TRIGGER agent_turns_enforce_forward_revision;"#,
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE agent_turns SET deployment_manifest_digest = ?1 WHERE id = ?2"#,
+            params![dotted_manifest.digest, agent_id],
+        )
+        .unwrap();
+    connection.execute_batch(&agent_identity).unwrap();
+    connection.execute_batch(&agent_forward).unwrap();
+
+    let model_input = stored_trigger_sql(connection, "agent_model_jobs_reject_input_update");
+    let model_forward =
+        stored_trigger_sql(connection, "agent_model_jobs_enforce_forward_transition");
+    let stored_request: String = connection
+        .query_row(
+            "SELECT request_json FROM agent_model_jobs WHERE agent_id = ?1 AND step = 1",
+            [agent_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut dotted_request = serde_json::from_str::<Value>(&stored_request).unwrap();
+    dotted_request["tools"][0]["name"] = json!("workspace.list");
+    dotted_request["messages"].as_array_mut().unwrap().insert(
+        0,
+        json!({
+            "role": "system",
+            "content": system_prompt,
+        }),
+    );
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER agent_model_jobs_reject_input_update;
+               DROP TRIGGER agent_model_jobs_enforce_forward_transition;"#,
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE agent_model_jobs SET request_json = ?1 WHERE agent_id = ?2 AND step = 1",
+            params![serde_json::to_string(&dotted_request).unwrap(), agent_id],
+        )
+        .unwrap();
+    connection.execute_batch(&model_input).unwrap();
+    connection.execute_batch(&model_forward).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        19
+    );
+    dotted_manifest
+}
+
+fn agent_turn_spec_with_system_prompt(
+    id: &str,
+    turn_id: &str,
+    manifest: ManifestEnvelope,
+    prompt_content: &str,
+) -> AgentTurnSpec {
+    let mut spec = agent_turn_spec_with_manifest(id, turn_id, manifest);
+    spec.request_json["messages"]
+        .as_array_mut()
+        .unwrap()
+        .insert(
+            0,
+            json!({
+                "role": "system",
+                "content": prompt_content,
+            }),
+        );
+    spec
+}
+
 fn agent_request_with_tools(mut request: Value, manifest: &ManifestEnvelope) -> Value {
     let tools = manifest
         .manifest
@@ -16719,7 +17487,53 @@ fn agent_request_with_tools(mut request: Value, manifest: &ManifestEnvelope) -> 
     request
 }
 
-fn test_agent_request(request: Value) -> Value {
+fn test_agent_request(mut request: Value) -> Value {
+    // Storage-focused fixtures often specify only the continuation result.
+    // Complete that shorthand into the same valid provider transcript the API
+    // persists, so tests exercise their intended durable invariant without
+    // bypassing the typed request contract.
+    let messages = request
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .expect("Agent test request contains a messages array");
+    if let Some(tool_index) = messages
+        .iter()
+        .rposition(|message| message.get("role") == Some(&json!("tool")))
+    {
+        let tool_call_id = messages[tool_index]["tool_call_id"]
+            .as_str()
+            .expect("Agent test tool result has a call ID")
+            .to_owned();
+        let has_matching_call = tool_index.checked_sub(1).is_some_and(|assistant_index| {
+            messages[assistant_index].get("role") == Some(&json!("assistant"))
+                && messages[assistant_index]["tool_call"]["id"] == tool_call_id
+        });
+        if !has_matching_call {
+            let mut tool_index = tool_index;
+            if tool_index == 0 {
+                messages.insert(
+                    0,
+                    json!({
+                        "role": "user",
+                        "content": "Exercise the durable Agent continuation",
+                    }),
+                );
+                tool_index += 1;
+            }
+            messages.insert(
+                tool_index,
+                json!({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_call": {
+                        "id": tool_call_id,
+                        "name": "workspace_list",
+                        "arguments": {"path": ".", "depth": 2},
+                    },
+                }),
+            );
+        }
+    }
     agent_request_with_tools(request, &test_agent_manifest())
 }
 
@@ -16765,7 +17579,7 @@ fn agent_tool_call_spec(call_id: &str, policy_decision: PolicyDecision) -> Agent
     AgentToolCallSpec {
         call_id: call_id.into(),
         provider_call_id: format!("provider-call-{call_id}"),
-        tool_name: "workspace.list".into(),
+        tool_name: "workspace_list".into(),
         tool_version: "1.0.0".into(),
         arguments_digest: tools::arguments_digest(&arguments_json),
         arguments_json,

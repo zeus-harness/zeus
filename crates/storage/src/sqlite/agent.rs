@@ -2433,11 +2433,12 @@ fn insert_continuation_model_job(
         )
     })?;
     let manifest = query_agent_deployment_manifest(connection, digest)?;
-    validate_request_tools_match_manifest(request_json, &manifest).map_err(|error| {
-        StorageError::InvalidAgentTransition(format!(
-            "agent continuation tools disagree with its deployment manifest: {error}"
-        ))
-    })?;
+    validate_request_matches_manifest(request_json, &manifest, AgentRequestPhase::Continuation)
+        .map_err(|error| {
+            StorageError::InvalidAgentTransition(format!(
+                "agent continuation request disagrees with its deployment manifest: {error}"
+            ))
+        })?;
     if agent.status != AgentTurnStatus::WaitingModel {
         return Err(StorageError::InvalidAgentTransition(
             "only a waiting Agent can enqueue a model continuation".into(),
@@ -3975,13 +3976,123 @@ fn require_manifest_matches_agent_spec(spec: &AgentTurnSpec) -> Result<(), Stora
     Ok(())
 }
 
-fn validate_request_tools_match_manifest(
+#[derive(Clone, Copy)]
+enum AgentRequestPhase {
+    Initial,
+    Continuation,
+    LegacyPromptlessIntegrity,
+}
+
+fn validate_request_matches_manifest(
     request_json: &Value,
     manifest: &ManifestEnvelope,
+    phase: AgentRequestPhase,
 ) -> Result<(), StorageError> {
     let request = request_json.as_object().ok_or_else(|| {
         StorageError::InvalidAgentTransition("agent model request must be an object".into())
     })?;
+    if !matches!(phase, AgentRequestPhase::LegacyPromptlessIntegrity) {
+        let typed_request = serde_json::from_value::<llm::ReplyRequest>(request_json.clone())
+            .map_err(|error| {
+                StorageError::InvalidAgentTransition(format!(
+                    "agent model request does not match the typed provider contract: {error}"
+                ))
+            })?;
+        let validation = match phase {
+            AgentRequestPhase::Initial => llm::validate_initial_agent_reply_request(&typed_request),
+            AgentRequestPhase::Continuation => llm::validate_agent_reply_request(&typed_request),
+            AgentRequestPhase::LegacyPromptlessIntegrity => unreachable!(),
+        };
+        validation.map_err(|error| {
+            StorageError::InvalidAgentTransition(format!(
+                "agent model request violates the typed provider contract: {error}"
+            ))
+        })?;
+        let messages = match request.get("messages") {
+            Some(Value::Array(messages)) if !messages.is_empty() => messages,
+            Some(Value::Array(_)) => {
+                return Err(StorageError::InvalidAgentTransition(
+                    "agent model request messages must not be empty".into(),
+                ));
+            }
+            Some(_) => {
+                return Err(StorageError::InvalidAgentTransition(
+                    "agent model request messages must be an array".into(),
+                ));
+            }
+            None => {
+                return Err(StorageError::InvalidAgentTransition(
+                    "agent model request must contain messages".into(),
+                ));
+            }
+        };
+        let prompt = manifest.manifest.deployment.spec.prompt.as_ref();
+        let mut system_message: Option<&str> = None;
+        for (index, message) in messages.iter().enumerate() {
+            let message = message.as_object().ok_or_else(|| {
+                StorageError::InvalidAgentTransition(format!(
+                    "agent model request message {index} must be an object"
+                ))
+            })?;
+            let role = message.get("role").and_then(Value::as_str).ok_or_else(|| {
+                StorageError::InvalidAgentTransition(format!(
+                    "agent model request message {index} role must be a string"
+                ))
+            })?;
+            if !matches!(role, "system" | "user" | "assistant" | "tool") {
+                return Err(StorageError::InvalidAgentTransition(format!(
+                    "agent model request message {index} has an unsupported role"
+                )));
+            }
+            let content = message
+                .get("content")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    StorageError::InvalidAgentTransition(format!(
+                        "agent model request message {index} content must be a string"
+                    ))
+                })?;
+            if role == "system" {
+                if index != 0 || system_message.is_some() {
+                    return Err(StorageError::InvalidAgentTransition(
+                        "agent model request may contain exactly one leading system message".into(),
+                    ));
+                }
+                if message.contains_key("tool_call") || message.contains_key("tool_call_id") {
+                    return Err(StorageError::InvalidAgentTransition(
+                        "agent model request system message cannot contain tool metadata".into(),
+                    ));
+                }
+                system_message = Some(content);
+            }
+        }
+        match (prompt, system_message) {
+            (Some(prompt), Some(content)) if prompt.matches_content(content) => {}
+            (Some(_), Some(_)) => {
+                return Err(StorageError::InvalidAgentTransition(
+                    "agent model request system prompt content disagrees with the deployment manifest"
+                        .into(),
+                ));
+            }
+            (Some(_), None) => {
+                return Err(StorageError::InvalidAgentTransition(
+                    "agent model request is missing its manifest-bound system prompt".into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(StorageError::InvalidAgentTransition(
+                    "agent model request cannot contain a system prompt without a manifest binding"
+                        .into(),
+                ));
+            }
+            (None, None) => {}
+        }
+        if prompt.is_some() && messages.len() == 1 {
+            return Err(StorageError::InvalidAgentTransition(
+                "agent model request must contain a conversation after its system prompt".into(),
+            ));
+        }
+    }
     let tools = match request.get("tools") {
         None => &[][..],
         Some(Value::Array(tools)) => tools.as_slice(),
@@ -4038,6 +4149,38 @@ fn persist_agent_deployment_manifest(
     created_at: &str,
 ) -> Result<(), StorageError> {
     let canonical_json = canonical_manifest_json(manifest)?;
+    if let Some(candidate_prompt) = manifest.manifest.deployment.spec.prompt.as_ref() {
+        let stored_manifests = {
+            let mut statement = connection.prepare(
+                r#"SELECT digest, schema_version, envelope_json
+                   FROM agent_deployment_manifests ORDER BY digest"#,
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (digest, schema_version, envelope_json) in stored_manifests {
+            let stored = decode_agent_deployment_manifest(&digest, schema_version, &envelope_json)?;
+            let Some(stored_prompt) = stored.manifest.deployment.spec.prompt.as_ref() else {
+                continue;
+            };
+            if stored_prompt.prompt_id == candidate_prompt.prompt_id
+                && stored_prompt.revision == candidate_prompt.revision
+                && stored_prompt.content_digest != candidate_prompt.content_digest
+            {
+                return Err(StorageError::InvalidAgentTransition(format!(
+                    "Agent prompt `{}` revision `{}` is already bound to different content",
+                    candidate_prompt.prompt_id, candidate_prompt.revision
+                )));
+            }
+        }
+    }
     connection.execute(
         r#"INSERT OR IGNORE INTO agent_deployment_manifests(
                digest, schema_version, envelope_json, created_at
@@ -4200,7 +4343,46 @@ fn require_model_job_matches_manifest(
             "Agent model job provider disagrees with its deployment manifest".into(),
         ));
     }
-    validate_request_tools_match_manifest(&job.request_json, manifest)
+    let phase = match job.step {
+        1 => AgentRequestPhase::Initial,
+        2.. => AgentRequestPhase::Continuation,
+        0 => {
+            return Err(StorageError::InvalidAgentTransition(
+                "Agent model job step must be positive".into(),
+            ));
+        }
+    };
+    validate_request_matches_manifest(&job.request_json, manifest, phase)
+}
+
+fn require_model_job_matches_manifest_for_integrity(
+    job: &AgentModelJob,
+    manifest: &ManifestEnvelope,
+) -> Result<(), StorageError> {
+    let spec = &manifest.manifest.deployment.spec;
+    if job.provider_name != spec.provider.provider_id || job.model_name != spec.provider.model {
+        return Err(StorageError::InvalidAgentTransition(
+            "Agent model job provider disagrees with its deployment manifest".into(),
+        ));
+    }
+    if spec.prompt.is_none() {
+        validate_request_matches_manifest(
+            &job.request_json,
+            manifest,
+            AgentRequestPhase::LegacyPromptlessIntegrity,
+        )
+    } else {
+        let phase = match job.step {
+            1 => AgentRequestPhase::Initial,
+            2.. => AgentRequestPhase::Continuation,
+            0 => {
+                return Err(StorageError::InvalidAgentTransition(
+                    "Agent model job step must be positive".into(),
+                ));
+            }
+        };
+        validate_request_matches_manifest(&job.request_json, manifest, phase)
+    }
 }
 
 fn require_tool_call_matches_manifest(
@@ -4311,6 +4493,7 @@ pub(super) fn verify_agent_deployment_manifest_integrity(
     connection: &Connection,
 ) -> Result<(), StorageError> {
     {
+        let mut prompt_identities = std::collections::BTreeMap::<(String, String), String>::new();
         let mut statement = connection.prepare(
             r#"SELECT digest, schema_version, envelope_json
                FROM agent_deployment_manifests ORDER BY digest"#,
@@ -4324,7 +4507,20 @@ pub(super) fn verify_agent_deployment_manifest_integrity(
         })?;
         for row in rows {
             let (digest, schema_version, envelope_json) = row?;
-            decode_agent_deployment_manifest(&digest, schema_version, &envelope_json)?;
+            let manifest =
+                decode_agent_deployment_manifest(&digest, schema_version, &envelope_json)?;
+            if let Some(prompt) = manifest.manifest.deployment.spec.prompt {
+                let identity = (prompt.prompt_id.clone(), prompt.revision.clone());
+                if let Some(existing_digest) =
+                    prompt_identities.insert(identity, prompt.content_digest.clone())
+                    && existing_digest != prompt.content_digest
+                {
+                    return Err(StorageError::CorruptData(format!(
+                        "Agent prompt `{}` revision `{}` has conflicting durable content bindings",
+                        prompt.prompt_id, prompt.revision
+                    )));
+                }
+            }
         }
     }
 
@@ -4364,7 +4560,7 @@ pub(super) fn verify_agent_deployment_manifest_integrity(
         };
         for job in jobs {
             let job = job.decode()?;
-            require_model_job_matches_manifest(&job, &manifest).map_err(|error| {
+            require_model_job_matches_manifest_for_integrity(&job, &manifest).map_err(|error| {
                 StorageError::CorruptData(format!(
                     "Agent model job deployment binding is inconsistent: {error}"
                 ))
@@ -4407,7 +4603,11 @@ pub(super) fn validate_agent_turn_spec(spec: &AgentTurnSpec) -> Result<(), Stora
     )?;
     validate_manifest_envelope(&spec.manifest, "Agent deployment manifest")?;
     require_manifest_matches_agent_spec(spec)?;
-    validate_request_tools_match_manifest(&spec.request_json, &spec.manifest)?;
+    validate_request_matches_manifest(
+        &spec.request_json,
+        &spec.manifest,
+        AgentRequestPhase::Initial,
+    )?;
     WorkflowState::new(spec.manifest.manifest.deployment.spec.loop_limits.clone())
         .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?
         .validate()
@@ -5665,6 +5865,74 @@ mod tests {
                 AGENT_TOOL_ARGUMENTS_MAX_BYTES + 1
             )),
             Err(StorageError::InvalidReplyTransition(_))
+        ));
+    }
+
+    #[test]
+    fn promptless_legacy_integrity_accepts_old_system_and_dotted_tools_but_claim_does_not() {
+        let provider = deployment::ManifestProvider::new(
+            "test-provider",
+            Some("test-model".into()),
+            protocol::AssistantReplyKind::Model,
+        )
+        .unwrap();
+        let policy = deployment::ManifestPolicy::new("local", "local/v1").unwrap();
+        let tool = deployment::ManifestTool::new(
+            "workspace.list",
+            "1.0.0",
+            "List bounded workspace entries.",
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            }),
+            protocol::ToolEffect::ReadOnly,
+            protocol::SandboxProfile::ReadOnly,
+            protocol::ToolExecutorStatus::Available,
+        )
+        .unwrap();
+        let spec = deployment::AgentSpec::new(
+            "zeus-storage-legacy-agent",
+            "1",
+            "local-development",
+            "local",
+            provider,
+            policy,
+        )
+        .unwrap()
+        .with_tools(vec![tool])
+        .unwrap();
+        let manifest = ManifestEnvelope::from_deployment(
+            deployment::AgentDeployment::new("zeus-storage-legacy-deployment", "1", spec).unwrap(),
+        )
+        .unwrap();
+        let request = json!({
+            "messages": [
+                {"role": "system", "content": "Legacy provider prompt"},
+                {"role": "user", "content": "Read legacy terminal history"}
+            ],
+            "tools": [{
+                "name": "workspace.list",
+                "description": "List bounded workspace entries.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                },
+            }],
+        });
+
+        assert!(
+            validate_request_matches_manifest(
+                &request,
+                &manifest,
+                AgentRequestPhase::LegacyPromptlessIntegrity,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            validate_request_matches_manifest(&request, &manifest, AgentRequestPhase::Initial,),
+            Err(StorageError::InvalidAgentTransition(_))
         ));
     }
 }

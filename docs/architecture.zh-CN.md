@@ -22,7 +22,7 @@ Client / SvelteKit Web
 
 - `protocol`：认证、设置、Session/Run HTTP、SSE、turn 与可版本化事件合约。
 - `deployment`：版本化、规范化且不含 secret 的 Agent Spec / Deployment Manifest，负责稳定
-  digest 与确定性 JSON-pointer diff。
+  digest、系统提示词 ID/revision/content digest 绑定与确定性 JSON-pointer diff。
 - `tenancy`：本地身份、account/membership 授权上下文、Argon2id 密码、opaque token、CSRF 与域分离 digest。
 - `llm`：object-safe reply provider、本地非模型 fallback 和有界 OpenAI-compatible 客户端。
 - `kernel`：纯状态转换，不读数据库、不执行外部工具。
@@ -44,6 +44,11 @@ SQLite 是本地单实例 Alpha+ 的权威存储。Restate、MinIO 和 PostgreSQ
 提交 assistant content 或调用生产 flush route。
 Session 列表按 opaque cursor 逐页追加；保存的活动 Session 即使不在首屏，也先通过 actor-scoped
 point detail 恢复，只有权威 `404` 才回退 primary Session。
+
+系统提示词绑定复用现有 manifest 可选 prompt 字段和 immutable request JSON，不增加数据库
+migration。升级后仍 queued 的旧 promptless Agent work 会被当前 deployment manifest 判定为
+drift 并在外部 I/O 前关闭；已终结历史仍可读。动态 knowledge 不拼入稳定系统提示词；后续如
+实现知识注入，必须作为独立、受治理且可重建的 context snapshot 绑定到模型请求。
 
 ## 事件与状态
 
@@ -114,21 +119,32 @@ Session ledger 记录 `session_created`、`run_attached`、`user_message`、可�
 - start：只允许 actor 拥有的 `ready` Session；在一个事务中创建唯一 open turn、追加
   `user_message`、投影进入 `running`、保存 actor-scoped 响应回执，创建 Agent，绑定 canonical
   deployment manifest digest，并插入 immutable queued model job。provider request 以命令的
-  `expected_sequence` 为快照边界，由最新完整 flushed user/assistant 对和当前 user message
-  组成；最多保留 27 对历史消息，总 UTF-8 内容不超过 64 KiB。interrupted、缺少 assistant 或
-  尚未 flush 的 turn 不进入上下文。组装结果持久化在 job 中，迟到的幂等重试复用该 durable
-  request，而不是从更晚的 Session 状态重新生成。真实 API 返回 `202`。
+  `expected_sequence` 为快照边界：第一条且唯一一条 system message 是 manifest 绑定提示词的
+  精确内容，随后才是最新完整 flushed user/assistant 对和当前 user message。manifest 只保存
+  稳定 prompt ID、revision 与域分离 content digest，不保存提示词内容或 secret；精确内容随
+  immutable request 持久化。system prompt 与最多 27 对历史消息、当前 user message 共享
+  64 KiB 初始 UTF-8 内容预算；初始最多 56 条 message，为 Agent 全程 64-message 上限预留四组
+  assistant tool call / tool result。interrupted、缺少 assistant 或尚未 flush 的 turn 不进入
+  上下文。组装结果持久化在 job 中，迟到的幂等重试复用该 durable request，而不是从更晚的
+  Session 状态重新生成。当前 user message 无法与固定 prompt 一起装入初始预算时，API 在任何
+  turn/job 写入前返回 `413 agent_request_too_large`；合法请求返回 `202`。
 - Agent model worker：claim 事务先复验 active actor、Session owner、manifest digest、provider/
-  model、profile/environment、policy revision、workflow limits 与 provider-visible tool schema，
-  再把 queued job durable claim 为 `started`；任何缺失、损坏或 drift 都以
-  `deployment_unavailable` 终结且 provider 调用数为零。claim 成功后才在数据库锁之外调用
-  provider。最终文本原子追加带 provenance 的 `assistant_message`、flush turn 并写
-  `turn_flushed`；确定失败和 outcome unknown 都进入 `needs_attention`，不得自动重调 provider。
+  model、profile/environment、policy revision、workflow limits、完整 typed transcript、prompt
+  绑定与 provider-visible tool schema，再把 queued job durable claim 为 `started`。admission、
+  claim 和 deep-integrity 都校验消息顺序、数量、content 预算、system message 位置唯一及内容与
+  manifest digest 精确匹配。admission 发现错误会拒绝命令并回滚；已经 queued 的 work 在 claim
+  时发现持久化 authority 缺失、损坏、promptless 或与当前 deployment drift，才 durable settle
+  为 `deployment_unavailable`。两条路径都发生在 provider I/O 前，外部调用数为零。claim 成功后
+  才在数据库锁之外调用 provider。最终文本原子追加带 provenance 的 `assistant_message`、flush
+  turn 并写 `turn_flushed`；确定失败和 outcome unknown 都进入 `needs_attention`，不得自动重调
+  provider。
 - Agent tool worker：模型只能提出工具名与 arguments；服务端 registry/policy 生成不可变 call。
   require-approval 保留在 `waiting_approval`，拒绝和 policy deny 作为结构化 known result 返回模型。
   允许执行的 call 在 durable `started` checkpoint 后再次校验 manifest/registry/policy；只有通过
   才调用 executor。known completion 与它的 exact next-request JSON 在同一事务提交，SQL `NULL`
-  与 model-visible JSON `null` 不得混淆；重启只重放已持久化 continuation，不重新拼接 transcript。
+  与 model-visible JSON `null` 不得混淆。continuation 再次校验同一 prompt 绑定，并原样保留已
+  持久化的 system message 与 transcript；重启恢复只重放该 exact request，不从当前 prompt 或
+  Session 状态重新拼接输入。
 - flush：仅保留在不带认证的 storage/runtime 合约测试 router；真实 authenticated server 不注册
   此路由，浏览器不能上传 assistant content。
 - resume：只允许没有 active turn 的 `needs_attention` Session；追加
@@ -190,7 +206,9 @@ Session 必须通过幂等、sequence-checked resume 显式回到 `ready`。
 SQLite Physical Capacity Slice 已在监听端口开放前的启动阶段完成深度业务/ledger/FK/SQLite
 integrity 检查与 truncating WAL checkpoint。`/health/ready` 只保留 schema/PRAGMA metadata
 和物理 watermark 检查；运维或测试需要重跑昂贵检查时显式调用
-`SqliteStore::verify_integrity`，避免 readiness 触发全 ledger 扫描或 checkpoint。
+`SqliteStore::verify_integrity`，避免 readiness 触发全 ledger 扫描或 checkpoint。deep-integrity
+还会复验每个带 prompt 绑定的 Agent request：system message 必须位于首位且仅出现一次，内容
+digest、provider-visible tools 与 immutable manifest 必须一致。
 
 稳定的 `call_id` 会传给 provider 作为幂等键，但 Zeus 不据此宣称任意外部系统都具有
 exactly-once 语义。
@@ -414,8 +432,11 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
 - Agent model/tool、legacy reply 或 dispatch 在 started 后模拟崩溃，均恢复为
   `outcome_unknown` 且不发生第二次外部执行。
 - 新 Agent 的 manifest canonical/digest/reuse/secret-free、actor isolation、provider-visible tools
-  精确匹配和 provider/tool/policy/profile drift 均有自动化覆盖；v18 terminal history 可读，旧
-  queued/waiting-approval work 在首次可执行边界以 `deployment_unavailable` fail closed。
+  及 prompt ID/revision/content digest 精确匹配和 provider/tool/policy/profile/prompt drift 均有
+  自动化覆盖；prompt 缺失、重复、位置或内容不符在 provider I/O 前 fail closed。continuation 与
+  重启恢复复用 exact persisted request，不重新解析当前提示词。v18 terminal history 可读，旧
+  queued/waiting-approval 或 promptless work 在首次可执行边界以 `deployment_unavailable` fail
+  closed。
 - 首次 bootstrap 只能消费一次 token；登录、CSRF、同源、Cookie 属性、设置 revision、退出后
   401 以及退出/失效后 SSE 关闭有自动化或 live 验收。
 - bootstrap audit 的 v11 reason 迁移、canonical digest、64 行多批压缩、rotation/open 降限、
@@ -451,8 +472,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   刷新恢复、owner/member setup/登录、owner 成员与 audit 管理、设置/退出和
   system/light/dark。member 的审批卡只读。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化按项目既有统计口径是 478 个 Rust 测试（其中 deployment 7、storage 225、
-  runtime 48、API library 63、API main/config 6）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化按项目既有统计口径是 490 个 Rust 测试（其中 deployment 8、storage 232、
+  runtime 48、API library 64、API main/config 6）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
 提交 `af29089` 曾构建并运行在独立 `zeus-operation-acceptance` project（端口 `18089`）；既有

@@ -1242,6 +1242,7 @@ dependencies = [
  "execution",
  "fs2",
  "kernel",
+ "llm",
  "protocol",
  "rusqlite",
  "serde",

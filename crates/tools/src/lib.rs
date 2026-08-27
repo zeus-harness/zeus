@@ -19,7 +19,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const MAX_TOOL_NAME_BYTES: usize = 96;
+const MAX_TOOL_NAME_BYTES: usize = 64;
 const MAX_CALL_ID_BYTES: usize = 160;
 const MAX_ENVIRONMENT_BYTES: usize = 64;
 /// Maximum compact-JSON bytes accepted from one executor result value.
@@ -208,6 +208,8 @@ fn parameter_type_name(parameter_type: &ParameterType) -> &'static str {
 /// Static metadata for a registered executor.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolDescriptor {
+    /// Provider-safe function identifier shared by the registry, manifest,
+    /// and model request contracts.
     pub name: String,
     /// Explicit contract version persisted with every call.
     pub version: String,
@@ -658,15 +660,12 @@ impl ToolExecutor for RecordingExecutor {
 fn validate_tool_name(name: &str) -> Result<(), RegistryError> {
     if name.is_empty()
         || name.len() > MAX_TOOL_NAME_BYTES
-        || name.starts_with('.')
-        || name.ends_with('.')
-        || name.split('.').any(|segment| segment.is_empty())
-        || !name.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
-        })
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte))
     {
         return Err(RegistryError::InvalidDescriptor(format!(
-            "tool name `{name}` must be lowercase ASCII segments separated by dots"
+            "tool name `{name}` must be at most {MAX_TOOL_NAME_BYTES} lowercase ASCII letters, digits, underscores, or hyphens"
         )));
     }
     Ok(())
@@ -898,8 +897,8 @@ mod tests {
 
     #[test]
     fn stable_ids_and_provider_keys_survive_retries() {
-        let first = stable_call_id("ZR-1842", 7, 11, "telemetry.query").unwrap();
-        let retry = stable_call_id("ZR-1842", 7, 11, "telemetry.query").unwrap();
+        let first = stable_call_id("ZR-1842", 7, 11, "telemetry_query").unwrap();
+        let retry = stable_call_id("ZR-1842", 7, 11, "telemetry_query").unwrap();
         assert_eq!(first, retry);
         assert_eq!(
             provider_idempotency_key(&first).unwrap(),
@@ -980,22 +979,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn registry_rejects_names_that_cannot_be_exposed_to_model_providers() {
+        for name in [
+            "known.query".to_owned(),
+            "a".repeat(MAX_TOOL_NAME_BYTES + 1),
+        ] {
+            let mut registry = ToolRegistry::new();
+            assert!(matches!(
+                registry.register(
+                    descriptor(&name),
+                    RecordingExecutor::new(json!({"ok": true}))
+                ),
+                Err(RegistryError::InvalidDescriptor(_))
+            ));
+        }
+    }
+
     #[tokio::test]
     async fn unknown_tool_never_calls_a_registered_executor() {
         let recorder = RecordingExecutor::new(json!({"ok": true}));
         let mut registry = ToolRegistry::new();
         registry
-            .register(descriptor("known.query"), recorder.clone())
+            .register(descriptor("known_query"), recorder.clone())
             .unwrap();
 
         let error = registry
             .dispatch(
-                call("unknown.query", json!({"query": "safe"})),
+                call("unknown_query", json!({"query": "safe"})),
                 "local-development",
             )
             .await
             .unwrap_err();
-        assert_eq!(error, RegistryError::UnknownTool("unknown.query".into()));
+        assert_eq!(error, RegistryError::UnknownTool("unknown_query".into()));
         assert!(recorder.calls().is_empty());
     }
 
@@ -1004,10 +1020,10 @@ mod tests {
         let recorder = RecordingExecutor::new(json!({"ok": true}));
         let mut registry = ToolRegistry::new();
         registry
-            .register(descriptor("known.query"), recorder.clone())
+            .register(descriptor("known_query"), recorder.clone())
             .unwrap();
 
-        let mut wrong_digest = call("known.query", json!({"query": "safe"}));
+        let mut wrong_digest = call("known_query", json!({"query": "safe"}));
         wrong_digest.arguments_digest = arguments_digest(&json!({"query": "changed"}));
         assert!(matches!(
             registry.dispatch(wrong_digest, "local-development").await,
@@ -1017,7 +1033,7 @@ mod tests {
         ));
 
         let unknown_argument = call(
-            "known.query",
+            "known_query",
             json!({"query": "safe", "path": "/etc/passwd"}),
         );
         assert!(matches!(
@@ -1034,9 +1050,9 @@ mod tests {
         let recorder = RecordingExecutor::new(json!({"ok": true}));
         let mut registry = ToolRegistry::new();
         registry
-            .register(descriptor("known.query"), recorder.clone())
+            .register(descriptor("known_query"), recorder.clone())
             .unwrap();
-        let call = call("known.query", json!({"query": "safe"}));
+        let call = call("known_query", json!({"query": "safe"}));
         let expected_key = provider_idempotency_key(&call.call_id).unwrap();
 
         registry.dispatch(call, "local-development").await.unwrap();
@@ -1051,13 +1067,13 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry
             .register(
-                descriptor("offline.query"),
+                descriptor("offline_query"),
                 UnavailableExecutor::new("provider is not configured"),
             )
             .unwrap();
         let error = registry
             .dispatch(
-                call("offline.query", json!({"query": "safe"})),
+                call("offline_query", json!({"query": "safe"})),
                 "local-development",
             )
             .await
@@ -1075,11 +1091,11 @@ mod tests {
         ));
         let mut registry = ToolRegistry::new();
         registry
-            .register(descriptor("exact.query"), exact.clone())
+            .register(descriptor("exact_query"), exact.clone())
             .unwrap();
         registry
             .dispatch(
-                call("exact.query", json!({"query": "safe"})),
+                call("exact_query", json!({"query": "safe"})),
                 "local-development",
             )
             .await
@@ -1090,12 +1106,12 @@ mod tests {
             "x".repeat(TOOL_OUTPUT_MAX_SERIALIZED_BYTES - 1),
         ));
         registry
-            .register(descriptor("large.query"), oversized.clone())
+            .register(descriptor("large_query"), oversized.clone())
             .unwrap();
         assert_eq!(
             registry
                 .dispatch(
-                    call("large.query", json!({"query": "safe"})),
+                    call("large_query", json!({"query": "safe"})),
                     "local-development",
                 )
                 .await,
@@ -1111,7 +1127,7 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry
             .register(
-                descriptor("bad.query"),
+                descriptor("bad_query"),
                 FailingExecutor(ExecutorError::Failed {
                     code: "executor_failed".into(),
                     message: "x".repeat(protocol::TOOL_OUTCOME_SUMMARY_MAX_BYTES + 1),
@@ -1122,7 +1138,7 @@ mod tests {
         assert_eq!(
             registry
                 .dispatch(
-                    call("bad.query", json!({"query": "safe"})),
+                    call("bad_query", json!({"query": "safe"})),
                     "local-development",
                 )
                 .await,
@@ -1133,7 +1149,7 @@ mod tests {
 
         registry
             .register(
-                descriptor("bad-code.query"),
+                descriptor("bad-code_query"),
                 FailingExecutor(ExecutorError::Failed {
                     code: "x".repeat(protocol::TOOL_OUTCOME_CODE_MAX_BYTES + 1),
                     message: "bounded failure".into(),
@@ -1144,7 +1160,7 @@ mod tests {
         assert_eq!(
             registry
                 .dispatch(
-                    call("bad-code.query", json!({"query": "safe"})),
+                    call("bad-code_query", json!({"query": "safe"})),
                     "local-development",
                 )
                 .await,
@@ -1167,11 +1183,11 @@ mod tests {
         };
         let mut registry = ToolRegistry::new();
         registry
-            .register(descriptor("request-id.query"), exact)
+            .register(descriptor("request-id_query"), exact)
             .unwrap();
         registry
             .dispatch(
-                call("request-id.query", json!({"query": "safe"})),
+                call("request-id_query", json!({"query": "safe"})),
                 "local-development",
             )
             .await
@@ -1186,12 +1202,12 @@ mod tests {
             },
         };
         registry
-            .register(descriptor("large-request-id.query"), oversized)
+            .register(descriptor("large-request-id_query"), oversized)
             .unwrap();
         assert_eq!(
             registry
                 .dispatch(
-                    call("large-request-id.query", json!({"query": "safe"})),
+                    call("large-request-id_query", json!({"query": "safe"})),
                     "local-development",
                 )
                 .await,
