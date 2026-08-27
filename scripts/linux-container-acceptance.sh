@@ -262,6 +262,7 @@ assert_project_unused() {
 		line_list_contains "${name}" "${container_names}" \
 			&& die "refusing an exact-name collision with foreign or stale container: ${name}"
 	done
+	return 0
 }
 
 line_list_contains() {
