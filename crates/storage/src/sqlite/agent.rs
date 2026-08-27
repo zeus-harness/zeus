@@ -12,9 +12,11 @@ use crate::{
     AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
     AgentToolOutcomeUnknownCommit, AgentToolWork, settle_agent_continuation_limit,
 };
+use deployment::ManifestEnvelope;
 use protocol::{
     AgentApprovalReview, AgentReviewResponse, AgentToolCallDetail, AgentToolCallStatus,
-    AgentTurnDetail, AgentTurnStatus, PolicyDecision, ReviewDecision, ToolExecutorStatus,
+    AgentTurnDetail, AgentTurnStatus, AssistantReplyKind, PolicyDecision, ReviewDecision,
+    ToolExecutorStatus,
 };
 use workflows::{
     AgentStatus as WorkflowStatus, Command as WorkflowCommand, ProposalDisposition,
@@ -28,14 +30,20 @@ const AGENT_RESPONSE_JSON_MAX_BYTES: usize = 512 * 1024;
 const AGENT_ERROR_JSON_MAX_BYTES: usize = 32 * 1024;
 const AGENT_TOOL_ARGUMENTS_MAX_BYTES: usize = 16 * 1024;
 const AGENT_TOOL_RESULT_JSON_MAX_BYTES: usize = 64 * 1024;
+const AGENT_DEPLOYMENT_MANIFEST_MAX_BYTES: usize = 256 * 1024;
 
 impl SqliteStore {
     /// Claims one queued model step. The returned job is externally callable
     /// only because its `started` state and workflow transition have committed.
-    pub async fn claim_next_agent_model(&self) -> Result<AgentModelClaimOutcome, StorageError> {
+    pub async fn claim_next_agent_model(
+        &self,
+        current_manifest: &ManifestEnvelope,
+    ) -> Result<AgentModelClaimOutcome, StorageError> {
+        validate_manifest_envelope(current_manifest, "current Agent deployment manifest")?;
+        let current_manifest = current_manifest.clone();
         let physical_limits = self.physical_limits.clone();
         self.with_progress_connection(move |connection| {
-            claim_next_agent_model(connection, &physical_limits)
+            claim_next_agent_model(connection, &current_manifest, &physical_limits)
         })
         .await
     }
@@ -71,10 +79,15 @@ impl SqliteStore {
     /// Claims one already-admitted tool call after persisting its sole
     /// `started` checkpoint. The returned model job is the exact transcript
     /// authority from which the continuation must be built.
-    pub async fn claim_next_agent_tool(&self) -> Result<AgentToolClaimOutcome, StorageError> {
+    pub async fn claim_next_agent_tool(
+        &self,
+        current_manifest: &ManifestEnvelope,
+    ) -> Result<AgentToolClaimOutcome, StorageError> {
+        validate_manifest_envelope(current_manifest, "current Agent deployment manifest")?;
+        let current_manifest = current_manifest.clone();
         let physical_limits = self.physical_limits.clone();
         self.with_progress_connection(move |connection| {
-            claim_next_agent_tool(connection, &physical_limits)
+            claim_next_agent_tool(connection, &current_manifest, &physical_limits)
         })
         .await
     }
@@ -117,6 +130,24 @@ impl SqliteStore {
         let turn_id = validated_durable_reference(turn_id, "turn ID")?.to_owned();
         self.with_connection(move |connection| {
             query_agent_turn_detail_for_actor(connection, &context, &session_id, &turn_id)
+        })
+        .await
+    }
+
+    /// Returns the exact immutable deployment manifest bound to an Agent turn.
+    /// Authorization and account isolation are checked before its binding is
+    /// exposed. Pre-v19 legacy turns return `None`.
+    pub async fn agent_deployment_manifest_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<ManifestEnvelope>, StorageError> {
+        let context = validated_authz_context(context)?;
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        let turn_id = validated_durable_reference(turn_id, "turn ID")?.to_owned();
+        self.with_connection(move |connection| {
+            query_agent_deployment_manifest_for_actor(connection, &context, &session_id, &turn_id)
         })
         .await
     }
@@ -187,6 +218,7 @@ impl SqliteStore {
 
 fn claim_next_agent_model(
     connection: &mut Connection,
+    current_manifest: &ManifestEnvelope,
     physical_limits: &SqlitePhysicalLimits,
 ) -> Result<AgentModelClaimOutcome, StorageError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -216,14 +248,52 @@ fn claim_next_agent_model(
         .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?
         .into_state();
     update_agent_workflow(&transaction, &mut agent, started, None, None, None)?;
+    let timestamp = now();
     let changed = transaction.execute(
         r#"UPDATE agent_model_jobs
            SET status = 'started', attempt = 1, started_at = ?1
            WHERE id = ?2 AND status = 'queued' AND attempt = 0"#,
-        params![now(), job_id],
+        params![timestamp, job_id],
     )?;
     if changed != 1 {
         return Err(StorageError::ConcurrentModification);
+    }
+
+    if !agent_deployment_matches_current(&transaction, &agent, Some(&job), None, current_manifest)?
+    {
+        let error_json = deployment_unavailable_error(
+            "the bound Agent deployment manifest is missing, invalid, or changed before model execution",
+        );
+        let failed = reduce(
+            &agent.workflow_state,
+            WorkflowCommand::DeploymentUnavailable,
+        )
+        .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?
+        .into_state();
+        update_agent_workflow(
+            &transaction,
+            &mut agent,
+            failed,
+            None,
+            Some(&error_json),
+            Some(&timestamp),
+        )?;
+        let changed = transaction.execute(
+            r#"UPDATE agent_model_jobs
+               SET status = 'failed', error_json = ?1, finished_at = ?2
+               WHERE id = ?3 AND status = 'started' AND attempt = 1"#,
+            params![serde_json::to_string(&error_json)?, timestamp, job_id],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::ConcurrentModification);
+        }
+        let completion = interrupt_agent_turn(
+            &transaction,
+            &agent,
+            "agent deployment became unavailable before model execution",
+        )?;
+        transaction.commit()?;
+        return Ok(AgentModelClaimOutcome::Rejected(Box::new(completion)));
     }
 
     if !agent_actor_is_authorized(&transaction, &agent)? {
@@ -240,13 +310,13 @@ fn claim_next_agent_model(
             failed,
             None,
             Some(&error_json),
-            Some(&now()),
+            Some(&timestamp),
         )?;
         transaction.execute(
             r#"UPDATE agent_model_jobs
                SET status = 'failed', error_json = ?1, finished_at = ?2
                WHERE id = ?3 AND status = 'started'"#,
-            params![serde_json::to_string(&error_json)?, now(), job_id],
+            params![serde_json::to_string(&error_json)?, timestamp, job_id],
         )?;
         let completion = interrupt_agent_turn(
             &transaction,
@@ -593,6 +663,7 @@ fn complete_agent_model_failure(
 
 fn claim_next_agent_tool(
     connection: &mut Connection,
+    current_manifest: &ManifestEnvelope,
     physical_limits: &SqlitePhysicalLimits,
 ) -> Result<AgentToolClaimOutcome, StorageError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -646,6 +717,48 @@ fn claim_next_agent_tool(
     if changed != 1 {
         return Err(StorageError::ConcurrentModification);
     }
+    if !agent_deployment_matches_current(
+        &transaction,
+        &agent,
+        Some(&model_job),
+        Some(&call),
+        current_manifest,
+    )? {
+        let error_json = deployment_unavailable_error(
+            "the bound Agent deployment manifest is missing, invalid, or changed before tool execution",
+        );
+        let terminal = reduce(
+            &agent.workflow_state,
+            WorkflowCommand::DeploymentUnavailable,
+        )
+        .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?
+        .into_state();
+        update_agent_workflow(
+            &transaction,
+            &mut agent,
+            terminal,
+            None,
+            Some(&error_json),
+            Some(&timestamp),
+        )?;
+        let changed = transaction.execute(
+            r#"UPDATE agent_tool_calls
+               SET status = 'not_dispatched', result_json = ?1,
+                   completion_next_request_json = 'null', finished_at = ?2
+               WHERE call_id = ?3 AND status = 'started'"#,
+            params![serde_json::to_string(&error_json)?, timestamp, call.call_id],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::ConcurrentModification);
+        }
+        let completion = interrupt_agent_turn(
+            &transaction,
+            &agent,
+            "agent deployment became unavailable before tool execution",
+        )?;
+        transaction.commit()?;
+        return Ok(AgentToolClaimOutcome::Rejected(Box::new(completion)));
+    }
     let initiator_authorized = agent_actor_is_authorized(&transaction, &agent)?;
     let approver_authorized = agent_tool_approver_is_authorized(&transaction, &call)?;
     if !initiator_authorized || !approver_authorized {
@@ -666,7 +779,8 @@ fn claim_next_agent_tool(
         )?;
         let changed = transaction.execute(
             r#"UPDATE agent_tool_calls
-               SET status = 'not_dispatched', result_json = ?1, finished_at = ?2
+               SET status = 'not_dispatched', result_json = ?1,
+                   completion_next_request_json = 'null', finished_at = ?2
                WHERE call_id = ?3 AND status = 'started'"#,
             params![serde_json::to_string(&error_json)?, timestamp, call.call_id],
         )?;
@@ -711,6 +825,12 @@ fn complete_agent_tool(
             DISPATCH_IDENTIFIER_MAX_BYTES,
         )?;
     }
+    let completion_next_request_json = commit
+        .next_request_json
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?
+        .unwrap_or_else(|| "null".into());
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let call = query_agent_tool_call(&transaction, &commit.call_id)?;
     let mut agent = query_agent_turn(&transaction, &call.agent_id)?;
@@ -763,12 +883,13 @@ fn complete_agent_tool(
     let changed = transaction.execute(
         r#"UPDATE agent_tool_calls
            SET status = ?1, result_json = ?2, provider_request_id = ?3,
-               finished_at = ?4
-           WHERE call_id = ?5 AND status = 'started'"#,
+               completion_next_request_json = ?4, finished_at = ?5
+           WHERE call_id = ?6 AND status = 'started'"#,
         params![
             agent_tool_status_to_db(&commit.status),
             serde_json::to_string(&commit.result_json)?,
             commit.provider_request_id,
+            completion_next_request_json,
             timestamp,
             call.call_id,
         ],
@@ -1242,6 +1363,17 @@ fn insert_continuation_model_job(
         "agent continuation request JSON",
         AGENT_REQUEST_JSON_MAX_BYTES,
     )?;
+    let digest = agent.deployment_manifest_digest.as_deref().ok_or_else(|| {
+        StorageError::CorruptData(
+            "a legacy Agent cannot enqueue a post-v19 model continuation".into(),
+        )
+    })?;
+    let manifest = query_agent_deployment_manifest(connection, digest)?;
+    validate_request_tools_match_manifest(request_json, &manifest).map_err(|error| {
+        StorageError::InvalidAgentTransition(format!(
+            "agent continuation tools disagree with its deployment manifest: {error}"
+        ))
+    })?;
     if agent.status != AgentTurnStatus::WaitingModel {
         return Err(StorageError::InvalidAgentTransition(
             "only a waiting Agent can enqueue a model continuation".into(),
@@ -1397,6 +1529,13 @@ fn insert_agent_tool_call(
     timestamp: &str,
 ) -> Result<AgentToolCall, StorageError> {
     validate_agent_tool_call_spec(spec)?;
+    let digest = agent.deployment_manifest_digest.as_deref().ok_or_else(|| {
+        StorageError::CorruptData(
+            "a post-upgrade Agent tool call is missing its deployment manifest".into(),
+        )
+    })?;
+    let manifest = query_agent_deployment_manifest(connection, digest)?;
+    require_tool_spec_matches_manifest(spec, &manifest)?;
     if result_json.is_some() != status.is_terminal() {
         return Err(StorageError::InvalidAgentTransition(
             "agent tool terminal state and result must be committed together".into(),
@@ -1729,6 +1868,32 @@ fn query_agent_turn_detail_for_actor(
     Ok(detail)
 }
 
+fn query_agent_deployment_manifest_for_actor(
+    connection: &mut Connection,
+    context: &AuthzContext,
+    session_id: &str,
+    turn_id: &str,
+) -> Result<Option<ManifestEnvelope>, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    require_active_session_actor(&transaction, session_id, context)?;
+    let agent = query_agent_turn_for_session_turn(&transaction, session_id, turn_id)?;
+    if agent.account_id != context.account_id {
+        return Err(StorageError::AgentTurnNotFound(turn_id.to_owned()));
+    }
+    let Some(digest) = agent.deployment_manifest_digest.as_deref() else {
+        transaction.commit()?;
+        return Ok(None);
+    };
+    let manifest = query_agent_deployment_manifest(&transaction, digest)?;
+    require_manifest_matches_agent_identity(&transaction, &manifest, &agent).map_err(|error| {
+        StorageError::CorruptData(format!(
+            "Agent deployment manifest binding is invalid: {error}"
+        ))
+    })?;
+    transaction.commit()?;
+    Ok(Some(manifest))
+}
+
 fn query_agent_review_context_for_actor(
     connection: &mut Connection,
     context: &AuthzContext,
@@ -1787,6 +1952,7 @@ fn agent_turn_detail(
         id: agent.id.clone(),
         session_id: agent.session_id.clone(),
         turn_id: agent.turn_id.clone(),
+        deployment_manifest_digest: agent.deployment_manifest_digest.clone(),
         status: agent.status.clone(),
         model_steps: agent.model_steps,
         tool_calls: agent.tool_calls,
@@ -2026,15 +2192,34 @@ fn review_agent_tool_for_actor(
             )
             .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?
             .into_state();
-            let (settled, continuation_request) = settle_known_result_continuation(
+            let (mut settled, mut continuation_request) = settle_known_result_continuation(
                 rejected,
                 commit.next_request_json.as_ref(),
                 "agent rejection continuation request JSON",
             )?;
+            let deployment_unavailable =
+                agent.deployment_manifest_digest.is_none() && continuation_request.is_some();
+            if deployment_unavailable {
+                // This is a review settlement, not a claim checkpoint. Reuse
+                // the v18-compatible continuation terminal class so the
+                // waiting_approval -> rejected trigger remains valid, while
+                // retaining the precise deployment error in last_error_json.
+                settled = reduce(&settled, WorkflowCommand::ContinuationUnavailable)
+                    .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?
+                    .into_state();
+                continuation_request = None;
+            }
             let continuation_unavailable =
                 settled.terminal_reason() == Some(TerminalReason::ContinuationUnavailable);
-            let terminal_error = (settled.status() == WorkflowStatus::Failed)
-                .then(|| workflow_terminal_error(&settled));
+            let terminal_error = (settled.status() == WorkflowStatus::Failed).then(|| {
+                if deployment_unavailable {
+                    deployment_unavailable_error(
+                        "the legacy Agent has no deployment manifest for a rejection continuation",
+                    )
+                } else {
+                    workflow_terminal_error(&settled)
+                }
+            });
             update_agent_workflow(
                 &transaction,
                 &mut agent,
@@ -2075,7 +2260,9 @@ fn review_agent_tool_for_actor(
                 terminal_completion = Some(interrupt_agent_turn(
                     &transaction,
                     &agent,
-                    if continuation_unavailable {
+                    if deployment_unavailable {
+                        "agent deployment is unavailable for a rejection continuation"
+                    } else if continuation_unavailable {
                         "agent rejection is known but its model continuation is unavailable"
                     } else {
                         "agent loop reached its model or tool-result limit after rejection"
@@ -2270,6 +2457,461 @@ fn recover_started_agent_work(
     Ok(recovered)
 }
 
+fn validate_manifest_envelope(
+    manifest: &ManifestEnvelope,
+    field: &'static str,
+) -> Result<(), StorageError> {
+    manifest.validate().map_err(|error| {
+        StorageError::InvalidAgentTransition(format!("{field} is invalid: {error}"))
+    })?;
+    let bytes = manifest.canonical_json_bytes().map_err(|error| {
+        StorageError::InvalidAgentTransition(format!("{field} cannot be canonicalized: {error}"))
+    })?;
+    if bytes.len() > AGENT_DEPLOYMENT_MANIFEST_MAX_BYTES {
+        return Err(StorageError::InvalidAgentTransition(format!(
+            "{field} canonical envelope cannot exceed {AGENT_DEPLOYMENT_MANIFEST_MAX_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn require_manifest_matches_agent_spec(spec: &AgentTurnSpec) -> Result<(), StorageError> {
+    let manifest_spec = &spec.manifest.manifest.deployment.spec;
+    let expected_reply_kind = if spec.model_name.is_some() {
+        AssistantReplyKind::Model
+    } else {
+        AssistantReplyKind::NonModelFallback
+    };
+    if manifest_spec.environment != spec.environment
+        || manifest_spec.provider.provider_id != spec.provider_name
+        || manifest_spec.provider.model != spec.model_name
+        || manifest_spec.provider.reply_kind != expected_reply_kind
+        || manifest_spec.workflow_schema_version != workflows::STATE_SCHEMA_VERSION
+        || manifest_spec.loop_limits != workflows::Limits::default()
+    {
+        return Err(StorageError::InvalidAgentTransition(
+            "Agent inputs disagree with the deployment manifest identity or fixed workflow limits"
+                .into(),
+        ));
+    }
+    if manifest_spec
+        .tools
+        .iter()
+        .any(|tool| tool.executor_status != ToolExecutorStatus::Available)
+    {
+        return Err(StorageError::InvalidAgentTransition(
+            "every provider-visible manifest tool must have an available executor".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_request_tools_match_manifest(
+    request_json: &Value,
+    manifest: &ManifestEnvelope,
+) -> Result<(), StorageError> {
+    let request = request_json.as_object().ok_or_else(|| {
+        StorageError::InvalidAgentTransition("agent model request must be an object".into())
+    })?;
+    let tools = match request.get("tools") {
+        None => &[][..],
+        Some(Value::Array(tools)) => tools.as_slice(),
+        Some(_) => {
+            return Err(StorageError::InvalidAgentTransition(
+                "agent model request tools must be an array".into(),
+            ));
+        }
+    };
+    let manifest_tools = &manifest.manifest.deployment.spec.tools;
+    if tools.len() != manifest_tools.len() {
+        return Err(StorageError::InvalidAgentTransition(
+            "agent model request tools do not match the deployment manifest".into(),
+        ));
+    }
+    for (request_tool, manifest_tool) in tools.iter().zip(manifest_tools) {
+        if manifest_tool.executor_status != ToolExecutorStatus::Available {
+            return Err(StorageError::InvalidAgentTransition(
+                "an unavailable manifest tool cannot be exposed to a provider".into(),
+            ));
+        }
+        let expected = json!({
+            "name": manifest_tool.name,
+            "description": manifest_tool.description,
+            "parameters": manifest_tool.input_schema,
+        });
+        if request_tool != &expected {
+            return Err(StorageError::InvalidAgentTransition(format!(
+                "provider-visible tool `{}` disagrees with the deployment manifest",
+                manifest_tool.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn canonical_manifest_json(manifest: &ManifestEnvelope) -> Result<String, StorageError> {
+    validate_manifest_envelope(manifest, "Agent deployment manifest")?;
+    String::from_utf8(manifest.canonical_json_bytes().map_err(|error| {
+        StorageError::InvalidAgentTransition(format!(
+            "Agent deployment manifest cannot be canonicalized: {error}"
+        ))
+    })?)
+    .map_err(|error| {
+        StorageError::InvalidAgentTransition(format!(
+            "Agent deployment manifest canonical JSON is not UTF-8: {error}"
+        ))
+    })
+}
+
+fn persist_agent_deployment_manifest(
+    connection: &Connection,
+    manifest: &ManifestEnvelope,
+    created_at: &str,
+) -> Result<(), StorageError> {
+    let canonical_json = canonical_manifest_json(manifest)?;
+    connection.execute(
+        r#"INSERT OR IGNORE INTO agent_deployment_manifests(
+               digest, schema_version, envelope_json, created_at
+           ) VALUES (?1, ?2, ?3, ?4)"#,
+        params![
+            manifest.digest,
+            i64::from(manifest.schema_version),
+            canonical_json,
+            created_at,
+        ],
+    )?;
+    let stored = connection
+        .query_row(
+            r#"SELECT schema_version, envelope_json
+               FROM agent_deployment_manifests WHERE digest = ?1"#,
+            [&manifest.digest],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((stored_schema_version, stored_json)) = stored else {
+        return Err(StorageError::CorruptData(
+            "Agent deployment manifest insert did not create a durable row".into(),
+        ));
+    };
+    if stored_schema_version != i64::from(manifest.schema_version) || stored_json != canonical_json
+    {
+        return Err(StorageError::CorruptData(
+            "Agent deployment manifest digest collides with different durable content".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn decode_agent_deployment_manifest(
+    digest: &str,
+    schema_version: i64,
+    envelope_json: &str,
+) -> Result<ManifestEnvelope, StorageError> {
+    if envelope_json.len() > AGENT_DEPLOYMENT_MANIFEST_MAX_BYTES {
+        return Err(StorageError::CorruptData(
+            "stored Agent deployment manifest exceeds its canonical byte limit".into(),
+        ));
+    }
+    let manifest =
+        ManifestEnvelope::from_json_slice(envelope_json.as_bytes()).map_err(|error| {
+            StorageError::CorruptData(format!("invalid stored Agent deployment manifest: {error}"))
+        })?;
+    let canonical = manifest.canonical_json_bytes().map_err(|error| {
+        StorageError::CorruptData(format!(
+            "stored Agent deployment manifest cannot be canonicalized: {error}"
+        ))
+    })?;
+    if manifest.digest != digest
+        || i64::from(manifest.schema_version) != schema_version
+        || canonical.as_slice() != envelope_json.as_bytes()
+    {
+        return Err(StorageError::CorruptData(
+            "stored Agent deployment manifest digest, schema, or canonical JSON disagrees".into(),
+        ));
+    }
+    Ok(manifest)
+}
+
+fn query_agent_deployment_manifest(
+    connection: &Connection,
+    digest: &str,
+) -> Result<ManifestEnvelope, StorageError> {
+    let stored = connection
+        .query_row(
+            r#"SELECT schema_version, envelope_json
+               FROM agent_deployment_manifests WHERE digest = ?1"#,
+            [digest],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((schema_version, envelope_json)) = stored else {
+        return Err(StorageError::CorruptData(format!(
+            "Agent deployment manifest `{digest}` is missing"
+        )));
+    };
+    decode_agent_deployment_manifest(digest, schema_version, &envelope_json)
+}
+
+fn require_manifest_matches_runtime_identity(
+    connection: &Connection,
+    manifest: &ManifestEnvelope,
+) -> Result<(), StorageError> {
+    let runtime = connection
+        .query_row(
+            r#"SELECT profile, environment, policy_id, policy_revision
+               FROM runtime_identity WHERE singleton = 1"#,
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((profile, environment, policy_id, policy_revision)) = runtime else {
+        return Err(StorageError::InvalidAgentTransition(
+            "runtime identity must be bound before an Agent deployment can be used".into(),
+        ));
+    };
+    let spec = &manifest.manifest.deployment.spec;
+    if spec.profile != profile
+        || spec.environment != environment
+        || spec.policy.policy_id != policy_id
+        || spec.policy.revision != policy_revision
+    {
+        return Err(StorageError::InvalidAgentTransition(
+            "Agent deployment manifest disagrees with the immutable runtime identity".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_manifest_matches_agent_identity(
+    connection: &Connection,
+    manifest: &ManifestEnvelope,
+    agent: &AgentTurn,
+) -> Result<(), StorageError> {
+    require_manifest_matches_runtime_identity(connection, manifest)?;
+    let spec = &manifest.manifest.deployment.spec;
+    let expected_reply_kind = if agent.model_name.is_some() {
+        AssistantReplyKind::Model
+    } else {
+        AssistantReplyKind::NonModelFallback
+    };
+    if agent.deployment_manifest_digest.as_deref() != Some(manifest.digest.as_str())
+        || agent.environment != spec.environment
+        || agent.provider_name != spec.provider.provider_id
+        || agent.model_name != spec.provider.model
+        || spec.provider.reply_kind != expected_reply_kind
+        || agent.workflow_state.schema_version() != spec.workflow_schema_version
+        || agent.workflow_state.limits() != &spec.loop_limits
+        || spec.loop_limits != workflows::Limits::default()
+        || spec
+            .tools
+            .iter()
+            .any(|tool| tool.executor_status != ToolExecutorStatus::Available)
+    {
+        return Err(StorageError::InvalidAgentTransition(
+            "Agent projection disagrees with its deployment manifest".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_model_job_matches_manifest(
+    job: &AgentModelJob,
+    manifest: &ManifestEnvelope,
+) -> Result<(), StorageError> {
+    let spec = &manifest.manifest.deployment.spec;
+    if job.provider_name != spec.provider.provider_id || job.model_name != spec.provider.model {
+        return Err(StorageError::InvalidAgentTransition(
+            "Agent model job provider disagrees with its deployment manifest".into(),
+        ));
+    }
+    validate_request_tools_match_manifest(&job.request_json, manifest)
+}
+
+fn require_tool_call_matches_manifest(
+    call: &AgentToolCall,
+    manifest: &ManifestEnvelope,
+) -> Result<(), StorageError> {
+    let spec = &manifest.manifest.deployment.spec;
+    let tool = spec
+        .tools
+        .iter()
+        .find(|tool| tool.name == call.tool_name)
+        .ok_or_else(|| {
+            StorageError::InvalidAgentTransition(format!(
+                "Agent tool `{}` is absent from its deployment manifest",
+                call.tool_name
+            ))
+        })?;
+    if call.tool_version != tool.version
+        || call.effect != tool.effect
+        || call.sandbox_profile != tool.sandbox_profile
+        || call.executor_status != ToolExecutorStatus::Available
+        || tool.executor_status != ToolExecutorStatus::Available
+        || call.policy_revision != spec.policy.revision
+    {
+        return Err(StorageError::InvalidAgentTransition(format!(
+            "Agent tool `{}` disagrees with its deployment manifest or policy revision",
+            call.tool_name
+        )));
+    }
+    Ok(())
+}
+
+fn require_tool_spec_matches_manifest(
+    call: &AgentToolCallSpec,
+    manifest: &ManifestEnvelope,
+) -> Result<(), StorageError> {
+    let spec = &manifest.manifest.deployment.spec;
+    let tool = spec
+        .tools
+        .iter()
+        .find(|tool| tool.name == call.tool_name)
+        .ok_or_else(|| {
+            StorageError::InvalidAgentTransition(format!(
+                "Agent tool `{}` is absent from its deployment manifest",
+                call.tool_name
+            ))
+        })?;
+    if call.tool_version != tool.version
+        || call.effect != tool.effect
+        || call.sandbox_profile != tool.sandbox_profile
+        || call.executor_status != ToolExecutorStatus::Available
+        || tool.executor_status != ToolExecutorStatus::Available
+        || call.policy_revision != spec.policy.revision
+    {
+        return Err(StorageError::InvalidAgentTransition(format!(
+            "Agent tool `{}` disagrees with its deployment manifest or policy revision",
+            call.tool_name
+        )));
+    }
+    Ok(())
+}
+
+fn agent_deployment_matches_current(
+    connection: &Connection,
+    agent: &AgentTurn,
+    job: Option<&AgentModelJob>,
+    call: Option<&AgentToolCall>,
+    current_manifest: &ManifestEnvelope,
+) -> Result<bool, StorageError> {
+    let Some(digest) = agent.deployment_manifest_digest.as_deref() else {
+        return Ok(false);
+    };
+    if digest != current_manifest.digest {
+        return Ok(false);
+    }
+    let persisted = match query_agent_deployment_manifest(connection, digest) {
+        Ok(manifest) => manifest,
+        Err(StorageError::Sqlite(error)) => return Err(StorageError::Sqlite(error)),
+        Err(_) => return Ok(false),
+    };
+    if persisted != *current_manifest {
+        return Ok(false);
+    }
+    if require_manifest_matches_agent_identity(connection, &persisted, agent).is_err() {
+        return Ok(false);
+    }
+    if let Some(job) = job
+        && require_model_job_matches_manifest(job, &persisted).is_err()
+    {
+        return Ok(false);
+    }
+    if let Some(call) = call
+        && require_tool_call_matches_manifest(call, &persisted).is_err()
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn deployment_unavailable_error(message: &str) -> Value {
+    json!({
+        "code": "deployment_unavailable",
+        "message": message,
+    })
+}
+
+pub(super) fn verify_agent_deployment_manifest_integrity(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    {
+        let mut statement = connection.prepare(
+            r#"SELECT digest, schema_version, envelope_json
+               FROM agent_deployment_manifests ORDER BY digest"#,
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (digest, schema_version, envelope_json) = row?;
+            decode_agent_deployment_manifest(&digest, schema_version, &envelope_json)?;
+        }
+    }
+
+    let agent_ids = {
+        let mut statement = connection.prepare(
+            r#"SELECT id FROM agent_turns
+               WHERE deployment_manifest_digest IS NOT NULL ORDER BY id"#,
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for agent_id in agent_ids {
+        let agent = query_agent_turn(connection, &agent_id)?;
+        let digest = agent.deployment_manifest_digest.as_deref().ok_or_else(|| {
+            StorageError::CorruptData(
+                "bound Agent lost its deployment manifest digest during verification".into(),
+            )
+        })?;
+        let manifest = query_agent_deployment_manifest(connection, digest)?;
+        require_manifest_matches_agent_identity(connection, &manifest, &agent).map_err(
+            |error| {
+                StorageError::CorruptData(format!(
+                    "Agent deployment identity binding is inconsistent: {error}"
+                ))
+            },
+        )?;
+
+        let jobs = {
+            let mut statement = connection.prepare(&format!(
+                "{} WHERE agent_id = ?1 ORDER BY step",
+                model_job_select()
+            ))?;
+            statement
+                .query_map([&agent.id], decode_agent_model_job_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for job in jobs {
+            let job = job.decode()?;
+            require_model_job_matches_manifest(&job, &manifest).map_err(|error| {
+                StorageError::CorruptData(format!(
+                    "Agent model job deployment binding is inconsistent: {error}"
+                ))
+            })?;
+        }
+        for call in query_agent_tool_calls(connection, &agent.id)? {
+            require_tool_call_matches_manifest(&call, &manifest).map_err(|error| {
+                StorageError::CorruptData(format!(
+                    "Agent tool deployment binding is inconsistent: {error}"
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn validate_agent_turn_spec(spec: &AgentTurnSpec) -> Result<(), StorageError> {
     normalized_reply_value(&spec.id, "agent turn ID")?;
     if spec.id.len() > AGENT_ID_MAX_BYTES {
@@ -2294,7 +2936,11 @@ pub(super) fn validate_agent_turn_spec(spec: &AgentTurnSpec) -> Result<(), Stora
         "agent model request JSON",
         AGENT_REQUEST_JSON_MAX_BYTES,
     )?;
-    WorkflowState::default()
+    validate_manifest_envelope(&spec.manifest, "Agent deployment manifest")?;
+    require_manifest_matches_agent_spec(spec)?;
+    validate_request_tools_match_manifest(&spec.request_json, &spec.manifest)?;
+    WorkflowState::new(spec.manifest.manifest.deployment.spec.loop_limits.clone())
+        .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?
         .validate()
         .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
     Ok(())
@@ -2313,6 +2959,7 @@ pub(super) fn agent_start_fingerprint(
             "environment": spec.environment,
             "provider_name": spec.provider_name,
             "model_name": spec.model_name,
+            "deployment_manifest_digest": spec.manifest.digest,
         },
     }))?)
 }
@@ -2329,6 +2976,7 @@ pub(super) fn require_agent_matches_spec(
         || agent.environment != spec.environment
         || agent.provider_name != spec.provider_name
         || agent.model_name != spec.model_name
+        || agent.deployment_manifest_digest.as_deref() != Some(spec.manifest.digest.as_str())
     {
         return Err(StorageError::IdempotencyConflict);
     }
@@ -2343,17 +2991,22 @@ pub(super) fn insert_agent_turn(
     queued_at: &str,
 ) -> Result<(AgentTurn, AgentModelJob), StorageError> {
     validate_agent_turn_spec(spec)?;
-    let workflow_state = WorkflowState::default();
+    require_manifest_matches_runtime_identity(connection, &spec.manifest)?;
+    persist_agent_deployment_manifest(connection, &spec.manifest, queued_at)?;
+    let workflow_state =
+        WorkflowState::new(spec.manifest.manifest.deployment.spec.loop_limits.clone())
+            .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
     connection.execute(
         r#"INSERT INTO agent_turns(
                id, account_id, actor_user_id, actor_membership_revision,
-               session_id, turn_id, environment, provider_name, model_name,
+               session_id, turn_id, deployment_manifest_digest,
+               environment, provider_name, model_name,
                status, model_steps, tool_calls, tool_result_bytes, revision,
                pending_call_id, workflow_state_json, last_error_json,
                created_at, updated_at, completed_at
            ) VALUES (
-               ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
-               'waiting_model', 0, 0, 0, 1, NULL, ?10, NULL, ?11, ?11, NULL
+               ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+               'waiting_model', 0, 0, 0, 1, NULL, ?11, NULL, ?12, ?12, NULL
            )"#,
         params![
             spec.id,
@@ -2365,6 +3018,7 @@ pub(super) fn insert_agent_turn(
             )?,
             session_id,
             turn_id,
+            spec.manifest.digest,
             spec.environment,
             spec.provider_name,
             spec.model_name,
@@ -2665,14 +3319,20 @@ fn replay_agent_tool_completion(
             "agent tool completion conflicts with its durable terminal state".into(),
         ));
     }
+    let durable_next_request = query_agent_tool_completion_next_request(connection, &call.call_id)?;
+    if durable_next_request.as_ref() != commit.next_request_json.as_ref() {
+        return Err(StorageError::InvalidAgentTransition(
+            "agent tool replay conflicts with its durable continuation request".into(),
+        ));
+    }
     let next_step = call
         .model_step
         .checked_add(1)
         .ok_or(StorageError::IntegerOutOfRange("agent model step"))?;
     if let Some(job) = query_agent_model_job_optional(connection, &agent.id, next_step)? {
-        if commit.next_request_json.as_ref() != Some(&job.request_json) {
-            return Err(StorageError::InvalidAgentTransition(
-                "agent tool replay conflicts with its durable continuation request".into(),
+        if durable_next_request.as_ref() != Some(&job.request_json) {
+            return Err(StorageError::CorruptData(
+                "agent tool completion request does not match its durable continuation job".into(),
             ));
         }
         Ok(AgentToolCompletion::ModelQueued {
@@ -2688,6 +3348,33 @@ fn replay_agent_tool_completion(
             "terminal agent tool result has no continuation model job".into(),
         ))
     }
+}
+
+fn query_agent_tool_completion_next_request(
+    connection: &Connection,
+    call_id: &str,
+) -> Result<Option<Value>, StorageError> {
+    let stored: Option<String> = connection.query_row(
+        r#"SELECT completion_next_request_json
+           FROM agent_tool_calls WHERE call_id = ?1"#,
+        [call_id],
+        |row| row.get(0),
+    )?;
+    let Some(stored) = stored else {
+        return Err(StorageError::InvalidAgentTransition(
+            "agent tool replay cannot verify its durable continuation request".into(),
+        ));
+    };
+    let request: Value = serde_json::from_str(&stored)?;
+    if request.is_null() {
+        return Ok(None);
+    }
+    if !request.is_object() {
+        return Err(StorageError::CorruptData(
+            "stored agent tool completion request must be an object or null".into(),
+        ));
+    }
+    Ok(Some(request))
 }
 
 fn update_agent_workflow(
@@ -2822,7 +3509,8 @@ fn interrupt_agent_turn(
 
 fn agent_turn_select() -> &'static str {
     r#"SELECT id, account_id, actor_user_id, actor_membership_revision,
-              session_id, turn_id, environment, provider_name, model_name,
+              session_id, turn_id, deployment_manifest_digest,
+              environment, provider_name, model_name,
               status, model_steps, tool_calls, tool_result_bytes, revision,
               pending_call_id, workflow_state_json, last_error_json,
               created_at, updated_at, completed_at
@@ -2844,6 +3532,7 @@ struct StoredAgentTurnRow {
     actor_membership_revision: i64,
     session_id: String,
     turn_id: String,
+    deployment_manifest_digest: Option<String>,
     environment: String,
     provider_name: String,
     model_name: Option<String>,
@@ -2896,6 +3585,7 @@ impl StoredAgentTurnRow {
             })?,
             session_id: self.session_id,
             turn_id: self.turn_id,
+            deployment_manifest_digest: self.deployment_manifest_digest,
             environment: self.environment,
             provider_name: self.provider_name,
             model_name: self.model_name,
@@ -2927,20 +3617,21 @@ fn decode_agent_turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAgen
         actor_membership_revision: row.get(3)?,
         session_id: row.get(4)?,
         turn_id: row.get(5)?,
-        environment: row.get(6)?,
-        provider_name: row.get(7)?,
-        model_name: row.get(8)?,
-        status: row.get(9)?,
-        model_steps: row.get(10)?,
-        tool_calls: row.get(11)?,
-        tool_result_bytes: row.get(12)?,
-        revision: row.get(13)?,
-        pending_call_id: row.get(14)?,
-        workflow_state_json: row.get(15)?,
-        last_error_json: row.get(16)?,
-        created_at: row.get(17)?,
-        updated_at: row.get(18)?,
-        completed_at: row.get(19)?,
+        deployment_manifest_digest: row.get(6)?,
+        environment: row.get(7)?,
+        provider_name: row.get(8)?,
+        model_name: row.get(9)?,
+        status: row.get(10)?,
+        model_steps: row.get(11)?,
+        tool_calls: row.get(12)?,
+        tool_result_bytes: row.get(13)?,
+        revision: row.get(14)?,
+        pending_call_id: row.get(15)?,
+        workflow_state_json: row.get(16)?,
+        last_error_json: row.get(17)?,
+        created_at: row.get(18)?,
+        updated_at: row.get(19)?,
+        completed_at: row.get(20)?,
     })
 }
 

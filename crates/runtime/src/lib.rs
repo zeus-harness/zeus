@@ -20,18 +20,21 @@ use std::{
 use authz::{PolicyBuildError, PolicyContext, PolicyEngine, PolicyEvaluation, PolicyRule};
 use chrono::{SecondsFormat, Utc};
 use connectors::{ConnectorConfigError, LOCAL_DEV_ENVIRONMENT, register_local_dev_connectors};
+pub use deployment::ManifestEnvelope;
+use deployment::{AgentDeployment, AgentSpec, ManifestPolicy, ManifestProvider, ManifestTool};
 use kernel::{
     DemoScenario, KernelError, LOCAL_POLICY_REVISION, PRODUCTION_POLICY_REVISION, apply_review,
     apply_tool_result, start_tool_dispatch,
 };
 use protocol::{
-    Approval, ApprovalStatus, AttachRunRequest, AttachRunResponse, CreateSessionRequest,
-    CreateSessionResponse, EVENT_PAGE_DEFAULT_LIMIT, FlushSessionRequest, FlushSessionResponse,
-    NotDispatchedReason, OverviewResponse, PolicyDecision, ResourceEnvelopeError,
-    ResumeSessionRequest, ResumeSessionResponse, ReviewDecision, ReviewRequest, ReviewResponse,
-    RunDetail, RunDetailPagination, RunEvent, RunEventData, RunEventPage, RunSummary,
-    SessionDetail, SessionEvent, SessionEventData, SessionEventPage, SessionSummary, SessionTurn,
-    StartTurnRequest, StartTurnResponse, ToolCall, ToolExecutorStatus, ToolOutcome,
+    Approval, ApprovalStatus, AssistantReplyKind, AttachRunRequest, AttachRunResponse,
+    CreateSessionRequest, CreateSessionResponse, EVENT_PAGE_DEFAULT_LIMIT, FlushSessionRequest,
+    FlushSessionResponse, NotDispatchedReason, OverviewResponse, PolicyDecision,
+    ResourceEnvelopeError, ResumeSessionRequest, ResumeSessionResponse, ReviewDecision,
+    ReviewRequest, ReviewResponse, RunDetail, RunDetailPagination, RunEvent, RunEventData,
+    RunEventPage, RunSummary, SessionDetail, SessionEvent, SessionEventData, SessionEventPage,
+    SessionSummary, SessionTurn, StartTurnRequest, StartTurnResponse, ToolCall, ToolExecutorStatus,
+    ToolOutcome,
 };
 use serde_json::Value;
 pub use storage::{
@@ -66,6 +69,10 @@ use tools::{ExecutorError, RegistryError, ToolRegistry, arguments_digest, stable
 
 const PRODUCTION_POLICY_ID: &str = "production-guarded";
 const LOCAL_POLICY_ID: &str = "local-development";
+const SESSION_AGENT_SPEC_ID: &str = "zeus-session-agent";
+const SESSION_AGENT_SPEC_REVISION: &str = "1";
+const SESSION_AGENT_DEPLOYMENT_ID_PREFIX: &str = "zeus-session-agent";
+const SESSION_AGENT_DEPLOYMENT_REVISION: &str = "1";
 const INTERNAL_PROGRESS_RETRY_DELAY: Duration = Duration::from_millis(25);
 const WORKER_IDLE: u8 = 0;
 const WORKER_RUNNING: u8 = 1;
@@ -183,6 +190,7 @@ pub struct DemoStore {
     session_publisher: broadcast::Sender<PublishedSessionEvent>,
     policy: Arc<PolicyEngine>,
     registry: Arc<ToolRegistry>,
+    profile_id: Arc<str>,
     environment: Arc<str>,
     policy_id: Arc<str>,
     policy_revision: Arc<str>,
@@ -661,12 +669,13 @@ impl DemoStore {
         auto_dispatch: bool,
     ) -> Result<Self, StoreError> {
         let components = RuntimeComponents::build(profile)?;
+        let profile_id = components.profile_id;
         let primary_session_id = components.primary_session_id;
         let primary_run_id = components.scenario.run.id.clone();
         let environment = components.scenario.run.environment.clone();
         storage
             .bind_runtime_identity(RuntimeIdentity {
-                profile: components.profile_id.into(),
+                profile: profile_id.into(),
                 environment: environment.clone(),
                 primary_session_id: primary_session_id.into(),
                 primary_run_id: primary_run_id.clone(),
@@ -708,6 +717,7 @@ impl DemoStore {
             session_publisher,
             policy: Arc::new(components.policy),
             registry: Arc::new(components.registry),
+            profile_id: Arc::from(profile_id),
             environment: Arc::from(environment),
             policy_id: Arc::from(components.policy_id),
             policy_revision: Arc::from(components.policy_revision),
@@ -740,14 +750,138 @@ impl DemoStore {
     pub fn session_agent_tool_definitions(
         &self,
     ) -> Result<Vec<SessionAgentToolDefinition>, StoreError> {
+        Ok(self
+            .session_agent_manifest_tools()?
+            .into_iter()
+            .map(|tool| SessionAgentToolDefinition {
+                name: tool.name,
+                description: tool.description,
+                input_schema: tool.input_schema,
+            })
+            .collect())
+    }
+
+    /// Build the validated, secret-free deployment manifest for this runtime.
+    ///
+    /// `provider_id` must already be the provider's stable non-secret identity;
+    /// endpoints, API keys, and resolved credentials have no manifest field.
+    pub fn session_agent_manifest(
+        &self,
+        provider_id: impl Into<String>,
+        model: Option<String>,
+        reply_kind: AssistantReplyKind,
+    ) -> Result<ManifestEnvelope, StoreError> {
+        let provider = ManifestProvider::new(provider_id, model, reply_kind)
+            .map_err(invalid_deployment_manifest)?;
+        let policy = ManifestPolicy::new(
+            self.policy_id.as_ref().to_owned(),
+            self.policy_revision.as_ref().to_owned(),
+        )
+        .map_err(invalid_deployment_manifest)?;
+        let spec = AgentSpec::new(
+            SESSION_AGENT_SPEC_ID,
+            SESSION_AGENT_SPEC_REVISION,
+            self.profile_id.as_ref(),
+            self.environment.as_ref(),
+            provider,
+            policy,
+        )
+        .map_err(invalid_deployment_manifest)?
+        .with_workflow(
+            workflows::STATE_SCHEMA_VERSION,
+            workflows::Limits::default(),
+        )
+        .map_err(invalid_deployment_manifest)?
+        .with_tools(self.session_agent_manifest_tools()?)
+        .map_err(invalid_deployment_manifest)?;
+        let deployment = AgentDeployment::new(
+            format!("{SESSION_AGENT_DEPLOYMENT_ID_PREFIX}-{}", self.profile_id),
+            SESSION_AGENT_DEPLOYMENT_REVISION,
+            spec,
+        )
+        .map_err(invalid_deployment_manifest)?;
+        ManifestEnvelope::from_deployment(deployment).map_err(invalid_deployment_manifest)
+    }
+
+    /// Validate that a caller-supplied manifest is exactly the deployment
+    /// resolved by this runtime for one Session Agent model provider.
+    ///
+    /// The explicit binding checks make configuration drift diagnosable. The
+    /// final equality check also rejects otherwise-valid substitutions of
+    /// deployment identity, workflow limits, prompt binding, or tool contract.
+    fn validate_session_agent_manifest_binding(
+        &self,
+        manifest: &ManifestEnvelope,
+        provider_id: &str,
+        model: Option<&str>,
+    ) -> Result<(), StoreError> {
+        manifest
+            .validate()
+            .map_err(invalid_agent_deployment_manifest)?;
+        let spec = &manifest.manifest.deployment.spec;
+
+        if spec.profile != self.profile_id.as_ref() {
+            return Err(StoreError::InvalidAgentTransition(
+                "the Agent deployment profile does not match the bound runtime".into(),
+            ));
+        }
+        if spec.environment != self.environment.as_ref() {
+            return Err(StoreError::InvalidAgentTransition(
+                "the Agent deployment environment does not match the bound runtime".into(),
+            ));
+        }
+        if spec.policy.policy_id != self.policy_id.as_ref()
+            || spec.policy.revision != self.policy_revision.as_ref()
+        {
+            return Err(StoreError::InvalidAgentTransition(
+                "the Agent deployment policy does not match the bound runtime".into(),
+            ));
+        }
+        if spec.provider.provider_id != provider_id {
+            return Err(StoreError::InvalidAgentTransition(
+                "the Agent deployment provider does not match the Agent turn".into(),
+            ));
+        }
+        if spec.provider.model.as_deref() != model {
+            return Err(StoreError::InvalidAgentTransition(
+                "the Agent deployment model does not match the Agent turn".into(),
+            ));
+        }
+
+        let expected = self
+            .session_agent_manifest(
+                provider_id.to_owned(),
+                model.map(str::to_owned),
+                spec.provider.reply_kind.clone(),
+            )
+            .map_err(|error| {
+                StoreError::ExecutionInvariant(format!(
+                    "the runtime could not resolve its current Agent deployment manifest: {error}"
+                ))
+            })?;
+        if manifest != &expected {
+            return Err(StoreError::InvalidAgentTransition(
+                "the Agent deployment manifest does not match the runtime-resolved deployment"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn session_agent_manifest_tools(&self) -> Result<Vec<ManifestTool>, StoreError> {
         self.registry
             .descriptors()
             .map(|descriptor| {
-                Ok(SessionAgentToolDefinition {
-                    name: descriptor.name.clone(),
-                    description: descriptor.description.clone(),
-                    input_schema: descriptor.input_schema.provider_json_schema()?,
-                })
+                ManifestTool::new(
+                    descriptor.name.clone(),
+                    descriptor.version.clone(),
+                    descriptor.description.clone(),
+                    descriptor.input_schema.provider_json_schema()?,
+                    descriptor.effect.clone(),
+                    descriptor.sandbox_profile.clone(),
+                    ToolExecutorStatus::Available,
+                )
+                .map_err(invalid_deployment_manifest)
             })
             .collect()
     }
@@ -1544,6 +1678,11 @@ impl DemoStore {
                 "the Agent environment does not match the bound runtime".into(),
             ));
         }
+        self.validate_session_agent_manifest_binding(
+            &agent.manifest,
+            &agent.provider_name,
+            agent.model_name.as_deref(),
+        )?;
         let idempotency_key = normalized_idempotency_key(idempotency_key)?;
         let response = self
             .storage
@@ -1563,10 +1702,19 @@ impl DemoStore {
 
     /// Durable model-worker claim façade. Storage revalidates the persisted
     /// initiator before a provider may observe the returned request.
-    pub async fn claim_next_agent_model(&self) -> Result<AgentModelClaimOutcome, StoreError> {
+    pub async fn claim_next_agent_model(
+        &self,
+        manifest: &ManifestEnvelope,
+    ) -> Result<AgentModelClaimOutcome, StoreError> {
+        let provider = &manifest.manifest.deployment.spec.provider;
+        self.validate_session_agent_manifest_binding(
+            manifest,
+            &provider.provider_id,
+            provider.model.as_deref(),
+        )?;
         loop {
             match retry_operation_capacity(|| async {
-                Ok(self.storage.claim_next_agent_model().await?)
+                Ok(self.storage.claim_next_agent_model(manifest).await?)
             })
             .await?
             {
@@ -1633,10 +1781,19 @@ impl DemoStore {
 
     /// Durable tool-worker claim façade. A rejected claim has already
     /// terminalized its Session, so it is published and skipped locally.
-    pub async fn claim_next_agent_tool(&self) -> Result<AgentToolClaimOutcome, StoreError> {
+    pub async fn claim_next_agent_tool(
+        &self,
+        manifest: &ManifestEnvelope,
+    ) -> Result<AgentToolClaimOutcome, StoreError> {
+        let provider = &manifest.manifest.deployment.spec.provider;
+        self.validate_session_agent_manifest_binding(
+            manifest,
+            &provider.provider_id,
+            provider.model.as_deref(),
+        )?;
         loop {
             match retry_operation_capacity(|| async {
-                Ok(self.storage.claim_next_agent_tool().await?)
+                Ok(self.storage.claim_next_agent_tool(manifest).await?)
             })
             .await?
             {
@@ -1701,6 +1858,35 @@ impl DemoStore {
             .storage
             .agent_turn_detail_for_actor(context, session_id, turn_id)
             .await?)
+    }
+
+    /// Return the immutable deployment manifest bound to an authenticated
+    /// Session Agent turn. Storage performs the account-scoped authorization;
+    /// runtime treats an invalid persisted envelope as an invariant failure.
+    pub async fn agent_deployment_manifest_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<ManifestEnvelope>, StoreError> {
+        validate_durable_reference(session_id, "session ID")?;
+        validate_durable_reference(turn_id, "turn ID")?;
+        let manifest = self
+            .storage
+            .agent_deployment_manifest_for_actor(context, session_id, turn_id)
+            .await
+            .map_err(|error| match error {
+                StorageError::CorruptData(detail) => StoreError::ExecutionInvariant(detail),
+                other => StoreError::from(other),
+            })?;
+        if let Some(manifest) = &manifest {
+            manifest.validate().map_err(|error| {
+                StoreError::ExecutionInvariant(format!(
+                    "invalid persisted Session Agent deployment manifest: {error}"
+                ))
+            })?;
+        }
+        Ok(manifest)
     }
 
     /// Load the server-owned transcript required to derive an approval
@@ -2748,6 +2934,16 @@ fn invalid_resource_envelope(field: &'static str, error: ResourceEnvelopeError) 
     StoreError::InvalidSessionRequest(format!("{field} {error}"))
 }
 
+fn invalid_deployment_manifest(error: deployment::ManifestError) -> StoreError {
+    StoreError::ExecutionInvariant(format!(
+        "invalid session Agent deployment manifest: {error}"
+    ))
+}
+
+fn invalid_agent_deployment_manifest(error: deployment::ManifestError) -> StoreError {
+    StoreError::InvalidAgentTransition(format!("invalid Agent deployment manifest: {error}"))
+}
+
 fn validate_session_sequence(value: u64, field: &'static str) -> Result<(), StoreError> {
     if i64::try_from(value).is_err() {
         Err(StoreError::InvalidSessionRequest(format!(
@@ -2875,6 +3071,39 @@ mod tests {
         }
     }
 
+    fn manifest_with_spec_mutation(
+        manifest: &ManifestEnvelope,
+        mutate: impl FnOnce(&mut AgentSpec),
+    ) -> ManifestEnvelope {
+        let mut changed = manifest.manifest.clone();
+        mutate(&mut changed.deployment.spec);
+        ManifestEnvelope::new(changed).unwrap()
+    }
+
+    fn agent_request_for_manifest(manifest: &ManifestEnvelope, content: &str) -> Value {
+        let tools = manifest
+            .manifest
+            .deployment
+            .spec
+            .tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.input_schema,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": content,
+            }],
+            "tools": tools,
+        })
+    }
+
     #[tokio::test]
     async fn session_agent_tool_definitions_expose_only_provider_contracts() {
         let paths = TestPaths::new("agent-tool-definitions");
@@ -2910,11 +3139,349 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_agent_manifest_is_stable_and_secret_free() {
+        let paths = TestPaths::new("agent-manifest-stable");
+        let store = local_store(&paths, false).await;
+
+        let first = store
+            .session_agent_manifest(
+                "openai-compatible:route-v1",
+                Some("deepseek-chat".into()),
+                AssistantReplyKind::Model,
+            )
+            .unwrap();
+        let second = store
+            .session_agent_manifest(
+                "openai-compatible:route-v1",
+                Some("deepseek-chat".into()),
+                AssistantReplyKind::Model,
+            )
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.digest, first.manifest.digest().unwrap());
+        assert_eq!(
+            first.manifest.deployment.deployment_id,
+            "zeus-session-agent-local-development"
+        );
+        assert_eq!(first.manifest.deployment.revision, "1");
+        assert_eq!(first.manifest.deployment.spec.spec_id, "zeus-session-agent");
+        assert_eq!(first.manifest.deployment.spec.revision, "1");
+        assert_eq!(first.manifest.deployment.spec.profile, "local-development");
+        assert_eq!(
+            first.manifest.deployment.spec.workflow_schema_version,
+            workflows::STATE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            first.manifest.deployment.spec.loop_limits,
+            workflows::Limits::default()
+        );
+
+        let serialized = String::from_utf8(first.canonical_json_bytes().unwrap()).unwrap();
+        for forbidden in ["endpoint", "api_key", "\"secret\"", "secret_value"] {
+            assert!(
+                !serialized.contains(forbidden),
+                "manifest serialized forbidden field {forbidden}"
+            );
+        }
+        let provider = serde_json::to_value(&first.manifest.deployment.spec.provider).unwrap();
+        let provider_keys = provider
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(provider_keys, ["model", "provider_id", "reply_kind"]);
+    }
+
+    #[tokio::test]
+    async fn session_agent_manifest_digest_tracks_profile_tool_and_provider_drift() {
+        let paths = TestPaths::new("agent-manifest-drift");
+        let store = local_store(&paths, false).await;
+        let baseline = store
+            .session_agent_manifest(
+                "openai-compatible:route-v1",
+                Some("deepseek-chat".into()),
+                AssistantReplyKind::Model,
+            )
+            .unwrap();
+
+        let provider_drift = store
+            .session_agent_manifest(
+                "openai-compatible:route-v1",
+                Some("deepseek-reasoner".into()),
+                AssistantReplyKind::Model,
+            )
+            .unwrap();
+        assert_ne!(baseline.digest, provider_drift.digest);
+
+        let mut profile_drift_store = store.clone();
+        profile_drift_store.profile_id = Arc::from("local-development-v2");
+        let profile_drift = profile_drift_store
+            .session_agent_manifest(
+                "openai-compatible:route-v1",
+                Some("deepseek-chat".into()),
+                AssistantReplyKind::Model,
+            )
+            .unwrap();
+        assert_ne!(baseline.digest, profile_drift.digest);
+
+        let mut descriptor = connectors::dev_marker_descriptor();
+        descriptor
+            .description
+            .push_str(" with a changed provider-visible contract");
+        let mut changed_registry = ToolRegistry::new();
+        changed_registry
+            .register(
+                descriptor,
+                RecordingExecutor::new(serde_json::json!({"changed": true})),
+            )
+            .unwrap();
+        let mut tool_drift_store = store.clone();
+        tool_drift_store.registry = Arc::new(changed_registry);
+        let tool_drift = tool_drift_store
+            .session_agent_manifest(
+                "openai-compatible:route-v1",
+                Some("deepseek-chat".into()),
+                AssistantReplyKind::Model,
+            )
+            .unwrap();
+        assert_ne!(baseline.digest, tool_drift.digest);
+    }
+
+    #[tokio::test]
+    async fn session_agent_manifest_tools_match_provider_visible_definitions() {
+        let paths = TestPaths::new("agent-manifest-tool-contract");
+        let store = local_store(&paths, false).await;
+        let definitions = store.session_agent_tool_definitions().unwrap();
+        let envelope = store
+            .session_agent_manifest(
+                "openai-compatible:route-v1",
+                Some("deepseek-chat".into()),
+                AssistantReplyKind::Model,
+            )
+            .unwrap();
+        let tools = &envelope.manifest.deployment.spec.tools;
+
+        assert_eq!(definitions.len(), tools.len());
+        for (definition, tool) in definitions.iter().zip(tools) {
+            assert_eq!(definition.name, tool.name);
+            assert_eq!(definition.description, tool.description);
+            assert_eq!(definition.input_schema, tool.input_schema);
+            assert_eq!(tool.executor_status, ToolExecutorStatus::Available);
+        }
+        assert!(tools.windows(2).all(|pair| pair[0].name < pair[1].name));
+    }
+
+    #[tokio::test]
+    async fn agent_start_rejects_runtime_binding_drift_before_enqueue() {
+        let paths = TestPaths::new("agent-manifest-runtime-binding");
+        let store = local_store(&paths, false).await;
+        let owner = test_authz(TEST_OWNER_ID);
+        let baseline = store
+            .session_agent_manifest(
+                "test-provider",
+                Some("test-model".into()),
+                AssistantReplyKind::Model,
+            )
+            .unwrap();
+        let profile_mismatch = manifest_with_spec_mutation(&baseline, |spec| {
+            spec.profile = "other-profile".into();
+        });
+        let environment_mismatch = manifest_with_spec_mutation(&baseline, |spec| {
+            spec.environment = "other-environment".into();
+        });
+        let policy_mismatch = manifest_with_spec_mutation(&baseline, |spec| {
+            spec.policy.policy_id = "other-policy".into();
+            spec.policy.revision = "2".into();
+        });
+        let tool_contract_mismatch = manifest_with_spec_mutation(&baseline, |spec| {
+            spec.tools[0]
+                .description
+                .push_str(" with a caller-substituted contract");
+        });
+
+        for (label, expected_error, manifest) in [
+            ("profile", "profile", profile_mismatch),
+            ("environment", "environment", environment_mismatch),
+            ("policy", "policy", policy_mismatch),
+            (
+                "tool-contract",
+                "runtime-resolved deployment",
+                tool_contract_mismatch,
+            ),
+        ] {
+            let result = store
+                .start_turn_and_enqueue_agent_for_actor(
+                    &owner,
+                    LOCAL_DEMO_SESSION_ID,
+                    StartTurnRequest {
+                        turn_id: format!("turn-runtime-manifest-{label}"),
+                        user_message: "This invalid deployment must not enqueue.".into(),
+                        expected_sequence: 2,
+                    },
+                    &format!("runtime-manifest-{label}"),
+                    AgentTurnSpec {
+                        id: format!("agent-runtime-manifest-{label}"),
+                        authz: owner.clone(),
+                        environment: LOCAL_DEV_ENVIRONMENT.into(),
+                        provider_name: "test-provider".into(),
+                        model_name: Some("test-model".into()),
+                        request_json: agent_request_for_manifest(
+                            &manifest,
+                            "This invalid deployment must not enqueue.",
+                        ),
+                        manifest,
+                    },
+                )
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(StoreError::InvalidAgentTransition(message))
+                        if message.contains(expected_error)
+                ),
+                "runtime must reject a valid but mismatched {label} manifest"
+            );
+            assert_eq!(
+                store
+                    .get_session_for_actor(
+                        &owner,
+                        LOCAL_DEMO_SESSION_ID,
+                        None,
+                        protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                        None,
+                        protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                        None,
+                        protocol::EVENT_PAGE_DEFAULT_LIMIT,
+                    )
+                    .await
+                    .unwrap()
+                    .session
+                    .sequence,
+                2,
+                "a rejected {label} manifest must not append a Session turn"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn actor_manifest_query_is_account_scoped() {
+        let paths = TestPaths::new("agent-manifest-actor-scope");
+        let store = local_store(&paths, false).await;
+        let owner = test_authz(TEST_OWNER_ID);
+        let manifest = store
+            .session_agent_manifest(
+                "test-provider",
+                Some("test-model".into()),
+                AssistantReplyKind::Model,
+            )
+            .unwrap();
+        let turn_id = "turn-runtime-agent-manifest-scope";
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner,
+                LOCAL_DEMO_SESSION_ID,
+                StartTurnRequest {
+                    turn_id: turn_id.into(),
+                    user_message: "Persist this deployment manifest.".into(),
+                    expected_sequence: 2,
+                },
+                "runtime-agent-manifest-scope",
+                AgentTurnSpec {
+                    id: "agent-runtime-manifest-scope".into(),
+                    authz: owner.clone(),
+                    environment: LOCAL_DEV_ENVIRONMENT.into(),
+                    provider_name: "test-provider".into(),
+                    model_name: Some("test-model".into()),
+                    request_json: agent_request_for_manifest(
+                        &manifest,
+                        "Persist this deployment manifest.",
+                    ),
+                    manifest: manifest.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .agent_deployment_manifest_for_actor(&owner, LOCAL_DEMO_SESSION_ID, turn_id,)
+                .await
+                .unwrap(),
+            Some(manifest)
+        );
+
+        let foreign = install_foreign_owner_authz(&paths.database);
+        assert!(matches!(
+            store
+                .agent_deployment_manifest_for_actor(
+                    &foreign,
+                    LOCAL_DEMO_SESSION_ID,
+                    turn_id,
+                )
+                .await,
+            Err(StoreError::SessionNotFound(session_id))
+                if session_id == LOCAL_DEMO_SESSION_ID
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_model_fallback_manifest_can_enqueue_and_claim() {
+        let paths = TestPaths::new("agent-manifest-non-model-fallback");
+        let store = local_store(&paths, false).await;
+        let owner = test_authz(TEST_OWNER_ID);
+        let manifest = store
+            .session_agent_manifest("local-fallback", None, AssistantReplyKind::NonModelFallback)
+            .unwrap();
+
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner,
+                LOCAL_DEMO_SESSION_ID,
+                StartTurnRequest {
+                    turn_id: "turn-runtime-agent-fallback".into(),
+                    user_message: "Use the bounded non-model fallback.".into(),
+                    expected_sequence: 2,
+                },
+                "runtime-agent-fallback-start",
+                AgentTurnSpec {
+                    id: "agent-runtime-fallback".into(),
+                    authz: owner.clone(),
+                    environment: LOCAL_DEV_ENVIRONMENT.into(),
+                    provider_name: "local-fallback".into(),
+                    model_name: None,
+                    request_json: agent_request_for_manifest(
+                        &manifest,
+                        "Use the bounded non-model fallback.",
+                    ),
+                    manifest: manifest.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let AgentModelClaimOutcome::Claimed(job) =
+            store.claim_next_agent_model(&manifest).await.unwrap()
+        else {
+            panic!("the fallback Agent model step must be claimable");
+        };
+        assert_eq!(job.provider_name, "local-fallback");
+        assert_eq!(job.model_name, None);
+    }
+
+    #[tokio::test]
     async fn replayed_agent_final_completion_is_broadcast_only_once() {
         let paths = TestPaths::new("agent-final-live-replay");
         let store = local_store(&paths, false).await;
         let owner = test_authz(TEST_OWNER_ID);
         let turn_id = "turn-runtime-agent-final";
+        let manifest = store
+            .session_agent_manifest(
+                "test-provider",
+                Some("test-model".into()),
+                AssistantReplyKind::Model,
+            )
+            .unwrap();
         let enqueued = store
             .start_turn_and_enqueue_agent_for_actor(
                 &owner,
@@ -2931,17 +3498,17 @@ mod tests {
                     environment: LOCAL_DEV_ENVIRONMENT.into(),
                     provider_name: "test-provider".into(),
                     model_name: Some("test-model".into()),
-                    request_json: serde_json::json!({
-                        "messages": [{
-                            "role": "user",
-                            "content": "Finish this Agent turn exactly once.",
-                        }],
-                    }),
+                    request_json: agent_request_for_manifest(
+                        &manifest,
+                        "Finish this Agent turn exactly once.",
+                    ),
+                    manifest: manifest.clone(),
                 },
             )
             .await
             .unwrap();
-        let AgentModelClaimOutcome::Claimed(job) = store.claim_next_agent_model().await.unwrap()
+        let AgentModelClaimOutcome::Claimed(job) =
+            store.claim_next_agent_model(&manifest).await.unwrap()
         else {
             panic!("the first runtime Agent model step must be claimable");
         };

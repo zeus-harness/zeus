@@ -26,6 +26,7 @@ use axum::{
     },
     routing::{get, post},
 };
+use deployment::{ManifestDiff, ManifestEnvelope};
 #[cfg(test)]
 use llm::ReplyRole;
 use llm::{
@@ -681,6 +682,17 @@ struct SessionDetailQuery {
     events_limit: Option<usize>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct AgentDeploymentExplainResponse {
+    agent: AgentTurnDetail,
+    persisted_manifest: Option<ManifestEnvelope>,
+    current_manifest: ManifestEnvelope,
+    legacy_unbound: bool,
+    matches_current: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diff: Option<ManifestDiff>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RunDetailQuery {
@@ -745,6 +757,10 @@ fn build_authenticated_app(state: ApiState) -> Router {
         .route(
             "/api/v1/sessions/{id}/turns/{turn_id}/agent",
             get(agent_turn_detail),
+        )
+        .route(
+            "/api/v1/sessions/{id}/turns/{turn_id}/agent/explain",
+            get(agent_deployment_explain),
         )
         .route(
             "/api/v1/sessions/{id}/turns/{turn_id}/approvals/{call_id}/decision",
@@ -873,6 +889,10 @@ fn build_test_app(state: ApiState, request_auth: TestRequestAuth) -> Router {
         .route(
             "/api/v1/sessions/{id}/turns/{turn_id}/agent",
             get(agent_turn_detail),
+        )
+        .route(
+            "/api/v1/sessions/{id}/turns/{turn_id}/agent/explain",
+            get(agent_deployment_explain),
         )
         .route(
             "/api/v1/sessions/{id}/turns/{turn_id}/approvals/{call_id}/decision",
@@ -2369,17 +2389,31 @@ fn provider_error_message(error: &ProviderError) -> &'static str {
     }
 }
 
-fn current_agent_tools(store: &DemoStore) -> Result<Vec<ReplyToolDefinition>, StoreError> {
-    store
-        .session_agent_tool_definitions()?
-        .into_iter()
-        .map(|definition| {
-            let tool = ReplyToolDefinition::new(definition.name, definition.input_schema);
-            Ok(if definition.description.is_empty() {
-                tool
-            } else {
-                tool.with_description(definition.description)
-            })
+fn current_agent_manifest(
+    store: &DemoStore,
+    executor: &ReplyExecutor,
+) -> Result<ManifestEnvelope, StoreError> {
+    let metadata = executor.provider.metadata();
+    store.session_agent_manifest(
+        metadata.provider_id.clone(),
+        metadata.model.clone(),
+        match metadata.reply_kind {
+            ReplyKind::Model => AssistantReplyKind::Model,
+            ReplyKind::NonModelFallback => AssistantReplyKind::NonModelFallback,
+        },
+    )
+}
+
+fn agent_tools_from_manifest(manifest: &ManifestEnvelope) -> Vec<ReplyToolDefinition> {
+    manifest
+        .manifest
+        .deployment
+        .spec
+        .tools
+        .iter()
+        .map(|tool| {
+            ReplyToolDefinition::new(tool.name.clone(), tool.input_schema.clone())
+                .with_description(tool.description.clone())
         })
         .collect()
 }
@@ -2440,17 +2474,26 @@ async fn drain_agent_model_jobs(state: &ApiState) -> Result<(), StoreError> {
         .as_ref()
         .expect("the Agent model worker is only started when a provider exists");
     let _drain = executor.agent_model_drain.lock().await;
+    let current_manifest = current_agent_manifest(&state.store, executor)?;
     loop {
-        let job = match state.store.claim_next_agent_model().await? {
+        let job = match state
+            .store
+            .claim_next_agent_model(&current_manifest)
+            .await?
+        {
             AgentModelClaimOutcome::Claimed(job) => *job,
             AgentModelClaimOutcome::Rejected(_) => continue,
             AgentModelClaimOutcome::NotAvailable => return Ok(()),
         };
-        process_agent_model_job(state, job).await?;
+        process_agent_model_job(state, job, &current_manifest).await?;
     }
 }
 
-async fn process_agent_model_job(state: &ApiState, job: AgentModelJob) -> Result<(), StoreError> {
+async fn process_agent_model_job(
+    state: &ApiState,
+    job: AgentModelJob,
+    current_manifest: &ManifestEnvelope,
+) -> Result<(), StoreError> {
     let executor = state
         .reply
         .as_ref()
@@ -2490,20 +2533,7 @@ async fn process_agent_model_job(state: &ApiState, job: AgentModelJob) -> Result
             .await;
         }
     };
-    let current_tools = match current_agent_tools(&state.store) {
-        Ok(tools) => tools,
-        Err(error) => {
-            eprintln!("zeus Agent tool catalog could not be loaded: {error}");
-            return settle_agent_model_failure(
-                state,
-                &job,
-                "tool_catalog_unavailable",
-                "The Agent tool catalog could not be verified",
-                false,
-            )
-            .await;
-        }
-    };
+    let current_tools = agent_tools_from_manifest(current_manifest);
     if request.tools != current_tools {
         return settle_agent_model_failure(
             state,
@@ -2774,8 +2804,9 @@ async fn drain_agent_tool_calls(state: &ApiState) -> Result<(), StoreError> {
         .as_ref()
         .expect("the Agent tool worker is only started when a provider exists");
     let _drain = executor.agent_tool_drain.lock().await;
+    let current_manifest = current_agent_manifest(&state.store, executor)?;
     loop {
-        let work = match state.store.claim_next_agent_tool().await? {
+        let work = match state.store.claim_next_agent_tool(&current_manifest).await? {
             AgentToolClaimOutcome::Claimed(work) => *work,
             AgentToolClaimOutcome::Rejected(_) => continue,
             AgentToolClaimOutcome::NotAvailable => return Ok(()),
@@ -3133,6 +3164,44 @@ async fn agent_turn_detail(
     ))
 }
 
+async fn agent_deployment_explain(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    Path((id, turn_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let agent = state
+        .store
+        .agent_turn_detail_for_actor(&current.principal.authz, &id, &turn_id)
+        .await?;
+    let persisted_manifest = state
+        .store
+        .agent_deployment_manifest_for_actor(&current.principal.authz, &id, &turn_id)
+        .await?;
+    let executor = reply_executor(&state)?;
+    validate_provider_metadata(executor.provider.metadata())
+        .map_err(ApiError::reply_unavailable)?;
+    let current_manifest = current_agent_manifest(&state.store, executor)?;
+    let legacy_unbound = persisted_manifest.is_none();
+    let matches_current = persisted_manifest
+        .as_ref()
+        .is_some_and(|persisted| persisted.digest == current_manifest.digest);
+    let diff = persisted_manifest
+        .as_ref()
+        .filter(|persisted| persisted.digest != current_manifest.digest)
+        .map(|persisted| persisted.manifest.diff(&current_manifest.manifest))
+        .transpose()
+        .map_err(|error| ApiError::internal_contract(&error.to_string()))?;
+
+    json_no_store(AgentDeploymentExplainResponse {
+        agent,
+        persisted_manifest,
+        current_manifest,
+        legacy_unbound,
+        matches_current,
+        diff,
+    })
+}
+
 async fn resume_session(
     State(state): State<ApiState>,
     Extension(current): Extension<CurrentAuth>,
@@ -3171,6 +3240,7 @@ async fn start_turn(
     let executor = reply_executor(&state)?;
     let metadata = executor.provider.metadata();
     validate_provider_metadata(metadata).map_err(ApiError::reply_unavailable)?;
+    let manifest = current_agent_manifest(&state.store, executor)?;
     let reply_turns = state
         .store
         .session_reply_turns_for_actor(
@@ -3183,7 +3253,7 @@ async fn start_turn(
     let mut reply_request =
         ReplyRequest::from_session_history_for_agent(&reply_turns, request.user_message.clone())
             .map_err(|error| ApiError::internal_contract(&error.to_string()))?;
-    reply_request.tools = current_agent_tools(&state.store)?;
+    reply_request.tools = agent_tools_from_manifest(&manifest);
     let request_json =
         persisted_agent_reply_request(&reply_request).map_err(ApiError::agent_request_too_large)?;
     let agent = AgentTurnSpec {
@@ -3193,6 +3263,7 @@ async fn start_turn(
         provider_name: metadata.provider_id.clone(),
         model_name: metadata.model.clone(),
         request_json,
+        manifest,
     };
     let response = state
         .store
@@ -6506,6 +6577,48 @@ mod tests {
         assert_eq!(agent.status, protocol::AgentTurnStatus::Succeeded);
         assert_eq!(agent.model_steps, 1);
         assert!(agent.calls.is_empty());
+        let manifest_digest = agent
+            .deployment_manifest_digest
+            .clone()
+            .expect("new Agent turns must expose their deployment binding");
+
+        let explanation = app
+            .clone()
+            .oneshot(
+                Request::get(
+                    "/api/v1/sessions/session-reply-context/turns/turn-context-2/agent/explain",
+                )
+                .header(header::HOST, "zeus.test")
+                .header(header::COOKIE, &owner.cookie_header)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(explanation.status(), StatusCode::OK);
+        assert_eq!(
+            explanation.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        let explanation: AgentDeploymentExplainResponse = response_json(explanation).await;
+        assert!(!explanation.legacy_unbound);
+        assert!(explanation.matches_current);
+        assert!(explanation.diff.is_none());
+        assert_eq!(explanation.current_manifest.digest, manifest_digest);
+        assert_eq!(
+            explanation
+                .persisted_manifest
+                .as_ref()
+                .map(|manifest| manifest.digest.as_str()),
+            Some(manifest_digest.as_str())
+        );
+        let explanation_json = serde_json::to_string(&explanation).unwrap();
+        for forbidden in ["endpoint", "api_key", "secret_value"] {
+            assert!(
+                !explanation_json.contains(forbidden),
+                "deployment explanation exposed forbidden field {forbidden}"
+            );
+        }
 
         let recorded = requests.lock().unwrap().clone();
         assert_eq!(
@@ -6529,6 +6642,119 @@ mod tests {
         drop(app);
         drop(store);
         cleanup_test_database(&path);
+    }
+
+    #[tokio::test]
+    async fn agent_manifest_drift_is_explained_and_rejected_before_provider_execution() {
+        let store = DemoStore::seeded().await.unwrap();
+        let owner =
+            provision_test_owner(&store, "user-manifest-drift", "manifest-drift-owner").await;
+        let session_id = "session-manifest-drift";
+        let turn_id = "turn-manifest-drift";
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: session_id.into(),
+                    title: "Manifest drift".into(),
+                },
+                "create-manifest-drift",
+            )
+            .await
+            .unwrap();
+
+        let queued_manifest = store
+            .session_agent_manifest(
+                "queued-agent-provider",
+                Some("queued-model".into()),
+                AssistantReplyKind::Model,
+            )
+            .unwrap();
+        let request = ReplyRequest::with_tools(
+            [ReplyMessage::new(
+                ReplyRole::User,
+                "do not execute after deployment drift",
+            )],
+            agent_tools_from_manifest(&queued_manifest),
+        );
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner.authz,
+                session_id,
+                StartTurnRequest {
+                    turn_id: turn_id.into(),
+                    user_message: "do not execute after deployment drift".into(),
+                    expected_sequence: 1,
+                },
+                "start-manifest-drift",
+                AgentTurnSpec {
+                    id: durable_agent_id(session_id, turn_id),
+                    authz: owner.authz.clone(),
+                    environment: store.session_agent_environment().to_owned(),
+                    provider_name: "queued-agent-provider".into(),
+                    model_name: Some("queued-model".into()),
+                    request_json: persisted_agent_reply_request(&request).unwrap(),
+                    manifest: queued_manifest.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(CountingProvider::new(Arc::clone(&provider_calls))),
+        )
+        .unwrap();
+        let failed = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            session_id,
+            turn_id,
+            protocol::AgentTurnStatus::Failed,
+        )
+        .await;
+        assert_eq!(provider_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            failed
+                .last_error
+                .as_ref()
+                .and_then(|error| error.get("code"))
+                .and_then(serde_json::Value::as_str),
+            Some("deployment_unavailable")
+        );
+        assert_eq!(
+            failed.deployment_manifest_digest.as_deref(),
+            Some(queued_manifest.digest.as_str())
+        );
+
+        let explanation = app
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/sessions/{session_id}/turns/{turn_id}/agent/explain"
+                ))
+                .header(header::HOST, "zeus.test")
+                .header(header::COOKIE, &owner.cookie_header)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(explanation.status(), StatusCode::OK);
+        let explanation: AgentDeploymentExplainResponse = response_json(explanation).await;
+        assert!(!explanation.legacy_unbound);
+        assert!(!explanation.matches_current);
+        let diff = explanation.diff.expect("provider drift must be explained");
+        assert!(
+            diff.changes
+                .iter()
+                .any(|change| change.path.ends_with("/provider_id"))
+        );
+        assert_eq!(
+            explanation.persisted_manifest.unwrap().digest,
+            queued_manifest.digest
+        );
     }
 
     #[tokio::test]

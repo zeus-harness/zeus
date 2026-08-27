@@ -260,6 +260,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "deployment"
+version = "0.1.0"
+dependencies = [
+ "protocol",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "workflows",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1004,6 +1016,7 @@ dependencies = [
  "authz",
  "chrono",
  "connectors",
+ "deployment",
  "kernel",
  "protocol",
  "rusqlite",
@@ -1012,6 +1025,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tools",
+ "workflows",
 ]
 
 [[package]]
@@ -1209,6 +1223,7 @@ dependencies = [
  "authz",
  "base64",
  "chrono",
+ "deployment",
  "fs2",
  "kernel",
  "protocol",
@@ -1867,6 +1882,7 @@ dependencies = [
  "async-stream",
  "axum",
  "chrono",
+ "deployment",
  "http-body-util",
  "kernel",
  "llm",

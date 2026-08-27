@@ -49,7 +49,7 @@ use crate::{
     UpdateAccountAuditPolicyCommit,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 17;
+const CURRENT_SCHEMA_VERSION: i64 = 19;
 const LOCAL_ACCOUNT_ID: &str = "acc_local";
 const EVENT_PAYLOAD_VERSION_V1: i64 = 1;
 const EVENT_PAYLOAD_VERSION_V2: i64 = 2;
@@ -73,6 +73,8 @@ const MIGRATION_0014: &str =
 const MIGRATION_0015: &str = include_str!("../migrations/0015_member_lifecycle_account_audit.sql");
 const MIGRATION_0016: &str = include_str!("../migrations/0016_session_reply_context_index.sql");
 const MIGRATION_0017: &str = include_str!("../migrations/0017_session_agent_loop.sql");
+const MIGRATION_0018: &str = include_str!("../migrations/0018_agent_tool_completion_replay.sql");
+const MIGRATION_0019: &str = include_str!("../migrations/0019_agent_deployment_manifest.sql");
 const RECOVERY_BATCH_LIMIT: i64 = 64;
 const AUTH_SESSION_CLEANUP_BATCH_LIMIT: i64 = 64;
 const BOOTSTRAP_AUDIT_ROLLUP_BATCH_LIMIT: i64 = 64;
@@ -2766,6 +2768,20 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
             params![17, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 18 {
+        transaction.execute_batch(MIGRATION_0018)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![18, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
+    if current < 19 {
+        transaction.execute_batch(MIGRATION_0019)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![19, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
     validate_configured_account_audit_policies(&transaction, limits)?;
     compact_existing_bootstrap_audit_to_capacity(&transaction, &now(), limits)?;
     transaction.commit()?;
@@ -3361,12 +3377,13 @@ fn readiness(
                'member_setup_tokens', 'account_audit_rollups',
                'account_audit_policies', 'account_audit_archive_state',
                'account_audit_events', 'agent_turns', 'agent_model_jobs',
-               'agent_tool_calls', 'agent_review_receipts'
+               'agent_tool_calls', 'agent_review_receipts',
+               'agent_deployment_manifests'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if table_count != 31 {
+    if table_count != 32 {
         return Err(StorageError::CorruptData(
             "one or more required tables are missing".into(),
         ));
@@ -3419,6 +3436,37 @@ fn readiness(
     if dispatch_authorization_columns != 2 {
         return Err(StorageError::CorruptData(
             "dispatch authorization columns are missing".into(),
+        ));
+    }
+
+    let agent_tool_completion_columns: i64 = connection.query_row(
+        r#"SELECT COUNT(*) FROM pragma_table_info('agent_tool_calls')
+           WHERE name = 'completion_next_request_json'"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if agent_tool_completion_columns != 1 {
+        return Err(StorageError::CorruptData(
+            "Agent tool completion replay column is missing".into(),
+        ));
+    }
+
+    let agent_deployment_manifest_columns: i64 = connection.query_row(
+        r#"SELECT COUNT(*)
+           FROM pragma_table_info('agent_deployment_manifests')
+           WHERE name IN ('digest', 'schema_version', 'envelope_json', 'created_at')"#,
+        [],
+        |row| row.get(0),
+    )?;
+    let agent_manifest_binding_columns: i64 = connection.query_row(
+        r#"SELECT COUNT(*) FROM pragma_table_info('agent_turns')
+           WHERE name = 'deployment_manifest_digest'"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if agent_deployment_manifest_columns != 4 || agent_manifest_binding_columns != 1 {
+        return Err(StorageError::CorruptData(
+            "Agent deployment manifest schema is missing".into(),
         ));
     }
 
@@ -3504,12 +3552,13 @@ fn readiness(
                'agent_model_jobs_one_live_idx',
                'agent_tool_calls_ready_idx',
                'agent_tool_calls_started_idx',
-               'agent_tool_calls_one_live_idx'
+               'agent_tool_calls_one_live_idx',
+               'agent_turns_deployment_manifest_idx'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if point_query_indexes != 49 {
+    if point_query_indexes != 50 {
         return Err(StorageError::CorruptData(
             "one or more point-query indexes are missing".into(),
         ));
@@ -3608,15 +3657,21 @@ fn readiness(
                'agent_tool_calls_enforce_forward_transition',
                'agent_tool_calls_reject_input_update',
                'agent_tool_calls_freeze_review_binding',
+               'agent_tool_calls_require_completion_next_request',
+               'agent_tool_calls_freeze_completion_next_request',
+               'agent_model_jobs_bind_tool_completion_request',
                'agent_tool_calls_reject_delete',
                'agent_review_receipts_require_current_owner',
                'agent_review_receipts_reject_update',
-               'agent_review_receipts_reject_delete'
+               'agent_review_receipts_reject_delete',
+               'agent_deployment_manifests_reject_update',
+               'agent_deployment_manifests_reject_delete',
+               'agent_turns_require_deployment_manifest'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 94 {
+    if trigger_count != 100 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
         ));
@@ -3637,6 +3692,21 @@ fn readiness(
     if agent_pending_call_fk != 1 {
         return Err(StorageError::CorruptData(
             "the Agent pending-call composite foreign key is missing".into(),
+        ));
+    }
+
+    let agent_manifest_fk: i64 = connection.query_row(
+        r#"SELECT COUNT(*) FROM pragma_foreign_key_list('agent_turns')
+           WHERE "table" = 'agent_deployment_manifests'
+             AND "from" = 'deployment_manifest_digest'
+             AND "to" = 'digest'
+             AND on_delete = 'RESTRICT'"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if agent_manifest_fk != 1 {
+        return Err(StorageError::CorruptData(
+            "the Agent deployment manifest foreign key is missing".into(),
         ));
     }
 
@@ -3871,6 +3941,55 @@ fn readiness(
             "one or more durable records cross an actor ownership boundary".into(),
         ));
     }
+
+    let agent_tool_completion_binding_violation: i64 = connection.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1
+               FROM agent_tool_calls call
+               LEFT JOIN agent_model_jobs next_job
+                 ON next_job.agent_id = call.agent_id
+                AND next_job.step = call.model_step + 1
+               WHERE (
+                   call.completion_next_request_json IS NOT NULL
+                   AND (
+                       call.status NOT IN (
+                           'succeeded', 'failed', 'cancelled', 'not_dispatched'
+                       )
+                       OR call.policy_decision NOT IN ('allow', 'require_approval')
+                       OR call.started_at IS NULL
+                       OR call.finished_at IS NULL
+                       OR call.result_json IS NULL
+                       OR CASE
+                           WHEN json_valid(call.completion_next_request_json) = 0 THEN 1
+                           WHEN json_type(call.completion_next_request_json)
+                                NOT IN ('object', 'null') THEN 1
+                           ELSE 0
+                       END = 1
+                   )
+               )
+               OR (
+                   call.status IN ('succeeded', 'failed', 'cancelled', 'not_dispatched')
+                   AND call.policy_decision IN ('allow', 'require_approval')
+                   AND call.started_at IS NOT NULL
+                   AND next_job.id IS NOT NULL
+                   AND CASE
+                       WHEN call.completion_next_request_json IS NULL THEN 1
+                       WHEN json_valid(call.completion_next_request_json) = 0 THEN 1
+                       WHEN json_type(call.completion_next_request_json) <> 'object' THEN 1
+                       WHEN call.completion_next_request_json IS NOT next_job.request_json THEN 1
+                       ELSE 0
+                   END = 1
+               )
+           )"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if agent_tool_completion_binding_violation != 0 {
+        return Err(StorageError::CorruptData(
+            "one or more Agent tool completion replay bindings are inconsistent".into(),
+        ));
+    }
+    agent::verify_agent_deployment_manifest_integrity(connection)?;
     let (user_count, owner_count): (i64, i64) = connection.query_row(
         r#"SELECT (SELECT COUNT(*) FROM users),
                   (SELECT COUNT(*)

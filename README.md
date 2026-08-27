@@ -449,10 +449,18 @@ and bounded memory, CPU, and PID resources.
 - Starting a turn requires the expected Session sequence. It atomically creates
   the open turn, appends `user_message`, advances the Session to `running`,
   stores the actor-scoped response receipt, creates the durable Agent state,
-  and enqueues its first immutable model job.
+  binds that Agent to one canonical, secret-free deployment manifest, and
+  enqueues its first immutable model job.
   That work contains a bounded provider request assembled from complete
   historical turns through the submitted sequence plus the new user message;
   interrupted or otherwise unflushed turns never enter model context.
+- The deployment manifest fixes the profile, environment, provider/model
+  identity, policy revision, workflow limits, and exact versioned tool
+  contracts used for the turn. Model requests derive their visible tool list
+  from that same manifest. Before a queued model or tool operation can reach an
+  external provider/executor, claim compares the persisted digest and binding
+  with the current runtime. Missing, corrupted, or drifted authority settles
+  durably as `deployment_unavailable` with zero external calls.
 - The model worker commits a `started` checkpoint before calling a provider.
   Final text atomically stores the assistant message, appends
   `assistant_message` and `turn_flushed`, and returns the Session to `ready`.
@@ -542,6 +550,13 @@ and bounded memory, CPU, and PID resources.
   context pairs at an immutable ledger boundary. Schema v17 adds the
   Session-native Agent state, model jobs, sequential tool calls, approval
   receipts, fixed loop limits, and bounded terminal-event replay indexes.
+  Schema v18 binds every known tool completion to its exact next-request JSON,
+  including the distinction between SQL `NULL` and model-visible JSON `null`,
+  so continuation replay cannot silently change after a restart. Schema v19
+  stores immutable canonical deployment manifests and binds every newly
+  admitted Agent turn to one digest; pre-v19 terminal history remains readable,
+  while legacy queued work fails closed at claim instead of running under an
+  unproven deployment.
   Existing Runs and events are decoded, validated, and migrated in place without
   rewriting their payloads. Runtime identity still binds profile, environment,
   primary Session and Run, policy ID, and policy revision; a mismatch fails
@@ -632,7 +647,12 @@ directly.
   approval, or an explicit interrupted/needs-attention event through Session
   SSE.
 - `GET /api/v1/sessions/{session_id}/turns/{turn_id}/agent` returns the
-  actor-scoped durable Agent state and its ordered tool calls.
+  actor-scoped durable Agent state, deployment-manifest digest, and ordered
+  tool calls.
+- `GET /api/v1/sessions/{session_id}/turns/{turn_id}/agent/explain` returns the
+  actor-scoped persisted and current secret-free manifests plus a deterministic
+  JSON-pointer diff. It explicitly marks pre-v19 unbound history and whether
+  the current runtime can execute the exact persisted deployment.
 - `POST /api/v1/sessions/{session_id}/turns/{turn_id}/approvals/{call_id}/decision`
   lets an owner approve the exact persisted call or reject it as a structured
   model-visible result. The decision is idempotent and never accepts a
@@ -693,7 +713,7 @@ directly.
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Current schema v17 retains durable Run attachment during migration and demo
+Current schema v19 retains durable Run attachment during migration and demo
 seeding, but Alpha+ does not expose a public attach-Run HTTP route.
 
 The application boundary now caps auth JSON at 8 KiB and command JSON at
@@ -714,7 +734,7 @@ approval, dispatch, reply completion, attachment checks, and startup recovery
 use typed point queries or fixed 64-row batches. Production Session list/detail,
 Run detail, and overview reads now use indexed `LIMIT + 1` keyset pages inside
 actor-authorized SQLite snapshots; no production HTTP read loads a complete
-ledger or collection. Current schema v17 retains bounded Session, open-turn,
+ledger or collection. Current schema v19 retains bounded Session, open-turn,
 active reply/dispatch, auth-session, bootstrap-audit, event-slot, and logical
 event-payload-byte admission. Exact idempotent replay is checked before capacity,
 while accepted work consumes its reserved terminal slots and payload bytes
@@ -792,14 +812,16 @@ Payload Envelope, Bounded Event Feed, Point-query Durable Context, Bounded Read
 Models, SQLite Capacity Slice 2, the SQLite Physical Capacity Slice, and the
 SQLite Operation Capacity Slice, Bootstrap Audit Retention, schema v13 Account
 Membership Foundation, schema v14 Account-scoped Durable Authorization, and
-schema v15 Member Lifecycle / Account Audit plus schema v16 Session Reply
-Context Index and schema v17 Durable Session Agent Loop host verification:
+schema v15 Member Lifecycle / Account Audit, schema v16 Session Reply Context
+Index, schema v17 Durable Session Agent Loop, schema v18 exact tool-completion
+replay, and schema v19 deployment-manifest binding host verification:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --all-features`: 409 tests passed under
-  the existing project counting convention, including 188 storage tests, 41
-  runtime tests, 60 API library tests, 6 API main/config tests, and the real
+- `cargo test --workspace --all-targets --all-features`: 436 tests passed under
+  the existing project counting convention, including 7 deployment tests, 199
+  storage tests, 47 runtime tests, 61 API library tests, 6 API main/config
+  tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,
   body/field/idempotency boundaries, atomic login limits, SSE lease capacity,
@@ -840,7 +862,10 @@ Context Index and schema v17 Durable Session Agent Loop host verification:
   results and 128 KiB aggregate results, scalar/array result replay, exact
   persistence retry without external re-execution, unavailable-continuation
   settlement, transient claim recovery without a lost worker wake, bounded
-  terminal replay queries, and one-shot restart settlement of started work.
+  terminal replay queries, one-shot restart settlement of started work,
+  canonical secret-free manifests, actor-scoped explainability, exact
+  provider-visible tools, completion replay binding, and fail-closed
+  provider/tool/policy/profile drift.
 - `pnpm --filter web test`: 28 tests passed for CSRF headers, stable command
   identity, deep-page active-Session restore, Session-list cursor encoding and
   deduplication, bounded-tail retry reconciliation and Session-switch race

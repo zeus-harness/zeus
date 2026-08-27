@@ -1006,6 +1006,8 @@ pub struct AgentTurnDetail {
     pub id: String,
     pub session_id: String,
     pub turn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_manifest_digest: Option<String>,
     pub status: AgentTurnStatus,
     pub model_steps: u32,
     pub tool_calls: u32,
@@ -1727,6 +1729,50 @@ mod tests {
         );
         let value = serde_json::to_value(event).unwrap();
         assert!(!value.as_object().unwrap().contains_key("provenance"));
+    }
+
+    #[test]
+    fn agent_turn_detail_manifest_digest_is_legacy_optional_and_round_trips() {
+        let legacy = json!({
+            "id": "agent-old",
+            "session_id": "session-old",
+            "turn_id": "turn-old",
+            "status": "waiting_model",
+            "model_steps": 0,
+            "tool_calls": 0,
+            "tool_result_bytes": 0,
+            "revision": 1,
+            "calls": [],
+            "created_at": "2026-08-27T00:00:00Z",
+            "updated_at": "2026-08-27T00:00:00Z"
+        });
+        let legacy_detail: AgentTurnDetail = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(legacy_detail.deployment_manifest_digest, None);
+        assert!(
+            !serde_json::to_value(&legacy_detail)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("deployment_manifest_digest")
+        );
+
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut bound = legacy;
+        bound
+            .as_object_mut()
+            .unwrap()
+            .insert("deployment_manifest_digest".into(), json!(digest));
+        let bound_detail: AgentTurnDetail = serde_json::from_value(bound).unwrap();
+        assert_eq!(
+            bound_detail.deployment_manifest_digest.as_deref(),
+            Some(digest)
+        );
+        let serialized = serde_json::to_value(&bound_detail).unwrap();
+        assert_eq!(serialized["deployment_manifest_digest"], digest);
+        assert_eq!(
+            serde_json::from_value::<AgentTurnDetail>(serialized).unwrap(),
+            bound_detail
+        );
     }
 
     #[test]

@@ -159,6 +159,10 @@ pub enum Command {
     /// Current Session authority disappeared after work was queued but before
     /// any external model/tool operation was invoked.
     AuthorizationRevoked,
+    /// The immutable deployment manifest is missing or no longer matches the
+    /// executable runtime. Callers may use this only before invoking the
+    /// external operation authorized by the current durable phase.
+    DeploymentUnavailable,
     /// Record an allow-once approval and queue the already-bound tool call.
     ApprovalApproved,
     /// Record a rejection as a structured non-dispatch result.
@@ -186,6 +190,7 @@ impl Command {
             Self::ModelFailed => CommandKind::ModelFailed,
             Self::ModelOutcomeUnknown => CommandKind::ModelOutcomeUnknown,
             Self::AuthorizationRevoked => CommandKind::AuthorizationRevoked,
+            Self::DeploymentUnavailable => CommandKind::DeploymentUnavailable,
             Self::ApprovalApproved => CommandKind::ApprovalApproved,
             Self::ApprovalRejected { .. } => CommandKind::ApprovalRejected,
             Self::StartTool => CommandKind::StartTool,
@@ -449,6 +454,32 @@ pub fn reduce(state: &State, command: Command) -> Result<Transition, Error> {
                 AgentStatus::Failed,
                 Some(TerminalReason::AuthorizationRevoked),
                 None,
+                None,
+                None,
+            )
+        }
+        Command::DeploymentUnavailable => {
+            require_one_of(
+                state,
+                &[
+                    AgentStatus::ModelStarted,
+                    AgentStatus::WaitingApproval,
+                    AgentStatus::ToolQueued,
+                    AgentStatus::ToolStarted,
+                    AgentStatus::ContinuationQueued,
+                ],
+                command_kind,
+            )?;
+            next_transition(
+                state,
+                AgentStatus::Failed,
+                // A deployment manifest is durable execution authority. Reuse
+                // the existing authorization terminal class so upgraded v17
+                // databases and fresh databases persist the same state shape;
+                // callers retain the precise `deployment_unavailable` code in
+                // the terminal error envelope.
+                Some(TerminalReason::AuthorizationRevoked),
+                Some(0),
                 None,
                 None,
             )
@@ -752,6 +783,7 @@ pub enum CommandKind {
     ModelFailed,
     ModelOutcomeUnknown,
     AuthorizationRevoked,
+    DeploymentUnavailable,
     ApprovalApproved,
     ApprovalRejected,
     StartTool,
@@ -1093,6 +1125,49 @@ mod tests {
             );
             assert_eq!(revoked.external_call(), None);
         }
+    }
+
+    #[test]
+    fn unavailable_deployment_fails_every_admitted_phase_before_external_io() {
+        let continuation = apply(
+            started_tool(),
+            Command::ToolResultKnown {
+                kind: ToolCompletionKind::Succeeded,
+                result_bytes: 17,
+            },
+        )
+        .into_state();
+        for state in [
+            started_model(),
+            waiting_approval(),
+            queued_tool(),
+            started_tool(),
+            continuation,
+        ] {
+            let model_steps = state.model_steps();
+            let tool_calls = state.tool_calls();
+            let result_bytes = state.tool_result_bytes();
+            let rejected = apply(state, Command::DeploymentUnavailable);
+            assert_eq!(rejected.state().status(), AgentStatus::Failed);
+            assert_eq!(
+                rejected.state().terminal_reason(),
+                Some(TerminalReason::AuthorizationRevoked)
+            );
+            assert_eq!(rejected.state().model_steps(), model_steps);
+            assert_eq!(rejected.state().tool_calls(), tool_calls);
+            assert_eq!(rejected.state().tool_result_bytes(), result_bytes);
+            assert_eq!(rejected.state().pending_approvals(), 0);
+            assert_eq!(rejected.external_call(), None);
+            assert_eq!(rejected.emitted_result(), None);
+        }
+
+        assert!(matches!(
+            reduce(&State::default(), Command::DeploymentUnavailable),
+            Err(Error::InvalidTransition {
+                status: AgentStatus::ModelQueued,
+                command: CommandKind::DeploymentUnavailable,
+            })
+        ));
     }
 
     #[test]

@@ -16,22 +16,25 @@ Client / SvelteKit Web
                       │           │              ├──► Authz / Tool Registry
                       │           │              │          │
                       ▼           ▼              ▼          ▼
-              Session ledger   Run ledger   Reply worker  Connector
-              turn / receipt   dispatch     LLM boundary  / Sandbox
+              Session ledger   Run ledger   Agent workers  Connector
+              turn / receipt   dispatch     model + tool   / Sandbox
 ```
 
 - `protocol`：认证、设置、Session/Run HTTP、SSE、turn 与可版本化事件合约。
+- `deployment`：版本化、规范化且不含 secret 的 Agent Spec / Deployment Manifest，负责稳定
+  digest 与确定性 JSON-pointer diff。
 - `tenancy`：本地身份、account/membership 授权上下文、Argon2id 密码、opaque token、CSRF 与域分离 digest。
 - `llm`：object-safe reply provider、本地非模型 fallback 和有界 OpenAI-compatible 客户端。
 - `kernel`：纯状态转换，不读数据库、不执行外部工具。
 - `authz`：account capability matrix，以及精确工具名规则、策略 revision、环境和 effect guard；没有命中即拒绝。
 - `tools`：工具描述、注册表、参数验证和 object-safe executor 边界。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
-- `storage`：schema v16 migration、`acc_local` membership 权威、一次性 member setup、用户/偏好、
+- `storage`：schema v19 migration、`acc_local` membership 权威、一次性 member setup、用户/偏好、
   account audit/rollup/policy/archive state、独立 Session/Run ledger、typed event lookup、
-  account+actor-scoped 回执、durable reply/dispatch queue，以及 actor/account/global logical
-  capacity、physical capacity 和 operation capacity。
-- `runtime`：Session 命令编排、reply/Run worker、提交后 SSE 提示和启动恢复。
+  account+actor-scoped 回执、durable Agent/model/tool/dispatch queue、不可变 deployment manifest，
+  以及 actor/account/global logical capacity、physical capacity 和 operation capacity。
+- `runtime`：Session 命令编排、Agent model/tool 与 Run worker、运行时 manifest 构建、提交后 SSE
+  提示和启动恢复。
 - `zeus-api`：进程组合、owner/member 认证、CSRF、owner-only 管理面、provider 配置、REST/SSE
   和 readiness。
 
@@ -82,9 +85,14 @@ Session 状态机独立于 Run 状态机：
 create
   │
   ▼
-ready ── start_turn ──► running / open turn + queued reply job
+ready ── start_turn ──► running / open turn + Agent + queued model job
                               │
-                              ├─ worker success ──► assistant_message + turn_flushed ──► ready
+                              ├─ final text ──► assistant_message + turn_flushed ──► ready
+                              │
+                              ├─ tool proposal ──► policy / optional approval
+                              │                         │
+                              │                         └─ known result + queued model continuation
+                              │                                  (loop remains running)
                               │
                               └─ failure / unknown / restart ──► needs_attention / interrupted
                                                                     │
@@ -104,24 +112,30 @@ Session ledger 记录 `session_created`、`run_attached`、`user_message`、可�
 
 - create：写入 `ready` 投影、`session_created` 和完整响应回执。
 - start：只允许 actor 拥有的 `ready` Session；在一个事务中创建唯一 open turn、追加
-  `user_message`、投影进入 `running`、保存 actor-scoped 响应回执，并插入 immutable queued
-  reply job。provider request 以命令的 `expected_sequence` 为快照边界，由最新完整 flushed
-  user/assistant 对和当前 user message 组成；最多保留 31 对历史消息，总 UTF-8 内容不超过
-  64 KiB。interrupted、缺少 assistant 或尚未 flush 的 turn 不进入上下文。组装结果持久化在
-  job 中，迟到的幂等重试复用该 durable request，而不是从更晚的 Session 状态重新生成。
-  真实 API 返回 `202`。
-- reply worker：claim 事务先复验 active actor 与 Session owner，再把 queued job durable
-  claim 为 `started`，随后在数据库锁之外调用 provider。
-  成功事务追加带 `provider_id/model/reply_kind` 的 `assistant_message`、flush turn、追加
-  `turn_flushed` 并把 job 标为 `succeeded`。确定失败写 `failed`；timeout/transport 等不确定
-  远端结果写 `outcome_unknown`，两者都把 Session 转为 `needs_attention`，不得自动重调 provider。
+  `user_message`、投影进入 `running`、保存 actor-scoped 响应回执，创建 Agent，绑定 canonical
+  deployment manifest digest，并插入 immutable queued model job。provider request 以命令的
+  `expected_sequence` 为快照边界，由最新完整 flushed user/assistant 对和当前 user message
+  组成；最多保留 27 对历史消息，总 UTF-8 内容不超过 64 KiB。interrupted、缺少 assistant 或
+  尚未 flush 的 turn 不进入上下文。组装结果持久化在 job 中，迟到的幂等重试复用该 durable
+  request，而不是从更晚的 Session 状态重新生成。真实 API 返回 `202`。
+- Agent model worker：claim 事务先复验 active actor、Session owner、manifest digest、provider/
+  model、profile/environment、policy revision、workflow limits 与 provider-visible tool schema，
+  再把 queued job durable claim 为 `started`；任何缺失、损坏或 drift 都以
+  `deployment_unavailable` 终结且 provider 调用数为零。claim 成功后才在数据库锁之外调用
+  provider。最终文本原子追加带 provenance 的 `assistant_message`、flush turn 并写
+  `turn_flushed`；确定失败和 outcome unknown 都进入 `needs_attention`，不得自动重调 provider。
+- Agent tool worker：模型只能提出工具名与 arguments；服务端 registry/policy 生成不可变 call。
+  require-approval 保留在 `waiting_approval`，拒绝和 policy deny 作为结构化 known result 返回模型。
+  允许执行的 call 在 durable `started` checkpoint 后再次校验 manifest/registry/policy；只有通过
+  才调用 executor。known completion 与它的 exact next-request JSON 在同一事务提交，SQL `NULL`
+  与 model-visible JSON `null` 不得混淆；重启只重放已持久化 continuation，不重新拼接 transcript。
 - flush：仅保留在不带认证的 storage/runtime 合约测试 router；真实 authenticated server 不注册
   此路由，浏览器不能上传 assistant content。
 - resume：只允许没有 active turn 的 `needs_attention` Session；追加
   `session_resumed`，投影回到 `ready` 并保存响应回执。
 
-Session commit 后才发布进程内提示。start/reply/resume 不修改 Run ledger、approval 或 dispatch
-job；reply job 与 Run dispatch job 是两条独立队列。
+Session commit 后才发布进程内提示。start/Agent/resume 不修改 Run ledger 或 Run dispatch job；
+Session Agent job 与 Run dispatch job 是相互独立的 durable queue。
 
 审批命令也在一个 `BEGIN IMMEDIATE` 事务内完成：
 
@@ -152,21 +166,22 @@ connector 在数据库事务和锁之外运行。
 
 API 监听端口之前按固定顺序完成：
 
-1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v16；按当前
+1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v19；按当前
    detailed-row limit 以最多 64 行 batch 压缩 bootstrap terminal audit prefix，再按稳定
    `(priority actor, expires_at, auth-session ID)` 顺序最多清理 64 个过期或绑定
    missing/disabled/suspended/stale-revision authority 的 auth session。
 2. 绑定并核对 runtime identity、primary Session/Run 和 demo attachment。
-3. 以固定 64 行 batch 读取 `started` 且没有持久结果的 reply job，循环排空：结算为 `outcome_unknown`，追加
-   `turn_interrupted`，不得重放可能已经计费的 provider 请求。queued reply 原样保留并可安全领取。
-4. 再以固定 64 行 batch 循环处理没有 reply job 终态解释的 open Session turn：将 turn 标为 `interrupted`，追加
-   `turn_interrupted`，Session
-   进入 `needs_attention`。不生成 flush ack，也不修改 Run ledger。
-5. 以固定 64 行 batch 循环处理 started 且没有 ToolResult 的 dispatch：追加 `OutcomeUnknown`，Run 进入
+3. 以固定 64 行 batch 读取 `started` 且没有持久结果的 legacy reply job，循环排空：结算为
+   `outcome_unknown`，追加 `turn_interrupted`，不得重放可能已经计费的 provider 请求。
+4. 再循环处理 Agent 中已 `started` 的 model/tool operation：两者都结算为 `outcome_unknown`，
+   Agent/Session 进入 `needs_attention`，且绝不重放可能已计费或已产生副作用的外部调用。queued
+   model/tool work 没有 checkpoint，保持可领取；waiting-for-approval 原样保留。
+5. 随后以固定 64 行 batch 处理没有 durable terminal 解释的其它 open Session turn：标记
+   `interrupted`、追加 `turn_interrupted`，不生成 flush ack，也不修改 Run ledger。
+6. 以固定 64 行 batch 循环处理 started 且没有 ToolResult 的 Run dispatch：追加 `OutcomeUnknown`，Run 进入
    `needs_attention`，不自动重试外部调用。
-6. waiting-for-approval 原样保留；queued 且没有 started checkpoint 的 job 才可以继续派发；
-   已有终态结果不重新执行。
-7. 恢复和安全派发完成后，进程才绑定监听端口。
+7. 只有 queued 且没有 started checkpoint 的工作才可以继续派发；已有终态结果不重新执行。
+8. 恢复和安全派发完成后，进程才绑定监听端口。
 
 锁由最后一个 Store clone 的生命周期持有；第二个进程不能进入 migration 或恢复路径。被中断的
 Session 必须通过幂等、sequence-checked resume 显式回到 `ready`。
@@ -374,20 +389,26 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   Session/Run 绑定稳定；迁移时尚未 bootstrap 的 legacy actor 只允许在首次 owner bootstrap
   事务中认领一次。v13→v14 再原地重建 auth session、receipt、reply/dispatch job 与 reservation；
   configured/unconfigured active work、窄化 NULL claim、owner-only auth 保留和 version-13 原子回滚
-  都有确定性覆盖。
-- 重启后用户/偏好、Session/turn/event、reply job、Run/Event、审批决定、dispatch job 和命令
-  回执仍存在。
-- Session start 与 reply enqueue 同事务；reply success 把 assistant provenance、连续事件、turn
-  和 job 终态原子提交，注入失败时整体回滚。测试专用 flush 合约仍证明旧迁移路径的原子性。
+  都有确定性覆盖。后续 v15 member/audit、v16 context index、v17 Agent loop、v18 exact tool
+  completion replay 与 v19 deployment manifest 也覆盖 fresh schema 和历史原地迁移。
+- 重启后用户/偏好、Session/turn/event、Agent/model/tool job、deployment manifest、Run/Event、
+  审批决定、dispatch job 和命令回执仍存在。
+- Session start 与 Agent/first-model enqueue/manifest binding 同事务；最终 reply 把 assistant
+  provenance、连续事件、turn、Agent 和 job 终态原子提交，注入失败时整体回滚。测试专用 flush
+  合约仍证明旧迁移路径的原子性。
 - open turn 重启后只追加一次 `turn_interrupted`，Session 进入 `needs_attention`，不生成 flush
   ack、不改变 Run ledger；显式 resume 后才能开始新 turn。
 - 同 key 同输入只提交一次并重放响应；同 key 不同输入返回冲突；不同 key 由对应 ledger 的
   head sequence CAS 仲裁。
-- 未知工具和策略拒绝路径的 executor 调用数为零。
+- 未知工具、策略拒绝和 deployment drift 路径的 provider/executor 调用数为零。
 - checkpoint 写入失败时外部副作用为零。
-- reply/dispatch 排队后 actor 被禁用、降权或失去 ownership 时，claim 写入 durable
+- Agent/legacy reply/dispatch 排队后 actor 被禁用、降权或失去 ownership 时，claim 写入 durable
   `authorization_revoked` 终态，provider/connector 调用数为零。
-- reply/dispatch started 后模拟崩溃，均恢复为 `outcome_unknown` 且不发生第二次外部执行。
+- Agent model/tool、legacy reply 或 dispatch 在 started 后模拟崩溃，均恢复为
+  `outcome_unknown` 且不发生第二次外部执行。
+- 新 Agent 的 manifest canonical/digest/reuse/secret-free、actor isolation、provider-visible tools
+  精确匹配和 provider/tool/policy/profile drift 均有自动化覆盖；v18 terminal history 可读，旧
+  queued/waiting-approval work 在首次可执行边界以 `deployment_unavailable` fail closed。
 - 首次 bootstrap 只能消费一次 token；登录、CSRF、同源、Cookie 属性、设置 revision、退出后
   401 以及退出/失效后 SSE 关闭有自动化或 live 验收。
 - bootstrap audit 的 v11 reason 迁移、canonical digest、64 行多批压缩、rotation/open 降限、
@@ -409,12 +430,13 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
 - 本地 Alpha+ 已按 UTF-8 bytes 限制 Session ID/title/user+assistant message/review note、
   typed reply/tool terminal payload 与幂等键；SSE
   replay 已在 storage 层分页，future cursor 对已授权资源返回 `409`，foreign resource 仍为
-  `404`。审批、派发、reply completion、attachment 和启动恢复已改为 typed point query 或
+  `404`。审批、派发、Agent completion、attachment 和启动恢复已改为 typed point query 或
   固定 64 行 batch；Session list/detail 与 Run detail/overview 也已改为 indexed bounded read
   model。SQLite row/active/event-slot、逻辑 event-payload byte quota 与 physical capacity gate
   和 operation capacity gate 已落地；bootstrap audit detailed retention/rollup、v13 account
   membership foundation、v14 account-scoped durable authorization 与 v15 member lifecycle /
-  account audit 已落地。对外或多租户部署仍必须完成共享部署门禁。
+  account audit，以及 v17 Agent loop、v18 exact completion replay、v19 deployment manifest
+  binding 已落地。对外或多租户部署仍必须完成共享部署门禁。
   此前 Operation Capacity Apple 指定 readiness-pressure 与历史 v14 migration/restart 已分别
   通过；v14 当轮没有重跑该压力。完整低内存/对抗性压力与 Linux Docker PID/OOM authoritative
   evidence 仍是 deployment gate。
@@ -422,8 +444,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   刷新恢复、owner/member setup/登录、owner 成员与 audit 管理、设置/退出和
   system/light/dark。member 的审批卡只读。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化按项目既有统计口径是 342 个 Rust 测试（storage 174、runtime 33、API library 51、
-  API main/config 6）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化按项目既有统计口径是 436 个 Rust 测试（其中 deployment 7、storage 199、
+  runtime 47、API library 61、API main/config 6）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
 提交 `af29089` 曾构建并运行在独立 `zeus-operation-acceptance` project（端口 `18089`）；既有

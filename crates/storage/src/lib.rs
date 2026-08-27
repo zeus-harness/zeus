@@ -13,6 +13,7 @@ mod sqlite;
 
 use std::fmt;
 
+use deployment::ManifestEnvelope;
 pub use error::StorageError;
 pub use limits::{StorageLimits, StorageLimitsError};
 pub use operation::{SqliteOperationLimits, SqliteOperationLimitsError};
@@ -484,6 +485,7 @@ pub struct ReplyCompletion {
 pub struct AgentTurnSpec {
     pub id: String,
     pub authz: AuthzContext,
+    pub manifest: ManifestEnvelope,
     pub environment: String,
     pub provider_name: String,
     pub model_name: Option<String>,
@@ -533,6 +535,7 @@ pub struct AgentTurn {
     pub actor_membership_revision: MembershipRevision,
     pub session_id: String,
     pub turn_id: String,
+    pub deployment_manifest_digest: Option<String>,
     pub environment: String,
     pub provider_name: String,
     pub model_name: Option<String>,
