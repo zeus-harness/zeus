@@ -348,7 +348,8 @@ exactly-once 语义。
   固定 64 行 batch；Session list/detail 与 Run detail/overview 也已改为 indexed bounded read
   model。SQLite row/active/event-slot、逻辑 event-payload byte quota 与 physical capacity gate
   和 operation capacity gate 已落地；对外或多租户部署前仍必须完成 tenant/account membership
-  scope 与完整 audit retention。完整低内存/OOM 和当前镜像容器验收仍是 deployment gate。
+  scope 与完整 audit retention。current-image Apple 指定 readiness-pressure 已通过；完整低内存/
+  对抗性压力与 Linux Docker PID/OOM authoritative evidence 仍是 deployment gate。
 - Web 保持紧凑时间线、一个内联审批卡和一个 composer；支持真实 New Session、活动 Session
   刷新恢复、owner 设置/退出和 system/light/dark。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
@@ -356,13 +357,13 @@ exactly-once 语义。
   main/config 4）和 25 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
-Apple `container` 的 Alpha 基线验收属于提交 `9a89706`。本阶段前的已推送主机基线为
-`8117ed6`（SQLite Physical Capacity）；当前 helper shell 语法通过，现有 labeled API/Web/gateway 均为 running、
-volume 存在且 Web/API readiness 通过，但旧镜像的 `/api/v1/auth/status` 返回 `404`。包含
-Actor Boundary/API Resource Envelope/Bounded Event Feed/Point-query Durable Context/Bounded Read Models/SQLite Capacity Slice 2/SQLite Physical Capacity Slice 的上一轮新镜像构建受 BuildKit 内
-crates.io 索引更新阻塞，并在替换运行容器前安全中止；因此不声明当前
-`up/verify/restart-verify` 已通过。旧空闲 Alpha API 的只读 `resources` 快照为 2 CPU/1 GiB、
-OOM counters 0、`pids.current=6`、`pids.max=max`；它不是当前镜像、压力或 OOM 验收，也不构成
-PID 上限保证。Operation Capacity 已通过主机确定性测试，但尚未进入 current-image Apple
-build/压力验收；Linux Docker OOM authoritative acceptance 也仍待完成。
+提交 `af29089` 已构建并运行在独立 `zeus-operation-acceptance` project（端口 `18089`）；既有
+`zeus-alpha` 容器与 volume 未被替换。current-image 的 `build/up/verify/restart-verify` 均通过。
+API 限制核对为 2 CPU/1 GiB；30,000 次 readiness、并发 128 的压力结果为 2,670 个 `200`、
+27,330 个预期 operation-capacity `503`、transport error 0、约 6,677 req/s。第二轮 10,000 次、
+并发 64 的 9,586 个 `503` 全部携带 `sqlite_operation_capacity_exceeded`。压力期间/之后
+`memory.peak=97,595,392` bytes、Zeus RSS 约 23 MiB、`oom=0`、`oom_kill=0`，且 CPU quota
+发生 throttling。Apple VM 无 Swap，1.0 无 per-container PID limit 且 `pids.max=max`；因此这只
+证明当前镜像在该 Apple readiness-pressure 场景下保持有界，不替代 Linux Docker PID/OOM
+authoritative acceptance 或更低内存/对抗性压力。
 Docker Compose 当前只有静态配置检查；本机缺少 Docker CLI 时不声明 Compose build/up 已通过。

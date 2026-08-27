@@ -1,6 +1,6 @@
 # Zeus Harness Alpha+ 设计冻结
 
-状态：主机 Alpha+、Actor Boundary Foundation、API/Terminal Payload Resource Envelope、Bounded Event Feed、Point-query Durable Context、Bounded Read Models、SQLite Capacity Slice 2、SQLite Physical Capacity Slice 与 SQLite Operation Capacity Slice 已实现并通过主机全量验收；当前镜像压力与 OOM 验收待完成
+状态：主机 Alpha+、Actor Boundary Foundation、API/Terminal Payload Resource Envelope、Bounded Event Feed、Point-query Durable Context、Bounded Read Models、SQLite Capacity Slice 2、SQLite Physical Capacity Slice 与 SQLite Operation Capacity Slice 已实现并通过主机全量验收；current-image Apple 指定压力场景已通过，Linux Docker PID/OOM authoritative gate 待完成
 前置基线：`8117ed6`（SQLite Physical Capacity）
 
 ## 1. 产品术语
@@ -249,8 +249,15 @@ POST /sessions/{id}/turns
 - Apple helper 的 release API 默认 2 CPU/1 GiB，可由 `ZEUS_CONTAINER_API_CPUS` 与
   `ZEUS_CONTAINER_API_MEMORY` 调整并在创建后核对。`scripts/apple-container.sh resources` 只读
   输出 inspect、cgroup v2 与 `/proc` 证据。
-- 旧的空闲 Alpha 镜像快照观测到 2 CPU/1 GiB、OOM counters 为 0、`pids.current=6`、
-  `pids.max=max`。这是旧镜像的一次只读观测，不是当前源码镜像的压力/OOM 验收，也不构成
-  PID 上限保证；Apple `container` 1.0 没有 per-container PID-limit CLI。
-- 已推送主机基线是 `8117ed6`。Operation Capacity 有主机确定性测试，但完整低内存行为、当前
-  镜像 Apple 压力验收和 Linux Docker OOM authoritative evidence 仍是 deployment gate。
+- `af29089` 已构建为独立 `zeus-operation-acceptance` current-image 栈；它使用独立 image/network/
+  named volume 与 `18089`，未替换既有 `zeus-alpha`。`build`、`up`、`verify` 和保留 volume 的
+  `restart-verify` 均通过，栈保留运行供本地检查。
+- API 实际限制为 2 CPU/1 GiB。`/health/ready` 的 30,000 请求、并发 128 压力在 4.493 秒内
+  完成：2,670 个 `200`、27,330 个 fail-fast `503`、transport error 0。第二轮 10,000 请求、
+  并发 64 得到 414 个 `200` 与 9,586 个 `503`，所有 `503` code 都是
+  `sqlite_operation_capacity_exceeded`。
+- 压力期间及之后 cgroup `memory.peak=97,595,392` bytes（约 93 MiB），Zeus RSS 约 23 MiB，
+  `oom=0`、`oom_kill=0`；CPU throttling 证明 2 CPU quota 生效。VM 无 Swap，Apple 1.0 仍没有
+  per-container PID limit，`pids.max=max`。因此只声明该 current-image Apple readiness-pressure
+  场景通过；Linux Docker PID/OOM authoritative evidence 与更低内存/对抗性压力仍是 deployment
+  gate。

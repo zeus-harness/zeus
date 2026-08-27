@@ -574,8 +574,10 @@ now gates the main DB, active-WAL target, and filesystem headroom, subject to
 the documented WAL and `statvfs` limitations. Bounded SQLite operation
 concurrency is also implemented. A complete audit-retention horizon and
 tenant/member membership scope remain unresolved; shared-network and
-multi-tenant deployment is therefore still out of scope. Full low-memory/OOM
-and current-image container acceptance remain separate deployment gates.
+multi-tenant deployment is therefore still out of scope. The specified
+current-image Apple readiness-pressure scenario has passed; authoritative
+Linux Docker PID/OOM and adversarial low-memory acceptance remain separate
+deployment gates.
 
 ## Container images
 
@@ -692,28 +694,24 @@ creating a Session; and a valid create/turn request still settled through the
 durable worker to sequence 4 with local-fallback provenance. Rate-window and
 SSE body-drop behavior are covered by deterministic automated tests.
 
-Apple `container` remains a supported local debug path. `bash -n` passes for
-the helper. Its read-only `resources` command observed the old idle Alpha API at
-2 CPUs/1 GiB, with zero OOM counters, `pids.current=6`, and `pids.max=max`.
-Those numbers are a single snapshot of the old image, not current-image,
-pressure, or OOM acceptance, and `pids.max=max` is not a PID guarantee. A
-current read-only status check found the pre-existing labeled
-API/Web/gateway containers running and `zeus-alpha-data` present; no container
-or volume was replaced. The gateway Web/API readiness probes passed, then the
-full helper `verify` stopped at `GET /api/v1/auth/status` with `404`, confirming
-that the running image is the older Alpha baseline rather than this slice.
-The Alpha+ image rebuild on this machine stalled while updating the crates.io
-index inside BuildKit and was interrupted before any running container was
-replaced. Therefore the new image, `verify`, and named-volume `restart-verify`
-are not yet claimed as current Alpha+ acceptance. The earlier Alpha baseline
-container acceptance belongs to commit `9a89706`; the pushed host baseline
-before this slice is Physical Capacity commit `8117ed6`. No
-replacement image containing Actor Boundary, API Resource Envelope, Bounded
-Event Feed, Point-query Durable Context, Bounded Read Models, SQLite Capacity
-Slice 2, the SQLite Physical Capacity Slice, or bounded SQLite operation
-concurrency is yet verified. Host deterministic operation-gate tests have
-passed, but authoritative low-memory behavior still requires a current-image
-pressure run and Linux Docker OOM evidence.
+Apple `container` remains a supported local debug path. Commit `af29089` was
+built and accepted without replacing the pre-existing `zeus-alpha` stack. The
+isolated `zeus-operation-acceptance` stack uses its own images, network, named
+volume, and port `18089`; `build`, `up`, `verify`, and volume-retaining
+`restart-verify` all passed. It remains available locally for inspection.
+
+The current-image API was verified at 2 CPUs/1 GiB. A 30,000-request
+`/health/ready` run at concurrency 128 completed in 4.493 seconds (about 6,677
+requests/second): 2,670 responses were `200`, 27,330 were the expected
+fail-fast `503`, and there were no transport errors. A second 10,000-request
+run at concurrency 64 returned 414 `200` and 9,586 `503`; every `503` carried
+`sqlite_operation_capacity_exceeded`. During and after pressure, cgroup memory
+peak remained 97,595,392 bytes (about 93 MiB), Zeus RSS remained around 23 MiB,
+and `memory.events` reported zero `oom`/`oom_kill`. CPU throttling confirmed the
+2-CPU quota was active. Apple `container` 1.0 still exposes no per-container
+PID limit (`pids.max=max`), and the VM had no swap. This is current-image Apple
+acceptance for the stated readiness-pressure scenario, not authoritative Linux
+Docker PID/OOM or adversarial low-memory acceptance.
 
 Docker Compose configuration remains available for environments with Docker
 Compose v2; this machine currently has Apple `container` but no Docker CLI, so
