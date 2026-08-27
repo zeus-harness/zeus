@@ -6837,6 +6837,7 @@ mod tests {
     }
 
     const TEST_WORKSPACE_READ_FILE_TOOL_NAME: &str = "workspace_read_file";
+    const TEST_WORKSPACE_LIST_DIRECTORY_TOOL_NAME: &str = "workspace_list_directory";
 
     struct HistoryThenToolProvider {
         metadata: ProviderMetadata,
@@ -6962,15 +6963,28 @@ mod tests {
                                 .iter()
                                 .any(|tool| tool.name == TEST_WORKSPACE_READ_FILE_TOOL_NAME)
                         );
+                        assert!(
+                            request
+                                .tools
+                                .iter()
+                                .any(|tool| tool.name == TEST_WORKSPACE_LIST_DIRECTORY_TOOL_NAME)
+                        );
                         ReplyOutput::ToolCall {
                             call: ReplyToolCall::new(
-                                "provider-call-workspace-read-1",
-                                TEST_WORKSPACE_READ_FILE_TOOL_NAME,
-                                serde_json::json!({ "path": "src/lib.rs" }),
+                                "provider-call-workspace-list-1",
+                                TEST_WORKSPACE_LIST_DIRECTORY_TOOL_NAME,
+                                serde_json::json!({ "path": "." }),
                             ),
                         }
                     }
-                    2 => ReplyOutput::Final {
+                    2 => ReplyOutput::ToolCall {
+                        call: ReplyToolCall::new(
+                            "provider-call-workspace-read-2",
+                            TEST_WORKSPACE_READ_FILE_TOOL_NAME,
+                            serde_json::json!({ "path": "src/lib.rs" }),
+                        ),
+                    },
+                    3 => ReplyOutput::Final {
                         content: "workspace read completed".into(),
                     },
                     call => panic!("unexpected workspace Agent provider call {call}"),
@@ -7902,15 +7916,25 @@ mod tests {
             protocol::AgentTurnStatus::Succeeded,
         )
         .await;
-        assert_eq!(agent.model_steps, 2);
-        assert_eq!(agent.tool_calls, 1);
-        assert_eq!(agent.calls.len(), 1);
-        assert_eq!(agent.calls[0].tool, TEST_WORKSPACE_READ_FILE_TOOL_NAME);
-        assert!(!agent.calls[0].approval_required);
-        assert!(agent.calls[0].review.is_none());
-        assert_eq!(agent.calls[0].status, AgentToolCallStatus::Succeeded);
+        assert_eq!(agent.model_steps, 3);
+        assert_eq!(agent.tool_calls, 2);
+        assert_eq!(agent.calls.len(), 2);
+        assert_eq!(agent.calls[0].tool, TEST_WORKSPACE_LIST_DIRECTORY_TOOL_NAME);
         assert_eq!(
             agent.calls[0].output,
+            Some(serde_json::json!({
+                "path": ".",
+                "entries": [{ "name": "src", "kind": "directory" }],
+            }))
+        );
+        assert_eq!(agent.calls[1].tool, TEST_WORKSPACE_READ_FILE_TOOL_NAME);
+        for call in &agent.calls {
+            assert!(!call.approval_required);
+            assert!(call.review.is_none());
+            assert_eq!(call.status, AgentToolCallStatus::Succeeded);
+        }
+        assert_eq!(
+            agent.calls[1].output,
             Some(serde_json::json!({
                 "path": "src/lib.rs",
                 "content": "pub fn governed_workspace() {}\n",
@@ -7920,12 +7944,18 @@ mod tests {
         assert_eq!(std::fs::read_dir(&marker_root).unwrap().count(), 0);
 
         let recorded = requests.lock().unwrap().clone();
-        assert_eq!(recorded.len(), 2);
-        let tool_result = recorded[1].messages.last().unwrap();
-        assert_eq!(tool_result.role, ReplyRole::Tool);
+        assert_eq!(recorded.len(), 3);
+        let list_result = recorded[1].messages.last().unwrap();
+        assert_eq!(list_result.role, ReplyRole::Tool);
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&tool_result.content).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&list_result.content).unwrap(),
             agent.calls[0].output.clone().unwrap()
+        );
+        let read_result = recorded[2].messages.last().unwrap();
+        assert_eq!(read_result.role, ReplyRole::Tool);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&read_result.content).unwrap(),
+            agent.calls[1].output.clone().unwrap()
         );
 
         drop(app);

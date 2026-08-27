@@ -21,7 +21,8 @@ use authz::{PolicyBuildError, PolicyContext, PolicyEngine, PolicyEvaluation, Pol
 use chrono::{SecondsFormat, Utc};
 use connectors::{
     ConnectorConfigError, LOCAL_DEV_ENVIRONMENT, register_local_dev_connectors,
-    register_local_workspace_connector, workspace_read_file_descriptor,
+    register_local_workspace_connectors, workspace_list_directory_descriptor,
+    workspace_read_file_descriptor,
 };
 pub use deployment::ManifestEnvelope;
 use deployment::{
@@ -3211,16 +3212,20 @@ impl RuntimeComponents {
                     marker_root,
                 )?;
                 if let Some(workspace_root) = workspace_root {
-                    let descriptor = workspace_read_file_descriptor();
-                    policy_rules.push(PolicyRule {
-                        revision: LOCAL_POLICY_REVISION.into(),
-                        tool: descriptor.name.clone(),
-                        environment: scenario.run.environment.clone(),
-                        effect: descriptor.effect.clone(),
-                        sandbox_profile: descriptor.sandbox_profile.clone(),
-                        decision: PolicyDecision::Allow,
-                    });
-                    register_local_workspace_connector(
+                    for descriptor in [
+                        workspace_list_directory_descriptor(),
+                        workspace_read_file_descriptor(),
+                    ] {
+                        policy_rules.push(PolicyRule {
+                            revision: LOCAL_POLICY_REVISION.into(),
+                            tool: descriptor.name,
+                            environment: scenario.run.environment.clone(),
+                            effect: descriptor.effect,
+                            sandbox_profile: descriptor.sandbox_profile,
+                            decision: PolicyDecision::Allow,
+                        });
+                    }
+                    register_local_workspace_connectors(
                         &mut registry,
                         &scenario.run.environment,
                         workspace_root,

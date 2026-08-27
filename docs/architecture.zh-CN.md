@@ -388,10 +388,12 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
 - `production-guarded` profile 即使 owner 已认证，仍因真实生产 connector 缺失而保持执行禁用。
 - `dev_marker_write` 仅在 `local-development` profile 注册，只能在服务端固定目录写服务器生成的
   marker 文件；参数不能提供路径。
-- `workspace_read_file` 仅在显式配置 `ZEUS_LOCAL_WORKSPACE_ROOT` 的 `local-development`
-  profile 注册。服务启动时把该目录转换为 capability root；模型只能提交 canonical relative
-  UTF-8 path，路径穿越、符号链接、非普通文件、非 UTF-8 内容和超过 8 KiB 的文件都 fail closed。
-  该工具是 `read_only + read_only sandbox`，策略自动允许，不经过写操作审批。
+- `workspace_list_directory` 与 `workspace_read_file` 仅在显式配置
+  `ZEUS_LOCAL_WORKSPACE_ROOT` 的 `local-development` profile 注册。服务启动时把该目录转换为
+  capability root；模型只能提交 canonical relative UTF-8 path。目录发现最多返回 64 个按名称
+  排序的直接子项并标注 file/directory/symlink/other，不跟随符号链接；文件读取拒绝路径穿越、
+  符号链接、非普通文件、非 UTF-8 内容和超过 8 KiB 的文件。两个工具均为
+  `read_only + read_only sandbox`，策略自动允许，不经过写操作审批，也没有 shell 或写权限。
 - `ZEUS_DEMO_PROFILE=production-guarded` 是默认值；切到 `local-development` 时必须使用独立
   SQLite 数据库，并由 `ZEUS_LOCAL_MARKER_ROOT` 固定写入根目录。只有显式设置
   `ZEUS_LOCAL_WORKSPACE_ROOT` 时才注册只读 workspace 工具；未设置时保留原 marker-only 行为。
