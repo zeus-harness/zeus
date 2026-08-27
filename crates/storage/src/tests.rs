@@ -15,7 +15,7 @@ use deployment::{
     AgentDeployment, AgentSpec, ManifestEnvelope, ManifestPolicy, ManifestPromptBinding,
     ManifestProvider, ManifestTool,
 };
-use knowledge::{CorpusRevisionEnvelope, SelectionSnapshotEnvelope, select_context};
+use knowledge::{CorpusRevisionEnvelope, EntryRevision, SelectionSnapshotEnvelope, select_context};
 use protocol::{
     AgentToolCallStatus, AgentTurnStatus, Approval, ApprovalScope, ApprovalStatus,
     AssistantReplyKind, AssistantReplyProvenance, AttachRunRequest, CreateSessionRequest,
@@ -36,12 +36,12 @@ use crate::{
     AgentToolCompletion, AgentToolCompletionCommit, AgentTurnSpec, AuthSessionCommit,
     AuthSessionId, AuthzContext, BootstrapOwnerCommit, ClaimOutcome, CommitOutcome,
     CreateMemberCommit, DispatchCompleteCommit, DispatchJobSpec, DispatchRecoveryCommit,
-    DispatchStartCommit, DispatchStatus, MemberSetupCommit, MemberSetupToken, MembershipRevision,
-    MembershipRole, ReplyClaimOutcome, ReplyFailureCommit, ReplyJobSpec, ReplyJobStatus,
-    ReplyOutcomeUnknownCommit, ReplySuccessCommit, ReviewCommit, RotateMemberSetupTokenCommit,
-    RunSnapshot, RuntimeIdentity, SqliteOperationLimits, SqlitePhysicalLimits, SqliteStore,
-    StorageError, StorageLimits, StoredMembershipStatus, StoredUserRole, StoredUserStatus,
-    TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
+    DispatchStartCommit, DispatchStatus, KnowledgeCatalogCommit, MemberSetupCommit,
+    MemberSetupToken, MembershipRevision, MembershipRole, ReplyClaimOutcome, ReplyFailureCommit,
+    ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit, ReplySuccessCommit, ReviewCommit,
+    RotateMemberSetupTokenCommit, RunSnapshot, RuntimeIdentity, SqliteOperationLimits,
+    SqlitePhysicalLimits, SqliteStore, StorageError, StorageLimits, StoredMembershipStatus,
+    StoredUserRole, StoredUserStatus, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
@@ -1633,7 +1633,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
     assert_eq!(
         versions,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
         ]
     );
     let owner: Option<String> = connection
@@ -1775,7 +1775,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
     assert_eq!(
         run_event_payloads(database.path(), &long_run_id),
         payloads_before,
-        "v9-v22 migrations must not rewrite immutable event payloads"
+        "v9-v23 migrations must not rewrite immutable event payloads"
     );
     let connection = rusqlite::Connection::open(database.path()).unwrap();
     let version: i64 = connection
@@ -1783,7 +1783,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 22);
+    assert_eq!(version, 23);
     let configured_account: (String, String, String, i64) = connection
         .query_row(
             r#"SELECT
@@ -2309,7 +2309,7 @@ async fn v12_identity_and_run_crash_prefix_migrates_then_recovers_the_primary_se
     assert_eq!(
         recovered,
         (
-            22,
+            23,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into()
@@ -4056,7 +4056,7 @@ async fn v5_configured_database_migrates_to_the_local_owner_membership() {
     assert_eq!(
         migrated,
         (
-            22,
+            23,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into(),
@@ -4182,7 +4182,7 @@ async fn v13_configured_active_work_migrates_with_account_authority_and_exact_vo
             },
         )
         .unwrap();
-    assert_eq!(migrated_counts, (22, 1, 1, 2, 1));
+    assert_eq!(migrated_counts, (23, 1, 1, 2, 1));
 }
 
 #[tokio::test]
@@ -4544,7 +4544,7 @@ async fn v14_database_migrates_through_v19_with_member_and_audit_roots() {
             },
         )
         .unwrap();
-    assert_eq!(state, (22, 1, 1, 1, 19));
+    assert_eq!(state, (23, 1, 1, 1, 19));
 }
 
 #[tokio::test]
@@ -4583,7 +4583,7 @@ async fn v15_migration_seeds_the_configured_audit_detail_limit() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (22, 2));
+    assert_eq!(state, (23, 2));
 }
 
 #[tokio::test]
@@ -4628,7 +4628,7 @@ async fn v15_reopen_rejects_a_lower_audit_detail_limit_without_mutating_policy()
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (22, 4));
+    assert_eq!(state, (23, 4));
     drop(connection);
 
     let reopened = SqliteStore::open_with_limits(database.path(), original_limits)
@@ -4788,6 +4788,274 @@ async fn readiness_rejects_a_weakened_v22_knowledge_trigger_definition() {
             if message == "durability trigger `agent_turns_require_knowledge_context` differs from the authoritative migration"),
         "unexpected weakened-trigger error: {error:?}"
     );
+}
+
+#[tokio::test]
+async fn knowledge_catalog_is_owner_governed_idempotent_and_active_for_members() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    let member = provision_test_member_for_reply(&store).await;
+
+    let initial = store
+        .knowledge_catalog_for_admin(&owner_authz())
+        .await
+        .unwrap();
+    assert_eq!(initial.account_id, AccountId::local());
+    assert_eq!(initial.revision, 0);
+    assert!(initial.corpus.entries().is_empty());
+    assert_eq!(initial.updated_by_user_id, None);
+    assert!(
+        store
+            .active_knowledge_corpus_for_actor(&member)
+            .await
+            .unwrap()
+            .entries()
+            .is_empty()
+    );
+    assert!(matches!(
+        store.knowledge_catalog_for_admin(&member).await,
+        Err(StorageError::PermissionDenied)
+    ));
+
+    let first_corpus = CorpusRevisionEnvelope::new(vec![
+        EntryRevision::new(
+            "operations-handbook",
+            "1",
+            "Operations handbook",
+            "Zeus escalates production incidents through an owner-approved run.",
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let first_commit = KnowledgeCatalogCommit {
+        expected_revision: 0,
+        corpus: first_corpus.clone(),
+        idempotency_key: "knowledge-catalog-first".into(),
+    };
+    assert!(matches!(
+        store
+            .replace_knowledge_catalog(&member, first_commit.clone())
+            .await,
+        Err(StorageError::PermissionDenied)
+    ));
+
+    let committed = store
+        .replace_knowledge_catalog(&owner_authz(), first_commit.clone())
+        .await
+        .unwrap();
+    assert!(!committed.replayed);
+    assert_eq!(committed.catalog.revision, 1);
+    assert_eq!(committed.catalog.corpus, first_corpus);
+    assert_eq!(
+        committed.catalog.updated_by_user_id.as_deref(),
+        Some("user-owner")
+    );
+
+    let replay = store
+        .replace_knowledge_catalog(&owner_authz(), first_commit.clone())
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.catalog, committed.catalog);
+
+    let second_corpus = CorpusRevisionEnvelope::new(vec![
+        EntryRevision::new(
+            "operations-handbook",
+            "2",
+            "Operations handbook",
+            "Zeus binds every incident action to an immutable execution epoch.",
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    assert!(matches!(
+        store
+            .replace_knowledge_catalog(
+                &owner_authz(),
+                KnowledgeCatalogCommit {
+                    expected_revision: 1,
+                    corpus: second_corpus.clone(),
+                    idempotency_key: first_commit.idempotency_key.clone(),
+                },
+            )
+            .await,
+        Err(StorageError::IdempotencyConflict)
+    ));
+    assert!(matches!(
+        store
+            .replace_knowledge_catalog(
+                &owner_authz(),
+                KnowledgeCatalogCommit {
+                    expected_revision: 0,
+                    corpus: second_corpus.clone(),
+                    idempotency_key: "knowledge-catalog-stale".into(),
+                },
+            )
+            .await,
+        Err(StorageError::KnowledgeCatalogRevisionConflict)
+    ));
+    assert!(matches!(
+        store
+            .replace_knowledge_catalog(
+                &owner_authz(),
+                KnowledgeCatalogCommit {
+                    expected_revision: 1,
+                    corpus: first_corpus,
+                    idempotency_key: "knowledge-catalog-same-active".into(),
+                },
+            )
+            .await,
+        Err(StorageError::InvalidKnowledgeCatalog(message))
+            if message == "the replacement corpus is already active"
+    ));
+
+    let second = store
+        .replace_knowledge_catalog(
+            &owner_authz(),
+            KnowledgeCatalogCommit {
+                expected_revision: 1,
+                corpus: second_corpus.clone(),
+                idempotency_key: "knowledge-catalog-second".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.catalog.revision, 2);
+    assert_eq!(
+        store
+            .active_knowledge_corpus_for_actor(&member)
+            .await
+            .unwrap(),
+        second_corpus
+    );
+    store.verify_integrity().await.unwrap();
+    drop(store);
+
+    let reopened = SqliteStore::open(database.path()).await.unwrap();
+    let durable = reopened
+        .knowledge_catalog_for_admin(&owner_authz())
+        .await
+        .unwrap();
+    assert_eq!(durable, second.catalog);
+    reopened.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn knowledge_catalog_receipt_tampering_fails_deep_readiness() {
+    let database = TestDatabase::new();
+    {
+        let store = created_owned_file_session_store(database.path()).await;
+        let corpus = CorpusRevisionEnvelope::new(vec![
+            EntryRevision::new(
+                "tamper-evidence",
+                "1",
+                "Tamper evidence",
+                "Catalog receipts commit the expected revision and corpus digest.",
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        store
+            .replace_knowledge_catalog(
+                &owner_authz(),
+                KnowledgeCatalogCommit {
+                    expected_revision: 0,
+                    corpus,
+                    idempotency_key: "knowledge-catalog-tamper".into(),
+                },
+            )
+            .await
+            .unwrap();
+        store.verify_integrity().await.unwrap();
+    }
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let reject_update = stored_trigger_sql(&connection, "knowledge_catalog_receipts_reject_update");
+    connection
+        .execute_batch("DROP TRIGGER knowledge_catalog_receipts_reject_update;")
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE knowledge_catalog_receipts
+               SET request_fingerprint = '{"expected_revision":99,"corpus_digest":"0000000000000000000000000000000000000000000000000000000000000000"}'
+               WHERE account_id = 'acc_local' AND catalog_revision = 1"#,
+            [],
+        )
+        .unwrap();
+    connection.execute_batch(&reject_update).unwrap();
+    drop(connection);
+
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("a forged catalog receipt must fail deep readiness"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(&error, StorageError::CorruptData(message)
+            if message == "knowledge catalog `acc_local` receipt chain is inconsistent"),
+        "unexpected catalog-tamper error: {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn knowledge_catalog_rejects_the_first_corpus_beyond_its_history_capacity() {
+    let store = created_owned_session_store().await;
+    for revision in 0_u64..128 {
+        let corpus = CorpusRevisionEnvelope::new(vec![
+            EntryRevision::new(
+                "bounded-history",
+                (revision + 1).to_string(),
+                "Bounded knowledge history",
+                format!("Immutable account knowledge revision {}", revision + 1),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let result = store
+            .replace_knowledge_catalog(
+                &owner_authz(),
+                KnowledgeCatalogCommit {
+                    expected_revision: revision,
+                    corpus,
+                    idempotency_key: format!("knowledge-capacity-{revision}"),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.catalog.revision, revision + 1);
+    }
+
+    let rejected = CorpusRevisionEnvelope::new(vec![
+        EntryRevision::new(
+            "bounded-history",
+            "129",
+            "Bounded knowledge history",
+            "The first corpus beyond the durable history limit must not commit",
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    assert!(matches!(
+        store
+            .replace_knowledge_catalog(
+                &owner_authz(),
+                KnowledgeCatalogCommit {
+                    expected_revision: 128,
+                    corpus: rejected,
+                    idempotency_key: "knowledge-capacity-overflow".into(),
+                },
+            )
+            .await,
+        Err(StorageError::StorageQuotaExceeded)
+    ));
+    assert_eq!(
+        store
+            .knowledge_catalog_for_admin(&owner_authz())
+            .await
+            .unwrap()
+            .revision,
+        128
+    );
+    store.verify_integrity().await.unwrap();
 }
 
 #[tokio::test]
@@ -6094,7 +6362,7 @@ async fn v19_agent_manifest_is_canonical_actor_scoped_reused_and_secret_free() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(version, 22);
+    assert_eq!(version, 23);
     assert_eq!(
         manifest_rows, 1,
         "the identical manifest must be deduplicated"
@@ -16450,7 +16718,7 @@ async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempot
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, (1_i64..=22).collect::<Vec<_>>());
+    assert_eq!(versions, (1_i64..=23).collect::<Vec<_>>());
     assert_eq!(
         connection
             .query_row(
@@ -19180,6 +19448,14 @@ fn drop_v21_fixture_objects(connection: &rusqlite::Connection) {
 }
 
 fn drop_v22_fixture_objects(connection: &rusqlite::Connection) {
+    let version: i64 = connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    if version >= 23 {
+        drop_v23_fixture_objects(connection);
+    }
     rewrite_v22_native_execution_facts_for_v20(connection);
     let schema_reject_update = migration_trigger_sql(
         include_str!("../migrations/0020_agent_execution_ledger.sql"),
@@ -19239,6 +19515,34 @@ fn drop_v22_fixture_objects(connection: &rusqlite::Connection) {
     connection.execute_batch(agent_identity).unwrap();
     connection.execute_batch(model_current_step).unwrap();
     connection.execute_batch(model_input).unwrap();
+}
+
+fn drop_v23_fixture_objects(connection: &rusqlite::Connection) {
+    let schema_reject_update = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_update",
+    );
+    let schema_reject_delete = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_delete",
+    );
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER schema_migrations_reject_update;
+               DROP TRIGGER schema_migrations_reject_delete;
+               DROP TRIGGER account_knowledge_catalogs_require_current_owner;
+               DROP TRIGGER account_knowledge_catalogs_enforce_revision;
+               DROP TRIGGER account_knowledge_catalogs_reject_delete;
+               DROP TRIGGER knowledge_catalog_receipts_require_current_owner;
+               DROP TRIGGER knowledge_catalog_receipts_reject_update;
+               DROP TRIGGER knowledge_catalog_receipts_reject_delete;
+               DROP TABLE knowledge_catalog_receipts;
+               DROP TABLE account_knowledge_catalogs;
+               DELETE FROM schema_migrations WHERE version = 23;"#,
+        )
+        .unwrap();
+    connection.execute_batch(schema_reject_update).unwrap();
+    connection.execute_batch(schema_reject_delete).unwrap();
 }
 
 fn rewrite_v22_native_execution_facts_for_v20(connection: &rusqlite::Connection) {

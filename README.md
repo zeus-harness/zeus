@@ -592,7 +592,9 @@ and bounded memory, CPU, and PID resources.
   deterministic selection snapshot, canonical context, initial model job, and
   execution-origin fact. The exact pre-v22 Agent set is sealed during migration
   by a domain-separated count+digest commitment; unbound legacy work remains
-  readable but cannot execute.
+  readable but cannot execute. Schema v23 adds an owner-governed, revisioned
+  account knowledge catalog, immutable ingestion receipts, and a bounded active
+  corpus projection consumed by every newly admitted owner or member Agent.
   Manifest-bound system-prompt v1 uses the existing optional manifest prompt
   field and immutable request JSON, so it requires no database migration.
   Previously queued promptless Agent work no longer matches the current
@@ -610,9 +612,11 @@ digest-bearing selection snapshot. Schema v22 persists the exact corpus,
 snapshot, canonical context, Agent/job binding, and execution admission digests;
 replay never reselects from live state. The provider contract carries the
 context as a distinct durable `context` role, mapped to a separate `user`
-message only at the OpenAI-compatible wire boundary. The current runtime
-deliberately admits an explicit empty corpus until an account knowledge catalog
-and ingestion surface are implemented.
+message only at the OpenAI-compatible wire boundary. Schema v23 exposes the
+account catalog through an owner-only ingestion API. Revision zero is an
+implicit empty corpus; after the first committed replacement, Agent admission
+selects from the active durable revision and still persists the exact corpus and
+selection snapshot, so later catalog updates cannot rewrite an existing turn.
 
 SQLite is the authoritative store for this local single-instance Alpha. Do not
 place it on NFS or share one database volume between multiple Zeus replicas.
@@ -671,6 +675,13 @@ directly.
   The NDJSON export is fully collected and validated before its `200` response
   and fails above 96 MiB; a checkpoint is an operator assertion, not proof that
   an external archive exists.
+- Owner-only `GET/PUT /api/v1/knowledge/catalog` reads or atomically replaces
+  the active account corpus. `PUT` accepts `expected_revision` and validated
+  immutable `entries`, requires a canonical `Idempotency-Key`, and returns the
+  committed catalog revision plus `replayed`. Stale revision returns
+  `409 knowledge_catalog_revision_conflict`; the same key with different input
+  returns the normal idempotency conflict. Ordinary members cannot administer
+  the catalog, but their newly admitted Agents read its active corpus.
 - `GET /api/v1/me/settings` returns the current safe preferences.
   `PATCH /api/v1/me/settings` accepts `theme`, optional allowlisted
   `preferred_model`, and `expected_revision`. Provider endpoints and API keys
@@ -746,7 +757,9 @@ directly.
   token. Malformed input returns 400,
   oversized JSON returns 413, a wrong content type returns 415, schema mismatch
   or unknown fields return 422, and capacity/rate rejection returns 429.
-  Durable capacity problems use `storage_quota_exceeded`,
+  Knowledge catalog replacement is the exception among owner administration
+  commands: it has its own durable idempotency receipt. Durable capacity
+  problems use `storage_quota_exceeded`,
   `reply_queue_capacity_exceeded`, `dispatch_queue_capacity_exceeded`, or
   `auth_session_capacity_exceeded` with `Cache-Control: no-store`; reply and
   dispatch queue responses also return `Retry-After: 2`.
@@ -765,11 +778,12 @@ directly.
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Current schema v22 retains durable Run attachment during migration and demo
+Current schema v23 retains durable Run attachment during migration and demo
 seeding, but Alpha+ does not expose a public attach-Run HTTP route.
 
-The application boundary now caps auth JSON at 8 KiB and command JSON at
-512 KiB. Newly created Session and turn IDs are capped at 128 UTF-8 bytes;
+The application boundary now caps auth JSON at 8 KiB, command JSON at 512 KiB,
+and knowledge-catalog JSON at 2 MiB plus 4 KiB of request-envelope headroom.
+Newly created Session and turn IDs are capped at 128 UTF-8 bytes;
 Session titles at 256 bytes; user and assistant messages at 64 KiB; and review
 notes at 8 KiB. A typed reply response is capped at 512 KiB; provider, model,
 finish-reason, failure-code, and tool digest/code fields are capped at 128
@@ -786,7 +800,7 @@ approval, dispatch, reply completion, attachment checks, and startup recovery
 use typed point queries or fixed 64-row batches. Production Session list/detail,
 Run detail, and overview reads now use indexed `LIMIT + 1` keyset pages inside
 actor-authorized SQLite snapshots; no production HTTP read loads a complete
-ledger or collection. Current schema v22 retains bounded Session, open-turn,
+ledger or collection. Current schema v23 retains bounded Session, open-turn,
 active reply/dispatch, auth-session, bootstrap-audit, event-slot, and logical
 event-payload-byte admission. Exact idempotent replay is checked before capacity,
 while accepted work consumes its reserved terminal slots and payload bytes
@@ -867,13 +881,14 @@ Membership Foundation, schema v14 Account-scoped Durable Authorization, and
 schema v15 Member Lifecycle / Account Audit, schema v16 Session Reply Context
 Index, schema v17 Durable Session Agent Loop, schema v18 exact tool-completion
 replay, schema v19 deployment-manifest binding, schema v20 execution-ledger,
-schema v21 prepared claims, and schema v22 durable knowledge-context binding:
+schema v21 prepared claims, schema v22 durable knowledge-context binding, and
+schema v23 account knowledge catalog ingestion:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 539 tests passed
+- `cargo test --workspace --all-targets --locked`: 543 tests passed
   under the existing project counting convention, including 8 deployment tests,
-  29 knowledge tests, 242 storage tests, 48 runtime tests, 64 API library tests, 6 API main/config
+  29 knowledge tests, 245 storage tests, 48 runtime tests, 65 API library tests, 6 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,

@@ -38,7 +38,8 @@ use crate::{
     AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, BoundedRunRead,
     ClaimOutcome, CommitOutcome, CreateMemberCommit, CreateMemberResult, DispatchCompleteCommit,
     DispatchContext, DispatchJob, DispatchJobSpec, DispatchRecoveryCommit, DispatchRejection,
-    DispatchStartCommit, DispatchStatus, InFlightWorkSummary, MEMBER_SETUP_TOKEN_TTL_SECONDS,
+    DispatchStartCommit, DispatchStatus, InFlightWorkSummary, KnowledgeCatalogCommit,
+    KnowledgeCatalogState, KnowledgeCatalogUpdateResult, MEMBER_SETUP_TOKEN_TTL_SECONDS,
     MemberSetupCommit, MemberSetupResult, MemberTransitionResult, MembershipRevision,
     MembershipRole, RecoveredSessionTurn, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit,
     ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
@@ -50,7 +51,7 @@ use crate::{
     UpdateAccountAuditPolicyCommit,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 22;
+const CURRENT_SCHEMA_VERSION: i64 = 23;
 const LOCAL_ACCOUNT_ID: &str = "acc_local";
 const EVENT_PAYLOAD_VERSION_V1: i64 = 1;
 const EVENT_PAYLOAD_VERSION_V2: i64 = 2;
@@ -79,6 +80,7 @@ const MIGRATION_0019: &str = include_str!("../migrations/0019_agent_deployment_m
 const MIGRATION_0020: &str = include_str!("../migrations/0020_agent_execution_ledger.sql");
 const MIGRATION_0021: &str = include_str!("../migrations/0021_agent_operation_claims.sql");
 const MIGRATION_0022: &str = include_str!("../migrations/0022_agent_knowledge_context.sql");
+const MIGRATION_0023: &str = include_str!("../migrations/0023_account_knowledge_catalog.sql");
 const MIGRATION_0022_TRIGGER_NAMES: &[&str] = &[
     "knowledge_corpus_revisions_reject_update",
     "knowledge_corpus_revisions_reject_delete",
@@ -94,6 +96,14 @@ const MIGRATION_0022_TRIGGER_NAMES: &[&str] = &[
     "agent_turns_reject_identity_update",
     "agent_model_jobs_require_current_step",
     "agent_model_jobs_reject_input_update",
+];
+const MIGRATION_0023_TRIGGER_NAMES: &[&str] = &[
+    "account_knowledge_catalogs_require_current_owner",
+    "account_knowledge_catalogs_enforce_revision",
+    "account_knowledge_catalogs_reject_delete",
+    "knowledge_catalog_receipts_require_current_owner",
+    "knowledge_catalog_receipts_reject_update",
+    "knowledge_catalog_receipts_reject_delete",
 ];
 const RECOVERY_BATCH_LIMIT: i64 = 64;
 const AUTH_SESSION_CLEANUP_BATCH_LIMIT: i64 = 64;
@@ -1362,6 +1372,48 @@ impl SqliteStore {
                 expected_revision,
                 &theme,
                 preferred_model.as_deref(),
+                &physical_limits,
+            )
+        })
+        .await
+    }
+
+    pub async fn knowledge_catalog_for_admin(
+        &self,
+        context: &AuthzContext,
+    ) -> Result<KnowledgeCatalogState, StorageError> {
+        let context = validated_authz_context(context)?;
+        self.with_connection(move |connection| {
+            agent::query_account_knowledge_catalog_for_admin(connection, &context)
+        })
+        .await
+    }
+
+    pub async fn active_knowledge_corpus_for_actor(
+        &self,
+        context: &AuthzContext,
+    ) -> Result<knowledge::CorpusRevisionEnvelope, StorageError> {
+        let context = validated_authz_context(context)?;
+        self.with_connection(move |connection| {
+            agent::query_active_knowledge_corpus_for_actor(connection, &context)
+        })
+        .await
+    }
+
+    pub async fn replace_knowledge_catalog(
+        &self,
+        context: &AuthzContext,
+        commit: KnowledgeCatalogCommit,
+    ) -> Result<KnowledgeCatalogUpdateResult, StorageError> {
+        let context = validated_authz_context(context)?;
+        let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            agent::replace_account_knowledge_catalog(
+                connection,
+                &context,
+                commit,
+                &limits,
                 &physical_limits,
             )
         })
@@ -2894,6 +2946,13 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
             params![22, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 23 {
+        transaction.execute_batch(MIGRATION_0023)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![23, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
     // The execution verifier now understands the v22 knowledge binding. Run
     // it only after every missing schema step has been installed so upgrades
     // from v19 and older never query a column that does not exist yet. This
@@ -2901,6 +2960,7 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
     // still rolls the entire upgrade back.
     if current < CURRENT_SCHEMA_VERSION {
         agent::verify_agent_knowledge_context_integrity(&transaction)?;
+        agent::verify_account_knowledge_catalog_integrity(&transaction)?;
         execution::verify_agent_execution_integrity(&transaction)?;
     }
     validate_configured_account_audit_policies(&transaction, limits)?;
@@ -3554,12 +3614,13 @@ fn readiness(
                'agent_execution_events', 'agent_execution_heads',
                'agent_operation_claims', 'knowledge_corpus_revisions',
                'agent_knowledge_contexts', 'agent_knowledge_legacy_boundary',
-               'agent_knowledge_legacy_agents'
+               'agent_knowledge_legacy_agents', 'account_knowledge_catalogs',
+               'knowledge_catalog_receipts'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if table_count != 40 {
+    if table_count != 42 {
         return Err(StorageError::CorruptData(
             "one or more required tables are missing".into(),
         ));
@@ -3681,6 +3742,28 @@ fn readiness(
     if agent_knowledge_columns != 34 {
         return Err(StorageError::CorruptData(
             "Agent knowledge context schema is missing".into(),
+        ));
+    }
+
+    let knowledge_catalog_columns: i64 = connection.query_row(
+        r#"SELECT
+               (SELECT COUNT(*) FROM pragma_table_info('account_knowledge_catalogs')
+                WHERE name IN (
+                    'account_id', 'revision', 'active_corpus_digest',
+                    'updated_by_user_id', 'updated_by_membership_revision', 'updated_at'
+                ))
+             + (SELECT COUNT(*) FROM pragma_table_info('knowledge_catalog_receipts')
+                WHERE name IN (
+                    'account_id', 'actor_user_id', 'actor_membership_revision',
+                    'idempotency_key', 'request_fingerprint', 'catalog_revision',
+                    'corpus_digest', 'created_at'
+                ))"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if knowledge_catalog_columns != 14 {
+        return Err(StorageError::CorruptData(
+            "account knowledge catalog schema is missing".into(),
         ));
     }
 
@@ -3811,12 +3894,14 @@ fn readiness(
                'agent_knowledge_contexts_corpus_idx',
                'agent_turns_knowledge_context_idx',
                'agent_model_jobs_knowledge_context_idx',
-               'agent_tool_calls_one_per_model_step_idx'
+               'agent_tool_calls_one_per_model_step_idx',
+               'account_knowledge_catalogs_active_corpus_idx',
+               'knowledge_catalog_receipts_corpus_idx'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if point_query_indexes != 66 {
+    if point_query_indexes != 68 {
         return Err(StorageError::CorruptData(
             "one or more point-query indexes are missing".into(),
         ));
@@ -3976,18 +4061,25 @@ fn readiness(
                'agent_knowledge_legacy_agents_reject_update',
                'agent_knowledge_legacy_agents_reject_delete',
                'agent_turns_require_knowledge_context',
+               'account_knowledge_catalogs_require_current_owner',
+               'account_knowledge_catalogs_enforce_revision',
+               'account_knowledge_catalogs_reject_delete',
+               'knowledge_catalog_receipts_require_current_owner',
+               'knowledge_catalog_receipts_reject_update',
+               'knowledge_catalog_receipts_reject_delete',
                'schema_migrations_reject_update',
                'schema_migrations_reject_delete'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 129 {
+    if trigger_count != 135 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
         ));
     }
     verify_migration_trigger_definitions(connection, MIGRATION_0022, MIGRATION_0022_TRIGGER_NAMES)?;
+    verify_migration_trigger_definitions(connection, MIGRATION_0023, MIGRATION_0023_TRIGGER_NAMES)?;
 
     let agent_pending_call_fk: i64 = connection.query_row(
         r#"SELECT COUNT(*)
@@ -4538,6 +4630,7 @@ fn readiness(
     }
     agent::verify_agent_deployment_manifest_integrity(connection)?;
     agent::verify_agent_knowledge_context_integrity(connection)?;
+    agent::verify_account_knowledge_catalog_integrity(connection)?;
     execution::verify_agent_execution_integrity(connection)?;
     let (user_count, owner_count): (i64, i64) = connection.query_row(
         r#"SELECT (SELECT COUNT(*) FROM users),

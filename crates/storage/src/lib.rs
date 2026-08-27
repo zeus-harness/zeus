@@ -530,6 +530,36 @@ pub struct AgentKnowledgeContextSpec {
     pub snapshot: SelectionSnapshotEnvelope,
 }
 
+/// Current account-scoped knowledge catalog projection.
+///
+/// Revision zero is the implicit, unconfigured empty corpus. Once configured,
+/// every positive revision is backed by one immutable corpus and one durable
+/// idempotency receipt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct KnowledgeCatalogState {
+    pub account_id: AccountId,
+    pub revision: u64,
+    pub corpus: CorpusRevisionEnvelope,
+    pub updated_by_user_id: Option<String>,
+    pub updated_by_membership_revision: Option<MembershipRevision>,
+    pub updated_at: Option<String>,
+}
+
+/// Persistence-ready replacement of the active account knowledge corpus.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KnowledgeCatalogCommit {
+    pub expected_revision: u64,
+    pub corpus: CorpusRevisionEnvelope,
+    pub idempotency_key: String,
+}
+
+/// Exact catalog revision returned by a committed or replayed ingestion.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct KnowledgeCatalogUpdateResult {
+    pub catalog: KnowledgeCatalogState,
+    pub replayed: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentModelJobStatus {
     Queued,

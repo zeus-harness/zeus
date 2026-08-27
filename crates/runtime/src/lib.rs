@@ -30,6 +30,7 @@ use kernel::{
     DemoScenario, KernelError, LOCAL_POLICY_REVISION, PRODUCTION_POLICY_REVISION, apply_review,
     apply_tool_result, start_tool_dispatch,
 };
+pub use knowledge::EntryRevision;
 use knowledge::{CorpusRevisionEnvelope, SelectionSnapshotEnvelope, select_context};
 use protocol::{
     Approval, ApprovalStatus, AssistantReplyKind, AttachRunRequest, AttachRunResponse,
@@ -54,11 +55,12 @@ pub use storage::{
     AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurn,
     AgentTurnEnqueueResponse, AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal,
     AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, CreateMemberResult,
-    InFlightWorkSummary, MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit, MemberSetupResult,
-    MemberSetupToken, MemberTransitionResult, MembershipRevision, MembershipRole,
-    ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse,
-    ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit, ReplySuccessCommit,
-    RotateMemberSetupTokenResult, SessionSummaryPage, SqliteOperationLimits,
+    InFlightWorkSummary, KnowledgeCatalogCommit, KnowledgeCatalogState,
+    KnowledgeCatalogUpdateResult, MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit,
+    MemberSetupResult, MemberSetupToken, MemberTransitionResult, MembershipRevision,
+    MembershipRole, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit, ReplyJob,
+    ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
+    ReplySuccessCommit, RotateMemberSetupTokenResult, SessionSummaryPage, SqliteOperationLimits,
     SqliteOperationLimitsError, SqlitePhysicalLimits, SqlitePhysicalLimitsError, StorageLimits,
     StorageLimitsError, StoredCredential, StoredMember, StoredMemberPage, StoredMembershipStatus,
     StoredPreferences, StoredUser, StoredUserRole, StoredUserStatus, TransitionMemberCommit,
@@ -393,6 +395,10 @@ pub enum StoreError {
     AuditPolicyConflict,
     #[error("the account audit archive checkpoint changed concurrently or is invalid")]
     AuditCheckpointConflict,
+    #[error("the account knowledge catalog revision changed concurrently")]
+    KnowledgeCatalogRevisionConflict,
+    #[error("invalid account knowledge catalog: {0}")]
+    InvalidKnowledgeCatalog(String),
     #[error("the durable storage quota is exhausted")]
     StorageQuotaExceeded,
     #[error("SQLite physical storage cannot safely accept this operation")]
@@ -488,6 +494,10 @@ impl From<StorageError> for StoreError {
             StorageError::AuditArchiveRequired => Self::AuditArchiveRequired,
             StorageError::AuditPolicyConflict => Self::AuditPolicyConflict,
             StorageError::AuditCheckpointConflict => Self::AuditCheckpointConflict,
+            StorageError::KnowledgeCatalogRevisionConflict => {
+                Self::KnowledgeCatalogRevisionConflict
+            }
+            StorageError::InvalidKnowledgeCatalog(detail) => Self::InvalidKnowledgeCatalog(detail),
             StorageError::StorageQuotaExceeded => Self::StorageQuotaExceeded,
             StorageError::PhysicalStorageExhausted => Self::PhysicalStorageExhausted,
             StorageError::OperationCapacityExceeded => Self::OperationCapacityExceeded,
@@ -814,17 +824,18 @@ impl DemoStore {
         SESSION_AGENT_SYSTEM_PROMPT
     }
 
-    /// Select the immutable knowledge context admitted with one Session Agent turn.
-    ///
-    /// The first core delivery intentionally uses an explicit empty corpus
-    /// revision until an account knowledge catalog is exposed. Even this empty
-    /// selection is deterministic, digest-bound, and replayed from storage.
-    pub fn session_agent_knowledge_context(
+    /// Select the immutable active account knowledge context admitted with one
+    /// Session Agent turn. The catalog read is capability-gated; the resulting
+    /// corpus and exact query selection are persisted with the Agent admission.
+    pub async fn session_agent_knowledge_context(
         &self,
+        context: &AuthzContext,
         user_message: &str,
     ) -> Result<AgentKnowledgeContextSpec, StoreError> {
-        let corpus = CorpusRevisionEnvelope::new(Vec::new())
-            .map_err(|error| StoreError::InvalidAgentTransition(error.to_string()))?;
+        let corpus = self
+            .storage
+            .active_knowledge_corpus_for_actor(context)
+            .await?;
         let snapshot = select_context(user_message, corpus.entries())
             .and_then(SelectionSnapshotEnvelope::new)
             .map_err(|error| StoreError::InvalidAgentTransition(error.to_string()))?;
@@ -1181,6 +1192,35 @@ impl DemoStore {
         Ok(self
             .storage
             .update_preferences(context, expected_revision, theme, preferred_model)
+            .await?)
+    }
+
+    pub async fn knowledge_catalog_for_admin(
+        &self,
+        context: &AuthzContext,
+    ) -> Result<KnowledgeCatalogState, StoreError> {
+        Ok(self.storage.knowledge_catalog_for_admin(context).await?)
+    }
+
+    pub async fn replace_knowledge_catalog(
+        &self,
+        context: &AuthzContext,
+        expected_revision: u64,
+        entries: Vec<EntryRevision>,
+        idempotency_key: String,
+    ) -> Result<KnowledgeCatalogUpdateResult, StoreError> {
+        let corpus = CorpusRevisionEnvelope::new(entries)
+            .map_err(|error| StoreError::InvalidKnowledgeCatalog(error.to_string()))?;
+        Ok(self
+            .storage
+            .replace_knowledge_catalog(
+                context,
+                KnowledgeCatalogCommit {
+                    expected_revision,
+                    corpus,
+                    idempotency_key,
+                },
+            )
             .await?)
     }
 

@@ -4,7 +4,7 @@
 Event Feed、Point-query Durable Context、Bounded Read Models、SQLite Capacity Slice 2、SQLite
 Physical/Operation Capacity、Bootstrap Audit Retention、schema v13 Account Membership
 Foundation、schema v14 Account-scoped Durable Authorization、schema v15 Member Lifecycle /
-Account Audit、schema v16 Session Reply Context Index 至 schema v22 Durable Knowledge Context 已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
+Account Audit、schema v16 Session Reply Context Index 至 schema v23 Account Knowledge Catalog 已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
 v11→v12→v13→v14 迁移证据，current-image 证据见本节验收结果，Linux Docker PID/OOM
 authoritative gate 待完成。
 
@@ -278,14 +278,20 @@ POST /sessions/{id}/turns
   snapshot、canonical context 与 Agent/initial-job/execution admission digest；迁移时冻结 exact
   legacy Agent 集合并写入 domain-separated count+digest commitment，防止 post-v22 binding 被剥离后
   伪装为 legacy。
+- `0023_account_knowledge_catalog.sql`：增加 account active corpus head 和 actor-scoped ingestion
+  receipt。Owner 通过 expected revision CAS 与 canonical `Idempotency-Key` 原子替换 catalog，
+  mutation 同事务写 account audit；revision 0 是不落库的隐式空 catalog。Head revision 最多 256，
+  每个 account 最多保留 128 个不同 corpus revision 与 64 MiB canonical envelope。
 
 Manifest-bound system prompt v1 复用 `0019` 已有的可选 prompt 字段和 immutable request JSON，
 不增加 schema migration。升级后旧 queued promptless Agent work 与当前 deployment 不一致，首次
 进入 claim 时 fail closed；terminal history 保持可读。Knowledge v1 生成独立、受治理、带完整
 digest 的 canonical context snapshot，不修改稳定 system prompt。schema v22 已完成数据库绑定、
 Agent request 注入和 exact replay；LLM 协议层使用独立 durable `context` role，并只在
-OpenAI-compatible provider wire 上映射为另一条 `user` message。当前 runtime 使用显式空 corpus，
-真实 account knowledge catalog 与 ingestion surface 是下一阶段。
+OpenAI-compatible provider wire 上映射为另一条 `user` message。schema v23 已完成 owner-only
+`GET/PUT /api/v1/knowledge/catalog`、持久 revision/idempotency receipt、权限与篡改校验。未配置时
+runtime 使用隐式空 corpus；配置后 owner/member 的新 Agent 从 active corpus 做确定性选择，并把
+exact corpus/snapshot 固化到该 Agent，之后的 catalog 更新不会改写旧 turn。
 
 迁移必须原地保留 Alpha append-only ledger、事件外键与 runtime identity。任何一步失败都回滚整个 migration transaction。
 
@@ -340,7 +346,7 @@ OpenAI-compatible provider wire 上映射为另一条 `user` message。当前 ru
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 按项目既有统计口径通过 539 个 Rust 测试（knowledge 29、storage 242、runtime 48、API library 64、API
+- host 按项目既有统计口径通过 543 个 Rust 测试（knowledge 29、storage 245、runtime 48、API library 65、API
   main/config 6）与 28 个 Web Node 测试。
 - `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 

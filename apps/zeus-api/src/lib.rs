@@ -67,10 +67,10 @@ use runtime::{
     AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
     AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe,
     AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthzContext, BootstrapOwnerCommit, DemoStore,
-    MemberSetupCommit, PublishedEvent, ReplyClaimOutcome, ReplyFailureCommit, ReplyJob,
-    ReplyOutcomeUnknownCommit, ReplySuccessCommit, StoreError, StoredMember,
-    StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserStatus,
-    TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
+    EntryRevision, KnowledgeCatalogState, KnowledgeCatalogUpdateResult, MemberSetupCommit,
+    PublishedEvent, ReplyClaimOutcome, ReplyFailureCommit, ReplyJob, ReplyOutcomeUnknownCommit,
+    ReplySuccessCommit, StoreError, StoredMember, StoredMembershipStatus, StoredPreferences,
+    StoredUser, StoredUserStatus, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -88,6 +88,7 @@ use zeroize::{Zeroize, Zeroizing};
 const DURABLE_LEDGER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const AUTH_JSON_BODY_MAX_BYTES: usize = 8 * 1024;
 const COMMAND_JSON_BODY_MAX_BYTES: usize = 512 * 1024;
+const KNOWLEDGE_JSON_BODY_MAX_BYTES: usize = 2 * 1024 * 1024 + 4 * 1024;
 const ACCOUNT_AUDIT_EXPORT_MAX_BYTES: usize = 96 * 1024 * 1024;
 const PASSWORD_WORKER_LIMIT: usize = 2;
 const AUTH_RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -714,6 +715,13 @@ struct AuditListQuery {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplaceKnowledgeCatalogRequest {
+    expected_revision: u64,
+    entries: Vec<EntryRevision>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SessionDetailQuery {
@@ -863,6 +871,15 @@ fn build_authenticated_app(state: ApiState) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .layer(DefaultBodyLimit::max(AUTH_JSON_BODY_MAX_BYTES));
 
+    let knowledge_admin = Router::new()
+        .route(
+            "/api/v1/knowledge/catalog",
+            get(get_knowledge_catalog).put(replace_knowledge_catalog),
+        )
+        .route_layer(middleware::from_fn(require_account_owner))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
+        .layer(DefaultBodyLimit::max(KNOWLEDGE_JSON_BODY_MAX_BYTES));
+
     let public = Router::new()
         .route("/health/live", get(liveness))
         .route("/health/ready", get(readiness))
@@ -876,6 +893,7 @@ fn build_authenticated_app(state: ApiState) -> Router {
     let router = public
         .merge(protected)
         .merge(account_admin)
+        .merge(knowledge_admin)
         .fallback(not_found)
         .with_state(state.clone());
     kick_reply_worker(&state);
@@ -1376,6 +1394,37 @@ async fn list_members(
         members: page.items.iter().map(account_member).collect(),
         next_cursor: page.next_cursor,
     })
+}
+
+async fn get_knowledge_catalog(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+) -> Result<Response, ApiError> {
+    let catalog: KnowledgeCatalogState = state
+        .store
+        .knowledge_catalog_for_admin(&current.principal.authz)
+        .await?;
+    json_no_store(catalog)
+}
+
+async fn replace_knowledge_catalog(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    headers: HeaderMap,
+    payload: Result<Json<ReplaceKnowledgeCatalogRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(request) = payload.map_err(ApiError::invalid_json)?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let result: KnowledgeCatalogUpdateResult = state
+        .store
+        .replace_knowledge_catalog(
+            &current.principal.authz,
+            request.expected_revision,
+            request.entries,
+            idempotency_key,
+        )
+        .await?;
+    json_no_store(result)
 }
 
 async fn create_member(
@@ -3439,7 +3488,8 @@ async fn start_turn(
     }
     let knowledge = state
         .store
-        .session_agent_knowledge_context(&request.user_message)?;
+        .session_agent_knowledge_context(&current.principal.authz, &request.user_message)
+        .await?;
     let reply_turns = state
         .store
         .session_reply_turns_for_actor(
@@ -3664,7 +3714,7 @@ fn required_idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {
     let value = values.next().ok_or_else(|| {
         ApiError::bad_request(
             "missing_idempotency_key",
-            "Idempotency-Key header is required for POST requests",
+            "Idempotency-Key header is required for this command",
         )
     })?;
     if values.next().is_some() {
@@ -4629,6 +4679,16 @@ impl From<StoreError> for ApiError {
                 "The audit archive state changed or the checkpoint does not match durable history",
             )
             .with_no_store(),
+            StoreError::KnowledgeCatalogRevisionConflict => Self::new(
+                StatusCode::CONFLICT,
+                "knowledge_catalog_revision_conflict",
+                "Knowledge catalog revision conflict",
+                "The account knowledge catalog changed; refresh it and retry",
+            )
+            .with_no_store(),
+            StoreError::InvalidKnowledgeCatalog(reason) => {
+                Self::bad_request("invalid_knowledge_catalog", reason.clone()).with_no_store()
+            }
             StoreError::StorageQuotaExceeded => Self::storage_quota_exceeded(),
             StoreError::PhysicalStorageExhausted => Self::physical_storage_exhausted(),
             StoreError::OperationCapacityExceeded => Self::sqlite_operation_capacity_exceeded(),
@@ -6771,7 +6831,8 @@ mod tests {
         )
         .unwrap();
         let context = store
-            .session_agent_knowledge_context("budget probe")
+            .session_agent_knowledge_context(&owner.authz, "budget probe")
+            .await
             .unwrap()
             .snapshot
             .snapshot()
@@ -7133,14 +7194,16 @@ mod tests {
 
         let recorded = requests.lock().unwrap().clone();
         let first_context = store
-            .session_agent_knowledge_context("remember alpha")
+            .session_agent_knowledge_context(&owner.authz, "remember alpha")
+            .await
             .unwrap()
             .snapshot
             .snapshot()
             .canonical_context()
             .to_owned();
         let second_context = store
-            .session_agent_knowledge_context("what did I say?")
+            .session_agent_knowledge_context(&owner.authz, "what did I say?")
+            .await
             .unwrap()
             .snapshot
             .snapshot()
@@ -7202,7 +7265,8 @@ mod tests {
             )
             .unwrap();
         let knowledge = store
-            .session_agent_knowledge_context("do not execute after deployment drift")
+            .session_agent_knowledge_context(&owner.authz, "do not execute after deployment drift")
+            .await
             .unwrap();
         let request = ReplyRequest::with_tools(
             [
@@ -7418,7 +7482,8 @@ mod tests {
 
         let recorded = requests.lock().unwrap().clone();
         let context = store
-            .session_agent_knowledge_context("write the approved marker")
+            .session_agent_knowledge_context(&owner.authz, "write the approved marker")
+            .await
             .unwrap()
             .snapshot
             .snapshot()
@@ -7732,15 +7797,16 @@ mod tests {
         assert_eq!(agent.calls[0].status, AgentToolCallStatus::Succeeded);
         assert_eq!(std::fs::read_dir(&marker_root).unwrap().count(), 1);
 
-        let recorded = requests.lock().unwrap();
-        assert_eq!(recorded.len(), 4);
         let context = store
-            .session_agent_knowledge_context("write after trimming")
+            .session_agent_knowledge_context(&owner.authz, "write after trimming")
+            .await
             .unwrap()
             .snapshot
             .snapshot()
             .canonical_context()
             .to_owned();
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 4);
         assert_eq!(
             recorded[2].messages,
             vec![
@@ -8269,6 +8335,121 @@ mod tests {
         assert_eq!(overview.run.id, DEMO_RUN_ID);
         assert_eq!(overview.run.sequence, 8);
         assert_eq!(overview.recent_events.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn knowledge_catalog_api_drives_the_active_agent_context() {
+        let store = DemoStore::seeded().await.unwrap();
+        let owner = provision_test_owner(&store, "user-knowledge-owner", "knowledge-owner").await;
+        let app = authenticated_app(store.clone(), false)
+            .unwrap()
+            .layer(MockConnectInfo(test_peer()));
+
+        let initial = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/knowledge/catalog")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(initial.status(), StatusCode::OK);
+        assert_eq!(initial.headers()[header::CACHE_CONTROL], "no-store");
+        let initial: serde_json::Value = response_json(initial).await;
+        assert_eq!(initial["revision"], 0);
+        assert_eq!(initial["corpus"]["entries"], serde_json::json!([]));
+
+        let body = serde_json::json!({
+            "expected_revision": 0,
+            "entries": [{
+                "entry_id": "execution-epochs",
+                "revision": "1",
+                "title": "Immutable execution epochs",
+                "content": "Zeus binds every approved incident action to an immutable execution epoch."
+            }]
+        })
+        .to_string();
+        let update = app
+            .clone()
+            .oneshot(
+                Request::put("/api/v1/knowledge/catalog")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "knowledge-api-first")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update.status(), StatusCode::OK);
+        assert_eq!(update.headers()[header::CACHE_CONTROL], "no-store");
+        let update: serde_json::Value = response_json(update).await;
+        assert_eq!(update["catalog"]["revision"], 1);
+        assert_eq!(update["replayed"], false);
+
+        let replay = app
+            .clone()
+            .oneshot(
+                Request::put("/api/v1/knowledge/catalog")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "knowledge-api-first")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay: serde_json::Value = response_json(replay).await;
+        assert_eq!(replay["catalog"], update["catalog"]);
+        assert_eq!(replay["replayed"], true);
+
+        let stale = app
+            .oneshot(
+                Request::put("/api/v1/knowledge/catalog")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "knowledge-api-stale")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            stale,
+            StatusCode::CONFLICT,
+            "knowledge_catalog_revision_conflict",
+        )
+        .await;
+
+        let context = store
+            .session_agent_knowledge_context(&owner.authz, "explain the immutable execution epoch")
+            .await
+            .unwrap();
+        assert_eq!(context.corpus.entries().len(), 1);
+        assert_eq!(
+            context.snapshot.snapshot().hits()[0].entry().entry_id(),
+            "execution-epochs"
+        );
+        assert!(
+            context
+                .snapshot
+                .snapshot()
+                .canonical_context()
+                .contains("Zeus binds every approved incident action")
+        );
     }
 
     #[tokio::test]

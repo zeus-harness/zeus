@@ -12,7 +12,8 @@ use crate::{
     AgentReviewCommit, AgentReviewContext, AgentReviewResult, AgentTerminalCompletion,
     AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion,
     AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork,
-    AgentTurnReceiptProbe,
+    AgentTurnReceiptProbe, KnowledgeCatalogCommit, KnowledgeCatalogState,
+    KnowledgeCatalogUpdateResult,
 };
 use ::execution::{DigestDomain, FactSource, OperationRef, Sha256Digest};
 use deployment::ManifestEnvelope;
@@ -42,6 +43,9 @@ const AGENT_KNOWLEDGE_LEGACY_SET_DIGEST_DOMAIN: &[u8] =
     b"zeus.agent-knowledge-legacy-set.sha256.v1\0";
 const AGENT_OPERATION_HOLDER_MAX_BYTES: usize = 128;
 const AGENT_OPERATION_CLAIM_TTL_SECONDS: i64 = 30;
+const KNOWLEDGE_CATALOG_MAX_REVISIONS_PER_ACCOUNT: u64 = 256;
+const KNOWLEDGE_CORPUS_MAX_REVISIONS_PER_ACCOUNT: i64 = 128;
+const KNOWLEDGE_CORPUS_MAX_ENVELOPE_BYTES_PER_ACCOUNT: i64 = 64 * 1024 * 1024;
 
 #[derive(Serialize)]
 struct AgentKnowledgeContextBinding<'a> {
@@ -5510,6 +5514,447 @@ fn query_stored_knowledge_corpus(
         )));
     }
     Ok(corpus)
+}
+
+fn invalid_knowledge_catalog(error: impl std::fmt::Display) -> StorageError {
+    StorageError::InvalidKnowledgeCatalog(error.to_string())
+}
+
+fn empty_knowledge_corpus() -> Result<knowledge::CorpusRevisionEnvelope, StorageError> {
+    knowledge::CorpusRevisionEnvelope::new(Vec::new()).map_err(invalid_knowledge_catalog)
+}
+
+fn knowledge_catalog_fingerprint(
+    expected_revision: u64,
+    corpus_digest: &str,
+) -> Result<String, StorageError> {
+    Ok(serde_json::to_string(&json!({
+        "expected_revision": expected_revision,
+        "corpus_digest": corpus_digest,
+    }))?)
+}
+
+fn query_account_knowledge_catalog(
+    connection: &Connection,
+    account_id: &str,
+) -> Result<KnowledgeCatalogState, StorageError> {
+    let stored = connection
+        .query_row(
+            r#"SELECT revision, active_corpus_digest, updated_by_user_id,
+                      updated_by_membership_revision, updated_at
+               FROM account_knowledge_catalogs WHERE account_id = ?1"#,
+            [account_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let account_id_value = decode_account_id(account_id.to_owned())?;
+    let Some((revision, corpus_digest, actor_user_id, actor_revision, updated_at)) = stored else {
+        return Ok(KnowledgeCatalogState {
+            account_id: account_id_value,
+            revision: 0,
+            corpus: empty_knowledge_corpus()?,
+            updated_by_user_id: None,
+            updated_by_membership_revision: None,
+            updated_at: None,
+        });
+    };
+    Ok(KnowledgeCatalogState {
+        account_id: account_id_value,
+        revision: i64_to_u64(revision, "knowledge catalog revision")?,
+        corpus: query_stored_knowledge_corpus(connection, account_id, &corpus_digest)?,
+        updated_by_user_id: Some(actor_user_id),
+        updated_by_membership_revision: Some(decode_membership_revision(actor_revision)?),
+        updated_at: Some(updated_at),
+    })
+}
+
+pub(super) fn query_account_knowledge_catalog_for_admin(
+    connection: &Connection,
+    context: &AuthzContext,
+) -> Result<KnowledgeCatalogState, StorageError> {
+    require_current_authority(connection, context, AccountCapability::AccountAdmin)?;
+    query_account_knowledge_catalog(connection, context.account_id.as_str())
+}
+
+pub(super) fn query_active_knowledge_corpus_for_actor(
+    connection: &Connection,
+    context: &AuthzContext,
+) -> Result<knowledge::CorpusRevisionEnvelope, StorageError> {
+    require_current_authority(connection, context, AccountCapability::Reply)?;
+    Ok(query_account_knowledge_catalog(connection, context.account_id.as_str())?.corpus)
+}
+
+fn require_knowledge_corpus_capacity(
+    connection: &Connection,
+    account_id: &str,
+    corpus_digest: &str,
+    envelope_bytes: i64,
+) -> Result<(), StorageError> {
+    let exists: i64 = connection.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM knowledge_corpus_revisions
+               WHERE account_id = ?1 AND digest = ?2
+           )"#,
+        params![account_id, corpus_digest],
+        |row| row.get(0),
+    )?;
+    if exists != 0 {
+        return Ok(());
+    }
+    let (count, bytes): (i64, i64) = connection.query_row(
+        r#"SELECT COUNT(*), COALESCE(SUM(length(CAST(envelope_json AS BLOB))), 0)
+           FROM knowledge_corpus_revisions WHERE account_id = ?1"#,
+        [account_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if count >= KNOWLEDGE_CORPUS_MAX_REVISIONS_PER_ACCOUNT
+        || bytes
+            .checked_add(envelope_bytes)
+            .is_none_or(|total| total > KNOWLEDGE_CORPUS_MAX_ENVELOPE_BYTES_PER_ACCOUNT)
+    {
+        return Err(StorageError::StorageQuotaExceeded);
+    }
+    Ok(())
+}
+
+pub(super) fn replace_account_knowledge_catalog(
+    connection: &mut Connection,
+    context: &AuthzContext,
+    commit: KnowledgeCatalogCommit,
+    limits: &StorageLimits,
+    physical_limits: &SqlitePhysicalLimits,
+) -> Result<KnowledgeCatalogUpdateResult, StorageError> {
+    let key = normalized_key(&commit.idempotency_key)?.to_owned();
+    commit
+        .corpus
+        .validate()
+        .map_err(invalid_knowledge_catalog)?;
+    let corpus_digest = commit.corpus.digest().to_hex();
+    let corpus_json = commit
+        .corpus
+        .canonical_json()
+        .map_err(invalid_knowledge_catalog)?;
+    let corpus_bytes = i64::try_from(corpus_json.len())
+        .map_err(|_| StorageError::IntegerOutOfRange("knowledge corpus envelope bytes"))?;
+    let request_fingerprint =
+        knowledge_catalog_fingerprint(commit.expected_revision, &corpus_digest)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_current_authority(&transaction, context, AccountCapability::AccountAdmin)?;
+
+    let stored_receipt = transaction
+        .query_row(
+            r#"SELECT actor_membership_revision, request_fingerprint,
+                      catalog_revision, corpus_digest, created_at
+               FROM knowledge_catalog_receipts
+               WHERE account_id = ?1 AND actor_user_id = ?2 AND idempotency_key = ?3"#,
+            params![context.account_id.as_str(), context.user_id, key],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((actor_revision, fingerprint, revision, stored_digest, created_at)) = stored_receipt
+    {
+        if decode_membership_revision(actor_revision)? != context.membership_revision
+            || fingerprint != request_fingerprint
+            || stored_digest != corpus_digest
+        {
+            return Err(StorageError::IdempotencyConflict);
+        }
+        let revision = i64_to_u64(revision, "knowledge catalog receipt revision")?;
+        let current = query_account_knowledge_catalog(&transaction, context.account_id.as_str())?;
+        if current.revision < revision {
+            return Err(StorageError::CorruptData(
+                "knowledge catalog receipt is ahead of the catalog head".into(),
+            ));
+        }
+        let catalog = KnowledgeCatalogState {
+            account_id: context.account_id.clone(),
+            revision,
+            corpus: query_stored_knowledge_corpus(
+                &transaction,
+                context.account_id.as_str(),
+                &stored_digest,
+            )?,
+            updated_by_user_id: Some(context.user_id.clone()),
+            updated_by_membership_revision: Some(context.membership_revision),
+            updated_at: Some(created_at),
+        };
+        transaction.commit()?;
+        return Ok(KnowledgeCatalogUpdateResult {
+            catalog,
+            replayed: true,
+        });
+    }
+
+    let current = query_account_knowledge_catalog(&transaction, context.account_id.as_str())?;
+    if current.revision != commit.expected_revision {
+        return Err(StorageError::KnowledgeCatalogRevisionConflict);
+    }
+    if current.corpus.digest().to_hex() == corpus_digest {
+        return Err(StorageError::InvalidKnowledgeCatalog(
+            "the replacement corpus is already active".into(),
+        ));
+    }
+    if current.revision >= KNOWLEDGE_CATALOG_MAX_REVISIONS_PER_ACCOUNT {
+        return Err(StorageError::StorageQuotaExceeded);
+    }
+    let next_revision = current
+        .revision
+        .checked_add(1)
+        .ok_or(StorageError::IntegerOutOfRange(
+            "knowledge catalog revision",
+        ))?;
+    require_knowledge_corpus_capacity(
+        &transaction,
+        context.account_id.as_str(),
+        &corpus_digest,
+        corpus_bytes,
+    )?;
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Admission,
+    )?;
+    let timestamp = now();
+    prepare_account_audit_admission(
+        &transaction,
+        context.account_id.as_str(),
+        AuditAdmission::General,
+        limits,
+        &timestamp,
+    )?;
+    persist_agent_knowledge_corpus(
+        &transaction,
+        context.account_id.as_str(),
+        &commit.corpus,
+        &timestamp,
+    )
+    .map_err(|error| match error {
+        StorageError::InvalidAgentTransition(message) => {
+            StorageError::InvalidKnowledgeCatalog(message)
+        }
+        other => other,
+    })?;
+    let next_revision_sql = u64_to_i64(next_revision, "knowledge catalog revision")?;
+    let actor_revision_sql = u64_to_i64(
+        context.membership_revision.get(),
+        "knowledge catalog membership revision",
+    )?;
+    let changed = if current.revision == 0 {
+        transaction.execute(
+            r#"INSERT INTO account_knowledge_catalogs(
+                   account_id, revision, active_corpus_digest, updated_by_user_id,
+                   updated_by_membership_revision, updated_at
+               ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+            params![
+                context.account_id.as_str(),
+                next_revision_sql,
+                corpus_digest,
+                context.user_id,
+                actor_revision_sql,
+                timestamp,
+            ],
+        )?
+    } else {
+        transaction.execute(
+            r#"UPDATE account_knowledge_catalogs
+               SET revision = ?1, active_corpus_digest = ?2,
+                   updated_by_user_id = ?3, updated_by_membership_revision = ?4,
+                   updated_at = ?5
+               WHERE account_id = ?6 AND revision = ?7"#,
+            params![
+                next_revision_sql,
+                corpus_digest,
+                context.user_id,
+                actor_revision_sql,
+                timestamp,
+                context.account_id.as_str(),
+                u64_to_i64(current.revision, "knowledge catalog expected revision")?,
+            ],
+        )?
+    };
+    if changed != 1 {
+        return Err(StorageError::ConcurrentModification);
+    }
+    transaction.execute(
+        r#"INSERT INTO knowledge_catalog_receipts(
+               account_id, actor_user_id, actor_membership_revision,
+               idempotency_key, request_fingerprint, catalog_revision,
+               corpus_digest, created_at
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+        params![
+            context.account_id.as_str(),
+            context.user_id,
+            actor_revision_sql,
+            key,
+            request_fingerprint,
+            next_revision_sql,
+            corpus_digest,
+            timestamp,
+        ],
+    )?;
+    append_account_audit_event(
+        &transaction,
+        context.account_id.as_str(),
+        AccountAuditEventInput {
+            actor_user_id: Some(&context.user_id),
+            action: "knowledge.catalog.updated",
+            target_kind: "knowledge_catalog",
+            target_id: &corpus_digest,
+            metadata: json!({
+                "previous_revision": current.revision,
+                "revision": next_revision,
+                "corpus_digest": corpus_digest,
+                "entry_count": commit.corpus.entries().len(),
+                "aggregate_entry_bytes": aggregate_corpus_entry_bytes(&commit.corpus)?,
+            }),
+        },
+        &timestamp,
+    )?;
+    let catalog = KnowledgeCatalogState {
+        account_id: context.account_id.clone(),
+        revision: next_revision,
+        corpus: commit.corpus,
+        updated_by_user_id: Some(context.user_id.clone()),
+        updated_by_membership_revision: Some(context.membership_revision),
+        updated_at: Some(timestamp),
+    };
+    transaction.commit()?;
+    Ok(KnowledgeCatalogUpdateResult {
+        catalog,
+        replayed: false,
+    })
+}
+
+pub(super) fn verify_account_knowledge_catalog_integrity(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    let account_capacity_violation: i64 = connection.query_row(
+        r#"SELECT EXISTS(
+               SELECT account_id
+               FROM knowledge_corpus_revisions
+               GROUP BY account_id
+               HAVING COUNT(*) > ?1
+                  OR SUM(length(CAST(envelope_json AS BLOB))) > ?2
+           )"#,
+        params![
+            KNOWLEDGE_CORPUS_MAX_REVISIONS_PER_ACCOUNT,
+            KNOWLEDGE_CORPUS_MAX_ENVELOPE_BYTES_PER_ACCOUNT,
+        ],
+        |row| row.get(0),
+    )?;
+    if account_capacity_violation != 0 {
+        return Err(StorageError::CorruptData(
+            "account knowledge corpus history exceeds its durable capacity".into(),
+        ));
+    }
+    let orphan_receipt: i64 = connection.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM knowledge_catalog_receipts receipt
+               LEFT JOIN account_knowledge_catalogs catalog
+                 ON catalog.account_id = receipt.account_id
+               WHERE catalog.account_id IS NULL
+           )"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if orphan_receipt != 0 {
+        return Err(StorageError::CorruptData(
+            "knowledge catalog receipt has no catalog head".into(),
+        ));
+    }
+    let account_ids = {
+        let mut statement = connection
+            .prepare("SELECT account_id FROM account_knowledge_catalogs ORDER BY account_id")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for account_id in account_ids {
+        let catalog = query_account_knowledge_catalog(connection, &account_id)?;
+        if catalog.revision == 0 || catalog.revision > KNOWLEDGE_CATALOG_MAX_REVISIONS_PER_ACCOUNT {
+            return Err(StorageError::CorruptData(format!(
+                "knowledge catalog `{account_id}` has an invalid revision"
+            )));
+        }
+        let receipts = {
+            let mut statement = connection.prepare(
+                r#"SELECT actor_user_id, actor_membership_revision,
+                          request_fingerprint, catalog_revision, corpus_digest, created_at
+                   FROM knowledge_catalog_receipts
+                   WHERE account_id = ?1 ORDER BY catalog_revision"#,
+            )?;
+            statement
+                .query_map([&account_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if u64::try_from(receipts.len()).ok() != Some(catalog.revision) {
+            return Err(StorageError::CorruptData(format!(
+                "knowledge catalog `{account_id}` receipt chain is incomplete"
+            )));
+        }
+        for (index, (actor, actor_revision, fingerprint, revision, digest, created_at)) in
+            receipts.iter().enumerate()
+        {
+            let expected_revision = u64::try_from(index)
+                .map_err(|_| StorageError::IntegerOutOfRange("knowledge receipt index"))?
+                .checked_add(1)
+                .ok_or(StorageError::IntegerOutOfRange(
+                    "knowledge receipt revision",
+                ))?;
+            if i64_to_u64(*revision, "knowledge receipt revision")? != expected_revision
+                || *fingerprint != knowledge_catalog_fingerprint(expected_revision - 1, digest)?
+            {
+                return Err(StorageError::CorruptData(format!(
+                    "knowledge catalog `{account_id}` receipt chain is inconsistent"
+                )));
+            }
+            decode_membership_revision(*actor_revision)?;
+            query_stored_knowledge_corpus(connection, &account_id, digest)?;
+            if expected_revision == catalog.revision
+                && (catalog.corpus.digest().to_hex() != *digest
+                    || catalog.updated_by_user_id.as_deref() != Some(actor.as_str())
+                    || catalog
+                        .updated_by_membership_revision
+                        .as_ref()
+                        .map(|revision| revision.get())
+                        != Some(i64_to_u64(
+                            *actor_revision,
+                            "knowledge catalog actor revision",
+                        )?)
+                    || catalog.updated_at.as_deref() != Some(created_at.as_str()))
+            {
+                return Err(StorageError::CorruptData(format!(
+                    "knowledge catalog `{account_id}` head disagrees with its latest receipt"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn query_legacy_agent_knowledge_boundary(

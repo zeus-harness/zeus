@@ -64,6 +64,10 @@ pub enum StorageError {
     AuditPolicyConflict,
     #[error("the account audit archive checkpoint changed concurrently or is invalid")]
     AuditCheckpointConflict,
+    #[error("the account knowledge catalog changed concurrently")]
+    KnowledgeCatalogRevisionConflict,
+    #[error("invalid account knowledge catalog: {0}")]
+    InvalidKnowledgeCatalog(String),
     #[error(
         "account audit policy for `{account_id}` retains {detail_rows} detail rows, above the configured limit {configured_limit}"
     )]

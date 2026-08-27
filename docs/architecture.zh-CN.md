@@ -29,10 +29,11 @@ Client / SvelteKit Web
 - `authz`：account capability matrix，以及精确工具名规则、策略 revision、环境和 effect guard；没有命中即拒绝。
 - `tools`：工具描述、注册表、参数验证和 object-safe executor 边界。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
-- `storage`：schema v22 migration、`acc_local` membership 权威、一次性 member setup、用户/偏好、
+- `storage`：schema v23 migration、`acc_local` membership 权威、一次性 member setup、用户/偏好、
   account audit/rollup/policy/archive state、独立 Session/Run ledger、typed event lookup、
   account+actor-scoped 回执、durable Agent/model/tool/dispatch queue、不可变 deployment manifest，
-  以及 actor/account/global logical capacity、physical capacity 和 operation capacity。
+  revisioned account knowledge catalog，以及 actor/account/global logical capacity、physical
+  capacity 和 operation capacity。
 - `runtime`：Session 命令编排、Agent model/tool 与 Run worker、运行时 manifest 构建、提交后 SSE
   提示和启动恢复。
 - `zeus-api`：进程组合、owner/member 认证、CSRF、owner-only 管理面、provider 配置、REST/SSE
@@ -52,8 +53,14 @@ revision 校验、固定 tokenizer/整数排序、整条 entry 丢弃、16 KiB c
 selection snapshot digest。schema v22 把 exact corpus、snapshot、canonical context、Agent、
 initial model job 和 execution admission digest 绑定后持久化，重放不从 live state 重新检索。
 LLM 协议层使用独立 durable `context` role，仅在 OpenAI-compatible wire 边界映射为单独的
-`user` message。当前 runtime 明确使用空 corpus；account knowledge catalog 与 ingestion surface
-仍未实现。
+`user` message。schema v23 增加 owner-only account knowledge catalog：revision 0 表示未配置的
+隐式空 corpus；每次替换通过 expected revision CAS、actor-scoped `Idempotency-Key` receipt、当前
+owner authority 和 account audit 在一个事务内提交。Owner 和 member 新建 Agent 时都以 Reply
+capability 读取当时的 active corpus，随后仍把 exact corpus/snapshot 固化到 Agent，之后的 catalog
+更新不会改写既有 turn。Catalog revision 最多 256，单 account 最多保留 128 个不同 corpus revision
+与 64 MiB canonical envelope；超过边界 fail closed。SQLite 内 trigger/deep readiness 可检测缺失、
+不连续或投影不一致，但与其它本地 commitment 一样，不是防止拥有任意数据库写权限者同时替换数据
+和校验逻辑的外部信任锚。
 
 ## 事件与状态
 
@@ -123,7 +130,9 @@ Session ledger 记录 `session_created`、`run_attached`、`user_message`、可�
 - create：写入 `ready` 投影、`session_created` 和完整响应回执。
 - start：只允许 actor 拥有的 `ready` Session；在一个事务中创建唯一 open turn、追加
   `user_message`、投影进入 `running`、保存 actor-scoped 响应回执，创建 Agent，绑定 canonical
-  deployment manifest digest，并插入 immutable queued model job。provider request 以命令的
+  deployment manifest digest，并插入 immutable queued model job。事务前先以当前 actor 的 Reply
+  capability 读取 account active knowledge corpus，再对当前 user message 生成确定性 selection；
+  provider request 以命令的
   `expected_sequence` 为快照边界：第一条且唯一一条 system message 是 manifest 绑定提示词的
   精确内容，随后才是最新完整 flushed user/assistant 对和当前 user message。manifest 只保存
   稳定 prompt ID、revision 与域分离 content digest，不保存提示词内容或 secret；精确内容随
@@ -188,7 +197,7 @@ connector 在数据库事务和锁之外运行。
 
 API 监听端口之前按固定顺序完成：
 
-1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v22；按当前
+1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v23；按当前
    detailed-row limit 以最多 64 行 batch 压缩 bootstrap terminal audit prefix，再按稳定
    `(priority actor, expires_at, auth-session ID)` 顺序最多清理 64 个过期或绑定
    missing/disabled/suspended/stale-revision authority 的 auth session。
@@ -420,8 +429,9 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   都有确定性覆盖。后续 v15 member/audit、v16 context index、v17 Agent loop、v18 exact tool
   completion replay、v19 deployment manifest、v20 RunEpoch/execution fact ledger 与 v21
   prepared operation claim，以及 v22 knowledge context binding 与 domain-separated count+digest
-  legacy-set commitment，也覆盖 fresh schema 和历史原地迁移；畸形 v21 升级会整体回滚，不留下
-  v22 版本或表。
+  legacy-set commitment、v23 owner-governed catalog head/ingestion receipt，也覆盖 fresh schema
+  和历史原地迁移；畸形 v21 升级会整体回滚，不留下 v22 版本或表，既有 v22 数据库则原地增加
+  空的 revision-0 catalog projection，不改写已经固化的 Agent knowledge context。
 - 重启后用户/偏好、Session/turn/event、Agent/model/tool job、deployment manifest、Run/Event、
   审批决定、dispatch job 和命令回执仍存在。
 - Session start 与 Agent/first-model enqueue/manifest binding 同事务；最终 reply 把 assistant
@@ -445,6 +455,9 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   重启恢复复用 exact persisted request，不重新解析当前提示词。v18 terminal history 可读，旧
   queued/waiting-approval 或 promptless work 在首次可执行边界以 `deployment_unavailable` fail
   closed。
+- Account knowledge catalog 的 owner/member capability、revision CAS、相同 key 精确重放、异输入
+  冲突、重启持久性、receipt 篡改检测，以及“HTTP 入库后 Agent 真实命中 active entry”都有自动化
+  覆盖；catalog 更新不对已经持久化的 Agent 做 live reselection。
 - 首次 bootstrap 只能消费一次 token；登录、CSRF、同源、Cookie 属性、设置 revision、退出后
   401 以及退出/失效后 SSE 关闭有自动化或 live 验收。
 - bootstrap audit 的 v11 reason 迁移、canonical digest、64 行多批压缩、rotation/open 降限、
@@ -480,8 +493,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   刷新恢复、owner/member setup/登录、owner 成员与 audit 管理、设置/退出和
   system/light/dark。member 的审批卡只读。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化按项目既有统计口径是 539 个 Rust 测试（其中 deployment 8、knowledge 29、storage 242、
-  runtime 48、API library 64、API main/config 6）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化按项目既有统计口径是 543 个 Rust 测试（其中 deployment 8、knowledge 29、storage 245、
+  runtime 48、API library 65、API main/config 6）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
 提交 `af29089` 曾构建并运行在独立 `zeus-operation-acceptance` project（端口 `18089`）；既有
