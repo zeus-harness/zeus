@@ -17,10 +17,14 @@ use std::{
 use protocol::{SessionTurn, SessionTurnStatus};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 pub use openai_compatible::{
     DEFAULT_MAX_RESPONSE_BYTES, DEFAULT_REQUEST_TIMEOUT, OpenAiCompatibleProvider,
 };
+
+/// Maximum bytes in one non-secret credential reference.
+pub const SECRET_REF_MAX_BYTES: usize = 128;
 
 /// Maximum serialized size of a typed reply admitted to durable storage.
 pub const REPLY_RESPONSE_MAX_SERIALIZED_BYTES: usize = 512 * 1024;
@@ -96,6 +100,80 @@ pub const FINISH_REASON_MAX_BYTES: usize = protocol::REPLY_FINISH_REASON_MAX_BYT
 /// Boxed reply operation used by the object-safe provider interface.
 pub type ReplyFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ReplyResponse, ProviderError>> + Send + 'a>>;
+
+/// Boxed, per-operation secret resolution.
+pub type SecretResolveFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ResolvedSecret, SecretResolveError>> + Send + 'a>>;
+
+/// Stable, non-secret identifier for a credential managed outside durable
+/// Zeus state. Rotating the value behind the same reference must not change
+/// queued-work identity.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SecretRef(String);
+
+impl SecretRef {
+    pub fn parse(value: impl Into<String>) -> Result<Self, SecretRefError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > SECRET_REF_MAX_BYTES
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'/' | b'.' | b'_' | b'-')
+            })
+        {
+            return Err(SecretRefError::InvalidFormat);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SecretRef {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum SecretRefError {
+    #[error("secret reference must use restricted ASCII and be at most 128 bytes")]
+    InvalidFormat,
+}
+
+/// One short-lived resolved secret. Its allocation is zeroized on drop and its
+/// debug representation never exposes the value.
+pub struct ResolvedSecret(Zeroizing<String>);
+
+impl ResolvedSecret {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(Zeroizing::new(value.into()))
+    }
+
+    pub fn expose_secret(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl std::fmt::Debug for ResolvedSecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ResolvedSecret([REDACTED])")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum SecretResolveError {
+    #[error("secret is unavailable")]
+    Unavailable,
+}
+
+/// Resolves one credential at the last responsible moment for each provider
+/// operation. Implementations must return only the exact requested reference
+/// and must not cache plaintext in durable Zeus state.
+pub trait SecretResolver: Send + Sync {
+    fn resolve<'a>(&'a self, reference: &'a SecretRef) -> SecretResolveFuture<'a>;
+}
 
 /// Role of one message admitted to a reply provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -639,6 +717,10 @@ pub enum ProviderError {
     /// A request cannot be represented by the provider contract.
     #[error("invalid reply request: {0}")]
     InvalidRequest(&'static str),
+    /// The configured external credential could not be resolved before any
+    /// provider request was sent.
+    #[error("provider credential is unavailable")]
+    SecretUnavailable,
     /// The complete request exceeded its deadline.
     #[error("provider request timed out")]
     Timeout,
@@ -1241,6 +1323,26 @@ impl ReplyProvider for LocalFallbackProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_references_are_bounded_restricted_and_secret_values_are_redacted() {
+        let reference = SecretRef::parse("env:ZEUS_LLM_RUNTIME_KEY").unwrap();
+        assert_eq!(reference.as_str(), "env:ZEUS_LLM_RUNTIME_KEY");
+        for invalid in ["", " env:KEY", "env:KEY ", "env:KEY=value", "env:密钥"] {
+            assert_eq!(
+                SecretRef::parse(invalid),
+                Err(SecretRefError::InvalidFormat)
+            );
+        }
+        assert_eq!(
+            SecretRef::parse("x".repeat(SECRET_REF_MAX_BYTES + 1)),
+            Err(SecretRefError::InvalidFormat)
+        );
+
+        let secret = ResolvedSecret::new("do-not-print-this-api-key");
+        assert_eq!(format!("{secret:?}"), "ResolvedSecret([REDACTED])");
+        assert_eq!(secret.expose_secret(), "do-not-print-this-api-key");
+    }
 
     fn turn(
         ordinal: u64,

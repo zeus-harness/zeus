@@ -115,13 +115,41 @@ set, the legacy `ZEUS_COOKIE_SECURE` direct-mode flag remains available.
 
 With no model configuration, the durable Agent model worker returns an explicit
 non-model local message. Configure an OpenAI-compatible Chat Completions
-provider by setting all three variables together:
+provider with endpoint/model and exactly one credential source. The legacy
+inline form remains available:
 
 ```sh
 ZEUS_LLM_ENDPOINT=https://provider.example/v1/chat/completions
 ZEUS_LLM_MODEL=your-model
 ZEUS_LLM_API_KEY=your-secret
 ```
+
+For per-operation resolution, configure a non-secret reference instead of
+`ZEUS_LLM_API_KEY`:
+
+```sh
+ZEUS_LLM_ENDPOINT=https://provider.example/v1/chat/completions
+ZEUS_LLM_MODEL=your-model
+ZEUS_LLM_API_KEY_REF=env:ZEUS_LLM_RUNTIME_KEY
+ZEUS_LLM_RUNTIME_KEY=your-secret
+```
+
+The `env:` adapter re-reads only the exact referenced process variable for
+every model operation. On Unix, `file:/absolute/normalized/path` reopens a
+regular file for every operation without following a symlink in the final path
+component, accepts at most 16 KiB, and strips one terminal LF or CRLF; atomic
+replacement behind the same path therefore rotates the credential without
+changing queued-work identity. The file form fails closed on platforms without
+this no-follow boundary. Zeus resolves and validates the reference once before
+opening SQLite, then again immediately before each request. An unavailable
+reference produces the durable, sanitized `provider_secret_unavailable` known
+failure before provider I/O; it is never mislabeled as `outcome_unknown`.
+
+The bounded reference—not its value—participates in the provider configuration
+digest. Changing a reference invalidates incompatible queued work, while
+rotating the value behind the same reference preserves its manifest binding.
+Neither reference mode stores the resolved plaintext in SQLite, the execution
+ledger, provider metadata, or application logs.
 
 Partial provider configuration fails startup. The endpoint and key are never
 writable through the browser Settings API.
@@ -1021,15 +1049,15 @@ Index, schema v17 Durable Session Agent Loop, schema v18 exact tool-completion
 replay, schema v19 deployment-manifest binding, schema v20 execution-ledger,
 schema v21 prepared claims, schema v22 durable knowledge-context binding, and
 schema v23 account knowledge catalog ingestion, schema v24 account Agent prompt
-governance, schema v25 durable Session context compaction, and Trusted
-Single-Node Ingress:
+governance, schema v25 durable Session context compaction, Trusted Single-Node
+Ingress, and Per-Operation SecretRef Resolution:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 600 tests passed
+- `cargo test --workspace --all-targets --locked`: 606 tests passed
   across the top-level test targets, including 22 connector tests,
-  8 deployment tests, 29 knowledge tests, 29 LLM unit and 13 provider-contract
-  tests, 252 storage tests, 48 runtime tests, 79 API library tests, 8 API main/config
+  8 deployment tests, 29 knowledge tests, 30 LLM unit and 15 provider-contract
+  tests, 252 storage tests, 48 runtime tests, 79 API library tests, 11 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,

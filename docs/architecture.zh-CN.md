@@ -401,7 +401,12 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   running，而是在 durable started checkpoint 之后按 at-most-once 语义结算为
   `outcome_unknown`，不重试外部操作。
 - OpenAI-compatible reply endpoint 默认只接受 HTTPS 或 loopback HTTP，禁止 redirect，限制连接/
-  总超时和响应体；queued job 绑定 endpoint/model/limits 的非秘密配置 digest，API key 不入 ledger。
+  总超时和响应体；queued job 绑定 endpoint/model/limits/可选 SecretRef 的非秘密配置 digest，API
+  key 不入 ledger。兼容 inline key 之外，`env:VARIABLE` 与 Unix
+  `file:/absolute/normalized/path` resolver 会在每次 provider 操作前解析短生命周期 secret；file
+  adapter 对 final path component 使用 `O_NOFOLLOW`、regular-file 检查、16 KiB read cap，并允许同路径原子换值。启动在
+  打开 SQLite 前预检当前值；运行期 unavailable 在任何 provider I/O 前以脱敏
+  `provider_secret_unavailable` 已知失败结算，不进入 `outcome_unknown`。
 - provider assistant 或 executor output/diagnostic 超过终端字段边界时，runtime 使用固定、脱敏、
   有界 failure 一次性结算；原始超限载荷不进入 event、reply/dispatch job，也不会自动重试。
 - sandbox 或 executor 不可用：写入 `NotDispatched`，禁止回退到宿主机裸执行。
@@ -598,8 +603,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   刷新恢复、owner/member setup/登录、owner 成员与 audit 管理、设置/退出和
   system/light/dark。member 的审批卡只读。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化按项目既有统计口径是 600 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、
-  storage 252、runtime 48、API library 79、API main/config 8）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化按项目既有统计口径是 606 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
+  provider contract 15、storage 252、runtime 48、API library 79、API main/config 11）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
 提交 `af29089` 曾构建并运行在独立 `zeus-operation-acceptance` project（端口 `18089`）；既有

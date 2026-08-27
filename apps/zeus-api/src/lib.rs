@@ -3061,6 +3061,7 @@ fn provider_error_code(error: &ProviderError) -> &'static str {
     match error {
         ProviderError::InvalidConfiguration(_) => "provider_configuration_invalid",
         ProviderError::InvalidRequest(_) => "provider_request_invalid",
+        ProviderError::SecretUnavailable => "provider_secret_unavailable",
         ProviderError::Timeout => "provider_timeout",
         ProviderError::Transport => "provider_transport_failed",
         ProviderError::HttpStatus { .. } => "provider_http_error",
@@ -3074,6 +3075,7 @@ fn provider_error_message(error: &ProviderError) -> &'static str {
     match error {
         ProviderError::InvalidConfiguration(_) => "The reply provider configuration is invalid",
         ProviderError::InvalidRequest(_) => "The reply provider rejected the request contract",
+        ProviderError::SecretUnavailable => "The reply provider credential is unavailable",
         ProviderError::Timeout => "The reply provider request timed out",
         ProviderError::Transport => "The reply provider transport failed",
         ProviderError::HttpStatus { .. } => "The reply provider returned an HTTP error",
@@ -7625,6 +7627,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum IndeterminateFailure {
         Known,
+        SecretUnavailable,
         Timeout,
         Transport,
         Panic,
@@ -7660,6 +7663,7 @@ mod tests {
                     IndeterminateFailure::Known => {
                         ProviderError::InvalidRequest("known provider rejection")
                     }
+                    IndeterminateFailure::SecretUnavailable => ProviderError::SecretUnavailable,
                     IndeterminateFailure::Timeout => ProviderError::Timeout,
                     IndeterminateFailure::Transport => ProviderError::Transport,
                     IndeterminateFailure::Panic => {
@@ -11129,6 +11133,12 @@ mod tests {
                 IndeterminateFailure::Known,
                 protocol::AgentTurnStatus::Failed,
                 "provider_request_invalid",
+            ),
+            (
+                "secret-unavailable",
+                IndeterminateFailure::SecretUnavailable,
+                protocol::AgentTurnStatus::Failed,
+                "provider_secret_unavailable",
             ),
             (
                 "timeout",

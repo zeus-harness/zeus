@@ -39,6 +39,7 @@ deployment = { path = "crates/deployment" }
 execution = { path = "crates/execution" }
 kernel = { path = "crates/kernel" }
 knowledge = { path = "crates/knowledge" }
+libc = "0.2.189"
 llm = { path = "crates/llm" }
 protocol = { path = "crates/protocol" }
 runtime = { path = "crates/runtime" }

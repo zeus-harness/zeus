@@ -1,9 +1,17 @@
-use std::time::Duration;
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use llm::{
     LocalFallbackProvider, OpenAiCompatibleProvider, ProviderError, REPLY_TOOL_ARGUMENTS_MAX_BYTES,
     ReplyKind, ReplyMessage, ReplyOutput, ReplyProvider, ReplyRequest, ReplyRole, ReplyToolCall,
-    ReplyToolDefinition,
+    ReplyToolDefinition, ResolvedSecret, SecretRef, SecretResolveError, SecretResolveFuture,
+    SecretResolver,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -22,6 +30,51 @@ struct MockServer {
     endpoint: String,
     received: Option<oneshot::Receiver<CapturedRequest>>,
     task: JoinHandle<()>,
+}
+
+struct SequenceSecretResolver {
+    expected: SecretRef,
+    values: Mutex<VecDeque<Result<String, SecretResolveError>>>,
+    calls: AtomicUsize,
+}
+
+impl SequenceSecretResolver {
+    fn new(
+        expected: SecretRef,
+        values: impl IntoIterator<Item = Result<&'static str, SecretResolveError>>,
+    ) -> Self {
+        Self {
+            expected,
+            values: Mutex::new(
+                values
+                    .into_iter()
+                    .map(|value| value.map(str::to_owned))
+                    .collect(),
+            ),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+impl SecretResolver for SequenceSecretResolver {
+    fn resolve<'a>(&'a self, reference: &'a SecretRef) -> SecretResolveFuture<'a> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        let result = if reference == &self.expected {
+            self.values
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Err(SecretResolveError::Unavailable))
+                .map(ResolvedSecret::new)
+        } else {
+            Err(SecretResolveError::Unavailable)
+        };
+        Box::pin(async move { result })
+    }
 }
 
 impl Drop for MockServer {
@@ -196,6 +249,142 @@ fn openai_compatible_provider_id_binds_non_secret_configuration() {
     );
     assert!(!first.metadata().provider_id.contains("one.example"));
     assert!(!first.metadata().provider_id.contains("first-secret"));
+}
+
+#[tokio::test]
+async fn openai_compatible_resolves_secret_ref_for_each_operation() {
+    let response = serde_json::json!({
+        "choices": [{
+            "message": { "role": "assistant", "content": "Rotated credential reply" },
+            "finish_reason": "stop"
+        }]
+    });
+    let mut mock = spawn_mock(
+        "200 OK",
+        &[("Content-Type", "application/json".to_owned())],
+        serde_json::to_vec(&response).unwrap(),
+        Duration::ZERO,
+    )
+    .await;
+    let secret_ref = SecretRef::parse("env:ZEUS_RUNTIME_KEY").unwrap();
+    let resolver = Arc::new(SequenceSecretResolver::new(
+        secret_ref.clone(),
+        [Ok("first-api-key"), Ok("rotated-api-key")],
+    ));
+    let provider = OpenAiCompatibleProvider::with_secret_resolver(
+        &mock.endpoint,
+        "mock-model",
+        secret_ref.clone(),
+        resolver.clone(),
+    )
+    .unwrap();
+
+    provider.validate_secret_source().await.unwrap();
+    let reply = provider
+        .reply(request_with_secret("Hello after rotation"))
+        .await
+        .unwrap();
+    let captured = mock.received.take().unwrap().await.unwrap();
+
+    assert_eq!(reply.output.final_text(), Some("Rotated credential reply"));
+    assert_eq!(resolver.calls(), 2);
+    assert_eq!(provider.secret_ref(), Some(&secret_ref));
+    assert!(
+        captured
+            .head
+            .to_ascii_lowercase()
+            .contains("\r\nauthorization: bearer rotated-api-key\r\n")
+    );
+    assert!(!captured.head.contains("first-api-key"));
+
+    let same_reference = OpenAiCompatibleProvider::with_secret_resolver(
+        &mock.endpoint,
+        "mock-model",
+        secret_ref,
+        Arc::new(SequenceSecretResolver::new(
+            SecretRef::parse("env:ZEUS_RUNTIME_KEY").unwrap(),
+            [Ok("third-api-key")],
+        )),
+    )
+    .unwrap();
+    let different_reference_value = SecretRef::parse("env:ZEUS_OTHER_KEY").unwrap();
+    let different_reference = OpenAiCompatibleProvider::with_secret_resolver(
+        &mock.endpoint,
+        "mock-model",
+        different_reference_value.clone(),
+        Arc::new(SequenceSecretResolver::new(
+            different_reference_value,
+            [Ok("rotated-api-key")],
+        )),
+    )
+    .unwrap();
+    assert_eq!(
+        provider.metadata().provider_id,
+        same_reference.metadata().provider_id
+    );
+    assert_ne!(
+        provider.metadata().provider_id,
+        different_reference.metadata().provider_id
+    );
+    assert!(!provider.metadata().provider_id.contains("ZEUS_RUNTIME_KEY"));
+    assert!(!provider.metadata().provider_id.contains("rotated-api-key"));
+}
+
+#[tokio::test]
+async fn unresolved_secret_ref_fails_before_provider_io() {
+    let response = serde_json::json!({
+        "choices": [{
+            "message": { "role": "assistant", "content": "must not be returned" },
+            "finish_reason": "stop"
+        }]
+    });
+    let mut mock = spawn_mock(
+        "200 OK",
+        &[("Content-Type", "application/json".to_owned())],
+        serde_json::to_vec(&response).unwrap(),
+        Duration::ZERO,
+    )
+    .await;
+    let secret_ref = SecretRef::parse("env:ZEUS_MISSING_KEY").unwrap();
+    let resolver = Arc::new(SequenceSecretResolver::new(
+        secret_ref.clone(),
+        [Err(SecretResolveError::Unavailable)],
+    ));
+    let provider = OpenAiCompatibleProvider::with_secret_resolver(
+        &mock.endpoint,
+        "mock-model",
+        secret_ref,
+        resolver.clone(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        provider
+            .reply(request_with_secret("Do not send this"))
+            .await
+            .unwrap_err(),
+        ProviderError::SecretUnavailable
+    );
+    assert_eq!(resolver.calls(), 1);
+    assert!(
+        timeout(Duration::from_millis(50), mock.received.take().unwrap())
+            .await
+            .is_err(),
+        "credential failure must happen before the TCP request"
+    );
+
+    let blank_ref = SecretRef::parse("env:ZEUS_BLANK_KEY").unwrap();
+    let blank = OpenAiCompatibleProvider::with_secret_resolver(
+        &mock.endpoint,
+        "mock-model",
+        blank_ref.clone(),
+        Arc::new(SequenceSecretResolver::new(blank_ref, [Ok("   ")])),
+    )
+    .unwrap();
+    assert_eq!(
+        blank.validate_secret_source().await.unwrap_err(),
+        ProviderError::InvalidConfiguration("API key must not be blank")
+    );
 }
 
 #[tokio::test]

@@ -1,6 +1,19 @@
 use std::{future::IntoFuture, io, net::SocketAddr, sync::Arc, time::Duration};
 
-use llm::{LocalFallbackProvider, OpenAiCompatibleProvider, ReplyProvider};
+#[cfg(unix)]
+use std::{
+    fs::OpenOptions,
+    io::Read,
+    os::unix::fs::OpenOptionsExt,
+    path::{Component, Path, PathBuf},
+};
+#[cfg(unix)]
+use zeroize::Zeroizing;
+
+use llm::{
+    LocalFallbackProvider, OpenAiCompatibleProvider, ReplyProvider, ResolvedSecret, SecretRef,
+    SecretResolveError, SecretResolveFuture, SecretResolver,
+};
 use runtime::{DemoStore, SqliteOperationLimits, SqlitePhysicalLimits, StorageLimits};
 use tenancy::BootstrapToken;
 use tokio::sync::oneshot;
@@ -8,6 +21,8 @@ use zeus_api::IngressPolicy;
 
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const BOOTSTRAP_TOKEN_TTL: chrono::Duration = chrono::Duration::minutes(15);
+#[cfg(unix)]
+const SECRET_FILE_MAX_BYTES: usize = 16 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -21,6 +36,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ingress = configured_ingress_policy()?;
     let ingress_mode = ingress.mode_name();
     let public_origin = ingress.public_origin().unwrap_or("direct peer").to_owned();
+    let reply_provider = configured_reply_provider().await?;
+    let reply_provider_id = reply_provider.metadata().provider_id.clone();
     let store = match profile.as_str() {
         "production-guarded" => {
             DemoStore::open_with_limits_and_physical_and_operations(
@@ -83,8 +100,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bootstrap.expose_secret()
         );
     }
-    let reply_provider = configured_reply_provider()?;
-    let reply_provider_id = reply_provider.metadata().provider_id.clone();
     let listener = tokio::net::TcpListener::bind(address).await?;
     let app =
         zeus_api::authenticated_app_with_provider_and_ingress(store, ingress, reply_provider)?;
@@ -340,21 +355,236 @@ fn parse_environment_capacity_with_legacy_alias(
     }
 }
 
-fn configured_reply_provider() -> Result<Arc<dyn ReplyProvider>, io::Error> {
-    let endpoint = optional_environment("ZEUS_LLM_ENDPOINT")?;
-    let model = optional_environment("ZEUS_LLM_MODEL")?;
-    let api_key = optional_environment("ZEUS_LLM_API_KEY")?;
-    match (endpoint, model, api_key) {
-        (None, None, None) => Ok(Arc::new(LocalFallbackProvider::new())),
-        (Some(endpoint), Some(model), Some(api_key)) => Ok(Arc::new(
+async fn configured_reply_provider() -> Result<Arc<dyn ReplyProvider>, io::Error> {
+    let settings = parse_reply_provider_settings(
+        optional_environment("ZEUS_LLM_ENDPOINT")?,
+        optional_environment("ZEUS_LLM_MODEL")?,
+        optional_environment("ZEUS_LLM_API_KEY")?,
+        optional_environment("ZEUS_LLM_API_KEY_REF")?,
+    )?;
+    match settings {
+        ReplyProviderSettings::LocalFallback => Ok(Arc::new(LocalFallbackProvider::new())),
+        ReplyProviderSettings::Inline {
+            endpoint,
+            model,
+            api_key,
+        } => Ok(Arc::new(
             OpenAiCompatibleProvider::new(endpoint, model, api_key)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?,
         )),
+        ReplyProviderSettings::SecretRef {
+            endpoint,
+            model,
+            secret_ref,
+        } => {
+            let resolver = configured_secret_resolver(secret_ref.clone())?;
+            let provider = OpenAiCompatibleProvider::with_secret_resolver(
+                endpoint, model, secret_ref, resolver,
+            )
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            provider
+                .validate_secret_source()
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            Ok(Arc::new(provider))
+        }
+    }
+}
+
+fn configured_secret_resolver(reference: SecretRef) -> Result<Arc<dyn SecretResolver>, io::Error> {
+    if reference.as_str().starts_with("env:") {
+        return Ok(Arc::new(EnvironmentSecretResolver::new(reference)?));
+    }
+    if reference.as_str().starts_with("file:") {
+        #[cfg(unix)]
+        {
+            return Ok(Arc::new(FileSecretResolver::new(reference)?));
+        }
+        #[cfg(not(unix))]
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file SecretRef requires a Unix no-follow file boundary",
+            ));
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "ZEUS_LLM_API_KEY_REF must use env:VARIABLE or file:/absolute/path syntax",
+    ))
+}
+
+enum ReplyProviderSettings {
+    LocalFallback,
+    Inline {
+        endpoint: String,
+        model: String,
+        api_key: String,
+    },
+    SecretRef {
+        endpoint: String,
+        model: String,
+        secret_ref: SecretRef,
+    },
+}
+
+fn parse_reply_provider_settings(
+    endpoint: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+    api_key_ref: Option<String>,
+) -> Result<ReplyProviderSettings, io::Error> {
+    match (endpoint, model, api_key, api_key_ref) {
+        (None, None, None, None) => Ok(ReplyProviderSettings::LocalFallback),
+        (Some(endpoint), Some(model), Some(api_key), None) => Ok(ReplyProviderSettings::Inline {
+            endpoint,
+            model,
+            api_key,
+        }),
+        (Some(endpoint), Some(model), None, Some(secret_ref)) => {
+            let secret_ref = SecretRef::parse(secret_ref)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            Ok(ReplyProviderSettings::SecretRef {
+                endpoint,
+                model,
+                secret_ref,
+            })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "ZEUS_LLM_ENDPOINT, ZEUS_LLM_MODEL, and ZEUS_LLM_API_KEY must be set together",
+            "ZEUS_LLM_ENDPOINT and ZEUS_LLM_MODEL require exactly one of ZEUS_LLM_API_KEY or ZEUS_LLM_API_KEY_REF",
         )),
     }
+}
+
+struct EnvironmentSecretResolver {
+    reference: SecretRef,
+    variable: String,
+}
+
+impl EnvironmentSecretResolver {
+    fn new(reference: SecretRef) -> Result<Self, io::Error> {
+        let variable = reference.as_str().strip_prefix("env:").ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ZEUS_LLM_API_KEY_REF must use env:VARIABLE syntax",
+            )
+        })?;
+        let mut bytes = variable.bytes();
+        if !bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+            || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ZEUS_LLM_API_KEY_REF environment variable name is invalid",
+            ));
+        }
+        let variable = variable.to_owned();
+        Ok(Self {
+            reference,
+            variable,
+        })
+    }
+}
+
+impl SecretResolver for EnvironmentSecretResolver {
+    fn resolve<'a>(&'a self, reference: &'a SecretRef) -> SecretResolveFuture<'a> {
+        let result = if reference != &self.reference {
+            Err(SecretResolveError::Unavailable)
+        } else {
+            std::env::var(&self.variable)
+                .map(ResolvedSecret::new)
+                .map_err(|_| SecretResolveError::Unavailable)
+        };
+        Box::pin(async move { result })
+    }
+}
+
+#[cfg(unix)]
+struct FileSecretResolver {
+    reference: SecretRef,
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl FileSecretResolver {
+    fn new(reference: SecretRef) -> Result<Self, io::Error> {
+        let raw_path = reference
+            .as_str()
+            .strip_prefix("file:")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid file SecretRef"))?;
+        let path = PathBuf::from(raw_path);
+        let mut components = path.components();
+        let invalid_segment = raw_path
+            .split('/')
+            .skip(1)
+            .any(|segment| segment.is_empty() || matches!(segment, "." | ".."));
+        if !matches!(components.next(), Some(Component::RootDir))
+            || components
+                .clone()
+                .any(|component| !matches!(component, Component::Normal(_)))
+            || components.next().is_none()
+            || invalid_segment
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file SecretRef must use a normalized absolute path without traversal",
+            ));
+        }
+        Ok(Self { reference, path })
+    }
+}
+
+#[cfg(unix)]
+impl SecretResolver for FileSecretResolver {
+    fn resolve<'a>(&'a self, reference: &'a SecretRef) -> SecretResolveFuture<'a> {
+        let authorized = reference == &self.reference;
+        let path = self.path.clone();
+        Box::pin(async move {
+            if !authorized {
+                return Err(SecretResolveError::Unavailable);
+            }
+            tokio::task::spawn_blocking(move || read_secret_file(&path))
+                .await
+                .unwrap_or(Err(SecretResolveError::Unavailable))
+        })
+    }
+}
+
+#[cfg(unix)]
+fn read_secret_file(path: &Path) -> Result<ResolvedSecret, SecretResolveError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| SecretResolveError::Unavailable)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| SecretResolveError::Unavailable)?;
+    if !metadata.is_file() || metadata.len() > SECRET_FILE_MAX_BYTES as u64 {
+        return Err(SecretResolveError::Unavailable);
+    }
+
+    let mut bytes = Zeroizing::new(Vec::with_capacity(
+        usize::try_from(metadata.len()).unwrap_or(SECRET_FILE_MAX_BYTES),
+    ));
+    file.take(SECRET_FILE_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| SecretResolveError::Unavailable)?;
+    if bytes.len() > SECRET_FILE_MAX_BYTES {
+        return Err(SecretResolveError::Unavailable);
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    let value = String::from_utf8(std::mem::take(&mut *bytes))
+        .map_err(|_| SecretResolveError::Unavailable)?;
+    Ok(ResolvedSecret::new(value))
 }
 
 fn optional_environment(name: &str) -> Result<Option<String>, io::Error> {
@@ -515,9 +745,13 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_environment_capacity, parse_environment_capacity_with_legacy_alias,
-        parse_environment_flag, parse_environment_u64, parse_ingress_policy,
+        EnvironmentSecretResolver, ReplyProviderSettings, parse_environment_capacity,
+        parse_environment_capacity_with_legacy_alias, parse_environment_flag,
+        parse_environment_u64, parse_ingress_policy, parse_reply_provider_settings,
     };
+    #[cfg(unix)]
+    use super::{FileSecretResolver, SECRET_FILE_MAX_BYTES};
+    use llm::{SecretRef, SecretResolveError, SecretResolver};
     use std::{env::VarError, io};
 
     #[test]
@@ -603,6 +837,128 @@ mod tests {
             parse_environment_flag("FLAG", Err(VarError::NotUnicode("invalid".into())), false,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn reply_provider_settings_require_one_complete_credential_source() {
+        assert!(matches!(
+            parse_reply_provider_settings(None, None, None, None).unwrap(),
+            ReplyProviderSettings::LocalFallback
+        ));
+        assert!(matches!(
+            parse_reply_provider_settings(
+                Some("https://provider.example/v1/chat/completions".into()),
+                Some("model-a".into()),
+                Some("inline-key".into()),
+                None,
+            )
+            .unwrap(),
+            ReplyProviderSettings::Inline { .. }
+        ));
+        let referenced = parse_reply_provider_settings(
+            Some("https://provider.example/v1/chat/completions".into()),
+            Some("model-a".into()),
+            None,
+            Some("env:ZEUS_RUNTIME_KEY".into()),
+        )
+        .unwrap();
+        assert!(matches!(
+            referenced,
+            ReplyProviderSettings::SecretRef { ref secret_ref, .. }
+                if secret_ref.as_str() == "env:ZEUS_RUNTIME_KEY"
+        ));
+
+        for settings in [
+            (Some("endpoint".into()), None, None, None),
+            (
+                Some("endpoint".into()),
+                Some("model".into()),
+                Some("key".into()),
+                Some("env:KEY".into()),
+            ),
+            (
+                Some("endpoint".into()),
+                Some("model".into()),
+                None,
+                Some("invalid ref".into()),
+            ),
+        ] {
+            assert!(
+                parse_reply_provider_settings(settings.0, settings.1, settings.2, settings.3)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn environment_secret_resolver_accepts_only_exact_environment_references() {
+        let valid = SecretRef::parse("env:ZEUS_RUNTIME_KEY_2").unwrap();
+        let resolver = EnvironmentSecretResolver::new(valid.clone()).unwrap();
+        assert_eq!(resolver.reference, valid);
+        assert_eq!(resolver.variable, "ZEUS_RUNTIME_KEY_2");
+
+        for invalid in ["vault:key", "env:", "env:2KEY", "env:KEY-NAME"] {
+            let reference = SecretRef::parse(invalid).unwrap();
+            assert!(EnvironmentSecretResolver::new(reference).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_secret_resolver_rotates_bounded_regular_files_without_following_symlinks() {
+        use std::{
+            fs,
+            os::unix::fs::symlink,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("zeus-secret-ref-{}-{nonce}", std::process::id()));
+        let link = path.with_extension("link");
+        fs::write(&path, b"first-api-key\n").unwrap();
+        let reference = SecretRef::parse(format!("file:{}", path.display())).unwrap();
+        let resolver = FileSecretResolver::new(reference.clone()).unwrap();
+
+        let first = resolver.resolve(&reference).await.unwrap();
+        assert_eq!(first.expose_secret(), "first-api-key");
+        drop(first);
+        fs::write(&path, b"rotated-api-key\r\n").unwrap();
+        let rotated = resolver.resolve(&reference).await.unwrap();
+        assert_eq!(rotated.expose_secret(), "rotated-api-key");
+        drop(rotated);
+
+        symlink(&path, &link).unwrap();
+        let link_ref = SecretRef::parse(format!("file:{}", link.display())).unwrap();
+        let link_resolver = FileSecretResolver::new(link_ref.clone()).unwrap();
+        assert_eq!(
+            link_resolver.resolve(&link_ref).await.unwrap_err(),
+            SecretResolveError::Unavailable
+        );
+
+        fs::write(&path, vec![b'x'; SECRET_FILE_MAX_BYTES + 1]).unwrap();
+        assert_eq!(
+            resolver.resolve(&reference).await.unwrap_err(),
+            SecretResolveError::Unavailable
+        );
+        let _ = fs::remove_file(&link);
+        let _ = fs::remove_file(&path);
+
+        for invalid in [
+            "file:relative",
+            "file:/",
+            "file:/tmp/../key",
+            "file:/tmp/./key",
+            "file:/tmp//key",
+        ] {
+            assert!(
+                FileSecretResolver::new(SecretRef::parse(invalid).unwrap()).is_err(),
+                "{invalid} must fail closed"
+            );
+        }
     }
 
     #[test]

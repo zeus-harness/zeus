@@ -5,7 +5,7 @@ Event Feed、Point-query Durable Context、Bounded Read Models、SQLite Capacity
 Physical/Operation Capacity、Bootstrap Audit Retention、schema v13 Account Membership
 Foundation、schema v14 Account-scoped Durable Authorization、schema v15 Member Lifecycle /
 Account Audit、schema v16 Session Reply Context Index 至 schema v25 Durable Session Context
-Compaction，以及 Trusted Single-Node Ingress 主机代码已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
+Compaction、Trusted Single-Node Ingress 与 Per-Operation SecretRef Resolution 主机代码已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
 v11→v12→v13→v14 迁移证据，current-image 证据见本节验收结果，Linux Docker PID/OOM
 authoritative gate 待完成。
 
@@ -190,7 +190,12 @@ Provider/connector 的外部 `await` 位于 SQLite transaction 之外，不持�
 - `preferred_model`: 服务端 allowlist 中的模型标识，可为空
 - `revision`: 乐观并发版本；更新必须提交 `expected_revision`
 
-Provider endpoint 和 API key 只从服务端环境或后续 SecretRef 解析，禁止由普通 Settings API 明文写入 SQLite。
+Provider endpoint 只来自服务端配置，API key 可用兼容的 inline 环境变量，或通过 bounded
+`SecretRef` 在每次 provider 操作前解析；禁止由普通 Settings API 明文写入 SQLite。当前 resolver
+支持 exact `env:VARIABLE`，以及 Unix 上 final-component no-follow、regular-file、16 KiB 上限的
+`file:/absolute/normalized/path`。启动会在打开 SQLite 前预检一次；运行时仍逐次解析。reference
+身份进入 provider config digest，plaintext 不进入 metadata/manifest/ledger；同 reference 换值
+允许轮换，换 reference 会让不兼容 queued work fail closed。
 
 ## 5. 回复执行链
 
@@ -414,8 +419,8 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 按项目既有统计口径通过 600 个 Rust 测试（connectors 22、deployment 8、knowledge 29、
-  storage 252、runtime 48、API library 79、API main/config 8）与 28 个 Web Node 测试。
+- host 按项目既有统计口径通过 606 个 Rust 测试（connectors 22、deployment 8、knowledge 29、
+  LLM unit 30、provider contract 15、storage 252、runtime 48、API library 79、API main/config 11）与 28 个 Web Node 测试。
 - `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 
 ## 8. 容器与 OOM 验收边界

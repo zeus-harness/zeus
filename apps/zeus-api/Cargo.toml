@@ -16,6 +16,7 @@ chrono.workspace = true
 deployment.workspace = true
 execution.workspace = true
 kernel.workspace = true
+libc.workspace = true
 llm.workspace = true
 protocol.workspace = true
 runtime.workspace = true

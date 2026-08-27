@@ -1,6 +1,6 @@
 //! Bounded OpenAI-compatible Chat Completions provider.
 
-use std::{fmt::Write as _, net::IpAddr, time::Duration};
+use std::{fmt::Write as _, net::IpAddr, sync::Arc, time::Duration};
 
 use reqwest::{
     Client, Url,
@@ -14,8 +14,8 @@ use zeroize::Zeroizing;
 use crate::{
     ProviderError, ProviderMetadata, REPLY_TOOL_ARGUMENTS_MAX_BYTES, ReplyFuture, ReplyKind,
     ReplyMessage, ReplyOutput, ReplyProvider, ReplyRequest, ReplyResponse, ReplyRole,
-    ReplyToolCall, ReplyToolDefinition, validate_provider_metadata, validate_reply_request,
-    validate_reply_response_for_request,
+    ReplyToolCall, ReplyToolDefinition, SecretRef, SecretResolveError, SecretResolver,
+    validate_provider_metadata, validate_reply_request, validate_reply_response_for_request,
 };
 
 /// Default deadline for connection, upload, and response download.
@@ -36,10 +36,27 @@ const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct OpenAiCompatibleProvider {
     client: Client,
     endpoint: Url,
-    authorization: HeaderValue,
+    api_key: ApiKeySource,
     model: String,
     max_response_bytes: usize,
     metadata: ProviderMetadata,
+}
+
+enum ApiKeySource {
+    Inline(HeaderValue),
+    SecretRef {
+        reference: SecretRef,
+        resolver: Arc<dyn SecretResolver>,
+    },
+}
+
+impl ApiKeySource {
+    fn secret_ref(&self) -> Option<&SecretRef> {
+        match self {
+            Self::Inline(_) => None,
+            Self::SecretRef { reference, .. } => Some(reference),
+        }
+    }
 }
 
 impl OpenAiCompatibleProvider {
@@ -67,6 +84,63 @@ impl OpenAiCompatibleProvider {
         endpoint: impl Into<String>,
         model: impl Into<String>,
         api_key: impl Into<String>,
+        timeout: Duration,
+        max_response_bytes: usize,
+    ) -> Result<Self, ProviderError> {
+        let api_key = Zeroizing::new(api_key.into());
+        let authorization = authorization_header(api_key.as_str())?;
+        Self::with_api_key_source(
+            endpoint,
+            model,
+            ApiKeySource::Inline(authorization),
+            timeout,
+            max_response_bytes,
+        )
+    }
+
+    /// Construct a provider that resolves its API key for every operation.
+    /// The non-secret reference participates in durable provider identity,
+    /// while rotating the value behind the same reference does not.
+    pub fn with_secret_resolver(
+        endpoint: impl Into<String>,
+        model: impl Into<String>,
+        secret_ref: SecretRef,
+        resolver: Arc<dyn SecretResolver>,
+    ) -> Result<Self, ProviderError> {
+        Self::with_secret_resolver_and_limits(
+            endpoint,
+            model,
+            secret_ref,
+            resolver,
+            DEFAULT_REQUEST_TIMEOUT,
+            DEFAULT_MAX_RESPONSE_BYTES,
+        )
+    }
+
+    pub fn with_secret_resolver_and_limits(
+        endpoint: impl Into<String>,
+        model: impl Into<String>,
+        secret_ref: SecretRef,
+        resolver: Arc<dyn SecretResolver>,
+        timeout: Duration,
+        max_response_bytes: usize,
+    ) -> Result<Self, ProviderError> {
+        Self::with_api_key_source(
+            endpoint,
+            model,
+            ApiKeySource::SecretRef {
+                reference: secret_ref,
+                resolver,
+            },
+            timeout,
+            max_response_bytes,
+        )
+    }
+
+    fn with_api_key_source(
+        endpoint: impl Into<String>,
+        model: impl Into<String>,
+        api_key: ApiKeySource,
         timeout: Duration,
         max_response_bytes: usize,
     ) -> Result<Self, ProviderError> {
@@ -100,17 +174,6 @@ impl OpenAiCompatibleProvider {
         }
 
         let model = model.into();
-        let api_key = Zeroizing::new(api_key.into());
-        if api_key.trim().is_empty() {
-            return Err(ProviderError::InvalidConfiguration(
-                "API key must not be blank",
-            ));
-        }
-        let bearer = Zeroizing::new(format!("Bearer {}", api_key.as_str()));
-        let mut authorization = HeaderValue::from_str(bearer.as_str())
-            .map_err(|_| ProviderError::InvalidConfiguration("API key is not header-safe"))?;
-        authorization.set_sensitive(true);
-
         let client = Client::builder()
             .redirect(Policy::none())
             .connect_timeout(timeout.min(MAX_CONNECT_TIMEOUT))
@@ -118,7 +181,13 @@ impl OpenAiCompatibleProvider {
             .build()
             .map_err(|_| ProviderError::InvalidConfiguration("HTTP client could not be built"))?;
         let metadata = ProviderMetadata {
-            provider_id: configuration_provider_id(&endpoint, &model, timeout, max_response_bytes),
+            provider_id: configuration_provider_id(
+                &endpoint,
+                &model,
+                timeout,
+                max_response_bytes,
+                api_key.secret_ref(),
+            ),
             model: Some(model.clone()),
             reply_kind: ReplyKind::Model,
         };
@@ -127,11 +196,41 @@ impl OpenAiCompatibleProvider {
         Ok(Self {
             client,
             endpoint,
-            authorization,
+            api_key,
             model,
             max_response_bytes,
             metadata,
         })
+    }
+
+    /// Return the configured non-secret credential reference, if this provider
+    /// resolves credentials per operation.
+    pub fn secret_ref(&self) -> Option<&SecretRef> {
+        self.api_key.secret_ref()
+    }
+
+    /// Resolve and validate the current credential without sending a provider
+    /// request. Startup uses this to fail before opening durable state.
+    pub async fn validate_secret_source(&self) -> Result<(), ProviderError> {
+        self.authorization_header().await.map(drop)
+    }
+
+    async fn authorization_header(&self) -> Result<HeaderValue, ProviderError> {
+        match &self.api_key {
+            ApiKeySource::Inline(authorization) => Ok(authorization.clone()),
+            ApiKeySource::SecretRef {
+                reference,
+                resolver,
+            } => {
+                let secret = resolver
+                    .resolve(reference)
+                    .await
+                    .map_err(|error| match error {
+                        SecretResolveError::Unavailable => ProviderError::SecretUnavailable,
+                    })?;
+                authorization_header(secret.expose_secret())
+            }
+        }
     }
 
     async fn request(&self, request: ReplyRequest) -> Result<ReplyResponse, ProviderError> {
@@ -152,10 +251,11 @@ impl OpenAiCompatibleProvider {
             tool_choice: (!tools.is_empty()).then_some("auto"),
             tools,
         };
+        let authorization = self.authorization_header().await?;
         let response = self
             .client
             .post(self.endpoint.clone())
-            .header(AUTHORIZATION, self.authorization.clone())
+            .header(AUTHORIZATION, authorization)
             .json(&wire_request)
             .send()
             .await
@@ -227,14 +327,32 @@ fn endpoint_is_loopback(endpoint: &Url) -> bool {
     })
 }
 
+fn authorization_header(api_key: &str) -> Result<HeaderValue, ProviderError> {
+    if api_key.trim().is_empty() {
+        return Err(ProviderError::InvalidConfiguration(
+            "API key must not be blank",
+        ));
+    }
+    let bearer = Zeroizing::new(format!("Bearer {api_key}"));
+    let mut authorization = HeaderValue::from_str(bearer.as_str())
+        .map_err(|_| ProviderError::InvalidConfiguration("API key is not header-safe"))?;
+    authorization.set_sensitive(true);
+    Ok(authorization)
+}
+
 fn configuration_provider_id(
     endpoint: &Url,
     model: &str,
     timeout: Duration,
     max_response_bytes: usize,
+    secret_ref: Option<&SecretRef>,
 ) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"zeus:openai-compatible-config:v1\0");
+    digest.update(if secret_ref.is_some() {
+        b"zeus:openai-compatible-config:v2\0".as_slice()
+    } else {
+        b"zeus:openai-compatible-config:v1\0".as_slice()
+    });
     update_digest_field(&mut digest, endpoint.as_str().as_bytes());
     update_digest_field(&mut digest, model.as_bytes());
     update_digest_field(&mut digest, &timeout.as_nanos().to_le_bytes());
@@ -244,6 +362,9 @@ fn configuration_provider_id(
             .expect("the configured response limit is bounded below u64::MAX")
             .to_le_bytes(),
     );
+    if let Some(secret_ref) = secret_ref {
+        update_digest_field(&mut digest, secret_ref.as_str().as_bytes());
+    }
     let digest = digest.finalize();
     let mut encoded = String::with_capacity(digest.len() * 2);
     for byte in digest {
