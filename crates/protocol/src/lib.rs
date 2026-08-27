@@ -215,6 +215,20 @@ pub fn validate_review_note(value: &str) -> Result<(), ResourceEnvelopeError> {
     }
 }
 
+/// Canonical model-visible result for an owner-rejected Agent tool call.
+///
+/// Both continuation construction and durable persistence must use this
+/// function so the next model step observes exactly the audited result.
+pub fn agent_approval_rejected_result(call_id: &str, note: Option<&str>) -> Value {
+    serde_json::json!({
+        "code": "approval_rejected",
+        "message": "the current account owner rejected this tool call",
+        "status": "rejected",
+        "call_id": call_id,
+        "note": note,
+    })
+}
+
 /// Validates an exactly canonical idempotency key.
 ///
 /// The accepted alphabet is ASCII `!` through `~`. In particular, this rejects
@@ -471,6 +485,8 @@ pub struct RotateMemberSetupTokenRequest {
 pub struct InFlightWorkSummary {
     pub reply_job_ids: Vec<String>,
     pub dispatch_call_ids: Vec<String>,
+    pub agent_model_job_ids: Vec<String>,
+    pub agent_tool_call_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -887,6 +903,131 @@ pub struct SessionTurn {
     pub started_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<String>,
+}
+
+/// Durable orchestration state for one Session turn.
+///
+/// The state describes Zeus' own agent loop, not the legacy demo Run. A turn
+/// may cross several model steps and tool calls while the Session remains
+/// `running`; only `succeeded`, `failed`, and `needs_attention` are terminal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTurnStatus {
+    WaitingModel,
+    ModelRunning,
+    WaitingApproval,
+    ToolQueued,
+    ToolRunning,
+    Succeeded,
+    Failed,
+    NeedsAttention,
+}
+
+impl AgentTurnStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::NeedsAttention)
+    }
+}
+
+/// Durable state of one model-selected, server-resolved tool call.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentToolCallStatus {
+    WaitingApproval,
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Rejected,
+    NotDispatched,
+    OutcomeUnknown,
+}
+
+impl AgentToolCallStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded
+                | Self::Failed
+                | Self::Cancelled
+                | Self::Rejected
+                | Self::NotDispatched
+                | Self::OutcomeUnknown
+        )
+    }
+}
+
+/// Approval evidence attached to one Session-native agent tool call.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentApprovalReview {
+    pub decision: ReviewDecision,
+    pub reviewer_user_id: String,
+    pub membership_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub reviewed_at: String,
+}
+
+/// Authenticated query projection for one model-selected tool call.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentToolCallDetail {
+    pub call_id: String,
+    pub provider_call_id: String,
+    pub ordinal: u32,
+    pub model_step: u32,
+    pub tool: String,
+    pub tool_version: String,
+    pub arguments: Value,
+    pub arguments_digest: String,
+    pub effect: ToolEffect,
+    pub sandbox_profile: SandboxProfile,
+    pub status: AgentToolCallStatus,
+    pub approval_required: bool,
+    pub policy_revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<AgentApprovalReview>,
+    /// Full bounded connector output. Zeus persists this value so a later
+    /// model step can consume exactly the result that was committed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<Value>,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+}
+
+/// Authenticated query projection for one durable Session-native agent loop.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentTurnDetail {
+    pub id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub status: AgentTurnStatus,
+    pub model_steps: u32,
+    pub tool_calls: u32,
+    pub tool_result_bytes: u64,
+    pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<Value>,
+    pub calls: Vec<AgentToolCallDetail>,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+}
+
+/// Result of an idempotent owner approval decision for an agent tool call.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentReviewResponse {
+    pub agent: AgentTurnDetail,
+    pub call: AgentToolCallDetail,
+    pub replayed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1327,6 +1468,20 @@ mod tests {
             validate_review_note(&"🙂".repeat(REVIEW_NOTE_MAX_BYTES / 4 + 1)),
             Err(ResourceEnvelopeError::TooLong {
                 max_bytes: REVIEW_NOTE_MAX_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn agent_approval_rejection_result_is_canonical_and_context_bound() {
+        assert_eq!(
+            agent_approval_rejected_result("agent-call-7", Some("not now")),
+            json!({
+                "code": "approval_rejected",
+                "message": "the current account owner rejected this tool call",
+                "status": "rejected",
+                "call_id": "agent-call-7",
+                "note": "not now",
             })
         );
     }

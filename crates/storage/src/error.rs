@@ -100,10 +100,18 @@ pub enum StorageError {
     DispatchJobNotFound(String),
     #[error("reply job `{0}` was not found")]
     ReplyJobNotFound(String),
+    #[error("agent turn `{0}` was not found")]
+    AgentTurnNotFound(String),
+    #[error("agent model job `{0}` was not found")]
+    AgentModelJobNotFound(String),
+    #[error("agent tool call `{0}` was not found")]
+    AgentToolCallNotFound(String),
     #[error("invalid dispatch state transition: {0}")]
     InvalidDispatchTransition(String),
     #[error("invalid reply state transition: {0}")]
     InvalidReplyTransition(String),
+    #[error("invalid agent state transition: {0}")]
+    InvalidAgentTransition(String),
     #[error("invalid session state transition: {0}")]
     InvalidSessionTransition(String),
     #[error("invalid API resource envelope: {0}")]
@@ -137,6 +145,38 @@ pub enum StorageError {
     InjectedFailure,
 }
 
+impl StorageError {
+    /// Whether an exact, idempotent durable completion should remain in memory
+    /// and retry without invoking its external model or tool operation again.
+    ///
+    /// Constraint, envelope, transition, and corruption failures are
+    /// deliberately excluded: retrying the same invalid commit cannot make it
+    /// valid. The selected errors can clear when SQLite contention, the file
+    /// system, or operator-managed storage capacity recovers.
+    pub fn is_retryable_durable_completion_error(&self) -> bool {
+        match self {
+            Self::Io(_)
+            | Self::StorageQuotaExceeded
+            | Self::PhysicalStorageExhausted
+            | Self::OperationCapacityExceeded
+            | Self::ConcurrentModification => true,
+            Self::Sqlite(error) => matches!(
+                error.sqlite_error_code(),
+                Some(
+                    rusqlite::ErrorCode::DatabaseBusy
+                        | rusqlite::ErrorCode::DatabaseLocked
+                        | rusqlite::ErrorCode::OperationInterrupted
+                        | rusqlite::ErrorCode::SystemIoFailure
+                        | rusqlite::ErrorCode::CannotOpen
+                        | rusqlite::ErrorCode::FileLockingProtocolFailed
+                        | rusqlite::ErrorCode::SchemaChanged
+                )
+            ),
+            _ => false,
+        }
+    }
+}
+
 impl From<rusqlite::Error> for StorageError {
     fn from(error: rusqlite::Error) -> Self {
         if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) {
@@ -144,5 +184,32 @@ impl From<rusqlite::Error> for StorageError {
         } else {
             Self::Sqlite(error)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sqlite_failure(code: i32) -> StorageError {
+        StorageError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            None,
+        ))
+    }
+
+    #[test]
+    fn exact_completion_retry_classifies_sqlite_failures_fail_closed() {
+        assert!(sqlite_failure(rusqlite::ffi::SQLITE_BUSY).is_retryable_durable_completion_error());
+        assert!(
+            sqlite_failure(rusqlite::ffi::SQLITE_IOERR).is_retryable_durable_completion_error()
+        );
+        assert!(
+            !sqlite_failure(rusqlite::ffi::SQLITE_CONSTRAINT)
+                .is_retryable_durable_completion_error()
+        );
+        assert!(
+            !sqlite_failure(rusqlite::ffi::SQLITE_CORRUPT).is_retryable_durable_completion_error()
+        );
     }
 }

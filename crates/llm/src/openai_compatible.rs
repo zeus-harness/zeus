@@ -12,9 +12,10 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::{
-    ProviderError, ProviderMetadata, ReplyFuture, ReplyKind, ReplyMessage, ReplyProvider,
-    ReplyRequest, ReplyResponse, validate_provider_metadata, validate_reply_request,
-    validate_reply_response,
+    ProviderError, ProviderMetadata, REPLY_TOOL_ARGUMENTS_MAX_BYTES, ReplyFuture, ReplyKind,
+    ReplyMessage, ReplyOutput, ReplyProvider, ReplyRequest, ReplyResponse, ReplyRole,
+    ReplyToolCall, ReplyToolDefinition, validate_provider_metadata, validate_reply_request,
+    validate_reply_response_for_request,
 };
 
 /// Default deadline for connection, upload, and response download.
@@ -135,9 +136,21 @@ impl OpenAiCompatibleProvider {
 
     async fn request(&self, request: ReplyRequest) -> Result<ReplyResponse, ProviderError> {
         validate_reply_request(&request)?;
+        let messages = request
+            .messages
+            .iter()
+            .map(ChatCompletionRequestMessage::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        let tools = request
+            .tools
+            .iter()
+            .map(ChatCompletionToolDefinition::from)
+            .collect::<Vec<_>>();
         let wire_request = ChatCompletionRequest {
             model: &self.model,
-            messages: &request.messages,
+            messages,
+            tool_choice: (!tools.is_empty()).then_some("auto"),
+            tools,
         };
         let response = self
             .client
@@ -192,15 +205,13 @@ impl OpenAiCompatibleProvider {
             .into_iter()
             .next()
             .ok_or(ProviderError::InvalidResponse)?;
-        if choice.message.content.trim().is_empty() {
-            return Err(ProviderError::InvalidResponse);
-        }
+        let output = decode_output(choice.message)?;
         let response = ReplyResponse {
-            content: choice.message.content,
+            output,
             finish_reason: choice.finish_reason,
             provider: self.metadata.clone(),
         };
-        validate_reply_response(&response)?;
+        validate_reply_response_for_request(&request, &response)?;
         Ok(response)
     }
 }
@@ -271,7 +282,114 @@ fn map_transport_error(error: reqwest::Error) -> ProviderError {
 #[derive(Serialize)]
 struct ChatCompletionRequest<'a> {
     model: &'a str,
-    messages: &'a [ReplyMessage],
+    messages: Vec<ChatCompletionRequestMessage<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<ChatCompletionToolDefinition<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+struct ChatCompletionRequestMessage<'a> {
+    role: &'static str,
+    content: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ChatCompletionRequestToolCall<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<&'a str>,
+}
+
+impl<'a> TryFrom<&'a ReplyMessage> for ChatCompletionRequestMessage<'a> {
+    type Error = ProviderError;
+
+    fn try_from(message: &'a ReplyMessage) -> Result<Self, Self::Error> {
+        let (role, content, tool_calls, tool_call_id) = match message.role {
+            ReplyRole::System => ("system", Some(message.content.as_str()), None, None),
+            ReplyRole::User => ("user", Some(message.content.as_str()), None, None),
+            ReplyRole::Assistant => {
+                if let Some(call) = &message.tool_call {
+                    (
+                        "assistant",
+                        None,
+                        Some(vec![ChatCompletionRequestToolCall::try_from(call)?]),
+                        None,
+                    )
+                } else {
+                    ("assistant", Some(message.content.as_str()), None, None)
+                }
+            }
+            ReplyRole::Tool => (
+                "tool",
+                Some(message.content.as_str()),
+                None,
+                message.tool_call_id.as_deref(),
+            ),
+        };
+        Ok(Self {
+            role,
+            content,
+            tool_calls,
+            tool_call_id,
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct ChatCompletionRequestToolCall<'a> {
+    id: &'a str,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: ChatCompletionRequestFunction<'a>,
+}
+
+impl<'a> TryFrom<&'a ReplyToolCall> for ChatCompletionRequestToolCall<'a> {
+    type Error = ProviderError;
+
+    fn try_from(call: &'a ReplyToolCall) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: &call.id,
+            kind: "function",
+            function: ChatCompletionRequestFunction {
+                name: &call.name,
+                arguments: serde_json::to_string(&call.arguments)
+                    .map_err(|_| ProviderError::InvalidRequest("invalid tool call arguments"))?,
+            },
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct ChatCompletionRequestFunction<'a> {
+    name: &'a str,
+    arguments: String,
+}
+
+#[derive(Serialize)]
+struct ChatCompletionToolDefinition<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: ChatCompletionFunctionDefinition<'a>,
+}
+
+impl<'a> From<&'a ReplyToolDefinition> for ChatCompletionToolDefinition<'a> {
+    fn from(tool: &'a ReplyToolDefinition) -> Self {
+        Self {
+            kind: "function",
+            function: ChatCompletionFunctionDefinition {
+                name: &tool.name,
+                description: tool.description.as_deref(),
+                parameters: &tool.parameters,
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ChatCompletionFunctionDefinition<'a> {
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
+    parameters: &'a serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -287,5 +405,53 @@ struct ChatCompletionChoice {
 
 #[derive(Deserialize)]
 struct ChatCompletionMessage {
-    content: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ChatCompletionResponseToolCall>,
+}
+
+#[derive(Deserialize)]
+struct ChatCompletionResponseToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    kind: String,
+    function: ChatCompletionResponseFunction,
+}
+
+#[derive(Deserialize)]
+struct ChatCompletionResponseFunction {
+    name: String,
+    arguments: String,
+}
+
+fn decode_output(message: ChatCompletionMessage) -> Result<ReplyOutput, ProviderError> {
+    if message.tool_calls.is_empty() {
+        let content = message.content.ok_or(ProviderError::InvalidResponse)?;
+        if content.trim().is_empty() {
+            return Err(ProviderError::InvalidResponse);
+        }
+        return Ok(ReplyOutput::Final { content });
+    }
+    if message.tool_calls.len() != 1
+        || message
+            .content
+            .as_ref()
+            .is_some_and(|content| !content.is_empty())
+    {
+        return Err(ProviderError::InvalidResponse);
+    }
+    let call = message
+        .tool_calls
+        .into_iter()
+        .next()
+        .expect("the single tool call was checked above");
+    if call.kind != "function" || call.function.arguments.len() > REPLY_TOOL_ARGUMENTS_MAX_BYTES {
+        return Err(ProviderError::InvalidResponse);
+    }
+    let arguments = serde_json::from_str(&call.function.arguments)
+        .map_err(|_| ProviderError::InvalidResponse)?;
+    Ok(ReplyOutput::ToolCall {
+        call: ReplyToolCall::new(call.id, call.function.name, arguments),
+    })
 }

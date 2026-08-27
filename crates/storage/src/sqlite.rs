@@ -28,17 +28,19 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::cursor;
+mod agent;
 use crate::operation::{OperationClass, OperationLimiter};
 use crate::{
     AccountAuditArchiveState, AccountAuditCheckpointCommit, AccountAuditEvent, AccountAuditPage,
-    AccountAuditPolicy, AccountAuditRollup, AccountAuditState, AccountId, AuthPrincipal,
-    AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, BoundedRunRead,
-    ClaimOutcome, CommitOutcome, CreateMemberCommit, CreateMemberResult, DispatchCompleteCommit,
-    DispatchContext, DispatchJob, DispatchJobSpec, DispatchRecoveryCommit, DispatchRejection,
-    DispatchStartCommit, DispatchStatus, InFlightWorkSummary, MEMBER_SETUP_TOKEN_TTL_SECONDS,
-    MemberSetupCommit, MemberSetupResult, MemberTransitionResult, MembershipRevision,
-    MembershipRole, RecoveredSessionTurn, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit,
-    ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
+    AccountAuditPolicy, AccountAuditRollup, AccountAuditState, AccountId, AgentModelJob, AgentTurn,
+    AgentTurnEnqueueResponse, AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthSessionId,
+    AuthzContext, BootstrapOwnerCommit, BoundedRunRead, ClaimOutcome, CommitOutcome,
+    CreateMemberCommit, CreateMemberResult, DispatchCompleteCommit, DispatchContext, DispatchJob,
+    DispatchJobSpec, DispatchRecoveryCommit, DispatchRejection, DispatchStartCommit,
+    DispatchStatus, InFlightWorkSummary, MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit,
+    MemberSetupResult, MemberTransitionResult, MembershipRevision, MembershipRole,
+    RecoveredSessionTurn, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit, ReplyJob,
+    ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
     ReplySuccessCommit, ReviewCommit, ReviewContext, ReviewReceipt, RotateMemberSetupTokenCommit,
     RotateMemberSetupTokenResult, RunSnapshot, RuntimeIdentity, SessionSummaryPage,
     SqliteOperationLimits, SqlitePhysicalLimits, StorageError, StorageLimits, StoredCredential,
@@ -47,7 +49,7 @@ use crate::{
     UpdateAccountAuditPolicyCommit,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 16;
+const CURRENT_SCHEMA_VERSION: i64 = 17;
 const LOCAL_ACCOUNT_ID: &str = "acc_local";
 const EVENT_PAYLOAD_VERSION_V1: i64 = 1;
 const EVENT_PAYLOAD_VERSION_V2: i64 = 2;
@@ -70,6 +72,7 @@ const MIGRATION_0014: &str =
     include_str!("../migrations/0014_account_scoped_durable_authorization.sql");
 const MIGRATION_0015: &str = include_str!("../migrations/0015_member_lifecycle_account_audit.sql");
 const MIGRATION_0016: &str = include_str!("../migrations/0016_session_reply_context_index.sql");
+const MIGRATION_0017: &str = include_str!("../migrations/0017_session_agent_loop.sql");
 const RECOVERY_BATCH_LIMIT: i64 = 64;
 const AUTH_SESSION_CLEANUP_BATCH_LIMIT: i64 = 64;
 const BOOTSTRAP_AUDIT_ROLLUP_BATCH_LIMIT: i64 = 64;
@@ -746,12 +749,13 @@ impl SqliteStore {
                 StartTurnOptions {
                     authz: None,
                     reply_job: None,
+                    agent_turn: None,
                     limits: &limits,
                     physical_limits: &physical_limits,
                     fail_after_enqueue: false,
                 },
             )
-            .map(|(response, _)| response)
+            .map(|outcome| outcome.start)
         })
         .await
     }
@@ -777,12 +781,13 @@ impl SqliteStore {
                 StartTurnOptions {
                     authz: Some(&context),
                     reply_job: None,
+                    agent_turn: None,
                     limits: &limits,
                     physical_limits: &physical_limits,
                     fail_after_enqueue: false,
                 },
             )
-            .map(|(response, _)| response)
+            .map(|outcome| outcome.start)
         })
         .await
     }
@@ -816,13 +821,19 @@ impl SqliteStore {
                 StartTurnOptions {
                     authz: Some(&context),
                     reply_job: Some(job),
+                    agent_turn: None,
                     limits: &limits,
                     physical_limits: &physical_limits,
                     fail_after_enqueue: false,
                 },
             )
-            .and_then(|(start, job)| {
-                job.map(|job| ReplyJobEnqueueResponse { start, job })
+            .and_then(|outcome| {
+                outcome
+                    .reply_job
+                    .map(|job| ReplyJobEnqueueResponse {
+                        start: outcome.start,
+                        job,
+                    })
                     .ok_or_else(|| {
                         StorageError::CorruptData(
                             "reply enqueue committed without a queue record".into(),
@@ -858,16 +869,74 @@ impl SqliteStore {
                 StartTurnOptions {
                     authz: Some(&context),
                     reply_job: Some(job),
+                    agent_turn: None,
                     limits: &limits,
                     physical_limits: &physical_limits,
                     fail_after_enqueue: false,
                 },
             )
-            .and_then(|(start, job)| {
-                job.map(|job| ReplyJobEnqueueResponse { start, job })
+            .and_then(|outcome| {
+                outcome
+                    .reply_job
+                    .map(|job| ReplyJobEnqueueResponse {
+                        start: outcome.start,
+                        job,
+                    })
                     .ok_or_else(|| {
                         StorageError::CorruptData(
                             "reply enqueue committed without a queue record".into(),
+                        )
+                    })
+            })
+        })
+        .await
+    }
+
+    /// Atomically persists a user turn, its Session-native agent state, and
+    /// the immutable first model request. Provider execution cannot begin
+    /// until the model job is claimed and its `started` checkpoint commits.
+    pub async fn start_turn_and_enqueue_agent_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        request: StartTurnRequest,
+        idempotency_key: &str,
+        agent: AgentTurnSpec,
+    ) -> Result<AgentTurnEnqueueResponse, StorageError> {
+        let context = validated_authz_context(context)?;
+        if agent.authz != context {
+            return Err(StorageError::SessionNotFound(session_id.to_owned()));
+        }
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        let key = normalized_key(idempotency_key)?.to_owned();
+        let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            start_turn(
+                connection,
+                &session_id,
+                request,
+                &key,
+                StartTurnOptions {
+                    authz: Some(&context),
+                    reply_job: None,
+                    agent_turn: Some(agent),
+                    limits: &limits,
+                    physical_limits: &physical_limits,
+                    fail_after_enqueue: false,
+                },
+            )
+            .and_then(|outcome| {
+                outcome
+                    .agent_work
+                    .map(|(agent, job)| AgentTurnEnqueueResponse {
+                        start: outcome.start,
+                        agent,
+                        job,
+                    })
+                    .ok_or_else(|| {
+                        StorageError::CorruptData(
+                            "agent enqueue committed without durable work".into(),
                         )
                     })
             })
@@ -1814,13 +1883,19 @@ impl SqliteStore {
                 StartTurnOptions {
                     authz: Some(&context),
                     reply_job: Some(job),
+                    agent_turn: None,
                     limits: &limits,
                     physical_limits: &physical_limits,
                     fail_after_enqueue: true,
                 },
             )
-            .and_then(|(start, job)| {
-                job.map(|job| ReplyJobEnqueueResponse { start, job })
+            .and_then(|outcome| {
+                outcome
+                    .reply_job
+                    .map(|job| ReplyJobEnqueueResponse {
+                        start: outcome.start,
+                        job,
+                    })
                     .ok_or_else(|| {
                         StorageError::CorruptData(
                             "reply enqueue committed without a queue record".into(),
@@ -2684,6 +2759,13 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
             params![16, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 17 {
+        transaction.execute_batch(MIGRATION_0017)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![17, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
     validate_configured_account_audit_policies(&transaction, limits)?;
     compact_existing_bootstrap_audit_to_capacity(&transaction, &now(), limits)?;
     transaction.commit()?;
@@ -3278,12 +3360,13 @@ fn readiness(
                'bootstrap_audit_rollup', 'accounts', 'account_memberships',
                'member_setup_tokens', 'account_audit_rollups',
                'account_audit_policies', 'account_audit_archive_state',
-               'account_audit_events'
+               'account_audit_events', 'agent_turns', 'agent_model_jobs',
+               'agent_tool_calls', 'agent_review_receipts'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if table_count != 27 {
+    if table_count != 31 {
         return Err(StorageError::CorruptData(
             "one or more required tables are missing".into(),
         ));
@@ -3412,12 +3495,21 @@ fn readiness(
                'member_setup_tokens_expiry_idx',
                'account_audit_events_hash_idx',
                'account_audit_events_time_idx',
-               'session_events_reply_context_idx'
+               'session_events_reply_context_idx',
+               'session_events_turn_kind_idx',
+               'agent_turns_account_status_idx',
+               'agent_turns_recovery_idx',
+               'agent_model_jobs_ready_idx',
+               'agent_model_jobs_started_idx',
+               'agent_model_jobs_one_live_idx',
+               'agent_tool_calls_ready_idx',
+               'agent_tool_calls_started_idx',
+               'agent_tool_calls_one_live_idx'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if point_query_indexes != 40 {
+    if point_query_indexes != 49 {
         return Err(StorageError::CorruptData(
             "one or more point-query indexes are missing".into(),
         ));
@@ -3503,14 +3595,48 @@ fn readiness(
                'runs_owner_is_write_once',
                'user_preferences_enforce_revision',
                'users_reject_delete_with_history',
-               'users_reject_identity_update'
+               'users_reject_identity_update',
+               'agent_turns_reject_identity_update',
+               'agent_turns_require_current_authority',
+               'agent_turns_enforce_forward_revision',
+               'agent_turns_reject_delete',
+               'agent_model_jobs_require_current_step',
+               'agent_model_jobs_reject_input_update',
+               'agent_model_jobs_enforce_forward_transition',
+               'agent_model_jobs_reject_delete',
+               'agent_tool_calls_require_current_call',
+               'agent_tool_calls_enforce_forward_transition',
+               'agent_tool_calls_reject_input_update',
+               'agent_tool_calls_freeze_review_binding',
+               'agent_tool_calls_reject_delete',
+               'agent_review_receipts_require_current_owner',
+               'agent_review_receipts_reject_update',
+               'agent_review_receipts_reject_delete'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 78 {
+    if trigger_count != 94 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
+        ));
+    }
+
+    let agent_pending_call_fk: i64 = connection.query_row(
+        r#"SELECT COUNT(*)
+           FROM pragma_foreign_key_list('agent_turns') left_column
+           JOIN pragma_foreign_key_list('agent_turns') right_column
+             ON right_column.id = left_column.id
+           WHERE left_column."table" = 'agent_tool_calls'
+             AND left_column."from" = 'id' AND left_column."to" = 'agent_id'
+             AND right_column."from" = 'pending_call_id'
+             AND right_column."to" = 'call_id'"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if agent_pending_call_fk != 1 {
+        return Err(StorageError::CorruptData(
+            "the Agent pending-call composite foreign key is missing".into(),
         ));
     }
 
@@ -3690,6 +3816,52 @@ fn readiness(
                           job.initiating_actor_user_id,
                           job.approving_actor_user_id
                       ))
+               UNION ALL
+               SELECT 1
+               FROM agent_turns agent
+               JOIN sessions session ON session.id = agent.session_id
+               JOIN session_turns turn ON turn.id = agent.turn_id
+               WHERE agent.account_id IS NOT session.account_id
+                  OR turn.session_id IS NOT agent.session_id
+               UNION ALL
+               SELECT 1
+               FROM agent_model_jobs job
+               JOIN agent_turns agent ON agent.id = job.agent_id
+               WHERE job.account_id IS NOT agent.account_id
+                  OR job.actor_user_id IS NOT agent.actor_user_id
+                  OR job.actor_membership_revision IS NOT agent.actor_membership_revision
+                  OR job.session_id IS NOT agent.session_id
+                  OR job.turn_id IS NOT agent.turn_id
+                  OR job.provider_name IS NOT agent.provider_name
+                  OR job.model_name IS NOT agent.model_name
+               UNION ALL
+               SELECT 1
+               FROM agent_tool_calls call
+               JOIN agent_turns agent ON agent.id = call.agent_id
+               WHERE call.account_id IS NOT agent.account_id
+                  OR call.session_id IS NOT agent.session_id
+                  OR call.turn_id IS NOT agent.turn_id
+                  OR call.ordinal > agent.tool_calls
+                  OR call.model_step > agent.model_steps
+               UNION ALL
+               SELECT 1
+               FROM agent_review_receipts receipt
+               JOIN agent_tool_calls call ON call.call_id = receipt.call_id
+               WHERE receipt.account_id IS NOT call.account_id
+                  OR receipt.actor_user_id IS NOT call.approving_actor_user_id
+                  OR receipt.actor_membership_revision
+                     IS NOT call.approving_membership_revision
+               UNION ALL
+               SELECT 1
+               FROM agent_turns agent
+               LEFT JOIN agent_tool_calls call
+                 ON call.agent_id = agent.id AND call.call_id = agent.pending_call_id
+               WHERE (agent.status = 'waiting_approval'
+                      AND (call.status IS NULL OR call.status <> 'waiting_approval'))
+                  OR (agent.status = 'tool_queued'
+                      AND (call.status IS NULL OR call.status <> 'queued'))
+                  OR (agent.status = 'tool_running'
+                      AND (call.status IS NULL OR call.status <> 'started'))
            )"#,
         [],
         |row| row.get(0),
@@ -3747,20 +3919,20 @@ fn readiness(
                             > ((9223372036854775807 - 524288) / 6) / 2
                        THEN 9223372036854775807
                        ELSE CASE
-                           WHEN length(CAST(COALESCE(job.provider_name, '') AS BLOB))
+                           WHEN length(CAST(COALESCE(job.provider_name, agent.provider_name, '') AS BLOB))
                                 > (9223372036854775807 - 524288) / 6
                                   - 2 * length(CAST(turn.id AS BLOB))
                            THEN 9223372036854775807
                            ELSE CASE
-                               WHEN length(CAST(COALESCE(job.model_name, '') AS BLOB))
+                               WHEN length(CAST(COALESCE(job.model_name, agent.model_name, '') AS BLOB))
                                     > (9223372036854775807 - 524288) / 6
                                       - 2 * length(CAST(turn.id AS BLOB))
-                                      - length(CAST(COALESCE(job.provider_name, '') AS BLOB))
+                                      - length(CAST(COALESCE(job.provider_name, agent.provider_name, '') AS BLOB))
                                THEN 9223372036854775807
                                ELSE 524288 + 6 * (
                                    2 * length(CAST(turn.id AS BLOB))
-                                   + length(CAST(COALESCE(job.provider_name, '') AS BLOB))
-                                   + length(CAST(COALESCE(job.model_name, '') AS BLOB))
+                                   + length(CAST(COALESCE(job.provider_name, agent.provider_name, '') AS BLOB))
+                                   + length(CAST(COALESCE(job.model_name, agent.model_name, '') AS BLOB))
                                )
                            END
                        END
@@ -3769,6 +3941,9 @@ fn readiness(
                LEFT JOIN reply_jobs job
                  ON job.session_id = turn.session_id
                 AND job.turn_id = turn.id
+               LEFT JOIN agent_turns agent
+                 ON agent.session_id = turn.session_id
+                AND agent.turn_id = turn.id
            ),
            dispatch_expected AS (
                SELECT
@@ -3806,6 +3981,12 @@ fn readiness(
                             IS NOT expected.expected_bytes
                      ))
                   OR (t.status <> 'open' AND reservation.turn_id IS NOT NULL)
+               UNION ALL
+               SELECT 1
+               FROM reply_jobs reply
+               JOIN agent_turns agent
+                 ON agent.session_id = reply.session_id
+                AND agent.turn_id = reply.turn_id
                UNION ALL
                SELECT 1
                FROM dispatch_jobs job
@@ -4597,7 +4778,12 @@ fn require_reply_queue_capacity(
             r#"SELECT COUNT(*) FROM (
                    SELECT 1 FROM reply_jobs
                    WHERE account_id = ?1 AND actor_user_id = ?2
-                     AND status IN ('queued', 'started') LIMIT ?3
+                     AND status IN ('queued', 'started')
+                   UNION ALL
+                   SELECT 1 FROM agent_turns
+                   WHERE account_id = ?1 AND actor_user_id = ?2
+                     AND status NOT IN ('succeeded', 'failed', 'needs_attention')
+                   LIMIT ?3
                )"#,
             params![account_id, actor_user_id, actor_limit],
             |row| row.get(0),
@@ -4608,8 +4794,14 @@ fn require_reply_queue_capacity(
     }
     let account_limit = capacity_limit(limits.active_reply_jobs_per_account)?;
     let account_count: i64 = connection.query_row(
-        r#"SELECT COUNT(*) FROM (SELECT 1 FROM reply_jobs WHERE account_id = ?1
-           AND status IN ('queued','started') LIMIT ?2)"#,
+        r#"SELECT COUNT(*) FROM (
+               SELECT 1 FROM reply_jobs WHERE account_id = ?1
+                 AND status IN ('queued','started')
+               UNION ALL
+               SELECT 1 FROM agent_turns WHERE account_id = ?1
+                 AND status NOT IN ('succeeded', 'failed', 'needs_attention')
+               LIMIT ?2
+           )"#,
         params![account_id, account_limit],
         |row| row.get(0),
     )?;
@@ -4621,7 +4813,11 @@ fn require_reply_queue_capacity(
     let global_count: i64 = connection.query_row(
         r#"SELECT COUNT(*) FROM (
                SELECT 1 FROM reply_jobs
-               WHERE status IN ('queued', 'started') LIMIT ?1
+               WHERE status IN ('queued', 'started')
+               UNION ALL
+               SELECT 1 FROM agent_turns
+               WHERE status NOT IN ('succeeded', 'failed', 'needs_attention')
+               LIMIT ?1
            )"#,
         [global_limit],
         |row| row.get(0),
@@ -6453,6 +6649,8 @@ fn transition_member(
                 "revoked_setup_tokens": revoked_setup_tokens,
                 "in_flight_reply_jobs": in_flight.reply_job_ids.len(),
                 "in_flight_dispatch_jobs": in_flight.dispatch_call_ids.len(),
+                "in_flight_agent_model_jobs": in_flight.agent_model_job_ids.len(),
+                "in_flight_agent_tool_calls": in_flight.agent_tool_call_ids.len(),
             }),
         },
         &timestamp,
@@ -6492,9 +6690,30 @@ fn query_in_flight_work(
     let dispatch_call_ids = dispatch_statement
         .query_map(params![account_id, user_id], |row| row.get(0))?
         .collect::<Result<Vec<String>, _>>()?;
+    let mut agent_model_statement = connection.prepare(
+        r#"SELECT id FROM agent_model_jobs
+           WHERE account_id = ?1 AND actor_user_id = ?2 AND status = 'started'
+           ORDER BY id"#,
+    )?;
+    let agent_model_job_ids = agent_model_statement
+        .query_map(params![account_id, user_id], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+    let mut agent_tool_statement = connection.prepare(
+        r#"SELECT call.call_id
+           FROM agent_tool_calls call
+           JOIN agent_turns agent ON agent.id = call.agent_id
+           WHERE call.account_id = ?1 AND call.status = 'started'
+             AND (agent.actor_user_id = ?2 OR call.approving_actor_user_id = ?2)
+           ORDER BY call.call_id"#,
+    )?;
+    let agent_tool_call_ids = agent_tool_statement
+        .query_map(params![account_id, user_id], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
     Ok(InFlightWorkSummary {
         reply_job_ids,
         dispatch_call_ids,
+        agent_model_job_ids,
+        agent_tool_call_ids,
     })
 }
 
@@ -8879,9 +9098,16 @@ fn attach_run(
 struct StartTurnOptions<'a> {
     authz: Option<&'a AuthzContext>,
     reply_job: Option<ReplyJobSpec>,
+    agent_turn: Option<AgentTurnSpec>,
     limits: &'a StorageLimits,
     physical_limits: &'a SqlitePhysicalLimits,
     fail_after_enqueue: bool,
+}
+
+struct StartTurnOutcome {
+    start: StartTurnResponse,
+    reply_job: Option<ReplyJob>,
+    agent_work: Option<(AgentTurn, AgentModelJob)>,
 }
 
 fn start_turn(
@@ -8890,10 +9116,11 @@ fn start_turn(
     request: StartTurnRequest,
     idempotency_key: &str,
     options: StartTurnOptions<'_>,
-) -> Result<(StartTurnResponse, Option<ReplyJob>), StorageError> {
+) -> Result<StartTurnOutcome, StorageError> {
     let StartTurnOptions {
         authz,
         reply_job,
+        agent_turn,
         limits,
         physical_limits,
         fail_after_enqueue,
@@ -8912,17 +9139,33 @@ fn start_turn(
             return Err(StorageError::SessionNotFound(session_id.to_owned()));
         }
     }
-    let (fingerprint, legacy_fingerprint) = match &reply_job {
-        Some(job) => (
+    if let Some(agent) = &agent_turn {
+        agent::validate_agent_turn_spec(agent)?;
+        if authz != Some(&agent.authz) {
+            return Err(StorageError::SessionNotFound(session_id.to_owned()));
+        }
+    }
+    if reply_job.is_some() && agent_turn.is_some() {
+        return Err(StorageError::InvalidSessionTransition(
+            "a turn cannot enqueue both a legacy reply and an agent loop".into(),
+        ));
+    }
+    let (fingerprint, legacy_fingerprint) = match (&reply_job, &agent_turn) {
+        (Some(job), None) => (
             reply_start_fingerprint(session_id, &request, job)?,
             Some(legacy_reply_start_fingerprint_v1(
                 session_id, &request, job,
             )?),
         ),
-        None => (
+        (None, Some(agent)) => (
+            agent::agent_start_fingerprint(session_id, &request, agent)?,
+            None,
+        ),
+        (None, None) => (
             session_command_fingerprint(Some(session_id), &request)?,
             None,
         ),
+        (Some(_), Some(_)) => unreachable!("dual work was rejected above"),
     };
     let stored_response = match authz {
         Some(context) => load_session_command_receipt_for_actor::<StartTurnResponse>(
@@ -8950,8 +9193,25 @@ fn start_turn(
             }
             None => None,
         };
+        let stored_agent = match &agent_turn {
+            Some(spec) => {
+                let agent = agent::query_agent_turn_for_session_turn(
+                    &transaction,
+                    session_id,
+                    &request.turn_id,
+                )?;
+                agent::require_agent_matches_spec(&agent, spec)?;
+                let job = agent::query_agent_model_job(&transaction, &agent.id, 1)?;
+                Some((agent, job))
+            }
+            None => None,
+        };
         transaction.commit()?;
-        return Ok((response, stored_job));
+        return Ok(StartTurnOutcome {
+            start: response,
+            reply_job: stored_job,
+            agent_work: stored_agent,
+        });
     }
     require_connection_physical_capacity(
         &transaction,
@@ -8981,13 +9241,27 @@ fn start_turn(
     let account_id = authz.map_or(LOCAL_ACCOUNT_ID, |context| context.account_id.as_str());
     let actor_user_id = authz.map(|context| context.user_id.as_str());
     require_open_turn_capacity(&transaction, account_id, actor_user_id, limits)?;
-    if reply_job.is_some() {
+    if reply_job.is_some() || agent_turn.is_some() {
         require_reply_queue_capacity(&transaction, account_id, actor_user_id, limits)?;
     }
     let finalization_payload_reservation = session_finalization_payload_reservation(
         &request.turn_id,
-        reply_job.as_ref().map(|job| job.provider_name.as_str()),
-        reply_job.as_ref().and_then(|job| job.model_name.as_deref()),
+        reply_job
+            .as_ref()
+            .map(|job| job.provider_name.as_str())
+            .or_else(|| {
+                agent_turn
+                    .as_ref()
+                    .map(|agent| agent.provider_name.as_str())
+            }),
+        reply_job
+            .as_ref()
+            .and_then(|job| job.model_name.as_deref())
+            .or_else(|| {
+                agent_turn
+                    .as_ref()
+                    .and_then(|agent| agent.model_name.as_deref())
+            }),
     )?;
     let timestamp = now();
     let sequence = next_session_sequence(summary.sequence)?;
@@ -9055,6 +9329,17 @@ fn start_turn(
     } else {
         None
     };
+    let stored_agent = if let Some(agent) = agent_turn {
+        Some(agent::insert_agent_turn(
+            &transaction,
+            session_id,
+            &request.turn_id,
+            &agent,
+            &timestamp,
+        )?)
+    } else {
+        None
+    };
 
     #[cfg(test)]
     if fail_after_enqueue {
@@ -9092,7 +9377,11 @@ fn start_turn(
         )?;
     }
     transaction.commit()?;
-    Ok((response, stored_job))
+    Ok(StartTurnOutcome {
+        start: response,
+        reply_job: stored_job,
+        agent_work: stored_agent,
+    })
 }
 
 fn insert_reply_job(
@@ -9686,6 +9975,19 @@ fn flush_turn(
             "reply-backed turns must finalize through their durable reply job".into(),
         ));
     }
+    let agent_backed: i64 = transaction.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM agent_turns
+               WHERE session_id = ?1 AND turn_id = ?2
+           )"#,
+        params![session_id, request.turn_id],
+        |row| row.get(0),
+    )?;
+    if agent_backed != 0 {
+        return Err(StorageError::InvalidSessionTransition(
+            "agent-backed turns must finalize through their durable agent loop".into(),
+        ));
+    }
     let emitted_events = if request.assistant_message.is_some() {
         2
     } else {
@@ -9960,6 +10262,11 @@ fn recover_open_turns(
                  SELECT 1 FROM reply_jobs j
                  WHERE j.session_id = t.session_id AND j.turn_id = t.id
                    AND j.status IN ('queued', 'started')
+             )
+             AND NOT EXISTS (
+                 SELECT 1 FROM agent_turns a
+                 WHERE a.session_id = t.session_id AND a.turn_id = t.id
+                   AND a.status NOT IN ('succeeded', 'failed', 'needs_attention')
              )
            ORDER BY t.session_id, t.ordinal LIMIT ?1"#,
     )?;
@@ -11215,12 +11522,22 @@ fn validate_reply_json(
             "{field} must be a JSON object"
         )));
     }
+    if bounded_json_serialized_len(value, max_bytes)?.is_none() {
+        return Err(StorageError::InvalidReplyTransition(format!(
+            "{field} cannot exceed {max_bytes} serialized bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn bounded_json_serialized_len(
+    value: &Value,
+    max_bytes: usize,
+) -> Result<Option<usize>, StorageError> {
     let mut writer = BoundedJsonWriter::new(max_bytes);
     match serde_json::to_writer(&mut writer, value) {
-        Ok(()) => Ok(()),
-        Err(_) if writer.exceeded => Err(StorageError::InvalidReplyTransition(format!(
-            "{field} cannot exceed {max_bytes} serialized bytes"
-        ))),
+        Ok(()) => Ok(Some(writer.written)),
+        Err(_) if writer.exceeded => Ok(None),
         Err(error) => Err(StorageError::Json(error)),
     }
 }

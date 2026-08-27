@@ -17,7 +17,7 @@ use std::{
     time::Duration,
 };
 
-use authz::{PolicyBuildError, PolicyContext, PolicyEngine, PolicyRule};
+use authz::{PolicyBuildError, PolicyContext, PolicyEngine, PolicyEvaluation, PolicyRule};
 use chrono::{SecondsFormat, Utc};
 use connectors::{ConnectorConfigError, LOCAL_DEV_ENVIRONMENT, register_local_dev_connectors};
 use kernel::{
@@ -33,15 +33,21 @@ use protocol::{
     SessionDetail, SessionEvent, SessionEventData, SessionEventPage, SessionSummary, SessionTurn,
     StartTurnRequest, StartTurnResponse, ToolCall, ToolExecutorStatus, ToolOutcome,
 };
+use serde_json::Value;
 pub use storage::{
     AccountAuditArchiveState, AccountAuditCheckpointCommit, AccountAuditEvent, AccountAuditPage,
-    AccountAuditPolicy, AccountAuditRollup, AccountAuditState, AccountId, AuthPrincipal,
-    AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, CreateMemberResult,
-    InFlightWorkSummary, MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit, MemberSetupResult,
-    MemberSetupToken, MemberTransitionResult, MembershipRevision, MembershipRole,
-    ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse,
-    ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit, ReplySuccessCommit,
-    RotateMemberSetupTokenResult, SessionSummaryPage, SqliteOperationLimits,
+    AccountAuditPolicy, AccountAuditRollup, AccountAuditState, AccountId, AgentFinalCompletion,
+    AgentModelClaimOutcome, AgentModelCompletion, AgentModelFailureCommit, AgentModelJob,
+    AgentModelJobStatus, AgentModelResolution, AgentModelSuccessCommit, AgentReviewCommit,
+    AgentReviewContext, AgentReviewResult, AgentTerminalCompletion, AgentToolCall,
+    AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
+    AgentToolOutcomeUnknownCommit, AgentToolWork, AgentTurn, AgentTurnEnqueueResponse,
+    AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthSessionId, AuthzContext,
+    BootstrapOwnerCommit, CreateMemberResult, InFlightWorkSummary, MEMBER_SETUP_TOKEN_TTL_SECONDS,
+    MemberSetupCommit, MemberSetupResult, MemberSetupToken, MemberTransitionResult,
+    MembershipRevision, MembershipRole, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit,
+    ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
+    ReplySuccessCommit, RotateMemberSetupTokenResult, SessionSummaryPage, SqliteOperationLimits,
     SqliteOperationLimitsError, SqlitePhysicalLimits, SqlitePhysicalLimitsError, StorageLimits,
     StorageLimitsError, StoredCredential, StoredMember, StoredMemberPage, StoredMembershipStatus,
     StoredPreferences, StoredUser, StoredUserRole, StoredUserStatus, TransitionMemberCommit,
@@ -55,7 +61,8 @@ use storage::{
 };
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast};
-use tools::{ExecutorError, RegistryError, ToolRegistry, arguments_digest};
+pub use tools::ToolOutput;
+use tools::{ExecutorError, RegistryError, ToolRegistry, arguments_digest, stable_agent_call_id};
 
 const PRODUCTION_POLICY_ID: &str = "production-guarded";
 const LOCAL_POLICY_ID: &str = "local-development";
@@ -176,6 +183,7 @@ pub struct DemoStore {
     session_publisher: broadcast::Sender<PublishedSessionEvent>,
     policy: Arc<PolicyEngine>,
     registry: Arc<ToolRegistry>,
+    environment: Arc<str>,
     policy_id: Arc<str>,
     policy_revision: Arc<str>,
     primary_session_id: Arc<str>,
@@ -183,6 +191,42 @@ pub struct DemoStore {
     dispatcher: Arc<Mutex<()>>,
     dispatcher_wake: Arc<WorkerWakeState>,
     auto_dispatch: bool,
+}
+
+/// Secret-free tool definition suitable for a model-provider request.
+///
+/// Execution-owned version, effect, sandbox, and executor fields are omitted;
+/// the runtime resolves them from its registry after the model chooses only a
+/// name and arguments.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionAgentToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+}
+
+/// Server-resolved immutable call contract for one Session Agent tool step.
+/// Private fields prevent callers from substituting model-selected execution
+/// attributes before the runtime performs its final guard.
+#[derive(Debug, PartialEq)]
+pub struct ResolvedSessionAgentTool {
+    call: ToolCall,
+    environment: String,
+    policy_evaluation: PolicyEvaluation,
+}
+
+impl ResolvedSessionAgentTool {
+    pub const fn call(&self) -> &ToolCall {
+        &self.call
+    }
+
+    pub fn environment(&self) -> &str {
+        &self.environment
+    }
+
+    pub const fn policy_evaluation(&self) -> &PolicyEvaluation {
+        &self.policy_evaluation
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -316,6 +360,14 @@ pub enum StoreError {
     InvalidSessionRequest(String),
     #[error("invalid session state transition: {0}")]
     InvalidSessionTransition(String),
+    #[error("agent turn {0} was not found")]
+    AgentTurnNotFound(String),
+    #[error("agent model job {0} was not found")]
+    AgentModelJobNotFound(String),
+    #[error("agent tool call {0} was not found")]
+    AgentToolCallNotFound(String),
+    #[error("invalid agent state transition: {0}")]
+    InvalidAgentTransition(String),
     #[error("approval {approval_id} was not found or is no longer pending for run {run_id}")]
     ApprovalNotPending { run_id: String, approval_id: String },
     #[error("the approval has no matching persisted tool call")]
@@ -397,6 +449,10 @@ impl From<StorageError> for StoreError {
             StorageError::InvalidSessionTransition(detail) => {
                 Self::InvalidSessionTransition(detail)
             }
+            StorageError::AgentTurnNotFound(id) => Self::AgentTurnNotFound(id),
+            StorageError::AgentModelJobNotFound(id) => Self::AgentModelJobNotFound(id),
+            StorageError::AgentToolCallNotFound(id) => Self::AgentToolCallNotFound(id),
+            StorageError::InvalidAgentTransition(detail) => Self::InvalidAgentTransition(detail),
             StorageError::InvalidResourceEnvelope(detail) => Self::InvalidSessionRequest(detail),
             StorageError::EmptyIdempotencyKey => Self::EmptyIdempotencyKey,
             StorageError::IdempotencyConflict => Self::IdempotencyConflict,
@@ -413,6 +469,21 @@ impl From<StorageError> for StoreError {
             StorageError::InvalidPageCursor => Self::InvalidPageCursor,
             StorageError::PageCursorBeyondHead { head } => Self::PageCursorBeyondHead { head },
             other => Self::Storage(other),
+        }
+    }
+}
+
+impl StoreError {
+    /// Return whether an exact durable completion may be retried without
+    /// repeating the external operation it records.
+    pub fn is_retryable_durable_completion_error(&self) -> bool {
+        match self {
+            Self::StorageQuotaExceeded
+            | Self::PhysicalStorageExhausted
+            | Self::OperationCapacityExceeded
+            | Self::ConcurrentModification => true,
+            Self::Storage(error) => error.is_retryable_durable_completion_error(),
+            _ => false,
         }
     }
 }
@@ -592,10 +663,11 @@ impl DemoStore {
         let components = RuntimeComponents::build(profile)?;
         let primary_session_id = components.primary_session_id;
         let primary_run_id = components.scenario.run.id.clone();
+        let environment = components.scenario.run.environment.clone();
         storage
             .bind_runtime_identity(RuntimeIdentity {
                 profile: components.profile_id.into(),
-                environment: components.scenario.run.environment.clone(),
+                environment: environment.clone(),
                 primary_session_id: primary_session_id.into(),
                 primary_run_id: primary_run_id.clone(),
                 policy_id: components.policy_id.into(),
@@ -636,6 +708,7 @@ impl DemoStore {
             session_publisher,
             policy: Arc::new(components.policy),
             registry: Arc::new(components.registry),
+            environment: Arc::from(environment),
             policy_id: Arc::from(components.policy_id),
             policy_revision: Arc::from(components.policy_revision),
             primary_session_id: Arc::from(primary_session_id),
@@ -649,6 +722,7 @@ impl DemoStore {
         // missing result becomes outcome_unknown before generic turn recovery.
         // Queued reply turns are deliberately left open and claimable.
         store.recover_started_reply_jobs().await?;
+        store.recover_started_agent_work().await?;
 
         // Session recovery precedes run-dispatch recovery. Started calls are
         // settled next and never re-executed. Only then are queued calls safe
@@ -659,6 +733,164 @@ impl DemoStore {
             store.dispatch_pending().await?;
         }
         Ok(store)
+    }
+
+    /// Return the deterministic, secret-free tool catalog visible to a model.
+    /// The returned values are copies and cannot alter the executable registry.
+    pub fn session_agent_tool_definitions(
+        &self,
+    ) -> Result<Vec<SessionAgentToolDefinition>, StoreError> {
+        self.registry
+            .descriptors()
+            .map(|descriptor| {
+                Ok(SessionAgentToolDefinition {
+                    name: descriptor.name.clone(),
+                    description: descriptor.description.clone(),
+                    input_schema: descriptor.input_schema.provider_json_schema()?,
+                })
+            })
+            .collect()
+    }
+
+    /// Return the runtime-bound environment persisted with each Session Agent.
+    pub fn session_agent_environment(&self) -> &str {
+        &self.environment
+    }
+
+    /// Resolve the only model-controlled fields, `name` and `arguments`, into
+    /// an immutable server-owned call and its exact policy/environment facts.
+    pub fn resolve_session_agent_tool(
+        &self,
+        agent_id: &str,
+        model_step: u32,
+        call_ordinal: u32,
+        name: &str,
+        arguments: Value,
+    ) -> Result<ResolvedSessionAgentTool, StoreError> {
+        let call_id = stable_agent_call_id(agent_id, model_step, call_ordinal)?;
+        let descriptor = self
+            .registry
+            .descriptor(name)
+            .ok_or_else(|| RegistryError::UnknownTool(name.to_owned()))?;
+        descriptor.input_schema.validate_arguments(&arguments)?;
+        let call = ToolCall {
+            call_id,
+            tool: descriptor.name.clone(),
+            tool_version: descriptor.version.clone(),
+            arguments_digest: arguments_digest(&arguments),
+            arguments,
+            effect: descriptor.effect.clone(),
+            sandbox_profile: descriptor.sandbox_profile.clone(),
+            executor_status: ToolExecutorStatus::Available,
+        };
+        let environment = self.environment.to_string();
+        let policy_evaluation = self
+            .policy
+            .evaluate(&PolicyContext::for_call(&environment, &call));
+        Ok(ResolvedSessionAgentTool {
+            call,
+            environment,
+            policy_evaluation,
+        })
+    }
+
+    /// Rehydrate a claimed durable call from the current registry and prove
+    /// that every execution-owned field still matches the persisted contract.
+    ///
+    /// This method performs no execution. Callers must run it only after the
+    /// durable `started` checkpoint and pass the returned value directly to
+    /// [`Self::dispatch_session_agent_tool_after_checkpoint`]. Registry or
+    /// policy drift therefore fails closed before an executor can observe the
+    /// request.
+    pub fn verify_persisted_session_agent_tool(
+        &self,
+        persisted: &AgentToolCall,
+    ) -> Result<ResolvedSessionAgentTool, StoreError> {
+        let resolved = self.resolve_session_agent_tool(
+            &persisted.agent_id,
+            persisted.model_step,
+            persisted.ordinal,
+            &persisted.tool_name,
+            persisted.arguments_json.clone(),
+        )?;
+        let call = resolved.call();
+        let policy = resolved.policy_evaluation();
+
+        for (field, matches) in [
+            ("call_id", call.call_id == persisted.call_id),
+            ("tool", call.tool == persisted.tool_name),
+            ("tool_version", call.tool_version == persisted.tool_version),
+            (
+                "arguments_digest",
+                call.arguments_digest == persisted.arguments_digest,
+            ),
+            ("effect", call.effect == persisted.effect),
+            (
+                "sandbox_profile",
+                call.sandbox_profile == persisted.sandbox_profile,
+            ),
+            (
+                "executor_status",
+                call.executor_status == persisted.executor_status,
+            ),
+            (
+                "policy_decision",
+                policy.decision == persisted.policy_decision,
+            ),
+            (
+                "policy_revision",
+                policy.policy_revision == persisted.policy_revision,
+            ),
+        ] {
+            if !matches {
+                return Err(StoreError::PolicyChanged(format!(
+                    "the persisted agent tool {field} no longer matches the current runtime"
+                )));
+            }
+        }
+
+        Ok(resolved)
+    }
+
+    /// Re-evaluate policy and the complete registry contract immediately before
+    /// executing a previously resolved call.
+    ///
+    /// The caller must persist its single durable `started` checkpoint before
+    /// invoking this method. This façade never retries an executor.
+    pub async fn dispatch_session_agent_tool_after_checkpoint(
+        &self,
+        resolved: ResolvedSessionAgentTool,
+        approval: Option<&Approval>,
+    ) -> Result<ToolOutput, StoreError> {
+        if resolved.environment != self.environment.as_ref() {
+            return Err(StoreError::PolicyChanged(
+                "the resolved tool environment no longer matches this runtime".into(),
+            ));
+        }
+        let current_policy_evaluation = self.policy.evaluate(&PolicyContext::for_call(
+            &resolved.environment,
+            &resolved.call,
+        ));
+        if current_policy_evaluation != resolved.policy_evaluation {
+            return Err(StoreError::PolicyChanged(
+                "the tool policy evaluation changed after server-side resolution".into(),
+            ));
+        }
+        let evaluation =
+            self.policy
+                .guard_dispatch(&resolved.environment, &resolved.call, approval);
+        if evaluation.decision != PolicyDecision::Allow {
+            return Err(policy_guard_error(evaluation));
+        }
+        if evaluation.policy_revision != resolved.policy_evaluation.policy_revision {
+            return Err(StoreError::PolicyChanged(
+                "the tool policy revision changed after server-side resolution".into(),
+            ));
+        }
+        self.registry
+            .dispatch(resolved.call, &resolved.environment)
+            .await
+            .map_err(StoreError::from)
     }
 
     pub async fn readiness(&self) -> Result<(), StoreError> {
@@ -1291,6 +1523,243 @@ impl DemoStore {
         Ok(response)
     }
 
+    /// Atomically append one Session user turn and enqueue the immutable first
+    /// model step for Zeus' Session-native Agent Loop.
+    pub async fn start_turn_and_enqueue_agent_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        request: StartTurnRequest,
+        idempotency_key: &str,
+        agent: AgentTurnSpec,
+    ) -> Result<AgentTurnEnqueueResponse, StoreError> {
+        validate_durable_reference(session_id, "session ID")?;
+        validate_new_turn_id(&request.turn_id, "turn ID")?;
+        self.authorize_session_for_actor(context, session_id)
+            .await?;
+        validate_user_message_value(&request.user_message, "user message")?;
+        validate_session_sequence(request.expected_sequence, "expected session sequence")?;
+        if agent.environment != self.environment.as_ref() {
+            return Err(StoreError::InvalidAgentTransition(
+                "the Agent environment does not match the bound runtime".into(),
+            ));
+        }
+        let idempotency_key = normalized_idempotency_key(idempotency_key)?;
+        let response = self
+            .storage
+            .start_turn_and_enqueue_agent_for_actor(
+                context,
+                session_id,
+                request,
+                idempotency_key,
+                agent,
+            )
+            .await?;
+        if !response.start.replayed {
+            self.publish_session_event(session_id, response.start.event.clone());
+        }
+        Ok(response)
+    }
+
+    /// Durable model-worker claim façade. Storage revalidates the persisted
+    /// initiator before a provider may observe the returned request.
+    pub async fn claim_next_agent_model(&self) -> Result<AgentModelClaimOutcome, StoreError> {
+        loop {
+            match retry_operation_capacity(|| async {
+                Ok(self.storage.claim_next_agent_model().await?)
+            })
+            .await?
+            {
+                AgentModelClaimOutcome::Rejected(completion) => {
+                    if !completion.replayed {
+                        self.publish_session_event(
+                            &completion.session.id,
+                            completion.event.clone(),
+                        );
+                    }
+                }
+                outcome => return Ok(outcome),
+            }
+        }
+    }
+
+    /// Commit one trusted provider response after a claimed model checkpoint.
+    pub async fn complete_agent_model_success(
+        &self,
+        commit: AgentModelSuccessCommit,
+    ) -> Result<AgentModelCompletion, StoreError> {
+        let completion = retry_operation_capacity(|| async {
+            Ok(self
+                .storage
+                .complete_agent_model_success(commit.clone())
+                .await?)
+        })
+        .await?;
+        match &completion {
+            AgentModelCompletion::Final(finalized) => {
+                if !finalized.replayed {
+                    for event in &finalized.events {
+                        self.publish_session_event(&finalized.session.id, event.clone());
+                    }
+                }
+            }
+            AgentModelCompletion::Terminal(terminal) => {
+                if !terminal.replayed {
+                    self.publish_session_event(&terminal.session.id, terminal.event.clone());
+                }
+            }
+            AgentModelCompletion::ToolCall { .. } => {}
+        }
+        Ok(completion)
+    }
+
+    /// Commit a known or indeterminate provider failure after model start.
+    pub async fn complete_agent_model_failure(
+        &self,
+        commit: AgentModelFailureCommit,
+    ) -> Result<AgentTerminalCompletion, StoreError> {
+        let completion = retry_operation_capacity(|| async {
+            Ok(self
+                .storage
+                .complete_agent_model_failure(commit.clone())
+                .await?)
+        })
+        .await?;
+        if !completion.replayed {
+            self.publish_session_event(&completion.session.id, completion.event.clone());
+        }
+        Ok(completion)
+    }
+
+    /// Durable tool-worker claim façade. A rejected claim has already
+    /// terminalized its Session, so it is published and skipped locally.
+    pub async fn claim_next_agent_tool(&self) -> Result<AgentToolClaimOutcome, StoreError> {
+        loop {
+            match retry_operation_capacity(|| async {
+                Ok(self.storage.claim_next_agent_tool().await?)
+            })
+            .await?
+            {
+                AgentToolClaimOutcome::Rejected(completion) => {
+                    if !completion.replayed {
+                        self.publish_session_event(
+                            &completion.session.id,
+                            completion.event.clone(),
+                        );
+                    }
+                }
+                outcome => return Ok(outcome),
+            }
+        }
+    }
+
+    /// Commit one known connector result and its immutable continuation.
+    pub async fn complete_agent_tool(
+        &self,
+        commit: AgentToolCompletionCommit,
+    ) -> Result<AgentToolCompletion, StoreError> {
+        let completion = retry_operation_capacity(|| async {
+            Ok(self.storage.complete_agent_tool(commit.clone()).await?)
+        })
+        .await?;
+        if let AgentToolCompletion::Terminal(terminal) = &completion
+            && !terminal.replayed
+        {
+            self.publish_session_event(&terminal.session.id, terminal.event.clone());
+        }
+        Ok(completion)
+    }
+
+    /// Commit an indeterminate connector outcome without ever re-queuing it.
+    pub async fn complete_agent_tool_outcome_unknown(
+        &self,
+        commit: AgentToolOutcomeUnknownCommit,
+    ) -> Result<AgentTerminalCompletion, StoreError> {
+        let completion = retry_operation_capacity(|| async {
+            Ok(self
+                .storage
+                .complete_agent_tool_outcome_unknown(commit.clone())
+                .await?)
+        })
+        .await?;
+        if !completion.replayed {
+            self.publish_session_event(&completion.session.id, completion.event.clone());
+        }
+        Ok(completion)
+    }
+
+    /// Return one authenticated, account-scoped Session Agent projection.
+    pub async fn agent_turn_detail_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<protocol::AgentTurnDetail, StoreError> {
+        validate_durable_reference(session_id, "session ID")?;
+        validate_durable_reference(turn_id, "turn ID")?;
+        Ok(self
+            .storage
+            .agent_turn_detail_for_actor(context, session_id, turn_id)
+            .await?)
+    }
+
+    /// Load the server-owned transcript required to derive an approval
+    /// rejection continuation. Storage authorizes before exposing the call.
+    pub async fn agent_review_context_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        turn_id: &str,
+        call_id: &str,
+    ) -> Result<AgentReviewContext, StoreError> {
+        validate_durable_reference(session_id, "session ID")?;
+        validate_durable_reference(turn_id, "turn ID")?;
+        validate_durable_reference(call_id, "agent call ID")?;
+        Ok(self
+            .storage
+            .agent_review_context_for_actor(context, session_id, turn_id, call_id)
+            .await?)
+    }
+
+    /// Predict whether rejecting an authenticated pending Agent call requires
+    /// a model continuation. This is pure and uses the same canonical result,
+    /// reducer, and fixed-limit settlement as the storage transaction.
+    pub fn agent_rejection_requires_continuation(
+        &self,
+        context: &AgentReviewContext,
+        note: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        Ok(context.rejection_requires_continuation(note)?)
+    }
+
+    /// Atomically record one owner decision and queue its permitted next step.
+    pub async fn review_agent_tool_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        turn_id: &str,
+        commit: AgentReviewCommit,
+    ) -> Result<AgentReviewResult, StoreError> {
+        validate_durable_reference(session_id, "session ID")?;
+        validate_durable_reference(turn_id, "turn ID")?;
+        validate_durable_reference(&commit.call_id, "agent call ID")?;
+        normalized_idempotency_key(&commit.idempotency_key)?;
+        if let Some(note) = &commit.note {
+            protocol::validate_review_note(note)
+                .map_err(|error| invalid_resource_envelope("review note", error))?;
+        }
+        let result = self
+            .storage
+            .review_agent_tool_for_actor(context, session_id, turn_id, commit)
+            .await?;
+        if let Some(completion) = &result.terminal_completion
+            && !completion.replayed
+        {
+            self.publish_session_event(&completion.session.id, completion.event.clone());
+        }
+        Ok(result)
+    }
+
     /// Durable reply-worker claim façade. No handler authority is accepted;
     /// storage revalidates the persisted initiating authority atomically.
     pub async fn claim_next_reply(&self) -> Result<ReplyClaimOutcome, StoreError> {
@@ -1620,6 +2089,33 @@ impl DemoStore {
                         ));
                     }
                     self.publish_session_event(&completion.session.id, event);
+                }
+            }
+        }
+    }
+
+    /// Recover every started Agent model/tool operation as outcome unknown.
+    /// Queued work remains claimable and is never consumed by this pass.
+    pub async fn recover_started_agent_work(&self) -> Result<(), StoreError> {
+        loop {
+            let recovered = retry_operation_capacity(|| async {
+                Ok(self.storage.recover_started_agent_work().await?)
+            })
+            .await?;
+            if recovered.is_empty() {
+                return Ok(());
+            }
+            for completion in recovered {
+                if !matches!(
+                    completion.event.data,
+                    SessionEventData::TurnInterrupted { .. }
+                ) {
+                    return Err(StoreError::ExecutionInvariant(
+                        "started-Agent recovery returned a non-interruption event".into(),
+                    ));
+                }
+                if !completion.replayed {
+                    self.publish_session_event(&completion.session.id, completion.event);
                 }
             }
         }
@@ -2297,8 +2793,9 @@ mod tests {
 
     use kernel::{LOCAL_MARKER_CALL_ID, PRODUCTION_DEMO_CALL_ID};
     use protocol::{
-        DEMO_RUN_ID, DEMO_SESSION_ID, LOCAL_DEMO_RUN_ID, LOCAL_DEMO_SESSION_ID, RunStatus,
-        SessionStatus, SessionTurnStatus, ToolCallStatus,
+        AgentToolCallStatus, ApprovalScope, DEMO_RUN_ID, DEMO_SESSION_ID, LOCAL_DEMO_RUN_ID,
+        LOCAL_DEMO_SESSION_ID, RunStatus, SandboxProfile, SessionStatus, SessionTurnStatus,
+        ToolCallStatus, ToolEffect,
     };
     use rusqlite::{Connection, params};
     use storage::DispatchStatus;
@@ -2321,6 +2818,432 @@ mod tests {
             auth_session_id: AuthSessionId::from_persistence(format!("runtime-test-{user_id}"))
                 .unwrap(),
         }
+    }
+
+    fn approval_for_resolved_tool(resolved: &ResolvedSessionAgentTool) -> Approval {
+        Approval {
+            id: "APR-agent-tool".into(),
+            status: ApprovalStatus::Approved,
+            action: "execute the resolved agent tool".into(),
+            tool: resolved.call().tool.clone(),
+            change: "apply the exact approved tool call".into(),
+            requires_approval: true,
+            call_id: Some(resolved.call().call_id.clone()),
+            policy_revision: Some(resolved.policy_evaluation().policy_revision.clone()),
+            arguments_digest: Some(resolved.call().arguments_digest.clone()),
+            sandbox_profile: Some(resolved.call().sandbox_profile.clone()),
+            scope: Some(ApprovalScope::AllowOnce),
+        }
+    }
+
+    fn persisted_agent_tool_call(
+        resolved: &ResolvedSessionAgentTool,
+        agent_id: &str,
+        model_step: u32,
+        ordinal: u32,
+    ) -> AgentToolCall {
+        let call = resolved.call();
+        let timestamp = now();
+        AgentToolCall {
+            call_id: call.call_id.clone(),
+            agent_id: agent_id.into(),
+            account_id: AccountId::local(),
+            session_id: "session-agent-runtime".into(),
+            turn_id: "turn-agent-runtime".into(),
+            provider_call_id: "provider-call-runtime".into(),
+            ordinal,
+            model_step,
+            tool_name: call.tool.clone(),
+            tool_version: call.tool_version.clone(),
+            arguments_json: call.arguments.clone(),
+            arguments_digest: call.arguments_digest.clone(),
+            effect: call.effect.clone(),
+            sandbox_profile: call.sandbox_profile.clone(),
+            executor_status: call.executor_status.clone(),
+            policy_decision: resolved.policy_evaluation().decision.clone(),
+            policy_revision: resolved.policy_evaluation().policy_revision.clone(),
+            status: AgentToolCallStatus::Running,
+            approving_actor_user_id: Some(TEST_OWNER_ID.into()),
+            approving_membership_revision: Some(MembershipRevision::new(1).unwrap()),
+            review_note: None,
+            reviewed_at: Some(timestamp.clone()),
+            result_json: None,
+            provider_request_id: None,
+            created_at: timestamp.clone(),
+            started_at: Some(timestamp),
+            finished_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn session_agent_tool_definitions_expose_only_provider_contracts() {
+        let paths = TestPaths::new("agent-tool-definitions");
+        let store = local_store(&paths, false).await;
+
+        let definitions = store.session_agent_tool_definitions().unwrap();
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].name, connectors::DEV_MARKER_TOOL_NAME);
+        assert_eq!(
+            definitions[0].input_schema,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "marker": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128
+                    }
+                },
+                "required": ["marker"],
+                "additionalProperties": false,
+                "x-zeus-max-serialized-bytes": 160
+            })
+        );
+
+        let production = DemoStore::seeded().await.unwrap();
+        assert!(
+            production
+                .session_agent_tool_definitions()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn replayed_agent_final_completion_is_broadcast_only_once() {
+        let paths = TestPaths::new("agent-final-live-replay");
+        let store = local_store(&paths, false).await;
+        let owner = test_authz(TEST_OWNER_ID);
+        let turn_id = "turn-runtime-agent-final";
+        let enqueued = store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner,
+                LOCAL_DEMO_SESSION_ID,
+                StartTurnRequest {
+                    turn_id: turn_id.into(),
+                    user_message: "Finish this Agent turn exactly once.".into(),
+                    expected_sequence: 2,
+                },
+                "runtime-agent-final-start",
+                AgentTurnSpec {
+                    id: "agent-runtime-final".into(),
+                    authz: owner.clone(),
+                    environment: LOCAL_DEV_ENVIRONMENT.into(),
+                    provider_name: "test-provider".into(),
+                    model_name: Some("test-model".into()),
+                    request_json: serde_json::json!({
+                        "messages": [{
+                            "role": "user",
+                            "content": "Finish this Agent turn exactly once.",
+                        }],
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        let AgentModelClaimOutcome::Claimed(job) = store.claim_next_agent_model().await.unwrap()
+        else {
+            panic!("the first runtime Agent model step must be claimable");
+        };
+        let mut feed = store
+            .session_event_feed_for_actor(
+                &owner,
+                LOCAL_DEMO_SESSION_ID,
+                enqueued.start.event.sequence,
+            )
+            .await
+            .unwrap();
+        assert!(feed.replay.is_empty());
+
+        let assistant_message = "The runtime Agent turn completed durably.";
+        let commit = AgentModelSuccessCommit {
+            job_id: job.id,
+            response_json: serde_json::json!({
+                "output": {
+                    "type": "final",
+                    "content": assistant_message,
+                },
+                "finish_reason": "stop",
+                "provider": {
+                    "provider_id": "test-provider",
+                    "model": "test-model",
+                    "reply_kind": "model",
+                },
+            }),
+            resolution: AgentModelResolution::Final {
+                assistant_message: assistant_message.into(),
+                provenance: protocol::AssistantReplyProvenance {
+                    provider_id: "test-provider".into(),
+                    model: Some("test-model".into()),
+                    reply_kind: protocol::AssistantReplyKind::Model,
+                },
+            },
+        };
+        let AgentModelCompletion::Final(first) = store
+            .complete_agent_model_success(commit.clone())
+            .await
+            .unwrap()
+        else {
+            panic!("the first Agent completion must finalize the Session turn");
+        };
+        assert!(!first.replayed);
+        for expected in &first.events {
+            let published = tokio::time::timeout(Duration::from_secs(1), feed.receiver.recv())
+                .await
+                .expect("fresh Agent finalization must wake the live Session feed")
+                .unwrap();
+            assert_eq!(published.session_id, LOCAL_DEMO_SESSION_ID);
+            assert_eq!(&published.event, expected);
+        }
+
+        let AgentModelCompletion::Final(replayed) =
+            store.complete_agent_model_success(commit).await.unwrap()
+        else {
+            panic!("the duplicate Agent completion must replay the durable finalization");
+        };
+        assert!(replayed.replayed);
+        assert_eq!(replayed.events, first.events);
+        assert!(matches!(
+            feed.receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_agent_resolution_owns_the_execution_contract() {
+        let paths = TestPaths::new("agent-tool-resolution");
+        let store = local_store(&paths, false).await;
+        let arguments = serde_json::json!({"marker": "agent safe"});
+
+        let resolved = store
+            .resolve_session_agent_tool(
+                "agent-turn-7",
+                2,
+                1,
+                connectors::DEV_MARKER_TOOL_NAME,
+                arguments.clone(),
+            )
+            .unwrap();
+        let call = resolved.call();
+        assert_eq!(
+            call.call_id,
+            stable_agent_call_id("agent-turn-7", 2, 1).unwrap()
+        );
+        assert_eq!(call.tool, connectors::DEV_MARKER_TOOL_NAME);
+        assert_eq!(call.tool_version, connectors::DEV_MARKER_TOOL_VERSION);
+        assert_eq!(call.arguments, arguments);
+        assert_eq!(call.arguments_digest, arguments_digest(&call.arguments));
+        assert_eq!(call.effect, ToolEffect::LocalWrite);
+        assert_eq!(call.sandbox_profile, SandboxProfile::WorkspaceWrite);
+        assert_eq!(call.executor_status, ToolExecutorStatus::Available);
+        assert_eq!(resolved.environment(), LOCAL_DEV_ENVIRONMENT);
+        assert_eq!(
+            resolved.policy_evaluation().decision,
+            PolicyDecision::RequireApproval
+        );
+        assert_eq!(
+            resolved.policy_evaluation().policy_revision,
+            LOCAL_POLICY_REVISION
+        );
+
+        let unknown = store
+            .resolve_session_agent_tool(
+                "agent-turn-7",
+                2,
+                1,
+                "model.supplied.tool",
+                serde_json::json!({}),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            unknown,
+            StoreError::Registry(RegistryError::UnknownTool(name))
+                if name == "model.supplied.tool"
+        ));
+
+        let injected_execution_fields = store
+            .resolve_session_agent_tool(
+                "agent-turn-7",
+                2,
+                1,
+                connectors::DEV_MARKER_TOOL_NAME,
+                serde_json::json!({
+                    "marker": "agent safe",
+                    "version": "model-version",
+                    "effect": "destructive",
+                    "sandbox": "production_guarded"
+                }),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            injected_execution_fields,
+            StoreError::Registry(RegistryError::InvalidArguments(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn persisted_session_agent_tool_is_rehydrated_before_dispatch() {
+        let paths = TestPaths::new("agent-tool-rehydrate");
+        let store = local_store(&paths, false).await;
+        let agent_id = "agent-turn-rehydrate";
+        let resolved = store
+            .resolve_session_agent_tool(
+                agent_id,
+                2,
+                1,
+                connectors::DEV_MARKER_TOOL_NAME,
+                serde_json::json!({"marker": "rehydrated call"}),
+            )
+            .unwrap();
+        let persisted = persisted_agent_tool_call(&resolved, agent_id, 2, 1);
+
+        let rehydrated = store
+            .verify_persisted_session_agent_tool(&persisted)
+            .unwrap();
+        assert_eq!(rehydrated.call(), resolved.call());
+        assert_eq!(rehydrated.policy_evaluation(), resolved.policy_evaluation());
+        assert_eq!(directory_entries(&paths.marker_root), 0);
+
+        let approval = approval_for_resolved_tool(&rehydrated);
+        store
+            .dispatch_session_agent_tool_after_checkpoint(rehydrated, Some(&approval))
+            .await
+            .unwrap();
+        assert_eq!(directory_entries(&paths.marker_root), 1);
+    }
+
+    #[tokio::test]
+    async fn persisted_session_agent_tool_drift_fails_closed_before_dispatch() {
+        let paths = TestPaths::new("agent-tool-persisted-drift");
+        let store = local_store(&paths, false).await;
+        let agent_id = "agent-turn-persisted-drift";
+        let resolved = store
+            .resolve_session_agent_tool(
+                agent_id,
+                3,
+                1,
+                connectors::DEV_MARKER_TOOL_NAME,
+                serde_json::json!({"marker": "must not execute"}),
+            )
+            .unwrap();
+        let persisted = persisted_agent_tool_call(&resolved, agent_id, 3, 1);
+
+        let mut mismatches = Vec::new();
+        let mut changed = persisted.clone();
+        changed.call_id.push_str("-changed");
+        mismatches.push(("call_id", changed));
+        let mut changed = persisted.clone();
+        changed.tool_version.push_str("-changed");
+        mismatches.push(("tool_version", changed));
+        let mut changed = persisted.clone();
+        changed.arguments_digest.push_str("-changed");
+        mismatches.push(("arguments_digest", changed));
+        let mut changed = persisted.clone();
+        changed.effect = ToolEffect::ReadOnly;
+        mismatches.push(("effect", changed));
+        let mut changed = persisted.clone();
+        changed.sandbox_profile = SandboxProfile::ReadOnly;
+        mismatches.push(("sandbox_profile", changed));
+        let mut changed = persisted.clone();
+        changed.executor_status = ToolExecutorStatus::Unavailable;
+        mismatches.push(("executor_status", changed));
+        let mut changed = persisted.clone();
+        changed.policy_decision = PolicyDecision::Allow;
+        mismatches.push(("policy_decision", changed));
+        let mut changed = persisted.clone();
+        changed.policy_revision.push_str("-changed");
+        mismatches.push(("policy_revision", changed));
+
+        for (field, changed) in mismatches {
+            let error = store
+                .verify_persisted_session_agent_tool(&changed)
+                .unwrap_err();
+            assert!(
+                matches!(error, StoreError::PolicyChanged(message) if message.contains(field)),
+                "{field} drift must fail closed"
+            );
+        }
+
+        let mut unknown_tool = persisted;
+        unknown_tool.tool_name = "model.supplied.unknown".into();
+        assert!(matches!(
+            store.verify_persisted_session_agent_tool(&unknown_tool),
+            Err(StoreError::Registry(RegistryError::UnknownTool(_)))
+        ));
+        assert_eq!(directory_entries(&paths.marker_root), 0);
+    }
+
+    #[tokio::test]
+    async fn session_agent_dispatch_rechecks_approval_then_executes_once() {
+        let paths = TestPaths::new("agent-tool-dispatch");
+        let store = local_store(&paths, false).await;
+        let resolve = || {
+            store.resolve_session_agent_tool(
+                "agent-turn-8",
+                3,
+                1,
+                connectors::DEV_MARKER_TOOL_NAME,
+                serde_json::json!({"marker": "approved agent call"}),
+            )
+        };
+
+        let missing_approval = store
+            .dispatch_session_agent_tool_after_checkpoint(resolve().unwrap(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(missing_approval, StoreError::PolicyChanged(_)));
+        assert_eq!(directory_entries(&paths.marker_root), 0);
+
+        let resolved = resolve().unwrap();
+        let approval = approval_for_resolved_tool(&resolved);
+        let expected_call_id = resolved.call().call_id.clone();
+        let output = store
+            .dispatch_session_agent_tool_after_checkpoint(resolved, Some(&approval))
+            .await
+            .unwrap();
+        assert!(!output.replayed);
+        assert_eq!(
+            output.provider_request_id.as_deref(),
+            Some(expected_call_id.as_str())
+        );
+        assert_eq!(directory_entries(&paths.marker_root), 1);
+    }
+
+    #[tokio::test]
+    async fn session_agent_dispatch_rejects_a_changed_policy_before_execution() {
+        let paths = TestPaths::new("agent-tool-policy-change");
+        let mut store = local_store(&paths, false).await;
+        let resolved = store
+            .resolve_session_agent_tool(
+                "agent-turn-9",
+                4,
+                1,
+                connectors::DEV_MARKER_TOOL_NAME,
+                serde_json::json!({"marker": "must not execute"}),
+            )
+            .unwrap();
+        let approval = approval_for_resolved_tool(&resolved);
+        store.policy = Arc::new(
+            PolicyEngine::new(vec![PolicyRule {
+                revision: LOCAL_POLICY_REVISION.into(),
+                tool: connectors::DEV_MARKER_TOOL_NAME.into(),
+                environment: LOCAL_DEV_ENVIRONMENT.into(),
+                effect: ToolEffect::LocalWrite,
+                sandbox_profile: SandboxProfile::WorkspaceWrite,
+                decision: PolicyDecision::Allow,
+            }])
+            .unwrap(),
+        );
+
+        let error = store
+            .dispatch_session_agent_tool_after_checkpoint(resolved, Some(&approval))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::PolicyChanged(message) if message.contains("evaluation changed")
+        ));
+        assert_eq!(directory_entries(&paths.marker_root), 0);
     }
 
     fn install_foreign_owner_authz(path: &Path) -> AuthzContext {
@@ -2574,6 +3497,30 @@ mod tests {
             Err(StoreError::RunNotFound(run_id)) if run_id == "fatal"
         ));
         assert_eq!(fatal_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn exact_completion_retry_classification_excludes_contract_failures() {
+        assert!(StoreError::OperationCapacityExceeded.is_retryable_durable_completion_error());
+        assert!(StoreError::PhysicalStorageExhausted.is_retryable_durable_completion_error());
+        assert!(StoreError::ConcurrentModification.is_retryable_durable_completion_error());
+        assert!(
+            StoreError::Storage(StorageError::Io(std::io::Error::other("temporary I/O")))
+                .is_retryable_durable_completion_error()
+        );
+
+        assert!(
+            !StoreError::InvalidAgentTransition("permanent contract failure".into())
+                .is_retryable_durable_completion_error()
+        );
+        assert!(
+            !StoreError::ExecutionInvariant("permanent runtime invariant".into())
+                .is_retryable_durable_completion_error()
+        );
+        assert!(
+            !StoreError::Storage(StorageError::CorruptData("permanent corruption".into()))
+                .is_retryable_durable_completion_error()
+        );
     }
 
     fn approval_request(decision: ReviewDecision) -> ReviewRequest {
@@ -4349,7 +5296,7 @@ mod tests {
         let mut store = local_store(&paths, false).await;
         let descriptor = store
             .registry
-            .descriptor("dev.marker.write")
+            .descriptor("dev_marker_write")
             .unwrap()
             .clone();
         let mut registry = ToolRegistry::new();

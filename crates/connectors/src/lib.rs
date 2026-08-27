@@ -1,6 +1,6 @@
 //! Narrow, explicitly configured tool connectors.
 //!
-//! The Alpha ships one real executor, `dev.marker.write`. It is registered only
+//! The Alpha ships one real executor, `dev_marker_write`. It is registered only
 //! for `local-development`, accepts no caller-provided path, and atomically publishes a
 //! deterministic file below one fixed root. There is no host-command or remote
 //! provider fallback.
@@ -23,7 +23,9 @@ use tools::{
 };
 
 pub const LOCAL_DEV_ENVIRONMENT: &str = "local-development";
-pub const DEV_MARKER_TOOL_NAME: &str = "dev.marker.write";
+/// Provider-visible function name. DeepSeek/OpenAI-compatible function names
+/// permit only ASCII letters, digits, underscores, and dashes.
+pub const DEV_MARKER_TOOL_NAME: &str = "dev_marker_write";
 pub const DEV_MARKER_TOOL_VERSION: &str = "1";
 pub const MAX_MARKER_BYTES: usize = 128;
 

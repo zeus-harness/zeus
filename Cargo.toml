@@ -40,3 +40,4 @@ runtime = { path = "crates/runtime" }
 storage = { path = "crates/storage" }
 tenancy = { path = "crates/tenancy" }
 tools = { path = "crates/tools" }
+workflows = { path = "crates/workflows" }

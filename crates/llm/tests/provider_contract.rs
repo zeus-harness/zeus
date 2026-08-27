@@ -1,8 +1,9 @@
 use std::time::Duration;
 
 use llm::{
-    LocalFallbackProvider, OpenAiCompatibleProvider, ProviderError, ReplyKind, ReplyMessage,
-    ReplyProvider, ReplyRequest, ReplyRole,
+    LocalFallbackProvider, OpenAiCompatibleProvider, ProviderError, REPLY_TOOL_ARGUMENTS_MAX_BYTES,
+    ReplyKind, ReplyMessage, ReplyOutput, ReplyProvider, ReplyRequest, ReplyRole, ReplyToolCall,
+    ReplyToolDefinition,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -112,12 +113,24 @@ async fn local_fallback_is_object_safe_non_model_and_never_echoes_input() {
     let provider: Box<dyn ReplyProvider> = Box::new(LocalFallbackProvider::new());
     let secret = "sk-user-secret-do-not-reflect";
 
-    let response = provider.reply(request_with_secret(secret)).await.unwrap();
+    let response = provider
+        .reply(ReplyRequest::with_tools(
+            [
+                ReplyMessage::new(ReplyRole::System, "Answer concisely."),
+                ReplyMessage::new(ReplyRole::User, secret),
+            ],
+            [lookup_tool()],
+        ))
+        .await
+        .unwrap();
 
     assert_eq!(response.provider.reply_kind, ReplyKind::NonModelFallback);
     assert!(!response.provider.is_model_reply());
     assert!(response.provider.model.is_none());
-    assert!(!response.content.contains(secret));
+    let ReplyOutput::Final { content } = response.output else {
+        panic!("local fallback must always return final text")
+    };
+    assert!(!content.contains(secret));
 }
 
 #[test]
@@ -210,7 +223,7 @@ async fn openai_compatible_success_sends_bearer_model_and_messages() {
     let captured = mock.received.take().unwrap().await.unwrap();
     let request_json: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
 
-    assert_eq!(reply.content, "Mock reply");
+    assert_eq!(reply.output.final_text(), Some("Mock reply"));
     assert_eq!(reply.finish_reason.as_deref(), Some("stop"));
     assert!(reply.provider.is_model_reply());
     assert_eq!(reply.provider.model.as_deref(), Some("mock-model"));
@@ -223,6 +236,176 @@ async fn openai_compatible_success_sends_bearer_model_and_messages() {
     assert_eq!(request_json["model"], "mock-model");
     assert_eq!(request_json["messages"][1]["role"], "user");
     assert_eq!(request_json["messages"][1]["content"], "Hello provider");
+    assert!(request_json.get("tools").is_none());
+    assert!(request_json.get("tool_choice").is_none());
+}
+
+fn lookup_tool() -> ReplyToolDefinition {
+    ReplyToolDefinition::new(
+        "lookup_order",
+        serde_json::json!({
+            "type": "object",
+            "properties": { "order_id": { "type": "string" } },
+            "required": ["order_id"],
+            "additionalProperties": false,
+        }),
+    )
+    .with_description("Look up one order")
+}
+
+#[tokio::test]
+async fn openai_compatible_encodes_tool_transcript_and_decodes_one_function_call() {
+    let response = serde_json::json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_next",
+                    "type": "function",
+                    "function": {
+                        "name": "lookup_order",
+                        "arguments": "{\"order_id\":\"B-99\"}"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+    let mut mock = spawn_mock(
+        "200 OK",
+        &[("Content-Type", "application/json".to_owned())],
+        serde_json::to_vec(&response).unwrap(),
+        Duration::ZERO,
+    )
+    .await;
+    let provider =
+        OpenAiCompatibleProvider::new(&mock.endpoint, "mock-model", "test-api-key").unwrap();
+    let request = ReplyRequest::with_tools(
+        [
+            ReplyMessage::new(ReplyRole::User, "Check two orders"),
+            ReplyMessage::assistant_tool_call(ReplyToolCall::new(
+                "call_first",
+                "lookup_order",
+                serde_json::json!({ "order_id": "A-42" }),
+            )),
+            ReplyMessage::tool_result("call_first", r#"{"status":"shipped"}"#),
+        ],
+        [lookup_tool()],
+    );
+
+    let reply = provider.reply(request).await.unwrap();
+    let captured = mock.received.take().unwrap().await.unwrap();
+    let request_json: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
+
+    assert_eq!(request_json["tool_choice"], "auto");
+    assert_eq!(request_json["tools"][0]["type"], "function");
+    assert_eq!(request_json["tools"][0]["function"]["name"], "lookup_order");
+    assert_eq!(request_json["messages"][1]["role"], "assistant");
+    assert!(request_json["messages"][1]["content"].is_null());
+    assert_eq!(
+        request_json["messages"][1]["tool_calls"][0]["function"]["arguments"],
+        r#"{"order_id":"A-42"}"#
+    );
+    assert_eq!(request_json["messages"][2]["role"], "tool");
+    assert_eq!(request_json["messages"][2]["tool_call_id"], "call_first");
+
+    let ReplyOutput::ToolCall { call } = reply.output else {
+        panic!("provider must decode one function call")
+    };
+    assert_eq!(call.id, "call_next");
+    assert_eq!(call.name, "lookup_order");
+    assert_eq!(call.arguments, serde_json::json!({ "order_id": "B-99" }));
+}
+
+#[tokio::test]
+async fn openai_compatible_rejects_ambiguous_or_invalid_tool_outputs() {
+    let oversized_arguments = serde_json::to_string(&serde_json::json!({
+        "blob": "x".repeat(REPLY_TOOL_ARGUMENTS_MAX_BYTES)
+    }))
+    .unwrap();
+    let cases = [
+        serde_json::json!({
+            "content": "mixed text",
+            "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": { "name": "lookup_order", "arguments": "{}" }
+            }]
+        }),
+        serde_json::json!({
+            "content": null,
+            "tool_calls": [
+                { "id": "call_1", "type": "function", "function": { "name": "lookup_order", "arguments": "{}" } },
+                { "id": "call_2", "type": "function", "function": { "name": "lookup_order", "arguments": "{}" } }
+            ]
+        }),
+        serde_json::json!({
+            "content": null,
+            "tool_calls": [{
+                "id": "", "type": "function",
+                "function": { "name": "lookup_order", "arguments": "{}" }
+            }]
+        }),
+        serde_json::json!({
+            "content": null,
+            "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": { "name": "bad tool name", "arguments": "{}" }
+            }]
+        }),
+        serde_json::json!({
+            "content": null,
+            "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": { "name": "", "arguments": "{}" }
+            }]
+        }),
+        serde_json::json!({
+            "content": null,
+            "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": { "name": "lookup_order", "arguments": "[]" }
+            }]
+        }),
+        serde_json::json!({
+            "content": null,
+            "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": { "name": "lookup_order", "arguments": oversized_arguments }
+            }]
+        }),
+        serde_json::json!({
+            "content": null,
+            "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": { "name": "not_server_defined", "arguments": "{}" }
+            }]
+        }),
+    ];
+
+    for message in cases {
+        let response = serde_json::json!({
+            "choices": [{ "message": message, "finish_reason": "tool_calls" }]
+        });
+        let mock = spawn_mock(
+            "200 OK",
+            &[("Content-Type", "application/json".to_owned())],
+            serde_json::to_vec(&response).unwrap(),
+            Duration::ZERO,
+        )
+        .await;
+        let provider =
+            OpenAiCompatibleProvider::new(&mock.endpoint, "mock-model", "test-api-key").unwrap();
+        let request = ReplyRequest::with_tools(
+            [ReplyMessage::new(ReplyRole::User, "Check an order")],
+            [lookup_tool()],
+        );
+
+        assert_eq!(
+            provider.reply(request).await,
+            Err(ProviderError::InvalidResponse)
+        );
+    }
 }
 
 #[tokio::test]

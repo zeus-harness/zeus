@@ -1,13 +1,18 @@
 //! Reply-provider boundary for Zeus Harness.
 //!
-//! Providers admit a complete message list and return one text reply. A
-//! provider failure is never converted into a successful fallback reply: the
-//! caller must select [`LocalFallbackProvider`] explicitly when it wants the
-//! non-model experience.
+//! Providers admit one bounded model-step transcript and return either final
+//! text or one server-defined tool call. A provider failure is never converted
+//! into a successful fallback reply: the caller must select
+//! [`LocalFallbackProvider`] explicitly when it wants the non-model experience.
 
 mod openai_compatible;
 
-use std::{future::Future, pin::Pin};
+use std::{
+    collections::HashSet,
+    future::Future,
+    io::{self, Write},
+    pin::Pin,
+};
 
 use protocol::{SessionTurn, SessionTurnStatus};
 use serde::{Deserialize, Serialize};
@@ -19,12 +24,45 @@ pub use openai_compatible::{
 
 /// Maximum serialized size of a typed reply admitted to durable storage.
 pub const REPLY_RESPONSE_MAX_SERIALIZED_BYTES: usize = 512 * 1024;
+/// Maximum compact-JSON size of one immutable Agent provider request.
+pub const AGENT_REQUEST_MAX_SERIALIZED_BYTES: usize = 512 * 1024;
 /// Maximum number of ordered messages in one durable provider request.
 pub const REPLY_REQUEST_MAX_MESSAGES: usize = 64;
 /// Maximum number of complete historical user/assistant pairs in one request.
 pub const REPLY_REQUEST_MAX_HISTORY_PAIRS: usize = (REPLY_REQUEST_MAX_MESSAGES - 1) / 2;
-/// Maximum aggregate UTF-8 content admitted to one durable provider request.
-pub const REPLY_REQUEST_MAX_CONTENT_BYTES: usize = protocol::USER_MESSAGE_MAX_BYTES;
+/// Maximum historical pairs admitted when a request can enter the Agent loop.
+///
+/// The initial 55 messages (27 pairs plus the current user message) reserve
+/// eight message slots for the four fixed tool-call/result pairs.
+pub const AGENT_REQUEST_MAX_HISTORY_PAIRS: usize = 27;
+/// Maximum aggregate transcript bytes admitted to one durable provider request.
+///
+/// Individual user, assistant, and tool-result messages remain capped at
+/// 64 KiB. The larger aggregate admits two persisted maximum-size tool results
+/// alongside bounded ordinary conversation context.
+pub const REPLY_REQUEST_MAX_CONTENT_BYTES: usize = 256 * 1024;
+/// Initial conversation bytes admitted before an Agent may append tool steps.
+///
+/// Together with four 16 KiB argument objects and the workflow's 128 KiB
+/// aggregate known-result limit, this fits the complete 256 KiB transcript
+/// envelope without relying on best-effort truncation after a tool executes.
+pub const AGENT_REQUEST_INITIAL_CONTENT_MAX_BYTES: usize = 64 * 1024;
+/// Maximum number of server-defined tools admitted to one provider request.
+pub const REPLY_REQUEST_MAX_TOOLS: usize = 32;
+/// Maximum aggregate serialized bytes for server-defined tool definitions.
+pub const REPLY_REQUEST_MAX_TOOL_DEFINITION_BYTES: usize = 64 * 1024;
+/// Maximum serialized JSON bytes in one tool call's arguments object.
+pub const REPLY_TOOL_ARGUMENTS_MAX_BYTES: usize = 64 * 1024;
+/// Maximum serialized JSON bytes in one Agent-loop tool call's arguments.
+pub const AGENT_TOOL_ARGUMENTS_MAX_BYTES: usize = 16 * 1024;
+/// Maximum UTF-8 bytes in one persisted tool result.
+pub const REPLY_TOOL_RESULT_MAX_BYTES: usize = 64 * 1024;
+/// Maximum UTF-8 bytes in one function name.
+pub const REPLY_TOOL_NAME_MAX_BYTES: usize = 64;
+/// Maximum UTF-8 bytes in one provider-issued tool call ID.
+pub const REPLY_TOOL_CALL_ID_MAX_BYTES: usize = 128;
+/// Maximum UTF-8 bytes in one tool description.
+pub const REPLY_TOOL_DESCRIPTION_MAX_BYTES: usize = 4 * 1024;
 /// Maximum UTF-8 byte length of a provider finish reason.
 pub const FINISH_REASON_MAX_BYTES: usize = protocol::REPLY_FINISH_REASON_MAX_BYTES;
 
@@ -42,6 +80,63 @@ pub enum ReplyRole {
     User,
     /// Prior model output included for conversational context.
     Assistant,
+    /// Result returned for the immediately preceding assistant tool call.
+    Tool,
+}
+
+/// One server-defined function available to a model step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyToolDefinition {
+    /// Stable function name exposed to the provider.
+    pub name: String,
+    /// Optional bounded human-readable guidance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// JSON Schema object for function arguments.
+    pub parameters: serde_json::Value,
+}
+
+impl ReplyToolDefinition {
+    /// Construct one server-defined function.
+    pub fn new(name: impl Into<String>, parameters: serde_json::Value) -> Self {
+        Self {
+            name: name.into(),
+            description: None,
+            parameters,
+        }
+    }
+
+    /// Attach bounded human-readable guidance.
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+}
+
+/// Exactly one function call emitted by an assistant model step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyToolCall {
+    /// Provider-issued identifier bound to the subsequent tool result.
+    pub id: String,
+    /// Server-defined function name.
+    pub name: String,
+    /// Parsed JSON object passed to the function.
+    pub arguments: serde_json::Value,
+}
+
+impl ReplyToolCall {
+    /// Construct one typed tool call.
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: serde_json::Value,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            arguments,
+        }
+    }
 }
 
 /// One ordered message in a reply request.
@@ -51,6 +146,13 @@ pub struct ReplyMessage {
     pub role: ReplyRole,
     /// Plain text content sent to the selected provider.
     pub content: String,
+    /// Function call emitted by an assistant message. Its text content must be
+    /// empty and it must be followed immediately by a matching tool result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call: Option<ReplyToolCall>,
+    /// Call ID bound to a tool-result message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ReplyMessage {
@@ -59,6 +161,28 @@ impl ReplyMessage {
         Self {
             role,
             content: content.into(),
+            tool_call: None,
+            tool_call_id: None,
+        }
+    }
+
+    /// Construct an assistant message containing exactly one tool call.
+    pub fn assistant_tool_call(call: ReplyToolCall) -> Self {
+        Self {
+            role: ReplyRole::Assistant,
+            content: String::new(),
+            tool_call: Some(call),
+            tool_call_id: None,
+        }
+    }
+
+    /// Construct the result for an immediately preceding assistant tool call.
+    pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: ReplyRole::Tool,
+            content: content.into(),
+            tool_call: None,
+            tool_call_id: Some(call_id.into()),
         }
     }
 }
@@ -68,6 +192,9 @@ impl ReplyMessage {
 pub struct ReplyRequest {
     /// Messages in provider-visible order.
     pub messages: Vec<ReplyMessage>,
+    /// Server-defined tools. The default preserves messages-only queued JSON.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ReplyToolDefinition>,
 }
 
 impl ReplyRequest {
@@ -75,6 +202,18 @@ impl ReplyRequest {
     pub fn new(messages: impl IntoIterator<Item = ReplyMessage>) -> Self {
         Self {
             messages: messages.into_iter().collect(),
+            tools: Vec::new(),
+        }
+    }
+
+    /// Construct a request with a bounded server-defined tool set.
+    pub fn with_tools(
+        messages: impl IntoIterator<Item = ReplyMessage>,
+        tools: impl IntoIterator<Item = ReplyToolDefinition>,
+    ) -> Self {
+        Self {
+            messages: messages.into_iter().collect(),
+            tools: tools.into_iter().collect(),
         }
     }
 
@@ -88,14 +227,46 @@ impl ReplyRequest {
         turns: &[SessionTurn],
         user_message: impl Into<String>,
     ) -> Result<Self, ProviderError> {
-        let user_message = user_message.into();
+        Self::from_session_history_with_limits(
+            turns,
+            user_message.into(),
+            REPLY_REQUEST_MAX_HISTORY_PAIRS,
+            REPLY_REQUEST_MAX_CONTENT_BYTES,
+        )
+    }
+
+    /// Build the initial request for a durable Agent loop while reserving the
+    /// complete fixed tool-step budget.
+    pub fn from_session_history_for_agent(
+        turns: &[SessionTurn],
+        user_message: impl Into<String>,
+    ) -> Result<Self, ProviderError> {
+        Self::from_session_history_with_limits(
+            turns,
+            user_message.into(),
+            AGENT_REQUEST_MAX_HISTORY_PAIRS,
+            AGENT_REQUEST_INITIAL_CONTENT_MAX_BYTES,
+        )
+    }
+
+    fn from_session_history_with_limits(
+        turns: &[SessionTurn],
+        user_message: String,
+        max_history_pairs: usize,
+        max_content_bytes: usize,
+    ) -> Result<Self, ProviderError> {
         protocol::validate_user_message(&user_message)
             .map_err(|_| ProviderError::InvalidRequest("invalid user message"))?;
+        if user_message.len() > max_content_bytes {
+            return Err(ProviderError::InvalidRequest(
+                "conversation context is too large",
+            ));
+        }
 
         let mut retained = Vec::new();
         let mut content_bytes = user_message.len();
         for turn in turns.iter().rev() {
-            if retained.len() >= REPLY_REQUEST_MAX_HISTORY_PAIRS {
+            if retained.len() >= max_history_pairs {
                 break;
             }
             if turn.status != SessionTurnStatus::Flushed {
@@ -121,7 +292,7 @@ impl ReplyRequest {
                     "conversation context is too large",
                 ));
             };
-            if next_bytes > REPLY_REQUEST_MAX_CONTENT_BYTES {
+            if next_bytes > max_content_bytes {
                 break;
             }
             content_bytes = next_bytes;
@@ -135,7 +306,10 @@ impl ReplyRequest {
             messages.push(ReplyMessage::new(ReplyRole::Assistant, assistant));
         }
         messages.push(ReplyMessage::new(ReplyRole::User, user_message));
-        let request = Self { messages };
+        let request = Self {
+            messages,
+            tools: Vec::new(),
+        };
         validate_reply_request(&request)?;
         Ok(request)
     }
@@ -172,11 +346,39 @@ impl ProviderMetadata {
     }
 }
 
+/// Explicit output of one provider model step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReplyOutput {
+    /// Terminal assistant text.
+    Final { content: String },
+    /// Exactly one server-defined function call.
+    ToolCall { call: ReplyToolCall },
+}
+
+impl ReplyOutput {
+    /// Return final text, or `None` for a tool call.
+    pub fn final_text(&self) -> Option<&str> {
+        match self {
+            Self::Final { content } => Some(content),
+            Self::ToolCall { .. } => None,
+        }
+    }
+
+    /// Return the tool call, or `None` for final text.
+    pub fn tool_call(&self) -> Option<&ReplyToolCall> {
+        match self {
+            Self::Final { .. } => None,
+            Self::ToolCall { call } => Some(call),
+        }
+    }
+}
+
 /// One accepted provider reply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplyResponse {
-    /// Assistant text to append to the Session ledger.
-    pub content: String,
+    /// Unambiguous final-text or single-tool-call output.
+    pub output: ReplyOutput,
     /// Provider-specific terminal reason when one was supplied.
     pub finish_reason: Option<String>,
     /// Provenance repeated on the response so callers cannot lose it by
@@ -232,55 +434,227 @@ pub fn validate_reply_request(request: &ReplyRequest) -> Result<(), ProviderErro
         ));
     }
 
-    let conversation_start = usize::from(
-        request
-            .messages
-            .first()
-            .is_some_and(|message| message.role == ReplyRole::System),
-    );
-    let conversation = &request.messages[conversation_start..];
-    if conversation.is_empty() || conversation.len().is_multiple_of(2) {
+    validate_reply_tools(&request.tools)?;
+    let mut total_bytes = 0usize;
+    let mut index = 0usize;
+    if request.messages[0].role == ReplyRole::System {
+        let message = &request.messages[0];
+        require_plain_message(message, ReplyRole::System)?;
+        require_user_content(&message.content)?;
+        add_request_bytes(&mut total_bytes, message.content.len())?;
+        index = 1;
+    }
+    if index == request.messages.len() {
         return Err(ProviderError::InvalidRequest(
-            "request must end with a user message",
+            "request must contain a conversation after system instructions",
         ));
     }
-    for (index, message) in conversation.iter().enumerate() {
-        let expected = if index.is_multiple_of(2) {
-            ReplyRole::User
-        } else {
-            ReplyRole::Assistant
-        };
-        if message.role != expected {
-            return Err(ProviderError::InvalidRequest(
-                "request roles must alternate user and assistant",
-            ));
-        }
+
+    enum TranscriptState<'a> {
+        ExpectUser,
+        AfterUser,
+        AfterAssistantFinal,
+        AfterAssistantTool(&'a str),
+        AfterTool,
     }
 
-    let mut total_bytes = 0usize;
-    for message in &request.messages {
-        let valid = match message.role {
-            ReplyRole::Assistant => protocol::validate_assistant_message(&message.content),
-            ReplyRole::System | ReplyRole::User => {
-                protocol::validate_user_message(&message.content)
+    let mut state = TranscriptState::ExpectUser;
+    let mut call_ids = HashSet::new();
+    for message in &request.messages[index..] {
+        state = match (&state, message.role) {
+            (TranscriptState::ExpectUser, ReplyRole::User)
+            | (TranscriptState::AfterAssistantFinal, ReplyRole::User) => {
+                require_plain_message(message, ReplyRole::User)?;
+                require_user_content(&message.content)?;
+                add_request_bytes(&mut total_bytes, message.content.len())?;
+                TranscriptState::AfterUser
+            }
+            (TranscriptState::AfterUser, ReplyRole::Assistant)
+            | (TranscriptState::AfterTool, ReplyRole::Assistant) => {
+                if let Some(call) = &message.tool_call {
+                    if !message.content.is_empty() || message.tool_call_id.is_some() {
+                        return Err(ProviderError::InvalidRequest(
+                            "assistant tool calls must not include text or a result ID",
+                        ));
+                    }
+                    validate_tool_call(call, ProviderError::InvalidRequest("invalid tool call"))?;
+                    if !request.tools.iter().any(|tool| tool.name == call.name) {
+                        return Err(ProviderError::InvalidRequest(
+                            "assistant tool call is not server-defined",
+                        ));
+                    }
+                    if !call_ids.insert(call.id.as_str()) {
+                        return Err(ProviderError::InvalidRequest(
+                            "tool call IDs must be unique within a transcript",
+                        ));
+                    }
+                    let argument_bytes =
+                        bounded_json_len(&call.arguments, REPLY_TOOL_ARGUMENTS_MAX_BYTES).ok_or(
+                            ProviderError::InvalidRequest("tool call arguments are too large"),
+                        )?;
+                    add_request_bytes(&mut total_bytes, argument_bytes)?;
+                    TranscriptState::AfterAssistantTool(&call.id)
+                } else {
+                    if message.tool_call_id.is_some() {
+                        return Err(ProviderError::InvalidRequest(
+                            "assistant text must not include a tool result ID",
+                        ));
+                    }
+                    require_assistant_content(&message.content)?;
+                    add_request_bytes(&mut total_bytes, message.content.len())?;
+                    TranscriptState::AfterAssistantFinal
+                }
+            }
+            (TranscriptState::AfterAssistantTool(expected_id), ReplyRole::Tool) => {
+                if message.tool_call.is_some()
+                    || message.tool_call_id.as_deref() != Some(*expected_id)
+                    || !valid_tool_result(&message.content)
+                {
+                    return Err(ProviderError::InvalidRequest(
+                        "tool result must immediately match the preceding call",
+                    ));
+                }
+                add_request_bytes(&mut total_bytes, message.content.len())?;
+                TranscriptState::AfterTool
+            }
+            _ => {
+                return Err(ProviderError::InvalidRequest(
+                    "invalid model-step transcript sequence",
+                ));
             }
         };
-        if valid.is_err() {
-            return Err(ProviderError::InvalidRequest("invalid message content"));
-        }
-        total_bytes =
-            total_bytes
-                .checked_add(message.content.len())
-                .ok_or(ProviderError::InvalidRequest(
-                    "request content is too large",
-                ))?;
-        if total_bytes > REPLY_REQUEST_MAX_CONTENT_BYTES {
+    }
+    if !matches!(
+        state,
+        TranscriptState::AfterUser | TranscriptState::AfterTool
+    ) {
+        return Err(ProviderError::InvalidRequest(
+            "request must end with a user message or tool result",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_reply_tools(tools: &[ReplyToolDefinition]) -> Result<(), ProviderError> {
+    if tools.len() > REPLY_REQUEST_MAX_TOOLS {
+        return Err(ProviderError::InvalidRequest(
+            "request cannot contain more than 32 tools",
+        ));
+    }
+    if bounded_json_len(tools, REPLY_REQUEST_MAX_TOOL_DEFINITION_BYTES).is_none() {
+        return Err(ProviderError::InvalidRequest(
+            "tool definitions are too large",
+        ));
+    }
+    let mut names = HashSet::new();
+    for tool in tools {
+        if !valid_tool_name(&tool.name)
+            || !tool.parameters.is_object()
+            || tool
+                .description
+                .as_ref()
+                .is_some_and(|description| description.len() > REPLY_TOOL_DESCRIPTION_MAX_BYTES)
+            || !names.insert(tool.name.as_str())
+        {
             return Err(ProviderError::InvalidRequest(
-                "request content is too large",
+                "invalid or duplicate tool definition",
             ));
         }
     }
     Ok(())
+}
+
+fn require_plain_message(message: &ReplyMessage, role: ReplyRole) -> Result<(), ProviderError> {
+    if message.role != role || message.tool_call.is_some() || message.tool_call_id.is_some() {
+        return Err(ProviderError::InvalidRequest(
+            "plain messages cannot contain tool fields",
+        ));
+    }
+    Ok(())
+}
+
+fn require_user_content(content: &str) -> Result<(), ProviderError> {
+    protocol::validate_user_message(content)
+        .map_err(|_| ProviderError::InvalidRequest("invalid user or system content"))
+}
+
+fn require_assistant_content(content: &str) -> Result<(), ProviderError> {
+    protocol::validate_assistant_message(content)
+        .map_err(|_| ProviderError::InvalidRequest("invalid assistant content"))
+}
+
+fn valid_tool_result(content: &str) -> bool {
+    !content.trim().is_empty() && content.len() <= REPLY_TOOL_RESULT_MAX_BYTES
+}
+
+fn add_request_bytes(total: &mut usize, added: usize) -> Result<(), ProviderError> {
+    *total = total
+        .checked_add(added)
+        .ok_or(ProviderError::InvalidRequest(
+            "request content is too large",
+        ))?;
+    if *total > REPLY_REQUEST_MAX_CONTENT_BYTES {
+        return Err(ProviderError::InvalidRequest(
+            "request content is too large",
+        ));
+    }
+    Ok(())
+}
+
+fn valid_tool_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= REPLY_TOOL_NAME_MAX_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn valid_tool_call_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= REPLY_TOOL_CALL_ID_MAX_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn validate_tool_call(call: &ReplyToolCall, error: ProviderError) -> Result<(), ProviderError> {
+    if !valid_tool_call_id(&call.id)
+        || !valid_tool_name(&call.name)
+        || !call.arguments.is_object()
+        || bounded_json_len(&call.arguments, REPLY_TOOL_ARGUMENTS_MAX_BYTES).is_none()
+    {
+        return Err(error);
+    }
+    Ok(())
+}
+
+struct BoundedJsonWriter {
+    written: usize,
+    limit: usize,
+}
+
+impl Write for BoundedJsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let next = self
+            .written
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::other("serialized JSON exceeds its byte limit"))?;
+        if next > self.limit {
+            return Err(io::Error::other("serialized JSON exceeds its byte limit"));
+        }
+        self.written = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn bounded_json_len(value: &(impl Serialize + ?Sized), limit: usize) -> Option<usize> {
+    let mut writer = BoundedJsonWriter { written: 0, limit };
+    serde_json::to_writer(&mut writer, value).ok()?;
+    Some(writer.written)
 }
 
 /// Validates stable provider metadata before it can be copied into a queued
@@ -318,14 +692,19 @@ pub fn validate_provider_metadata(metadata: &ProviderMetadata) -> Result<(), Pro
 /// provider cannot cause another allocation proportional to an oversized
 /// reply.
 pub fn validate_reply_response(response: &ReplyResponse) -> Result<(), ProviderError> {
-    match protocol::validate_assistant_message(&response.content) {
-        Ok(()) => {}
-        Err(protocol::ResourceEnvelopeError::TooLong { .. }) => {
-            return Err(ProviderError::TerminalPayloadTooLarge {
-                limit_bytes: protocol::ASSISTANT_MESSAGE_MAX_BYTES,
-            });
+    match &response.output {
+        ReplyOutput::Final { content } => match protocol::validate_assistant_message(content) {
+            Ok(()) => {}
+            Err(protocol::ResourceEnvelopeError::TooLong { .. }) => {
+                return Err(ProviderError::TerminalPayloadTooLarge {
+                    limit_bytes: protocol::ASSISTANT_MESSAGE_MAX_BYTES,
+                });
+            }
+            Err(_) => return Err(ProviderError::InvalidResponse),
+        },
+        ReplyOutput::ToolCall { call } => {
+            validate_tool_call(call, ProviderError::InvalidResponse)?;
         }
-        Err(_) => return Err(ProviderError::InvalidResponse),
     }
     if let Some(finish_reason) = &response.finish_reason
         && let Err(error) = protocol::validate_reply_finish_reason(finish_reason)
@@ -350,6 +729,72 @@ pub fn validate_reply_response(response: &ReplyResponse) -> Result<(), ProviderE
         });
     }
     Ok(())
+}
+
+/// Validate a provider result against the server-defined tools in its request.
+pub fn validate_reply_response_for_request(
+    request: &ReplyRequest,
+    response: &ReplyResponse,
+) -> Result<(), ProviderError> {
+    validate_reply_response(response)?;
+    if let ReplyOutput::ToolCall { call } = &response.output
+        && !request.tools.iter().any(|tool| tool.name == call.name)
+    {
+        return Err(ProviderError::InvalidResponse);
+    }
+    Ok(())
+}
+
+/// Validate a durable Agent request, including the stricter per-step argument
+/// budget reserved by [`ReplyRequest::from_session_history_for_agent`].
+pub fn validate_agent_reply_request(request: &ReplyRequest) -> Result<(), ProviderError> {
+    validate_reply_request(request)?;
+    for message in &request.messages {
+        if let Some(call) = &message.tool_call
+            && bounded_json_len(&call.arguments, AGENT_TOOL_ARGUMENTS_MAX_BYTES).is_none()
+        {
+            return Err(ProviderError::InvalidRequest(
+                "Agent tool call arguments are too large",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate one provider response against the durable Agent request and its
+/// reserved per-step argument budget.
+pub fn validate_agent_reply_response_for_request(
+    request: &ReplyRequest,
+    response: &ReplyResponse,
+) -> Result<(), ProviderError> {
+    validate_reply_response_for_request(request, response)?;
+    if let ReplyOutput::ToolCall { call } = &response.output
+        && bounded_json_len(&call.arguments, AGENT_TOOL_ARGUMENTS_MAX_BYTES).is_none()
+    {
+        return Err(ProviderError::InvalidResponse);
+    }
+    Ok(())
+}
+
+/// Convert one validated Agent request into its durable JSON value while
+/// enforcing the storage envelope after JSON escaping.
+///
+/// Transcript content limits alone are insufficient here: control characters
+/// and nested serialized tool results can expand when the complete request is
+/// encoded. Callers must treat this error as an unavailable continuation, not
+/// as an unknown tool outcome.
+pub fn persisted_agent_reply_request(
+    request: &ReplyRequest,
+) -> Result<serde_json::Value, ProviderError> {
+    validate_agent_reply_request(request)?;
+    let value = serde_json::to_value(request)
+        .map_err(|_| ProviderError::InvalidRequest("Agent request cannot be serialized"))?;
+    if bounded_json_len(&value, AGENT_REQUEST_MAX_SERIALIZED_BYTES).is_none() {
+        return Err(ProviderError::InvalidRequest(
+            "serialized Agent request is too large",
+        ));
+    }
+    Ok(value)
 }
 
 /// Explicit non-model experience used when no remote provider is configured.
@@ -390,7 +835,10 @@ impl ReplyProvider for LocalFallbackProvider {
         Box::pin(async move {
             validate_reply_request(&request)?;
             Ok(ReplyResponse {
-                content: "Your message was saved, but no model provider is configured.".to_owned(),
+                output: ReplyOutput::Final {
+                    content: "Your message was saved, but no model provider is configured."
+                        .to_owned(),
+                },
                 finish_reason: Some("local_fallback".to_owned()),
                 provider,
             })
@@ -422,7 +870,7 @@ mod tests {
 
     fn response(content: String) -> ReplyResponse {
         ReplyResponse {
-            content,
+            output: ReplyOutput::Final { content },
             finish_reason: Some("stop".into()),
             provider: ProviderMetadata {
                 provider_id: "test-provider".into(),
@@ -521,6 +969,63 @@ mod tests {
     }
 
     #[test]
+    fn agent_history_reserves_all_four_tool_step_pairs() {
+        let turns = (0..40)
+            .map(|ordinal| {
+                turn(
+                    ordinal,
+                    SessionTurnStatus::Flushed,
+                    format!("user-{ordinal}"),
+                    Some(format!("assistant-{ordinal}")),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut request = ReplyRequest::from_session_history_for_agent(&turns, "current").unwrap();
+        request.tools = vec![lookup_tool()];
+        assert_eq!(request.messages.len(), 55);
+        assert_eq!(request.messages[0].content, "user-13");
+
+        for index in 0..4 {
+            let call_id = format!("call_{index}");
+            request
+                .messages
+                .push(ReplyMessage::assistant_tool_call(ReplyToolCall::new(
+                    &call_id,
+                    "lookup_order",
+                    serde_json::json!({ "step": index }),
+                )));
+            request
+                .messages
+                .push(ReplyMessage::tool_result(call_id, "known result"));
+        }
+
+        assert_eq!(request.messages.len(), 63);
+        assert!(validate_agent_reply_request(&request).is_ok());
+    }
+
+    #[test]
+    fn agent_history_reserves_the_content_budget_before_tool_execution() {
+        let turns = vec![turn(
+            1,
+            SessionTurnStatus::Flushed,
+            "u".repeat(20 * 1024),
+            Some("a".repeat(20 * 1024)),
+        )];
+
+        let request = ReplyRequest::from_session_history_for_agent(
+            &turns,
+            "c".repeat(AGENT_REQUEST_INITIAL_CONTENT_MAX_BYTES - 20 * 1024),
+        )
+        .unwrap();
+        assert_eq!(request.messages.len(), 1);
+        assert_eq!(
+            request.messages[0].content.len(),
+            AGENT_REQUEST_INITIAL_CONTENT_MAX_BYTES - 20 * 1024
+        );
+    }
+
+    #[test]
     fn legacy_oversized_history_is_skipped_without_stranding_a_new_turn() {
         let turns = vec![
             turn(1, SessionTurnStatus::Flushed, "kept", Some("answer".into())),
@@ -563,5 +1068,289 @@ mod tests {
             ReplyMessage::new(ReplyRole::User, "question"),
         ]);
         assert!(validate_reply_request(&valid).is_ok());
+    }
+
+    fn lookup_tool() -> ReplyToolDefinition {
+        ReplyToolDefinition::new(
+            "lookup_order",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "order_id": { "type": "string" } },
+                "required": ["order_id"],
+                "additionalProperties": false,
+            }),
+        )
+        .with_description("Look up one order")
+    }
+
+    fn tool_result_chain(result_count: usize, result_bytes: usize) -> ReplyRequest {
+        let mut messages = vec![ReplyMessage::new(ReplyRole::User, "start the workflow")];
+        for index in 0..result_count {
+            let call_id = format!("call_{index}");
+            messages.push(ReplyMessage::assistant_tool_call(ReplyToolCall::new(
+                &call_id,
+                "lookup_order",
+                serde_json::json!({ "step": index }),
+            )));
+            messages.push(ReplyMessage::tool_result(call_id, "x".repeat(result_bytes)));
+        }
+        ReplyRequest::with_tools(messages, [lookup_tool()])
+    }
+
+    #[test]
+    fn messages_only_queued_json_defaults_to_no_tools() {
+        let request: ReplyRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{ "role": "user", "content": "legacy request" }]
+        }))
+        .unwrap();
+
+        assert!(request.tools.is_empty());
+        assert!(validate_reply_request(&request).is_ok());
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({
+                "messages": [{ "role": "user", "content": "legacy request" }]
+            })
+        );
+    }
+
+    #[test]
+    fn tool_transcript_requires_immediate_matching_result() {
+        let call = ReplyToolCall::new(
+            "call_123",
+            "lookup_order",
+            serde_json::json!({ "order_id": "A-42" }),
+        );
+        let valid = ReplyRequest::with_tools(
+            [
+                ReplyMessage::new(ReplyRole::User, "Find the order"),
+                ReplyMessage::assistant_tool_call(call.clone()),
+                ReplyMessage::tool_result("call_123", r#"{"status":"shipped"}"#),
+            ],
+            [lookup_tool()],
+        );
+        assert!(validate_reply_request(&valid).is_ok());
+
+        let mismatched = ReplyRequest::with_tools(
+            [
+                ReplyMessage::new(ReplyRole::User, "Find the order"),
+                ReplyMessage::assistant_tool_call(call.clone()),
+                ReplyMessage::tool_result("call_other", "not bound"),
+            ],
+            [lookup_tool()],
+        );
+        assert!(validate_reply_request(&mismatched).is_err());
+
+        let mixed = ReplyRequest::with_tools(
+            [
+                ReplyMessage::new(ReplyRole::User, "Find the order"),
+                {
+                    let mut message = ReplyMessage::assistant_tool_call(call);
+                    message.content = "I will call a tool".into();
+                    message
+                },
+                ReplyMessage::tool_result("call_123", "result"),
+            ],
+            [lookup_tool()],
+        );
+        assert!(validate_reply_request(&mixed).is_err());
+    }
+
+    #[test]
+    fn tools_and_transcript_share_strict_resource_envelopes() {
+        let tools = (0..REPLY_REQUEST_MAX_TOOLS)
+            .map(|index| {
+                ReplyToolDefinition::new(
+                    format!("tool_{index}"),
+                    serde_json::json!({ "type": "object" }),
+                )
+            })
+            .collect::<Vec<_>>();
+        let exact_count = ReplyRequest::with_tools(
+            [ReplyMessage::new(ReplyRole::User, "use a tool")],
+            tools.clone(),
+        );
+        assert!(validate_reply_request(&exact_count).is_ok());
+
+        let mut too_many = exact_count;
+        too_many.tools.push(ReplyToolDefinition::new(
+            "tool_overflow",
+            serde_json::json!({ "type": "object" }),
+        ));
+        assert!(validate_reply_request(&too_many).is_err());
+
+        let oversized_arguments = ReplyRequest::with_tools(
+            [
+                ReplyMessage::new(ReplyRole::User, "use a tool"),
+                ReplyMessage::assistant_tool_call(ReplyToolCall::new(
+                    "call_big",
+                    "tool_0",
+                    serde_json::json!({ "blob": "x".repeat(REPLY_TOOL_ARGUMENTS_MAX_BYTES) }),
+                )),
+                ReplyMessage::tool_result("call_big", "result"),
+            ],
+            tools,
+        );
+        assert!(validate_reply_request(&oversized_arguments).is_err());
+    }
+
+    #[test]
+    fn transcript_aggregate_admits_two_full_tool_results_but_keeps_per_item_limits() {
+        let mut two_results = tool_result_chain(2, REPLY_TOOL_RESULT_MAX_BYTES);
+        two_results.messages.push(ReplyMessage::new(
+            ReplyRole::Assistant,
+            "Both lookups completed",
+        ));
+        two_results.messages.push(ReplyMessage::new(
+            ReplyRole::User,
+            "Continue with the ordinary conversation",
+        ));
+        assert!(validate_reply_request(&two_results).is_ok());
+
+        let oversized_result = tool_result_chain(1, REPLY_TOOL_RESULT_MAX_BYTES + 1);
+        assert!(validate_reply_request(&oversized_result).is_err());
+
+        let aggregate_overflow = tool_result_chain(4, REPLY_TOOL_RESULT_MAX_BYTES);
+        assert!(validate_reply_request(&aggregate_overflow).is_err());
+    }
+
+    #[test]
+    fn transcript_message_count_remains_capped_at_64() {
+        let mut messages = vec![ReplyMessage::new(ReplyRole::System, "Be concise")];
+        for index in 0..31 {
+            messages.push(ReplyMessage::new(ReplyRole::User, format!("user-{index}")));
+            messages.push(ReplyMessage::new(
+                ReplyRole::Assistant,
+                format!("assistant-{index}"),
+            ));
+        }
+        messages.push(ReplyMessage::new(ReplyRole::User, "current"));
+        assert_eq!(messages.len(), REPLY_REQUEST_MAX_MESSAGES);
+        assert!(validate_reply_request(&ReplyRequest::new(messages.clone())).is_ok());
+
+        messages.push(ReplyMessage::new(ReplyRole::Assistant, "overflow"));
+        assert!(validate_reply_request(&ReplyRequest::new(messages)).is_err());
+    }
+
+    #[test]
+    fn typed_tool_call_response_rejects_invalid_fields_and_arguments() {
+        let mut response = ReplyResponse {
+            output: ReplyOutput::ToolCall {
+                call: ReplyToolCall::new(
+                    "call_123",
+                    "lookup_order",
+                    serde_json::json!({ "order_id": "A-42" }),
+                ),
+            },
+            finish_reason: Some("tool_calls".into()),
+            provider: ProviderMetadata {
+                provider_id: "test-provider".into(),
+                model: Some("test-model".into()),
+                reply_kind: ReplyKind::Model,
+            },
+        };
+        assert!(validate_reply_response(&response).is_ok());
+
+        let mut invalid = response.clone();
+        let ReplyOutput::ToolCall { call } = &mut invalid.output else {
+            unreachable!()
+        };
+        call.name = "bad tool name".into();
+        assert_eq!(
+            validate_reply_response(&invalid),
+            Err(ProviderError::InvalidResponse)
+        );
+        let mut invalid = response.clone();
+        let ReplyOutput::ToolCall { call } = &mut invalid.output else {
+            unreachable!()
+        };
+        call.id.clear();
+        assert_eq!(
+            validate_reply_response(&invalid),
+            Err(ProviderError::InvalidResponse)
+        );
+        let mut invalid = response.clone();
+        let ReplyOutput::ToolCall { call } = &mut invalid.output else {
+            unreachable!()
+        };
+        call.arguments = serde_json::json!(["not", "an", "object"]);
+        assert_eq!(
+            validate_reply_response(&invalid),
+            Err(ProviderError::InvalidResponse)
+        );
+        let ReplyOutput::ToolCall { call } = &mut response.output else {
+            unreachable!()
+        };
+        call.arguments = serde_json::json!({ "blob": "x".repeat(REPLY_TOOL_ARGUMENTS_MAX_BYTES) });
+        assert_eq!(
+            validate_reply_response(&response),
+            Err(ProviderError::InvalidResponse)
+        );
+    }
+
+    #[test]
+    fn agent_response_uses_the_reserved_tool_argument_budget() {
+        let request = ReplyRequest::with_tools(
+            [ReplyMessage::new(ReplyRole::User, "Run the tool")],
+            [lookup_tool()],
+        );
+        let response = ReplyResponse {
+            output: ReplyOutput::ToolCall {
+                call: ReplyToolCall::new(
+                    "call_large",
+                    "lookup_order",
+                    serde_json::json!({
+                        "order_id": "x".repeat(AGENT_TOOL_ARGUMENTS_MAX_BYTES)
+                    }),
+                ),
+            },
+            finish_reason: Some("tool_calls".into()),
+            provider: ProviderMetadata {
+                provider_id: "test-provider".into(),
+                model: Some("test-model".into()),
+                reply_kind: ReplyKind::Model,
+            },
+        };
+
+        assert!(validate_reply_response_for_request(&request, &response).is_ok());
+        assert_eq!(
+            validate_agent_reply_response_for_request(&request, &response),
+            Err(ProviderError::InvalidResponse)
+        );
+    }
+
+    #[test]
+    fn persisted_agent_request_rechecks_json_escape_expansion() {
+        let escaped_result = serde_json::to_string(&"\0".repeat(10_920)).unwrap();
+        assert!(escaped_result.len() <= REPLY_TOOL_RESULT_MAX_BYTES);
+        let request = ReplyRequest::with_tools(
+            [
+                ReplyMessage::new(
+                    ReplyRole::User,
+                    "\0".repeat(AGENT_REQUEST_INITIAL_CONTENT_MAX_BYTES),
+                ),
+                ReplyMessage::assistant_tool_call(ReplyToolCall::new(
+                    "call_escape_1",
+                    "lookup_order",
+                    serde_json::json!({}),
+                )),
+                ReplyMessage::tool_result("call_escape_1", &escaped_result),
+                ReplyMessage::assistant_tool_call(ReplyToolCall::new(
+                    "call_escape_2",
+                    "lookup_order",
+                    serde_json::json!({}),
+                )),
+                ReplyMessage::tool_result("call_escape_2", escaped_result),
+            ],
+            [lookup_tool()],
+        );
+
+        assert!(validate_agent_reply_request(&request).is_ok());
+        assert_eq!(
+            persisted_agent_reply_request(&request),
+            Err(ProviderError::InvalidRequest(
+                "serialized Agent request is too large"
+            ))
+        );
     }
 }

@@ -18,9 +18,10 @@ pub use limits::{StorageLimits, StorageLimitsError};
 pub use operation::{SqliteOperationLimits, SqliteOperationLimitsError};
 pub use physical::{SqlitePhysicalLimits, SqlitePhysicalLimitsError};
 use protocol::{
-    Approval, EvidenceSummary, IncidentSummary, Metric, ReadPageInfo, ReviewResponse, RunEvent,
-    RunSummary, SandboxProfile, SessionEvent, SessionSummary, SessionTurn, StartTurnResponse,
-    ToolCall, ToolEffect, ToolPolicySummary,
+    AgentReviewResponse, AgentToolCallStatus, AgentTurnStatus, Approval, AssistantReplyProvenance,
+    EvidenceSummary, IncidentSummary, Metric, PolicyDecision, ReadPageInfo, ReviewResponse,
+    RunEvent, RunSummary, SandboxProfile, SessionEvent, SessionSummary, SessionTurn,
+    StartTurnResponse, ToolCall, ToolEffect, ToolExecutorStatus, ToolPolicySummary,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -28,6 +29,7 @@ pub use sqlite::SqliteStore;
 pub use tenancy::{
     AccountId, AuthSessionId, AuthzContext, MemberSetupToken, MembershipRevision, MembershipRole,
 };
+use workflows::State as AgentWorkflowState;
 
 pub const MEMBER_SETUP_TOKEN_TTL_SECONDS: i64 = 86_400;
 
@@ -150,6 +152,8 @@ pub struct TransitionMemberCommit {
 pub struct InFlightWorkSummary {
     pub reply_job_ids: Vec<String>,
     pub dispatch_call_ids: Vec<String>,
+    pub agent_model_job_ids: Vec<String>,
+    pub agent_tool_call_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -469,6 +473,343 @@ pub struct ReplyCompletion {
     pub turn: SessionTurn,
     pub events: Vec<SessionEvent>,
     pub replayed: bool,
+}
+
+/// Immutable inputs for one durable Session-native agent loop.
+///
+/// The first provider request is committed atomically with the user turn. The
+/// server-derived request body is durable authority and is intentionally not
+/// compared when an idempotent client command is replayed after an upgrade.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AgentTurnSpec {
+    pub id: String,
+    pub authz: AuthzContext,
+    pub environment: String,
+    pub provider_name: String,
+    pub model_name: Option<String>,
+    pub request_json: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentModelJobStatus {
+    Queued,
+    Started,
+    Succeeded,
+    Failed,
+    OutcomeUnknown,
+}
+
+/// Durable at-most-once model step. Each step owns a complete immutable
+/// provider request, including every prior tool call and tool result.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentModelJob {
+    pub id: String,
+    pub agent_id: String,
+    pub account_id: AccountId,
+    pub actor_user_id: String,
+    pub actor_membership_revision: MembershipRevision,
+    pub session_id: String,
+    pub turn_id: String,
+    pub step: u32,
+    pub provider_name: String,
+    pub model_name: Option<String>,
+    pub status: AgentModelJobStatus,
+    pub attempt: u32,
+    pub request_json: Value,
+    pub response_json: Option<Value>,
+    pub error_json: Option<Value>,
+    pub queued_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+/// Storage projection for one durable Session-native agent loop. Public HTTP
+/// callers receive [`AgentTurnDetail`], which adds its bounded tool-call list.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentTurn {
+    pub id: String,
+    pub account_id: AccountId,
+    pub actor_user_id: String,
+    pub actor_membership_revision: MembershipRevision,
+    pub session_id: String,
+    pub turn_id: String,
+    pub environment: String,
+    pub provider_name: String,
+    pub model_name: Option<String>,
+    pub status: AgentTurnStatus,
+    pub model_steps: u32,
+    pub tool_calls: u32,
+    pub tool_result_bytes: u64,
+    pub revision: u64,
+    pub pending_call_id: Option<String>,
+    pub workflow_state: AgentWorkflowState,
+    pub last_error_json: Option<Value>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+}
+
+/// Result of atomically appending a user turn and its first model step.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentTurnEnqueueResponse {
+    pub start: StartTurnResponse,
+    pub agent: AgentTurn,
+    pub job: AgentModelJob,
+}
+
+/// Immutable server-resolved contract for one model-selected tool call.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentToolCallSpec {
+    pub call_id: String,
+    pub provider_call_id: String,
+    pub tool_name: String,
+    pub tool_version: String,
+    pub arguments_json: Value,
+    pub arguments_digest: String,
+    pub effect: ToolEffect,
+    pub sandbox_profile: SandboxProfile,
+    pub executor_status: ToolExecutorStatus,
+    pub policy_decision: PolicyDecision,
+    pub policy_revision: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentToolCall {
+    pub call_id: String,
+    pub agent_id: String,
+    pub account_id: AccountId,
+    pub session_id: String,
+    pub turn_id: String,
+    pub provider_call_id: String,
+    pub ordinal: u32,
+    pub model_step: u32,
+    pub tool_name: String,
+    pub tool_version: String,
+    pub arguments_json: Value,
+    pub arguments_digest: String,
+    pub effect: ToolEffect,
+    pub sandbox_profile: SandboxProfile,
+    pub executor_status: ToolExecutorStatus,
+    pub policy_decision: PolicyDecision,
+    pub policy_revision: String,
+    pub status: AgentToolCallStatus,
+    pub approving_actor_user_id: Option<String>,
+    pub approving_membership_revision: Option<MembershipRevision>,
+    pub review_note: Option<String>,
+    pub reviewed_at: Option<String>,
+    pub result_json: Option<Value>,
+    pub provider_request_id: Option<String>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+/// One successful provider step either finishes the Session turn or admits one
+/// server-resolved tool call. Mixed text/tool outputs are rejected by `llm`
+/// before this commit can be constructed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AgentModelResolution {
+    Final {
+        assistant_message: String,
+        provenance: AssistantReplyProvenance,
+    },
+    ToolCall {
+        call: AgentToolCallSpec,
+    },
+    /// An exact deny is a known non-dispatch result. The denied result commits
+    /// with the audit call row. `next_request_json` is absent only when the
+    /// bounded continuation cannot be represented; storage then terminalizes
+    /// the loop without misclassifying the known non-dispatch as unknown.
+    PolicyDenied {
+        call: AgentToolCallSpec,
+        result_json: Value,
+        next_request_json: Option<Value>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentModelSuccessCommit {
+    pub job_id: String,
+    pub response_json: Value,
+    pub resolution: AgentModelResolution,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentModelFailureCommit {
+    pub job_id: String,
+    pub error_json: Value,
+    pub outcome_unknown: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AgentModelClaimOutcome {
+    Claimed(Box<AgentModelJob>),
+    Rejected(Box<AgentTerminalCompletion>),
+    NotAvailable,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AgentToolClaimOutcome {
+    Claimed(Box<AgentToolWork>),
+    Rejected(Box<AgentTerminalCompletion>),
+    NotAvailable,
+}
+
+/// Complete immutable context required to execute one claimed tool and build
+/// the model continuation from the exact provider request/response that
+/// proposed it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentToolWork {
+    pub call: AgentToolCall,
+    pub model_job: AgentModelJob,
+}
+
+/// Authenticated owner-review context. The API derives a rejection
+/// continuation from this server-owned transcript; the client never supplies
+/// provider messages directly.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentReviewContext {
+    pub agent: AgentTurn,
+    pub work: AgentToolWork,
+}
+
+impl AgentReviewContext {
+    /// Predict whether rejecting this exact pending call must enqueue another
+    /// model step. The prediction uses the same canonical rejection result and
+    /// reducer/limit settlement as the transactional review commit.
+    pub fn rejection_requires_continuation(
+        &self,
+        note: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        if let Some(note) = note {
+            protocol::validate_review_note(note).map_err(|error| {
+                StorageError::InvalidResourceEnvelope(format!("agent review note {error}"))
+            })?;
+        }
+        if self.work.call.status != AgentToolCallStatus::WaitingApproval
+            || self.agent.status != AgentTurnStatus::WaitingApproval
+            || self.agent.pending_call_id.as_deref() != Some(self.work.call.call_id.as_str())
+        {
+            // An already-reviewed call may be an idempotent receipt replay.
+            // Storage owns that decision; the service must not manufacture a
+            // now-unused continuation before presenting the receipt key.
+            return Ok(false);
+        }
+        let result = protocol::agent_approval_rejected_result(&self.work.call.call_id, note);
+        let result_bytes = u64::try_from(serde_json::to_vec(&result)?.len())
+            .map_err(|_| StorageError::IntegerOutOfRange("agent tool result bytes"))?;
+        let rejected = workflows::reduce(
+            &self.agent.workflow_state,
+            workflows::Command::ApprovalRejected { result_bytes },
+        )
+        .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?
+        .into_state();
+        let (_, queue_continuation) = settle_agent_continuation_limit(rejected)?;
+        Ok(queue_continuation)
+    }
+}
+
+pub(crate) fn settle_agent_continuation_limit(
+    continuation: AgentWorkflowState,
+) -> Result<(AgentWorkflowState, bool), StorageError> {
+    if continuation.status() != workflows::AgentStatus::ContinuationQueued {
+        return Ok((continuation, false));
+    }
+    let preview = workflows::reduce(&continuation, workflows::Command::StartModel)
+        .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+    if preview.state().status() == workflows::AgentStatus::Failed {
+        Ok((preview.into_state(), false))
+    } else {
+        Ok((continuation, true))
+    }
+}
+
+/// Persistence-ready owner decision. `next_request_json` is required only for
+/// a rejection that queues another model step and is derived from
+/// [`AgentReviewContext`] by the service layer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentReviewCommit {
+    pub call_id: String,
+    pub decision: protocol::ReviewDecision,
+    pub note: Option<String>,
+    pub idempotency_key: String,
+    pub next_request_json: Option<Value>,
+}
+
+/// Exact result committed after a known connector outcome. `result_json` is
+/// both the bounded durable record and the value supplied to the next model
+/// step. `next_request_json` is absent only when that bounded continuation
+/// cannot be represented. A panic or transport ambiguity uses the separate
+/// unknown transition.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentToolCompletionCommit {
+    pub call_id: String,
+    pub status: AgentToolCallStatus,
+    pub result_json: Value,
+    pub provider_request_id: Option<String>,
+    pub next_request_json: Option<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentToolOutcomeUnknownCommit {
+    pub call_id: String,
+    pub error_json: Value,
+}
+
+/// Session finalization caused by a failed, rejected, or indeterminate agent
+/// operation. The interruption event is committed in the same transaction.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentTerminalCompletion {
+    pub agent: AgentTurn,
+    pub session: SessionSummary,
+    pub turn: SessionTurn,
+    pub event: SessionEvent,
+    /// `true` only when storage reconstructed an already-committed terminal
+    /// transition. Callers use this as a live-publication guard; the durable
+    /// Session ledger remains the source of truth.
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentFinalCompletion {
+    pub agent: AgentTurn,
+    pub session: SessionSummary,
+    pub turn: SessionTurn,
+    pub events: Vec<SessionEvent>,
+    /// `true` only when storage reconstructed an already-committed final
+    /// transition. Fresh commits and restart recovery always return `false`.
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AgentModelCompletion {
+    Final(Box<AgentFinalCompletion>),
+    ToolCall {
+        agent: Box<AgentTurn>,
+        call: Box<AgentToolCall>,
+    },
+    Terminal(Box<AgentTerminalCompletion>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AgentToolCompletion {
+    ModelQueued {
+        agent: Box<AgentTurn>,
+        job: Box<AgentModelJob>,
+    },
+    Terminal(Box<AgentTerminalCompletion>),
+}
+
+/// Query/approval projection produced entirely from one authenticated SQLite
+/// transaction.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentReviewResult {
+    pub response: AgentReviewResponse,
+    pub queued_model_job: Option<AgentModelJob>,
+    /// Present when a rejection reaches a fixed Agent Loop limit and therefore
+    /// interrupts the Session instead of queueing a continuation. Receipt
+    /// replay reconstructs this completion with `replayed = true`.
+    pub terminal_completion: Option<AgentTerminalCompletion>,
 }
 
 /// Immutable runtime boundary attached to one persistent database.

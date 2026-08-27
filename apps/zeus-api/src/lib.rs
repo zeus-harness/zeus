@@ -26,13 +26,15 @@ use axum::{
     },
     routing::{get, post},
 };
-use llm::{
-    LocalFallbackProvider, ProviderError, REPLY_REQUEST_MAX_HISTORY_PAIRS, ReplyKind,
-    ReplyProvider, ReplyRequest, validate_provider_metadata, validate_reply_request,
-    validate_reply_response,
-};
 #[cfg(test)]
-use llm::{ReplyMessage, ReplyRole};
+use llm::ReplyRole;
+use llm::{
+    AGENT_REQUEST_MAX_HISTORY_PAIRS, LocalFallbackProvider, ProviderError, ReplyKind, ReplyMessage,
+    ReplyOutput, ReplyProvider, ReplyRequest, ReplyToolCall, ReplyToolDefinition,
+    persisted_agent_reply_request, validate_agent_reply_request,
+    validate_agent_reply_response_for_request, validate_provider_metadata, validate_reply_request,
+    validate_reply_response_for_request,
+};
 use protocol::{
     ACCOUNT_AUDIT_EVENT_SCHEMA, ACCOUNT_AUDIT_EXPORT_MANIFEST_KIND,
     ACCOUNT_AUDIT_EXPORT_SCHEMA_VERSION,
@@ -41,26 +43,34 @@ use protocol::{
     AccountAuditPolicy as AccountAuditPolicyResponse,
     AccountAuditRollup as AccountAuditRollupResponse,
     AccountAuditState as AccountAuditStateResponse, AccountMember, AccountMemberPage, AccountRole,
-    AccountStatus, AccountUser, AssistantReplyKind, AssistantReplyProvenance, AuthStatusResponse,
-    AuthenticationResponse, BootstrapRequest, COLLECTION_PAGE_DEFAULT_LIMIT,
+    AccountStatus, AccountUser, AgentReviewResponse, AgentToolCallStatus, AgentTurnDetail,
+    Approval, ApprovalScope, ApprovalStatus, AssistantReplyKind, AssistantReplyProvenance,
+    AuthStatusResponse, AuthenticationResponse, BootstrapRequest, COLLECTION_PAGE_DEFAULT_LIMIT,
     CreateAccountAuditCheckpointRequest, CreateMemberRequest, CreateSessionRequest,
     CreateSessionResponse, EVENT_PAGE_DEFAULT_LIMIT, HealthResponse, InFlightWorkSummary,
-    LoginRequest, LogoutResponse, MemberSetupRequest, MemberSetupTokenResponse, ProblemDetails,
-    ResumeSessionRequest, ResumeSessionResponse, ReviewRequest, ReviewResponse,
-    RotateMemberSetupTokenRequest, RunDetail, SessionDetail, SessionEvent, SessionTurn,
-    StartTurnRequest, ThemePreference, UpdateAccountAuditPolicyRequest, UpdateMemberRequest,
-    UpdateMemberResponse, UpdatePreferencesRequest, UserPreferences,
+    LoginRequest, LogoutResponse, MemberSetupRequest, MemberSetupTokenResponse, PolicyDecision,
+    ProblemDetails, ResumeSessionRequest, ResumeSessionResponse, ReviewDecision, ReviewRequest,
+    ReviewResponse, RotateMemberSetupTokenRequest, RunDetail, SessionDetail, SessionEvent,
+    SessionTurn, StartTurnRequest, ThemePreference, UpdateAccountAuditPolicyRequest,
+    UpdateMemberRequest, UpdateMemberResponse, UpdatePreferencesRequest, UserPreferences,
 };
+#[cfg(test)]
+use runtime::ReplyJobSpec;
 use runtime::{
     AccountAuditCheckpointCommit, AccountAuditEvent as StoredAccountAuditEvent,
     AccountAuditPolicy as StoredAccountAuditPolicy, AccountAuditRollup as StoredAccountAuditRollup,
-    AccountAuditState as StoredAccountAuditState, AuthPrincipal, AuthSessionCommit, AuthzContext,
-    BootstrapOwnerCommit, DemoStore, MemberSetupCommit, PublishedEvent, ReplyClaimOutcome,
-    ReplyFailureCommit, ReplyJob, ReplyJobSpec, ReplyOutcomeUnknownCommit, ReplySuccessCommit,
-    StoreError, StoredMember, StoredMembershipStatus, StoredPreferences, StoredUser,
-    StoredUserStatus, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
+    AccountAuditState as StoredAccountAuditState, AgentModelClaimOutcome, AgentModelCompletion,
+    AgentModelFailureCommit, AgentModelJob, AgentModelResolution, AgentModelSuccessCommit,
+    AgentReviewCommit, AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome,
+    AgentToolCompletion, AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit, AgentToolWork,
+    AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthzContext, BootstrapOwnerCommit, DemoStore,
+    MemberSetupCommit, PublishedEvent, ReplyClaimOutcome, ReplyFailureCommit, ReplyJob,
+    ReplyOutcomeUnknownCommit, ReplySuccessCommit, StoreError, StoredMember,
+    StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserStatus,
+    TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tenancy::{
     AccountId, AuthSessionId, BootstrapTokenDigest, CsrfToken, CsrfTokenDigest, MemberSetupToken,
     MembershipRole, Password, PasswordAuthenticator, PasswordHashRecord, SessionToken,
@@ -86,6 +96,7 @@ const SSE_GLOBAL_CONNECTION_LIMIT: usize = 64;
 const SSE_ACTOR_CONNECTION_LIMIT: usize = 4;
 const SSE_CAPACITY_RETRY_AFTER: Duration = Duration::from_secs(2);
 const WORKER_ERROR_RETRY_DELAY: Duration = Duration::from_millis(25);
+const AGENT_COMPLETION_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 const WORKER_IDLE: u8 = 0;
 const WORKER_RUNNING: u8 = 1;
 const WORKER_PENDING: u8 = 2;
@@ -167,6 +178,35 @@ impl WorkerWakeState {
                 WORKER_IDLE => return false,
                 _ => unreachable!("invalid worker wake state"),
             }
+        }
+    }
+}
+
+async fn retry_agent_durable_progress<T, F, Fut>(
+    label: &str,
+    mut operation: F,
+) -> Result<T, StoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, StoreError>>,
+{
+    let mut attempt = 1_u64;
+    let mut retry_delay = WORKER_ERROR_RETRY_DELAY;
+    loop {
+        match operation().await {
+            Ok(completion) => return Ok(completion),
+            Err(error) if error.is_retryable_durable_completion_error() => {
+                eprintln!(
+                    "zeus {label} durable attempt {attempt} failed; retrying without repeating external work: {error}"
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = std::cmp::min(
+                    retry_delay.saturating_mul(2),
+                    AGENT_COMPLETION_RETRY_MAX_DELAY,
+                );
+                attempt = attempt.saturating_add(1);
+            }
+            Err(error) => return Err(error),
         }
     }
 }
@@ -568,8 +608,26 @@ impl Drop for SseLease {
 
 struct ReplyExecutor {
     provider: Arc<dyn ReplyProvider>,
-    drain: Mutex<()>,
-    worker_wake: WorkerWakeState,
+    reply_drain: Mutex<()>,
+    reply_worker_wake: WorkerWakeState,
+    agent_model_drain: Mutex<()>,
+    agent_model_worker_wake: WorkerWakeState,
+    agent_tool_drain: Mutex<()>,
+    agent_tool_worker_wake: WorkerWakeState,
+}
+
+impl ReplyExecutor {
+    fn new(provider: Arc<dyn ReplyProvider>) -> Self {
+        Self {
+            provider,
+            reply_drain: Mutex::new(()),
+            reply_worker_wake: WorkerWakeState::default(),
+            agent_model_drain: Mutex::new(()),
+            agent_model_worker_wake: WorkerWakeState::default(),
+            agent_tool_drain: Mutex::new(()),
+            agent_tool_worker_wake: WorkerWakeState::default(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -643,11 +701,7 @@ pub fn authenticated_app_with_provider(
     provider: Arc<dyn ReplyProvider>,
 ) -> Result<Router, tenancy::CredentialError> {
     let auth = auth_config_with_clock(cookie_secure, Arc::new(SystemRateLimitClock))?;
-    let reply = Arc::new(ReplyExecutor {
-        provider,
-        drain: Mutex::new(()),
-        worker_wake: WorkerWakeState::default(),
-    });
+    let reply = Arc::new(ReplyExecutor::new(provider));
     let state = ApiState {
         store,
         durable_ledger_poll_interval: DURABLE_LEDGER_POLL_INTERVAL,
@@ -688,6 +742,14 @@ fn build_authenticated_app(state: ApiState) -> Router {
         .route("/api/v1/sessions/{id}/resume", post(resume_session))
         .route("/api/v1/sessions/{id}/turns", post(start_turn))
         .route("/api/v1/sessions/{id}/turns/{turn_id}", get(session_turn))
+        .route(
+            "/api/v1/sessions/{id}/turns/{turn_id}/agent",
+            get(agent_turn_detail),
+        )
+        .route(
+            "/api/v1/sessions/{id}/turns/{turn_id}/approvals/{call_id}/decision",
+            post(agent_review_decision),
+        )
         .route("/api/v1/sessions/{id}/events", get(session_events))
         .route("/api/v1/runs/{id}", get(run_detail))
         .route(
@@ -746,6 +808,8 @@ fn build_authenticated_app(state: ApiState) -> Router {
         .fallback(not_found)
         .with_state(state.clone());
     kick_reply_worker(&state);
+    kick_agent_model_worker(&state);
+    kick_agent_tool_worker(&state);
     router
 }
 
@@ -806,6 +870,14 @@ fn build_test_app(state: ApiState, request_auth: TestRequestAuth) -> Router {
         .route("/api/v1/sessions/{id}/resume", post(resume_session))
         .route("/api/v1/sessions/{id}/turns", post(test_start_turn))
         .route("/api/v1/sessions/{id}/turns/{turn_id}", get(session_turn))
+        .route(
+            "/api/v1/sessions/{id}/turns/{turn_id}/agent",
+            get(agent_turn_detail),
+        )
+        .route(
+            "/api/v1/sessions/{id}/turns/{turn_id}/approvals/{call_id}/decision",
+            post(agent_review_decision),
+        )
         .route(
             "/api/v1/sessions/{id}/turns/{turn_id}/flush",
             post(test_flush_turn),
@@ -1308,6 +1380,8 @@ async fn update_member(
         in_flight: InFlightWorkSummary {
             reply_job_ids: result.in_flight.reply_job_ids,
             dispatch_call_ids: result.in_flight.dispatch_call_ids,
+            agent_model_job_ids: result.in_flight.agent_model_job_ids,
+            agent_tool_call_ids: result.in_flight.agent_tool_call_ids,
         },
     })
 }
@@ -2027,7 +2101,7 @@ fn kick_reply_worker(state: &ApiState) {
     let Some(reply) = &state.reply else {
         return;
     };
-    if !reply.worker_wake.request() {
+    if !reply.reply_worker_wake.request() {
         return;
     }
     let state = state.clone();
@@ -2041,7 +2115,7 @@ fn kick_reply_worker(state: &ApiState) {
                 .reply
                 .as_ref()
                 .expect("a scheduled reply worker requires a provider");
-            if !reply.worker_wake.complete_cycle() {
+            if !reply.reply_worker_wake.complete_cycle() {
                 return;
             }
         }
@@ -2053,7 +2127,7 @@ async fn drain_reply_jobs(state: &ApiState) -> Result<(), StoreError> {
         .reply
         .as_ref()
         .expect("reply worker is only started when a provider exists");
-    let _drain = reply.drain.lock().await;
+    let _drain = reply.reply_drain.lock().await;
     loop {
         let job = match state.store.claim_next_reply().await? {
             ReplyClaimOutcome::Claimed(job) => *job,
@@ -2111,7 +2185,8 @@ async fn process_reply_job(state: &ApiState, job: ReplyJob) -> Result<(), StoreE
         .await;
     }
     let provider = Arc::clone(&reply.provider);
-    let response = match tokio::spawn(async move { provider.reply(request).await }).await {
+    let provider_request = request.clone();
+    let response = match tokio::spawn(async move { provider.reply(provider_request).await }).await {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
             if matches!(&error, ProviderError::Timeout | ProviderError::Transport) {
@@ -2142,7 +2217,7 @@ async fn process_reply_job(state: &ApiState, job: ReplyJob) -> Result<(), StoreE
             .await;
         }
     };
-    if let Err(error) = validate_reply_response(&response) {
+    if let Err(error) = validate_reply_response_for_request(&request, &response) {
         return fail_reply_job(
             state,
             &job,
@@ -2161,6 +2236,18 @@ async fn process_reply_job(state: &ApiState, job: ReplyJob) -> Result<(), StoreE
         .await;
     }
 
+    let assistant_message = match &response.output {
+        ReplyOutput::Final { content } => content.clone(),
+        ReplyOutput::ToolCall { .. } => {
+            return fail_reply_job(
+                state,
+                &job,
+                "legacy_reply_tool_call_unsupported",
+                "Legacy reply work cannot admit a tool call",
+            )
+            .await;
+        }
+    };
     let expected_sequence = state
         .store
         .session_summary_for_progress(&job.session_id)
@@ -2183,7 +2270,7 @@ async fn process_reply_job(state: &ApiState, job: ReplyJob) -> Result<(), StoreE
         .complete_reply_success(ReplySuccessCommit {
             job_id: job.id,
             expected_sequence,
-            assistant_message: response.content,
+            assistant_message,
             provenance: AssistantReplyProvenance {
                 provider_id: response.provider.provider_id,
                 model: response.provider.model,
@@ -2282,6 +2369,661 @@ fn provider_error_message(error: &ProviderError) -> &'static str {
     }
 }
 
+fn current_agent_tools(store: &DemoStore) -> Result<Vec<ReplyToolDefinition>, StoreError> {
+    store
+        .session_agent_tool_definitions()?
+        .into_iter()
+        .map(|definition| {
+            let tool = ReplyToolDefinition::new(definition.name, definition.input_schema);
+            Ok(if definition.description.is_empty() {
+                tool
+            } else {
+                tool.with_description(definition.description)
+            })
+        })
+        .collect()
+}
+
+fn durable_agent_id(session_id: &str, turn_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"zeus-session-agent-v1\0");
+    digest.update(
+        u64::try_from(session_id.len())
+            .expect("validated Session IDs fit in u64")
+            .to_be_bytes(),
+    );
+    digest.update(session_id.as_bytes());
+    digest.update(
+        u64::try_from(turn_id.len())
+            .expect("validated turn IDs fit in u64")
+            .to_be_bytes(),
+    );
+    digest.update(turn_id.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+fn kick_agent_model_worker(state: &ApiState) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let Some(executor) = &state.reply else {
+        return;
+    };
+    if !executor.agent_model_worker_wake.request() {
+        return;
+    }
+    let state = state.clone();
+    runtime.spawn(async move {
+        loop {
+            if let Err(error) = retry_agent_durable_progress("Agent model worker", || {
+                drain_agent_model_jobs(&state)
+            })
+            .await
+            {
+                eprintln!("zeus Agent model worker stopped: {error}");
+                tokio::time::sleep(WORKER_ERROR_RETRY_DELAY).await;
+            }
+            let executor = state
+                .reply
+                .as_ref()
+                .expect("a scheduled Agent model worker requires a provider");
+            if !executor.agent_model_worker_wake.complete_cycle() {
+                return;
+            }
+        }
+    });
+}
+
+async fn drain_agent_model_jobs(state: &ApiState) -> Result<(), StoreError> {
+    let executor = state
+        .reply
+        .as_ref()
+        .expect("the Agent model worker is only started when a provider exists");
+    let _drain = executor.agent_model_drain.lock().await;
+    loop {
+        let job = match state.store.claim_next_agent_model().await? {
+            AgentModelClaimOutcome::Claimed(job) => *job,
+            AgentModelClaimOutcome::Rejected(_) => continue,
+            AgentModelClaimOutcome::NotAvailable => return Ok(()),
+        };
+        process_agent_model_job(state, job).await?;
+    }
+}
+
+async fn process_agent_model_job(state: &ApiState, job: AgentModelJob) -> Result<(), StoreError> {
+    let executor = state
+        .reply
+        .as_ref()
+        .expect("a claimed Agent model job requires a configured provider");
+    let metadata = executor.provider.metadata();
+    if validate_provider_metadata(metadata).is_err() {
+        return settle_agent_model_failure(
+            state,
+            &job,
+            "provider_configuration_invalid",
+            "The configured Agent provider is invalid",
+            false,
+        )
+        .await;
+    }
+    if job.provider_name != metadata.provider_id || job.model_name != metadata.model {
+        return settle_agent_model_failure(
+            state,
+            &job,
+            "provider_configuration_changed",
+            "The queued Agent step no longer matches the configured provider",
+            false,
+        )
+        .await;
+    }
+
+    let request = match serde_json::from_value::<ReplyRequest>(job.request_json.clone()) {
+        Ok(request) if validate_agent_reply_request(&request).is_ok() => request,
+        _ => {
+            return settle_agent_model_failure(
+                state,
+                &job,
+                "invalid_persisted_request",
+                "The persisted Agent request could not be decoded safely",
+                false,
+            )
+            .await;
+        }
+    };
+    let current_tools = match current_agent_tools(&state.store) {
+        Ok(tools) => tools,
+        Err(error) => {
+            eprintln!("zeus Agent tool catalog could not be loaded: {error}");
+            return settle_agent_model_failure(
+                state,
+                &job,
+                "tool_catalog_unavailable",
+                "The Agent tool catalog could not be verified",
+                false,
+            )
+            .await;
+        }
+    };
+    if request.tools != current_tools {
+        return settle_agent_model_failure(
+            state,
+            &job,
+            "tool_catalog_changed",
+            "The queued Agent step no longer matches the server tool catalog",
+            false,
+        )
+        .await;
+    }
+
+    let provider = Arc::clone(&executor.provider);
+    let provider_request = request.clone();
+    let response = match tokio::spawn(async move { provider.reply(provider_request).await }).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            let outcome_unknown =
+                matches!(error, ProviderError::Timeout | ProviderError::Transport);
+            return settle_agent_model_failure(
+                state,
+                &job,
+                provider_error_code(&error),
+                provider_error_message(&error),
+                outcome_unknown,
+            )
+            .await;
+        }
+        Err(_) => {
+            eprintln!("zeus Agent provider task panicked; settling outcome_unknown");
+            return settle_agent_model_failure(
+                state,
+                &job,
+                "provider_panicked",
+                "The Agent provider stopped after its durable start checkpoint",
+                true,
+            )
+            .await;
+        }
+    };
+    if let Err(error) = validate_agent_reply_response_for_request(&request, &response) {
+        return settle_agent_model_failure(
+            state,
+            &job,
+            provider_error_code(&error),
+            provider_error_message(&error),
+            false,
+        )
+        .await;
+    }
+    if &response.provider != metadata {
+        return settle_agent_model_failure(
+            state,
+            &job,
+            "provider_metadata_mismatch",
+            "The Agent provider returned inconsistent provenance",
+            false,
+        )
+        .await;
+    }
+    let response_json = match serde_json::to_value(&response) {
+        Ok(value) => value,
+        Err(_) => {
+            return settle_agent_model_failure(
+                state,
+                &job,
+                "invalid_provider_response",
+                "The Agent provider response could not be persisted safely",
+                false,
+            )
+            .await;
+        }
+    };
+
+    let resolution = match &response.output {
+        ReplyOutput::Final { content } => AgentModelResolution::Final {
+            assistant_message: content.clone(),
+            provenance: AssistantReplyProvenance {
+                provider_id: response.provider.provider_id.clone(),
+                model: response.provider.model.clone(),
+                reply_kind: match response.provider.reply_kind {
+                    ReplyKind::Model => AssistantReplyKind::Model,
+                    ReplyKind::NonModelFallback => AssistantReplyKind::NonModelFallback,
+                },
+            },
+        },
+        ReplyOutput::ToolCall {
+            call: provider_call,
+        } => {
+            let resolved = match state.store.resolve_session_agent_tool(
+                &job.agent_id,
+                job.step,
+                job.step,
+                &provider_call.name,
+                provider_call.arguments.clone(),
+            ) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    eprintln!("zeus rejected a model-selected Agent tool: {error}");
+                    return settle_agent_model_failure(
+                        state,
+                        &job,
+                        "tool_resolution_failed",
+                        "The model-selected tool could not be resolved safely",
+                        false,
+                    )
+                    .await;
+                }
+            };
+            let resolved_call = resolved.call();
+            let evaluation = resolved.policy_evaluation();
+            let call = AgentToolCallSpec {
+                call_id: resolved_call.call_id.clone(),
+                provider_call_id: provider_call.id.clone(),
+                tool_name: resolved_call.tool.clone(),
+                tool_version: resolved_call.tool_version.clone(),
+                arguments_json: resolved_call.arguments.clone(),
+                arguments_digest: resolved_call.arguments_digest.clone(),
+                effect: resolved_call.effect.clone(),
+                sandbox_profile: resolved_call.sandbox_profile.clone(),
+                executor_status: resolved_call.executor_status.clone(),
+                policy_decision: evaluation.decision.clone(),
+                policy_revision: evaluation.policy_revision.clone(),
+            };
+            if evaluation.decision == PolicyDecision::Deny {
+                let result = policy_denied_result(&evaluation.policy_revision);
+                AgentModelResolution::PolicyDenied {
+                    call,
+                    next_request_json: continuation_request_json(&request, provider_call, &result),
+                    result_json: result,
+                }
+            } else {
+                AgentModelResolution::ToolCall { call }
+            }
+        }
+    };
+    let commit = AgentModelSuccessCommit {
+        job_id: job.id.clone(),
+        response_json,
+        resolution,
+    };
+    let completion = match retry_agent_durable_progress("Agent model", || {
+        state.store.complete_agent_model_success(commit.clone())
+    })
+    .await
+    {
+        Ok(completion) => completion,
+        Err(error)
+            if matches!(
+                &commit.resolution,
+                AgentModelResolution::PolicyDenied {
+                    next_request_json: Some(_),
+                    ..
+                }
+            ) =>
+        {
+            eprintln!(
+                "zeus could not persist an Agent policy-denied continuation; terminalizing the same known denial: {error}"
+            );
+            let mut fallback = commit;
+            if let AgentModelResolution::PolicyDenied {
+                next_request_json, ..
+            } = &mut fallback.resolution
+            {
+                *next_request_json = None;
+            }
+            match retry_agent_durable_progress("Agent policy-denied fallback", || {
+                state.store.complete_agent_model_success(fallback.clone())
+            })
+            .await
+            {
+                Ok(completion) => completion,
+                Err(error) => {
+                    eprintln!(
+                        "zeus could not persist an Agent policy-denied known-result fallback: {error}"
+                    );
+                    return settle_agent_model_failure(
+                        state,
+                        &job,
+                        "durable_model_completion_failed",
+                        "The model result was known but its durable completion could not be committed",
+                        false,
+                    )
+                    .await;
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("zeus could not persist an exact Agent model completion: {error}");
+            return settle_agent_model_failure(
+                state,
+                &job,
+                "durable_model_completion_failed",
+                "The model result was known but its durable completion could not be committed",
+                false,
+            )
+            .await;
+        }
+    };
+    match completion {
+        AgentModelCompletion::ToolCall { call, .. } => match call.status {
+            AgentToolCallStatus::Queued => kick_agent_tool_worker(state),
+            AgentToolCallStatus::NotDispatched => kick_agent_model_worker(state),
+            AgentToolCallStatus::WaitingApproval => {}
+            _ => {
+                return Err(StoreError::ExecutionInvariant(
+                    "a model tool proposal committed an invalid initial call state".into(),
+                ));
+            }
+        },
+        AgentModelCompletion::Final(_) | AgentModelCompletion::Terminal(_) => {}
+    }
+    Ok(())
+}
+
+async fn settle_agent_model_failure(
+    state: &ApiState,
+    job: &AgentModelJob,
+    code: &str,
+    message: &str,
+    outcome_unknown: bool,
+) -> Result<(), StoreError> {
+    let commit = AgentModelFailureCommit {
+        job_id: job.id.clone(),
+        error_json: serde_json::json!({ "code": code, "message": message }),
+        outcome_unknown,
+    };
+    retry_agent_durable_progress("Agent model failure", || {
+        state.store.complete_agent_model_failure(commit.clone())
+    })
+    .await?;
+    Ok(())
+}
+
+fn kick_agent_tool_worker(state: &ApiState) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let Some(executor) = &state.reply else {
+        return;
+    };
+    if !executor.agent_tool_worker_wake.request() {
+        return;
+    }
+    let state = state.clone();
+    runtime.spawn(async move {
+        loop {
+            if let Err(error) =
+                retry_agent_durable_progress("Agent tool worker", || drain_agent_tool_calls(&state))
+                    .await
+            {
+                eprintln!("zeus Agent tool worker stopped: {error}");
+                tokio::time::sleep(WORKER_ERROR_RETRY_DELAY).await;
+            }
+            let executor = state
+                .reply
+                .as_ref()
+                .expect("a scheduled Agent tool worker requires a provider");
+            if !executor.agent_tool_worker_wake.complete_cycle() {
+                return;
+            }
+        }
+    });
+}
+
+async fn drain_agent_tool_calls(state: &ApiState) -> Result<(), StoreError> {
+    let executor = state
+        .reply
+        .as_ref()
+        .expect("the Agent tool worker is only started when a provider exists");
+    let _drain = executor.agent_tool_drain.lock().await;
+    loop {
+        let work = match state.store.claim_next_agent_tool().await? {
+            AgentToolClaimOutcome::Claimed(work) => *work,
+            AgentToolClaimOutcome::Rejected(_) => continue,
+            AgentToolClaimOutcome::NotAvailable => return Ok(()),
+        };
+        process_agent_tool_work(state, work).await?;
+    }
+}
+
+async fn process_agent_tool_work(state: &ApiState, work: AgentToolWork) -> Result<(), StoreError> {
+    let resolved = match state.store.verify_persisted_session_agent_tool(&work.call) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            eprintln!("zeus refused a drifted persisted Agent tool: {error}");
+            return settle_known_agent_tool(
+                state,
+                &work,
+                AgentToolCallStatus::NotDispatched,
+                serde_json::json!({
+                    "code": "tool_contract_changed",
+                    "message": "The persisted tool no longer matches the current runtime",
+                    "status": "not_dispatched"
+                }),
+                None,
+            )
+            .await;
+        }
+    };
+    let approval = approval_for_agent_call(&work.call);
+    let store = state.store.clone();
+    let outcome = tokio::spawn(async move {
+        store
+            .dispatch_session_agent_tool_after_checkpoint(resolved, approval.as_ref())
+            .await
+    })
+    .await;
+    match outcome {
+        Ok(Ok(output)) => {
+            settle_known_agent_tool(
+                state,
+                &work,
+                AgentToolCallStatus::Succeeded,
+                output.value,
+                output.provider_request_id,
+            )
+            .await
+        }
+        Ok(Err(error)) => {
+            eprintln!("zeus Agent tool returned a known failure: {error}");
+            let (status, result) = match error {
+                StoreError::PolicyDenied(_) | StoreError::PolicyChanged(_) => (
+                    AgentToolCallStatus::NotDispatched,
+                    serde_json::json!({
+                        "code": "tool_not_dispatched",
+                        "message": "The tool was not dispatched because its execution contract changed",
+                        "status": "not_dispatched"
+                    }),
+                ),
+                _ => (
+                    AgentToolCallStatus::Failed,
+                    serde_json::json!({
+                        "code": "tool_execution_failed",
+                        "message": "The tool returned a known failure",
+                        "status": "failed"
+                    }),
+                ),
+            };
+            settle_known_agent_tool(state, &work, status, result, None).await
+        }
+        Err(_) => {
+            eprintln!("zeus Agent tool task panicked; settling outcome_unknown");
+            settle_agent_tool_outcome_unknown(
+                state,
+                &work.call,
+                "tool_panicked",
+                "The tool stopped after its durable start checkpoint",
+            )
+            .await
+        }
+    }
+}
+
+async fn settle_known_agent_tool(
+    state: &ApiState,
+    work: &AgentToolWork,
+    status: AgentToolCallStatus,
+    result_json: serde_json::Value,
+    provider_request_id: Option<String>,
+) -> Result<(), StoreError> {
+    let next_request_json = continuation_request_json_for_work(work, &result_json);
+    let commit = AgentToolCompletionCommit {
+        call_id: work.call.call_id.clone(),
+        status,
+        result_json,
+        provider_request_id,
+        next_request_json,
+    };
+    let completion = match retry_agent_durable_progress("Agent tool", || {
+        state.store.complete_agent_tool(commit.clone())
+    })
+    .await
+    {
+        Ok(completion) => completion,
+        Err(error) if commit.next_request_json.is_some() => {
+            eprintln!(
+                "zeus could not persist an Agent tool continuation; terminalizing the same known result: {error}"
+            );
+            let mut fallback = commit;
+            fallback.next_request_json = None;
+            retry_agent_durable_progress("Agent tool known-result fallback", || {
+                state.store.complete_agent_tool(fallback.clone())
+            })
+            .await?
+        }
+        Err(error) => return Err(error),
+    };
+    if matches!(completion, AgentToolCompletion::ModelQueued { .. }) {
+        kick_agent_model_worker(state);
+    }
+    Ok(())
+}
+
+async fn settle_agent_tool_outcome_unknown(
+    state: &ApiState,
+    call: &AgentToolCall,
+    code: &str,
+    message: &str,
+) -> Result<(), StoreError> {
+    let commit = AgentToolOutcomeUnknownCommit {
+        call_id: call.call_id.clone(),
+        error_json: serde_json::json!({ "code": code, "message": message }),
+    };
+    retry_agent_durable_progress("Agent tool outcome-unknown", || {
+        state
+            .store
+            .complete_agent_tool_outcome_unknown(commit.clone())
+    })
+    .await?;
+    Ok(())
+}
+
+fn approval_for_agent_call(call: &AgentToolCall) -> Option<Approval> {
+    (call.policy_decision == PolicyDecision::RequireApproval).then(|| Approval {
+        id: call.call_id.clone(),
+        status: ApprovalStatus::Approved,
+        action: "execute the approved Agent tool".into(),
+        tool: call.tool_name.clone(),
+        change: "execute the exact persisted tool call".into(),
+        requires_approval: true,
+        call_id: Some(call.call_id.clone()),
+        policy_revision: Some(call.policy_revision.clone()),
+        arguments_digest: Some(call.arguments_digest.clone()),
+        sandbox_profile: Some(call.sandbox_profile.clone()),
+        scope: Some(ApprovalScope::AllowOnce),
+    })
+}
+
+fn continuation_request_for_work(
+    work: &AgentToolWork,
+    result: &serde_json::Value,
+) -> Result<ReplyRequest, ProviderError> {
+    let request = serde_json::from_value::<ReplyRequest>(work.model_job.request_json.clone())
+        .map_err(|_| ProviderError::InvalidRequest("invalid persisted Agent request"))?;
+    validate_agent_reply_request(&request)?;
+    let response_json = work
+        .model_job
+        .response_json
+        .clone()
+        .ok_or(ProviderError::InvalidResponse)?;
+    let response = serde_json::from_value::<llm::ReplyResponse>(response_json)
+        .map_err(|_| ProviderError::InvalidResponse)?;
+    validate_agent_reply_response_for_request(&request, &response)?;
+    let ReplyOutput::ToolCall { call } = response.output else {
+        return Err(ProviderError::InvalidResponse);
+    };
+    if call.id != work.call.provider_call_id
+        || call.name != work.call.tool_name
+        || call.arguments != work.call.arguments_json
+    {
+        return Err(ProviderError::InvalidResponse);
+    }
+    continuation_request(&request, &call, result)
+}
+
+fn continuation_request_json_for_work(
+    work: &AgentToolWork,
+    result: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let next = match continuation_request_for_work(work, result) {
+        Ok(next) => next,
+        Err(error) => {
+            eprintln!("zeus could not build a bounded Agent continuation: {error}");
+            return None;
+        }
+    };
+    match persisted_agent_reply_request(&next) {
+        Ok(next) => Some(next),
+        Err(error) => {
+            eprintln!("zeus could not serialize a validated Agent continuation: {error}");
+            None
+        }
+    }
+}
+
+fn continuation_request_json(
+    request: &ReplyRequest,
+    call: &ReplyToolCall,
+    result: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let next = match continuation_request(request, call, result) {
+        Ok(next) => next,
+        Err(error) => {
+            eprintln!("zeus could not build a bounded Agent continuation: {error}");
+            return None;
+        }
+    };
+    match persisted_agent_reply_request(&next) {
+        Ok(next) => Some(next),
+        Err(error) => {
+            eprintln!("zeus could not serialize a validated Agent continuation: {error}");
+            None
+        }
+    }
+}
+
+fn continuation_request(
+    request: &ReplyRequest,
+    call: &ReplyToolCall,
+    result: &serde_json::Value,
+) -> Result<ReplyRequest, ProviderError> {
+    let content = serde_json::to_string(result).map_err(|_| ProviderError::InvalidResponse)?;
+    let mut next = request.clone();
+    next.messages
+        .push(ReplyMessage::assistant_tool_call(call.clone()));
+    next.messages
+        .push(ReplyMessage::tool_result(call.id.clone(), content));
+    validate_agent_reply_request(&next)?;
+    Ok(next)
+}
+
+fn policy_denied_result(policy_revision: &str) -> serde_json::Value {
+    serde_json::json!({
+        "code": "policy_denied",
+        "message": "Zeus policy denied this tool call",
+        "policy_revision": policy_revision,
+        "status": "not_dispatched"
+    })
+}
+
 async fn overview(
     State(state): State<ApiState>,
     Extension(current): Extension<CurrentAuth>,
@@ -2378,6 +3120,19 @@ async fn session_turn(
     ))
 }
 
+async fn agent_turn_detail(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    Path((id, turn_id)): Path<(String, String)>,
+) -> Result<Json<AgentTurnDetail>, ApiError> {
+    Ok(Json(
+        state
+            .store
+            .agent_turn_detail_for_actor(&current.principal.authz, &id, &turn_id)
+            .await?,
+    ))
+}
+
 async fn resume_session(
     State(state): State<ApiState>,
     Extension(current): Extension<CurrentAuth>,
@@ -2413,8 +3168,8 @@ async fn start_turn(
     let Json(request) = payload.map_err(ApiError::invalid_json)?;
     let idempotency_key = required_idempotency_key(&headers)?;
     validate_start_turn_envelope(&request)?;
-    let reply = reply_executor(&state)?;
-    let metadata = reply.provider.metadata();
+    let executor = reply_executor(&state)?;
+    let metadata = executor.provider.metadata();
     validate_provider_metadata(metadata).map_err(ApiError::reply_unavailable)?;
     let reply_turns = state
         .store
@@ -2422,31 +3177,34 @@ async fn start_turn(
             &current.principal.authz,
             &id,
             request.expected_sequence,
-            REPLY_REQUEST_MAX_HISTORY_PAIRS,
+            AGENT_REQUEST_MAX_HISTORY_PAIRS,
         )
         .await?;
-    let reply_request =
-        ReplyRequest::from_session_history(&reply_turns, request.user_message.clone())
+    let mut reply_request =
+        ReplyRequest::from_session_history_for_agent(&reply_turns, request.user_message.clone())
             .map_err(|error| ApiError::internal_contract(&error.to_string()))?;
-    let job = ReplyJobSpec {
-        id: format!("reply:{id}:{}", request.turn_id),
+    reply_request.tools = current_agent_tools(&state.store)?;
+    let request_json =
+        persisted_agent_reply_request(&reply_request).map_err(ApiError::agent_request_too_large)?;
+    let agent = AgentTurnSpec {
+        id: durable_agent_id(&id, &request.turn_id),
         authz: current.principal.authz.clone(),
+        environment: state.store.session_agent_environment().to_owned(),
         provider_name: metadata.provider_id.clone(),
         model_name: metadata.model.clone(),
-        request_json: serde_json::to_value(reply_request)
-            .map_err(|error| ApiError::auth_unavailable(&error))?,
+        request_json,
     };
     let response = state
         .store
-        .start_turn_and_enqueue_reply_for_actor(
+        .start_turn_and_enqueue_agent_for_actor(
             &current.principal.authz,
             &id,
             request,
             &idempotency_key,
-            job,
+            agent,
         )
         .await?;
-    kick_reply_worker(&state);
+    kick_agent_model_worker(&state);
     Ok((StatusCode::ACCEPTED, Json(response.start)).into_response())
 }
 
@@ -2559,6 +3317,70 @@ async fn review_decision(
             )
             .await?,
     ))
+}
+
+async fn agent_review_decision(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    Path((id, turn_id, call_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    payload: Result<Json<ReviewRequest>, JsonRejection>,
+) -> Result<Json<AgentReviewResponse>, ApiError> {
+    let Json(request) = payload.map_err(ApiError::invalid_json)?;
+    let header_key = required_idempotency_key(&headers)?;
+    if let Some(body_key) = &request.idempotency_key
+        && body_key != &header_key
+    {
+        return Err(ApiError::bad_request(
+            "idempotency_key_mismatch",
+            "Idempotency-Key header and request body must match",
+        ));
+    }
+
+    let next_request_json = if request.decision == ReviewDecision::Reject {
+        let context = state
+            .store
+            .agent_review_context_for_actor(&current.principal.authz, &id, &turn_id, &call_id)
+            .await?;
+        let requires_continuation = context.work.call.status
+            == AgentToolCallStatus::WaitingApproval
+            && state
+                .store
+                .agent_rejection_requires_continuation(&context, request.note.as_deref())?;
+        if requires_continuation {
+            let result = protocol::agent_approval_rejected_result(
+                &context.work.call.call_id,
+                request.note.as_deref(),
+            );
+            continuation_request_json_for_work(&context.work, &result)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let result = state
+        .store
+        .review_agent_tool_for_actor(
+            &current.principal.authz,
+            &id,
+            &turn_id,
+            AgentReviewCommit {
+                call_id,
+                decision: request.decision,
+                note: request.note,
+                idempotency_key: header_key,
+                next_request_json,
+            },
+        )
+        .await?;
+    if result.response.call.status == AgentToolCallStatus::Queued {
+        kick_agent_tool_worker(&state);
+    }
+    if result.queued_model_job.is_some() {
+        kick_agent_model_worker(&state);
+    }
+    Ok(Json(result.response))
 }
 
 fn required_idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {
@@ -3260,6 +4082,17 @@ impl ApiError {
         .with_no_store()
     }
 
+    fn agent_request_too_large(error: ProviderError) -> Self {
+        eprintln!("zeus rejected an Agent request outside its durable envelope: {error}");
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "agent_request_too_large",
+            "Agent request is too large",
+            "The bounded Agent request cannot fit in durable storage",
+        )
+        .with_no_store()
+    }
+
     fn rate_limited(code: &'static str, title: &'static str, retry_after: Duration) -> Self {
         Self::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -3425,6 +4258,18 @@ impl From<StoreError> for ApiError {
                 "Session turn not found",
                 format!("Session turn `{id}` does not exist"),
             ),
+            StoreError::AgentTurnNotFound(_) => Self::new(
+                StatusCode::NOT_FOUND,
+                "agent_turn_not_found",
+                "Agent turn not found",
+                "The requested Agent turn does not exist",
+            ),
+            StoreError::AgentToolCallNotFound(_) => Self::new(
+                StatusCode::NOT_FOUND,
+                "agent_tool_call_not_found",
+                "Agent tool call not found",
+                "The requested Agent tool call does not exist",
+            ),
             StoreError::SessionAlreadyExists(id) => Self::new(
                 StatusCode::CONFLICT,
                 "session_already_exists",
@@ -3514,6 +4359,12 @@ impl From<StoreError> for ApiError {
                 "Session command conflicts with current state",
                 "The session state does not allow this command",
             ),
+            StoreError::InvalidAgentTransition(_) => Self::new(
+                StatusCode::CONFLICT,
+                "invalid_agent_transition",
+                "Agent command conflicts with current state",
+                "The Agent state does not allow this command",
+            ),
             StoreError::ApprovalNotPending {
                 run_id,
                 approval_id,
@@ -3536,6 +4387,7 @@ impl From<StoreError> for ApiError {
                 reason.clone(),
             ),
             StoreError::ToolCallNotFound
+            | StoreError::AgentModelJobNotFound(_)
             | StoreError::ExecutionInvariant(_)
             | StoreError::Kernel(_)
             | StoreError::SequenceOverflow => Self::internal_runtime_error(&error),
@@ -3628,6 +4480,97 @@ mod tests {
         assert!(!wake.complete_cycle());
         assert!(wake.request());
         assert!(!wake.complete_cycle());
+    }
+
+    #[test]
+    fn known_result_continuation_is_unavailable_at_the_aggregate_envelope() {
+        let tool =
+            ReplyToolDefinition::new("dev_marker_write", serde_json::json!({ "type": "object" }));
+        let request = ReplyRequest::with_tools(
+            [
+                ReplyMessage::new(ReplyRole::User, "u".repeat(49_120)),
+                ReplyMessage::new(ReplyRole::Assistant, "a".repeat(49_120)),
+                ReplyMessage::new(ReplyRole::User, "u".repeat(49_120)),
+                ReplyMessage::new(ReplyRole::Assistant, "a".repeat(49_120)),
+                ReplyMessage::new(
+                    ReplyRole::User,
+                    "u".repeat(protocol::USER_MESSAGE_MAX_BYTES),
+                ),
+            ],
+            [tool],
+        );
+        validate_reply_request(&request).unwrap();
+        let call = ReplyToolCall::new(
+            "provider-call-envelope",
+            "dev_marker_write",
+            serde_json::json!({ "marker": "agent-api-approved" }),
+        );
+        let result = serde_json::json!({ "payload": "x".repeat(256) });
+
+        assert!(continuation_request_json(&request, &call, &result).is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_agent_completion_retries_without_reinvoking_external_work() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let external_calls = Arc::new(AtomicUsize::new(1));
+        let result = retry_agent_durable_progress("test", || {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                if attempts.fetch_add(1, Ordering::Relaxed) < 2 {
+                    Err(StoreError::ConcurrentModification)
+                } else {
+                    Ok("committed")
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result, "committed");
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+        assert_eq!(external_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn recoverable_agent_drain_keeps_the_worker_running_until_claim_recovers() {
+        let wake = WorkerWakeState::default();
+        assert!(wake.request());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        retry_agent_durable_progress("test drain", || {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                if attempts.fetch_add(1, Ordering::Relaxed) < 2 {
+                    Err(StoreError::PhysicalStorageExhausted)
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+        assert_eq!(wake.state.load(Ordering::Acquire), WORKER_RUNNING);
+        assert!(!wake.complete_cycle());
+    }
+
+    #[tokio::test]
+    async fn permanent_agent_completion_error_is_not_retried() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let result: Result<(), StoreError> = retry_agent_durable_progress("test", || {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Err(StoreError::InvalidAgentTransition(
+                    "permanent test transition".into(),
+                ))
+            }
+        })
+        .await;
+
+        assert!(matches!(result, Err(StoreError::InvalidAgentTransition(_))));
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
     }
 
     struct ManualRateLimitClock {
@@ -4054,11 +4997,9 @@ mod tests {
             durable_ledger_poll_interval: DURABLE_LEDGER_POLL_INTERVAL,
             broadcast_hints_enabled: true,
             auth: Some(auth),
-            reply: Some(Arc::new(ReplyExecutor {
-                provider: Arc::new(LocalFallbackProvider::new()),
-                drain: Mutex::new(()),
-                worker_wake: WorkerWakeState::default(),
-            })),
+            reply: Some(Arc::new(ReplyExecutor::new(Arc::new(
+                LocalFallbackProvider::new(),
+            )))),
             sse_capacity: SseCapacity::production(),
         };
         let app = build_authenticated_app(state).layer(MockConnectInfo(test_peer()));
@@ -4106,11 +5047,9 @@ mod tests {
             durable_ledger_poll_interval: DURABLE_LEDGER_POLL_INTERVAL,
             broadcast_hints_enabled: true,
             auth: Some(auth),
-            reply: Some(Arc::new(ReplyExecutor {
-                provider: Arc::new(LocalFallbackProvider::new()),
-                drain: Mutex::new(()),
-                worker_wake: WorkerWakeState::default(),
-            })),
+            reply: Some(Arc::new(ReplyExecutor::new(Arc::new(
+                LocalFallbackProvider::new(),
+            )))),
             sse_capacity: SseCapacity::production(),
         };
         let app = build_authenticated_app(state).layer(MockConnectInfo(test_peer()));
@@ -5184,6 +6123,7 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum IndeterminateFailure {
+        Known,
         Timeout,
         Transport,
         Panic,
@@ -5216,6 +6156,9 @@ mod tests {
             let failure = self.failure;
             Box::pin(async move {
                 Err(match failure {
+                    IndeterminateFailure::Known => {
+                        ProviderError::InvalidRequest("known provider rejection")
+                    }
                     IndeterminateFailure::Timeout => ProviderError::Timeout,
                     IndeterminateFailure::Transport => ProviderError::Transport,
                     IndeterminateFailure::Panic => {
@@ -5232,6 +6175,16 @@ mod tests {
     }
 
     struct RecordingProvider {
+        metadata: ProviderMetadata,
+        requests: Arc<StdMutex<Vec<ReplyRequest>>>,
+    }
+
+    struct ToolThenFinalProvider {
+        metadata: ProviderMetadata,
+        requests: Arc<StdMutex<Vec<ReplyRequest>>>,
+    }
+
+    struct HistoryThenToolProvider {
         metadata: ProviderMetadata,
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
     }
@@ -5263,7 +6216,116 @@ mod tests {
             let provider = self.metadata.clone();
             Box::pin(async move {
                 Ok(ReplyResponse {
-                    content: format!("durable answer {call}"),
+                    output: ReplyOutput::Final {
+                        content: format!("durable answer {call}"),
+                    },
+                    finish_reason: Some("stop".into()),
+                    provider,
+                })
+            })
+        }
+    }
+
+    impl ToolThenFinalProvider {
+        fn new(requests: Arc<StdMutex<Vec<ReplyRequest>>>) -> Self {
+            Self {
+                metadata: ProviderMetadata {
+                    provider_id: "test-tool-then-final-provider".into(),
+                    model: Some("test-model".into()),
+                    reply_kind: ReplyKind::Model,
+                },
+                requests,
+            }
+        }
+    }
+
+    impl ReplyProvider for ToolThenFinalProvider {
+        fn metadata(&self) -> &ProviderMetadata {
+            &self.metadata
+        }
+
+        fn reply(&self, request: ReplyRequest) -> ReplyFuture<'_> {
+            let output = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(request.clone());
+                match requests.len() {
+                    1 => ReplyOutput::ToolCall {
+                        call: ReplyToolCall::new(
+                            "provider-call-approved-1",
+                            request
+                                .tools
+                                .first()
+                                .expect("the local Agent request must expose its server tool")
+                                .name
+                                .clone(),
+                            serde_json::json!({ "marker": "agent-api-approved" }),
+                        ),
+                    },
+                    2 => ReplyOutput::Final {
+                        content: "tool completed".into(),
+                    },
+                    call => panic!("unexpected Agent provider call {call}"),
+                }
+            };
+            let provider = self.metadata.clone();
+            Box::pin(async move {
+                Ok(ReplyResponse {
+                    output,
+                    finish_reason: Some("stop".into()),
+                    provider,
+                })
+            })
+        }
+    }
+
+    impl HistoryThenToolProvider {
+        fn new(requests: Arc<StdMutex<Vec<ReplyRequest>>>) -> Self {
+            Self {
+                metadata: ProviderMetadata {
+                    provider_id: "test-history-then-tool-provider".into(),
+                    model: Some("test-model".into()),
+                    reply_kind: ReplyKind::Model,
+                },
+                requests,
+            }
+        }
+    }
+
+    impl ReplyProvider for HistoryThenToolProvider {
+        fn metadata(&self) -> &ProviderMetadata {
+            &self.metadata
+        }
+
+        fn reply(&self, request: ReplyRequest) -> ReplyFuture<'_> {
+            let output = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(request.clone());
+                match requests.len() {
+                    1 | 2 => ReplyOutput::Final {
+                        content: "a".repeat(40_000),
+                    },
+                    3 => ReplyOutput::ToolCall {
+                        call: ReplyToolCall::new(
+                            "provider-call-history",
+                            request
+                                .tools
+                                .first()
+                                .expect("the local Agent request must expose its server tool")
+                                .name
+                                .clone(),
+                            serde_json::json!({ "marker": "history-trimmed" }),
+                        ),
+                    },
+                    4 => ReplyOutput::Final {
+                        content: "trimmed history tool completed".into(),
+                    },
+                    call => panic!("unexpected Agent provider call {call}"),
+                }
+            };
+            let provider = self.metadata.clone();
+            Box::pin(async move {
+                Ok(ReplyResponse {
+                    output,
                     finish_reason: Some("stop".into()),
                     provider,
                 })
@@ -5299,7 +6361,9 @@ mod tests {
             let provider = self.metadata.clone();
             Box::pin(async move {
                 Ok(ReplyResponse {
-                    content: "x".repeat(protocol::ASSISTANT_MESSAGE_MAX_BYTES + 1),
+                    output: ReplyOutput::Final {
+                        content: "x".repeat(protocol::ASSISTANT_MESSAGE_MAX_BYTES + 1),
+                    },
                     finish_reason: Some("stop".into()),
                     provider,
                 })
@@ -5426,12 +6490,22 @@ mod tests {
         assert_eq!(replay.status(), StatusCode::ACCEPTED);
         let replay: StartTurnResponse = response_json(replay).await;
         assert!(replay.replayed);
-        let durable_job = store
-            .reply_job_for_actor(&owner.authz, "reply:session-reply-context:turn-context-2")
+        let agent = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/sessions/session-reply-context/turns/turn-context-2/agent")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(durable_job.status, runtime::ReplyJobStatus::Succeeded);
+        assert_eq!(agent.status(), StatusCode::OK);
+        let agent: AgentTurnDetail = response_json(agent).await;
+        assert_eq!(agent.status, protocol::AgentTurnStatus::Succeeded);
+        assert_eq!(agent.model_steps, 1);
+        assert!(agent.calls.is_empty());
 
         let recorded = requests.lock().unwrap().clone();
         assert_eq!(
@@ -5455,6 +6529,445 @@ mod tests {
         drop(app);
         drop(store);
         cleanup_test_database(&path);
+    }
+
+    #[tokio::test]
+    async fn agent_tool_approval_executes_once_and_continues_to_final() {
+        let unique = UserId::generate().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "zeus-api-agent-tool-{}",
+            unique.as_str().replace(':', "-")
+        ));
+        let path = root.join("zeus.db");
+        let marker_root = root.join("markers");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = DemoStore::open_local(&path, &marker_root).await.unwrap();
+        let owner = provision_test_owner(&store, "user-agent-tool", "agent-tool-owner").await;
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: "session-agent-tool".into(),
+                    title: "Approved Agent tool".into(),
+                },
+                "create-agent-tool",
+            )
+            .await
+            .unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(ToolThenFinalProvider::new(Arc::clone(&requests))),
+        )
+        .unwrap();
+
+        let started = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-agent-tool/turns")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "start-agent-tool")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-agent-tool",
+                            "user_message": "write the approved marker",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+
+        let waiting = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            "session-agent-tool",
+            "turn-agent-tool",
+            protocol::AgentTurnStatus::WaitingApproval,
+        )
+        .await;
+        let call_id = waiting.pending_call_id.clone().unwrap();
+        assert_eq!(waiting.model_steps, 1);
+        assert_eq!(waiting.calls.len(), 1);
+        assert_eq!(waiting.calls[0].call_id, call_id);
+        assert_eq!(
+            waiting.calls[0].status,
+            AgentToolCallStatus::WaitingApproval
+        );
+        assert_eq!(std::fs::read_dir(&marker_root).unwrap().count(), 0);
+
+        let approved = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/v1/sessions/session-agent-tool/turns/turn-agent-tool/approvals/{call_id}/decision"
+                ))
+                .header(header::HOST, "zeus.test")
+                .header(header::ORIGIN, "http://zeus.test")
+                .header(header::COOKIE, &owner.cookie_header)
+                .header(CSRF_HEADER, &owner.csrf_token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("idempotency-key", "approve-agent-tool")
+                .body(Body::from(
+                    serde_json::json!({
+                        "decision": "approve",
+                        "note": "execute the exact persisted call",
+                        "idempotency_key": "approve-agent-tool",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(approved.status(), StatusCode::OK);
+        let approved: AgentReviewResponse = response_json(approved).await;
+        assert!(!approved.replayed);
+        assert_eq!(approved.call.call_id, call_id);
+        assert_eq!(approved.call.status, AgentToolCallStatus::Queued);
+
+        let session = wait_for_ready_session(&store, &owner.authz, "session-agent-tool").await;
+        assert_eq!(session.session.sequence, 4);
+        let agent = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            "session-agent-tool",
+            "turn-agent-tool",
+            protocol::AgentTurnStatus::Succeeded,
+        )
+        .await;
+        assert_eq!(agent.model_steps, 2);
+        assert_eq!(agent.tool_calls, 1);
+        assert_eq!(agent.calls.len(), 1);
+        assert_eq!(agent.calls[0].status, AgentToolCallStatus::Succeeded);
+        assert!(agent.calls[0].output.is_some());
+        assert_eq!(std::fs::read_dir(&marker_root).unwrap().count(), 1);
+
+        let recorded = requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(
+            recorded[0].messages,
+            vec![ReplyMessage::new(
+                ReplyRole::User,
+                "write the approved marker"
+            )]
+        );
+        assert_eq!(recorded[1].messages.len(), 3);
+        let provider_call = recorded[1].messages[1].tool_call.as_ref().unwrap();
+        assert_eq!(provider_call.id, "provider-call-approved-1");
+        assert_eq!(provider_call.name, agent.calls[0].tool);
+        assert_eq!(provider_call.arguments, agent.calls[0].arguments);
+        let tool_result = &recorded[1].messages[2];
+        assert_eq!(tool_result.role, ReplyRole::Tool);
+        assert_eq!(
+            tool_result.tool_call_id.as_deref(),
+            Some("provider-call-approved-1")
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&tool_result.content).unwrap(),
+            agent.calls[0].output.clone().unwrap()
+        );
+
+        drop(app);
+        drop(store);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_tool_rejection_uses_exact_result_and_replays_after_final() {
+        let unique = UserId::generate().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "zeus-api-agent-reject-{}",
+            unique.as_str().replace(':', "-")
+        ));
+        let path = root.join("zeus.db");
+        let marker_root = root.join("markers");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = DemoStore::open_local(&path, &marker_root).await.unwrap();
+        let owner = provision_test_owner(&store, "user-agent-reject", "agent-reject-owner").await;
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: "session-agent-reject".into(),
+                    title: "Rejected Agent tool".into(),
+                },
+                "create-agent-reject",
+            )
+            .await
+            .unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(ToolThenFinalProvider::new(Arc::clone(&requests))),
+        )
+        .unwrap();
+
+        let started = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-agent-reject/turns")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "start-agent-reject")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-agent-reject",
+                            "user_message": "propose a marker I will reject",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+        let waiting = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            "session-agent-reject",
+            "turn-agent-reject",
+            protocol::AgentTurnStatus::WaitingApproval,
+        )
+        .await;
+        let call_id = waiting.pending_call_id.unwrap();
+        let rejection = || {
+            Request::post(format!(
+                "/api/v1/sessions/session-agent-reject/turns/turn-agent-reject/approvals/{call_id}/decision"
+            ))
+            .header(header::HOST, "zeus.test")
+            .header(header::ORIGIN, "http://zeus.test")
+            .header(header::COOKIE, &owner.cookie_header)
+            .header(CSRF_HEADER, &owner.csrf_token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("idempotency-key", "reject-agent-tool")
+            .body(Body::from(
+                serde_json::json!({
+                    "decision": "reject",
+                    "note": "not authorized for this turn",
+                    "idempotency_key": "reject-agent-tool",
+                })
+                .to_string(),
+            ))
+            .unwrap()
+        };
+
+        let rejected = app.clone().oneshot(rejection()).await.unwrap();
+        assert_eq!(rejected.status(), StatusCode::OK);
+        let rejected: AgentReviewResponse = response_json(rejected).await;
+        assert!(!rejected.replayed);
+        assert_eq!(rejected.call.status, AgentToolCallStatus::Rejected);
+        assert_eq!(std::fs::read_dir(&marker_root).unwrap().count(), 0);
+
+        wait_for_ready_session(&store, &owner.authz, "session-agent-reject").await;
+        let agent = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            "session-agent-reject",
+            "turn-agent-reject",
+            protocol::AgentTurnStatus::Succeeded,
+        )
+        .await;
+        assert_eq!(agent.model_steps, 2);
+        assert_eq!(agent.tool_calls, 1);
+        assert_eq!(agent.calls[0].status, AgentToolCallStatus::Rejected);
+        let expected_result = protocol::agent_approval_rejected_result(
+            &call_id,
+            Some("not authorized for this turn"),
+        );
+        assert_eq!(agent.calls[0].error.as_ref(), Some(&expected_result));
+        assert_eq!(std::fs::read_dir(&marker_root).unwrap().count(), 0);
+
+        let recorded = requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[1].messages.len(), 3);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recorded[1].messages[2].content).unwrap(),
+            expected_result
+        );
+        assert_eq!(
+            recorded[1].messages[2].tool_call_id.as_deref(),
+            Some("provider-call-approved-1")
+        );
+
+        let replay = app.clone().oneshot(rejection()).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay: AgentReviewResponse = response_json(replay).await;
+        assert!(replay.replayed);
+        assert_eq!(replay.call.status, AgentToolCallStatus::Rejected);
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert_eq!(std::fs::read_dir(&marker_root).unwrap().count(), 0);
+
+        drop(app);
+        drop(store);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_history_is_trimmed_to_reserved_budget_before_tool_to_final() {
+        let unique = UserId::generate().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "zeus-api-agent-history-{}",
+            unique.as_str().replace(':', "-")
+        ));
+        let path = root.join("zeus.db");
+        let marker_root = root.join("markers");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = DemoStore::open_local(&path, &marker_root).await.unwrap();
+        let owner = provision_test_owner(&store, "user-agent-history", "agent-history-owner").await;
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: "session-agent-history".into(),
+                    title: "Bounded Agent history".into(),
+                },
+                "create-agent-history",
+            )
+            .await
+            .unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(HistoryThenToolProvider::new(Arc::clone(&requests))),
+        )
+        .unwrap();
+        let send_turn =
+            |turn_id: &str, user_message: String, expected_sequence: u64, idempotency_key: &str| {
+                Request::post("/api/v1/sessions/session-agent-history/turns")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", idempotency_key)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": turn_id,
+                            "user_message": user_message,
+                            "expected_sequence": expected_sequence,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap()
+            };
+
+        let first = app
+            .clone()
+            .oneshot(send_turn(
+                "turn-agent-history-1",
+                "u".repeat(40_000),
+                1,
+                "agent-history-1",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let after_first =
+            wait_for_ready_session(&store, &owner.authz, "session-agent-history").await;
+
+        let second = app
+            .clone()
+            .oneshot(send_turn(
+                "turn-agent-history-2",
+                "u".repeat(40_000),
+                after_first.session.sequence,
+                "agent-history-2",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::ACCEPTED);
+        let after_second =
+            wait_for_ready_session(&store, &owner.authz, "session-agent-history").await;
+
+        let third = app
+            .clone()
+            .oneshot(send_turn(
+                "turn-agent-history-3",
+                "write after trimming".into(),
+                after_second.session.sequence,
+                "agent-history-3",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(third.status(), StatusCode::ACCEPTED);
+        let waiting = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            "session-agent-history",
+            "turn-agent-history-3",
+            protocol::AgentTurnStatus::WaitingApproval,
+        )
+        .await;
+        let call_id = waiting.pending_call_id.unwrap();
+
+        let approved = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/v1/sessions/session-agent-history/turns/turn-agent-history-3/approvals/{call_id}/decision"
+                ))
+                .header(header::HOST, "zeus.test")
+                .header(header::ORIGIN, "http://zeus.test")
+                .header(header::COOKIE, &owner.cookie_header)
+                .header(CSRF_HEADER, &owner.csrf_token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("idempotency-key", "approve-agent-history")
+                .body(Body::from(
+                    serde_json::json!({
+                        "decision": "approve",
+                        "note": null,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(approved.status(), StatusCode::OK);
+        wait_for_ready_session(&store, &owner.authz, "session-agent-history").await;
+        let agent = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            "session-agent-history",
+            "turn-agent-history-3",
+            protocol::AgentTurnStatus::Succeeded,
+        )
+        .await;
+        assert_eq!(agent.model_steps, 2);
+        assert_eq!(agent.calls[0].status, AgentToolCallStatus::Succeeded);
+        assert_eq!(std::fs::read_dir(&marker_root).unwrap().count(), 1);
+
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 4);
+        assert_eq!(
+            recorded[2].messages,
+            vec![ReplyMessage::new(ReplyRole::User, "write after trimming")],
+            "the 80 KiB newest pair must be omitted to preserve the 64 KiB Agent budget"
+        );
+        assert_eq!(recorded[3].messages.len(), 3);
+        assert_eq!(recorded[3].messages[0], recorded[2].messages[0]);
+        assert_eq!(recorded[3].messages[1].role, ReplyRole::Assistant);
+        assert_eq!(recorded[3].messages[2].role, ReplyRole::Tool);
+        drop(recorded);
+
+        drop(app);
+        drop(store);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[tokio::test]
@@ -5584,11 +7097,7 @@ mod tests {
             durable_ledger_poll_interval: DURABLE_LEDGER_POLL_INTERVAL,
             broadcast_hints_enabled: false,
             auth: None,
-            reply: Some(Arc::new(ReplyExecutor {
-                provider,
-                drain: Mutex::new(()),
-                worker_wake: WorkerWakeState::default(),
-            })),
+            reply: Some(Arc::new(ReplyExecutor::new(provider))),
             sse_capacity: SseCapacity::production(),
         };
 
@@ -5681,11 +7190,7 @@ mod tests {
             durable_ledger_poll_interval: DURABLE_LEDGER_POLL_INTERVAL,
             broadcast_hints_enabled: false,
             auth: None,
-            reply: Some(Arc::new(ReplyExecutor {
-                provider,
-                drain: Mutex::new(()),
-                worker_wake: WorkerWakeState::default(),
-            })),
+            reply: Some(Arc::new(ReplyExecutor::new(provider))),
             sse_capacity: SseCapacity::production(),
         };
 
@@ -5817,11 +7322,7 @@ mod tests {
                 durable_ledger_poll_interval: DURABLE_LEDGER_POLL_INTERVAL,
                 broadcast_hints_enabled: false,
                 auth: None,
-                reply: Some(Arc::new(ReplyExecutor {
-                    provider,
-                    drain: Mutex::new(()),
-                    worker_wake: WorkerWakeState::default(),
-                })),
+                reply: Some(Arc::new(ReplyExecutor::new(provider))),
                 sse_capacity: SseCapacity::production(),
             };
 
@@ -5853,6 +7354,101 @@ mod tests {
                 protocol::SessionEventData::TurnInterrupted { reason, .. }
                     if reason == "assistant reply provider outcome is unknown"
             ));
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_provider_failures_distinguish_known_from_unknown_outcomes() {
+        for (suffix, failure, expected_status, expected_code) in [
+            (
+                "known",
+                IndeterminateFailure::Known,
+                protocol::AgentTurnStatus::Failed,
+                "provider_request_invalid",
+            ),
+            (
+                "timeout",
+                IndeterminateFailure::Timeout,
+                protocol::AgentTurnStatus::NeedsAttention,
+                "provider_timeout",
+            ),
+            (
+                "transport",
+                IndeterminateFailure::Transport,
+                protocol::AgentTurnStatus::NeedsAttention,
+                "provider_transport_failed",
+            ),
+            (
+                "panic",
+                IndeterminateFailure::Panic,
+                protocol::AgentTurnStatus::NeedsAttention,
+                "provider_panicked",
+            ),
+        ] {
+            let store = DemoStore::seeded().await.unwrap();
+            let owner =
+                provision_test_owner(&store, "user-agent-failure", "agent-failure-owner").await;
+            let session_id = format!("session-agent-{suffix}");
+            let turn_id = format!("turn-agent-{suffix}");
+            store
+                .create_session_for_actor(
+                    &owner.authz,
+                    CreateSessionRequest {
+                        id: session_id.clone(),
+                        title: format!("Agent provider {suffix}"),
+                    },
+                    &format!("create-agent-{suffix}"),
+                )
+                .await
+                .unwrap();
+            let app = authenticated_app_with_provider(
+                store.clone(),
+                false,
+                Arc::new(IndeterminateProvider::new(failure)),
+            )
+            .unwrap();
+
+            let started = app
+                .clone()
+                .oneshot(
+                    Request::post(format!("/api/v1/sessions/{session_id}/turns"))
+                        .header(header::HOST, "zeus.test")
+                        .header(header::ORIGIN, "http://zeus.test")
+                        .header(header::COOKIE, &owner.cookie_header)
+                        .header(CSRF_HEADER, &owner.csrf_token)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header("idempotency-key", format!("start-agent-{suffix}"))
+                        .body(Body::from(
+                            serde_json::json!({
+                                "turn_id": turn_id.clone(),
+                                "user_message": "classify this provider outcome",
+                                "expected_sequence": 1,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(started.status(), StatusCode::ACCEPTED);
+            let agent =
+                wait_for_agent_status(&store, &owner.authz, &session_id, &turn_id, expected_status)
+                    .await;
+            assert_eq!(agent.last_error.as_ref().unwrap()["code"], expected_code);
+            let session = store
+                .get_session_for_actor(
+                    &owner.authz,
+                    &session_id,
+                    None,
+                    protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                    None,
+                    protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                    None,
+                    protocol::EVENT_PAGE_DEFAULT_LIMIT,
+                )
+                .await
+                .unwrap();
+            assert_eq!(session.session.status, SessionStatus::NeedsAttention);
         }
     }
 
@@ -8078,11 +9674,9 @@ mod tests {
             durable_ledger_poll_interval: DURABLE_LEDGER_POLL_INTERVAL,
             broadcast_hints_enabled: true,
             auth: Some(Arc::clone(&auth)),
-            reply: Some(Arc::new(ReplyExecutor {
-                provider: Arc::new(LocalFallbackProvider::new()),
-                drain: Mutex::new(()),
-                worker_wake: WorkerWakeState::default(),
-            })),
+            reply: Some(Arc::new(ReplyExecutor::new(Arc::new(
+                LocalFallbackProvider::new(),
+            )))),
             sse_capacity: SseCapacity::production(),
         };
         let app = build_authenticated_app(state).layer(MockConnectInfo(test_peer()));
@@ -8330,6 +9924,35 @@ mod tests {
         })
         .await
         .expect("the durable assistant reply should settle")
+    }
+
+    async fn wait_for_agent_status(
+        store: &DemoStore,
+        authz: &AuthzContext,
+        session_id: &str,
+        turn_id: &str,
+        expected: protocol::AgentTurnStatus,
+    ) -> AgentTurnDetail {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let detail = store
+                    .agent_turn_detail_for_actor(authz, session_id, turn_id)
+                    .await
+                    .unwrap();
+                if detail.status == expected {
+                    break detail;
+                }
+                assert!(
+                    !detail.status.is_terminal(),
+                    "Agent reached terminal status {:?} while waiting for {:?}",
+                    detail.status,
+                    expected
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the durable Agent should reach the expected status")
     }
 
     fn insert_legacy_ready_session(path: &Path, session_id: &str, owner_user_id: &str) {

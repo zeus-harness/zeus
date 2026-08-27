@@ -1219,6 +1219,8 @@ dependencies = [
  "tenancy",
  "thiserror",
  "tokio",
+ "tools",
+ "workflows",
 ]
 
 [[package]]
@@ -1763,6 +1765,11 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 [[package]]
 name = "workflows"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "writeable"
@@ -1868,6 +1875,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tenancy",
  "tokio",
  "tower",

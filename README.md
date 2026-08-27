@@ -4,8 +4,9 @@ Zeus Harness is an early Rust and SvelteKit vertical slice toward an auditable
 agent runtime. The current Alpha+ slice demonstrates a durable conversation
 Session attached to an incident Run, independent ordered Session and Run event
 streams, a guarded approval flow, local owner authentication, and recovery
-through SQLite. A user message and its reply job commit atomically; only the
-server-side worker may append assistant output and close the turn. Its web
+through SQLite. A user message, Agent turn, and first immutable model job
+commit atomically; only the server-side Agent workers may append assistant
+output, admit a server-resolved tool call, or close the turn. Its web
 interface deliberately follows the compact, conversation-first shape of
 DeepSeek Harness rather than a dense operations dashboard.
 
@@ -74,7 +75,7 @@ once to that process's terminal. Open the Web UI, enter the current token, and
 choose a username plus a password of at least 12 characters. After owner setup,
 later restarts preserve the owner and no longer print a setup token.
 
-With no model configuration, the durable reply worker returns an explicit
+With no model configuration, the durable Agent model worker returns an explicit
 non-model local message. Configure an OpenAI-compatible Chat Completions
 provider by setting all three variables together:
 
@@ -87,12 +88,15 @@ ZEUS_LLM_API_KEY=your-secret
 Partial provider configuration fails startup. The endpoint and key are never
 writable through the browser Settings API.
 
-Each accepted turn builds the provider request from the newest complete,
-flushed user/assistant pairs that existed at the submitted
-`expected_sequence`, followed by the new user message. The request is bounded
-to 31 prior pairs and 64 KiB of total UTF-8 message content, then persisted in
-the immutable reply job. Retries therefore reuse the originally admitted
-context rather than rebuilding it from newer Session state.
+Each accepted turn builds the initial provider request from the newest
+complete, flushed user/assistant pairs that existed at the submitted
+`expected_sequence`, followed by the new user message. The Agent entry request
+is bounded to 27 prior pairs and 64 KiB of UTF-8 message content, then persisted
+in the immutable model job. This reserves the complete fixed loop budget: at
+most eight model steps, four sequential tool calls, one pending approval,
+16 KiB of arguments per call, 64 KiB per known result, and 128 KiB of known
+results for the turn. Retries reuse the originally admitted request rather
+than rebuilding it from newer Session state.
 
 SQLite logical-capacity defaults can be reduced for local tests or raised only
 up to the compiled hard ceiling. Explicit values must be non-empty unsigned
@@ -444,18 +448,26 @@ and bounded memory, CPU, and PID resources.
   `BEGIN IMMEDIATE` transaction.
 - Starting a turn requires the expected Session sequence. It atomically creates
   the open turn, appends `user_message`, advances the Session to `running`,
-  stores the actor-scoped response receipt, and enqueues immutable reply work.
+  stores the actor-scoped response receipt, creates the durable Agent state,
+  and enqueues its first immutable model job.
   That work contains a bounded provider request assembled from complete
   historical turns through the submitted sequence plus the new user message;
   interrupted or otherwise unflushed turns never enter model context.
-- The worker commits a `started` checkpoint before calling a provider. Success
-  atomically stores the assistant message, appends `assistant_message` and
-  `turn_flushed`, marks the job succeeded, and returns the Session to `ready`.
-  Provider failure appends `turn_interrupted`, marks the job failed, and moves
-  the Session to `needs_attention` without fabricating assistant content.
-- Queued replies survive restart and remain claimable. A reply already marked
-  `started` becomes `outcome_unknown` exactly once and is never automatically
-  replayed, because the provider call may have incurred an external effect.
+- The model worker commits a `started` checkpoint before calling a provider.
+  Final text atomically stores the assistant message, appends
+  `assistant_message` and `turn_flushed`, and returns the Session to `ready`.
+  A tool proposal is matched against the server registry and current policy;
+  one immutable call is either queued, held for owner approval, or recorded as
+  a known policy-denied result before the next model step.
+- The tool worker rechecks the persisted descriptor, policy revision,
+  authority, and approval after its `started` checkpoint. A known connector
+  result and the next immutable model request commit in one transaction. If the
+  bounded continuation cannot be represented, the known result remains known
+  and the Agent fails as `continuation_unavailable`; it is never rewritten as
+  `outcome_unknown`.
+- Queued Agent jobs survive restart and remain claimable. A model or tool
+  already marked `started` moves to `needs_attention` exactly once and is never
+  automatically replayed because the external call may have taken effect.
   Other open turns follow the same interruption/resume contract.
 - Session commands do not change the Run ledger or wake the dispatch worker.
   Session and Run are joined by durable ownership, not by sharing an event
@@ -527,7 +539,9 @@ and bounded memory, CPU, and PID resources.
   one-time member setup tokens, revisioned lifecycle transitions, account audit
   state, and the final capability-gated member surface. Schema v16 adds the
   partial Session-event index used to read only the newest complete reply
-  context pairs at an immutable ledger boundary.
+  context pairs at an immutable ledger boundary. Schema v17 adds the
+  Session-native Agent state, model jobs, sequential tool calls, approval
+  receipts, fixed loop limits, and bounded terminal-event replay indexes.
   Existing Runs and events are decoded, validated, and migrated in place without
   rewriting their payloads. Runtime identity still binds profile, environment,
   primary Session and Run, policy ID, and policy revision; a mismatch fails
@@ -613,9 +627,16 @@ directly.
   identity when that turn is older than the bounded detail tail.
 - `POST /api/v1/sessions/{session_id}/turns` accepts
   `{"turn_id":...,"user_message":...,"expected_sequence":...}`, atomically
-  persists the user turn and a durable reply job, and returns `202`. The
-  server-side worker later commits either the assistant reply or an explicit
-  interrupted/needs-attention event through Session SSE.
+  persists the user turn and durable Agent entry job, and returns `202`. The
+  server-side workers later commit either the assistant reply, a pending tool
+  approval, or an explicit interrupted/needs-attention event through Session
+  SSE.
+- `GET /api/v1/sessions/{session_id}/turns/{turn_id}/agent` returns the
+  actor-scoped durable Agent state and its ordered tool calls.
+- `POST /api/v1/sessions/{session_id}/turns/{turn_id}/approvals/{call_id}/decision`
+  lets an owner approve the exact persisted call or reject it as a structured
+  model-visible result. The decision is idempotent and never accepts a
+  client-supplied continuation transcript.
 - Browsers cannot submit assistant content. The legacy
   `POST /api/v1/sessions/{session_id}/turns/{turn_id}/flush` route exists only
   in a private `#[cfg(test)]` contract router that bootstraps a real test owner;
@@ -672,7 +693,7 @@ directly.
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Current schema v16 retains durable Run attachment during migration and demo
+Current schema v17 retains durable Run attachment during migration and demo
 seeding, but Alpha+ does not expose a public attach-Run HTTP route.
 
 The application boundary now caps auth JSON at 8 KiB and command JSON at
@@ -681,7 +702,8 @@ Session titles at 256 bytes; user and assistant messages at 64 KiB; and review
 notes at 8 KiB. A typed reply response is capped at 512 KiB; provider, model,
 finish-reason, failure-code, and tool digest/code fields are capped at 128
 bytes; reply/tool diagnostics at 4 KiB; compact tool output and dispatch
-argument JSON at 64 KiB. Provider and executor over-limit results settle once
+argument JSON at 64 KiB. Agent tool arguments use the stricter 16 KiB reserved
+loop budget. Provider and executor over-limit results settle once
 as fixed, bounded durable failures; the rejected payload is never copied into
 the ledger or job result.
 New Session event IDs are ledger-local and bounded. Historical v8 durable IDs
@@ -692,7 +714,7 @@ approval, dispatch, reply completion, attachment checks, and startup recovery
 use typed point queries or fixed 64-row batches. Production Session list/detail,
 Run detail, and overview reads now use indexed `LIMIT + 1` keyset pages inside
 actor-authorized SQLite snapshots; no production HTTP read loads a complete
-ledger or collection. Current schema v16 retains bounded Session, open-turn,
+ledger or collection. Current schema v17 retains bounded Session, open-turn,
 active reply/dispatch, auth-session, bootstrap-audit, event-slot, and logical
 event-payload-byte admission. Exact idempotent replay is checked before capacity,
 while accepted work consumes its reserved terminal slots and payload bytes
@@ -771,13 +793,13 @@ Models, SQLite Capacity Slice 2, the SQLite Physical Capacity Slice, and the
 SQLite Operation Capacity Slice, Bootstrap Audit Retention, schema v13 Account
 Membership Foundation, schema v14 Account-scoped Durable Authorization, and
 schema v15 Member Lifecycle / Account Audit plus schema v16 Session Reply
-Context Index host verification:
+Context Index and schema v17 Durable Session Agent Loop host verification:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --all-features`: 348 tests passed under
-  the existing project counting convention, including 175 storage tests, 33
-  runtime tests, 52 API library tests, 6 API main/config tests, and the real
+- `cargo test --workspace --all-targets --all-features`: 409 tests passed under
+  the existing project counting convention, including 188 storage tests, 41
+  runtime tests, 60 API library tests, 6 API main/config tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,
   body/field/idempotency boundaries, atomic login limits, SSE lease capacity,
@@ -812,6 +834,13 @@ Context Index host verification:
   corruption, account/actor cursor and receipt isolation, three-tier capacity,
   stale-session relogin, dual-subject dispatch, worker claim revocation, and
   fail-closed rollback without a partial v13 or v14 schema.
+  Agent-loop coverage includes direct final replies, tool approval/rejection,
+  policy denial, deterministic call identity, strict provider transcripts,
+  the fixed 8-model-step/4-tool-call limits, 16 KiB arguments, 64 KiB individual
+  results and 128 KiB aggregate results, scalar/array result replay, exact
+  persistence retry without external re-execution, unavailable-continuation
+  settlement, transient claim recovery without a lost worker wake, bounded
+  terminal replay queries, and one-shot restart settlement of started work.
 - `pnpm --filter web test`: 28 tests passed for CSRF headers, stable command
   identity, deep-page active-Session restore, Session-list cursor encoding and
   deduplication, bounded-tail retry reconciliation and Session-switch race

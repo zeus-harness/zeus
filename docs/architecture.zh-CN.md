@@ -322,7 +322,7 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   有界 failure 一次性结算；原始超限载荷不进入 event、reply/dispatch job，也不会自动重试。
 - sandbox 或 executor 不可用：写入 `NotDispatched`，禁止回退到宿主机裸执行。
 - `production-guarded` profile 即使 owner 已认证，仍因真实生产 connector 缺失而保持执行禁用。
-- `dev.marker.write` 仅在 `local-development` profile 注册，只能在服务端固定目录写服务器生成的
+- `dev_marker_write` 仅在 `local-development` profile 注册，只能在服务端固定目录写服务器生成的
   marker 文件；参数不能提供路径。
 - `ZEUS_DEMO_PROFILE=production-guarded` 是默认值；切到 `local-development` 时必须使用独立
   SQLite 数据库，并由 `ZEUS_LOCAL_MARKER_ROOT` 固定写入根目录。

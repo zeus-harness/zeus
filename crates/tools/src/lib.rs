@@ -15,7 +15,7 @@ use std::{
 
 use protocol::{SandboxProfile, ToolCall, ToolEffect, ToolExecutorStatus};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -103,7 +103,64 @@ impl ObjectSchema {
         Ok(())
     }
 
-    fn validate_arguments(&self, value: &Value) -> Result<(), RegistryError> {
+    /// Convert the closed server-side contract into the JSON Schema fragment
+    /// exposed to a model provider. The byte limit remains a Zeus extension;
+    /// it is always re-enforced by [`Self::validate_arguments`].
+    pub fn provider_json_schema(&self) -> Result<Value, RegistryError> {
+        self.validate_definition()?;
+        let mut properties = Map::new();
+        let mut required = Vec::new();
+        for (name, spec) in &self.properties {
+            let mut property = Map::new();
+            property.insert(
+                "type".into(),
+                Value::String(parameter_type_name(&spec.parameter_type).into()),
+            );
+            if let Some(minimum) = spec.min_length {
+                property.insert(
+                    "minLength".into(),
+                    Value::from(u64::try_from(minimum).map_err(|_| {
+                        RegistryError::InvalidDescriptor(
+                            "parameter min_length cannot be represented in JSON Schema".into(),
+                        )
+                    })?),
+                );
+            }
+            if let Some(maximum) = spec.max_length {
+                property.insert(
+                    "maxLength".into(),
+                    Value::from(u64::try_from(maximum).map_err(|_| {
+                        RegistryError::InvalidDescriptor(
+                            "parameter max_length cannot be represented in JSON Schema".into(),
+                        )
+                    })?),
+                );
+            }
+            if spec.required {
+                required.push(Value::String(name.clone()));
+            }
+            properties.insert(name.clone(), Value::Object(property));
+        }
+
+        let max_serialized_bytes = u64::try_from(self.max_serialized_bytes).map_err(|_| {
+            RegistryError::InvalidDescriptor(
+                "input schema byte limit cannot be represented in provider JSON".into(),
+            )
+        })?;
+        Ok(Value::Object(Map::from_iter([
+            ("type".into(), Value::String("object".into())),
+            ("properties".into(), Value::Object(properties)),
+            ("required".into(), Value::Array(required)),
+            ("additionalProperties".into(), Value::Bool(false)),
+            (
+                "x-zeus-max-serialized-bytes".into(),
+                Value::from(max_serialized_bytes),
+            ),
+        ])))
+    }
+
+    /// Validate model-supplied arguments against the closed server contract.
+    pub fn validate_arguments(&self, value: &Value) -> Result<(), RegistryError> {
         let object = value.as_object().ok_or_else(|| {
             RegistryError::InvalidArguments("tool arguments must be a JSON object".into())
         })?;
@@ -134,6 +191,17 @@ impl ObjectSchema {
             validate_parameter_value(name, spec, argument)?;
         }
         Ok(())
+    }
+}
+
+fn parameter_type_name(parameter_type: &ParameterType) -> &'static str {
+    match parameter_type {
+        ParameterType::String => "string",
+        ParameterType::Boolean => "boolean",
+        ParameterType::Integer => "integer",
+        ParameterType::Number => "number",
+        ParameterType::Object => "object",
+        ParameterType::Array => "array",
     }
 }
 
@@ -409,6 +477,31 @@ pub fn stable_call_id(
     input.extend_from_slice(&turn.to_be_bytes());
     input.extend_from_slice(&step.to_be_bytes());
     input.extend_from_slice(tool_name.as_bytes());
+    let call_id = format!("call-{}", sha256_hex(&input));
+    validate_call_id(&call_id)?;
+    Ok(call_id)
+}
+
+/// Deterministically identify one logical tool position in a durable agent
+/// turn. Model-selected tool names and arguments are deliberately excluded: a
+/// persisted `(agent_id, model_step, call_ordinal)` can own only one call
+/// contract, and a retry must reuse this ID.
+pub fn stable_agent_call_id(
+    agent_id: &str,
+    model_step: u32,
+    call_ordinal: u32,
+) -> Result<String, RegistryError> {
+    validate_id_component(agent_id, "agent id")?;
+    let mut input = Vec::with_capacity(agent_id.len() + 40);
+    input.extend_from_slice(b"zeus-agent-tool-call-v1\0");
+    input.extend_from_slice(
+        &u64::try_from(agent_id.len())
+            .expect("validated agent IDs fit in u64")
+            .to_be_bytes(),
+    );
+    input.extend_from_slice(agent_id.as_bytes());
+    input.extend_from_slice(&model_step.to_be_bytes());
+    input.extend_from_slice(&call_ordinal.to_be_bytes());
     let call_id = format!("call-{}", sha256_hex(&input));
     validate_call_id(&call_id)?;
     Ok(call_id)
@@ -811,6 +904,79 @@ mod tests {
         assert_eq!(
             provider_idempotency_key(&first).unwrap(),
             provider_idempotency_key(&retry).unwrap()
+        );
+    }
+
+    #[test]
+    fn agent_call_ids_depend_only_on_the_durable_logical_position() {
+        let first = stable_agent_call_id("agent-turn-7", 3, 1).unwrap();
+        let retry = stable_agent_call_id("agent-turn-7", 3, 1).unwrap();
+        assert_eq!(first, retry);
+        assert_eq!(first.len(), "call-".len() + 64);
+        assert_ne!(first, stable_agent_call_id("agent-turn-8", 3, 1).unwrap());
+        assert_ne!(first, stable_agent_call_id("agent-turn-7", 4, 1).unwrap());
+        assert_ne!(first, stable_agent_call_id("agent-turn-7", 3, 2).unwrap());
+        assert!(stable_agent_call_id("model supplied/tool", 3, 1).is_err());
+    }
+
+    #[test]
+    fn provider_json_schema_is_closed_typed_and_deterministic() {
+        let schema = ObjectSchema {
+            max_serialized_bytes: 512,
+            properties: BTreeMap::from([
+                (
+                    "count".into(),
+                    ParameterSpec {
+                        parameter_type: ParameterType::Integer,
+                        required: false,
+                        min_length: None,
+                        max_length: None,
+                    },
+                ),
+                (
+                    "query".into(),
+                    ParameterSpec {
+                        parameter_type: ParameterType::String,
+                        required: true,
+                        min_length: Some(1),
+                        max_length: Some(16),
+                    },
+                ),
+                (
+                    "tags".into(),
+                    ParameterSpec {
+                        parameter_type: ParameterType::Array,
+                        required: false,
+                        min_length: None,
+                        max_length: None,
+                    },
+                ),
+            ]),
+        };
+
+        assert_eq!(
+            schema.provider_json_schema().unwrap(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "count": { "type": "integer" },
+                    "query": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 16
+                    },
+                    "tags": { "type": "array" }
+                },
+                "required": ["query"],
+                "additionalProperties": false,
+                "x-zeus-max-serialized-bytes": 512
+            })
+        );
+        assert!(schema.validate_arguments(&json!({"query": "safe"})).is_ok());
+        assert!(
+            schema
+                .validate_arguments(&json!({"query": "safe", "effect": "destructive"}))
+                .is_err()
         );
     }
 

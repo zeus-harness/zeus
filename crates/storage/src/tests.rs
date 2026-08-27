@@ -12,27 +12,30 @@ use std::{
 };
 
 use protocol::{
-    Approval, ApprovalScope, ApprovalStatus, AssistantReplyKind, AssistantReplyProvenance,
-    AttachRunRequest, CreateSessionRequest, EventType, EvidenceSummary, FlushSessionRequest,
-    IncidentStatus, IncidentSummary, Metric, MetricTone, NotDispatchedReason, ResumeSessionRequest,
-    ReviewDecision, ReviewResponse, RunEvent, RunEventData, RunStatus, RunSummary, SandboxProfile,
-    SessionEvent, SessionEventData, SessionStatus, SessionTurnStatus, Severity, StartTurnRequest,
-    ToolCall, ToolCallStatus, ToolEffect, ToolExecutorStatus, ToolOutcome, ToolPolicySummary,
+    AgentToolCallStatus, AgentTurnStatus, Approval, ApprovalScope, ApprovalStatus,
+    AssistantReplyKind, AssistantReplyProvenance, AttachRunRequest, CreateSessionRequest,
+    EventType, EvidenceSummary, FlushSessionRequest, IncidentStatus, IncidentSummary, Metric,
+    MetricTone, NotDispatchedReason, PolicyDecision, ResumeSessionRequest, ReviewDecision,
+    ReviewResponse, RunEvent, RunEventData, RunStatus, RunSummary, SandboxProfile, SessionEvent,
+    SessionEventData, SessionStatus, SessionTurnStatus, Severity, StartTurnRequest, ToolCall,
+    ToolCallStatus, ToolEffect, ToolExecutorStatus, ToolOutcome, ToolPolicySummary,
 };
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 use tenancy::{PasswordAuthenticator, PasswordHashRecord};
 
 use crate::{
-    AccountAuditCheckpointCommit, AccountId, AuthSessionCommit, AuthSessionId, AuthzContext,
-    BootstrapOwnerCommit, ClaimOutcome, CommitOutcome, CreateMemberCommit, DispatchCompleteCommit,
-    DispatchJobSpec, DispatchRecoveryCommit, DispatchStartCommit, DispatchStatus,
-    MemberSetupCommit, MemberSetupToken, MembershipRevision, MembershipRole, ReplyClaimOutcome,
-    ReplyFailureCommit, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
-    ReplySuccessCommit, ReviewCommit, RotateMemberSetupTokenCommit, RunSnapshot, RuntimeIdentity,
-    SqliteOperationLimits, SqlitePhysicalLimits, SqliteStore, StorageError, StorageLimits,
-    StoredMembershipStatus, StoredUserRole, StoredUserStatus, TransitionMemberCommit,
-    UpdateAccountAuditPolicyCommit,
+    AccountAuditCheckpointCommit, AccountId, AgentModelClaimOutcome, AgentModelCompletion,
+    AgentModelFailureCommit, AgentModelResolution, AgentModelSuccessCommit, AgentReviewCommit,
+    AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
+    AgentTurnSpec, AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit,
+    ClaimOutcome, CommitOutcome, CreateMemberCommit, DispatchCompleteCommit, DispatchJobSpec,
+    DispatchRecoveryCommit, DispatchStartCommit, DispatchStatus, MemberSetupCommit,
+    MemberSetupToken, MembershipRevision, MembershipRole, ReplyClaimOutcome, ReplyFailureCommit,
+    ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit, ReplySuccessCommit, ReviewCommit,
+    RotateMemberSetupTokenCommit, RunSnapshot, RuntimeIdentity, SqliteOperationLimits,
+    SqlitePhysicalLimits, SqliteStore, StorageError, StorageLimits, StoredMembershipStatus,
+    StoredUserRole, StoredUserStatus, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
@@ -1623,7 +1626,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         .unwrap();
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
     );
     let owner: Option<String> = connection
         .query_row(
@@ -1764,7 +1767,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
     assert_eq!(
         run_event_payloads(database.path(), &long_run_id),
         payloads_before,
-        "v9-v16 migrations must not rewrite immutable event payloads"
+        "v9-v17 migrations must not rewrite immutable event payloads"
     );
     let connection = rusqlite::Connection::open(database.path()).unwrap();
     let version: i64 = connection
@@ -1772,7 +1775,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
     let configured_account: (String, String, String, i64) = connection
         .query_row(
             r#"SELECT
@@ -2298,7 +2301,7 @@ async fn v12_identity_and_run_crash_prefix_migrates_then_recovers_the_primary_se
     assert_eq!(
         recovered,
         (
-            16,
+            17,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into()
@@ -4045,7 +4048,7 @@ async fn v5_configured_database_migrates_to_the_local_owner_membership() {
     assert_eq!(
         migrated,
         (
-            16,
+            17,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into(),
@@ -4171,7 +4174,7 @@ async fn v13_configured_active_work_migrates_with_account_authority_and_exact_vo
             },
         )
         .unwrap();
-    assert_eq!(migrated_counts, (16, 1, 1, 2, 1));
+    assert_eq!(migrated_counts, (17, 1, 1, 2, 1));
 }
 
 #[tokio::test]
@@ -4453,7 +4456,7 @@ async fn v14_rejects_a_disabled_legacy_owner_before_committing_any_schema_change
 }
 
 #[tokio::test]
-async fn v14_database_migrates_through_v16_with_member_and_audit_roots() {
+async fn v14_database_migrates_through_v17_with_member_and_audit_roots() {
     let database = TestDatabase::new();
     let store = SqliteStore::open(database.path()).await.unwrap();
     bootstrap_test_owner(&store).await;
@@ -4532,7 +4535,7 @@ async fn v14_database_migrates_through_v16_with_member_and_audit_roots() {
             },
         )
         .unwrap();
-    assert_eq!(state, (16, 1, 1, 1, 19));
+    assert_eq!(state, (17, 1, 1, 1, 19));
 }
 
 #[tokio::test]
@@ -4571,7 +4574,7 @@ async fn v15_migration_seeds_the_configured_audit_detail_limit() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (16, 2));
+    assert_eq!(state, (17, 2));
 }
 
 #[tokio::test]
@@ -4616,7 +4619,7 @@ async fn v15_reopen_rejects_a_lower_audit_detail_limit_without_mutating_policy()
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (16, 4));
+    assert_eq!(state, (17, 4));
     drop(connection);
 
     let reopened = SqliteStore::open_with_limits(database.path(), original_limits)
@@ -5705,6 +5708,1247 @@ async fn reply_start_is_atomic_actor_scoped_and_success_is_idempotent() {
             .len(),
         4
     );
+}
+
+#[tokio::test]
+async fn agent_final_reply_commits_one_terminal_session_transaction() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    let request = StartTurnRequest {
+        turn_id: "turn-agent-final".into(),
+        user_message: "Finish this turn through the durable Agent Loop".into(),
+        expected_sequence: 1,
+    };
+    let spec = agent_turn_spec("agent-final", &request.turn_id);
+    let enqueued = store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            request,
+            "agent-final-start",
+            spec.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(enqueued.agent.status, AgentTurnStatus::WaitingModel);
+    assert_eq!(enqueued.job.step, 1);
+
+    let AgentModelClaimOutcome::Claimed(claimed) = store.claim_next_agent_model().await.unwrap()
+    else {
+        panic!("the first Agent model step must be claimable");
+    };
+    assert_eq!(claimed.id, enqueued.job.id);
+    let assistant_message = "The durable Agent Loop completed this turn.";
+    let commit = AgentModelSuccessCommit {
+        job_id: claimed.id,
+        response_json: agent_final_response_json(assistant_message),
+        resolution: AgentModelResolution::Final {
+            assistant_message: assistant_message.into(),
+            provenance: agent_model_provenance(),
+        },
+    };
+    let completed = store
+        .complete_agent_model_success(commit.clone())
+        .await
+        .unwrap();
+    let AgentModelCompletion::Final(completed) = completed else {
+        panic!("a final provider output must finish the Session turn");
+    };
+    assert!(!completed.replayed);
+    assert_eq!(completed.agent.status, AgentTurnStatus::Succeeded);
+    assert_eq!(completed.session.status, SessionStatus::Ready);
+    assert_eq!(completed.session.sequence, 4);
+    assert_eq!(completed.turn.status, SessionTurnStatus::Flushed);
+    assert_eq!(
+        completed.turn.assistant_message.as_deref(),
+        Some(assistant_message)
+    );
+    assert_eq!(completed.events.len(), 2);
+    assert!(matches!(
+        completed.events[0].data,
+        SessionEventData::AssistantMessage { .. }
+    ));
+    assert!(matches!(
+        completed.events[1].data,
+        SessionEventData::TurnFlushed { .. }
+    ));
+
+    let replay = store.complete_agent_model_success(commit).await.unwrap();
+    let AgentModelCompletion::Final(replay) = replay else {
+        panic!("a replay must reconstruct the durable final completion");
+    };
+    assert!(replay.replayed);
+    assert_eq!(replay.agent, completed.agent);
+    assert_eq!(replay.session, completed.session);
+    assert_eq!(replay.turn, completed.turn);
+    assert_eq!(replay.events, completed.events);
+
+    store
+        .start_turn_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-after-agent-final".into(),
+                user_message: "Start another turn after the completed Agent".into(),
+                expected_sequence: 4,
+            },
+            "turn-after-agent-final-start",
+        )
+        .await
+        .unwrap();
+    let replay_after_session_advanced = store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: enqueued.job.id.clone(),
+            response_json: agent_final_response_json(assistant_message),
+            resolution: AgentModelResolution::Final {
+                assistant_message: assistant_message.into(),
+                provenance: agent_model_provenance(),
+            },
+        })
+        .await
+        .unwrap();
+    let AgentModelCompletion::Final(replay_after_session_advanced) = replay_after_session_advanced
+    else {
+        panic!("a final replay must not depend on the mutable Session head");
+    };
+    assert!(replay_after_session_advanced.replayed);
+    assert_eq!(
+        replay_after_session_advanced.session.status,
+        SessionStatus::Running
+    );
+    assert_eq!(replay_after_session_advanced.turn.id, "turn-agent-final");
+    assert!(matches!(
+        store.claim_next_agent_model().await.unwrap(),
+        AgentModelClaimOutcome::NotAvailable
+    ));
+    assert_eq!(
+        store
+            .get_session_for_actor(&owner_authz(), "session-alpha")
+            .await
+            .unwrap()
+            .events
+            .len(),
+        5
+    );
+
+    let flushed = store
+        .flush_turn_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            FlushSessionRequest {
+                turn_id: "turn-after-agent-final".into(),
+                assistant_message: Some("The later turn is complete.".into()),
+                expected_sequence: 5,
+            },
+            "turn-after-agent-final-flush",
+        )
+        .await
+        .unwrap();
+    let mut sequence = flushed.session.sequence;
+    for ordinal in 0..64 {
+        let turn_id = format!("turn-after-agent-final-{ordinal}");
+        let started = store
+            .start_turn_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: turn_id.clone(),
+                    user_message: format!("later user message {ordinal}"),
+                    expected_sequence: sequence,
+                },
+                &format!("turn-after-agent-final-{ordinal}-start"),
+            )
+            .await
+            .unwrap();
+        let flushed = store
+            .flush_turn_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                FlushSessionRequest {
+                    turn_id,
+                    assistant_message: Some(format!("later assistant message {ordinal}")),
+                    expected_sequence: started.session.sequence,
+                },
+                &format!("turn-after-agent-final-{ordinal}-flush"),
+            )
+            .await
+            .unwrap();
+        sequence = flushed.session.sequence;
+    }
+
+    let replay_after_large_history = store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: enqueued.job.id,
+            response_json: agent_final_response_json(assistant_message),
+            resolution: AgentModelResolution::Final {
+                assistant_message: assistant_message.into(),
+                provenance: agent_model_provenance(),
+            },
+        })
+        .await
+        .unwrap();
+    let AgentModelCompletion::Final(replay_after_large_history) = replay_after_large_history else {
+        panic!("a final replay must remain bounded after extensive later history");
+    };
+    assert!(replay_after_large_history.replayed);
+    assert_eq!(replay_after_large_history.turn.id, "turn-agent-final");
+    assert_eq!(replay_after_large_history.events, completed.events);
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let final_plan = explain_query_plan(
+        &connection,
+        r#"SELECT sequence, event_id, event_kind, payload_version, payload_json,
+                  turn_id, created_at
+           FROM session_events INDEXED BY session_events_turn_kind_idx
+           WHERE session_id = ?1 AND turn_id = ?2 AND turn_id IS NOT NULL
+             AND event_kind = ?3
+           ORDER BY sequence LIMIT ?4"#,
+        params![
+            "session-alpha",
+            "turn-agent-final",
+            "assistant_message",
+            2_i64
+        ],
+    );
+    assert!(
+        final_plan.contains("session_events_turn_kind_idx"),
+        "Agent final replay must use its bounded turn/kind index: {final_plan}"
+    );
+    let terminal_plan = explain_query_plan(
+        &connection,
+        r#"SELECT sequence, event_id, event_kind, payload_version, payload_json,
+                  turn_id, created_at
+           FROM session_events INDEXED BY session_events_turn_kind_idx
+           WHERE session_id = ?1 AND turn_id = ?2 AND turn_id IS NOT NULL
+             AND event_kind = ?3
+           ORDER BY sequence LIMIT ?4"#,
+        params![
+            "session-alpha",
+            "turn-agent-final",
+            "turn_interrupted",
+            2_i64
+        ],
+    );
+    assert!(
+        terminal_plan.contains("session_events_turn_kind_idx"),
+        "Agent terminal replay must use its bounded turn/kind index: {terminal_plan}"
+    );
+}
+
+#[tokio::test]
+async fn agent_tool_result_and_continuation_are_atomic_and_idempotent() {
+    let store = created_owned_session_store().await;
+    let request = StartTurnRequest {
+        turn_id: "turn-agent-tool".into(),
+        user_message: "Inspect the workspace before answering".into(),
+        expected_sequence: 1,
+    };
+    let enqueued = store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            request,
+            "agent-tool-start",
+            agent_turn_spec("agent-tool", "turn-agent-tool"),
+        )
+        .await
+        .unwrap();
+    let AgentModelClaimOutcome::Claimed(claimed) = store.claim_next_agent_model().await.unwrap()
+    else {
+        panic!("the first Agent model step must be claimable");
+    };
+    assert_eq!(claimed.id, enqueued.job.id);
+
+    let call = agent_tool_call_spec("agent-call-allow", PolicyDecision::Allow);
+    let proposed = store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: claimed.id,
+            response_json: agent_tool_response_json(&call),
+            resolution: AgentModelResolution::ToolCall { call: call.clone() },
+        })
+        .await
+        .unwrap();
+    let AgentModelCompletion::ToolCall {
+        agent,
+        call: stored_call,
+    } = proposed
+    else {
+        panic!("an allowed tool proposal must become durable queued work");
+    };
+    assert_eq!(agent.status, AgentTurnStatus::ToolQueued);
+    assert_eq!(stored_call.status, AgentToolCallStatus::Queued);
+
+    let AgentToolClaimOutcome::Claimed(work) = store.claim_next_agent_tool().await.unwrap() else {
+        panic!("the admitted Agent tool must be claimable");
+    };
+    assert_eq!(work.call.call_id, call.call_id);
+    assert_eq!(work.call.status, AgentToolCallStatus::Running);
+    assert_eq!(work.model_job.step, 1);
+
+    let result_json = json!({"entries": ["Cargo.toml", "apps", "crates"]});
+    let next_request_json = json!({
+        "messages": [
+            {"role": "user", "content": "Inspect the workspace before answering"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_call": {
+                    "id": call.provider_call_id,
+                    "name": call.tool_name,
+                    "arguments": call.arguments_json,
+                }
+            },
+            {
+                "role": "tool",
+                "content": serde_json::to_string(&result_json).unwrap(),
+                "tool_call_id": "provider-call-agent-call-allow"
+            }
+        ]
+    });
+    let completion_commit = AgentToolCompletionCommit {
+        call_id: call.call_id,
+        status: AgentToolCallStatus::Succeeded,
+        result_json: result_json.clone(),
+        provider_request_id: Some("connector-request-1".into()),
+        next_request_json: Some(next_request_json.clone()),
+    };
+    let completed = store
+        .complete_agent_tool(completion_commit.clone())
+        .await
+        .unwrap();
+    let AgentToolCompletion::ModelQueued { agent, job } = completed else {
+        panic!("a known tool result must atomically enqueue the model continuation");
+    };
+    assert_eq!(agent.status, AgentTurnStatus::WaitingModel);
+    assert_eq!(job.step, 2);
+    assert_eq!(job.request_json, next_request_json);
+
+    let replay = store
+        .complete_agent_tool(completion_commit.clone())
+        .await
+        .unwrap();
+    let AgentToolCompletion::ModelQueued {
+        agent: replayed_agent,
+        job: replayed_job,
+    } = replay
+    else {
+        panic!("a known Agent tool completion must be replayable");
+    };
+    assert_eq!(replayed_agent, agent);
+    assert_eq!(replayed_job, job);
+    let mut conflicting_completion = completion_commit;
+    conflicting_completion.next_request_json = Some(json!({
+        "messages": [{
+            "role": "user",
+            "content": "a conflicting continuation must not replay",
+        }],
+    }));
+    assert!(matches!(
+        store.complete_agent_tool(conflicting_completion).await,
+        Err(StorageError::InvalidAgentTransition(_))
+    ));
+    let detail = store
+        .agent_turn_detail_for_actor(&owner_authz(), "session-alpha", "turn-agent-tool")
+        .await
+        .unwrap();
+    assert_eq!(detail.calls.len(), 1);
+    assert_eq!(detail.calls[0].status, AgentToolCallStatus::Succeeded);
+    assert_eq!(detail.calls[0].output.as_ref(), Some(&result_json));
+
+    let AgentModelClaimOutcome::Claimed(continuation) =
+        store.claim_next_agent_model().await.unwrap()
+    else {
+        panic!("the continuation model job must remain claimable");
+    };
+    assert_eq!(continuation.id, job.id);
+    assert_eq!(continuation.step, 2);
+}
+
+#[tokio::test]
+async fn agent_known_tool_results_preserve_scalar_and_array_values() {
+    for (case, result_json) in [
+        ("scalar", json!("connector-ok")),
+        ("array", json!(["Cargo.toml", "crates"])),
+    ] {
+        let store = created_owned_session_store().await;
+        let turn_id = format!("turn-agent-result-{case}");
+        let agent_id = format!("agent-result-{case}");
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: turn_id.clone(),
+                    user_message: format!("Return a {case} tool result"),
+                    expected_sequence: 1,
+                },
+                &format!("agent-result-{case}-start"),
+                agent_turn_spec(&agent_id, &turn_id),
+            )
+            .await
+            .unwrap();
+        let AgentModelClaimOutcome::Claimed(model_job) =
+            store.claim_next_agent_model().await.unwrap()
+        else {
+            panic!("the initial Agent model job must be claimable");
+        };
+        let call =
+            agent_tool_call_spec(&format!("agent-call-result-{case}"), PolicyDecision::Allow);
+        store
+            .complete_agent_model_success(AgentModelSuccessCommit {
+                job_id: model_job.id,
+                response_json: agent_tool_response_json(&call),
+                resolution: AgentModelResolution::ToolCall { call: call.clone() },
+            })
+            .await
+            .unwrap();
+        let AgentToolClaimOutcome::Claimed(_) = store.claim_next_agent_tool().await.unwrap() else {
+            panic!("the Agent tool call must be claimable");
+        };
+        let next_request_json = json!({
+            "messages": [
+                {"role": "user", "content": format!("Return a {case} tool result")},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_call": {
+                        "id": call.provider_call_id,
+                        "name": call.tool_name,
+                        "arguments": call.arguments_json,
+                    }
+                },
+                {
+                    "role": "tool",
+                    "content": serde_json::to_string(&result_json).unwrap(),
+                    "tool_call_id": call.provider_call_id,
+                }
+            ]
+        });
+        let commit = AgentToolCompletionCommit {
+            call_id: call.call_id,
+            status: AgentToolCallStatus::Succeeded,
+            result_json: result_json.clone(),
+            provider_request_id: Some(format!("connector-result-{case}")),
+            next_request_json: Some(next_request_json.clone()),
+        };
+        let completion = store.complete_agent_tool(commit.clone()).await.unwrap();
+        let AgentToolCompletion::ModelQueued { job, .. } = completion else {
+            panic!("a known {case} result must enqueue its continuation");
+        };
+        assert_eq!(job.request_json, next_request_json);
+
+        let replay = store.complete_agent_tool(commit).await.unwrap();
+        assert!(matches!(replay, AgentToolCompletion::ModelQueued { .. }));
+        let detail = store
+            .agent_turn_detail_for_actor(&owner_authz(), "session-alpha", &turn_id)
+            .await
+            .unwrap();
+        assert_eq!(detail.calls.len(), 1);
+        assert_eq!(detail.calls[0].status, AgentToolCallStatus::Succeeded);
+        assert_eq!(detail.calls[0].output.as_ref(), Some(&result_json));
+        assert_ne!(detail.calls[0].status, AgentToolCallStatus::OutcomeUnknown);
+    }
+}
+
+#[tokio::test]
+async fn known_agent_tool_result_without_a_continuation_terminalizes_as_known() {
+    let store = created_owned_session_store().await;
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-agent-tool-no-continuation".into(),
+                user_message: "Inspect the workspace even if continuation encoding fails".into(),
+                expected_sequence: 1,
+            },
+            "agent-tool-no-continuation-start",
+            agent_turn_spec(
+                "agent-tool-no-continuation",
+                "turn-agent-tool-no-continuation",
+            ),
+        )
+        .await
+        .unwrap();
+    let AgentModelClaimOutcome::Claimed(job) = store.claim_next_agent_model().await.unwrap() else {
+        panic!("the initial model job must be claimable");
+    };
+    let call = agent_tool_call_spec("agent-call-tool-no-continuation", PolicyDecision::Allow);
+    store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: job.id,
+            response_json: agent_tool_response_json(&call),
+            resolution: AgentModelResolution::ToolCall { call: call.clone() },
+        })
+        .await
+        .unwrap();
+    let AgentToolClaimOutcome::Claimed(work) = store.claim_next_agent_tool().await.unwrap() else {
+        panic!("the admitted tool must be claimable");
+    };
+    assert_eq!(work.call.call_id, call.call_id);
+
+    let result_json = json!({"entries": ["Cargo.toml", "crates"]});
+    let commit = AgentToolCompletionCommit {
+        call_id: call.call_id.clone(),
+        status: AgentToolCallStatus::Succeeded,
+        result_json: result_json.clone(),
+        provider_request_id: Some("connector-known-no-continuation".into()),
+        next_request_json: None,
+    };
+    let completed = store.complete_agent_tool(commit.clone()).await.unwrap();
+    let AgentToolCompletion::Terminal(terminal) = completed else {
+        panic!("a missing continuation must terminalize the known tool result");
+    };
+    assert!(!terminal.replayed);
+    assert_eq!(terminal.agent.status, AgentTurnStatus::Failed);
+    assert_eq!(
+        terminal
+            .agent
+            .last_error_json
+            .as_ref()
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_str),
+        Some("continuation_unavailable")
+    );
+    assert_eq!(terminal.session.status, SessionStatus::NeedsAttention);
+    assert_eq!(terminal.turn.status, SessionTurnStatus::Interrupted);
+    let detail = store
+        .agent_turn_detail_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            "turn-agent-tool-no-continuation",
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail.calls.len(), 1);
+    assert_eq!(detail.calls[0].status, AgentToolCallStatus::Succeeded);
+    assert_eq!(detail.calls[0].output.as_ref(), Some(&result_json));
+    assert_ne!(
+        detail.calls[0].status,
+        AgentToolCallStatus::OutcomeUnknown,
+        "a missing continuation must not erase a known connector outcome"
+    );
+    assert!(matches!(
+        store.claim_next_agent_model().await.unwrap(),
+        AgentModelClaimOutcome::NotAvailable
+    ));
+
+    let replay = store.complete_agent_tool(commit.clone()).await.unwrap();
+    let AgentToolCompletion::Terminal(replay) = replay else {
+        panic!("the terminal known result must be replayable");
+    };
+    assert!(replay.replayed);
+    assert_eq!(replay.agent, terminal.agent);
+
+    let replay_with_unused_request = store
+        .complete_agent_tool(AgentToolCompletionCommit {
+            next_request_json: Some(json!({
+                "messages": [{"role": "user", "content": "unused terminal replay"}],
+            })),
+            ..commit
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        replay_with_unused_request,
+        AgentToolCompletion::Terminal(completion) if completion.replayed
+    ));
+}
+
+#[tokio::test]
+async fn policy_denial_without_a_continuation_persists_the_known_denial() {
+    let store = created_owned_session_store().await;
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-agent-deny-no-continuation".into(),
+                user_message: "Attempt a locally denied operation".into(),
+                expected_sequence: 1,
+            },
+            "agent-deny-no-continuation-start",
+            agent_turn_spec(
+                "agent-deny-no-continuation",
+                "turn-agent-deny-no-continuation",
+            ),
+        )
+        .await
+        .unwrap();
+    let AgentModelClaimOutcome::Claimed(job) = store.claim_next_agent_model().await.unwrap() else {
+        panic!("the initial model job must be claimable");
+    };
+    let call = agent_tool_call_spec("agent-call-deny-no-continuation", PolicyDecision::Deny);
+    let result_json = json!({
+        "code": "policy_denied",
+        "message": "the call is denied by local policy",
+    });
+    let commit = AgentModelSuccessCommit {
+        job_id: job.id,
+        response_json: agent_tool_response_json(&call),
+        resolution: AgentModelResolution::PolicyDenied {
+            call: call.clone(),
+            result_json: result_json.clone(),
+            next_request_json: None,
+        },
+    };
+    let completed = store
+        .complete_agent_model_success(commit.clone())
+        .await
+        .unwrap();
+    let AgentModelCompletion::Terminal(terminal) = completed else {
+        panic!("an unavailable denial continuation must terminate the loop");
+    };
+    assert!(!terminal.replayed);
+    assert_eq!(terminal.agent.status, AgentTurnStatus::Failed);
+    assert_eq!(terminal.agent.tool_calls, 1);
+    assert_eq!(
+        terminal
+            .agent
+            .last_error_json
+            .as_ref()
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_str),
+        Some("continuation_unavailable")
+    );
+    let detail = store
+        .agent_turn_detail_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            "turn-agent-deny-no-continuation",
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail.calls.len(), 1);
+    assert_eq!(detail.calls[0].status, AgentToolCallStatus::NotDispatched);
+    assert_eq!(detail.calls[0].error.as_ref(), Some(&result_json));
+    assert!(matches!(
+        store.claim_next_agent_model().await.unwrap(),
+        AgentModelClaimOutcome::NotAvailable
+    ));
+
+    let replay = store
+        .complete_agent_model_success(commit.clone())
+        .await
+        .unwrap();
+    let AgentModelCompletion::Terminal(replay) = replay else {
+        panic!("the terminal policy denial must be replayable");
+    };
+    assert!(replay.replayed);
+    assert_eq!(replay.agent, terminal.agent);
+
+    let mut conflicting = commit;
+    let AgentModelResolution::PolicyDenied {
+        next_request_json, ..
+    } = &mut conflicting.resolution
+    else {
+        unreachable!("the test commit is a policy denial")
+    };
+    *next_request_json = Some(json!({
+        "messages": [{"role": "user", "content": "different terminal fingerprint"}],
+    }));
+    assert!(matches!(
+        store.complete_agent_model_success(conflicting).await,
+        Err(StorageError::InvalidAgentTransition(_))
+    ));
+}
+
+#[tokio::test]
+async fn fifth_policy_denied_proposal_finishes_atomically_without_a_phantom_call() {
+    let store = created_owned_session_store().await;
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-agent-deny-limit".into(),
+                user_message: "Keep requesting denied tools until the loop boundary".into(),
+                expected_sequence: 1,
+            },
+            "agent-deny-limit-start",
+            agent_turn_spec("agent-deny-limit", "turn-agent-deny-limit"),
+        )
+        .await
+        .unwrap();
+
+    for ordinal in 1..=4 {
+        let AgentModelClaimOutcome::Claimed(job) = store.claim_next_agent_model().await.unwrap()
+        else {
+            panic!("denied model step {ordinal} must be claimable");
+        };
+        let call = agent_tool_call_spec(
+            &format!("agent-call-denied-{ordinal}"),
+            PolicyDecision::Deny,
+        );
+        let completion = store
+            .complete_agent_model_success(AgentModelSuccessCommit {
+                job_id: job.id,
+                response_json: agent_tool_response_json(&call),
+                resolution: AgentModelResolution::PolicyDenied {
+                    call,
+                    result_json: json!({
+                        "code": "policy_denied",
+                        "message": "the tool is denied by local policy",
+                    }),
+                    next_request_json: Some(json!({
+                        "messages": [{
+                            "role": "tool",
+                            "content": format!("policy denied call {ordinal}"),
+                            "tool_call_id": format!("provider-call-agent-call-denied-{ordinal}"),
+                        }],
+                    })),
+                },
+            })
+            .await
+            .unwrap();
+        let AgentModelCompletion::ToolCall { agent, call } = completion else {
+            panic!("the first four denied proposals must queue continuations");
+        };
+        assert_eq!(agent.status, AgentTurnStatus::WaitingModel);
+        assert_eq!(call.status, AgentToolCallStatus::NotDispatched);
+    }
+
+    let AgentModelClaimOutcome::Claimed(fifth_job) = store.claim_next_agent_model().await.unwrap()
+    else {
+        panic!("the fifth model step itself is still within the model-step limit");
+    };
+    let fifth_call = agent_tool_call_spec("agent-call-denied-5", PolicyDecision::Deny);
+    let fifth_commit = AgentModelSuccessCommit {
+        job_id: fifth_job.id,
+        response_json: agent_tool_response_json(&fifth_call),
+        resolution: AgentModelResolution::PolicyDenied {
+            call: fifth_call,
+            result_json: json!({
+                "code": "policy_denied",
+                "message": "the fifth denied call reaches the tool-call limit",
+            }),
+            next_request_json: Some(json!({
+                "messages": [{
+                    "role": "tool",
+                    "content": "the fifth call was denied",
+                    "tool_call_id": "provider-call-agent-call-denied-5",
+                }],
+            })),
+        },
+    };
+    let completion = store
+        .complete_agent_model_success(fifth_commit.clone())
+        .await
+        .unwrap();
+    let AgentModelCompletion::Terminal(terminal) = completion else {
+        panic!("the fifth proposal must terminate at the fixed tool-call limit");
+    };
+    assert!(!terminal.replayed);
+    assert_eq!(terminal.agent.status, AgentTurnStatus::Failed);
+    assert_eq!(terminal.agent.tool_calls, 4);
+    assert_eq!(terminal.session.status, SessionStatus::NeedsAttention);
+    assert_eq!(terminal.turn.status, SessionTurnStatus::Interrupted);
+    let detail = store
+        .agent_turn_detail_for_actor(&owner_authz(), "session-alpha", "turn-agent-deny-limit")
+        .await
+        .unwrap();
+    assert_eq!(detail.calls.len(), 4);
+    assert!(
+        detail
+            .calls
+            .iter()
+            .all(|call| call.status == AgentToolCallStatus::NotDispatched)
+    );
+
+    let replay = store
+        .complete_agent_model_success(fifth_commit)
+        .await
+        .unwrap();
+    let AgentModelCompletion::Terminal(replay) = replay else {
+        panic!("the fixed-limit terminal completion must be replayable");
+    };
+    assert!(replay.replayed);
+    assert_eq!(replay.agent, terminal.agent);
+    assert_eq!(replay.turn, terminal.turn);
+}
+
+#[tokio::test]
+async fn approval_rejection_without_a_continuation_persists_the_known_rejection() {
+    let store = created_owned_session_store().await;
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-agent-reject-no-continuation".into(),
+                user_message: "Propose an operation requiring owner review".into(),
+                expected_sequence: 1,
+            },
+            "agent-reject-no-continuation-start",
+            agent_turn_spec(
+                "agent-reject-no-continuation",
+                "turn-agent-reject-no-continuation",
+            ),
+        )
+        .await
+        .unwrap();
+    let AgentModelClaimOutcome::Claimed(job) = store.claim_next_agent_model().await.unwrap() else {
+        panic!("the initial model job must be claimable");
+    };
+    let call = agent_tool_call_spec(
+        "agent-call-reject-no-continuation",
+        PolicyDecision::RequireApproval,
+    );
+    store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: job.id,
+            response_json: agent_tool_response_json(&call),
+            resolution: AgentModelResolution::ToolCall { call: call.clone() },
+        })
+        .await
+        .unwrap();
+    let review_context = store
+        .agent_review_context_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            "turn-agent-reject-no-continuation",
+            &call.call_id,
+        )
+        .await
+        .unwrap();
+    assert!(
+        review_context
+            .rejection_requires_continuation(Some("owner rejected"))
+            .unwrap(),
+        "the reducer requires a continuation before its encoding is found unavailable"
+    );
+    let rejection_result =
+        protocol::agent_approval_rejected_result(&call.call_id, Some("owner rejected"));
+    let commit = AgentReviewCommit {
+        call_id: call.call_id.clone(),
+        decision: ReviewDecision::Reject,
+        note: Some("owner rejected".into()),
+        idempotency_key: "agent-reject-no-continuation".into(),
+        next_request_json: None,
+    };
+    let rejected = store
+        .review_agent_tool_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            "turn-agent-reject-no-continuation",
+            commit.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(!rejected.response.replayed);
+    assert_eq!(rejected.response.agent.status, AgentTurnStatus::Failed);
+    assert_eq!(rejected.response.call.status, AgentToolCallStatus::Rejected);
+    assert_eq!(
+        rejected.response.call.error.as_ref(),
+        Some(&rejection_result)
+    );
+    assert_ne!(
+        rejected.response.call.status,
+        AgentToolCallStatus::OutcomeUnknown
+    );
+    assert_eq!(
+        rejected
+            .response
+            .agent
+            .last_error
+            .as_ref()
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_str),
+        Some("continuation_unavailable")
+    );
+    assert!(rejected.queued_model_job.is_none());
+    let terminal = rejected
+        .terminal_completion
+        .expect("the unavailable continuation must interrupt the Session turn");
+    assert!(!terminal.replayed);
+    assert_eq!(terminal.session.status, SessionStatus::NeedsAttention);
+    assert_eq!(terminal.turn.status, SessionTurnStatus::Interrupted);
+    assert!(matches!(
+        store.claim_next_agent_model().await.unwrap(),
+        AgentModelClaimOutcome::NotAvailable
+    ));
+    assert!(matches!(
+        store.claim_next_agent_tool().await.unwrap(),
+        AgentToolClaimOutcome::NotAvailable
+    ));
+
+    let replay = store
+        .review_agent_tool_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            "turn-agent-reject-no-continuation",
+            commit,
+        )
+        .await
+        .unwrap();
+    assert!(replay.response.replayed);
+    assert!(replay.queued_model_job.is_none());
+    assert!(replay.terminal_completion.unwrap().replayed);
+}
+
+#[tokio::test]
+async fn agent_rejection_is_owner_bound_idempotent_and_never_dispatches() {
+    let store = created_owned_session_store().await;
+    let request = StartTurnRequest {
+        turn_id: "turn-agent-review".into(),
+        user_message: "Propose a guarded local change".into(),
+        expected_sequence: 1,
+    };
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            request,
+            "agent-review-start",
+            agent_turn_spec("agent-review", "turn-agent-review"),
+        )
+        .await
+        .unwrap();
+    let AgentModelClaimOutcome::Claimed(claimed) = store.claim_next_agent_model().await.unwrap()
+    else {
+        panic!("the approval Agent model step must be claimable");
+    };
+    let call = agent_tool_call_spec("agent-call-review", PolicyDecision::RequireApproval);
+    let proposed = store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: claimed.id,
+            response_json: agent_tool_response_json(&call),
+            resolution: AgentModelResolution::ToolCall { call: call.clone() },
+        })
+        .await
+        .unwrap();
+    let AgentModelCompletion::ToolCall {
+        agent,
+        call: proposed_call,
+    } = proposed
+    else {
+        panic!("a guarded proposal must wait for owner approval");
+    };
+    assert_eq!(agent.status, AgentTurnStatus::WaitingApproval);
+    assert_eq!(proposed_call.status, AgentToolCallStatus::WaitingApproval);
+    let context = store
+        .agent_review_context_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            "turn-agent-review",
+            &call.call_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(context.work.call, *proposed_call);
+    assert!(
+        context
+            .rejection_requires_continuation(Some("not needed"))
+            .unwrap()
+    );
+
+    let rejection_result =
+        protocol::agent_approval_rejected_result(&call.call_id, Some("not needed"));
+    let next_request_json = json!({
+        "messages": [
+            {"role": "user", "content": "Propose a guarded local change"},
+            {
+                "role": "tool",
+                "content": serde_json::to_string(&rejection_result).unwrap(),
+                "tool_call_id": call.provider_call_id,
+            }
+        ]
+    });
+    let review = AgentReviewCommit {
+        call_id: call.call_id.clone(),
+        decision: ReviewDecision::Reject,
+        note: Some("not needed".into()),
+        idempotency_key: "agent-review-reject".into(),
+        next_request_json: Some(next_request_json.clone()),
+    };
+    let rejected = store
+        .review_agent_tool_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            "turn-agent-review",
+            review.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(!rejected.response.replayed);
+    assert_eq!(
+        rejected.response.agent.status,
+        AgentTurnStatus::WaitingModel
+    );
+    assert_eq!(rejected.response.call.status, AgentToolCallStatus::Rejected);
+    assert_eq!(
+        rejected.response.call.error.as_ref(),
+        Some(&rejection_result)
+    );
+    assert!(rejected.terminal_completion.is_none());
+    assert_eq!(
+        rejected
+            .queued_model_job
+            .as_ref()
+            .map(|job| &job.request_json),
+        Some(&next_request_json)
+    );
+    assert!(matches!(
+        store.claim_next_agent_tool().await.unwrap(),
+        AgentToolClaimOutcome::NotAvailable
+    ));
+
+    let replay = store
+        .review_agent_tool_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            "turn-agent-review",
+            AgentReviewCommit {
+                next_request_json: None,
+                ..review.clone()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(replay.response.replayed);
+    assert_eq!(replay.queued_model_job, rejected.queued_model_job);
+    let mut conflicting = review;
+    conflicting.note = Some("different decision evidence".into());
+    assert!(matches!(
+        store
+            .review_agent_tool_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                "turn-agent-review",
+                conflicting,
+            )
+            .await,
+        Err(StorageError::IdempotencyConflict)
+    ));
+}
+
+#[tokio::test]
+async fn agent_rejection_at_result_limit_terminalizes_without_a_continuation_request() {
+    let store = created_owned_session_store().await;
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-agent-reject-limit".into(),
+                user_message: "Reach the cumulative tool-result safety boundary".into(),
+                expected_sequence: 1,
+            },
+            "agent-reject-limit-start",
+            agent_turn_spec("agent-reject-limit", "turn-agent-reject-limit"),
+        )
+        .await
+        .unwrap();
+
+    let large_result = json!({"data": "x".repeat(65_500)});
+    for ordinal in 1..=2 {
+        let AgentModelClaimOutcome::Claimed(job) = store.claim_next_agent_model().await.unwrap()
+        else {
+            panic!("large-result model step {ordinal} must be claimable");
+        };
+        let call = agent_tool_call_spec(
+            &format!("agent-call-large-{ordinal}"),
+            PolicyDecision::Allow,
+        );
+        let completion = store
+            .complete_agent_model_success(AgentModelSuccessCommit {
+                job_id: job.id,
+                response_json: agent_tool_response_json(&call),
+                resolution: AgentModelResolution::ToolCall { call: call.clone() },
+            })
+            .await
+            .unwrap();
+        assert!(matches!(completion, AgentModelCompletion::ToolCall { .. }));
+        let AgentToolClaimOutcome::Claimed(work) = store.claim_next_agent_tool().await.unwrap()
+        else {
+            panic!("large-result tool {ordinal} must be claimable");
+        };
+        assert_eq!(work.call.call_id, call.call_id);
+        let completion = store
+            .complete_agent_tool(AgentToolCompletionCommit {
+                call_id: call.call_id,
+                status: AgentToolCallStatus::Succeeded,
+                result_json: large_result.clone(),
+                provider_request_id: Some(format!("large-result-request-{ordinal}")),
+                next_request_json: Some(json!({
+                    "messages": [{
+                        "role": "tool",
+                        "content": format!("large result {ordinal} committed"),
+                        "tool_call_id": call.provider_call_id,
+                    }],
+                })),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            completion,
+            AgentToolCompletion::ModelQueued { .. }
+        ));
+    }
+
+    let AgentModelClaimOutcome::Claimed(job) = store.claim_next_agent_model().await.unwrap() else {
+        panic!("the approval proposal model step must be claimable");
+    };
+    let call = agent_tool_call_spec(
+        "agent-call-reject-at-limit",
+        PolicyDecision::RequireApproval,
+    );
+    store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: job.id,
+            response_json: agent_tool_response_json(&call),
+            resolution: AgentModelResolution::ToolCall { call: call.clone() },
+        })
+        .await
+        .unwrap();
+    let context = store
+        .agent_review_context_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            "turn-agent-reject-limit",
+            &call.call_id,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !context.rejection_requires_continuation(None).unwrap(),
+        "the exact rejection result must cross the cumulative result limit"
+    );
+    let review = AgentReviewCommit {
+        call_id: call.call_id.clone(),
+        decision: ReviewDecision::Reject,
+        note: None,
+        idempotency_key: "agent-reject-at-limit".into(),
+        next_request_json: None,
+    };
+    let rejected = store
+        .review_agent_tool_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            "turn-agent-reject-limit",
+            review.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(!rejected.response.replayed);
+    assert_eq!(rejected.response.agent.status, AgentTurnStatus::Failed);
+    assert_eq!(
+        rejected
+            .response
+            .agent
+            .last_error
+            .as_ref()
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_str),
+        Some("tool_result_bytes_limit_reached"),
+        "an existing result limit must take precedence over continuation availability"
+    );
+    assert_eq!(rejected.response.call.status, AgentToolCallStatus::Rejected);
+    assert_eq!(
+        rejected.response.call.error,
+        Some(protocol::agent_approval_rejected_result(
+            &call.call_id,
+            None
+        ))
+    );
+    assert!(rejected.queued_model_job.is_none());
+    let terminal = rejected
+        .terminal_completion
+        .expect("a limit rejection must return its Session interruption");
+    assert!(!terminal.replayed);
+    assert_eq!(terminal.session.status, SessionStatus::NeedsAttention);
+    assert_eq!(terminal.turn.status, SessionTurnStatus::Interrupted);
+
+    let replay = store
+        .review_agent_tool_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            "turn-agent-reject-limit",
+            review,
+        )
+        .await
+        .unwrap();
+    assert!(replay.response.replayed);
+    assert!(replay.queued_model_job.is_none());
+    assert!(replay.terminal_completion.unwrap().replayed);
+}
+
+#[tokio::test]
+async fn started_agent_model_becomes_unknown_once_after_restart() {
+    let database = TestDatabase::new();
+    let job_id = {
+        let store = created_owned_file_session_store(database.path()).await;
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: "turn-agent-recovery".into(),
+                    user_message: "Recover an interrupted model call safely".into(),
+                    expected_sequence: 1,
+                },
+                "agent-recovery-start",
+                agent_turn_spec("agent-recovery", "turn-agent-recovery"),
+            )
+            .await
+            .unwrap();
+        let AgentModelClaimOutcome::Claimed(claimed) =
+            store.claim_next_agent_model().await.unwrap()
+        else {
+            panic!("the recovery fixture must persist a started model checkpoint");
+        };
+        claimed.id
+    };
+
+    let reopened = SqliteStore::open(database.path()).await.unwrap();
+    let recovered = reopened.recover_started_agent_work().await.unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert!(!recovered[0].replayed);
+    assert_eq!(recovered[0].agent.status, AgentTurnStatus::NeedsAttention);
+    assert_eq!(recovered[0].session.status, SessionStatus::NeedsAttention);
+    assert_eq!(recovered[0].turn.status, SessionTurnStatus::Interrupted);
+    assert!(matches!(
+        recovered[0].event.data,
+        SessionEventData::TurnInterrupted { .. }
+    ));
+    assert!(
+        reopened
+            .recover_started_agent_work()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    reopened
+        .resume_session_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            ResumeSessionRequest {
+                expected_sequence: 3,
+            },
+            "resume-agent-recovery",
+        )
+        .await
+        .unwrap();
+    let replay = reopened
+        .complete_agent_model_failure(AgentModelFailureCommit {
+            job_id,
+            error_json: json!({
+                "code": "model_outcome_unknown_after_restart",
+                "message": "the process restarted after the model checkpoint without a trustworthy result",
+            }),
+            outcome_unknown: true,
+        })
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.agent.status, AgentTurnStatus::NeedsAttention);
+    assert_eq!(replay.session.status, SessionStatus::Ready);
+    assert_eq!(replay.turn.status, SessionTurnStatus::Interrupted);
+    assert!(matches!(
+        reopened.claim_next_agent_model().await.unwrap(),
+        AgentModelClaimOutcome::NotAvailable
+    ));
 }
 
 #[tokio::test]
@@ -9687,7 +10931,7 @@ async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempot
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, (1_i64..=16).collect::<Vec<_>>());
+    assert_eq!(versions, (1_i64..=17).collect::<Vec<_>>());
     assert_eq!(
         connection
             .query_row(
@@ -10491,6 +11735,10 @@ fn downgrade_account_foundation_fixture_to_v12(connection: &rusqlite::Connection
     if version < 13 {
         return;
     }
+    if version >= 17 {
+        drop_v17_fixture_objects(connection);
+        version = 16;
+    }
     if version >= 16 {
         drop_v16_fixture_objects(connection);
         version = 15;
@@ -10548,6 +11796,10 @@ fn downgrade_durable_authorization_fixture_to_v13(connection: &rusqlite::Connect
             row.get(0)
         })
         .unwrap();
+    if version >= 17 {
+        drop_v17_fixture_objects(connection);
+        version = 16;
+    }
     if version >= 16 {
         drop_v16_fixture_objects(connection);
         version = 15;
@@ -10848,6 +12100,19 @@ fn drop_v16_fixture_objects(connection: &rusqlite::Connection) {
         .execute_batch(
             r#"DROP INDEX session_events_reply_context_idx;
                DELETE FROM schema_migrations WHERE version = 16;"#,
+        )
+        .unwrap();
+}
+
+fn drop_v17_fixture_objects(connection: &rusqlite::Connection) {
+    connection
+        .execute_batch(
+            r#"DROP INDEX session_events_turn_kind_idx;
+               DROP TABLE agent_review_receipts;
+               DROP TABLE agent_tool_calls;
+               DROP TABLE agent_model_jobs;
+               DROP TABLE agent_turns;
+               DELETE FROM schema_migrations WHERE version = 17;"#,
         )
         .unwrap();
 }
@@ -11603,6 +12868,81 @@ fn reply_job_spec(id: &str, turn_id: &str) -> ReplyJobSpec {
             "messages": [{"role": "user", "content": format!("reply to {turn_id}")}]
         }),
     }
+}
+
+fn agent_turn_spec(id: &str, turn_id: &str) -> AgentTurnSpec {
+    AgentTurnSpec {
+        id: id.into(),
+        authz: owner_authz(),
+        environment: "local".into(),
+        provider_name: "test-provider".into(),
+        model_name: Some("test-model".into()),
+        request_json: json!({
+            "messages": [{
+                "role": "user",
+                "content": format!("reply to {turn_id}"),
+            }],
+        }),
+    }
+}
+
+fn agent_model_provenance() -> AssistantReplyProvenance {
+    AssistantReplyProvenance {
+        provider_id: "test-provider".into(),
+        model: Some("test-model".into()),
+        reply_kind: AssistantReplyKind::Model,
+    }
+}
+
+fn agent_final_response_json(content: &str) -> Value {
+    json!({
+        "output": {
+            "type": "final",
+            "content": content,
+        },
+        "finish_reason": "stop",
+        "provider": {
+            "provider_id": "test-provider",
+            "model": "test-model",
+            "reply_kind": "model",
+        },
+    })
+}
+
+fn agent_tool_call_spec(call_id: &str, policy_decision: PolicyDecision) -> AgentToolCallSpec {
+    let arguments_json = json!({"path": ".", "depth": 2});
+    AgentToolCallSpec {
+        call_id: call_id.into(),
+        provider_call_id: format!("provider-call-{call_id}"),
+        tool_name: "workspace.list".into(),
+        tool_version: "1.0.0".into(),
+        arguments_digest: tools::arguments_digest(&arguments_json),
+        arguments_json,
+        effect: ToolEffect::ReadOnly,
+        sandbox_profile: SandboxProfile::ReadOnly,
+        executor_status: ToolExecutorStatus::Available,
+        policy_decision,
+        policy_revision: "local/v1".into(),
+    }
+}
+
+fn agent_tool_response_json(call: &AgentToolCallSpec) -> Value {
+    json!({
+        "output": {
+            "type": "tool_call",
+            "call": {
+                "id": call.provider_call_id,
+                "name": call.tool_name,
+                "arguments": call.arguments_json,
+            },
+        },
+        "finish_reason": "tool_calls",
+        "provider": {
+            "provider_id": "test-provider",
+            "model": "test-model",
+            "reply_kind": "model",
+        },
+    })
 }
 
 fn model_reply_json(content: &str) -> Value {

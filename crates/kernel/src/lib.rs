@@ -363,7 +363,7 @@ pub fn production_rds_call() -> ToolCall {
 pub fn local_marker_call() -> ToolCall {
     ToolCall {
         call_id: LOCAL_MARKER_CALL_ID.into(),
-        tool: "dev.marker.write".into(),
+        tool: "dev_marker_write".into(),
         tool_version: "1".into(),
         arguments: json!({ "marker": "zeus alpha local marker" }),
         arguments_digest: LOCAL_MARKER_ARGUMENTS_DIGEST.into(),
@@ -841,7 +841,7 @@ mod tests {
         assert_eq!(demo.incident.region, "local");
 
         let call = local_marker_call();
-        assert_eq!(call.tool, "dev.marker.write");
+        assert_eq!(call.tool, "dev_marker_write");
         assert_eq!(call.effect, ToolEffect::LocalWrite);
         assert_eq!(call.sandbox_profile, SandboxProfile::WorkspaceWrite);
         assert_eq!(call.executor_status, ToolExecutorStatus::Available);
