@@ -15,9 +15,9 @@ profile has no RDS executor: approving the illustrated change is durably
 recorded, then settles as `not_dispatched / executor_unavailable` without a
 production side effect. An explicit `local-development` profile provides a
 path-constrained marker executor and can additionally register rooted,
-read-only workspace discovery, literal text search, file reading, and one
-approval-gated exact text replacement tool for testing a useful complete Agent
-loop. Restate,
+read-only workspace discovery, literal text search, file reading, plus
+approval-gated exact text replacement and create-new-only file tools for
+testing a useful complete Agent loop. Restate,
 MinIO, the networkless tool sandbox, and optional PostgreSQL are development
 topology for later milestones; they are not application state authorities.
 
@@ -244,10 +244,13 @@ depth, per-file bytes, and total bytes; it skips `.git`, `.svelte-kit`, `.zeus`,
 from one canonical relative UTF-8 regular file. `workspace_replace_text`
 atomically replaces exactly one unique occurrence in an existing UTF-8 regular
 file of at most 64 KiB, preserves file permissions, and requires owner approval
-for its exact persisted arguments. Same-process retries replay a bounded recent
-receipt; a changed target or reused call ID with different arguments fails
-closed. All workspace tools reject traversal and never follow symlinks. None of
-these connectors can invoke a host command:
+for its exact persisted arguments. `workspace_create_file` creates one UTF-8
+file of at most 12 KiB below an existing directory, publishes it atomically,
+never overwrites an existing path, and also requires owner approval for the
+exact persisted arguments. Same-process mutation retries replay a bounded
+recent receipt; a changed target or reused call ID with a different tool or
+arguments fails closed. All workspace tools reject traversal and never follow
+symlinks. None of these connectors can invoke a host command:
 
 ```sh
 ZEUS_DATABASE_PATH=.zeus/local-development.db \
@@ -932,11 +935,11 @@ schema v23 account knowledge catalog ingestion, and schema v24 account Agent
 prompt governance:
 
 - `cargo fmt --all -- --check`
-- `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 558 tests passed
-  under the existing project counting convention, including 14 connector tests,
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo test --workspace --all-targets --locked`: 560 tests passed
+  under the existing project counting convention, including 15 connector tests,
   8 deployment tests, 29 knowledge tests, 248 storage tests, 48 runtime tests,
-  68 API library tests, 6 API main/config
+  69 API library tests, 6 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,

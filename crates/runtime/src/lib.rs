@@ -21,9 +21,9 @@ use authz::{PolicyBuildError, PolicyContext, PolicyEngine, PolicyEvaluation, Pol
 use chrono::{SecondsFormat, Utc};
 use connectors::{
     ConnectorConfigError, LOCAL_DEV_ENVIRONMENT, register_local_dev_connectors,
-    register_local_workspace_connectors, workspace_list_directory_descriptor,
-    workspace_read_file_descriptor, workspace_replace_text_descriptor,
-    workspace_search_text_descriptor,
+    register_local_workspace_connectors, workspace_create_file_descriptor,
+    workspace_list_directory_descriptor, workspace_read_file_descriptor,
+    workspace_replace_text_descriptor, workspace_search_text_descriptor,
 };
 pub use deployment::ManifestEnvelope;
 use deployment::{
@@ -3227,15 +3227,19 @@ impl RuntimeComponents {
                             decision: PolicyDecision::Allow,
                         });
                     }
-                    let descriptor = workspace_replace_text_descriptor();
-                    policy_rules.push(PolicyRule {
-                        revision: LOCAL_POLICY_REVISION.into(),
-                        tool: descriptor.name,
-                        environment: scenario.run.environment.clone(),
-                        effect: descriptor.effect,
-                        sandbox_profile: descriptor.sandbox_profile,
-                        decision: PolicyDecision::RequireApproval,
-                    });
+                    for descriptor in [
+                        workspace_replace_text_descriptor(),
+                        workspace_create_file_descriptor(),
+                    ] {
+                        policy_rules.push(PolicyRule {
+                            revision: LOCAL_POLICY_REVISION.into(),
+                            tool: descriptor.name,
+                            environment: scenario.run.environment.clone(),
+                            effect: descriptor.effect,
+                            sandbox_profile: descriptor.sandbox_profile,
+                            decision: PolicyDecision::RequireApproval,
+                        });
+                    }
                     register_local_workspace_connectors(
                         &mut registry,
                         &scenario.run.environment,

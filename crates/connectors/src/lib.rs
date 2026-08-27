@@ -43,6 +43,8 @@ pub const WORKSPACE_SEARCH_TEXT_TOOL_NAME: &str = "workspace_search_text";
 pub const WORKSPACE_SEARCH_TEXT_TOOL_VERSION: &str = "1";
 pub const WORKSPACE_REPLACE_TEXT_TOOL_NAME: &str = "workspace_replace_text";
 pub const WORKSPACE_REPLACE_TEXT_TOOL_VERSION: &str = "1";
+pub const WORKSPACE_CREATE_FILE_TOOL_NAME: &str = "workspace_create_file";
+pub const WORKSPACE_CREATE_FILE_TOOL_VERSION: &str = "1";
 pub const MAX_WORKSPACE_PATH_BYTES: usize = 512;
 pub const MAX_WORKSPACE_FILE_BYTES: usize = 8 * 1024;
 pub const MAX_WORKSPACE_DIRECTORY_ENTRIES: usize = 64;
@@ -56,7 +58,8 @@ pub const MAX_WORKSPACE_SEARCH_DEPTH: usize = 12;
 pub const MAX_WORKSPACE_SEARCH_PREVIEW_BYTES: usize = 256;
 pub const MAX_WORKSPACE_EDIT_TEXT_BYTES: usize = 4 * 1024;
 pub const MAX_WORKSPACE_EDIT_FILE_BYTES: usize = 64 * 1024;
-pub const MAX_WORKSPACE_EDIT_RECEIPTS: usize = 1024;
+pub const MAX_WORKSPACE_CREATE_CONTENT_BYTES: usize = 12 * 1024;
+pub const MAX_WORKSPACE_MUTATION_RECEIPTS: usize = 1024;
 
 const WORKSPACE_SEARCH_IGNORED_DIRECTORIES: [&str; 6] = [
     ".git",
@@ -106,7 +109,7 @@ pub fn register_local_dev_connectors(
     Ok(canonical_root)
 }
 
-/// Register the bounded read-only workspace connectors for local development.
+/// Register the bounded workspace connectors for local development.
 ///
 /// The ambient path is resolved once at startup and converted into a rooted
 /// capability. Model-selected paths are always relative to that capability.
@@ -132,10 +135,14 @@ pub fn register_local_workspace_connectors(
     let replace_executor = WorkspaceReplaceTextExecutor {
         roots: Arc::clone(&executor.roots),
     };
+    let create_executor = WorkspaceCreateFileExecutor {
+        roots: Arc::clone(&executor.roots),
+    };
     registry.register(workspace_read_file_descriptor(), executor)?;
     registry.register(workspace_list_directory_descriptor(), list_executor)?;
     registry.register(workspace_search_text_descriptor(), search_executor)?;
     registry.register(workspace_replace_text_descriptor(), replace_executor)?;
+    registry.register(workspace_create_file_descriptor(), create_executor)?;
     Ok(canonical_root)
 }
 
@@ -253,20 +260,51 @@ pub fn workspace_replace_text_descriptor() -> ToolDescriptor {
     }
 }
 
+pub fn workspace_create_file_descriptor() -> ToolDescriptor {
+    ToolDescriptor {
+        name: WORKSPACE_CREATE_FILE_TOOL_NAME.into(),
+        version: WORKSPACE_CREATE_FILE_TOOL_VERSION.into(),
+        description: format!(
+            "Create one new UTF-8 file below an existing workspace directory without overwriting any path (maximum {MAX_WORKSPACE_CREATE_CONTENT_BYTES} content bytes)"
+        ),
+        effect: ToolEffect::LocalWrite,
+        sandbox_profile: SandboxProfile::WorkspaceWrite,
+        input_schema: ObjectSchema {
+            max_serialized_bytes: 16 * 1024,
+            properties: BTreeMap::from([
+                (
+                    "content".into(),
+                    ParameterSpec {
+                        parameter_type: ParameterType::String,
+                        required: true,
+                        min_length: Some(0),
+                        max_length: Some(MAX_WORKSPACE_CREATE_CONTENT_BYTES),
+                    },
+                ),
+                (
+                    "path".into(),
+                    ParameterSpec::required_string(MAX_WORKSPACE_PATH_BYTES),
+                ),
+            ]),
+        },
+    }
+}
+
 struct WorkspaceRoots {
     confined: Dir,
     inspection: Dir,
-    edit_state: Mutex<WorkspaceEditState>,
+    mutation_state: Mutex<WorkspaceMutationState>,
 }
 
 #[derive(Default)]
-struct WorkspaceEditState {
-    receipts: BTreeMap<String, WorkspaceEditReceipt>,
+struct WorkspaceMutationState {
+    receipts: BTreeMap<String, WorkspaceMutationReceipt>,
     receipt_order: VecDeque<String>,
 }
 
 #[derive(Clone)]
-struct WorkspaceEditReceipt {
+struct WorkspaceMutationReceipt {
+    tool: String,
     arguments_digest: String,
     output: ToolOutput,
 }
@@ -297,7 +335,7 @@ impl WorkspaceReadFileExecutor {
             roots: Arc::new(WorkspaceRoots {
                 confined,
                 inspection,
-                edit_state: Mutex::new(WorkspaceEditState::default()),
+                mutation_state: Mutex::new(WorkspaceMutationState::default()),
             }),
         })
     }
@@ -474,6 +512,53 @@ impl ToolExecutor for WorkspaceReplaceTextExecutor {
     }
 }
 
+#[derive(Clone)]
+struct WorkspaceCreateFileExecutor {
+    roots: Arc<WorkspaceRoots>,
+}
+
+impl ToolExecutor for WorkspaceCreateFileExecutor {
+    fn execute(&self, request: ExecutionRequest) -> ExecutionFuture<'_> {
+        let roots = Arc::clone(&self.roots);
+        Box::pin(async move {
+            if request.environment != LOCAL_DEV_ENVIRONMENT {
+                return Err(workspace_failure(
+                    "environment_denied",
+                    "Workspace file creation is restricted to local-development",
+                    false,
+                ));
+            }
+            let arguments: WorkspaceCreateFileArguments =
+                serde_json::from_value(request.call.arguments.clone()).map_err(|_| {
+                    workspace_failure(
+                        "invalid_arguments",
+                        "Workspace file creation arguments are invalid",
+                        false,
+                    )
+                })?;
+            let path = validate_workspace_path(&arguments.path)?;
+            if arguments.content.len() > MAX_WORKSPACE_CREATE_CONTENT_BYTES {
+                return Err(workspace_failure(
+                    "workspace_create_content_too_large",
+                    "Workspace file content exceeds the 12288-byte limit",
+                    false,
+                ));
+            }
+            tokio::task::spawn_blocking(move || {
+                create_workspace_file(&roots, &path, &arguments, &request.call)
+            })
+            .await
+            .map_err(|_| {
+                workspace_failure(
+                    "workspace_creator_join_failed",
+                    "The workspace file creator stopped unexpectedly",
+                    false,
+                )
+            })?
+        })
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkspaceReadArguments {
@@ -493,6 +578,13 @@ struct WorkspaceReplaceTextArguments {
     path: String,
     old_text: String,
     new_text: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceCreateFileArguments {
+    path: String,
+    content: String,
 }
 
 fn validate_workspace_path(path: &str) -> Result<PathBuf, ExecutorError> {
@@ -524,7 +616,7 @@ fn validate_workspace_path(path: &str) -> Result<PathBuf, ExecutorError> {
 }
 
 fn is_workspace_internal_entry(name: &str) -> bool {
-    name.starts_with(".zeus-replace-")
+    name.starts_with(".zeus-tool-")
 }
 
 fn validate_workspace_directory_path(path: &str) -> Result<PathBuf, ExecutorError> {
@@ -953,24 +1045,178 @@ fn workspace_search_preview(line: &str, query: &str) -> String {
     preview
 }
 
+fn create_workspace_file(
+    roots: &WorkspaceRoots,
+    path: &Path,
+    arguments: &WorkspaceCreateFileArguments,
+    call: &ToolCall,
+) -> Result<ToolOutput, ExecutorError> {
+    let mut mutation_state = roots.mutation_state.lock().map_err(|_| {
+        workspace_failure(
+            "workspace_mutation_state_poisoned",
+            "The workspace mutation state is unavailable",
+            false,
+        )
+    })?;
+    if let Some(receipt) = mutation_state.receipts.get(&call.call_id) {
+        if receipt.tool != call.tool || receipt.arguments_digest != call.arguments_digest {
+            return Err(workspace_failure(
+                "workspace_create_idempotency_conflict",
+                "The workspace create call id is already bound to a different tool or arguments",
+                false,
+            ));
+        }
+        let mut output = receipt.output.clone();
+        output.replayed = true;
+        return Ok(output);
+    }
+
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if parent_path != Path::new(".") {
+        reject_workspace_create_parent_symlinks(&roots.inspection, parent_path)?;
+    }
+    let file_name = path.file_name().ok_or_else(invalid_workspace_path)?;
+    let parent = roots
+        .confined
+        .open_dir(parent_path)
+        .map_err(workspace_create_parent_error)?;
+    match parent.symlink_metadata(file_name) {
+        Ok(_) => {
+            return Err(workspace_failure(
+                "workspace_create_target_exists",
+                "Workspace file creation never overwrites an existing path",
+                false,
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(workspace_create_io(error)),
+    }
+
+    let temp_sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp_name = format!(
+        ".zeus-tool-create-{}-{}-{temp_sequence}.tmp",
+        call.call_id,
+        std::process::id()
+    );
+    let publish_result = (|| -> Result<(), ExecutorError> {
+        let mut options = CapOpenOptions::new();
+        options.write(true).create_new(true);
+        let mut temp = parent
+            .open_with(&temp_name, &options)
+            .map_err(workspace_create_io)?;
+        temp.write_all(arguments.content.as_bytes())
+            .map_err(workspace_create_io)?;
+        temp.sync_all().map_err(workspace_create_io)?;
+        parent
+            .hard_link(&temp_name, &parent, file_name)
+            .map_err(workspace_create_publish_error)?;
+        let _ = parent.remove_file(&temp_name);
+        sync_cap_directory(&parent).map_err(workspace_create_io)
+    })();
+    if let Err(error) = publish_result {
+        let _ = parent.remove_file(&temp_name);
+        return Err(error);
+    }
+
+    let output = ToolOutput {
+        value: json!({
+            "path": arguments.path,
+            "bytes": arguments.content.len(),
+            "created": true,
+        }),
+        replayed: false,
+        provider_request_id: Some(call.call_id.clone()),
+    };
+    remember_workspace_mutation_receipt(
+        &mut mutation_state,
+        call.call_id.clone(),
+        WorkspaceMutationReceipt {
+            tool: call.tool.clone(),
+            arguments_digest: call.arguments_digest.clone(),
+            output: output.clone(),
+        },
+    );
+    Ok(output)
+}
+
+fn workspace_create_parent_error(error: io::Error) -> ExecutorError {
+    match error.kind() {
+        io::ErrorKind::NotFound => workspace_failure(
+            "workspace_create_parent_not_found",
+            "Workspace file creation requires an existing parent directory",
+            false,
+        ),
+        io::ErrorKind::PermissionDenied => workspace_failure(
+            "workspace_create_parent_denied",
+            "The workspace file parent directory is not writable",
+            false,
+        ),
+        io::ErrorKind::NotADirectory => workspace_failure(
+            "workspace_create_parent_not_directory",
+            "Workspace file creation requires every parent path to be a directory",
+            false,
+        ),
+        _ => workspace_failure(
+            "workspace_create_parent_failed",
+            "The workspace file parent directory could not be opened",
+            true,
+        ),
+    }
+}
+
+fn workspace_create_io(error: io::Error) -> ExecutorError {
+    match error.kind() {
+        io::ErrorKind::PermissionDenied => workspace_failure(
+            "workspace_create_denied",
+            "The workspace file could not be created in its parent directory",
+            false,
+        ),
+        io::ErrorKind::AlreadyExists => workspace_failure(
+            "workspace_create_temp_conflict",
+            "The workspace create temporary file already exists",
+            true,
+        ),
+        _ => workspace_failure(
+            "workspace_create_failed",
+            "The workspace file could not be prepared atomically",
+            true,
+        ),
+    }
+}
+
+fn workspace_create_publish_error(error: io::Error) -> ExecutorError {
+    if error.kind() == io::ErrorKind::AlreadyExists {
+        workspace_failure(
+            "workspace_create_target_exists",
+            "Workspace file creation never overwrites an existing path",
+            false,
+        )
+    } else {
+        workspace_create_io(error)
+    }
+}
+
 fn replace_workspace_text(
     roots: &WorkspaceRoots,
     path: &Path,
     arguments: &WorkspaceReplaceTextArguments,
     call: &ToolCall,
 ) -> Result<ToolOutput, ExecutorError> {
-    let mut edit_state = roots.edit_state.lock().map_err(|_| {
+    let mut mutation_state = roots.mutation_state.lock().map_err(|_| {
         workspace_failure(
-            "workspace_editor_poisoned",
-            "The workspace editor state is unavailable",
+            "workspace_mutation_state_poisoned",
+            "The workspace mutation state is unavailable",
             false,
         )
     })?;
-    if let Some(receipt) = edit_state.receipts.get(&call.call_id) {
-        if receipt.arguments_digest != call.arguments_digest {
+    if let Some(receipt) = mutation_state.receipts.get(&call.call_id) {
+        if receipt.tool != call.tool || receipt.arguments_digest != call.arguments_digest {
             return Err(workspace_failure(
                 "workspace_edit_idempotency_conflict",
-                "The workspace edit call id is already bound to different arguments",
+                "The workspace edit call id is already bound to a different tool or arguments",
                 false,
             ));
         }
@@ -1027,7 +1273,7 @@ fn replace_workspace_text(
 
     let temp_sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temp_name = format!(
-        ".zeus-replace-{}-{}-{temp_sequence}.tmp",
+        ".zeus-tool-replace-{}-{}-{temp_sequence}.tmp",
         call.call_id,
         std::process::id()
     );
@@ -1054,7 +1300,7 @@ fn replace_workspace_text(
         parent
             .rename(&temp_name, &parent, file_name)
             .map_err(workspace_edit_io)?;
-        sync_cap_directory(&parent)
+        sync_cap_directory(&parent).map_err(workspace_edit_io)
     })();
     if let Err(error) = write_result {
         let _ = parent.remove_file(&temp_name);
@@ -1071,10 +1317,11 @@ fn replace_workspace_text(
         replayed: false,
         provider_request_id: Some(call.call_id.clone()),
     };
-    remember_workspace_edit_receipt(
-        &mut edit_state,
+    remember_workspace_mutation_receipt(
+        &mut mutation_state,
         call.call_id.clone(),
-        WorkspaceEditReceipt {
+        WorkspaceMutationReceipt {
+            tool: call.tool.clone(),
             arguments_digest: call.arguments_digest.clone(),
             output: output.clone(),
         },
@@ -1082,18 +1329,18 @@ fn replace_workspace_text(
     Ok(output)
 }
 
-fn remember_workspace_edit_receipt(
-    edit_state: &mut WorkspaceEditState,
+fn remember_workspace_mutation_receipt(
+    mutation_state: &mut WorkspaceMutationState,
     call_id: String,
-    receipt: WorkspaceEditReceipt,
+    receipt: WorkspaceMutationReceipt,
 ) {
-    if edit_state.receipts.len() == MAX_WORKSPACE_EDIT_RECEIPTS
-        && let Some(expired_call_id) = edit_state.receipt_order.pop_front()
+    if mutation_state.receipts.len() == MAX_WORKSPACE_MUTATION_RECEIPTS
+        && let Some(expired_call_id) = mutation_state.receipt_order.pop_front()
     {
-        edit_state.receipts.remove(&expired_call_id);
+        mutation_state.receipts.remove(&expired_call_id);
     }
-    edit_state.receipt_order.push_back(call_id.clone());
-    edit_state.receipts.insert(call_id, receipt);
+    mutation_state.receipt_order.push_back(call_id.clone());
+    mutation_state.receipts.insert(call_id, receipt);
 }
 
 fn read_workspace_edit_file(
@@ -1167,14 +1414,12 @@ fn workspace_edit_io(error: io::Error) -> ExecutorError {
 }
 
 #[cfg(unix)]
-fn sync_cap_directory(directory: &Dir) -> Result<(), ExecutorError> {
-    Dir::reopen_dir(directory)
-        .and_then(|directory| directory.into_std_file().sync_all())
-        .map_err(workspace_edit_io)
+fn sync_cap_directory(directory: &Dir) -> io::Result<()> {
+    Dir::reopen_dir(directory).and_then(|directory| directory.into_std_file().sync_all())
 }
 
 #[cfg(not(unix))]
-fn sync_cap_directory(_directory: &Dir) -> Result<(), ExecutorError> {
+fn sync_cap_directory(_directory: &Dir) -> io::Result<()> {
     Ok(())
 }
 
@@ -1192,6 +1437,34 @@ fn reject_workspace_symlinks(root: &Dir, path: &Path) -> Result<(), ExecutorErro
             return Err(workspace_failure(
                 "workspace_symlink_denied",
                 "Workspace reads do not follow symbolic links",
+                false,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_workspace_create_parent_symlinks(root: &Dir, path: &Path) -> Result<(), ExecutorError> {
+    let mut prefix = PathBuf::new();
+    for component in path.components() {
+        let Component::Normal(component) = component else {
+            return Err(invalid_workspace_path());
+        };
+        prefix.push(component);
+        let metadata = root
+            .symlink_metadata(&prefix)
+            .map_err(workspace_create_parent_error)?;
+        if metadata.file_type().is_symlink() {
+            return Err(workspace_failure(
+                "workspace_symlink_denied",
+                "Workspace tools do not follow symbolic links",
+                false,
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(workspace_failure(
+                "workspace_create_parent_not_directory",
+                "Workspace file creation requires every parent path to be a directory",
                 false,
             ));
         }
@@ -1584,6 +1857,23 @@ mod tests {
         }
     }
 
+    fn workspace_create_call(step: u32, path: &str, content: &str) -> ToolCall {
+        let arguments = json!({
+            "path": path,
+            "content": content,
+        });
+        ToolCall {
+            call_id: stable_call_id("run-1", 1, step, WORKSPACE_CREATE_FILE_TOOL_NAME).unwrap(),
+            tool: WORKSPACE_CREATE_FILE_TOOL_NAME.into(),
+            tool_version: WORKSPACE_CREATE_FILE_TOOL_VERSION.into(),
+            arguments_digest: arguments_digest(&arguments),
+            arguments,
+            effect: ToolEffect::LocalWrite,
+            sandbox_profile: SandboxProfile::WorkspaceWrite,
+            executor_status: ToolExecutorStatus::Available,
+        }
+    }
+
     #[test]
     fn workspace_search_preview_keeps_a_late_utf8_match_within_the_byte_limit() {
         let line = format!("{}目标needle{}", "前".repeat(120), "后".repeat(120));
@@ -1596,13 +1886,14 @@ mod tests {
     }
 
     #[test]
-    fn workspace_edit_receipts_evict_in_insertion_order_at_the_hard_limit() {
-        let mut state = WorkspaceEditState::default();
-        for index in 0..=MAX_WORKSPACE_EDIT_RECEIPTS {
-            remember_workspace_edit_receipt(
+    fn workspace_mutation_receipts_evict_in_insertion_order_at_the_hard_limit() {
+        let mut state = WorkspaceMutationState::default();
+        for index in 0..=MAX_WORKSPACE_MUTATION_RECEIPTS {
+            remember_workspace_mutation_receipt(
                 &mut state,
                 format!("call-{index}"),
-                WorkspaceEditReceipt {
+                WorkspaceMutationReceipt {
+                    tool: WORKSPACE_REPLACE_TEXT_TOOL_NAME.into(),
                     arguments_digest: format!("digest-{index}"),
                     output: ToolOutput {
                         value: json!({"index": index}),
@@ -1613,14 +1904,14 @@ mod tests {
             );
         }
 
-        assert_eq!(state.receipts.len(), MAX_WORKSPACE_EDIT_RECEIPTS);
-        assert_eq!(state.receipt_order.len(), MAX_WORKSPACE_EDIT_RECEIPTS);
+        assert_eq!(state.receipts.len(), MAX_WORKSPACE_MUTATION_RECEIPTS);
+        assert_eq!(state.receipt_order.len(), MAX_WORKSPACE_MUTATION_RECEIPTS);
         assert!(!state.receipts.contains_key("call-0"));
         assert_eq!(state.receipt_order.front().unwrap(), "call-1");
         assert!(
             state
                 .receipts
-                .contains_key(&format!("call-{MAX_WORKSPACE_EDIT_RECEIPTS}"))
+                .contains_key(&format!("call-{MAX_WORKSPACE_MUTATION_RECEIPTS}"))
         );
     }
 
@@ -1658,6 +1949,11 @@ mod tests {
         assert!(
             registry
                 .descriptor(WORKSPACE_REPLACE_TEXT_TOOL_NAME)
+                .is_none()
+        );
+        assert!(
+            registry
+                .descriptor(WORKSPACE_CREATE_FILE_TOOL_NAME)
                 .is_none()
         );
     }
@@ -1719,7 +2015,7 @@ mod tests {
             "safe//file.txt",
             "safe.txt/",
             "safe\\file.txt",
-            ".zeus-replace-hidden.tmp",
+            ".zeus-tool-hidden.tmp",
         ] {
             let error = registry
                 .dispatch(workspace_call(path), LOCAL_DEV_ENVIRONMENT)
@@ -1739,7 +2035,7 @@ mod tests {
         fs::create_dir(temp.0.join("src")).unwrap();
         fs::write(temp.0.join("z.txt"), "z").unwrap();
         fs::write(temp.0.join("a.txt"), "a").unwrap();
-        fs::write(temp.0.join(".zeus-replace-hidden.tmp"), "hidden").unwrap();
+        fs::write(temp.0.join(".zeus-tool-hidden.tmp"), "hidden").unwrap();
         fs::create_dir(temp.0.join("too-many")).unwrap();
         for index in 0..=MAX_WORKSPACE_DIRECTORY_ENTRIES {
             fs::write(
@@ -2008,7 +2304,110 @@ mod tests {
                 .unwrap()
                 .file_name()
                 .to_string_lossy()
-                .starts_with(".zeus-replace-")
+                .starts_with(".zeus-tool-")
+        }));
+    }
+
+    #[tokio::test]
+    async fn workspace_create_is_atomic_create_new_and_idempotent() {
+        let temp = TestDirectory::new();
+        fs::create_dir(temp.0.join("src")).unwrap();
+        fs::write(temp.0.join("existing.txt"), "preserve me\n").unwrap();
+        let mut registry = ToolRegistry::new();
+        register_local_workspace_connectors(&mut registry, LOCAL_DEV_ENVIRONMENT, &temp.0).unwrap();
+
+        let call = workspace_create_call(20, "src/generated.rs", "pub fn generated() {}\n");
+        let first = registry
+            .dispatch(call.clone(), LOCAL_DEV_ENVIRONMENT)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.value,
+            serde_json::json!({
+                "path": "src/generated.rs",
+                "bytes": 22,
+                "created": true,
+            })
+        );
+        assert!(!first.replayed);
+        assert_eq!(
+            fs::read_to_string(temp.0.join("src/generated.rs")).unwrap(),
+            "pub fn generated() {}\n"
+        );
+
+        let replay = registry
+            .dispatch(call, LOCAL_DEV_ENVIRONMENT)
+            .await
+            .unwrap();
+        assert_eq!(replay.value, first.value);
+        assert!(replay.replayed);
+
+        let idempotency_conflict = registry
+            .dispatch(
+                workspace_create_call(20, "src/generated.rs", "different\n"),
+                LOCAL_DEV_ENVIRONMENT,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            idempotency_conflict,
+            RegistryError::Executor(ExecutorError::Failed { ref code, .. })
+                if code == "workspace_create_idempotency_conflict"
+        ));
+
+        let existing = registry
+            .dispatch(
+                workspace_create_call(21, "existing.txt", "overwrite\n"),
+                LOCAL_DEV_ENVIRONMENT,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            existing,
+            RegistryError::Executor(ExecutorError::Failed { ref code, .. })
+                if code == "workspace_create_target_exists"
+        ));
+        assert_eq!(
+            fs::read_to_string(temp.0.join("existing.txt")).unwrap(),
+            "preserve me\n"
+        );
+
+        let missing_parent = registry
+            .dispatch(
+                workspace_create_call(22, "missing/file.txt", "content\n"),
+                LOCAL_DEV_ENVIRONMENT,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                missing_parent,
+                RegistryError::Executor(ExecutorError::Failed { ref code, .. })
+                    if code == "workspace_create_parent_not_found"
+            ),
+            "unexpected missing-parent error: {missing_parent:?}"
+        );
+
+        let oversized = registry
+            .dispatch(
+                workspace_create_call(23, "oversized.txt", &"界".repeat(4097)),
+                LOCAL_DEV_ENVIRONMENT,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            oversized,
+            RegistryError::Executor(ExecutorError::Failed { ref code, .. })
+                if code == "workspace_create_content_too_large"
+        ));
+        assert!(!temp.0.join("oversized.txt").exists());
+
+        assert!(fs::read_dir(temp.0.join("src")).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".zeus-tool-")
         }));
     }
 
@@ -2062,6 +2461,20 @@ mod tests {
                 if code == "workspace_symlink_denied"
         ));
         assert_eq!(fs::read_to_string(&outside).unwrap(), "outside secret");
+
+        let create = registry
+            .dispatch(
+                workspace_create_call(24, "nested/linked-dir/created.txt", "inside\n"),
+                LOCAL_DEV_ENVIRONMENT,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            create,
+            RegistryError::Executor(ExecutorError::Failed { ref code, .. })
+                if code == "workspace_symlink_denied"
+        ));
+        assert!(!temp.0.parent().unwrap().join("created.txt").exists());
 
         for path in ["linked-file", "nested/linked-dir/outside.txt"] {
             let error = registry
