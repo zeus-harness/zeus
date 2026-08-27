@@ -34,14 +34,14 @@ use crate::operation::{OperationClass, OperationLimiter};
 use crate::{
     AccountAuditArchiveState, AccountAuditCheckpointCommit, AccountAuditEvent, AccountAuditPage,
     AccountAuditPolicy, AccountAuditRollup, AccountAuditState, AccountId, AgentModelJob, AgentTurn,
-    AgentTurnEnqueueResponse, AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthSessionId,
-    AuthzContext, BootstrapOwnerCommit, BoundedRunRead, ClaimOutcome, CommitOutcome,
-    CreateMemberCommit, CreateMemberResult, DispatchCompleteCommit, DispatchContext, DispatchJob,
-    DispatchJobSpec, DispatchRecoveryCommit, DispatchRejection, DispatchStartCommit,
-    DispatchStatus, InFlightWorkSummary, MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit,
-    MemberSetupResult, MemberTransitionResult, MembershipRevision, MembershipRole,
-    RecoveredSessionTurn, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit, ReplyJob,
-    ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
+    AgentTurnEnqueueResponse, AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal,
+    AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, BoundedRunRead,
+    ClaimOutcome, CommitOutcome, CreateMemberCommit, CreateMemberResult, DispatchCompleteCommit,
+    DispatchContext, DispatchJob, DispatchJobSpec, DispatchRecoveryCommit, DispatchRejection,
+    DispatchStartCommit, DispatchStatus, InFlightWorkSummary, MEMBER_SETUP_TOKEN_TTL_SECONDS,
+    MemberSetupCommit, MemberSetupResult, MemberTransitionResult, MembershipRevision,
+    MembershipRole, RecoveredSessionTurn, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit,
+    ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
     ReplySuccessCommit, ReviewCommit, ReviewContext, ReviewReceipt, RotateMemberSetupTokenCommit,
     RotateMemberSetupTokenResult, RunSnapshot, RuntimeIdentity, SessionSummaryPage,
     SqliteOperationLimits, SqlitePhysicalLimits, StorageError, StorageLimits, StoredCredential,
@@ -50,7 +50,7 @@ use crate::{
     UpdateAccountAuditPolicyCommit,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 21;
+const CURRENT_SCHEMA_VERSION: i64 = 22;
 const LOCAL_ACCOUNT_ID: &str = "acc_local";
 const EVENT_PAYLOAD_VERSION_V1: i64 = 1;
 const EVENT_PAYLOAD_VERSION_V2: i64 = 2;
@@ -78,6 +78,23 @@ const MIGRATION_0018: &str = include_str!("../migrations/0018_agent_tool_complet
 const MIGRATION_0019: &str = include_str!("../migrations/0019_agent_deployment_manifest.sql");
 const MIGRATION_0020: &str = include_str!("../migrations/0020_agent_execution_ledger.sql");
 const MIGRATION_0021: &str = include_str!("../migrations/0021_agent_operation_claims.sql");
+const MIGRATION_0022: &str = include_str!("../migrations/0022_agent_knowledge_context.sql");
+const MIGRATION_0022_TRIGGER_NAMES: &[&str] = &[
+    "knowledge_corpus_revisions_reject_update",
+    "knowledge_corpus_revisions_reject_delete",
+    "agent_knowledge_contexts_reject_update",
+    "agent_knowledge_contexts_reject_delete",
+    "agent_knowledge_legacy_boundary_reject_insert",
+    "agent_knowledge_legacy_boundary_reject_update",
+    "agent_knowledge_legacy_boundary_reject_delete",
+    "agent_knowledge_legacy_agents_reject_insert",
+    "agent_knowledge_legacy_agents_reject_update",
+    "agent_knowledge_legacy_agents_reject_delete",
+    "agent_turns_require_knowledge_context",
+    "agent_turns_reject_identity_update",
+    "agent_model_jobs_require_current_step",
+    "agent_model_jobs_reject_input_update",
+];
 const RECOVERY_BATCH_LIMIT: i64 = 64;
 const AUTH_SESSION_CLEANUP_BATCH_LIMIT: i64 = 64;
 const BOOTSTRAP_AUDIT_ROLLUP_BATCH_LIMIT: i64 = 64;
@@ -895,6 +912,37 @@ impl SqliteStore {
                         )
                     })
             })
+        })
+        .await
+    }
+
+    /// Resolve an exact Agent start replay before rebuilding server-derived
+    /// history, knowledge selection, or provider request bytes.
+    pub async fn agent_start_receipt_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        request: &StartTurnRequest,
+        idempotency_key: &str,
+        probe: &AgentTurnReceiptProbe,
+    ) -> Result<Option<AgentTurnEnqueueResponse>, StorageError> {
+        let context = validated_authz_context(context)?;
+        if probe.authz != context {
+            return Err(StorageError::SessionNotFound(session_id.to_owned()));
+        }
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        let key = normalized_key(idempotency_key)?.to_owned();
+        let request = request.clone();
+        let probe = probe.clone();
+        self.with_connection(move |connection| {
+            load_agent_start_receipt_for_actor(
+                connection,
+                &context,
+                &session_id,
+                &request,
+                &key,
+                &probe,
+            )
         })
         .await
     }
@@ -2830,7 +2878,6 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
             "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
             params![20, applied_at],
         )?;
-        execution::verify_agent_execution_integrity(&transaction)?;
     }
     if current < 21 {
         transaction.execute_batch(MIGRATION_0021)?;
@@ -2838,6 +2885,23 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
             "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
             params![21, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
+    }
+    if current < 22 {
+        transaction.execute_batch(MIGRATION_0022)?;
+        agent::seal_legacy_agent_knowledge_boundary(&transaction)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![22, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
+    // The execution verifier now understands the v22 knowledge binding. Run
+    // it only after every missing schema step has been installed so upgrades
+    // from v19 and older never query a column that does not exist yet. This
+    // remains inside the migration transaction, so a corrupt legacy ledger
+    // still rolls the entire upgrade back.
+    if current < CURRENT_SCHEMA_VERSION {
+        agent::verify_agent_knowledge_context_integrity(&transaction)?;
+        execution::verify_agent_execution_integrity(&transaction)?;
     }
     validate_configured_account_audit_policies(&transaction, limits)?;
     compact_existing_bootstrap_audit_to_capacity(&transaction, &now(), limits)?;
@@ -3364,6 +3428,57 @@ fn validate_migrated_run_ledgers(connection: &Connection) -> Result<(), StorageE
     Ok(())
 }
 
+fn migration_trigger_definition<'a>(
+    migration: &'a str,
+    name: &str,
+) -> Result<&'a str, StorageError> {
+    let marker = format!("CREATE TRIGGER {name}\n");
+    let start = migration.find(&marker).ok_or_else(|| {
+        StorageError::CorruptData(format!(
+            "the authoritative migration is missing trigger `{name}`"
+        ))
+    })?;
+    let trigger = &migration[start..];
+    let end = trigger.find("\nEND;").ok_or_else(|| {
+        StorageError::CorruptData(format!(
+            "the authoritative migration trigger `{name}` is unterminated"
+        ))
+    })? + "\nEND;".len();
+    Ok(&trigger[..end])
+}
+
+fn normalized_schema_sql(sql: &str) -> String {
+    sql.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_end_matches(';')
+        .to_owned()
+}
+
+fn verify_migration_trigger_definitions(
+    connection: &Connection,
+    migration: &str,
+    names: &[&str],
+) -> Result<(), StorageError> {
+    for name in names {
+        let expected = migration_trigger_definition(migration, name)?;
+        let expected = normalized_schema_sql(expected);
+        let stored = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if stored.as_deref().map(normalized_schema_sql).as_deref() != Some(expected.as_str()) {
+            return Err(StorageError::CorruptData(format!(
+                "durability trigger `{name}` differs from the authoritative migration"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn readiness(
     connection: &Connection,
     expects_wal: bool,
@@ -3437,12 +3552,14 @@ fn readiness(
                'agent_tool_calls', 'agent_review_receipts',
                'agent_deployment_manifests', 'agent_run_epochs',
                'agent_execution_events', 'agent_execution_heads',
-               'agent_operation_claims'
+               'agent_operation_claims', 'knowledge_corpus_revisions',
+               'agent_knowledge_contexts', 'agent_knowledge_legacy_boundary',
+               'agent_knowledge_legacy_agents'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if table_count != 36 {
+    if table_count != 40 {
         return Err(StorageError::CorruptData(
             "one or more required tables are missing".into(),
         ));
@@ -3526,6 +3643,44 @@ fn readiness(
     if agent_deployment_manifest_columns != 4 || agent_manifest_binding_columns != 1 {
         return Err(StorageError::CorruptData(
             "Agent deployment manifest schema is missing".into(),
+        ));
+    }
+
+    let agent_knowledge_columns: i64 = connection.query_row(
+        r#"SELECT
+               (SELECT COUNT(*) FROM pragma_table_info('knowledge_corpus_revisions')
+                WHERE name IN (
+                    'account_id', 'digest', 'schema_version', 'entry_count',
+                    'aggregate_entry_bytes', 'envelope_json', 'created_at'
+                ))
+             + (SELECT COUNT(*) FROM pragma_table_info('agent_knowledge_contexts')
+                WHERE name IN (
+                    'digest', 'schema_version', 'account_id', 'actor_user_id',
+                    'actor_membership_revision', 'session_id', 'turn_id',
+                    'agent_id', 'initial_model_job_id', 'corpus_digest',
+                    'snapshot_digest', 'query_digest', 'context_digest',
+                    'context_bytes', 'canonical_context', 'snapshot_envelope_json',
+                    'binding_json', 'created_at'
+                ))
+             + (SELECT COUNT(*) FROM pragma_table_info('agent_turns')
+                WHERE name = 'knowledge_context_digest')
+             + (SELECT COUNT(*) FROM pragma_table_info('agent_model_jobs')
+                WHERE name = 'knowledge_context_digest')
+             + (SELECT COUNT(*) FROM pragma_table_info('agent_knowledge_legacy_boundary')
+                WHERE name IN (
+                    'singleton', 'schema_version', 'agent_count', 'set_digest'
+                ))
+             + (SELECT COUNT(*) FROM pragma_table_info('agent_knowledge_legacy_agents')
+                WHERE name IN (
+                    'agent_id', 'initial_model_job_id',
+                    'execution_origin_fact_digest'
+                ))"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if agent_knowledge_columns != 34 {
+        return Err(StorageError::CorruptData(
+            "Agent knowledge context schema is missing".into(),
         ));
     }
 
@@ -3650,14 +3805,44 @@ fn readiness(
                'agent_execution_events_operation_idx',
                'agent_operation_claims_one_active_idx',
                'agent_operation_claims_one_prepared_holder_idx',
-               'agent_operation_claims_prepared_expiry_idx'
+               'agent_operation_claims_prepared_expiry_idx',
+               'knowledge_corpus_revisions_account_created_idx',
+               'agent_knowledge_contexts_account_created_idx',
+               'agent_knowledge_contexts_corpus_idx',
+               'agent_turns_knowledge_context_idx',
+               'agent_model_jobs_knowledge_context_idx',
+               'agent_tool_calls_one_per_model_step_idx'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if point_query_indexes != 60 {
+    if point_query_indexes != 66 {
         return Err(StorageError::CorruptData(
             "one or more point-query indexes are missing".into(),
+        ));
+    }
+    let one_tool_call_per_model_step_index: i64 = connection.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1
+               FROM pragma_index_list('agent_tool_calls') AS index_list
+               WHERE index_list.name = 'agent_tool_calls_one_per_model_step_idx'
+                 AND index_list."unique" = 1
+                 AND index_list.partial = 0
+                 AND (SELECT COUNT(*)
+                      FROM pragma_index_info('agent_tool_calls_one_per_model_step_idx')) = 2
+                 AND (SELECT name
+                      FROM pragma_index_info('agent_tool_calls_one_per_model_step_idx')
+                      WHERE seqno = 0) = 'agent_id'
+                 AND (SELECT name
+                      FROM pragma_index_info('agent_tool_calls_one_per_model_step_idx')
+                      WHERE seqno = 1) = 'model_step'
+           )"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if one_tool_call_per_model_step_index != 1 {
+        return Err(StorageError::CorruptData(
+            "Agent tool-call model-step uniqueness is not enforced".into(),
         ));
     }
 
@@ -3780,17 +3965,29 @@ fn readiness(
                'agent_operation_claims_reject_identity_update',
                'agent_operation_claims_enforce_forward_transition',
                'agent_operation_claims_reject_delete',
+               'knowledge_corpus_revisions_reject_update',
+               'knowledge_corpus_revisions_reject_delete',
+               'agent_knowledge_contexts_reject_update',
+               'agent_knowledge_contexts_reject_delete',
+               'agent_knowledge_legacy_boundary_reject_insert',
+               'agent_knowledge_legacy_boundary_reject_update',
+               'agent_knowledge_legacy_boundary_reject_delete',
+               'agent_knowledge_legacy_agents_reject_insert',
+               'agent_knowledge_legacy_agents_reject_update',
+               'agent_knowledge_legacy_agents_reject_delete',
+               'agent_turns_require_knowledge_context',
                'schema_migrations_reject_update',
                'schema_migrations_reject_delete'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 118 {
+    if trigger_count != 129 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
         ));
     }
+    verify_migration_trigger_definitions(connection, MIGRATION_0022, MIGRATION_0022_TRIGGER_NAMES)?;
 
     let agent_pending_call_fk: i64 = connection.query_row(
         r#"SELECT COUNT(*)
@@ -3822,6 +4019,122 @@ fn readiness(
     if agent_manifest_fk != 1 {
         return Err(StorageError::CorruptData(
             "the Agent deployment manifest foreign key is missing".into(),
+        ));
+    }
+
+    let agent_knowledge_binding_fks: i64 = connection.query_row(
+        r#"SELECT
+               (SELECT COUNT(*) FROM pragma_foreign_key_list('agent_turns')
+                WHERE "table" = 'agent_knowledge_contexts'
+                  AND "from" = 'knowledge_context_digest'
+                  AND "to" = 'digest'
+                  AND on_delete = 'RESTRICT')
+             + (SELECT COUNT(*) FROM pragma_foreign_key_list('agent_model_jobs')
+                WHERE "table" = 'agent_knowledge_contexts'
+                  AND "from" = 'knowledge_context_digest'
+                  AND "to" = 'digest'
+                  AND on_delete = 'RESTRICT')"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if agent_knowledge_binding_fks != 2 {
+        return Err(StorageError::CorruptData(
+            "one or more Agent knowledge binding foreign keys are missing".into(),
+        ));
+    }
+
+    let agent_knowledge_direct_fks: i64 = connection.query_row(
+        r#"SELECT
+               (SELECT COUNT(*) FROM pragma_foreign_key_list('knowledge_corpus_revisions')
+                WHERE "table" = 'accounts'
+                  AND "from" = 'account_id' AND "to" = 'id'
+                  AND on_delete = 'RESTRICT')
+             + (SELECT COUNT(*) FROM pragma_foreign_key_list('agent_knowledge_contexts')
+                WHERE "table" = 'accounts'
+                  AND "from" = 'account_id' AND "to" = 'id'
+                  AND on_delete = 'RESTRICT')
+             + (SELECT COUNT(*) FROM pragma_foreign_key_list('agent_knowledge_contexts')
+                WHERE "table" = 'users'
+                  AND "from" = 'actor_user_id' AND "to" = 'id'
+                  AND on_delete = 'RESTRICT')"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if agent_knowledge_direct_fks != 3 {
+        return Err(StorageError::CorruptData(
+            "one or more Agent knowledge authority foreign keys are missing".into(),
+        ));
+    }
+
+    let agent_knowledge_legacy_fks: i64 = connection.query_row(
+        r#"SELECT COUNT(*) FROM pragma_foreign_key_list('agent_knowledge_legacy_agents')
+           WHERE ("table" = 'agent_turns'
+                  AND "from" = 'agent_id' AND "to" = 'id'
+                  AND on_delete = 'RESTRICT')
+              OR ("table" = 'agent_model_jobs'
+                  AND "from" = 'initial_model_job_id' AND "to" = 'id'
+                  AND on_delete = 'RESTRICT')"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if agent_knowledge_legacy_fks != 2 {
+        return Err(StorageError::CorruptData(
+            "the frozen legacy Agent knowledge boundary foreign keys are missing".into(),
+        ));
+    }
+
+    let agent_knowledge_composite_fks: i64 = connection.query_row(
+        r#"SELECT
+               (SELECT COUNT(*)
+                FROM pragma_foreign_key_list('agent_knowledge_contexts') account_column
+                JOIN pragma_foreign_key_list('agent_knowledge_contexts') digest_column
+                  ON digest_column.id = account_column.id
+                WHERE account_column."table" = 'knowledge_corpus_revisions'
+                  AND account_column."from" = 'account_id'
+                  AND account_column."to" = 'account_id'
+                  AND digest_column."from" = 'corpus_digest'
+                  AND digest_column."to" = 'digest'
+                  AND account_column.on_delete = 'RESTRICT'
+                  AND digest_column.on_delete = 'RESTRICT')
+             + (SELECT COUNT(*)
+                FROM pragma_foreign_key_list('agent_knowledge_contexts') account_column
+                JOIN pragma_foreign_key_list('agent_knowledge_contexts') identity_column
+                  ON identity_column.id = account_column.id
+                WHERE account_column."table" = 'account_memberships'
+                  AND account_column."from" = 'account_id'
+                  AND account_column."to" = 'account_id'
+                  AND identity_column."from" = 'actor_user_id'
+                  AND identity_column."to" = 'user_id'
+                  AND account_column.on_delete = 'RESTRICT'
+                  AND identity_column.on_delete = 'RESTRICT')
+             + (SELECT COUNT(*)
+                FROM pragma_foreign_key_list('agent_knowledge_contexts') account_column
+                JOIN pragma_foreign_key_list('agent_knowledge_contexts') identity_column
+                  ON identity_column.id = account_column.id
+                WHERE account_column."table" = 'sessions'
+                  AND account_column."from" = 'account_id'
+                  AND account_column."to" = 'account_id'
+                  AND identity_column."from" = 'session_id'
+                  AND identity_column."to" = 'id'
+                  AND account_column.on_delete = 'RESTRICT'
+                  AND identity_column.on_delete = 'RESTRICT')
+             + (SELECT COUNT(*)
+                FROM pragma_foreign_key_list('agent_knowledge_contexts') session_column
+                JOIN pragma_foreign_key_list('agent_knowledge_contexts') turn_column
+                  ON turn_column.id = session_column.id
+                WHERE session_column."table" = 'session_turns'
+                  AND session_column."from" = 'session_id'
+                  AND session_column."to" = 'session_id'
+                  AND turn_column."from" = 'turn_id'
+                  AND turn_column."to" = 'id'
+                  AND session_column.on_delete = 'RESTRICT'
+                  AND turn_column.on_delete = 'RESTRICT')"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if agent_knowledge_composite_fks != 4 {
+        return Err(StorageError::CorruptData(
+            "one or more Agent knowledge composite foreign keys are missing".into(),
         ));
     }
 
@@ -4039,6 +4352,34 @@ fn readiness(
                   OR job.turn_id IS NOT agent.turn_id
                   OR job.provider_name IS NOT agent.provider_name
                   OR job.model_name IS NOT agent.model_name
+                  OR job.knowledge_context_digest IS NOT agent.knowledge_context_digest
+               UNION ALL
+               SELECT 1
+               FROM agent_knowledge_contexts context
+               LEFT JOIN agent_turns agent
+                 ON agent.id = context.agent_id
+               LEFT JOIN agent_model_jobs initial_job
+                 ON initial_job.id = context.initial_model_job_id
+               WHERE agent.id IS NULL
+                  OR initial_job.id IS NULL
+                  OR agent.account_id IS NOT context.account_id
+                  OR agent.actor_user_id IS NOT context.actor_user_id
+                  OR agent.actor_membership_revision
+                     IS NOT context.actor_membership_revision
+                  OR agent.session_id IS NOT context.session_id
+                  OR agent.turn_id IS NOT context.turn_id
+                  OR agent.knowledge_context_digest IS NOT context.digest
+                  OR agent.created_at IS NOT context.created_at
+                  OR initial_job.agent_id IS NOT context.agent_id
+                  OR initial_job.account_id IS NOT context.account_id
+                  OR initial_job.actor_user_id IS NOT context.actor_user_id
+                  OR initial_job.actor_membership_revision
+                     IS NOT context.actor_membership_revision
+                  OR initial_job.session_id IS NOT context.session_id
+                  OR initial_job.turn_id IS NOT context.turn_id
+                  OR initial_job.step <> 1
+                  OR initial_job.knowledge_context_digest IS NOT context.digest
+                  OR initial_job.queued_at IS NOT context.created_at
                UNION ALL
                SELECT 1
                FROM agent_tool_calls call
@@ -4196,6 +4537,7 @@ fn readiness(
         ));
     }
     agent::verify_agent_deployment_manifest_integrity(connection)?;
+    agent::verify_agent_knowledge_context_integrity(connection)?;
     execution::verify_agent_execution_integrity(connection)?;
     let (user_count, owner_count): (i64, i64) = connection.query_row(
         r#"SELECT (SELECT COUNT(*) FROM users),
@@ -9430,6 +9772,46 @@ struct StartTurnOptions<'a> {
     fail_after_enqueue: bool,
 }
 
+fn load_agent_start_receipt_for_actor(
+    connection: &mut Connection,
+    context: &AuthzContext,
+    session_id: &str,
+    request: &StartTurnRequest,
+    idempotency_key: &str,
+    probe: &AgentTurnReceiptProbe,
+) -> Result<Option<AgentTurnEnqueueResponse>, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    require_current_authority(&transaction, context, AccountCapability::SessionWrite)?;
+    require_active_session_actor(&transaction, session_id, context)?;
+    validate_start_turn_request(request)?;
+    agent::validate_agent_turn_receipt_probe(probe)?;
+    if probe.authz != *context {
+        return Err(StorageError::SessionNotFound(session_id.to_owned()));
+    }
+    let fingerprint = agent::agent_start_fingerprint_for_probe(session_id, request, probe)?;
+    let Some(mut start) = load_session_command_receipt_for_actor::<StartTurnResponse>(
+        &transaction,
+        context,
+        idempotency_key,
+        "start_turn",
+        &fingerprint,
+        None,
+    )?
+    else {
+        transaction.commit()?;
+        return Ok(None);
+    };
+    start.replayed = true;
+    let agent =
+        agent::query_agent_turn_for_session_turn(&transaction, session_id, &request.turn_id)?;
+    agent::require_agent_matches_probe(&agent, probe)?;
+    let job = agent::query_agent_model_job(&transaction, &agent.id, 1)?;
+    agent::require_agent_knowledge_context_integrity(&transaction, &agent, &job)
+        .map_err(agent::corrupt_agent_integrity)?;
+    transaction.commit()?;
+    Ok(Some(AgentTurnEnqueueResponse { start, agent, job }))
+}
+
 struct StartTurnOutcome {
     start: StartTurnResponse,
     reply_job: Option<ReplyJob>,
@@ -9528,6 +9910,8 @@ fn start_turn(
                 )?;
                 agent::require_agent_matches_spec(&agent, spec)?;
                 let job = agent::query_agent_model_job(&transaction, &agent.id, 1)?;
+                agent::require_agent_knowledge_context_integrity(&transaction, &agent, &job)
+                    .map_err(agent::corrupt_agent_integrity)?;
                 Some((agent, job))
             }
             None => None,
@@ -11298,6 +11682,17 @@ fn query_session_reply_turns_for_actor(
     if through_sequence > session.sequence {
         return Err(StorageError::ConcurrentModification);
     }
+    let turns = query_session_reply_turns(&transaction, session_id, through_sequence, limit)?;
+    transaction.commit()?;
+    Ok(turns)
+}
+
+fn query_session_reply_turns(
+    connection: &Connection,
+    session_id: &str,
+    through_sequence: u64,
+    limit: usize,
+) -> Result<Vec<SessionTurn>, StorageError> {
     if limit == 0 || limit > COLLECTION_PAGE_MAX_LIMIT {
         return Err(StorageError::InvalidPageLimit {
             limit,
@@ -11311,7 +11706,7 @@ fn query_session_reply_turns_for_actor(
     // immediately following flush proves the pair was complete at this
     // historical boundary while LIMIT can stop the index scan after `limit`
     // complete pairs.
-    let mut statement = transaction.prepare(
+    let mut statement = connection.prepare(
         r#"SELECT turn.id, turn.session_id, turn.ordinal, turn.status,
                   turn.user_message, turn.assistant_message,
                   turn.started_at, turn.completed_at
@@ -11346,8 +11741,97 @@ fn query_session_reply_turns_for_actor(
         .map(StoredSessionTurnRow::decode)
         .collect::<Result<Vec<_>, _>>()?;
     turns.reverse();
-    transaction.commit()?;
+    for turn in &turns {
+        let (_, durable_user) = query_session_user_message_event(connection, session_id, &turn.id)?;
+        let assistant =
+            query_session_turn_event(connection, session_id, &turn.id, "assistant_message")?;
+        let flushed = query_session_turn_event(connection, session_id, &turn.id, "turn_flushed")?;
+        let SessionEventData::AssistantMessage {
+            turn_id,
+            content: durable_assistant,
+            ..
+        } = assistant.data
+        else {
+            return Err(StorageError::CorruptData(format!(
+                "Session turn `{}` assistant event has the wrong payload kind",
+                turn.id
+            )));
+        };
+        let SessionEventData::TurnFlushed {
+            turn_id: flushed_turn_id,
+        } = flushed.data
+        else {
+            return Err(StorageError::CorruptData(format!(
+                "Session turn `{}` flush event has the wrong payload kind",
+                turn.id
+            )));
+        };
+        if turn_id != turn.id
+            || flushed_turn_id != turn.id
+            || durable_user != turn.user_message
+            || Some(durable_assistant.as_str()) != turn.assistant_message.as_deref()
+        {
+            return Err(StorageError::CorruptData(format!(
+                "Session turn `{}` reply history differs from its immutable events",
+                turn.id
+            )));
+        }
+    }
     Ok(turns)
+}
+
+fn query_session_turn_event(
+    connection: &Connection,
+    session_id: &str,
+    turn_id: &str,
+    event_kind: &str,
+) -> Result<SessionEvent, StorageError> {
+    let mut statement = connection.prepare(
+        r#"SELECT sequence, event_id, event_kind, payload_version, payload_json,
+                  turn_id, created_at
+           FROM session_events
+           WHERE session_id = ?1 AND turn_id = ?2 AND event_kind = ?3
+           ORDER BY sequence LIMIT 2"#,
+    )?;
+    let mut stored = statement
+        .query_map(
+            params![session_id, turn_id, event_kind],
+            decode_stored_session_event_row,
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    if stored.len() != 1 {
+        return Err(StorageError::CorruptData(format!(
+            "Session turn `{turn_id}` must have exactly one `{event_kind}` event"
+        )));
+    }
+    stored
+        .pop()
+        .expect("one durable turn event was required")
+        .decode()
+}
+
+fn query_session_user_message_event(
+    connection: &Connection,
+    session_id: &str,
+    turn_id: &str,
+) -> Result<(u64, String), StorageError> {
+    let event = query_session_turn_event(connection, session_id, turn_id, "user_message")?;
+    let SessionEventData::UserMessage {
+        turn_id: payload_turn_id,
+        content,
+    } = event.data
+    else {
+        return Err(StorageError::CorruptData(format!(
+            "Session turn `{turn_id}` user event has the wrong payload kind"
+        )));
+    };
+    if payload_turn_id != turn_id {
+        return Err(StorageError::CorruptData(format!(
+            "Session turn `{turn_id}` user event names a different turn"
+        )));
+    }
+    Ok((event.sequence, content))
 }
 
 fn decode_session_turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredSessionTurnRow> {

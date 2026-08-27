@@ -539,6 +539,12 @@ pub enum ExecutionFactData {
         manifest_digest: Sha256Digest,
         initial_job_id: String,
         initial_request_digest: Sha256Digest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        knowledge_context_digest: Option<Sha256Digest>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        knowledge_corpus_digest: Option<Sha256Digest>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        knowledge_snapshot_digest: Option<Sha256Digest>,
     },
     /// Honest migration boundary for an Agent whose earlier execution facts
     /// predate this ledger. It is not a synthetic reconstruction of history.
@@ -579,6 +585,9 @@ impl ExecutionFactData {
             Self::AgentAdmitted {
                 state,
                 initial_job_id,
+                knowledge_context_digest,
+                knowledge_corpus_digest,
+                knowledge_snapshot_digest,
                 ..
             } => {
                 validate_workflow_state(state)?;
@@ -592,6 +601,11 @@ impl ExecutionFactData {
                     "fact.data.initial_job_id",
                     initial_job_id,
                     MAX_AGENT_ID_BYTES,
+                )?;
+                validate_knowledge_digest_binding(
+                    knowledge_context_digest,
+                    knowledge_corpus_digest,
+                    knowledge_snapshot_digest,
                 )
             }
             Self::LegacySnapshot {
@@ -896,6 +910,7 @@ pub enum DeploymentAuthority {
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionHistoryReason {
     LegacyManifestUnbound,
+    LegacyKnowledgeUnbound,
     LegacyExecutionSnapshot,
     ExactRequestUnavailable,
     DerivationInputsUnavailable,
@@ -1632,6 +1647,33 @@ fn validate_sha256_hex(field: &'static str, value: &str) -> Result<(), Execution
     Ok(())
 }
 
+fn validate_knowledge_digest_binding(
+    context: &Option<Sha256Digest>,
+    corpus: &Option<Sha256Digest>,
+    snapshot: &Option<Sha256Digest>,
+) -> Result<(), ExecutionError> {
+    let present = usize::from(context.is_some())
+        + usize::from(corpus.is_some())
+        + usize::from(snapshot.is_some());
+    if present != 0 && present != 3 {
+        return Err(invalid_field(
+            "fact.data.knowledge_digest_binding",
+            "context, corpus, and snapshot digests must be present together or all absent",
+        ));
+    }
+
+    for (field, digest) in [
+        ("fact.data.knowledge_context_digest", context),
+        ("fact.data.knowledge_corpus_digest", corpus),
+        ("fact.data.knowledge_snapshot_digest", snapshot),
+    ] {
+        if let Some(digest) = digest {
+            validate_sha256_hex(field, digest.as_str())?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_identifier(
     field: &'static str,
     value: &str,
@@ -1780,7 +1822,9 @@ fn validate_non_release_material(
         return Ok(());
     }
     let valid = match command {
-        Command::AuthorizationRevoked | Command::DeploymentUnavailable => {
+        Command::AuthorizationRevoked
+        | Command::DeploymentUnavailable
+        | Command::KnowledgeUnavailable => {
             subject.is_some()
                 && input_digest.is_some()
                 && output_digest.is_some()
@@ -1891,6 +1935,7 @@ mod tests {
 
     const DIGEST_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const DIGEST_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const DIGEST_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     const NEVER_PERSIST: &str = "sk-test-never-persist";
 
     fn digest(value: &str) -> Sha256Digest {
@@ -1955,6 +2000,9 @@ mod tests {
                 manifest_digest: digest(DIGEST_A),
                 initial_job_id: "job-agent-001-1".into(),
                 initial_request_digest: digest(DIGEST_B),
+                knowledge_context_digest: None,
+                knowledge_corpus_digest: None,
+                knowledge_snapshot_digest: None,
             },
         )
         .unwrap();
@@ -1990,6 +2038,23 @@ mod tests {
             },
         )
         .unwrap();
+        ExecutionFactEnvelope::new(fact).unwrap()
+    }
+
+    fn knowledge_bound_first_fact() -> ExecutionFactEnvelope {
+        let mut fact = first_fact().fact;
+        let ExecutionFactData::AgentAdmitted {
+            knowledge_context_digest,
+            knowledge_corpus_digest,
+            knowledge_snapshot_digest,
+            ..
+        } = &mut fact.data
+        else {
+            unreachable!("first fact fixture must be an admission")
+        };
+        *knowledge_context_digest = Some(digest(DIGEST_A));
+        *knowledge_corpus_digest = Some(digest(DIGEST_B));
+        *knowledge_snapshot_digest = Some(digest(DIGEST_C));
         ExecutionFactEnvelope::new(fact).unwrap()
     }
 
@@ -2120,6 +2185,110 @@ mod tests {
             tampered.validate(),
             Err(ExecutionError::DigestMismatch {
                 kind: "execution fact"
+            })
+        ));
+    }
+
+    #[test]
+    fn admission_knowledge_binding_round_trips_without_changing_schema_v1() {
+        let legacy = first_fact();
+        let legacy_value = serde_json::to_value(&legacy).unwrap();
+        let legacy_data = legacy_value["fact"]["data"].as_object().unwrap();
+        assert!(!legacy_data.contains_key("knowledge_context_digest"));
+        assert!(!legacy_data.contains_key("knowledge_corpus_digest"));
+        assert!(!legacy_data.contains_key("knowledge_snapshot_digest"));
+        assert_eq!(
+            ExecutionFactEnvelope::from_json_slice(&legacy.canonical_json_bytes().unwrap())
+                .unwrap(),
+            legacy
+        );
+
+        let bound = knowledge_bound_first_fact();
+        assert_eq!(bound.schema_version, EXECUTION_FACT_ENVELOPE_SCHEMA_VERSION);
+        assert_eq!(bound.fact.schema_version, EXECUTION_FACT_SCHEMA_VERSION);
+        let decoded =
+            ExecutionFactEnvelope::from_json_slice(&bound.canonical_json_bytes().unwrap()).unwrap();
+        assert_eq!(decoded, bound);
+        let ExecutionFactData::AgentAdmitted {
+            knowledge_context_digest,
+            knowledge_corpus_digest,
+            knowledge_snapshot_digest,
+            ..
+        } = decoded.fact.data
+        else {
+            unreachable!("decoded fact must remain an admission")
+        };
+        assert_eq!(knowledge_context_digest, Some(digest(DIGEST_A)));
+        assert_eq!(knowledge_corpus_digest, Some(digest(DIGEST_B)));
+        assert_eq!(knowledge_snapshot_digest, Some(digest(DIGEST_C)));
+    }
+
+    #[test]
+    fn admission_rejects_partial_knowledge_digest_bindings() {
+        for presence in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, false),
+            (true, false, true),
+            (false, true, true),
+        ] {
+            let mut fact = first_fact().fact;
+            let ExecutionFactData::AgentAdmitted {
+                knowledge_context_digest,
+                knowledge_corpus_digest,
+                knowledge_snapshot_digest,
+                ..
+            } = &mut fact.data
+            else {
+                unreachable!("first fact fixture must be an admission")
+            };
+            *knowledge_context_digest = presence.0.then(|| digest(DIGEST_A));
+            *knowledge_corpus_digest = presence.1.then(|| digest(DIGEST_B));
+            *knowledge_snapshot_digest = presence.2.then(|| digest(DIGEST_C));
+
+            assert!(matches!(
+                fact.validate(),
+                Err(ExecutionError::InvalidField {
+                    field: "fact.data.knowledge_digest_binding",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn admission_knowledge_digest_tampering_is_rejected() {
+        let mut envelope = knowledge_bound_first_fact();
+        let ExecutionFactData::AgentAdmitted {
+            knowledge_snapshot_digest,
+            ..
+        } = &mut envelope.fact.data
+        else {
+            unreachable!("knowledge-bound fact must be an admission")
+        };
+        *knowledge_snapshot_digest = Some(digest(DIGEST_A));
+        assert!(matches!(
+            envelope.validate(),
+            Err(ExecutionError::DigestMismatch {
+                kind: "execution fact"
+            })
+        ));
+
+        let mut malformed = knowledge_bound_first_fact().fact;
+        let ExecutionFactData::AgentAdmitted {
+            knowledge_context_digest,
+            ..
+        } = &mut malformed.data
+        else {
+            unreachable!("knowledge-bound fact must be an admission")
+        };
+        *knowledge_context_digest = Some(Sha256Digest("A".repeat(SHA256_HEX_BYTES)));
+        assert!(matches!(
+            malformed.validate(),
+            Err(ExecutionError::InvalidField {
+                field: "fact.data.knowledge_context_digest",
+                ..
             })
         ));
     }

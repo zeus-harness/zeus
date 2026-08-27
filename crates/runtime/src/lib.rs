@@ -30,6 +30,7 @@ use kernel::{
     DemoScenario, KernelError, LOCAL_POLICY_REVISION, PRODUCTION_POLICY_REVISION, apply_review,
     apply_tool_result, start_tool_dispatch,
 };
+use knowledge::{CorpusRevisionEnvelope, SelectionSnapshotEnvelope, select_context};
 use protocol::{
     Approval, ApprovalStatus, AssistantReplyKind, AttachRunRequest, AttachRunResponse,
     CreateSessionRequest, CreateSessionResponse, EVENT_PAGE_DEFAULT_LIMIT, FlushSessionRequest,
@@ -44,22 +45,24 @@ use serde_json::Value;
 pub use storage::{
     AccountAuditArchiveState, AccountAuditCheckpointCommit, AccountAuditEvent, AccountAuditPage,
     AccountAuditPolicy, AccountAuditRollup, AccountAuditState, AccountId, AgentFinalCompletion,
-    AgentModelClaimOutcome, AgentModelCompletion, AgentModelFailureCommit, AgentModelJob,
-    AgentModelJobStatus, AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit,
-    AgentOperationClaim, AgentOperationKind, AgentPreparedModel, AgentPreparedTool,
-    AgentReviewCommit, AgentReviewContext, AgentReviewResult, AgentTerminalCompletion,
-    AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion,
-    AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork,
-    AgentTurn, AgentTurnEnqueueResponse, AgentTurnSpec, AuthPrincipal, AuthSessionCommit,
-    AuthSessionId, AuthzContext, BootstrapOwnerCommit, CreateMemberResult, InFlightWorkSummary,
-    MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit, MemberSetupResult, MemberSetupToken,
-    MemberTransitionResult, MembershipRevision, MembershipRole, ReplyClaimOutcome, ReplyCompletion,
-    ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus,
-    ReplyOutcomeUnknownCommit, ReplySuccessCommit, RotateMemberSetupTokenResult,
-    SessionSummaryPage, SqliteOperationLimits, SqliteOperationLimitsError, SqlitePhysicalLimits,
-    SqlitePhysicalLimitsError, StorageLimits, StorageLimitsError, StoredCredential, StoredMember,
-    StoredMemberPage, StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserRole,
-    StoredUserStatus, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
+    AgentKnowledgeContextSpec, AgentModelClaimOutcome, AgentModelCompletion,
+    AgentModelFailureCommit, AgentModelJob, AgentModelJobStatus, AgentModelResolution,
+    AgentModelStartOutcome, AgentModelSuccessCommit, AgentOperationClaim, AgentOperationKind,
+    AgentPreparedModel, AgentPreparedTool, AgentReviewCommit, AgentReviewContext,
+    AgentReviewResult, AgentTerminalCompletion, AgentToolCall, AgentToolCallSpec,
+    AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
+    AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurn,
+    AgentTurnEnqueueResponse, AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal,
+    AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, CreateMemberResult,
+    InFlightWorkSummary, MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit, MemberSetupResult,
+    MemberSetupToken, MemberTransitionResult, MembershipRevision, MembershipRole,
+    ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse,
+    ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit, ReplySuccessCommit,
+    RotateMemberSetupTokenResult, SessionSummaryPage, SqliteOperationLimits,
+    SqliteOperationLimitsError, SqlitePhysicalLimits, SqlitePhysicalLimitsError, StorageLimits,
+    StorageLimitsError, StoredCredential, StoredMember, StoredMemberPage, StoredMembershipStatus,
+    StoredPreferences, StoredUser, StoredUserRole, StoredUserStatus, TransitionMemberCommit,
+    UpdateAccountAuditPolicyCommit,
 };
 use storage::{
     ClaimOutcome, CommitOutcome, CreateMemberCommit, DispatchCompleteCommit, DispatchContext,
@@ -809,6 +812,23 @@ impl DemoStore {
     /// deployment manifest and persisted provider request.
     pub fn session_agent_system_prompt(&self) -> &'static str {
         SESSION_AGENT_SYSTEM_PROMPT
+    }
+
+    /// Select the immutable knowledge context admitted with one Session Agent turn.
+    ///
+    /// The first core delivery intentionally uses an explicit empty corpus
+    /// revision until an account knowledge catalog is exposed. Even this empty
+    /// selection is deterministic, digest-bound, and replayed from storage.
+    pub fn session_agent_knowledge_context(
+        &self,
+        user_message: &str,
+    ) -> Result<AgentKnowledgeContextSpec, StoreError> {
+        let corpus = CorpusRevisionEnvelope::new(Vec::new())
+            .map_err(|error| StoreError::InvalidAgentTransition(error.to_string()))?;
+        let snapshot = select_context(user_message, corpus.entries())
+            .and_then(SelectionSnapshotEnvelope::new)
+            .map_err(|error| StoreError::InvalidAgentTransition(error.to_string()))?;
+        Ok(AgentKnowledgeContextSpec { corpus, snapshot })
     }
 
     /// Build the validated, secret-free deployment manifest for this runtime.
@@ -1713,6 +1733,35 @@ impl DemoStore {
             self.publish_session_event(session_id, response.start.event.clone());
         }
         Ok(response)
+    }
+
+    /// Resolve an exact durable Agent start replay without rebuilding its
+    /// server-derived request or knowledge selection.
+    pub async fn agent_start_receipt_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        request: &StartTurnRequest,
+        idempotency_key: &str,
+        probe: &AgentTurnReceiptProbe,
+    ) -> Result<Option<AgentTurnEnqueueResponse>, StoreError> {
+        validate_durable_reference(session_id, "session ID")?;
+        validate_new_turn_id(&request.turn_id, "turn ID")?;
+        self.authorize_session_for_actor(context, session_id)
+            .await?;
+        validate_user_message_value(&request.user_message, "user message")?;
+        validate_session_sequence(request.expected_sequence, "expected session sequence")?;
+        if probe.authz != *context || probe.environment != self.environment.as_ref() {
+            return Err(StoreError::InvalidAgentTransition(
+                "the Agent receipt identity does not match the bound runtime actor or environment"
+                    .into(),
+            ));
+        }
+        let idempotency_key = normalized_idempotency_key(idempotency_key)?;
+        self.storage
+            .agent_start_receipt_for_actor(context, session_id, request, idempotency_key, probe)
+            .await
+            .map_err(StoreError::from)
     }
 
     /// Atomically append one Session user turn and enqueue the immutable first
@@ -3316,6 +3365,7 @@ mod tests {
     }
 
     fn agent_request_for_manifest(manifest: &ManifestEnvelope, content: &str) -> Value {
+        let knowledge = agent_knowledge_for_message(content);
         let tools = manifest
             .manifest
             .deployment
@@ -3341,10 +3391,22 @@ mod tests {
             "role": "user",
             "content": content,
         }));
+        messages.push(serde_json::json!({
+            "role": "context",
+            "content": knowledge.snapshot.snapshot().canonical_context(),
+        }));
         serde_json::json!({
             "messages": messages,
             "tools": tools,
         })
+    }
+
+    fn agent_knowledge_for_message(content: &str) -> AgentKnowledgeContextSpec {
+        let corpus = CorpusRevisionEnvelope::new(Vec::new()).unwrap();
+        let snapshot =
+            SelectionSnapshotEnvelope::new(select_context(content, corpus.entries()).unwrap())
+                .unwrap();
+        AgentKnowledgeContextSpec { corpus, snapshot }
     }
 
     #[tokio::test]
@@ -3613,6 +3675,9 @@ mod tests {
                             &manifest,
                             "This invalid deployment must not enqueue.",
                         ),
+                        knowledge: agent_knowledge_for_message(
+                            "This invalid deployment must not enqueue.",
+                        ),
                         manifest,
                     },
                 )
@@ -3680,6 +3745,7 @@ mod tests {
                         &manifest,
                         "Persist this deployment manifest.",
                     ),
+                    knowledge: agent_knowledge_for_message("Persist this deployment manifest."),
                     manifest: manifest.clone(),
                 },
             )
@@ -3737,6 +3803,7 @@ mod tests {
                         &manifest,
                         "Use the bounded non-model fallback.",
                     ),
+                    knowledge: agent_knowledge_for_message("Use the bounded non-model fallback."),
                     manifest: manifest.clone(),
                 },
             )
@@ -3785,6 +3852,7 @@ mod tests {
                         &manifest,
                         "Finish this Agent turn exactly once.",
                     ),
+                    knowledge: agent_knowledge_for_message("Finish this Agent turn exactly once."),
                     manifest: manifest.clone(),
                 },
             )

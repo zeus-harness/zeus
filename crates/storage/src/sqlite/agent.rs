@@ -12,6 +12,7 @@ use crate::{
     AgentReviewCommit, AgentReviewContext, AgentReviewResult, AgentTerminalCompletion,
     AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion,
     AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork,
+    AgentTurnReceiptProbe,
 };
 use ::execution::{DigestDomain, FactSource, OperationRef, Sha256Digest};
 use deployment::ManifestEnvelope;
@@ -33,8 +34,72 @@ const AGENT_ERROR_JSON_MAX_BYTES: usize = 32 * 1024;
 const AGENT_TOOL_ARGUMENTS_MAX_BYTES: usize = 16 * 1024;
 const AGENT_TOOL_RESULT_JSON_MAX_BYTES: usize = 64 * 1024;
 const AGENT_DEPLOYMENT_MANIFEST_MAX_BYTES: usize = 256 * 1024;
+const AGENT_KNOWLEDGE_BINDING_SCHEMA_VERSION: u16 = 1;
+const AGENT_KNOWLEDGE_BINDING_MAX_BYTES: usize = 64 * 1024;
+const AGENT_KNOWLEDGE_BINDING_DIGEST_DOMAIN: &[u8] =
+    b"zeus.agent-knowledge-context-binding.sha256.v1";
+const AGENT_KNOWLEDGE_LEGACY_SET_DIGEST_DOMAIN: &[u8] =
+    b"zeus.agent-knowledge-legacy-set.sha256.v1\0";
 const AGENT_OPERATION_HOLDER_MAX_BYTES: usize = 128;
 const AGENT_OPERATION_CLAIM_TTL_SECONDS: i64 = 30;
+
+#[derive(Serialize)]
+struct AgentKnowledgeContextBinding<'a> {
+    schema_version: u16,
+    account_id: &'a str,
+    actor_user_id: &'a str,
+    actor_membership_revision: u64,
+    session_id: &'a str,
+    turn_id: &'a str,
+    agent_id: &'a str,
+    initial_model_job_id: &'a str,
+    corpus_digest: &'a str,
+    snapshot_digest: &'a str,
+    query_digest: &'a str,
+    context_digest: &'a str,
+    context_bytes: u32,
+    canonical_context: &'a str,
+    created_at: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct AgentKnowledgeDigests {
+    pub context: Sha256Digest,
+    pub corpus: Sha256Digest,
+    pub snapshot: Sha256Digest,
+}
+
+struct StoredAgentKnowledgeContext {
+    digest: String,
+    schema_version: i64,
+    account_id: String,
+    actor_user_id: String,
+    actor_membership_revision: i64,
+    session_id: String,
+    turn_id: String,
+    agent_id: String,
+    initial_model_job_id: String,
+    corpus_digest: String,
+    snapshot_digest: String,
+    query_digest: String,
+    context_digest: String,
+    context_bytes: i64,
+    canonical_context: String,
+    snapshot_envelope_json: String,
+    binding_json: String,
+    created_at: String,
+}
+
+struct StoredLegacyAgentKnowledgeBoundary {
+    agent_id: String,
+    initial_model_job_id: String,
+    execution_origin_fact_digest: String,
+}
+
+struct StoredLegacyAgentKnowledgeCommitment {
+    agent_count: i64,
+    set_digest: String,
+}
 
 impl SqliteStore {
     /// Durably prepares one queued model step without authorizing external I/O.
@@ -409,6 +474,25 @@ fn prepare_next_agent_model(
                 "a prepared model claim disagrees with its durable job".into(),
             ));
         }
+        let mut agent = query_agent_turn(&transaction, &job.agent_id)?;
+        if !agent_knowledge_context_is_executable(&transaction, &agent, &job)? {
+            require_open_agent_turn(&transaction, &agent)?;
+            require_agent_finalization_capacity(&transaction, &agent)?;
+            require_connection_physical_capacity(
+                &transaction,
+                physical_limits,
+                PhysicalCapacityGate::ReservedProgress,
+            )?;
+            let completion = reject_model_for_unavailable_knowledge(
+                &transaction,
+                &mut agent,
+                &job,
+                Some(&claim),
+                &timestamp,
+            )?;
+            transaction.commit()?;
+            return Ok(AgentModelClaimOutcome::Rejected(Box::new(completion)));
+        }
         transaction.commit()?;
         return Ok(AgentModelClaimOutcome::Prepared(Box::new(
             AgentPreparedModel { claim, job },
@@ -442,6 +526,17 @@ fn prepare_next_agent_model(
         physical_limits,
         PhysicalCapacityGate::ReservedProgress,
     )?;
+    if !agent_knowledge_context_is_executable(&transaction, &agent, &job)? {
+        let completion = reject_model_for_unavailable_knowledge(
+            &transaction,
+            &mut agent,
+            &job,
+            None,
+            &timestamp,
+        )?;
+        transaction.commit()?;
+        return Ok(AgentModelClaimOutcome::Rejected(Box::new(completion)));
+    }
     if !agent_deployment_matches_current(&transaction, &agent, Some(&job), None, current_manifest)?
     {
         let error_json = deployment_unavailable_error(
@@ -578,6 +673,12 @@ fn start_prepared_agent_model(
                 "started model claim disagrees with its durable job".into(),
             ));
         }
+        let agent = query_agent_turn(&transaction, &job.agent_id)?;
+        if !agent_knowledge_context_is_executable(&transaction, &agent, &job)? {
+            return Err(StorageError::CorruptData(
+                "a started model claim has no valid durable knowledge context".into(),
+            ));
+        }
         transaction.commit()?;
         return Ok(AgentModelStartOutcome::Started(Box::new(job)));
     }
@@ -593,6 +694,18 @@ fn start_prepared_agent_model(
         physical_limits,
         PhysicalCapacityGate::ReservedProgress,
     )?;
+
+    if !agent_knowledge_context_is_executable(&transaction, &agent, &job)? {
+        let completion = reject_model_for_unavailable_knowledge(
+            &transaction,
+            &mut agent,
+            &job,
+            Some(claim),
+            &timestamp,
+        )?;
+        transaction.commit()?;
+        return Ok(AgentModelStartOutcome::Rejected(Box::new(completion)));
+    }
 
     if !agent_deployment_matches_current(&transaction, &agent, Some(&job), None, current_manifest)?
     {
@@ -1239,6 +1352,32 @@ fn prepare_next_agent_tool(
         }
         let model_job = query_agent_model_job(&transaction, &call.agent_id, call.model_step)?;
         validate_persisted_agent_model_tool_response(&model_job, &call)?;
+        let mut agent = query_agent_turn(&transaction, &call.agent_id)?;
+        if !agent_knowledge_context_is_executable(&transaction, &agent, &model_job)? {
+            require_open_agent_turn(&transaction, &agent)?;
+            require_agent_finalization_capacity(&transaction, &agent)?;
+            require_connection_physical_capacity(
+                &transaction,
+                physical_limits,
+                PhysicalCapacityGate::ReservedProgress,
+            )?;
+            if agent.status != AgentTurnStatus::ToolQueued
+                || agent.pending_call_id.as_deref() != Some(call.call_id.as_str())
+            {
+                return Err(StorageError::CorruptData(
+                    "a prepared tool claim disagrees with the current Agent state".into(),
+                ));
+            }
+            let completion = reject_tool_for_unavailable_knowledge(
+                &transaction,
+                &mut agent,
+                &call,
+                Some(&claim),
+                &timestamp,
+            )?;
+            transaction.commit()?;
+            return Ok(AgentToolClaimOutcome::Rejected(Box::new(completion)));
+        }
         let work = AgentToolWork { call, model_job };
         transaction.commit()?;
         return Ok(AgentToolClaimOutcome::Prepared(Box::new(
@@ -1281,6 +1420,17 @@ fn prepare_next_agent_tool(
         return Err(StorageError::InvalidAgentTransition(
             "queued agent tool does not match the current loop state".into(),
         ));
+    }
+    if !agent_knowledge_context_is_executable(&transaction, &agent, &model_job)? {
+        let completion = reject_tool_for_unavailable_knowledge(
+            &transaction,
+            &mut agent,
+            &call,
+            None,
+            &timestamp,
+        )?;
+        transaction.commit()?;
+        return Ok(AgentToolClaimOutcome::Rejected(Box::new(completion)));
     }
     if !agent_deployment_matches_current(
         &transaction,
@@ -1423,6 +1573,12 @@ fn start_prepared_agent_tool(
                 "started tool claim disagrees with its durable call".into(),
             ));
         }
+        let agent = query_agent_turn(&transaction, &call.agent_id)?;
+        if !agent_knowledge_context_is_executable(&transaction, &agent, &model_job)? {
+            return Err(StorageError::CorruptData(
+                "a started tool claim has no valid durable knowledge context".into(),
+            ));
+        }
         let work = AgentToolWork { call, model_job };
         transaction.commit()?;
         return Ok(AgentToolStartOutcome::Started(Box::new(work)));
@@ -1446,6 +1602,18 @@ fn start_prepared_agent_tool(
         return Err(StorageError::InvalidAgentTransition(
             "prepared agent tool does not match the current loop state".into(),
         ));
+    }
+
+    if !agent_knowledge_context_is_executable(&transaction, &agent, &model_job)? {
+        let completion = reject_tool_for_unavailable_knowledge(
+            &transaction,
+            &mut agent,
+            &call,
+            Some(claim),
+            &timestamp,
+        )?;
+        transaction.commit()?;
+        return Ok(AgentToolStartOutcome::Rejected(Box::new(completion)));
     }
 
     if !agent_deployment_matches_current(
@@ -1901,6 +2069,7 @@ fn validate_agent_model_resolution(resolution: &AgentModelResolution) -> Result<
                 ));
             }
             validate_agent_tool_result(result_json)?;
+            require_canonical_policy_denied_agent_tool_result(&call.policy_revision, result_json)?;
             match next_request_json {
                 Some(next_request_json) => validate_reply_json(
                     next_request_json,
@@ -2232,6 +2401,48 @@ fn validate_agent_tool_result(result: &Value) -> Result<u64, StorageError> {
     usize_to_u64(bytes, "agent tool result bytes")
 }
 
+fn canonical_policy_denied_agent_tool_result(policy_revision: &str) -> Value {
+    json!({
+        "code": "policy_denied",
+        "message": "Zeus policy denied this tool call",
+        "policy_revision": policy_revision,
+        "status": "not_dispatched",
+    })
+}
+
+fn require_canonical_policy_denied_agent_tool_result(
+    policy_revision: &str,
+    result: &Value,
+) -> Result<(), StorageError> {
+    if result != &canonical_policy_denied_agent_tool_result(policy_revision) {
+        return Err(StorageError::InvalidAgentTransition(
+            "policy-denied Agent tool result is not the canonical server-generated result".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_server_generated_agent_tool_result(call: &AgentToolCall) -> Result<(), StorageError> {
+    let expected = match (&call.policy_decision, &call.status) {
+        (PolicyDecision::Deny, AgentToolCallStatus::NotDispatched) => Some(
+            canonical_policy_denied_agent_tool_result(&call.policy_revision),
+        ),
+        (PolicyDecision::RequireApproval, AgentToolCallStatus::Rejected) => Some(
+            protocol::agent_approval_rejected_result(&call.call_id, call.review_note.as_deref()),
+        ),
+        _ => None,
+    };
+    if expected
+        .as_ref()
+        .is_some_and(|expected| call.result_json.as_ref() != Some(expected))
+    {
+        return Err(StorageError::InvalidAgentTransition(
+            "durable server-generated Agent tool result cannot be recomputed exactly".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_agent_error_json(value: &Value, field: &'static str) -> Result<(), StorageError> {
     validate_reply_json(value, field, AGENT_ERROR_JSON_MAX_BYTES)?;
     let object = value.as_object().expect("validated as an object");
@@ -2439,6 +2650,7 @@ fn insert_continuation_model_job(
                 "agent continuation request disagrees with its deployment manifest: {error}"
             ))
         })?;
+    require_agent_knowledge_request_integrity(connection, agent, request_json)?;
     if agent.status != AgentTurnStatus::WaitingModel {
         return Err(StorageError::InvalidAgentTransition(
             "only a waiting Agent can enqueue a model continuation".into(),
@@ -2453,11 +2665,12 @@ fn insert_continuation_model_job(
         r#"INSERT INTO agent_model_jobs(
                id, agent_id, account_id, actor_user_id, actor_membership_revision,
                session_id, turn_id, step, provider_name, model_name,
-               status, attempt, request_json, response_json, error_json,
+               status, attempt, request_json, knowledge_context_digest,
+               response_json, error_json,
                queued_at, started_at, finished_at
            ) VALUES (
                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-               'queued', 0, ?11, NULL, NULL, ?12, NULL, NULL
+               'queued', 0, ?11, ?12, NULL, NULL, ?13, NULL, NULL
            )"#,
         params![
             job_id,
@@ -2474,10 +2687,13 @@ fn insert_continuation_model_job(
             agent.provider_name,
             agent.model_name,
             serde_json::to_string(request_json)?,
+            agent.knowledge_context_digest,
             queued_at,
         ],
     )?;
-    query_agent_model_job(connection, &agent.id, step)
+    let job = query_agent_model_job(connection, &agent.id, step)?;
+    require_agent_knowledge_context_integrity(connection, agent, &job)?;
+    Ok(job)
 }
 
 fn finalize_agent_success(
@@ -3092,6 +3308,50 @@ pub(super) fn agent_tool_call_detail(
     })
 }
 
+fn require_agent_review_receipt_replay_integrity(
+    connection: &Connection,
+    agent: &AgentTurn,
+    call: &AgentToolCall,
+    commit: &AgentReviewCommit,
+    context: &AuthzContext,
+    reviewed_at: &str,
+) -> Result<(), StorageError> {
+    let decision_matches = match commit.decision {
+        ReviewDecision::Approve => matches!(
+            call.status,
+            AgentToolCallStatus::Queued
+                | AgentToolCallStatus::Running
+                | AgentToolCallStatus::Succeeded
+                | AgentToolCallStatus::Failed
+                | AgentToolCallStatus::Cancelled
+                | AgentToolCallStatus::NotDispatched
+                | AgentToolCallStatus::OutcomeUnknown
+        ),
+        ReviewDecision::Reject => call.status == AgentToolCallStatus::Rejected,
+    };
+    if call.policy_decision != PolicyDecision::RequireApproval
+        || !decision_matches
+        || call.approving_actor_user_id.as_deref() != Some(context.user_id.as_str())
+        || call.approving_membership_revision.as_ref() != Some(&context.membership_revision)
+        || call.review_note.as_deref() != commit.note.as_deref()
+        || call.reviewed_at.as_deref() != Some(reviewed_at)
+    {
+        return Err(StorageError::InvalidAgentTransition(
+            "durable Agent review receipt does not match the reviewed tool call".into(),
+        ));
+    }
+    if commit.decision == ReviewDecision::Reject {
+        require_server_generated_agent_tool_result(call)?;
+    }
+    let initial_job = query_agent_model_job(connection, &agent.id, 1)?;
+    if agent_has_frozen_legacy_knowledge_boundary(connection, agent, &initial_job)? {
+        return require_server_generated_agent_tool_result(call);
+    }
+    let causative_job = query_agent_model_job(connection, &agent.id, call.model_step)?;
+    require_agent_knowledge_context_integrity(connection, agent, &causative_job)?;
+    require_server_generated_agent_tool_result(call)
+}
+
 fn review_agent_tool_for_actor(
     connection: &mut Connection,
     context: &AuthzContext,
@@ -3124,21 +3384,23 @@ fn review_agent_tool_for_actor(
     {
         return Err(StorageError::AgentToolCallNotFound(commit.call_id));
     }
-    if let Some((stored_fingerprint, stored_call_id, stored_revision)) = transaction
-        .query_row(
-            r#"SELECT request_fingerprint, call_id, actor_membership_revision
+    if let Some((stored_fingerprint, stored_call_id, stored_revision, stored_created_at)) =
+        transaction
+            .query_row(
+                r#"SELECT request_fingerprint, call_id, actor_membership_revision, created_at
                FROM agent_review_receipts
                WHERE account_id = ?1 AND actor_user_id = ?2 AND idempotency_key = ?3"#,
-            params![context.account_id.as_str(), context.user_id, key],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            },
-        )
-        .optional()?
+                params![context.account_id.as_str(), context.user_id, key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
     {
         if stored_fingerprint != request_fingerprint
             || stored_call_id != call.call_id
@@ -3149,6 +3411,15 @@ fn review_agent_tool_for_actor(
         }
         let current_agent = query_agent_turn(&transaction, &agent.id)?;
         let current_call = query_agent_tool_call(&transaction, &call.call_id)?;
+        require_agent_review_receipt_replay_integrity(
+            &transaction,
+            &current_agent,
+            &current_call,
+            &commit,
+            context,
+            &stored_created_at,
+        )
+        .map_err(corrupt_agent_integrity)?;
         let response = AgentReviewResponse {
             agent: agent_turn_detail(&transaction, &current_agent)?,
             call: agent_tool_call_detail(&current_call)?,
@@ -3273,7 +3544,16 @@ fn review_agent_tool_for_actor(
             let deployment_unavailable = agent.deployment_manifest_digest.is_none()
                 && primary_state.status() == WorkflowStatus::ContinuationQueued
                 && commit.next_request_json.is_some();
-            let requested_continuation = if deployment_unavailable {
+            let knowledge_unavailable = if !deployment_unavailable
+                && primary_state.status() == WorkflowStatus::ContinuationQueued
+                && commit.next_request_json.is_some()
+            {
+                let model_job = query_agent_model_job(&transaction, &agent.id, call.model_step)?;
+                !agent_knowledge_context_is_executable(&transaction, &agent, &model_job)?
+            } else {
+                false
+            };
+            let requested_continuation = if deployment_unavailable || knowledge_unavailable {
                 None
             } else {
                 commit.next_request_json.as_ref()
@@ -3293,6 +3573,10 @@ fn review_agent_tool_for_actor(
                 if deployment_unavailable {
                     deployment_unavailable_error(
                         "the legacy Agent has no deployment manifest for a rejection continuation",
+                    )
+                } else if knowledge_unavailable {
+                    knowledge_unavailable_error(
+                        "the legacy Agent has no valid knowledge context for a rejection continuation",
                     )
                 } else {
                     workflow_terminal_error(&settled)
@@ -3388,6 +3672,8 @@ fn review_agent_tool_for_actor(
                     &agent,
                     if deployment_unavailable {
                         "agent deployment is unavailable for a rejection continuation"
+                    } else if knowledge_unavailable {
+                        "agent knowledge is unavailable for a rejection continuation"
                     } else if continuation_unavailable {
                         "agent rejection is known but its model continuation is unavailable"
                     } else {
@@ -4039,7 +4325,7 @@ fn validate_request_matches_manifest(
                     "agent model request message {index} role must be a string"
                 ))
             })?;
-            if !matches!(role, "system" | "user" | "assistant" | "tool") {
+            if !matches!(role, "system" | "user" | "context" | "assistant" | "tool") {
                 return Err(StorageError::InvalidAgentTransition(format!(
                     "agent model request message {index} has an unsupported role"
                 )));
@@ -4489,6 +4775,126 @@ fn deployment_unavailable_error(message: &str) -> Value {
     })
 }
 
+fn knowledge_unavailable_error(message: &str) -> Value {
+    json!({
+        "code": "knowledge_unavailable",
+        "message": message,
+    })
+}
+
+fn reject_model_for_unavailable_knowledge(
+    connection: &Connection,
+    agent: &mut AgentTurn,
+    job: &AgentModelJob,
+    claim: Option<&AgentOperationClaim>,
+    timestamp: &str,
+) -> Result<AgentTerminalCompletion, StorageError> {
+    let error_json = knowledge_unavailable_error(
+        "the Agent knowledge context is missing, invalid, or changed before model execution",
+    );
+    let command = WorkflowCommand::KnowledgeUnavailable;
+    let transition = reduce(&agent.workflow_state, command.clone())
+        .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+    persist_agent_workflow_transition(
+        connection,
+        agent,
+        transition.state().clone(),
+        None,
+        Some(&error_json),
+        Some(timestamp),
+        AgentTransitionFact {
+            command,
+            external_call: transition.external_call().cloned(),
+            emitted_result: transition.emitted_result().cloned(),
+            emitted_result_digest: None,
+            epoch_digest: None,
+            source: FactSource::Live,
+            subject: Some(model_subject(job)),
+            input_digest: Some(model_request_digest(job)?),
+            output_digest: Some(super::execution::digest_json(
+                DigestDomain::ExecutionError,
+                &error_json,
+            )?),
+            next_request_digest: None,
+        },
+        timestamp,
+    )?;
+    let changed = connection.execute(
+        r#"UPDATE agent_model_jobs
+           SET status = 'failed', attempt = 1, error_json = ?1,
+               started_at = ?2, finished_at = ?2
+           WHERE id = ?3 AND status = 'queued' AND attempt = 0"#,
+        params![serde_json::to_string(&error_json)?, timestamp, job.id],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::ConcurrentModification);
+    }
+    if let Some(claim) = claim {
+        release_agent_operation_claim(connection, claim, timestamp)?;
+    }
+    interrupt_agent_turn(
+        connection,
+        agent,
+        "agent knowledge became unavailable before model execution",
+    )
+}
+
+fn reject_tool_for_unavailable_knowledge(
+    connection: &Connection,
+    agent: &mut AgentTurn,
+    call: &AgentToolCall,
+    claim: Option<&AgentOperationClaim>,
+    timestamp: &str,
+) -> Result<AgentTerminalCompletion, StorageError> {
+    let error_json = knowledge_unavailable_error(
+        "the Agent knowledge context is missing, invalid, or changed before tool execution",
+    );
+    let command = WorkflowCommand::KnowledgeUnavailable;
+    let transition = reduce(&agent.workflow_state, command.clone())
+        .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+    persist_agent_workflow_transition(
+        connection,
+        agent,
+        transition.state().clone(),
+        None,
+        Some(&error_json),
+        Some(timestamp),
+        AgentTransitionFact {
+            command,
+            external_call: transition.external_call().cloned(),
+            emitted_result: transition.emitted_result().cloned(),
+            emitted_result_digest: None,
+            epoch_digest: None,
+            source: FactSource::Live,
+            subject: Some(tool_subject(call)),
+            input_digest: Some(tool_input_digest(call)?),
+            output_digest: Some(super::execution::digest_json(
+                DigestDomain::ExecutionError,
+                &error_json,
+            )?),
+            next_request_digest: None,
+        },
+        timestamp,
+    )?;
+    let changed = connection.execute(
+        r#"UPDATE agent_tool_calls
+           SET status = 'not_dispatched', result_json = ?1, finished_at = ?2
+           WHERE call_id = ?3 AND status = 'queued'"#,
+        params![serde_json::to_string(&error_json)?, timestamp, call.call_id],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::ConcurrentModification);
+    }
+    if let Some(claim) = claim {
+        release_agent_operation_claim(connection, claim, timestamp)?;
+    }
+    interrupt_agent_turn(
+        connection,
+        agent,
+        "agent knowledge became unavailable before tool execution",
+    )
+}
+
 pub(super) fn verify_agent_deployment_manifest_integrity(
     connection: &Connection,
 ) -> Result<(), StorageError> {
@@ -4577,25 +4983,1055 @@ pub(super) fn verify_agent_deployment_manifest_integrity(
     Ok(())
 }
 
-pub(super) fn validate_agent_turn_spec(spec: &AgentTurnSpec) -> Result<(), StorageError> {
-    normalized_reply_value(&spec.id, "agent turn ID")?;
-    if spec.id.len() > AGENT_ID_MAX_BYTES {
+fn invalid_knowledge_context(error: impl std::fmt::Display) -> StorageError {
+    StorageError::InvalidAgentTransition(format!("invalid Agent knowledge context: {error}"))
+}
+
+fn corrupt_knowledge_context(error: impl std::fmt::Display) -> StorageError {
+    StorageError::CorruptData(format!("invalid stored Agent knowledge context: {error}"))
+}
+
+fn validate_request_knowledge_context(
+    request_json: &Value,
+    canonical_context: &str,
+    query: Option<&str>,
+) -> Result<(), StorageError> {
+    let request =
+        serde_json::from_value::<llm::ReplyRequest>(request_json.clone()).map_err(|error| {
+            StorageError::InvalidAgentTransition(format!(
+                "agent model request does not match the typed provider contract: {error}"
+            ))
+        })?;
+    let contexts = request
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role == llm::ReplyRole::Context)
+        .collect::<Vec<_>>();
+    let [(index, context)] = contexts.as_slice() else {
+        return Err(StorageError::InvalidAgentTransition(
+            "agent model request must contain exactly one governed knowledge context".into(),
+        ));
+    };
+    if context.content != canonical_context {
+        return Err(StorageError::InvalidAgentTransition(
+            "agent model request governed context disagrees with its selection snapshot".into(),
+        ));
+    }
+    if let Some(query) = query {
+        let user = index
+            .checked_sub(1)
+            .and_then(|previous| request.messages.get(previous))
+            .filter(|message| message.role == llm::ReplyRole::User)
+            .ok_or_else(|| {
+                StorageError::InvalidAgentTransition(
+                    "agent knowledge context must immediately follow its immutable user message"
+                        .into(),
+                )
+            })?;
+        if user.content != query {
+            return Err(StorageError::InvalidAgentTransition(
+                "agent knowledge query disagrees with the immutable Session user message".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn agent_reply_tools_from_manifest(manifest: &ManifestEnvelope) -> Vec<llm::ReplyToolDefinition> {
+    manifest
+        .manifest
+        .deployment
+        .spec
+        .tools
+        .iter()
+        .map(|tool| {
+            llm::ReplyToolDefinition::new(tool.name.clone(), tool.input_schema.clone())
+                .with_description(tool.description.clone())
+        })
+        .collect()
+}
+
+fn invalid_agent_transcript(error: impl std::fmt::Display) -> StorageError {
+    StorageError::InvalidAgentTransition(format!(
+        "Agent provider transcript disagrees with durable Session facts: {error}"
+    ))
+}
+
+fn agent_transcript_storage_error(error: StorageError) -> StorageError {
+    match error {
+        error @ StorageError::Sqlite(_) => error,
+        other => invalid_agent_transcript(other),
+    }
+}
+
+fn require_initial_agent_request_transcript(
+    connection: &Connection,
+    agent: &AgentTurn,
+    job: &AgentModelJob,
+    manifest: &ManifestEnvelope,
+    canonical_context: &str,
+    query: &str,
+) -> Result<(), StorageError> {
+    let candidate = serde_json::from_value::<llm::ReplyRequest>(job.request_json.clone())
+        .map_err(invalid_agent_transcript)?;
+    let system_prompt = if manifest.manifest.deployment.spec.prompt.is_some() {
+        Some(
+            candidate
+                .messages
+                .first()
+                .filter(|message| message.role == llm::ReplyRole::System)
+                .map(|message| message.content.as_str())
+                .ok_or_else(|| {
+                    invalid_agent_transcript("manifest-bound system prompt is missing")
+                })?,
+        )
+    } else {
+        None
+    };
+    let (user_sequence, durable_user_message) =
+        query_session_user_message_event(connection, &agent.session_id, &agent.turn_id)
+            .map_err(agent_transcript_storage_error)?;
+    let turn = query_session_turn(connection, &agent.session_id, &agent.turn_id)
+        .map_err(agent_transcript_storage_error)?;
+    if durable_user_message != query
+        || turn.user_message != query
+        || turn.id != agent.turn_id
+        || turn.session_id != agent.session_id
+    {
+        return Err(invalid_agent_transcript(
+            "the immutable user event, turn projection, and knowledge query differ",
+        ));
+    }
+    let history_boundary = user_sequence
+        .checked_sub(1)
+        .ok_or_else(|| invalid_agent_transcript("the user event has no history boundary"))?;
+    let history = query_session_reply_turns(
+        connection,
+        &agent.session_id,
+        history_boundary,
+        llm::AGENT_REQUEST_MAX_HISTORY_PAIRS_WITH_CONTEXT,
+    )
+    .map_err(agent_transcript_storage_error)?;
+    let mut expected =
+        llm::ReplyRequest::from_session_history_for_agent_with_optional_system_prompt_and_context(
+            &history,
+            query,
+            system_prompt,
+            canonical_context,
+        )
+        .map_err(invalid_agent_transcript)?;
+    expected.tools = agent_reply_tools_from_manifest(manifest);
+    let expected =
+        llm::persisted_agent_reply_request(&expected).map_err(invalid_agent_transcript)?;
+    if job.request_json != expected {
+        return Err(invalid_agent_transcript(
+            "the initial request is not the canonical reconstruction of durable history",
+        ));
+    }
+    Ok(())
+}
+
+fn require_continuation_agent_request_transcript(
+    connection: &Connection,
+    agent: &AgentTurn,
+    job: &AgentModelJob,
+) -> Result<(), StorageError> {
+    let previous_step = job
+        .step
+        .checked_sub(1)
+        .ok_or_else(|| invalid_agent_transcript("continuation step underflow"))?;
+    let previous_job = query_agent_model_job(connection, &agent.id, previous_step)
+        .map_err(agent_transcript_storage_error)?;
+    let call = query_agent_tool_call_for_step(connection, &agent.id, previous_step)
+        .map_err(agent_transcript_storage_error)?
+        .ok_or_else(|| {
+            invalid_agent_transcript("the previous model step has no durable tool call")
+        })?;
+    validate_persisted_agent_model_tool_response(&previous_job, &call)
+        .map_err(invalid_agent_transcript)?;
+    let result = call.result_json.as_ref().ok_or_else(|| {
+        invalid_agent_transcript("the previous tool call has no exact durable result")
+    })?;
+    require_server_generated_agent_tool_result(&call).map_err(invalid_agent_transcript)?;
+    let previous_request =
+        serde_json::from_value::<llm::ReplyRequest>(previous_job.request_json.clone())
+            .map_err(invalid_agent_transcript)?;
+    let provider_call = llm::ReplyToolCall::new(
+        call.provider_call_id.clone(),
+        call.tool_name.clone(),
+        call.arguments_json.clone(),
+    );
+    let result_content = serde_json::to_string(result).map_err(invalid_agent_transcript)?;
+    let expected =
+        llm::agent_continuation_request(&previous_request, &provider_call, result_content)
+            .and_then(|request| llm::persisted_agent_reply_request(&request))
+            .map_err(invalid_agent_transcript)?;
+    if job.request_json != expected {
+        return Err(invalid_agent_transcript(
+            "the continuation does not exactly extend the prior request, tool call, and result",
+        ));
+    }
+    Ok(())
+}
+
+fn require_agent_request_transcript_chain(
+    connection: &Connection,
+    agent: &AgentTurn,
+    through_step: u32,
+    manifest: &ManifestEnvelope,
+    context_digest: &str,
+    canonical_context: &str,
+    query: &str,
+) -> Result<(), StorageError> {
+    for step in 1..=through_step {
+        let job = query_agent_model_job(connection, &agent.id, step)
+            .map_err(agent_transcript_storage_error)?;
+        if job.agent_id != agent.id
+            || job.account_id != agent.account_id
+            || job.actor_user_id != agent.actor_user_id
+            || job.actor_membership_revision != agent.actor_membership_revision
+            || job.session_id != agent.session_id
+            || job.turn_id != agent.turn_id
+            || job.knowledge_context_digest.as_deref() != Some(context_digest)
+        {
+            return Err(invalid_agent_transcript(format!(
+                "model job step {step} differs from the Agent knowledge identity"
+            )));
+        }
+        require_model_job_matches_manifest(&job, manifest).map_err(invalid_agent_transcript)?;
+        if step == 1 {
+            require_initial_agent_request_transcript(
+                connection,
+                agent,
+                &job,
+                manifest,
+                canonical_context,
+                query,
+            )?;
+        } else {
+            require_continuation_agent_request_transcript(connection, agent, &job)?;
+        }
+        if let Some(call) = query_agent_tool_call_for_step(connection, &agent.id, step)
+            .map_err(agent_transcript_storage_error)?
+        {
+            require_server_generated_agent_tool_result(&call).map_err(invalid_agent_transcript)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_agent_knowledge_spec(spec: &AgentTurnSpec) -> Result<(), StorageError> {
+    spec.knowledge
+        .corpus
+        .validate()
+        .map_err(invalid_knowledge_context)?;
+    spec.knowledge
+        .snapshot
+        .validate()
+        .map_err(invalid_knowledge_context)?;
+    if spec.knowledge.snapshot.snapshot().corpus_digest() != spec.knowledge.corpus.digest() {
+        return Err(StorageError::InvalidAgentTransition(
+            "Agent knowledge snapshot disagrees with its exact corpus revision".into(),
+        ));
+    }
+    validate_request_knowledge_context(
+        &spec.request_json,
+        spec.knowledge.snapshot.snapshot().canonical_context(),
+        None,
+    )
+}
+
+fn aggregate_corpus_entry_bytes(
+    corpus: &knowledge::CorpusRevisionEnvelope,
+) -> Result<i64, StorageError> {
+    let bytes = corpus.entries().iter().try_fold(0usize, |total, entry| {
+        total
+            .checked_add(entry.entry_id().len())
+            .and_then(|total| total.checked_add(entry.revision().len()))
+            .and_then(|total| total.checked_add(entry.title().len()))
+            .and_then(|total| total.checked_add(entry.content().len()))
+    });
+    let bytes = bytes.ok_or(StorageError::IntegerOutOfRange(
+        "knowledge corpus aggregate entry bytes",
+    ))?;
+    i64::try_from(bytes)
+        .map_err(|_| StorageError::IntegerOutOfRange("knowledge corpus aggregate entry bytes"))
+}
+
+fn persist_agent_knowledge_corpus(
+    connection: &Connection,
+    account_id: &str,
+    corpus: &knowledge::CorpusRevisionEnvelope,
+    created_at: &str,
+) -> Result<(), StorageError> {
+    let digest = corpus.digest().to_hex();
+    let envelope_json = corpus.canonical_json().map_err(invalid_knowledge_context)?;
+    let entry_count = i64::try_from(corpus.entries().len())
+        .map_err(|_| StorageError::IntegerOutOfRange("knowledge corpus entry count"))?;
+    let aggregate_entry_bytes = aggregate_corpus_entry_bytes(corpus)?;
+    connection.execute(
+        r#"INSERT INTO knowledge_corpus_revisions(
+               account_id, digest, schema_version, entry_count,
+               aggregate_entry_bytes, envelope_json, created_at
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+           ON CONFLICT(account_id, digest) DO NOTHING"#,
+        params![
+            account_id,
+            digest,
+            i64::from(corpus.schema_version()),
+            entry_count,
+            aggregate_entry_bytes,
+            envelope_json,
+            created_at,
+        ],
+    )?;
+    let stored = connection.query_row(
+        r#"SELECT schema_version, entry_count, aggregate_entry_bytes, envelope_json
+           FROM knowledge_corpus_revisions
+           WHERE account_id = ?1 AND digest = ?2"#,
+        params![account_id, digest],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        },
+    )?;
+    if stored
+        != (
+            i64::from(corpus.schema_version()),
+            entry_count,
+            aggregate_entry_bytes,
+            envelope_json,
+        )
+    {
+        return Err(StorageError::InvalidAgentTransition(
+            "Agent knowledge corpus digest collides with different durable bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn agent_knowledge_binding_json(
+    binding: &AgentKnowledgeContextBinding<'_>,
+) -> Result<String, StorageError> {
+    let encoded = serde_json::to_string(binding)?;
+    if encoded.len() > AGENT_KNOWLEDGE_BINDING_MAX_BYTES {
         return Err(StorageError::InvalidAgentTransition(format!(
-            "agent turn ID cannot exceed {AGENT_ID_MAX_BYTES} UTF-8 bytes"
+            "Agent knowledge binding cannot exceed {AGENT_KNOWLEDGE_BINDING_MAX_BYTES} bytes"
         )));
     }
-    validated_authz_context(&spec.authz)?;
-    normalized_account_value(
-        &spec.environment,
-        "agent environment",
-        AGENT_ENVIRONMENT_MAX_BYTES,
+    Ok(encoded)
+}
+
+fn agent_knowledge_binding_digest(binding_json: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(AGENT_KNOWLEDGE_BINDING_DIGEST_DOMAIN);
+    digest.update((binding_json.len() as u64).to_be_bytes());
+    digest.update(binding_json.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+fn persist_agent_knowledge_context(
+    connection: &Connection,
+    session_id: &str,
+    turn_id: &str,
+    initial_model_job_id: &str,
+    spec: &AgentTurnSpec,
+    created_at: &str,
+) -> Result<String, StorageError> {
+    let turn = query_session_turn(connection, session_id, turn_id)?;
+    spec.knowledge
+        .snapshot
+        .validate_for_selection(&turn.user_message, spec.knowledge.corpus.entries())
+        .map_err(invalid_knowledge_context)?;
+    let snapshot = spec.knowledge.snapshot.snapshot();
+    validate_request_knowledge_context(
+        &spec.request_json,
+        snapshot.canonical_context(),
+        Some(&turn.user_message),
     )?;
-    protocol::validate_reply_provider_id(&spec.provider_name)
-        .map_err(|error| invalid_resource_envelope("agent provider name", error))?;
-    if let Some(model_name) = &spec.model_name {
-        protocol::validate_reply_model_id(model_name)
-            .map_err(|error| invalid_resource_envelope("agent model name", error))?;
+    persist_agent_knowledge_corpus(
+        connection,
+        spec.authz.account_id.as_str(),
+        &spec.knowledge.corpus,
+        created_at,
+    )?;
+
+    let corpus_digest = spec.knowledge.corpus.digest().to_hex();
+    let snapshot_digest = spec.knowledge.snapshot.digest().to_hex();
+    let query_digest = snapshot.query_digest().to_hex();
+    let context_digest = snapshot.context_digest().to_hex();
+    let binding = AgentKnowledgeContextBinding {
+        schema_version: AGENT_KNOWLEDGE_BINDING_SCHEMA_VERSION,
+        account_id: spec.authz.account_id.as_str(),
+        actor_user_id: &spec.authz.user_id,
+        actor_membership_revision: spec.authz.membership_revision.get(),
+        session_id,
+        turn_id,
+        agent_id: &spec.id,
+        initial_model_job_id,
+        corpus_digest: &corpus_digest,
+        snapshot_digest: &snapshot_digest,
+        query_digest: &query_digest,
+        context_digest: &context_digest,
+        context_bytes: snapshot.context_bytes(),
+        canonical_context: snapshot.canonical_context(),
+        created_at,
+    };
+    let binding_json = agent_knowledge_binding_json(&binding)?;
+    let digest = agent_knowledge_binding_digest(&binding_json);
+    let snapshot_envelope_json = spec
+        .knowledge
+        .snapshot
+        .canonical_json()
+        .map_err(invalid_knowledge_context)?;
+    connection.execute(
+        r#"INSERT INTO agent_knowledge_contexts(
+               digest, schema_version, account_id, actor_user_id,
+               actor_membership_revision, session_id, turn_id, agent_id,
+               initial_model_job_id, corpus_digest, snapshot_digest,
+               query_digest, context_digest, context_bytes, canonical_context,
+               snapshot_envelope_json, binding_json, created_at
+           ) VALUES (
+               ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+               ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18
+           )"#,
+        params![
+            digest,
+            i64::from(AGENT_KNOWLEDGE_BINDING_SCHEMA_VERSION),
+            spec.authz.account_id.as_str(),
+            spec.authz.user_id,
+            u64_to_i64(
+                spec.authz.membership_revision.get(),
+                "Agent knowledge membership revision"
+            )?,
+            session_id,
+            turn_id,
+            spec.id,
+            initial_model_job_id,
+            corpus_digest,
+            snapshot_digest,
+            query_digest,
+            context_digest,
+            i64::from(snapshot.context_bytes()),
+            snapshot.canonical_context(),
+            snapshot_envelope_json,
+            binding_json,
+            created_at,
+        ],
+    )?;
+    Ok(digest)
+}
+
+fn query_stored_agent_knowledge_context(
+    connection: &Connection,
+    digest: &str,
+) -> Result<StoredAgentKnowledgeContext, StorageError> {
+    connection
+        .query_row(
+            r#"SELECT digest, schema_version, account_id, actor_user_id,
+                      actor_membership_revision, session_id, turn_id, agent_id,
+                      initial_model_job_id, corpus_digest, snapshot_digest,
+                      query_digest, context_digest, context_bytes, canonical_context,
+                      snapshot_envelope_json, binding_json, created_at
+               FROM agent_knowledge_contexts WHERE digest = ?1"#,
+            [digest],
+            |row| {
+                Ok(StoredAgentKnowledgeContext {
+                    digest: row.get(0)?,
+                    schema_version: row.get(1)?,
+                    account_id: row.get(2)?,
+                    actor_user_id: row.get(3)?,
+                    actor_membership_revision: row.get(4)?,
+                    session_id: row.get(5)?,
+                    turn_id: row.get(6)?,
+                    agent_id: row.get(7)?,
+                    initial_model_job_id: row.get(8)?,
+                    corpus_digest: row.get(9)?,
+                    snapshot_digest: row.get(10)?,
+                    query_digest: row.get(11)?,
+                    context_digest: row.get(12)?,
+                    context_bytes: row.get(13)?,
+                    canonical_context: row.get(14)?,
+                    snapshot_envelope_json: row.get(15)?,
+                    binding_json: row.get(16)?,
+                    created_at: row.get(17)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StorageError::CorruptData(format!("Agent knowledge context `{digest}` is missing"))
+        })
+}
+
+fn query_stored_knowledge_corpus(
+    connection: &Connection,
+    account_id: &str,
+    digest: &str,
+) -> Result<knowledge::CorpusRevisionEnvelope, StorageError> {
+    let stored = connection
+        .query_row(
+            r#"SELECT schema_version, entry_count, aggregate_entry_bytes, envelope_json
+               FROM knowledge_corpus_revisions
+               WHERE account_id = ?1 AND digest = ?2"#,
+            params![account_id, digest],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StorageError::CorruptData(format!(
+                "Agent knowledge corpus `{account_id}/{digest}` is missing"
+            ))
+        })?;
+    let corpus = knowledge::CorpusRevisionEnvelope::from_canonical_json(&stored.3)
+        .map_err(corrupt_knowledge_context)?;
+    let expected_entry_count = i64::try_from(corpus.entries().len())
+        .map_err(|_| StorageError::IntegerOutOfRange("stored knowledge corpus entry count"))?;
+    let expected_entry_bytes = aggregate_corpus_entry_bytes(&corpus)?;
+    if stored.0 != i64::from(corpus.schema_version())
+        || stored.1 != expected_entry_count
+        || stored.2 != expected_entry_bytes
+        || corpus.digest().to_hex() != digest
+    {
+        return Err(StorageError::CorruptData(format!(
+            "Agent knowledge corpus `{account_id}/{digest}` disagrees with its SQL projection"
+        )));
     }
+    Ok(corpus)
+}
+
+fn query_legacy_agent_knowledge_boundary(
+    connection: &Connection,
+    agent_id: &str,
+) -> Result<Option<StoredLegacyAgentKnowledgeBoundary>, StorageError> {
+    connection
+        .query_row(
+            r#"SELECT agent_id, initial_model_job_id, execution_origin_fact_digest
+               FROM agent_knowledge_legacy_agents WHERE agent_id = ?1"#,
+            [agent_id],
+            |row| {
+                Ok(StoredLegacyAgentKnowledgeBoundary {
+                    agent_id: row.get(0)?,
+                    initial_model_job_id: row.get(1)?,
+                    execution_origin_fact_digest: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(StorageError::from)
+}
+
+fn query_legacy_agent_knowledge_boundaries(
+    connection: &Connection,
+) -> Result<Vec<StoredLegacyAgentKnowledgeBoundary>, StorageError> {
+    let mut statement = connection.prepare(
+        r#"SELECT agent_id, initial_model_job_id, execution_origin_fact_digest
+           FROM agent_knowledge_legacy_agents ORDER BY agent_id"#,
+    )?;
+    statement
+        .query_map([], |row| {
+            Ok(StoredLegacyAgentKnowledgeBoundary {
+                agent_id: row.get(0)?,
+                initial_model_job_id: row.get(1)?,
+                execution_origin_fact_digest: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+fn legacy_agent_knowledge_set_digest(
+    boundaries: &[StoredLegacyAgentKnowledgeBoundary],
+) -> Result<String, StorageError> {
+    let mut digest = Sha256::new();
+    digest.update(AGENT_KNOWLEDGE_LEGACY_SET_DIGEST_DOMAIN);
+    digest.update(
+        usize_to_u64(boundaries.len(), "legacy Agent knowledge boundary count")?.to_be_bytes(),
+    );
+    for boundary in boundaries {
+        for value in [
+            boundary.agent_id.as_bytes(),
+            boundary.initial_model_job_id.as_bytes(),
+            boundary.execution_origin_fact_digest.as_bytes(),
+        ] {
+            digest.update(
+                usize_to_u64(value.len(), "legacy Agent knowledge boundary field bytes")?
+                    .to_be_bytes(),
+            );
+            digest.update(value);
+        }
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn query_legacy_agent_knowledge_commitment(
+    connection: &Connection,
+) -> Result<StoredLegacyAgentKnowledgeCommitment, StorageError> {
+    connection
+        .query_row(
+            r#"SELECT agent_count, set_digest
+               FROM agent_knowledge_legacy_boundary
+               WHERE singleton = 1 AND schema_version = 1"#,
+            [],
+            |row| {
+                Ok(StoredLegacyAgentKnowledgeCommitment {
+                    agent_count: row.get(0)?,
+                    set_digest: row.get(1)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StorageError::CorruptData(
+                "the legacy Agent knowledge boundary commitment is missing".into(),
+            )
+        })
+}
+
+fn verify_legacy_agent_knowledge_boundary_commitment(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    let commitment = query_legacy_agent_knowledge_commitment(connection)?;
+    let boundaries = query_legacy_agent_knowledge_boundaries(connection)?;
+    let agent_count = i64::try_from(boundaries.len())
+        .map_err(|_| StorageError::IntegerOutOfRange("legacy Agent knowledge boundary count"))?;
+    let set_digest = legacy_agent_knowledge_set_digest(&boundaries)?;
+    if commitment.agent_count != agent_count || commitment.set_digest != set_digest {
+        return Err(StorageError::CorruptData(
+            "the frozen legacy Agent knowledge set disagrees with its migration commitment".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn seal_legacy_agent_knowledge_boundary(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    let boundaries = query_legacy_agent_knowledge_boundaries(connection)?;
+    let agent_count = i64::try_from(boundaries.len())
+        .map_err(|_| StorageError::IntegerOutOfRange("legacy Agent knowledge boundary count"))?;
+    let set_digest = legacy_agent_knowledge_set_digest(&boundaries)?;
+    let inserted = connection.execute(
+        r#"INSERT INTO agent_knowledge_legacy_boundary(
+               singleton, schema_version, agent_count, set_digest
+           ) VALUES (1, 1, ?1, ?2)"#,
+        params![agent_count, set_digest],
+    )?;
+    if inserted != 1 {
+        return Err(StorageError::CorruptData(
+            "the legacy Agent knowledge boundary commitment was not sealed exactly once".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn agent_matches_frozen_legacy_knowledge_boundary(
+    connection: &Connection,
+    agent: &AgentTurn,
+    initial_job: &AgentModelJob,
+) -> Result<bool, StorageError> {
+    let Some(boundary) = query_legacy_agent_knowledge_boundary(connection, &agent.id)? else {
+        return Ok(false);
+    };
+    let origin_fact_digest = connection
+        .query_row(
+            r#"SELECT fact_digest FROM agent_execution_events
+               WHERE agent_id = ?1 AND sequence = 1"#,
+            [&agent.id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StorageError::CorruptData(format!(
+                "legacy Agent `{}` has no execution-origin fact",
+                agent.id
+            ))
+        })?;
+    if boundary.agent_id != agent.id
+        || boundary.initial_model_job_id != initial_job.id
+        || boundary.execution_origin_fact_digest != origin_fact_digest
+        || initial_job.step != 1
+        || initial_job.agent_id != agent.id
+        || initial_job.account_id != agent.account_id
+        || initial_job.actor_user_id != agent.actor_user_id
+        || initial_job.actor_membership_revision != agent.actor_membership_revision
+        || initial_job.session_id != agent.session_id
+        || initial_job.turn_id != agent.turn_id
+        || agent.knowledge_context_digest.is_some()
+        || initial_job.knowledge_context_digest.is_some()
+    {
+        return Err(StorageError::CorruptData(format!(
+            "legacy Agent `{}` disagrees with its frozen knowledge boundary",
+            agent.id
+        )));
+    }
+    Ok(true)
+}
+
+pub(super) fn agent_has_frozen_legacy_knowledge_boundary(
+    connection: &Connection,
+    agent: &AgentTurn,
+    initial_job: &AgentModelJob,
+) -> Result<bool, StorageError> {
+    if query_legacy_agent_knowledge_boundary(connection, &agent.id)?.is_none() {
+        return Ok(false);
+    }
+    verify_legacy_agent_knowledge_boundary_commitment(connection)?;
+    agent_matches_frozen_legacy_knowledge_boundary(connection, agent, initial_job)
+}
+
+fn load_and_validate_agent_knowledge_context(
+    connection: &Connection,
+    agent: &AgentTurn,
+) -> Result<(StoredAgentKnowledgeContext, String, AgentKnowledgeDigests), StorageError> {
+    let initial_job = query_agent_model_job(connection, &agent.id, 1)?;
+    let frozen_legacy =
+        agent_has_frozen_legacy_knowledge_boundary(connection, agent, &initial_job)?;
+    let digest = match (agent.knowledge_context_digest.as_deref(), frozen_legacy) {
+        (None, true) => {
+            return Err(StorageError::InvalidAgentTransition(
+                "legacy Agent has no durable knowledge context and cannot execute".into(),
+            ));
+        }
+        (None, false) => {
+            return Err(StorageError::CorruptData(format!(
+                "Agent `{}` lost its required durable knowledge context",
+                agent.id
+            )));
+        }
+        (Some(_), true) => {
+            return Err(StorageError::CorruptData(format!(
+                "legacy Agent `{}` was rebound after the frozen knowledge boundary",
+                agent.id
+            )));
+        }
+        (Some(digest), false) => digest,
+    };
+    let context = query_stored_agent_knowledge_context(connection, digest)?;
+    let membership_revision = i64_to_u64(
+        context.actor_membership_revision,
+        "Agent knowledge membership revision",
+    )?;
+    if context.schema_version != i64::from(AGENT_KNOWLEDGE_BINDING_SCHEMA_VERSION)
+        || context.digest != digest
+        || context.account_id != agent.account_id.as_str()
+        || context.actor_user_id != agent.actor_user_id
+        || membership_revision != agent.actor_membership_revision.get()
+        || context.session_id != agent.session_id
+        || context.turn_id != agent.turn_id
+        || context.agent_id != agent.id
+        || context.created_at != agent.created_at
+    {
+        return Err(StorageError::CorruptData(format!(
+            "Agent `{}` disagrees with its durable knowledge identity",
+            agent.id
+        )));
+    }
+
+    let corpus = query_stored_knowledge_corpus(
+        connection,
+        agent.account_id.as_str(),
+        &context.corpus_digest,
+    )?;
+    let snapshot =
+        knowledge::SelectionSnapshotEnvelope::from_canonical_json(&context.snapshot_envelope_json)
+            .map_err(corrupt_knowledge_context)?;
+    let turn = query_session_turn(connection, &agent.session_id, &agent.turn_id)?;
+    snapshot
+        .validate_for_selection(&turn.user_message, corpus.entries())
+        .map_err(corrupt_knowledge_context)?;
+    let selection = snapshot.snapshot();
+    let context_bytes = u32::try_from(context.context_bytes)
+        .map_err(|_| StorageError::IntegerOutOfRange("Agent knowledge context bytes"))?;
+    if corpus.digest().to_hex() != context.corpus_digest
+        || snapshot.digest().to_hex() != context.snapshot_digest
+        || selection.query_digest().to_hex() != context.query_digest
+        || selection.context_digest().to_hex() != context.context_digest
+        || selection.context_bytes() != context_bytes
+        || selection.canonical_context() != context.canonical_context
+    {
+        return Err(StorageError::CorruptData(format!(
+            "Agent `{}` knowledge snapshot disagrees with its SQL projection",
+            agent.id
+        )));
+    }
+
+    let binding = AgentKnowledgeContextBinding {
+        schema_version: AGENT_KNOWLEDGE_BINDING_SCHEMA_VERSION,
+        account_id: &context.account_id,
+        actor_user_id: &context.actor_user_id,
+        actor_membership_revision: membership_revision,
+        session_id: &context.session_id,
+        turn_id: &context.turn_id,
+        agent_id: &context.agent_id,
+        initial_model_job_id: &context.initial_model_job_id,
+        corpus_digest: &context.corpus_digest,
+        snapshot_digest: &context.snapshot_digest,
+        query_digest: &context.query_digest,
+        context_digest: &context.context_digest,
+        context_bytes,
+        canonical_context: &context.canonical_context,
+        created_at: &context.created_at,
+    };
+    let expected_binding_json =
+        agent_knowledge_binding_json(&binding).map_err(corrupt_knowledge_context)?;
+    if context.binding_json != expected_binding_json
+        || context.digest != agent_knowledge_binding_digest(&expected_binding_json)
+    {
+        return Err(StorageError::CorruptData(format!(
+            "Agent `{}` knowledge binding digest is inconsistent",
+            agent.id
+        )));
+    }
+
+    if initial_job.id != context.initial_model_job_id
+        || initial_job.agent_id != agent.id
+        || initial_job.account_id != agent.account_id
+        || initial_job.actor_user_id != agent.actor_user_id
+        || initial_job.actor_membership_revision != agent.actor_membership_revision
+        || initial_job.session_id != agent.session_id
+        || initial_job.turn_id != agent.turn_id
+        || initial_job.step != 1
+        || initial_job.knowledge_context_digest.as_deref() != Some(context.digest.as_str())
+        || initial_job.queued_at != context.created_at
+    {
+        return Err(StorageError::CorruptData(format!(
+            "Agent `{}` initial model job disagrees with its knowledge binding",
+            agent.id
+        )));
+    }
+    validate_request_knowledge_context(
+        &initial_job.request_json,
+        &context.canonical_context,
+        Some(&turn.user_message),
+    )
+    .map_err(corrupt_knowledge_context)?;
+
+    let digests = AgentKnowledgeDigests {
+        context: Sha256Digest::from_hex(&context.digest).map_err(corrupt_knowledge_context)?,
+        corpus: Sha256Digest::from_hex(&context.corpus_digest)
+            .map_err(corrupt_knowledge_context)?,
+        snapshot: Sha256Digest::from_hex(&context.snapshot_digest)
+            .map_err(corrupt_knowledge_context)?,
+    };
+    Ok((context, turn.user_message, digests))
+}
+
+fn require_agent_knowledge_request_integrity(
+    connection: &Connection,
+    agent: &AgentTurn,
+    request_json: &Value,
+) -> Result<(), StorageError> {
+    let (context, query, _) = load_and_validate_agent_knowledge_context(connection, agent)?;
+    validate_request_knowledge_context(request_json, &context.canonical_context, Some(&query))
+        .map_err(corrupt_knowledge_context)
+}
+
+pub(super) fn require_agent_knowledge_context_integrity(
+    connection: &Connection,
+    agent: &AgentTurn,
+    job: &AgentModelJob,
+) -> Result<AgentKnowledgeDigests, StorageError> {
+    let (context, query, digests) = load_and_validate_agent_knowledge_context(connection, agent)?;
+    if job.agent_id != agent.id
+        || job.account_id != agent.account_id
+        || job.actor_user_id != agent.actor_user_id
+        || job.actor_membership_revision != agent.actor_membership_revision
+        || job.session_id != agent.session_id
+        || job.turn_id != agent.turn_id
+        || job.knowledge_context_digest.as_deref() != Some(context.digest.as_str())
+    {
+        return Err(StorageError::CorruptData(format!(
+            "Agent model job `{}` disagrees with its knowledge binding",
+            job.id
+        )));
+    }
+    validate_request_knowledge_context(&job.request_json, &context.canonical_context, Some(&query))
+        .map_err(corrupt_knowledge_context)?;
+    let manifest_digest = agent.deployment_manifest_digest.as_deref().ok_or_else(|| {
+        StorageError::CorruptData(format!(
+            "Agent `{}` has knowledge but no deployment manifest",
+            agent.id
+        ))
+    })?;
+    let manifest = query_agent_deployment_manifest(connection, manifest_digest)?;
+    let latest_step = connection
+        .query_row(
+            "SELECT MAX(step) FROM agent_model_jobs WHERE agent_id = ?1",
+            [&agent.id],
+            |row| row.get::<_, Option<i64>>(0),
+        )?
+        .ok_or_else(|| {
+            StorageError::CorruptData(format!("Agent `{}` has no durable model job", agent.id))
+        })?;
+    let latest_step = u32::try_from(latest_step)
+        .map_err(|_| StorageError::IntegerOutOfRange("latest Agent model step"))?;
+    if latest_step < job.step {
+        return Err(StorageError::CorruptData(format!(
+            "Agent model job `{}` is beyond the durable model-job head",
+            job.id
+        )));
+    }
+    require_agent_request_transcript_chain(
+        connection,
+        agent,
+        latest_step,
+        &manifest,
+        &context.digest,
+        &context.canonical_context,
+        &query,
+    )?;
+    Ok(digests)
+}
+
+fn agent_knowledge_context_is_executable(
+    connection: &Connection,
+    agent: &AgentTurn,
+    job: &AgentModelJob,
+) -> Result<bool, StorageError> {
+    match require_agent_knowledge_context_integrity(connection, agent, job) {
+        Ok(_) => Ok(true),
+        Err(StorageError::Sqlite(error)) => Err(StorageError::Sqlite(error)),
+        Err(_) => Ok(false),
+    }
+}
+
+pub(super) fn corrupt_agent_integrity(error: StorageError) -> StorageError {
+    match error {
+        error @ StorageError::Sqlite(_) => error,
+        error @ StorageError::CorruptData(_) => error,
+        other => StorageError::CorruptData(format!(
+            "Agent durable integrity verification failed: {other}"
+        )),
+    }
+}
+
+pub(super) fn verify_agent_knowledge_context_integrity(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    verify_legacy_agent_knowledge_boundary_commitment(connection)?;
+
+    let corpora = {
+        let mut statement = connection.prepare(
+            r#"SELECT account_id, digest FROM knowledge_corpus_revisions
+               ORDER BY account_id, digest"#,
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (account_id, digest) in corpora {
+        query_stored_knowledge_corpus(connection, &account_id, &digest)?;
+    }
+
+    let contexts = {
+        let mut statement = connection.prepare(
+            r#"SELECT digest, agent_id FROM agent_knowledge_contexts
+               ORDER BY digest"#,
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (digest, agent_id) in &contexts {
+        let agent = query_agent_turn(connection, agent_id).map_err(|error| {
+            StorageError::CorruptData(format!(
+                "Agent knowledge context `{digest}` has no readable Agent: {error}"
+            ))
+        })?;
+        if agent.knowledge_context_digest.as_deref() != Some(digest.as_str()) {
+            return Err(StorageError::CorruptData(format!(
+                "Agent knowledge context `{digest}` is not bound by its Agent"
+            )));
+        }
+        let context = query_stored_agent_knowledge_context(connection, digest)?;
+        let initial_job = query_agent_model_job_by_id(connection, &context.initial_model_job_id)?;
+        require_agent_knowledge_context_integrity(connection, &agent, &initial_job)
+            .map_err(corrupt_agent_integrity)?;
+    }
+
+    let agents = {
+        let mut statement = connection
+            .prepare(r#"SELECT id, knowledge_context_digest FROM agent_turns ORDER BY id"#)?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let bound_agent_count = agents.iter().filter(|(_, digest)| digest.is_some()).count();
+    if bound_agent_count != contexts.len() {
+        return Err(StorageError::CorruptData(
+            "Agent knowledge contexts do not form a one-to-one Agent binding".into(),
+        ));
+    }
+    for (agent_id, context_digest) in agents {
+        let agent = query_agent_turn(connection, &agent_id)?;
+        let jobs = {
+            let mut statement = connection.prepare(&format!(
+                "{} WHERE agent_id = ?1 ORDER BY step",
+                model_job_select()
+            ))?;
+            statement
+                .query_map([&agent_id], decode_agent_model_job_row)?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(StoredAgentModelJobRow::decode)
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let initial_job = jobs.iter().find(|job| job.step == 1).ok_or_else(|| {
+            StorageError::CorruptData(format!(
+                "Agent `{agent_id}` has no initial model job for knowledge verification"
+            ))
+        })?;
+        let frozen_legacy =
+            agent_matches_frozen_legacy_knowledge_boundary(connection, &agent, initial_job)?;
+        match (context_digest.as_deref(), frozen_legacy) {
+            (Some(_), false) => {}
+            (None, true) => {}
+            (Some(_), true) => {
+                return Err(StorageError::CorruptData(format!(
+                    "legacy Agent `{agent_id}` was rebound after the frozen knowledge boundary"
+                )));
+            }
+            (None, false) => {
+                return Err(StorageError::CorruptData(format!(
+                    "post-v22 Agent `{agent_id}` lost its required knowledge binding"
+                )));
+            }
+        }
+        for job in &jobs {
+            if !frozen_legacy {
+                require_agent_knowledge_context_integrity(connection, &agent, job)
+                    .map_err(corrupt_agent_integrity)?;
+            } else if job.knowledge_context_digest.is_some() {
+                return Err(StorageError::CorruptData(format!(
+                    "legacy Agent `{agent_id}` has a partially bound knowledge context"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_agent_turn_spec(spec: &AgentTurnSpec) -> Result<(), StorageError> {
+    validate_agent_turn_receipt_probe(&spec.receipt_probe())?;
     validate_reply_json(
         &spec.request_json,
         "agent model request JSON",
@@ -4608,10 +6044,40 @@ pub(super) fn validate_agent_turn_spec(spec: &AgentTurnSpec) -> Result<(), Stora
         &spec.manifest,
         AgentRequestPhase::Initial,
     )?;
+    validate_agent_knowledge_spec(spec)?;
     WorkflowState::new(spec.manifest.manifest.deployment.spec.loop_limits.clone())
         .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?
         .validate()
         .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+    Ok(())
+}
+
+pub(super) fn validate_agent_turn_receipt_probe(
+    probe: &AgentTurnReceiptProbe,
+) -> Result<(), StorageError> {
+    normalized_reply_value(&probe.id, "agent turn ID")?;
+    if probe.id.len() > AGENT_ID_MAX_BYTES {
+        return Err(StorageError::InvalidAgentTransition(format!(
+            "agent turn ID cannot exceed {AGENT_ID_MAX_BYTES} UTF-8 bytes"
+        )));
+    }
+    validated_authz_context(&probe.authz)?;
+    normalized_account_value(
+        &probe.environment,
+        "agent environment",
+        AGENT_ENVIRONMENT_MAX_BYTES,
+    )?;
+    protocol::validate_reply_provider_id(&probe.provider_name)
+        .map_err(|error| invalid_resource_envelope("agent provider name", error))?;
+    if let Some(model_name) = &probe.model_name {
+        protocol::validate_reply_model_id(model_name)
+            .map_err(|error| invalid_resource_envelope("agent model name", error))?;
+    }
+    Sha256Digest::from_hex(&probe.deployment_manifest_digest).map_err(|error| {
+        StorageError::InvalidAgentTransition(format!(
+            "invalid Agent deployment manifest digest: {error}"
+        ))
+    })?;
     Ok(())
 }
 
@@ -4620,15 +6086,23 @@ pub(super) fn agent_start_fingerprint(
     request: &StartTurnRequest,
     spec: &AgentTurnSpec,
 ) -> Result<String, StorageError> {
+    agent_start_fingerprint_for_probe(session_id, request, &spec.receipt_probe())
+}
+
+pub(super) fn agent_start_fingerprint_for_probe(
+    session_id: &str,
+    request: &StartTurnRequest,
+    probe: &AgentTurnReceiptProbe,
+) -> Result<String, StorageError> {
     Ok(serde_json::to_string(&json!({
         "session_id": session_id,
         "request": request,
         "agent_turn": {
-            "id": spec.id,
-            "environment": spec.environment,
-            "provider_name": spec.provider_name,
-            "model_name": spec.model_name,
-            "deployment_manifest_digest": spec.manifest.digest,
+            "id": probe.id,
+            "environment": probe.environment,
+            "provider_name": probe.provider_name,
+            "model_name": probe.model_name,
+            "deployment_manifest_digest": probe.deployment_manifest_digest,
         },
     }))?)
 }
@@ -4637,18 +6111,29 @@ pub(super) fn require_agent_matches_spec(
     agent: &AgentTurn,
     spec: &AgentTurnSpec,
 ) -> Result<(), StorageError> {
+    require_agent_matches_probe(agent, &spec.receipt_probe())
+}
+
+pub(super) fn require_agent_matches_probe(
+    agent: &AgentTurn,
+    probe: &AgentTurnReceiptProbe,
+) -> Result<(), StorageError> {
     // Like reply context, request_json is server-derived durable authority.
-    if agent.id != spec.id
-        || agent.account_id != spec.authz.account_id
-        || agent.actor_user_id != spec.authz.user_id
-        || agent.actor_membership_revision != spec.authz.membership_revision
-        || agent.environment != spec.environment
-        || agent.provider_name != spec.provider_name
-        || agent.model_name != spec.model_name
-        || agent.deployment_manifest_digest.as_deref() != Some(spec.manifest.digest.as_str())
+    if agent.id != probe.id
+        || agent.account_id != probe.authz.account_id
+        || agent.actor_user_id != probe.authz.user_id
+        || agent.environment != probe.environment
+        || agent.provider_name != probe.provider_name
+        || agent.model_name != probe.model_name
+        || agent.deployment_manifest_digest.as_deref()
+            != Some(probe.deployment_manifest_digest.as_str())
     {
         return Err(StorageError::IdempotencyConflict);
     }
+    // A receipt belongs to the stable account/user namespace, not to one
+    // membership revision. Return the exact admitted work on replay; the
+    // release gate still compares its stored revision with current authority
+    // and rejects stale queued work before external I/O.
     Ok(())
 }
 
@@ -4662,20 +6147,23 @@ pub(super) fn insert_agent_turn(
     validate_agent_turn_spec(spec)?;
     require_manifest_matches_runtime_identity(connection, &spec.manifest)?;
     persist_agent_deployment_manifest(connection, &spec.manifest, queued_at)?;
+    let job_id = model_job_id(&spec.id, 1);
+    let knowledge_context_digest =
+        persist_agent_knowledge_context(connection, session_id, turn_id, &job_id, spec, queued_at)?;
     let workflow_state =
         WorkflowState::new(spec.manifest.manifest.deployment.spec.loop_limits.clone())
             .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
     connection.execute(
         r#"INSERT INTO agent_turns(
                id, account_id, actor_user_id, actor_membership_revision,
-               session_id, turn_id, deployment_manifest_digest,
+               session_id, turn_id, deployment_manifest_digest, knowledge_context_digest,
                environment, provider_name, model_name,
                status, model_steps, tool_calls, tool_result_bytes, revision,
                pending_call_id, workflow_state_json, last_error_json,
                created_at, updated_at, completed_at
            ) VALUES (
-               ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-               'waiting_model', 0, 0, 0, 1, NULL, ?11, NULL, ?12, ?12, NULL
+               ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+               'waiting_model', 0, 0, 0, 1, NULL, ?12, NULL, ?13, ?13, NULL
            )"#,
         params![
             spec.id,
@@ -4688,6 +6176,7 @@ pub(super) fn insert_agent_turn(
             session_id,
             turn_id,
             spec.manifest.digest,
+            knowledge_context_digest,
             spec.environment,
             spec.provider_name,
             spec.model_name,
@@ -4695,16 +6184,16 @@ pub(super) fn insert_agent_turn(
             queued_at,
         ],
     )?;
-    let job_id = model_job_id(&spec.id, 1);
     connection.execute(
         r#"INSERT INTO agent_model_jobs(
                id, agent_id, account_id, actor_user_id, actor_membership_revision,
                session_id, turn_id, step, provider_name, model_name,
-               status, attempt, request_json, response_json, error_json,
+               status, attempt, request_json, knowledge_context_digest,
+               response_json, error_json,
                queued_at, started_at, finished_at
            ) VALUES (
                ?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9,
-               'queued', 0, ?10, NULL, NULL, ?11, NULL, NULL
+               'queued', 0, ?10, ?11, NULL, NULL, ?12, NULL, NULL
            )"#,
         params![
             job_id,
@@ -4720,11 +6209,13 @@ pub(super) fn insert_agent_turn(
             spec.provider_name,
             spec.model_name,
             serde_json::to_string(&spec.request_json)?,
+            knowledge_context_digest,
             queued_at,
         ],
     )?;
     let agent = query_agent_turn(connection, &spec.id)?;
     let job = query_agent_model_job(connection, &spec.id, 1)?;
+    require_agent_knowledge_context_integrity(connection, &agent, &job)?;
     super::execution::insert_native_head_and_admission(connection, &agent, &job, queued_at)?;
     Ok((agent, job))
 }
@@ -5303,6 +6794,7 @@ fn interrupt_agent_turn(
 fn agent_turn_select() -> &'static str {
     r#"SELECT id, account_id, actor_user_id, actor_membership_revision,
               session_id, turn_id, deployment_manifest_digest,
+              knowledge_context_digest,
               environment, provider_name, model_name,
               status, model_steps, tool_calls, tool_result_bytes, revision,
               pending_call_id, workflow_state_json, last_error_json,
@@ -5313,7 +6805,8 @@ fn agent_turn_select() -> &'static str {
 fn model_job_select() -> &'static str {
     r#"SELECT id, agent_id, account_id, actor_user_id, actor_membership_revision,
               session_id, turn_id, step, provider_name, model_name,
-              status, attempt, request_json, response_json, error_json,
+              status, attempt, request_json, knowledge_context_digest,
+              response_json, error_json,
               queued_at, started_at, finished_at
        FROM agent_model_jobs"#
 }
@@ -5326,6 +6819,7 @@ struct StoredAgentTurnRow {
     session_id: String,
     turn_id: String,
     deployment_manifest_digest: Option<String>,
+    knowledge_context_digest: Option<String>,
     environment: String,
     provider_name: String,
     model_name: Option<String>,
@@ -5379,6 +6873,7 @@ impl StoredAgentTurnRow {
             session_id: self.session_id,
             turn_id: self.turn_id,
             deployment_manifest_digest: self.deployment_manifest_digest,
+            knowledge_context_digest: self.knowledge_context_digest,
             environment: self.environment,
             provider_name: self.provider_name,
             model_name: self.model_name,
@@ -5411,20 +6906,21 @@ fn decode_agent_turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAgen
         session_id: row.get(4)?,
         turn_id: row.get(5)?,
         deployment_manifest_digest: row.get(6)?,
-        environment: row.get(7)?,
-        provider_name: row.get(8)?,
-        model_name: row.get(9)?,
-        status: row.get(10)?,
-        model_steps: row.get(11)?,
-        tool_calls: row.get(12)?,
-        tool_result_bytes: row.get(13)?,
-        revision: row.get(14)?,
-        pending_call_id: row.get(15)?,
-        workflow_state_json: row.get(16)?,
-        last_error_json: row.get(17)?,
-        created_at: row.get(18)?,
-        updated_at: row.get(19)?,
-        completed_at: row.get(20)?,
+        knowledge_context_digest: row.get(7)?,
+        environment: row.get(8)?,
+        provider_name: row.get(9)?,
+        model_name: row.get(10)?,
+        status: row.get(11)?,
+        model_steps: row.get(12)?,
+        tool_calls: row.get(13)?,
+        tool_result_bytes: row.get(14)?,
+        revision: row.get(15)?,
+        pending_call_id: row.get(16)?,
+        workflow_state_json: row.get(17)?,
+        last_error_json: row.get(18)?,
+        created_at: row.get(19)?,
+        updated_at: row.get(20)?,
+        completed_at: row.get(21)?,
     })
 }
 
@@ -5442,6 +6938,7 @@ struct StoredAgentModelJobRow {
     status: String,
     attempt: i64,
     request_json: String,
+    knowledge_context_digest: Option<String>,
     response_json: Option<String>,
     error_json: Option<String>,
     queued_at: String,
@@ -5477,6 +6974,7 @@ impl StoredAgentModelJobRow {
             attempt: u32::try_from(self.attempt)
                 .map_err(|_| StorageError::IntegerOutOfRange("agent model attempt"))?,
             request_json: serde_json::from_str(&self.request_json)?,
+            knowledge_context_digest: self.knowledge_context_digest,
             response_json: self
                 .response_json
                 .map(|value| serde_json::from_str(&value))
@@ -5507,11 +7005,12 @@ fn decode_agent_model_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Store
         status: row.get(10)?,
         attempt: row.get(11)?,
         request_json: row.get(12)?,
-        response_json: row.get(13)?,
-        error_json: row.get(14)?,
-        queued_at: row.get(15)?,
-        started_at: row.get(16)?,
-        finished_at: row.get(17)?,
+        knowledge_context_digest: row.get(13)?,
+        response_json: row.get(14)?,
+        error_json: row.get(15)?,
+        queued_at: row.get(16)?,
+        started_at: row.get(17)?,
+        finished_at: row.get(18)?,
     })
 }
 
@@ -5535,18 +7034,23 @@ fn query_agent_tool_call_for_step(
     agent_id: &str,
     model_step: u32,
 ) -> Result<Option<AgentToolCall>, StorageError> {
-    connection
-        .query_row(
-            &format!(
-                "{} WHERE agent_id = ?1 AND model_step = ?2",
-                agent_tool_call_select()
-            ),
+    let mut statement = connection.prepare(&format!(
+        "{} WHERE agent_id = ?1 AND model_step = ?2 ORDER BY call_id LIMIT 2",
+        agent_tool_call_select()
+    ))?;
+    let mut rows = statement
+        .query_map(
             params![agent_id, i64::from(model_step)],
             decode_agent_tool_call_row,
-        )
-        .optional()?
-        .map(StoredAgentToolCallRow::decode)
-        .transpose()
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    if rows.len() > 1 {
+        return Err(StorageError::CorruptData(format!(
+            "Agent `{agent_id}` has more than one tool call for model step {model_step}"
+        )));
+    }
+    rows.pop().map(StoredAgentToolCallRow::decode).transpose()
 }
 
 fn query_agent_tool_calls(

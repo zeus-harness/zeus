@@ -36,6 +36,7 @@ connectors = { path = "crates/connectors" }
 deployment = { path = "crates/deployment" }
 execution = { path = "crates/execution" }
 kernel = { path = "crates/kernel" }
+knowledge = { path = "crates/knowledge" }
 llm = { path = "crates/llm" }
 protocol = { path = "crates/protocol" }
 runtime = { path = "crates/runtime" }

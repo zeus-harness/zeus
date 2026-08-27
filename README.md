@@ -90,13 +90,14 @@ writable through the browser Settings API.
 
 Each accepted turn builds the initial provider request from exactly one stable
 system message, the newest complete, flushed user/assistant pairs that existed
-at the submitted `expected_sequence`, and the new user message. The system
+at the submitted `expected_sequence`, the new user message, and one final
+durable `context` message. The system
 prompt identity, revision, and domain-separated content digest are part of the
 canonical secret-free deployment manifest; its exact content is the first
-message in the durable request. The prompt shares the 64 KiB initial UTF-8
-content budget with at most 27 prior pairs and the current user message. That
-initial shape uses at most 56 of the Agent's 64-message budget, reserving the
-remaining eight messages for four sequential assistant tool calls and their
+message in the durable request. The prompt and governed context share the 64 KiB
+initial UTF-8 content budget with at most 26 prior pairs and the current user
+message. That initial shape uses at most 55 of the Agent's 64-message budget,
+reserving eight messages for four sequential assistant tool calls and their
 results. The fixed loop also permits at most eight model steps, one pending
 approval, 16 KiB of arguments per call, 64 KiB per known result, and 128 KiB of
 known results for the turn. Retries reuse the originally admitted request
@@ -586,7 +587,12 @@ and bounded memory, CPU, and PID resources.
   Agent-local hash-chained execution-fact ledger. Schema v21 adds append-only,
   generation-ordered prepared/start claims for model and tool operations;
   prepared claims are safely recoverable, while started claims are released
-  only by a durable terminal result or conservative restart recovery.
+  only by a durable terminal result or conservative restart recovery. Schema
+  v22 binds every new Agent to an immutable account-scoped knowledge corpus,
+  deterministic selection snapshot, canonical context, initial model job, and
+  execution-origin fact. The exact pre-v22 Agent set is sealed during migration
+  by a domain-separated count+digest commitment; unbound legacy work remains
+  readable but cannot execute.
   Manifest-bound system-prompt v1 uses the existing optional manifest prompt
   field and immutable request JSON, so it requires no database migration.
   Previously queued promptless Agent work no longer matches the current
@@ -597,15 +603,16 @@ and bounded memory, CPU, and PID resources.
   primary Session and Run, policy ID, and policy revision; a mismatch fails
   startup.
 
-Dynamic knowledge remains separate from the stable prompt contract. The pure
-Knowledge v1 domain now validates immutable entry revisions, ranks them with a
-fixed integer/tokenizer contract, drops whole entries at a 16 KiB context
-boundary, and emits a canonical digest-bearing selection snapshot. Database
-binding and Agent request integration are not implemented yet; those layers
-must persist the admitted snapshot instead of mutating the system prompt or
-reconstructing a queued request from live state. The provider contract already
-has a distinct durable `context` role, mapped to a separate `user` message only
-at the OpenAI-compatible wire boundary; storage does not emit it yet.
+Dynamic knowledge remains separate from the stable prompt contract. Knowledge
+v1 validates immutable entry revisions, ranks them with a fixed integer/tokenizer
+contract, drops whole entries at a 16 KiB context boundary, and emits a canonical
+digest-bearing selection snapshot. Schema v22 persists the exact corpus,
+snapshot, canonical context, Agent/job binding, and execution admission digests;
+replay never reselects from live state. The provider contract carries the
+context as a distinct durable `context` role, mapped to a separate `user`
+message only at the OpenAI-compatible wire boundary. The current runtime
+deliberately admits an explicit empty corpus until an account knowledge catalog
+and ingestion surface are implemented.
 
 SQLite is the authoritative store for this local single-instance Alpha. Do not
 place it on NFS or share one database volume between multiple Zeus replicas.
@@ -758,7 +765,7 @@ directly.
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Current schema v21 retains durable Run attachment during migration and demo
+Current schema v22 retains durable Run attachment during migration and demo
 seeding, but Alpha+ does not expose a public attach-Run HTTP route.
 
 The application boundary now caps auth JSON at 8 KiB and command JSON at
@@ -779,7 +786,7 @@ approval, dispatch, reply completion, attachment checks, and startup recovery
 use typed point queries or fixed 64-row batches. Production Session list/detail,
 Run detail, and overview reads now use indexed `LIMIT + 1` keyset pages inside
 actor-authorized SQLite snapshots; no production HTTP read loads a complete
-ledger or collection. Current schema v21 retains bounded Session, open-turn,
+ledger or collection. Current schema v22 retains bounded Session, open-turn,
 active reply/dispatch, auth-session, bootstrap-audit, event-slot, and logical
 event-payload-byte admission. Exact idempotent replay is checked before capacity,
 while accepted work consumes its reserved terminal slots and payload bytes
@@ -860,13 +867,13 @@ Membership Foundation, schema v14 Account-scoped Durable Authorization, and
 schema v15 Member Lifecycle / Account Audit, schema v16 Session Reply Context
 Index, schema v17 Durable Session Agent Loop, schema v18 exact tool-completion
 replay, schema v19 deployment-manifest binding, schema v20 execution-ledger,
-and schema v21 prepared-claim host verification:
+schema v21 prepared claims, and schema v22 durable knowledge-context binding:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --locked`: 517 tests passed
+- `cargo test --workspace --all-targets --locked`: 539 tests passed
   under the existing project counting convention, including 8 deployment tests,
-  24 knowledge tests, 232 storage tests, 48 runtime tests, 64 API library tests, 6 API main/config
+  29 knowledge tests, 242 storage tests, 48 runtime tests, 64 API library tests, 6 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,

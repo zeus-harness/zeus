@@ -3,8 +3,8 @@
 状态：主机 Alpha+、Actor Boundary Foundation、API/Terminal Payload Resource Envelope、Bounded
 Event Feed、Point-query Durable Context、Bounded Read Models、SQLite Capacity Slice 2、SQLite
 Physical/Operation Capacity、Bootstrap Audit Retention、schema v13 Account Membership
-Foundation、schema v14 Account-scoped Durable Authorization 与 schema v15 Member Lifecycle /
-Account Audit、schema v16 Session Reply Context Index 已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
+Foundation、schema v14 Account-scoped Durable Authorization、schema v15 Member Lifecycle /
+Account Audit、schema v16 Session Reply Context Index 至 schema v22 Durable Knowledge Context 已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
 v11→v12→v13→v14 迁移证据，current-image 证据见本节验收结果，Linux Docker PID/OOM
 authoritative gate 待完成。
 
@@ -205,8 +205,8 @@ POST /sessions/{id}/turns
   user/assistant 对，再追加当前 user message。Session-native Agent request 的第一条且唯一一条
   system message 是稳定的 Zeus system prompt；其 ID、revision 与域分离 content digest 绑定在
   canonical secret-free deployment manifest，精确内容只随 immutable request 持久化。
-- system prompt 与最新至多 27 对历史消息及当前 user message 共享 64 KiB 初始 UTF-8 内容
-  预算。初始最多 56 条 message；Agent 全程最多 64 条，为四组 assistant tool call / tool result
+- system prompt、最新至多 26 对历史消息、当前 user message 及其后的 durable `context` message
+  共享 64 KiB 初始 UTF-8 内容预算。初始最多 55 条 message；Agent 全程最多 64 条，为四组 assistant tool call / tool result
   预留八条。当前 user message 无法与固定 prompt 一起装入该预算时，在任何 durable write 前
   返回 `413 agent_request_too_large`。interrupted 或尚未 flush 的 turn 不进入模型上下文。
 - admission、model claim、tool continuation 与 deep-integrity 都要求 system message 首位唯一、
@@ -214,7 +214,7 @@ POST /sessions/{id}/turns
   整个事务；已经 queued 的 work 在 claim 时发现持久化 authority 损坏、promptless 或与当前
   manifest 漂移，才 durable settle 为 `deployment_unavailable`。两条路径都发生在 provider I/O 前。
 - 组装后的 provider request 随 immutable model job 持久化。相同命令的迟到重试、known tool
-  completion continuation 和重启恢复都复用 exact persisted request，不根据当前 prompt、知识或
+  completion continuation 和重启恢复都复用 exact persisted request，不根据当前 prompt、live knowledge 或
   Session 的新状态重建上下文，也不会再次调用 provider。
 - Provider 调用前必须存在同一 prepared claim 对应的 durable `started` checkpoint。
 - `queued` job 可在重启后继续；`started` 且无持久结果的 job 变为 `outcome_unknown`，不得自动重放可能计费的模型请求。
@@ -274,13 +274,18 @@ POST /sessions/{id}/turns
 - `0021_agent_operation_claims.sql`：在 external start 之前增加 append-only prepared claim 与连续
   generation。prepared 可过期/重领且不写 unknown；started 不按 TTL 重放，只能由 durable
   terminal commit 或启动恢复释放。
+- `0022_agent_knowledge_context.sql`：持久化 account-scoped immutable corpus revision、selection
+  snapshot、canonical context 与 Agent/initial-job/execution admission digest；迁移时冻结 exact
+  legacy Agent 集合并写入 domain-separated count+digest commitment，防止 post-v22 binding 被剥离后
+  伪装为 legacy。
 
 Manifest-bound system prompt v1 复用 `0019` 已有的可选 prompt 字段和 immutable request JSON，
 不增加 schema migration。升级后旧 queued promptless Agent work 与当前 deployment 不一致，首次
-进入 claim 时 fail closed；terminal history 保持可读。Knowledge v1 纯领域层已生成独立、受治理、
-带完整 digest 的 canonical context snapshot，不修改稳定 system prompt。数据库持久化和 Agent
-request 注入仍是下一阶段，当前不能从 live knowledge 重建 queued request。LLM 协议层已保留独立
-durable `context` role，并只在 OpenAI-compatible provider wire 上映射为另一条 `user` message。
+进入 claim 时 fail closed；terminal history 保持可读。Knowledge v1 生成独立、受治理、带完整
+digest 的 canonical context snapshot，不修改稳定 system prompt。schema v22 已完成数据库绑定、
+Agent request 注入和 exact replay；LLM 协议层使用独立 durable `context` role，并只在
+OpenAI-compatible provider wire 上映射为另一条 `user` message。当前 runtime 使用显式空 corpus，
+真实 account knowledge catalog 与 ingestion surface 是下一阶段。
 
 迁移必须原地保留 Alpha append-only ledger、事件外键与 runtime identity。任何一步失败都回滚整个 migration transaction。
 
@@ -335,7 +340,7 @@ durable `context` role，并只在 OpenAI-compatible provider wire 上映射为�
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 按项目既有统计口径通过 517 个 Rust 测试（knowledge 24、storage 232、runtime 48、API library 64、API
+- host 按项目既有统计口径通过 539 个 Rust 测试（knowledge 29、storage 242、runtime 48、API library 64、API
   main/config 6）与 28 个 Web Node 测试。
 - `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 

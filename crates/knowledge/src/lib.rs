@@ -35,7 +35,17 @@ pub const MAX_ENTRY_REVISION_BYTES: usize = 128;
 pub const MAX_ENTRY_TITLE_BYTES: usize = 256;
 pub const MAX_ENTRY_CONTENT_BYTES: usize = 8 * 1024;
 pub const MAX_AGGREGATE_ENTRY_BYTES: usize = 512 * 1024;
-pub const MAX_QUERY_BYTES: usize = 4 * 1024;
+/// Maximum size of the exact immutable Agent user message bound to a selection.
+///
+/// This intentionally matches the upper Session/LLM message contract. Ranking
+/// remains independently bounded by [`MAX_QUERY_UNIQUE_TERMS`].
+pub const MAX_QUERY_BYTES: usize = 64 * 1024;
+/// Maximum number of distinct query terms admitted to ranking.
+///
+/// When a query contains more terms, the first distinct terms in tokenizer
+/// order are retained. Later occurrences of retained terms still contribute
+/// to their frequency; later new terms are ignored. This makes every valid
+/// message selectable without allowing its ranking state to grow unbounded.
 pub const MAX_QUERY_UNIQUE_TERMS: usize = 32;
 pub const MAX_ENTRY_UNIQUE_TERMS: usize = 256;
 pub const MAX_SELECTION_HITS: usize = 6;
@@ -596,8 +606,9 @@ impl SelectionSnapshot {
     /// Validate the snapshot against the exact user query that selected it.
     ///
     /// The durable query digest proves byte identity, while this additional
-    /// check recomputes every persisted query-term frequency. Storage should
-    /// use this method when it can read the immutable Session user message.
+    /// check recomputes every persisted projected query-term frequency.
+    /// Storage should use this method when it can read the immutable Session
+    /// user message.
     pub fn validate_for_query(&self, query: &str) -> Result<(), KnowledgeError> {
         self.validate()?;
         let query_frequencies = validated_query_frequencies(query)?;
@@ -1036,6 +1047,11 @@ impl std::error::Error for KnowledgeError {}
 /// floating-point behavior.
 pub fn tokenize(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
+    for_each_token(text, |token| tokens.push(token.to_owned()));
+    tokens
+}
+
+fn for_each_token(text: &str, mut visitor: impl FnMut(&str)) {
     let mut ascii = String::new();
     for character in text.chars() {
         if character.is_ascii_alphanumeric() {
@@ -1043,16 +1059,17 @@ pub fn tokenize(text: &str) -> Vec<String> {
             continue;
         }
         if !ascii.is_empty() {
-            tokens.push(std::mem::take(&mut ascii));
+            visitor(&ascii);
+            ascii.clear();
         }
         if !character.is_ascii() && !is_fixed_whitespace(character) {
-            tokens.push(character.to_string());
+            let mut encoded = [0_u8; 4];
+            visitor(character.encode_utf8(&mut encoded));
         }
     }
     if !ascii.is_empty() {
-        tokens.push(ascii);
+        visitor(&ascii);
     }
-    tokens
 }
 
 /// Digest the exact validated query bytes, not a normalized token stream.
@@ -1473,30 +1490,26 @@ fn push_json_string(output: &mut String, value: &str) {
 
 fn validate_query(query: &str) -> Result<(), KnowledgeError> {
     validate_text_bytes("query", query, MAX_QUERY_BYTES)?;
-    if query.chars().all(is_fixed_whitespace) {
+    // Mirror the Session message boundary: all other exact UTF-8 bytes,
+    // including punctuation and controls, are valid user-authored content.
+    if query.trim().is_empty() {
         return Err(invalid_field("query", "cannot be blank"));
-    }
-    if query.chars().any(is_disallowed_text_control) {
-        return Err(invalid_field(
-            "query",
-            "cannot contain controls other than tab or line breaks",
-        ));
-    }
-    if tokenize(query).is_empty() {
-        return Err(KnowledgeError::QueryHasNoTokens);
     }
     Ok(())
 }
 
 fn validated_query_frequencies(query: &str) -> Result<TermFrequencies, KnowledgeError> {
     validate_query(query)?;
-    let frequencies = token_frequencies(tokenize(query));
-    if frequencies.len() > MAX_QUERY_UNIQUE_TERMS {
-        return Err(KnowledgeError::TooManyQueryTerms {
-            max: MAX_QUERY_UNIQUE_TERMS,
-            actual: frequencies.len(),
-        });
-    }
+    let mut frequencies = TermFrequencies::new();
+    for_each_token(query, |token| {
+        if let Some(frequency) = frequencies.get_mut(token) {
+            *frequency = frequency
+                .checked_add(1)
+                .expect("bounded query cannot contain u32::MAX tokens");
+        } else if frequencies.len() < MAX_QUERY_UNIQUE_TERMS {
+            frequencies.insert(token.to_owned(), 1);
+        }
+    });
     Ok(frequencies)
 }
 
@@ -1990,11 +2003,10 @@ mod tests {
     }
 
     #[test]
-    fn strict_query_duplicate_count_and_aggregate_bounds_fail_closed() {
-        assert!(matches!(
-            select("---", &[]),
-            Err(KnowledgeError::QueryHasNoTokens)
-        ));
+    fn tokenless_queries_are_valid_while_input_and_corpus_bounds_fail_closed() {
+        let tokenless = select("---", &[]).unwrap();
+        assert!(tokenless.hits().is_empty());
+        assert!(tokenless.matches_query("---").unwrap());
         assert!(matches!(
             select(&"q".repeat(MAX_QUERY_BYTES + 1), &[]),
             Err(KnowledgeError::InvalidField { field: "query", .. })
@@ -2024,17 +2036,23 @@ mod tests {
     }
 
     #[test]
-    fn unique_term_limits_are_exact_and_fail_closed() {
+    fn query_terms_are_projected_and_entry_term_limit_fails_closed() {
         let query_32 = (0..MAX_QUERY_UNIQUE_TERMS)
             .map(|index| format!("q{index}"))
             .collect::<Vec<_>>()
             .join(" ");
         assert!(select(&query_32, &[]).is_ok());
         let query_33 = format!("{query_32} q{MAX_QUERY_UNIQUE_TERMS}");
-        assert!(matches!(
-            select(&query_33, &[]),
-            Err(KnowledgeError::TooManyQueryTerms { .. })
-        ));
+        let projected = select(
+            &query_33,
+            &[
+                entry("retained", "q31", "q31"),
+                entry("omitted", "q32", "q32"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(projected.hits().len(), 1);
+        assert_eq!(projected.hits()[0].entry().entry_id(), "retained");
 
         let terms_256 = (0..MAX_ENTRY_UNIQUE_TERMS)
             .map(|index| format!("t{index}"))
@@ -2046,6 +2064,99 @@ mod tests {
             select("t0", &[entry("entry-257", "t0", &terms_257)]),
             Err(KnowledgeError::TooManyEntryTerms { .. })
         ));
+    }
+
+    #[test]
+    fn query_projection_accepts_the_exact_64_kib_message_boundary() {
+        let suffix = " needle";
+        let query = format!("{}{}", "x".repeat(MAX_QUERY_BYTES - suffix.len()), suffix);
+        assert_eq!(query.len(), MAX_QUERY_BYTES);
+
+        let first = select("needle", &[entry("match", "Needle", "needle")]).unwrap();
+        let at_limit = select(&query, &[entry("match", "Needle", "needle")]).unwrap();
+        let repeated = select(&query, &[entry("match", "Needle", "needle")]).unwrap();
+        assert_eq!(at_limit, repeated);
+        assert_eq!(at_limit.hits().len(), 1);
+        assert_eq!(at_limit.hits()[0].matched_terms()[0].token(), "needle");
+        assert_ne!(at_limit.query_digest(), first.query_digest());
+        assert!(at_limit.matches_query(&query).unwrap());
+
+        let mut oversized = query;
+        oversized.push('x');
+        assert!(matches!(
+            select(&oversized, &[]),
+            Err(KnowledgeError::InvalidField { field: "query", .. })
+        ));
+    }
+
+    #[test]
+    fn query_projection_is_bounded_by_first_distinct_terms_but_counts_later_repeats() {
+        let retained = (0..MAX_QUERY_UNIQUE_TERMS)
+            .map(|index| format!("q{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let query = format!("{retained} q32 q0 q33");
+        let entries = [
+            entry("frequency", "q0", "q0"),
+            entry("last-retained", "q31", "q31"),
+            entry("first-omitted", "q32", "q32"),
+        ];
+
+        let snapshot = select(&query, &entries).unwrap();
+        assert_eq!(
+            snapshot
+                .hits()
+                .iter()
+                .map(|hit| hit.entry().entry_id())
+                .collect::<Vec<_>>(),
+            ["frequency", "last-retained"]
+        );
+        let q0 = &snapshot.hits()[0].matched_terms()[0];
+        assert_eq!(q0.token(), "q0");
+        assert_eq!(q0.query_frequency(), 2);
+        snapshot.validate_for_selection(&query, &entries).unwrap();
+    }
+
+    #[test]
+    fn ignored_query_terms_still_change_the_full_query_digest() {
+        let retained = (0..MAX_QUERY_UNIQUE_TERMS)
+            .map(|index| format!("q{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let first = select(&format!("{retained} ignored-first"), &[]).unwrap();
+        let second = select(&format!("{retained} ignored-second"), &[]).unwrap();
+
+        assert_eq!(first.hits(), second.hits());
+        assert_eq!(first.evidence(), second.evidence());
+        assert_eq!(first.canonical_context(), second.canonical_context());
+        assert_ne!(first.query_digest(), second.query_digest());
+        assert_ne!(
+            first.snapshot_digest().unwrap(),
+            second.snapshot_digest().unwrap()
+        );
+    }
+
+    #[test]
+    fn legal_tokenless_and_control_bearing_messages_produce_empty_snapshots() {
+        for query in ["---", "\0---", "?!…"] {
+            let snapshot = select(query, &[entry("entry", "Title", "Body")]).unwrap();
+            assert!(snapshot.hits().is_empty());
+            assert!(snapshot.matches_query(query).unwrap());
+            snapshot.validate_for_query(query).unwrap();
+        }
+    }
+
+    #[test]
+    fn multibyte_query_at_the_byte_limit_is_not_sliced() {
+        let query = "🙂".repeat(MAX_QUERY_BYTES / "🙂".len());
+        assert_eq!(query.len(), MAX_QUERY_BYTES);
+        let snapshot = select(&query, &[entry("emoji", "🙂", "🙂")]).unwrap();
+        assert_eq!(snapshot.hits().len(), 1);
+        assert_eq!(snapshot.hits()[0].matched_terms()[0].token(), "🙂");
+        assert_eq!(
+            snapshot.hits()[0].matched_terms()[0].query_frequency(),
+            u32::try_from(MAX_QUERY_BYTES / "🙂".len()).unwrap()
+        );
     }
 
     #[test]

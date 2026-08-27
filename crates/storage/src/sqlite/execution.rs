@@ -99,6 +99,8 @@ pub(super) fn insert_native_head_and_admission(
         ))
     })?;
     let manifest_digest = Sha256Digest::from_hex(manifest_digest).map_err(live_execution_error)?;
+    let knowledge =
+        super::agent::require_agent_knowledge_context_integrity(connection, agent, initial_job)?;
     let initial_request_digest =
         digest_json(DigestDomain::ModelRequest, &initial_job.request_json)?;
     let envelope = fact_envelope(
@@ -111,6 +113,9 @@ pub(super) fn insert_native_head_and_admission(
             manifest_digest,
             initial_job_id: initial_job.id.clone(),
             initial_request_digest,
+            knowledge_context_digest: Some(knowledge.context),
+            knowledge_corpus_digest: Some(knowledge.corpus),
+            knowledge_snapshot_digest: Some(knowledge.snapshot),
         },
     )?;
     insert_fact_row(connection, &envelope)?;
@@ -463,7 +468,14 @@ pub(super) fn query_agent_execution_explain_for_actor(
     let head = query_execution_read_head(&transaction, &agent)?;
     let facts = query_fact_summaries(&transaction, &agent, &head)?;
     let epochs = query_epoch_summaries(&transaction, &agent)?;
-    let history = execution_history(&agent, &head, manifest.is_some(), &epochs, false)?;
+    let history = execution_history(
+        &agent,
+        &head,
+        manifest.is_some(),
+        agent.knowledge_context_digest.is_some(),
+        &epochs,
+        false,
+    )?;
     let session_sequence = query_session_summary(&transaction, session_id)?.sequence;
     let explanation = AgentExecutionExplain {
         schema_version: AGENT_EXECUTION_EXPLAIN_SCHEMA_VERSION,
@@ -516,6 +528,7 @@ pub(super) fn query_agent_run_epoch_explain_for_actor(
         &agent,
         &head,
         manifest.is_some(),
+        agent.knowledge_context_digest.is_some(),
         std::slice::from_ref(&epoch),
         true,
     )?;
@@ -766,10 +779,34 @@ fn validate_origin_binding(
                 manifest_digest,
                 initial_job_id,
                 initial_request_digest,
+                knowledge_context_digest,
+                knowledge_corpus_digest,
+                knowledge_snapshot_digest,
             },
             ExecutionHistoryOrigin::Native,
         ) => {
             let job = super::agent::query_agent_model_job_by_id(connection, initial_job_id)?;
+            let knowledge_binding_valid = match (
+                knowledge_context_digest,
+                knowledge_corpus_digest,
+                knowledge_snapshot_digest,
+            ) {
+                (None, None, None) => {
+                    super::agent::agent_has_frozen_legacy_knowledge_boundary(
+                        connection, agent, &job,
+                    )? && agent.knowledge_context_digest.is_none()
+                        && job.knowledge_context_digest.is_none()
+                }
+                (Some(context), Some(corpus), Some(snapshot)) => {
+                    let stored = super::agent::require_agent_knowledge_context_integrity(
+                        connection, agent, &job,
+                    )?;
+                    context == &stored.context
+                        && corpus == &stored.corpus
+                        && snapshot == &stored.snapshot
+                }
+                _ => false,
+            };
             state.status() == workflows::AgentStatus::ModelQueued
                 && state.model_steps() == 0
                 && state.tool_calls() == 0
@@ -786,6 +823,7 @@ fn validate_origin_binding(
                 && job.step == 1
                 && digest_json(DigestDomain::ModelRequest, &job.request_json)?
                     == *initial_request_digest
+                && knowledge_binding_valid
                 && job.queued_at == agent.created_at
                 && envelope.fact.recorded_at.as_str() == agent.created_at
                 && expected_origin_revision == 1
@@ -1612,7 +1650,10 @@ fn validate_epochless_operation_fact(
         let error_code_matches = stored_code == Some(expected_code)
             || (matches!(command, Command::ContinuationUnavailable)
                 && stored_code == Some("deployment_unavailable")
-                && is_legacy_rejection_deployment_settlement(connection, &agent, envelope)?);
+                && is_legacy_rejection_deployment_settlement(connection, &agent, envelope)?)
+            || (matches!(command, Command::ContinuationUnavailable)
+                && stored_code == Some("knowledge_unavailable")
+                && is_legacy_rejection_knowledge_settlement(connection, &agent, envelope)?);
         let exact_terminal_material = *source == FactSource::Live
             && external_call.is_none()
             && subject.is_none()
@@ -1638,6 +1679,7 @@ fn validate_epochless_operation_fact(
         command,
         Command::AuthorizationRevoked
             | Command::DeploymentUnavailable
+            | Command::KnowledgeUnavailable
             | Command::ApprovalApproved
             | Command::ApprovalRejected { .. }
     ) {
@@ -1653,11 +1695,14 @@ fn validate_epochless_operation_fact(
     let rejection_error_code = match command {
         Command::AuthorizationRevoked => Some("authorization_revoked"),
         Command::DeploymentUnavailable => Some("deployment_unavailable"),
+        Command::KnowledgeUnavailable => Some("knowledge_unavailable"),
         _ => None,
     };
     let matches_durable = match (command, subject) {
         (
-            Command::AuthorizationRevoked | Command::DeploymentUnavailable,
+            Command::AuthorizationRevoked
+            | Command::DeploymentUnavailable
+            | Command::KnowledgeUnavailable,
             OperationRef::Model { job_id, step },
         ) => {
             let job = super::agent::query_agent_model_job_by_id(connection, job_id)?;
@@ -1674,7 +1719,9 @@ fn validate_epochless_operation_fact(
                 && error.get("code").and_then(Value::as_str) == rejection_error_code
         }
         (
-            Command::AuthorizationRevoked | Command::DeploymentUnavailable,
+            Command::AuthorizationRevoked
+            | Command::DeploymentUnavailable
+            | Command::KnowledgeUnavailable,
             OperationRef::Tool {
                 call_id,
                 ordinal,
@@ -1811,6 +1858,48 @@ fn is_legacy_rejection_deployment_settlement(
         && envelope.fact.recorded_at == previous.fact.recorded_at
         && state.status() == workflows::AgentStatus::ContinuationQueued
         && next_request_digest.is_none())
+}
+
+fn is_legacy_rejection_knowledge_settlement(
+    connection: &Connection,
+    agent: &AgentTurn,
+    envelope: &ExecutionFactEnvelope,
+) -> Result<bool, StorageError> {
+    if agent.knowledge_context_digest.is_some() || envelope.fact.sequence <= 1 {
+        return Ok(false);
+    }
+    let previous_sequence = envelope.fact.sequence - 1;
+    let previous_json = connection
+        .query_row(
+            r#"SELECT envelope_json FROM agent_execution_events
+               WHERE agent_id = ?1 AND sequence = ?2"#,
+            params![
+                envelope.fact.agent_id,
+                u64_to_i64(previous_sequence, "Agent execution sequence")?
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(previous_json) = previous_json else {
+        return Ok(false);
+    };
+    let previous = ExecutionFactEnvelope::from_json_slice(previous_json.as_bytes())
+        .map_err(stored_execution_error)?;
+    let ExecutionFactData::WorkflowTransition {
+        command: Command::ApprovalRejected { .. },
+        state,
+        next_request_digest,
+        ..
+    } = &previous.fact.data
+    else {
+        return Ok(false);
+    };
+    Ok(
+        envelope.fact.previous_fact_digest.as_ref() == Some(&previous.digest)
+            && envelope.fact.recorded_at == previous.fact.recorded_at
+            && state.status() == workflows::AgentStatus::ContinuationQueued
+            && next_request_digest.is_none(),
+    )
 }
 
 fn recomputed_tool_input_digest(
@@ -2454,6 +2543,7 @@ fn execution_history(
     agent: &AgentTurn,
     head: &ExecutionReadHead,
     has_manifest: bool,
+    has_knowledge: bool,
     epochs: &[RunEpochSummary],
     exact_request_returned: bool,
 ) -> Result<ExecutionHistory, StorageError> {
@@ -2463,6 +2553,9 @@ fn execution_history(
     }
     if !has_manifest {
         reasons.push(ExecutionHistoryReason::LegacyManifestUnbound);
+    }
+    if !has_knowledge {
+        reasons.push(ExecutionHistoryReason::LegacyKnowledgeUnbound);
     }
     if epochs.iter().any(|epoch| {
         matches!(
@@ -2526,6 +2619,7 @@ fn execution_history(
     let overall = if head.origin == ExecutionHistoryOrigin::Native
         && head.history_complete
         && has_manifest
+        && has_knowledge
         && reasons.is_empty()
     {
         ReconstructionLevel::Complete

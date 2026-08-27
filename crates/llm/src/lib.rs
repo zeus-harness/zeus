@@ -305,12 +305,35 @@ impl ReplyRequest {
         context: impl Into<String>,
     ) -> Result<Self, ProviderError> {
         let system_prompt = system_prompt.into();
+        Self::from_session_history_for_agent_with_optional_system_prompt_and_context(
+            turns,
+            user_message,
+            Some(&system_prompt),
+            context,
+        )
+    }
+
+    /// Build a context-bound initial Agent request with an optional system prompt.
+    ///
+    /// This is the canonical reconstruction boundary for durable Agent
+    /// admission. Both prompt-bound and promptless requests use the same
+    /// history ordering, trimming, content budget, and fixed tool-step reserve.
+    /// The governed context is always required and remains the final initial
+    /// message immediately after the current user message.
+    pub fn from_session_history_for_agent_with_optional_system_prompt_and_context(
+        turns: &[SessionTurn],
+        user_message: impl Into<String>,
+        system_prompt: Option<&str>,
+        context: impl Into<String>,
+    ) -> Result<Self, ProviderError> {
         let context = context.into();
-        protocol::validate_user_message(&system_prompt)
-            .map_err(|_| ProviderError::InvalidRequest("invalid system prompt"))?;
+        if let Some(system_prompt) = system_prompt {
+            protocol::validate_user_message(system_prompt)
+                .map_err(|_| ProviderError::InvalidRequest("invalid system prompt"))?;
+        }
         require_context_content(&context)?;
         let conversation_budget = AGENT_REQUEST_INITIAL_CONTENT_MAX_BYTES
-            .checked_sub(system_prompt.len())
+            .checked_sub(system_prompt.map_or(0, str::len))
             .and_then(|remaining| remaining.checked_sub(context.len()))
             .ok_or(ProviderError::InvalidRequest(
                 "system prompt and governed context exceed the initial Agent content budget",
@@ -321,9 +344,12 @@ impl ReplyRequest {
             AGENT_REQUEST_MAX_HISTORY_PAIRS_WITH_CONTEXT,
             conversation_budget,
         )?;
-        request
-            .messages
-            .insert(0, ReplyMessage::new(ReplyRole::System, system_prompt));
+        if let Some(system_prompt) = system_prompt {
+            request.messages.insert(
+                0,
+                ReplyMessage::new(ReplyRole::System, system_prompt.to_owned()),
+            );
+        }
         request
             .messages
             .push(ReplyMessage::new(ReplyRole::Context, context));
@@ -395,6 +421,30 @@ impl ReplyRequest {
         validate_reply_request(&request)?;
         Ok(request)
     }
+}
+
+/// Extend one exact Agent request with a known tool call and its exact result.
+///
+/// The prior request is revalidated before it is cloned. The returned request
+/// preserves every prior message and tool definition byte-for-byte at the
+/// typed boundary, appends exactly one assistant tool call followed by its
+/// matching result, and then reapplies the complete Agent transcript and
+/// aggregate budget validation.
+pub fn agent_continuation_request(
+    request: &ReplyRequest,
+    call: &ReplyToolCall,
+    result_content: impl Into<String>,
+) -> Result<ReplyRequest, ProviderError> {
+    validate_agent_reply_request(request)?;
+    let mut continuation = request.clone();
+    continuation
+        .messages
+        .push(ReplyMessage::assistant_tool_call(call.clone()));
+    continuation
+        .messages
+        .push(ReplyMessage::tool_result(call.id.clone(), result_content));
+    validate_agent_reply_request(&continuation)?;
+    Ok(continuation)
 }
 
 /// Provenance class attached to every successful reply.
@@ -868,9 +918,10 @@ pub fn validate_agent_reply_request(request: &ReplyRequest) -> Result<(), Provid
 
 /// Validate the first request in a durable Agent turn.
 ///
-/// Initial requests may contain only a system prompt plus complete historical
-/// user/assistant pairs and the current user message. The tighter message and
-/// content envelopes reserve room for every fixed tool-call/result step.
+/// Initial requests may contain only an optional system prompt, complete
+/// historical user/assistant pairs, the current user message, and one governed
+/// context message. The tighter message and content envelopes reserve room for
+/// every fixed tool-call/result step.
 pub fn validate_initial_agent_reply_request(request: &ReplyRequest) -> Result<(), ProviderError> {
     validate_agent_reply_request(request)?;
     let system_messages = usize::from(
@@ -1210,6 +1261,148 @@ mod tests {
 
         assert_eq!(request.messages.len(), 63);
         assert!(validate_agent_reply_request(&request).is_ok());
+    }
+
+    #[test]
+    fn optional_system_context_builder_is_the_canonical_initial_path() {
+        let turns = (0..40)
+            .map(|ordinal| {
+                turn(
+                    ordinal,
+                    SessionTurnStatus::Flushed,
+                    format!("user-{ordinal}"),
+                    Some(format!("assistant-{ordinal}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let context = r#"{"schema_version":1,"entries":[]}"#;
+
+        let prompted = ReplyRequest::from_session_history_for_agent_with_system_prompt_and_context(
+            &turns,
+            "current",
+            "You are Zeus.",
+            context,
+        )
+        .unwrap();
+        let reconstructed =
+            ReplyRequest::from_session_history_for_agent_with_optional_system_prompt_and_context(
+                &turns,
+                "current",
+                Some("You are Zeus."),
+                context,
+            )
+            .unwrap();
+        assert_eq!(reconstructed, prompted);
+
+        let promptless =
+            ReplyRequest::from_session_history_for_agent_with_optional_system_prompt_and_context(
+                &turns, "current", None, context,
+            )
+            .unwrap();
+        assert_eq!(promptless.messages.len(), 54);
+        assert_eq!(promptless.messages[0].role, ReplyRole::User);
+        assert_eq!(promptless.messages[0].content, "user-14");
+        assert_eq!(promptless.messages[52].content, "current");
+        assert_eq!(promptless.messages[53].role, ReplyRole::Context);
+        assert_eq!(promptless.messages[53].content, context);
+        assert!(validate_initial_agent_reply_request(&promptless).is_ok());
+    }
+
+    #[test]
+    fn agent_continuation_preserves_the_exact_prefix_and_appends_the_exact_result() {
+        let context = r#"{"schema_version":1,"entries":[]}"#;
+        let mut request =
+            ReplyRequest::from_session_history_for_agent_with_optional_system_prompt_and_context(
+                &[],
+                "find the order",
+                Some("You are Zeus."),
+                context,
+            )
+            .unwrap();
+        request.tools = vec![lookup_tool()];
+        let call = ReplyToolCall::new(
+            "call_exact",
+            "lookup_order",
+            serde_json::json!({"order_id": "ZR-1842"}),
+        );
+        let result = r#"{"ok":true,"order_id":"ZR-1842"}"#;
+
+        let continuation = agent_continuation_request(&request, &call, result).unwrap();
+        assert_eq!(continuation.tools, request.tools);
+        assert_eq!(
+            &continuation.messages[..request.messages.len()],
+            request.messages.as_slice()
+        );
+        assert_eq!(
+            continuation.messages[request.messages.len()],
+            ReplyMessage::assistant_tool_call(call.clone())
+        );
+        assert_eq!(
+            continuation.messages[request.messages.len() + 1],
+            ReplyMessage::tool_result(call.id, result)
+        );
+        assert!(validate_agent_reply_request(&continuation).is_ok());
+        assert!(persisted_agent_reply_request(&continuation).is_ok());
+    }
+
+    #[test]
+    fn agent_continuation_reapplies_tool_result_and_message_budgets() {
+        let context = r#"{"schema_version":1,"entries":[]}"#;
+        let turns = (0..40)
+            .map(|ordinal| {
+                turn(
+                    ordinal,
+                    SessionTurnStatus::Flushed,
+                    format!("user-{ordinal}"),
+                    Some(format!("assistant-{ordinal}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut request =
+            ReplyRequest::from_session_history_for_agent_with_optional_system_prompt_and_context(
+                &turns,
+                "current",
+                Some("You are Zeus."),
+                context,
+            )
+            .unwrap();
+        request.tools = vec![lookup_tool()];
+
+        let unknown = ReplyToolCall::new(
+            "call_unknown",
+            "unknown_tool",
+            serde_json::json!({"order_id": "ZR-1842"}),
+        );
+        assert!(agent_continuation_request(&request, &unknown, "known result").is_err());
+
+        let oversized = ReplyToolCall::new(
+            "call_oversized",
+            "lookup_order",
+            serde_json::json!({"order_id": "ZR-1842"}),
+        );
+        assert!(
+            agent_continuation_request(
+                &request,
+                &oversized,
+                "r".repeat(REPLY_TOOL_RESULT_MAX_BYTES + 1),
+            )
+            .is_err()
+        );
+
+        for index in 0..4 {
+            let call = ReplyToolCall::new(
+                format!("call_budget_{index}"),
+                "lookup_order",
+                serde_json::json!({"order_id": "ZR-1842"}),
+            );
+            request = agent_continuation_request(&request, &call, "known result").unwrap();
+        }
+        let fifth = ReplyToolCall::new(
+            "call_budget_4",
+            "lookup_order",
+            serde_json::json!({"order_id": "ZR-1842"}),
+        );
+        assert!(agent_continuation_request(&request, &fifth, "known result").is_err());
     }
 
     #[test]

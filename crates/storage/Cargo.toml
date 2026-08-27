@@ -17,6 +17,7 @@ deployment.workspace = true
 execution.workspace = true
 fs2.workspace = true
 kernel.workspace = true
+knowledge.workspace = true
 llm.workspace = true
 protocol.workspace = true
 rusqlite.workspace = true

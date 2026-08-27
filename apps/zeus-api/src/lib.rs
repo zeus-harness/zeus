@@ -28,15 +28,15 @@ use axum::{
 };
 use deployment::{ManifestDiff, ManifestEnvelope};
 use execution::{AgentExecutionExplain, AgentRunEpochExplain};
-#[cfg(test)]
-use llm::ReplyRole;
 use llm::{
-    AGENT_REQUEST_INITIAL_CONTENT_MAX_BYTES, AGENT_REQUEST_MAX_HISTORY_PAIRS,
-    LocalFallbackProvider, ProviderError, ReplyKind, ReplyMessage, ReplyOutput, ReplyProvider,
-    ReplyRequest, ReplyToolCall, ReplyToolDefinition, persisted_agent_reply_request,
+    AGENT_REQUEST_INITIAL_CONTENT_MAX_BYTES, AGENT_REQUEST_MAX_HISTORY_PAIRS_WITH_CONTEXT,
+    LocalFallbackProvider, ProviderError, ReplyKind, ReplyOutput, ReplyProvider, ReplyRequest,
+    ReplyToolCall, ReplyToolDefinition, agent_continuation_request, persisted_agent_reply_request,
     validate_agent_reply_request, validate_agent_reply_response_for_request,
     validate_provider_metadata, validate_reply_request, validate_reply_response_for_request,
 };
+#[cfg(test)]
+use llm::{ReplyMessage, ReplyRole};
 use protocol::{
     ACCOUNT_AUDIT_EVENT_SCHEMA, ACCOUNT_AUDIT_EXPORT_MANIFEST_KIND,
     ACCOUNT_AUDIT_EXPORT_SCHEMA_VERSION,
@@ -65,8 +65,8 @@ use runtime::{
     AgentModelFailureCommit, AgentModelJob, AgentModelResolution, AgentModelStartOutcome,
     AgentModelSuccessCommit, AgentReviewCommit, AgentToolCall, AgentToolCallSpec,
     AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
-    AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurnSpec,
-    AuthPrincipal, AuthSessionCommit, AuthzContext, BootstrapOwnerCommit, DemoStore,
+    AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe,
+    AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthzContext, BootstrapOwnerCommit, DemoStore,
     MemberSetupCommit, PublishedEvent, ReplyClaimOutcome, ReplyFailureCommit, ReplyJob,
     ReplyOutcomeUnknownCommit, ReplySuccessCommit, StoreError, StoredMember,
     StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserStatus,
@@ -3162,13 +3162,7 @@ fn continuation_request(
     result: &serde_json::Value,
 ) -> Result<ReplyRequest, ProviderError> {
     let content = serde_json::to_string(result).map_err(|_| ProviderError::InvalidResponse)?;
-    let mut next = request.clone();
-    next.messages
-        .push(ReplyMessage::assistant_tool_call(call.clone()));
-    next.messages
-        .push(ReplyMessage::tool_result(call.id.clone(), content));
-    validate_agent_reply_request(&next)?;
-    Ok(next)
+    agent_continuation_request(request, call, content)
 }
 
 fn policy_denied_result(policy_revision: &str) -> serde_json::Value {
@@ -3421,32 +3415,60 @@ async fn start_turn(
     let metadata = executor.provider.metadata();
     validate_provider_metadata(metadata).map_err(ApiError::reply_unavailable)?;
     let manifest = current_agent_manifest(&state.store, executor)?;
+    let probe = AgentTurnReceiptProbe {
+        id: durable_agent_id(&id, &request.turn_id),
+        authz: current.principal.authz.clone(),
+        deployment_manifest_digest: manifest.digest.clone(),
+        environment: state.store.session_agent_environment().to_owned(),
+        provider_name: metadata.provider_id.clone(),
+        model_name: metadata.model.clone(),
+    };
+    if let Some(replayed) = state
+        .store
+        .agent_start_receipt_for_actor(
+            &current.principal.authz,
+            &id,
+            &request,
+            &idempotency_key,
+            &probe,
+        )
+        .await?
+    {
+        kick_agent_model_worker(&state);
+        return Ok((StatusCode::ACCEPTED, Json(replayed.start)).into_response());
+    }
+    let knowledge = state
+        .store
+        .session_agent_knowledge_context(&request.user_message)?;
     let reply_turns = state
         .store
         .session_reply_turns_for_actor(
             &current.principal.authz,
             &id,
             request.expected_sequence,
-            AGENT_REQUEST_MAX_HISTORY_PAIRS,
+            AGENT_REQUEST_MAX_HISTORY_PAIRS_WITH_CONTEXT,
         )
         .await?;
-    let mut reply_request = ReplyRequest::from_session_history_for_agent_with_system_prompt(
-        &reply_turns,
-        request.user_message.clone(),
-        system_prompt,
-    )
-    .map_err(agent_request_builder_error)?;
+    let mut reply_request =
+        ReplyRequest::from_session_history_for_agent_with_optional_system_prompt_and_context(
+            &reply_turns,
+            request.user_message.clone(),
+            Some(system_prompt),
+            knowledge.snapshot.snapshot().canonical_context(),
+        )
+        .map_err(agent_request_builder_error)?;
     reply_request.tools = agent_tools_from_manifest(&manifest);
     let request_json =
         persisted_agent_reply_request(&reply_request).map_err(ApiError::agent_request_too_large)?;
     let agent = AgentTurnSpec {
-        id: durable_agent_id(&id, &request.turn_id),
-        authz: current.principal.authz.clone(),
-        environment: state.store.session_agent_environment().to_owned(),
-        provider_name: metadata.provider_id.clone(),
-        model_name: metadata.model.clone(),
+        id: probe.id,
+        authz: probe.authz,
+        environment: probe.environment,
+        provider_name: probe.provider_name,
+        model_name: probe.model_name,
         request_json,
         manifest,
+        knowledge,
     };
     let response = state
         .store
@@ -6748,8 +6770,16 @@ mod tests {
             Arc::new(RecordingProvider::new(Arc::clone(&requests))),
         )
         .unwrap();
+        let context = store
+            .session_agent_knowledge_context("budget probe")
+            .unwrap()
+            .snapshot
+            .snapshot()
+            .canonical_context()
+            .to_owned();
         let user_message_budget = AGENT_REQUEST_INITIAL_CONTENT_MAX_BYTES
             .checked_sub(store.session_agent_system_prompt().len())
+            .and_then(|remaining| remaining.checked_sub(context.len()))
             .unwrap();
         assert!(user_message_budget < protocol::USER_MESSAGE_MAX_BYTES);
 
@@ -6790,9 +6820,15 @@ mod tests {
             assert_eq!(recorded.len(), 1);
             assert_eq!(recorded[0].messages[0].role, ReplyRole::System);
             assert_eq!(recorded[0].messages[1].role, ReplyRole::User);
+            assert_eq!(recorded[0].messages[2].role, ReplyRole::Context);
+            assert_eq!(recorded[0].messages[2].content, context);
             assert_eq!(recorded[0].messages[1].content.len(), user_message_budget);
             assert_eq!(
-                recorded[0].messages[0].content.len() + recorded[0].messages[1].content.len(),
+                recorded[0]
+                    .messages
+                    .iter()
+                    .map(|message| message.content.len())
+                    .sum::<usize>(),
                 AGENT_REQUEST_INITIAL_CONTENT_MAX_BYTES
             );
         }
@@ -7096,6 +7132,20 @@ mod tests {
         assert_eq!(invalid_epoch.code, "invalid_agent_epoch_step");
 
         let recorded = requests.lock().unwrap().clone();
+        let first_context = store
+            .session_agent_knowledge_context("remember alpha")
+            .unwrap()
+            .snapshot
+            .snapshot()
+            .canonical_context()
+            .to_owned();
+        let second_context = store
+            .session_agent_knowledge_context("what did I say?")
+            .unwrap()
+            .snapshot
+            .snapshot()
+            .canonical_context()
+            .to_owned();
         assert_eq!(
             recorded.len(),
             2,
@@ -7106,6 +7156,7 @@ mod tests {
             vec![
                 ReplyMessage::new(ReplyRole::System, store.session_agent_system_prompt(),),
                 ReplyMessage::new(ReplyRole::User, "remember alpha"),
+                ReplyMessage::new(ReplyRole::Context, first_context),
             ]
         );
         assert_eq!(
@@ -7115,6 +7166,7 @@ mod tests {
                 ReplyMessage::new(ReplyRole::User, "remember alpha"),
                 ReplyMessage::new(ReplyRole::Assistant, "durable answer 1"),
                 ReplyMessage::new(ReplyRole::User, "what did I say?"),
+                ReplyMessage::new(ReplyRole::Context, second_context),
             ]
         );
 
@@ -7149,10 +7201,17 @@ mod tests {
                 AssistantReplyKind::Model,
             )
             .unwrap();
+        let knowledge = store
+            .session_agent_knowledge_context("do not execute after deployment drift")
+            .unwrap();
         let request = ReplyRequest::with_tools(
             [
                 ReplyMessage::new(ReplyRole::System, store.session_agent_system_prompt()),
                 ReplyMessage::new(ReplyRole::User, "do not execute after deployment drift"),
+                ReplyMessage::new(
+                    ReplyRole::Context,
+                    knowledge.snapshot.snapshot().canonical_context(),
+                ),
             ],
             agent_tools_from_manifest(&queued_manifest),
         );
@@ -7174,6 +7233,7 @@ mod tests {
                     model_name: Some("queued-model".into()),
                     request_json: persisted_agent_reply_request(&request).unwrap(),
                     manifest: queued_manifest.clone(),
+                    knowledge,
                 },
             )
             .await
@@ -7357,22 +7417,31 @@ mod tests {
         assert_eq!(std::fs::read_dir(&marker_root).unwrap().count(), 1);
 
         let recorded = requests.lock().unwrap().clone();
+        let context = store
+            .session_agent_knowledge_context("write the approved marker")
+            .unwrap()
+            .snapshot
+            .snapshot()
+            .canonical_context()
+            .to_owned();
         assert_eq!(recorded.len(), 2);
         assert_eq!(
             recorded[0].messages,
             vec![
                 ReplyMessage::new(ReplyRole::System, store.session_agent_system_prompt(),),
                 ReplyMessage::new(ReplyRole::User, "write the approved marker"),
+                ReplyMessage::new(ReplyRole::Context, context),
             ]
         );
-        assert_eq!(recorded[1].messages.len(), 4);
+        assert_eq!(recorded[1].messages.len(), 5);
         assert_eq!(recorded[1].messages[0], recorded[0].messages[0]);
         assert_eq!(recorded[1].messages[1], recorded[0].messages[1]);
-        let provider_call = recorded[1].messages[2].tool_call.as_ref().unwrap();
+        assert_eq!(recorded[1].messages[2], recorded[0].messages[2]);
+        let provider_call = recorded[1].messages[3].tool_call.as_ref().unwrap();
         assert_eq!(provider_call.id, "provider-call-approved-1");
         assert_eq!(provider_call.name, agent.calls[0].tool);
         assert_eq!(provider_call.arguments, agent.calls[0].arguments);
-        let tool_result = &recorded[1].messages[3];
+        let tool_result = &recorded[1].messages[4];
         assert_eq!(tool_result.role, ReplyRole::Tool);
         assert_eq!(
             tool_result.tool_call_id.as_deref(),
@@ -7500,15 +7569,17 @@ mod tests {
 
         let recorded = requests.lock().unwrap().clone();
         assert_eq!(recorded.len(), 2);
-        assert_eq!(recorded[1].messages.len(), 4);
+        assert_eq!(recorded[1].messages.len(), 5);
         assert_eq!(recorded[1].messages[0], recorded[0].messages[0]);
         assert_eq!(recorded[1].messages[0].role, ReplyRole::System);
+        assert_eq!(recorded[1].messages[1], recorded[0].messages[1]);
+        assert_eq!(recorded[1].messages[2], recorded[0].messages[2]);
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&recorded[1].messages[3].content).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&recorded[1].messages[4].content).unwrap(),
             expected_result
         );
         assert_eq!(
-            recorded[1].messages[3].tool_call_id.as_deref(),
+            recorded[1].messages[4].tool_call_id.as_deref(),
             Some("provider-call-approved-1")
         );
 
@@ -7663,19 +7734,28 @@ mod tests {
 
         let recorded = requests.lock().unwrap();
         assert_eq!(recorded.len(), 4);
+        let context = store
+            .session_agent_knowledge_context("write after trimming")
+            .unwrap()
+            .snapshot
+            .snapshot()
+            .canonical_context()
+            .to_owned();
         assert_eq!(
             recorded[2].messages,
             vec![
                 ReplyMessage::new(ReplyRole::System, store.session_agent_system_prompt(),),
                 ReplyMessage::new(ReplyRole::User, "write after trimming"),
+                ReplyMessage::new(ReplyRole::Context, context),
             ],
             "the 80 KiB newest pair must be omitted to preserve the 64 KiB Agent budget"
         );
-        assert_eq!(recorded[3].messages.len(), 4);
+        assert_eq!(recorded[3].messages.len(), 5);
         assert_eq!(recorded[3].messages[0], recorded[2].messages[0]);
         assert_eq!(recorded[3].messages[1], recorded[2].messages[1]);
-        assert_eq!(recorded[3].messages[2].role, ReplyRole::Assistant);
-        assert_eq!(recorded[3].messages[3].role, ReplyRole::Tool);
+        assert_eq!(recorded[3].messages[2], recorded[2].messages[2]);
+        assert_eq!(recorded[3].messages[3].role, ReplyRole::Assistant);
+        assert_eq!(recorded[3].messages[4].role, ReplyRole::Tool);
         drop(recorded);
 
         drop(app);

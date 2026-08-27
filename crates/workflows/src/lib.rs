@@ -163,6 +163,10 @@ pub enum Command {
     /// executable runtime. Callers may use this only before invoking the
     /// external operation authorized by the current durable phase.
     DeploymentUnavailable,
+    /// The immutable knowledge corpus, selection snapshot, or Agent binding is
+    /// missing or no longer verifies. Callers may use this only before the
+    /// current external model/tool operation is invoked.
+    KnowledgeUnavailable,
     /// Record an allow-once approval and queue the already-bound tool call.
     ApprovalApproved,
     /// Record a rejection as a structured non-dispatch result.
@@ -191,6 +195,7 @@ impl Command {
             Self::ModelOutcomeUnknown => CommandKind::ModelOutcomeUnknown,
             Self::AuthorizationRevoked => CommandKind::AuthorizationRevoked,
             Self::DeploymentUnavailable => CommandKind::DeploymentUnavailable,
+            Self::KnowledgeUnavailable => CommandKind::KnowledgeUnavailable,
             Self::ApprovalApproved => CommandKind::ApprovalApproved,
             Self::ApprovalRejected { .. } => CommandKind::ApprovalRejected,
             Self::StartTool => CommandKind::StartTool,
@@ -499,6 +504,32 @@ pub fn reduce(state: &State, command: Command) -> Result<Transition, Error> {
                 None,
             )
         }
+        Command::KnowledgeUnavailable => {
+            require_one_of(
+                state,
+                &[
+                    AgentStatus::ModelQueued,
+                    AgentStatus::ModelStarted,
+                    AgentStatus::WaitingApproval,
+                    AgentStatus::ToolQueued,
+                    AgentStatus::ToolStarted,
+                    AgentStatus::ContinuationQueued,
+                ],
+                command_kind,
+            )?;
+            next_transition(
+                state,
+                AgentStatus::Failed,
+                // The durable error envelope retains the precise
+                // knowledge_unavailable code. Reusing the established
+                // pre-release authorization terminal class preserves the
+                // existing workflow-state schema for upgraded databases.
+                Some(TerminalReason::AuthorizationRevoked),
+                Some(0),
+                None,
+                None,
+            )
+        }
         Command::ApprovalApproved => {
             require_status(state, AgentStatus::WaitingApproval, command_kind)?;
             next_transition(state, AgentStatus::ToolQueued, None, Some(0), None, None)
@@ -799,6 +830,7 @@ pub enum CommandKind {
     ModelOutcomeUnknown,
     AuthorizationRevoked,
     DeploymentUnavailable,
+    KnowledgeUnavailable,
     ApprovalApproved,
     ApprovalRejected,
     StartTool,
@@ -1184,6 +1216,42 @@ mod tests {
         let queued = apply(State::default(), Command::DeploymentUnavailable);
         assert_eq!(queued.state().status(), AgentStatus::Failed);
         assert_eq!(queued.external_call(), None);
+    }
+
+    #[test]
+    fn unavailable_knowledge_fails_every_admitted_phase_before_external_io() {
+        let continuation = apply(
+            started_tool(),
+            Command::ToolResultKnown {
+                kind: ToolCompletionKind::Succeeded,
+                result_bytes: 17,
+            },
+        )
+        .into_state();
+        for state in [
+            State::default(),
+            started_model(),
+            waiting_approval(),
+            queued_tool(),
+            started_tool(),
+            continuation,
+        ] {
+            let model_steps = state.model_steps();
+            let tool_calls = state.tool_calls();
+            let result_bytes = state.tool_result_bytes();
+            let rejected = apply(state, Command::KnowledgeUnavailable);
+            assert_eq!(rejected.state().status(), AgentStatus::Failed);
+            assert_eq!(
+                rejected.state().terminal_reason(),
+                Some(TerminalReason::AuthorizationRevoked)
+            );
+            assert_eq!(rejected.state().model_steps(), model_steps);
+            assert_eq!(rejected.state().tool_calls(), tool_calls);
+            assert_eq!(rejected.state().tool_result_bytes(), result_bytes);
+            assert_eq!(rejected.state().pending_approvals(), 0);
+            assert_eq!(rejected.external_call(), None);
+            assert_eq!(rejected.emitted_result(), None);
+        }
     }
 
     #[test]

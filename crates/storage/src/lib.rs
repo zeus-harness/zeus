@@ -15,6 +15,7 @@ use std::fmt;
 
 use deployment::ManifestEnvelope;
 pub use error::StorageError;
+use knowledge::{CorpusRevisionEnvelope, SelectionSnapshotEnvelope};
 pub use limits::{StorageLimits, StorageLimitsError};
 pub use operation::{SqliteOperationLimits, SqliteOperationLimitsError};
 pub use physical::{SqlitePhysicalLimits, SqlitePhysicalLimitsError};
@@ -490,6 +491,43 @@ pub struct AgentTurnSpec {
     pub provider_name: String,
     pub model_name: Option<String>,
     pub request_json: Value,
+    pub knowledge: AgentKnowledgeContextSpec,
+}
+
+impl AgentTurnSpec {
+    /// Return the server-derived command identity needed for an early receipt lookup.
+    pub fn receipt_probe(&self) -> AgentTurnReceiptProbe {
+        AgentTurnReceiptProbe {
+            id: self.id.clone(),
+            authz: self.authz.clone(),
+            deployment_manifest_digest: self.manifest.digest.clone(),
+            environment: self.environment.clone(),
+            provider_name: self.provider_name.clone(),
+            model_name: self.model_name.clone(),
+        }
+    }
+}
+
+/// Lightweight Agent command identity used to resolve an idempotent replay
+/// before history, knowledge selection, or provider-request construction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AgentTurnReceiptProbe {
+    pub id: String,
+    pub authz: AuthzContext,
+    pub deployment_manifest_digest: String,
+    pub environment: String,
+    pub provider_name: String,
+    pub model_name: Option<String>,
+}
+
+/// Exact governed corpus and selection admitted with one Agent turn.
+///
+/// Storage binds these account-neutral domain envelopes to the authenticated
+/// actor, Session turn, Agent, and initial model job before any external I/O.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AgentKnowledgeContextSpec {
+    pub corpus: CorpusRevisionEnvelope,
+    pub snapshot: SelectionSnapshotEnvelope,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -518,6 +556,7 @@ pub struct AgentModelJob {
     pub status: AgentModelJobStatus,
     pub attempt: u32,
     pub request_json: Value,
+    pub knowledge_context_digest: Option<String>,
     pub response_json: Option<Value>,
     pub error_json: Option<Value>,
     pub queued_at: String,
@@ -536,6 +575,7 @@ pub struct AgentTurn {
     pub session_id: String,
     pub turn_id: String,
     pub deployment_manifest_digest: Option<String>,
+    pub knowledge_context_digest: Option<String>,
     pub environment: String,
     pub provider_name: String,
     pub model_name: Option<String>,

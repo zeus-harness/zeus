@@ -29,7 +29,7 @@ Client / SvelteKit Web
 - `authz`：account capability matrix，以及精确工具名规则、策略 revision、环境和 effect guard；没有命中即拒绝。
 - `tools`：工具描述、注册表、参数验证和 object-safe executor 边界。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
-- `storage`：schema v21 migration、`acc_local` membership 权威、一次性 member setup、用户/偏好、
+- `storage`：schema v22 migration、`acc_local` membership 权威、一次性 member setup、用户/偏好、
   account audit/rollup/policy/archive state、独立 Session/Run ledger、typed event lookup、
   account+actor-scoped 回执、durable Agent/model/tool/dispatch queue、不可变 deployment manifest，
   以及 actor/account/global logical capacity、physical capacity 和 operation capacity。
@@ -45,13 +45,15 @@ SQLite 是本地单实例 Alpha+ 的权威存储。Restate、MinIO 和 PostgreSQ
 Session 列表按 opaque cursor 逐页追加；保存的活动 Session 即使不在首屏，也先通过 actor-scoped
 point detail 恢复，只有权威 `404` 才回退 primary Session。
 
-系统提示词绑定复用现有 manifest 可选 prompt 字段和 immutable request JSON，不增加数据库
-migration。升级后仍 queued 的旧 promptless Agent work 会被当前 deployment manifest 判定为
-drift 并在外部 I/O 前关闭；已终结历史仍可读。动态 knowledge 不拼入稳定系统提示词。Knowledge
-v1 纯领域层已实现 immutable entry revision 校验、固定 tokenizer/整数排序、整条 entry 丢弃、
-16 KiB canonical context 与完整 selection snapshot digest；数据库绑定和 Agent request 接入尚未
-实现，不能把运行时重新检索当作已持久化快照。LLM 协议层已有独立 durable `context` role，
-仅在 OpenAI-compatible wire 边界映射为单独的 `user` message；storage 当前尚未生成该消息。
+系统提示词绑定复用现有 manifest 可选 prompt 字段和 immutable request JSON。升级后仍 queued
+的旧 promptless Agent work 会被当前 deployment manifest 判定为 drift 并在外部 I/O 前关闭；
+已终结历史仍可读。动态 knowledge 不拼入稳定系统提示词。Knowledge v1 已实现 immutable entry
+revision 校验、固定 tokenizer/整数排序、整条 entry 丢弃、16 KiB canonical context 与完整
+selection snapshot digest。schema v22 把 exact corpus、snapshot、canonical context、Agent、
+initial model job 和 execution admission digest 绑定后持久化，重放不从 live state 重新检索。
+LLM 协议层使用独立 durable `context` role，仅在 OpenAI-compatible wire 边界映射为单独的
+`user` message。当前 runtime 明确使用空 corpus；account knowledge catalog 与 ingestion surface
+仍未实现。
 
 ## 事件与状态
 
@@ -125,8 +127,9 @@ Session ledger 记录 `session_created`、`run_attached`、`user_message`、可�
   `expected_sequence` 为快照边界：第一条且唯一一条 system message 是 manifest 绑定提示词的
   精确内容，随后才是最新完整 flushed user/assistant 对和当前 user message。manifest 只保存
   稳定 prompt ID、revision 与域分离 content digest，不保存提示词内容或 secret；精确内容随
-  immutable request 持久化。system prompt 与最多 27 对历史消息、当前 user message 共享
-  64 KiB 初始 UTF-8 内容预算；初始最多 56 条 message，为 Agent 全程 64-message 上限预留四组
+  immutable request 持久化；当前 user message 后追加一条 exact durable `context` message。
+  system prompt、最多 26 对历史消息、当前 user message 和 context 共享 64 KiB 初始 UTF-8
+  内容预算；初始最多 55 条 message，为 Agent 全程 64-message 上限预留四组
   assistant tool call / tool result。interrupted、缺少 assistant 或尚未 flush 的 turn 不进入
   上下文。组装结果持久化在 job 中，迟到的幂等重试复用该 durable request，而不是从更晚的
   Session 状态重新生成。当前 user message 无法与固定 prompt 一起装入初始预算时，API 在任何
@@ -185,7 +188,7 @@ connector 在数据库事务和锁之外运行。
 
 API 监听端口之前按固定顺序完成：
 
-1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v21；按当前
+1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v22；按当前
    detailed-row limit 以最多 64 行 batch 压缩 bootstrap terminal audit prefix，再按稳定
    `(priority actor, expires_at, auth-session ID)` 顺序最多清理 64 个过期或绑定
    missing/disabled/suspended/stale-revision authority 的 auth session。
@@ -416,7 +419,9 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   configured/unconfigured active work、窄化 NULL claim、owner-only auth 保留和 version-13 原子回滚
   都有确定性覆盖。后续 v15 member/audit、v16 context index、v17 Agent loop、v18 exact tool
   completion replay、v19 deployment manifest、v20 RunEpoch/execution fact ledger 与 v21
-  prepared operation claim 也覆盖 fresh schema 和历史原地迁移。
+  prepared operation claim，以及 v22 knowledge context binding 与 domain-separated count+digest
+  legacy-set commitment，也覆盖 fresh schema 和历史原地迁移；畸形 v21 升级会整体回滚，不留下
+  v22 版本或表。
 - 重启后用户/偏好、Session/turn/event、Agent/model/tool job、deployment manifest、Run/Event、
   审批决定、dispatch job 和命令回执仍存在。
 - Session start 与 Agent/first-model enqueue/manifest binding 同事务；最终 reply 把 assistant
@@ -475,7 +480,7 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   刷新恢复、owner/member setup/登录、owner 成员与 audit 管理、设置/退出和
   system/light/dark。member 的审批卡只读。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化按项目既有统计口径是 517 个 Rust 测试（其中 deployment 8、knowledge 24、storage 232、
+- 当前自动化按项目既有统计口径是 539 个 Rust 测试（其中 deployment 8、knowledge 29、storage 242、
   runtime 48、API library 64、API main/config 6）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
