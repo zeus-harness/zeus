@@ -5,7 +5,7 @@ Event Feed、Point-query Durable Context、Bounded Read Models、SQLite Capacity
 Physical/Operation Capacity、Bootstrap Audit Retention、schema v13 Account Membership
 Foundation、schema v14 Account-scoped Durable Authorization、schema v15 Member Lifecycle /
 Account Audit、schema v16 Session Reply Context Index 至 schema v25 Durable Session Context
-Compaction、Trusted Single-Node Ingress 与 Per-Operation SecretRef Resolution 主机代码已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
+Compaction、Trusted Single-Node Ingress、Per-Operation SecretRef Resolution 与有界多账户控制面主机代码已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
 v11→v12→v13→v14 迁移证据，current-image 证据见本节验收结果，Linux Docker PID/OOM
 authoritative gate 待完成。
 
@@ -21,7 +21,7 @@ authoritative gate 待完成。
 
 ## 2. 本地用户与认证
 
-Alpha+ 支持一个本地 `acc_local` account 内的 owner/member 协作：
+Alpha+ 从本地 `acc_local` 根账户启动，并支持有界的本地多账户控制面：
 
 1. 数据库尚未配置 owner 时，每次启动都会轮换 32-byte 随机 bootstrap token，使旧 token 失效，
    并只向该进程终端输出当前 bearer 一次；数据库仅保存 SHA-256 digest 和过期时间。
@@ -45,8 +45,14 @@ Alpha+ 支持一个本地 `acc_local` account 内的 owner/member 协作：
    `Forwarded: for=<client-ip>;proto=https;host=<public-authority>` 才是权威。登录默认每分钟
    global/source/account 为 60/10/5，bootstrap 为 10/3；IPv4 使用裸 `for`，IPv6 使用带双引号的
    `[address]`；超限统一返回带 `Retry-After` 的 `429`。
+9. owner 使用 `POST /api/v1/accounts` 配合幂等键创建账户；账户 ID 由 User 与幂等键域分离派生，
+   丢失响应后可安全重放。同一 User 最多 16 个 membership，单库最多 64 个 account。
+10. `GET /api/v1/accounts` 返回当前 User 的账户集合；登录可选 `account_id`，省略时默认
+    `acc_local`。`POST /api/v1/auth/switch-account` 在一个事务中删除当前 auth session、复核目标
+    active membership，并签发全新的 session/CSRF token；旧 token 立即失效。
 
-Health 路由保持公开。公开注册、邮件找回、OAuth/SSO、WebAuthn 不属于本阶段。
+Health 路由保持公开。跨账户邀请、Web account picker、公开注册、邮件找回、OAuth/SSO、WebAuthn
+不属于本阶段。
 
 ## 3. 所有权与幂等
 
@@ -419,8 +425,8 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 按项目既有统计口径通过 606 个 Rust 测试（connectors 22、deployment 8、knowledge 29、
-  LLM unit 30、provider contract 15、storage 252、runtime 48、API library 79、API main/config 11）与 28 个 Web Node 测试。
+- host 按项目既有统计口径通过 611 个 Rust 测试（connectors 22、deployment 8、knowledge 29、
+  LLM unit 30、provider contract 15、storage 254、runtime 48、API library 80、API main/config 11）与 28 个 Web Node 测试。
 - `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 
 ## 8. 容器与 OOM 验收边界

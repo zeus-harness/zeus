@@ -3,8 +3,8 @@
 状态：v12 Bootstrap Audit Retention、schema v13 Account Membership Foundation、schema v14
 Account-scoped Durable Authorization 与 schema v15 Member Lifecycle / Account Audit 已实现。
 Apple `zeus-operation-acceptance` 保留了历史 v11→v12→v13→v14 迁移链；current-image 的 v15
-迁移与验收证据见本文第 9 节。当前版本允许同一 `acc_local` account 内的 owner/member 协作，
-但仍是单实例本地部署，不表示共享网络、多 account 或公网部署已经具备上线条件。
+迁移与验收证据见本文第 9 节。当前版本从 `acc_local` 根账户启动，并实现了有界的本地多账户
+控制面；它仍是单实例本地部署，不表示共享网络或公网部署已经具备上线条件。
 
 ## 1. 为什么不能只删除 member gate
 
@@ -105,9 +105,12 @@ struct AuthzContext {
 
 登录 session 绑定 `account_id` 与签发时的 `membership_revision`。每次认证都 JOIN active User、
 active Account 和 active Membership；revision、角色或状态发生变化后，旧 session 立即失效。
-当前设计只支持一个 `acc_local`，不提供 account picker 或多 account runtime。
-未来若增加 account 切换，一个登录 session 仍只能绑定一个 account，切换必须轮换 session
-token，避免请求头临时选 tenant 带来的 confused-deputy 风险。
+当前后端允许 owner 幂等创建账户、列出当前 User 的 membership，并在已加入的账户之间切换。
+每个 User 最多 16 个 membership，每个数据库最多 64 个 account。登录可以显式携带
+`account_id`，省略时仍进入 `acc_local`。一个登录 session 始终只绑定一个 account；切换在同一
+SQLite 事务内撤销旧 session 并签发绑定目标 membership revision 的新 session/CSRF token，
+不允许通过请求头临时选择 tenant。当前 Web 尚未提供 account picker，也尚未提供把既有 User
+邀请到另一个 account 的产品路径。
 
 首版权限矩阵：
 
@@ -178,9 +181,11 @@ NULL、孤儿或跨 account 关系，并为 `(account_id, id/order key)` 建索�
 
 ## 5. HTTP 错误契约
 
-v15 延续 authentication/authorization/resource 错误边界，并增加成员管理和 account audit 合约。
+v15 延续 authentication/authorization/resource 错误边界，并增加成员管理和 account audit 合约；
+后续控制面在不改变 schema version 的前提下启用了既有多 account 数据模型。
 普通登录失败继续保持通用 `401 invalid_credentials`；setup token 无效、过期、已消费或已轮换统一
-返回 `401 invalid_member_setup_token`，不泄露具体原因。当前没有 account picker。
+返回 `401 invalid_member_setup_token`，不泄露具体原因。后端已有账户列表/切换 API，当前 Web
+尚未提供 account picker。
 
 - `401 authentication_required`：没有 session，或身份/session 已失效。
 - `401 invalid_credentials`：登录失败；用户名不存在、密码错误、User disabled 必须不可区分。
@@ -193,6 +198,7 @@ v15 延续 authentication/authorization/resource 错误边界，并增加成员�
 - `409 audit_policy_revision_conflict`：audit policy revision 已变化。
 - `409 audit_checkpoint_conflict`：archive checkpoint revision 或前缀不匹配。
 - `409 idempotency_conflict`：相同完整 scope/key 对应不同请求。
+- `507 account_capacity_exceeded`：User 的 16 个 membership 或数据库的 64 个 account 已满。
 - `507 audit_storage_exhausted`：legal hold/archive 约束下普通可审计 mutation 已无安全容量。
 - `507 audit_export_too_large`：完整 NDJSON export 超过响应上限；不得返回截断的 `200`。
 

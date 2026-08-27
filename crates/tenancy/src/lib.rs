@@ -23,10 +23,12 @@ use zeroize::{Zeroize, Zeroizing};
 
 pub const USERNAME_MIN_BYTES: usize = 3;
 pub const USERNAME_MAX_BYTES: usize = 32;
+pub const ACCOUNT_NAME_MAX_BYTES: usize = 80;
 pub const PASSWORD_MIN_CHARS: usize = 12;
 pub const PASSWORD_MAX_BYTES: usize = 1024;
 
 const USER_ID_RANDOM_BYTES: usize = 16;
+const ACCOUNT_ID_RANDOM_BYTES: usize = 16;
 const AUTH_SESSION_ID_RANDOM_BYTES: usize = 16;
 const TOKEN_RANDOM_BYTES: usize = 32;
 const ARGON2_MEMORY_KIB: u32 = 19 * 1024;
@@ -41,6 +43,7 @@ const SESSION_TOKEN_DOMAIN: &[u8] = b"zeus.session-token.v1\0";
 const CSRF_TOKEN_DOMAIN: &[u8] = b"zeus.csrf-token.v1\0";
 const BOOTSTRAP_TOKEN_DOMAIN: &[u8] = b"zeus.bootstrap-token.v1\0";
 const MEMBER_SETUP_TOKEN_DOMAIN: &[u8] = b"zeus.member-setup-token.v1\0";
+const ACCOUNT_CREATION_ID_DOMAIN: &[u8] = b"zeus.account-creation-id.v1\0";
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct UserId(String);
@@ -108,6 +111,56 @@ impl AccountId {
         Self("acc_local".into())
     }
 
+    /// Parses a public account identifier created by Zeus. The deterministic
+    /// local account remains valid for backward-compatible sign-in.
+    pub fn parse(value: impl Into<String>) -> Result<Self, AuthorityIdError> {
+        let value = value.into();
+        if value == "acc_local" {
+            return Ok(Self(value));
+        }
+        let encoded = value
+            .strip_prefix("acc_")
+            .ok_or(AuthorityIdError::Invalid {
+                field: "account ID",
+            })?;
+        let decoded = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| AuthorityIdError::Invalid {
+                field: "account ID",
+            })?;
+        if decoded.len() != ACCOUNT_ID_RANDOM_BYTES || URL_SAFE_NO_PAD.encode(decoded) != encoded {
+            return Err(AuthorityIdError::Invalid {
+                field: "account ID",
+            });
+        }
+        Ok(Self(value))
+    }
+
+    /// Derives a stable opaque account ID from one authenticated user's
+    /// canonical idempotency key. A lost create response can therefore replay
+    /// without persisting the key itself or minting an unreachable account.
+    pub fn for_creation(user_id: &str, idempotency_key: &str) -> Self {
+        let mut digest = Sha256::new();
+        digest.update(ACCOUNT_CREATION_ID_DOMAIN);
+        digest.update(
+            u64::try_from(user_id.len())
+                .expect("in-memory user ID length fits u64")
+                .to_be_bytes(),
+        );
+        digest.update(user_id.as_bytes());
+        digest.update(
+            u64::try_from(idempotency_key.len())
+                .expect("bounded idempotency key length fits u64")
+                .to_be_bytes(),
+        );
+        digest.update(idempotency_key.as_bytes());
+        let digest = digest.finalize();
+        Self(format!(
+            "acc_{}",
+            URL_SAFE_NO_PAD.encode(&digest[..ACCOUNT_ID_RANDOM_BYTES])
+        ))
+    }
+
     pub fn from_persistence(value: impl Into<String>) -> Result<Self, AuthorityIdError> {
         Ok(Self(validate_authority_id(value.into(), "account ID")?))
     }
@@ -115,6 +168,46 @@ impl AccountId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// Human-readable account name with a small durable/UI envelope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountName(String);
+
+impl AccountName {
+    pub fn parse(value: impl Into<String>) -> Result<Self, AccountNameError> {
+        let value = value.into();
+        if value.is_empty() || value.trim() != value {
+            return Err(AccountNameError::EmptyOrUntrimmed);
+        }
+        if value.len() > ACCOUNT_NAME_MAX_BYTES {
+            return Err(AccountNameError::TooLong);
+        }
+        if value.chars().any(char::is_control) {
+            return Err(AccountNameError::ControlCharacter);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AccountName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum AccountNameError {
+    #[error("account name must be non-empty and exactly trimmed")]
+    EmptyOrUntrimmed,
+    #[error("account name cannot exceed {ACCOUNT_NAME_MAX_BYTES} UTF-8 bytes")]
+    TooLong,
+    #[error("account name cannot contain control characters")]
+    ControlCharacter,
 }
 
 impl fmt::Display for AccountId {
@@ -753,6 +846,17 @@ mod tests {
             "\"owner\""
         );
         assert_eq!(AccountId::local().as_str(), "acc_local");
+        let created = AccountId::for_creation("usr_example", "create-account-1");
+        assert_eq!(AccountId::parse(created.as_str()).unwrap(), created);
+        assert_eq!(
+            AccountId::for_creation("usr_example", "create-account-1"),
+            created
+        );
+        assert_ne!(
+            AccountId::for_creation("usr_example", "create-account-2"),
+            created
+        );
+        assert!(AccountId::parse("acc_not-base64!").is_err());
         assert!(AccountId::from_persistence(" legacy").is_err());
         assert_eq!(MembershipRevision::new(1).unwrap().get(), 1);
         assert!(MembershipRevision::new(0).is_err());
@@ -764,6 +868,26 @@ mod tests {
                 .unwrap()
                 .as_str(),
             "legacy-auth-session"
+        );
+    }
+
+    #[test]
+    fn account_names_are_trimmed_control_safe_and_byte_bounded() {
+        assert_eq!(
+            AccountName::parse("Platform Ops").unwrap().as_str(),
+            "Platform Ops"
+        );
+        assert_eq!(
+            AccountName::parse(" Platform Ops"),
+            Err(AccountNameError::EmptyOrUntrimmed)
+        );
+        assert_eq!(
+            AccountName::parse("Platform\nOps"),
+            Err(AccountNameError::ControlCharacter)
+        );
+        assert_eq!(
+            AccountName::parse("a".repeat(ACCOUNT_NAME_MAX_BYTES + 1)),
+            Err(AccountNameError::TooLong)
         );
     }
 

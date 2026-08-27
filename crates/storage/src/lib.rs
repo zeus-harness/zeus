@@ -52,6 +52,36 @@ pub enum StoredMembershipStatus {
     Disabled,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoredAccountStatus {
+    Active,
+    Suspended,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredAccount {
+    pub id: AccountId,
+    pub name: String,
+    pub status: StoredAccountStatus,
+    pub role: MembershipRole,
+    pub membership_status: StoredMembershipStatus,
+    pub membership_revision: MembershipRevision,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateAccountCommit {
+    pub account_id: AccountId,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateAccountResult {
+    pub account: StoredAccount,
+    pub replayed: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredMember {
     pub account_id: AccountId,
@@ -363,6 +393,38 @@ pub struct AuthSessionCommit {
     pub session_token_hash: String,
     pub csrf_hash: String,
     pub expires_at: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SwitchAuthSessionCommit {
+    pub current_authz: AuthzContext,
+    pub current_session_token_hash: String,
+    pub target_account_id: AccountId,
+    pub next_auth_session_id: AuthSessionId,
+    pub next_session_token_hash: String,
+    pub next_csrf_hash: String,
+    pub next_expires_at: String,
+}
+
+impl fmt::Debug for SwitchAuthSessionCommit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SwitchAuthSessionCommit")
+            .field("current_authz", &self.current_authz)
+            .field("current_session_token_hash", &"[REDACTED]")
+            .field("target_account_id", &self.target_account_id)
+            .field("next_auth_session_id", &self.next_auth_session_id)
+            .field("next_session_token_hash", &"[REDACTED]")
+            .field("next_csrf_hash", &"[REDACTED]")
+            .field("next_expires_at", &self.next_expires_at)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SwitchAuthSessionResult {
+    pub principal: AuthPrincipal,
+    pub account: StoredAccount,
 }
 
 impl fmt::Debug for AuthSessionCommit {

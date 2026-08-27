@@ -21,18 +21,24 @@ and create-new-only file tools for testing a useful complete Agent loop. Restate
 MinIO, the networkless tool sandbox, and optional PostgreSQL are development
 topology for later milestones; they are not application state authorities.
 
-Alpha+ supports one local `acc_local` account with owner and member roles.
-Schema v14 made durable membership the sole capability authority for
-authentication, REST/SSE access, receipts, reply/dispatch work, and worker
-claim. Schema v15 adds owner-managed member setup/disable, immediate revision
-revocation, bounded account security audit, legal hold, and archive
-checkpoints. Members can use ordinary Session/Run and reply paths; approval,
-connector dispatch, member administration, and audit administration remain
-owner-only. Keep the service loopback/private-network only, and do not expose
-it directly as a shared or Internet-facing deployment. The optional trusted
-single-node ingress mode permits one canonical HTTPS origin through explicitly
-allowlisted reverse-proxy CIDRs; the API listener must still remain private and
-the proxy must be the only network path to it.
+Alpha+ bootstraps a local `acc_local` root and now supports a bounded local
+multi-account control plane. An owner can create accounts idempotently; one
+user may belong to at most 16 accounts and one database may contain at most 64.
+Every login session remains bound to exactly one account. Login may select an
+account explicitly, while account switching atomically revokes the current
+session and issues new session and CSRF tokens. Schema v14 made durable
+membership the sole capability authority for authentication, REST/SSE access,
+receipts, reply/dispatch work, and worker claim. Schema v15 adds owner-managed
+member setup/disable, immediate revision revocation, bounded account security
+audit, legal hold, and archive checkpoints. Members can use ordinary
+Session/Run and reply paths in their current account; approval, connector
+dispatch, member administration, account creation, and audit administration
+remain owner-only. Cross-account member invitation and the Web account picker
+are not implemented yet. Keep the service loopback/private-network only, and
+do not expose it directly as a shared or Internet-facing deployment. The
+optional trusted single-node ingress mode permits one canonical HTTPS origin
+through explicitly allowlisted reverse-proxy CIDRs; the API listener must
+still remain private and the proxy must be the only network path to it.
 
 The staged account/membership and audit-retention design is documented in
 [`docs/account-membership-audit-retention.zh-CN.md`](docs/account-membership-audit-retention.zh-CN.md).
@@ -795,6 +801,13 @@ directly.
   isolation, SQLite physical headroom, bounded bootstrap/account audit
   retention, durable authorization, and member revision revocation are
   enforced below HTTP.
+- `GET /api/v1/accounts` lists the authenticated User's memberships.
+  Owner-only `POST /api/v1/accounts` requires a canonical `Idempotency-Key`
+  and creates a bounded account with its initial owner and audit roots in one
+  transaction. `POST /api/v1/auth/switch-account` accepts only a target active
+  membership and atomically replaces the current auth session; it never reads
+  a tenant selector from an ordinary business request. Login optionally
+  accepts `account_id` and defaults to `acc_local` when it is absent.
 - An owner creates a member through `POST /api/v1/members`; the plaintext setup
   token appears only in that response, expires after 24 hours, and is stored by
   Zeus only as a domain-separated SHA-256 digest. The single-use
@@ -1050,14 +1063,15 @@ replay, schema v19 deployment-manifest binding, schema v20 execution-ledger,
 schema v21 prepared claims, schema v22 durable knowledge-context binding, and
 schema v23 account knowledge catalog ingestion, schema v24 account Agent prompt
 governance, schema v25 durable Session context compaction, Trusted Single-Node
-Ingress, and Per-Operation SecretRef Resolution:
+Ingress, Per-Operation SecretRef Resolution, and the bounded multi-account
+control plane:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 606 tests passed
+- `cargo test --workspace --all-targets --locked`: 611 tests passed
   across the top-level test targets, including 22 connector tests,
   8 deployment tests, 29 knowledge tests, 30 LLM unit and 15 provider-contract
-  tests, 252 storage tests, 48 runtime tests, 79 API library tests, 11 API main/config
+  tests, 254 storage tests, 48 runtime tests, 80 API library tests, 11 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,

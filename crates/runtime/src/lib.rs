@@ -65,20 +65,21 @@ pub use storage::{
     AgentToolCompletion, AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit,
     AgentToolStartOutcome, AgentToolWork, AgentTurn, AgentTurnEnqueueResponse,
     AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthSessionId,
-    AuthzContext, BootstrapOwnerCommit, CreateMemberResult, DEFAULT_SESSION_AGENT_PROMPT_REVISION,
-    DEFAULT_SESSION_AGENT_SYSTEM_PROMPT, InFlightWorkSummary, KnowledgeCatalogCommit,
-    KnowledgeCatalogRevisionPage, KnowledgeCatalogRevisionSummary, KnowledgeCatalogState,
-    KnowledgeCatalogUpdateResult, MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit,
-    MemberSetupResult, MemberSetupToken, MemberTransitionResult, MembershipRevision,
-    MembershipRole, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit, ReplyJob,
-    ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
-    ReplySuccessCommit, RotateMemberSetupTokenResult, SESSION_AGENT_PROMPT_ID,
-    SessionCompactionClaimOutcome, SessionCompactionFailureCommit, SessionCompactionJob,
-    SessionCompactionSuccessCommit, SessionContextCheckpoint, SessionSummaryPage,
-    SqliteOperationLimits, SqliteOperationLimitsError, SqlitePhysicalLimits,
-    SqlitePhysicalLimitsError, StorageLimits, StorageLimitsError, StoredCredential, StoredMember,
-    StoredMemberPage, StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserRole,
-    StoredUserStatus, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
+    AuthzContext, BootstrapOwnerCommit, CreateAccountCommit, CreateAccountResult,
+    CreateMemberResult, DEFAULT_SESSION_AGENT_PROMPT_REVISION, DEFAULT_SESSION_AGENT_SYSTEM_PROMPT,
+    InFlightWorkSummary, KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage,
+    KnowledgeCatalogRevisionSummary, KnowledgeCatalogState, KnowledgeCatalogUpdateResult,
+    MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit, MemberSetupResult, MemberSetupToken,
+    MemberTransitionResult, MembershipRevision, MembershipRole, ReplyClaimOutcome, ReplyCompletion,
+    ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus,
+    ReplyOutcomeUnknownCommit, ReplySuccessCommit, RotateMemberSetupTokenResult,
+    SESSION_AGENT_PROMPT_ID, SessionCompactionClaimOutcome, SessionCompactionFailureCommit,
+    SessionCompactionJob, SessionCompactionSuccessCommit, SessionContextCheckpoint,
+    SessionSummaryPage, SqliteOperationLimits, SqliteOperationLimitsError, SqlitePhysicalLimits,
+    SqlitePhysicalLimitsError, StorageLimits, StorageLimitsError, StoredAccount,
+    StoredAccountStatus, StoredCredential, StoredMember, StoredMemberPage, StoredMembershipStatus,
+    StoredPreferences, StoredUser, StoredUserRole, StoredUserStatus, SwitchAuthSessionCommit,
+    SwitchAuthSessionResult, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
 use storage::{
     ClaimOutcome, CommitOutcome, CreateMemberCommit, DispatchCompleteCommit, DispatchContext,
@@ -438,6 +439,8 @@ pub enum StoreError {
     DispatchQueueCapacityExceeded,
     #[error("the authentication session store is at capacity")]
     AuthSessionCapacityExceeded,
+    #[error("the durable account set is at capacity")]
+    AccountCapacityExceeded,
     #[error("durable finalization capacity is unavailable")]
     FinalizationReservationUnavailable,
     #[error("invalid account data: {0}")]
@@ -539,6 +542,7 @@ impl From<StorageError> for StoreError {
             StorageError::ReplyQueueCapacityExceeded => Self::ReplyQueueCapacityExceeded,
             StorageError::DispatchQueueCapacityExceeded => Self::DispatchQueueCapacityExceeded,
             StorageError::AuthSessionCapacityExceeded => Self::AuthSessionCapacityExceeded,
+            StorageError::AccountCapacityExceeded => Self::AccountCapacityExceeded,
             StorageError::FinalizationReservationUnavailable => {
                 Self::FinalizationReservationUnavailable
             }
@@ -1433,11 +1437,44 @@ impl DemoStore {
         Ok(self.storage.credential_for_username(username).await?)
     }
 
+    pub async fn credential_for_username_in_account(
+        &self,
+        username: &str,
+        account_id: &AccountId,
+    ) -> Result<Option<StoredCredential>, StoreError> {
+        Ok(self
+            .storage
+            .credential_for_username_in_account(username, account_id)
+            .await?)
+    }
+
+    pub async fn accounts_for_user(
+        &self,
+        context: &AuthzContext,
+    ) -> Result<Vec<StoredAccount>, StoreError> {
+        Ok(self.storage.accounts_for_user(context).await?)
+    }
+
+    pub async fn create_account(
+        &self,
+        context: &AuthzContext,
+        commit: CreateAccountCommit,
+    ) -> Result<CreateAccountResult, StoreError> {
+        Ok(self.storage.create_account(context, commit).await?)
+    }
+
     pub async fn create_auth_session(
         &self,
         commit: AuthSessionCommit,
     ) -> Result<AuthPrincipal, StoreError> {
         Ok(self.storage.create_auth_session(commit).await?)
+    }
+
+    pub async fn switch_auth_session(
+        &self,
+        commit: SwitchAuthSessionCommit,
+    ) -> Result<SwitchAuthSessionResult, StoreError> {
+        Ok(self.storage.switch_auth_session(commit).await?)
     }
 
     pub async fn authenticate(

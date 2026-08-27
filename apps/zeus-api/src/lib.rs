@@ -47,16 +47,18 @@ use protocol::{
     AccountAuditEvent, AccountAuditEventPage, AccountAuditExportManifest,
     AccountAuditPolicy as AccountAuditPolicyResponse,
     AccountAuditRollup as AccountAuditRollupResponse,
-    AccountAuditState as AccountAuditStateResponse, AccountMember, AccountMemberPage, AccountRole,
-    AccountStatus, AccountUser, AgentReviewResponse, AgentToolCallStatus, AgentTurnDetail,
-    Approval, ApprovalScope, ApprovalStatus, AssistantReplyKind, AssistantReplyProvenance,
-    AuthStatusResponse, AuthenticationResponse, BootstrapRequest, COLLECTION_PAGE_DEFAULT_LIMIT,
-    CreateAccountAuditCheckpointRequest, CreateMemberRequest, CreateSessionRequest,
-    CreateSessionResponse, EVENT_PAGE_DEFAULT_LIMIT, HealthResponse, InFlightWorkSummary,
-    LoginRequest, LogoutResponse, MemberSetupRequest, MemberSetupTokenResponse, PolicyDecision,
-    ProblemDetails, ResumeSessionRequest, ResumeSessionResponse, ReviewDecision, ReviewRequest,
-    ReviewResponse, RotateMemberSetupTokenRequest, RunDetail, SessionDetail, SessionEvent,
-    SessionTurn, StartTurnRequest, ThemePreference, UpdateAccountAuditPolicyRequest,
+    AccountAuditState as AccountAuditStateResponse, AccountLifecycleStatus, AccountListResponse,
+    AccountMember, AccountMemberPage, AccountRole, AccountStatus, AccountSummary, AccountUser,
+    AgentReviewResponse, AgentToolCallStatus, AgentTurnDetail, Approval, ApprovalScope,
+    ApprovalStatus, AssistantReplyKind, AssistantReplyProvenance, AuthStatusResponse,
+    AuthenticationResponse, BootstrapRequest, COLLECTION_PAGE_DEFAULT_LIMIT,
+    CreateAccountAuditCheckpointRequest, CreateAccountRequest, CreateAccountResponse,
+    CreateMemberRequest, CreateSessionRequest, CreateSessionResponse, EVENT_PAGE_DEFAULT_LIMIT,
+    HealthResponse, InFlightWorkSummary, LoginRequest, LogoutResponse, MemberSetupRequest,
+    MemberSetupTokenResponse, PolicyDecision, ProblemDetails, ResumeSessionRequest,
+    ResumeSessionResponse, ReviewDecision, ReviewRequest, ReviewResponse,
+    RotateMemberSetupTokenRequest, RunDetail, SessionDetail, SessionEvent, SessionTurn,
+    StartTurnRequest, SwitchAccountRequest, ThemePreference, UpdateAccountAuditPolicyRequest,
     UpdateMemberRequest, UpdateMemberResponse, UpdatePreferencesRequest, UserPreferences,
 };
 #[cfg(test)]
@@ -70,21 +72,21 @@ use runtime::{
     AgentPromptState, AgentPromptUpdateResult, AgentReviewCommit, AgentToolCall, AgentToolCallSpec,
     AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
     AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe,
-    AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthzContext, BootstrapOwnerCommit, DemoStore,
-    EntryRevision, KnowledgeCatalogRevisionPage, KnowledgeCatalogState,
-    KnowledgeCatalogUpdateResult, MemberSetupCommit, PublishedEvent, ReplyClaimOutcome,
-    ReplyFailureCommit, ReplyJob, ReplyOutcomeUnknownCommit, ReplySuccessCommit,
+    AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthzContext, BootstrapOwnerCommit,
+    CreateAccountCommit, DemoStore, EntryRevision, KnowledgeCatalogRevisionPage,
+    KnowledgeCatalogState, KnowledgeCatalogUpdateResult, MemberSetupCommit, PublishedEvent,
+    ReplyClaimOutcome, ReplyFailureCommit, ReplyJob, ReplyOutcomeUnknownCommit, ReplySuccessCommit,
     SessionCompactionClaimOutcome, SessionCompactionFailureCommit, SessionCompactionJob,
-    SessionCompactionSuccessCommit, StoreError, StoredMember, StoredMembershipStatus,
-    StoredPreferences, StoredUser, StoredUserStatus, TransitionMemberCommit,
-    UpdateAccountAuditPolicyCommit,
+    SessionCompactionSuccessCommit, StoreError, StoredAccount, StoredAccountStatus, StoredMember,
+    StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserStatus,
+    SwitchAuthSessionCommit, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tenancy::{
-    AccountId, AuthSessionId, BootstrapTokenDigest, CsrfToken, CsrfTokenDigest, MemberSetupToken,
-    MembershipRole, Password, PasswordAuthenticator, PasswordHashRecord, SessionToken,
-    SessionTokenDigest, UserId, Username, hash_password,
+    AccountId, AccountName, AuthSessionId, BootstrapTokenDigest, CsrfToken, CsrfTokenDigest,
+    MemberSetupToken, MembershipRole, Password, PasswordAuthenticator, PasswordHashRecord,
+    SessionToken, SessionTokenDigest, UserId, Username, hash_password,
 };
 use tokio::{
     sync::{Mutex, OwnedSemaphorePermit, Semaphore, broadcast},
@@ -1127,6 +1129,12 @@ fn build_authenticated_app(state: ApiState) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .layer(DefaultBodyLimit::max(COMMAND_JSON_BODY_MAX_BYTES));
 
+    let account_control = Router::new()
+        .route("/api/v1/accounts", get(list_accounts).post(create_account))
+        .route("/api/v1/auth/switch-account", post(switch_account))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
+        .layer(DefaultBodyLimit::max(AUTH_JSON_BODY_MAX_BYTES));
+
     let account_admin = Router::new()
         .route("/api/v1/members", get(list_members).post(create_member))
         .route(
@@ -1200,6 +1208,7 @@ fn build_authenticated_app(state: ApiState) -> Router {
 
     let router = public
         .merge(protected)
+        .merge(account_control)
         .merge(account_admin)
         .merge(knowledge_admin)
         .merge(agent_prompt_admin)
@@ -1436,9 +1445,10 @@ async fn auth_status(
     } else {
         None
     };
-    let (user, preferences) = if let Some(principal) = principal {
+    let (account_id, user, preferences) = if let Some(principal) = principal {
         let preferences = state.store.preferences(&principal.authz).await?;
         (
+            Some(principal.authz.account_id.as_str().to_owned()),
             Some(account_user(
                 &principal.user,
                 principal.authz.membership_role,
@@ -1446,11 +1456,12 @@ async fn auth_status(
             Some(user_preferences(&preferences)?),
         )
     } else {
-        (None, None)
+        (None, None, None)
     };
     let mut response = Json(AuthStatusResponse {
         configured,
         authenticated: user.is_some(),
+        account_id,
         user,
         preferences,
     })
@@ -1534,9 +1545,12 @@ async fn bootstrap(
         &session_token,
         &csrf_token,
         &expires_at,
-        user,
-        MembershipRole::Owner,
-        preferences,
+        AuthenticationSubject {
+            account_id: AccountId::local(),
+            user,
+            membership_role: MembershipRole::Owner,
+            preferences,
+        },
     )
 }
 
@@ -1558,6 +1572,12 @@ async fn login(
     let Json(request) = payload.map_err(ApiError::invalid_json)?;
     let password = Zeroizing::new(request.password);
     let normalized_username = Username::parse(&request.username).ok();
+    let requested_account_id = request
+        .account_id
+        .as_deref()
+        .map(AccountId::parse)
+        .unwrap_or_else(|| Ok(AccountId::local()))
+        .ok();
     let account_key = normalized_username
         .as_ref()
         .map(Username::as_str)
@@ -1570,14 +1590,15 @@ async fn login(
         "login_rate_limited",
         "Sign-in temporarily limited",
     )?;
-    let credential = if let Some(username) = &normalized_username {
-        state
-            .store
-            .credential_for_username(username.as_str())
-            .await?
-    } else {
-        None
-    };
+    let credential =
+        if let (Some(username), Some(account_id)) = (&normalized_username, &requested_account_id) {
+            state
+                .store
+                .credential_for_username_in_account(username.as_str(), account_id)
+                .await?
+        } else {
+            None
+        };
     let record = credential
         .as_ref()
         .map(|credential| PasswordHashRecord::parse(&credential.password_hash))
@@ -1596,11 +1617,8 @@ async fn login(
     .await
     .map_err(|error| ApiError::auth_unavailable(&error))?
     .map_err(|error| ApiError::auth_unavailable(&error))?;
-    let credential = credential.filter(|credential| {
-        verified
-            && credential.user.status == StoredUserStatus::Active
-            && credential.account_id == AccountId::local()
-    });
+    let credential = credential
+        .filter(|credential| verified && credential.user.status == StoredUserStatus::Active);
     let Some(credential) = credential else {
         return Err(ApiError::invalid_login());
     };
@@ -1635,9 +1653,129 @@ async fn login(
         &session_token,
         &csrf_token,
         &expires_at,
-        credential.user,
-        context.membership_role,
-        preferences,
+        AuthenticationSubject {
+            account_id: context.account_id,
+            user: credential.user,
+            membership_role: context.membership_role,
+            preferences,
+        },
+    )
+}
+
+async fn list_accounts(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+) -> Result<Response, ApiError> {
+    let accounts = state
+        .store
+        .accounts_for_user(&current.principal.authz)
+        .await?
+        .into_iter()
+        .map(account_summary)
+        .collect();
+    let mut response = Json(AccountListResponse {
+        current_account_id: current.principal.authz.account_id.as_str().to_owned(),
+        accounts,
+    })
+    .into_response();
+    no_store(response.headers_mut());
+    Ok(response)
+}
+
+async fn create_account(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    headers: HeaderMap,
+    payload: Result<Json<CreateAccountRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let Json(request) = payload.map_err(ApiError::invalid_json)?;
+    let name = AccountName::parse(request.name)
+        .map_err(|error| ApiError::bad_request("invalid_account_name", error.to_string()))?;
+    let account_id = AccountId::for_creation(&current.principal.user.id, &idempotency_key);
+    let result = state
+        .store
+        .create_account(
+            &current.principal.authz,
+            CreateAccountCommit {
+                account_id,
+                name: name.as_str().to_owned(),
+            },
+        )
+        .await?;
+    let status = if result.replayed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    let mut response = (
+        status,
+        Json(CreateAccountResponse {
+            account: account_summary(result.account),
+            replayed: result.replayed,
+        }),
+    )
+        .into_response();
+    no_store(response.headers_mut());
+    Ok(response)
+}
+
+async fn switch_account(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    headers: HeaderMap,
+    payload: Result<Json<SwitchAccountRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    reject_unsupported_idempotency(&headers)?;
+    let Json(request) = payload.map_err(ApiError::invalid_json)?;
+    let target_account_id = AccountId::parse(request.account_id).map_err(|_| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "account_not_found",
+            "Account not found",
+            "The requested account is unavailable",
+        )
+        .with_no_store()
+    })?;
+    // Preferences are user-global. Read and validate them before rotating the
+    // session so no fallible database read can turn a committed switch into an
+    // error response that withholds the newly minted token.
+    let preferences = state.store.preferences(&current.principal.authz).await?;
+    user_preferences(&preferences)?;
+    let (auth_session_id, session_token, csrf_token, expires_at) = fresh_auth_tokens()?;
+    let result = state
+        .store
+        .switch_auth_session(SwitchAuthSessionCommit {
+            current_authz: current.principal.authz,
+            current_session_token_hash: current.session_token_hash,
+            target_account_id,
+            next_auth_session_id: auth_session_id,
+            next_session_token_hash: session_token.digest().to_persistence(),
+            next_csrf_hash: csrf_token.digest().to_persistence(),
+            next_expires_at: expires_at.clone(),
+        })
+        .await
+        .map_err(|error| match error {
+            StoreError::AuthSessionNotFound | StoreError::PermissionDenied => ApiError::new(
+                StatusCode::NOT_FOUND,
+                "account_not_found",
+                "Account not found",
+                "The requested account is unavailable",
+            )
+            .with_no_store(),
+            other => other.into(),
+        })?;
+    authentication_response(
+        &state,
+        &session_token,
+        &csrf_token,
+        &expires_at,
+        AuthenticationSubject {
+            account_id: result.account.id,
+            user: result.principal.user,
+            membership_role: result.account.role,
+            preferences,
+        },
     )
 }
 
@@ -1686,9 +1824,12 @@ async fn member_setup(
         &session_token,
         &csrf_token,
         &expires_at,
-        result.principal.user,
-        context.membership_role,
-        preferences,
+        AuthenticationSubject {
+            account_id: context.account_id,
+            user: result.principal.user,
+            membership_role: context.membership_role,
+            preferences,
+        },
     )
 }
 
@@ -2621,18 +2762,24 @@ fn fresh_auth_tokens() -> Result<(AuthSessionId, SessionToken, CsrfToken, String
     Ok((auth_session_id, session, csrf, expires_at))
 }
 
+struct AuthenticationSubject {
+    account_id: AccountId,
+    user: StoredUser,
+    membership_role: MembershipRole,
+    preferences: StoredPreferences,
+}
+
 fn authentication_response(
     state: &ApiState,
     session_token: &SessionToken,
     csrf_token: &CsrfToken,
     expires_at: &str,
-    user: StoredUser,
-    membership_role: MembershipRole,
-    preferences: StoredPreferences,
+    subject: AuthenticationSubject,
 ) -> Result<Response, ApiError> {
     let mut response = Json(AuthenticationResponse {
-        user: account_user(&user, membership_role),
-        preferences: user_preferences(&preferences)?,
+        account_id: subject.account_id.as_str().to_owned(),
+        user: account_user(&subject.user, subject.membership_role),
+        preferences: user_preferences(&subject.preferences)?,
         csrf_token: csrf_token.expose_secret().to_owned(),
         expires_at: expires_at.to_owned(),
     })
@@ -2645,6 +2792,28 @@ fn authentication_response(
     )?;
     no_store(response.headers_mut());
     Ok(response)
+}
+
+fn account_summary(account: StoredAccount) -> AccountSummary {
+    AccountSummary {
+        id: account.id.as_str().to_owned(),
+        name: account.name,
+        status: match account.status {
+            StoredAccountStatus::Active => AccountLifecycleStatus::Active,
+            StoredAccountStatus::Suspended => AccountLifecycleStatus::Suspended,
+        },
+        role: match account.role {
+            MembershipRole::Owner => AccountRole::Owner,
+            MembershipRole::Member => AccountRole::Member,
+        },
+        membership_status: match account.membership_status {
+            StoredMembershipStatus::Active => AccountStatus::Active,
+            StoredMembershipStatus::Disabled => AccountStatus::Disabled,
+        },
+        membership_revision: account.membership_revision.get(),
+        created_at: account.created_at,
+        updated_at: account.updated_at,
+    }
 }
 
 async fn authenticate_headers(
@@ -5537,6 +5706,13 @@ impl From<StoreError> for ApiError {
             StoreError::ReplyQueueCapacityExceeded => Self::reply_queue_capacity_exceeded(),
             StoreError::DispatchQueueCapacityExceeded => Self::dispatch_queue_capacity_exceeded(),
             StoreError::AuthSessionCapacityExceeded => Self::auth_session_capacity_exceeded(),
+            StoreError::AccountCapacityExceeded => Self::new(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "account_capacity_exceeded",
+                "Account capacity exhausted",
+                "The bounded local account set is full",
+            )
+            .with_no_store(),
             StoreError::FinalizationReservationUnavailable => {
                 Self::finalization_unavailable(&error)
             }
@@ -6684,6 +6860,322 @@ mod tests {
             .unwrap();
         assert_eq!(success.status(), StatusCode::OK);
 
+        fixture.cleanup();
+    }
+
+    #[tokio::test]
+    async fn account_control_plane_is_idempotent_rotates_sessions_and_isolates_resources() {
+        let fixture = configured_auth_test_app("multi-account", LOGIN_RATE_POLICY).await;
+
+        let login = fixture
+            .app
+            .clone()
+            .oneshot(login_request("owner", TEST_OWNER_PASSWORD))
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let local_cookie = authentication_cookie_header(login.headers());
+        let local_authentication: AuthenticationResponse = response_json(login).await;
+        assert_eq!(local_authentication.account_id, AccountId::local().as_str());
+
+        let local_session = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &local_cookie)
+                    .header(CSRF_HEADER, &local_authentication.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "multi-account-local-session")
+                    .body(Body::from(
+                        r#"{"id":"session-local-account","title":"Local account"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(local_session.status(), StatusCode::CREATED);
+
+        let created = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/accounts")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &local_cookie)
+                    .header(CSRF_HEADER, &local_authentication.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "create-secondary-account")
+                    .body(Body::from(r#"{"name":"Secondary"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        assert_eq!(created.headers()[header::CACHE_CONTROL], "no-store");
+        let created: CreateAccountResponse = response_json(created).await;
+        assert!(!created.replayed);
+        assert_eq!(created.account.name, "Secondary");
+        assert_eq!(created.account.role, AccountRole::Owner);
+        let secondary_account_id = created.account.id;
+
+        let replay = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/accounts")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &local_cookie)
+                    .header(CSRF_HEADER, &local_authentication.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "create-secondary-account")
+                    .body(Body::from(r#"{"name":"Secondary"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay: CreateAccountResponse = response_json(replay).await;
+        assert!(replay.replayed);
+        assert_eq!(replay.account.id, secondary_account_id);
+
+        let conflict = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/accounts")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &local_cookie)
+                    .header(CSRF_HEADER, &local_authentication.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "create-secondary-account")
+                    .body(Body::from(r#"{"name":"Different"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(conflict, StatusCode::CONFLICT, "idempotency_conflict").await;
+
+        let accounts = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/accounts")
+                    .header(header::COOKIE, &local_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accounts.headers()[header::CACHE_CONTROL], "no-store");
+        let accounts: AccountListResponse = response_json(accounts).await;
+        assert_eq!(accounts.current_account_id, AccountId::local().as_str());
+        assert_eq!(accounts.accounts.len(), 2);
+        assert!(
+            accounts
+                .accounts
+                .iter()
+                .any(|account| account.id == secondary_account_id)
+        );
+
+        let malformed_account_login = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "username": "owner",
+                            "password": TEST_OWNER_PASSWORD,
+                            "account_id": "acc_not-canonical!",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            malformed_account_login,
+            StatusCode::UNAUTHORIZED,
+            "invalid_credentials",
+        )
+        .await;
+
+        let member = insert_test_member(&fixture.path, "user-account-member", "account-member");
+        let denied = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/accounts")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &member.cookie_header)
+                    .header(CSRF_HEADER, &member.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "member-cannot-create-account")
+                    .body(Body::from(r#"{"name":"Forbidden"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(denied, StatusCode::FORBIDDEN, "permission_denied").await;
+
+        let missing_account_id =
+            AccountId::for_creation(&local_authentication.user.id, "missing-account");
+        let missing = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/switch-account")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &local_cookie)
+                    .header(CSRF_HEADER, &local_authentication.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "account_id": missing_account_id.as_str() })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(missing, StatusCode::NOT_FOUND, "account_not_found").await;
+        let preserved = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/overview")
+                    .header(header::COOKIE, &local_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preserved.status(), StatusCode::OK);
+
+        let switched = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/switch-account")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &local_cookie)
+                    .header(CSRF_HEADER, &local_authentication.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "account_id": &secondary_account_id }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(switched.status(), StatusCode::OK);
+        let secondary_cookie = authentication_cookie_header(switched.headers());
+        assert_ne!(secondary_cookie, local_cookie);
+        let secondary_authentication: AuthenticationResponse = response_json(switched).await;
+        assert_eq!(secondary_authentication.account_id, secondary_account_id);
+
+        let revoked = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/overview")
+                    .header(header::COOKIE, &local_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+
+        let status = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/auth/status")
+                    .header(header::COOKIE, &secondary_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status: AuthStatusResponse = response_json(status).await;
+        assert!(status.authenticated);
+        assert_eq!(
+            status.account_id.as_deref(),
+            Some(secondary_account_id.as_str())
+        );
+
+        let isolated = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/sessions")
+                    .header(header::COOKIE, &secondary_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let isolated: serde_json::Value = response_json(isolated).await;
+        assert_eq!(isolated, serde_json::json!([]));
+
+        let secondary_session = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &secondary_cookie)
+                    .header(CSRF_HEADER, &secondary_authentication.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "multi-account-secondary-session")
+                    .body(Body::from(
+                        r#"{"id":"session-secondary-account","title":"Secondary account"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(secondary_session.status(), StatusCode::CREATED);
+
+        let account_login = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "username": "owner",
+                            "password": TEST_OWNER_PASSWORD,
+                            "account_id": &secondary_account_id,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(account_login.status(), StatusCode::OK);
+        let account_login: AuthenticationResponse = response_json(account_login).await;
+        assert_eq!(account_login.account_id, secondary_account_id);
+
+        fixture.store.readiness().await.unwrap();
         fixture.cleanup();
     }
 

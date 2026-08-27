@@ -96,6 +96,8 @@ pub enum StorageError {
     DispatchQueueCapacityExceeded,
     #[error("the authentication session store is at capacity")]
     AuthSessionCapacityExceeded,
+    #[error("the durable account set is at capacity")]
+    AccountCapacityExceeded,
     #[error("the durable finalization reservation is missing or inconsistent")]
     FinalizationReservationUnavailable,
     #[error("invalid account data: {0}")]

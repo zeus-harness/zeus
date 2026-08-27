@@ -29,15 +29,15 @@ Client / SvelteKit Web
 - `authz`：account capability matrix，以及精确工具名规则、策略 revision、环境和 effect guard；没有命中即拒绝。
 - `tools`：工具描述、注册表、参数验证和 object-safe executor 边界。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
-- `storage`：schema v25 migration、`acc_local` membership 权威、一次性 member setup、用户/偏好、
+- `storage`：schema v25 migration、有界 account/membership 权威、一次性 member setup、用户/偏好、
   account audit/rollup/policy/archive state、独立 Session/Run ledger、typed event lookup、
   account+actor-scoped 回执、durable Agent/model/tool/dispatch queue、不可变 deployment manifest，
   revisioned account knowledge catalog、owner-governed Agent prompt，以及
   actor/account/global logical capacity、physical capacity 和 operation capacity。
 - `runtime`：Session 命令编排、Agent model/tool 与 Run worker、运行时 manifest 构建、提交后 SSE
   提示和启动恢复。
-- `zeus-api`：进程组合、owner/member 认证、CSRF、owner-only 管理面、provider 配置、REST/SSE
-  和 readiness。
+- `zeus-api`：进程组合、owner/member 认证、账户创建/列表/原子切换、CSRF、owner-only 管理面、
+  provider 配置、REST/SSE 和 readiness。
 
 SQLite 是本地单实例 Alpha+ 的权威存储。Restate、MinIO 和 PostgreSQL 当前不是第二套事实源。
 当前 Web 认证后列出用户 Session，恢复仍存在的上次活动 Session，并行订阅 Run/Session SSE；
@@ -271,11 +271,13 @@ exactly-once 语义。
   connector dispatch、member/audit 管理保持 owner-only。正式业务路径已全部 account+actor-scoped，
   并有跨 account/actor 隔离测试；字段、HTTP/SSE 连接和
   event page 边界、内部 point/batch read、有界 list/detail，以及 SQLite 行数、active queue、
-  event-slot、事件载荷逻辑字节配额和 DB/WAL/disk headroom 门禁已落地。v14 已把唯一
+  event-slot、事件载荷逻辑字节配额和 DB/WAL/disk headroom 门禁已落地。v14 已把初始
   `acc_local` membership 切为 capability 权威，并为 auth session、receipt、reply/dispatch、
   reservation、cursor 和 capacity 建立 account/actor 边界；v15 再用 setup token、revisioned
   disable/role change、两秒 SSE authority poll 和 account audit 完成产品路径。管理 middleware
   不是最终授权点，storage mutation 与 worker claim 仍在同一事务内复核 durable capability。
+  当前控制面允许 owner 幂等创建账户，固定限制为每 User 16 个 membership、每库 64 个 account；
+  登录可选 account，切换会原子轮换 auth session，资源读取继续只使用 session 中固化的 account。
 - auth JSON 明确限制为 8 KiB、command JSON 为 512 KiB；新建 Session/turn ID、title、
   user/assistant message、review note 与严格幂等键分别按 UTF-8 bytes 设置硬上限。typed
   reply response 为 512 KiB，compact tool output 与 dispatch arguments JSON 为 64 KiB，
@@ -603,8 +605,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   刷新恢复、owner/member setup/登录、owner 成员与 audit 管理、设置/退出和
   system/light/dark。member 的审批卡只读。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化按项目既有统计口径是 606 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
-  provider contract 15、storage 252、runtime 48、API library 79、API main/config 11）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化按项目既有统计口径是 611 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
+  provider contract 15、storage 254、runtime 48、API library 80、API main/config 11）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
 提交 `af29089` 曾构建并运行在独立 `zeus-operation-acceptance` project（端口 `18089`）；既有

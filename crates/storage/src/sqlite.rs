@@ -38,25 +38,28 @@ use crate::{
     AgentPromptCommit, AgentPromptRevisionPage, AgentPromptState, AgentPromptUpdateResult,
     AgentTurn, AgentTurnEnqueueResponse, AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal,
     AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, BoundedRunRead,
-    ClaimOutcome, CommitOutcome, CreateMemberCommit, CreateMemberResult, DispatchCompleteCommit,
-    DispatchContext, DispatchJob, DispatchJobSpec, DispatchRecoveryCommit, DispatchRejection,
-    DispatchStartCommit, DispatchStatus, InFlightWorkSummary, KnowledgeCatalogCommit,
-    KnowledgeCatalogRevisionPage, KnowledgeCatalogState, KnowledgeCatalogUpdateResult,
-    MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit, MemberSetupResult, MemberTransitionResult,
-    MembershipRevision, MembershipRole, RecoveredSessionTurn, ReplyClaimOutcome, ReplyCompletion,
-    ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus,
-    ReplyOutcomeUnknownCommit, ReplySuccessCommit, ReviewCommit, ReviewContext, ReviewReceipt,
-    RotateMemberSetupTokenCommit, RotateMemberSetupTokenResult, RunSnapshot, RuntimeIdentity,
-    SessionCompactionClaimOutcome, SessionCompactionFailureCommit, SessionCompactionJob,
-    SessionCompactionSuccessCommit, SessionContextCheckpoint, SessionSummaryPage,
-    SqliteOperationLimits, SqlitePhysicalLimits, StorageError, StorageLimits, StoredCredential,
+    ClaimOutcome, CommitOutcome, CreateAccountCommit, CreateAccountResult, CreateMemberCommit,
+    CreateMemberResult, DispatchCompleteCommit, DispatchContext, DispatchJob, DispatchJobSpec,
+    DispatchRecoveryCommit, DispatchRejection, DispatchStartCommit, DispatchStatus,
+    InFlightWorkSummary, KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage,
+    KnowledgeCatalogState, KnowledgeCatalogUpdateResult, MEMBER_SETUP_TOKEN_TTL_SECONDS,
+    MemberSetupCommit, MemberSetupResult, MemberTransitionResult, MembershipRevision,
+    MembershipRole, RecoveredSessionTurn, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit,
+    ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
+    ReplySuccessCommit, ReviewCommit, ReviewContext, ReviewReceipt, RotateMemberSetupTokenCommit,
+    RotateMemberSetupTokenResult, RunSnapshot, RuntimeIdentity, SessionCompactionClaimOutcome,
+    SessionCompactionFailureCommit, SessionCompactionJob, SessionCompactionSuccessCommit,
+    SessionContextCheckpoint, SessionSummaryPage, SqliteOperationLimits, SqlitePhysicalLimits,
+    StorageError, StorageLimits, StoredAccount, StoredAccountStatus, StoredCredential,
     StoredMember, StoredMemberPage, StoredMembershipStatus, StoredPreferences, StoredRun,
-    StoredUser, StoredUserRole, StoredUserStatus, TransitionMemberCommit,
-    UpdateAccountAuditPolicyCommit,
+    StoredUser, StoredUserRole, StoredUserStatus, SwitchAuthSessionCommit, SwitchAuthSessionResult,
+    TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
 
 const CURRENT_SCHEMA_VERSION: i64 = 25;
 const LOCAL_ACCOUNT_ID: &str = "acc_local";
+const MAX_ACCOUNTS_PER_USER: i64 = 16;
+const MAX_ACCOUNTS_GLOBAL: i64 = 64;
 const EVENT_PAYLOAD_VERSION_V1: i64 = 1;
 const EVENT_PAYLOAD_VERSION_V2: i64 = 2;
 const SESSION_EVENT_PAYLOAD_VERSION_V1: i64 = 1;
@@ -1401,9 +1404,47 @@ impl SqliteStore {
         &self,
         username: &str,
     ) -> Result<Option<StoredCredential>, StorageError> {
-        let username = normalized_account_value(username, "username", 64)?.to_owned();
-        self.with_connection(move |connection| query_credential(connection, &username))
+        self.credential_for_username_in_account(username, &AccountId::local())
             .await
+    }
+
+    pub async fn credential_for_username_in_account(
+        &self,
+        username: &str,
+        account_id: &AccountId,
+    ) -> Result<Option<StoredCredential>, StorageError> {
+        let username = normalized_account_value(username, "username", 64)?.to_owned();
+        let account_id = account_id.clone();
+        self.with_connection(move |connection| {
+            query_credential(connection, &username, account_id.as_str())
+        })
+        .await
+    }
+
+    pub async fn accounts_for_user(
+        &self,
+        context: &AuthzContext,
+    ) -> Result<Vec<StoredAccount>, StorageError> {
+        let context = validated_authz_context(context)?;
+        self.with_connection(move |connection| {
+            require_current_authority(connection, &context, AccountCapability::Read)?;
+            query_accounts_for_user(connection, &context.user_id)
+        })
+        .await
+    }
+
+    pub async fn create_account(
+        &self,
+        context: &AuthzContext,
+        commit: CreateAccountCommit,
+    ) -> Result<CreateAccountResult, StorageError> {
+        let context = validated_authz_context(context)?;
+        let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            create_account(connection, &context, commit, &limits, &physical_limits)
+        })
+        .await
     }
 
     pub async fn create_auth_session(
@@ -1414,6 +1455,18 @@ impl SqliteStore {
         let physical_limits = self.physical_limits.clone();
         self.with_connection(move |connection| {
             create_auth_session(connection, commit, &limits, &physical_limits)
+        })
+        .await
+    }
+
+    pub async fn switch_auth_session(
+        &self,
+        commit: SwitchAuthSessionCommit,
+    ) -> Result<SwitchAuthSessionResult, StorageError> {
+        let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            switch_auth_session(connection, commit, &limits, &physical_limits)
         })
         .await
     }
@@ -4550,9 +4603,22 @@ fn readiness(
         [LOCAL_ACCOUNT_ID],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    if account_rows != 1 || active_local_accounts != 1 {
+    if !(1..=MAX_ACCOUNTS_GLOBAL).contains(&account_rows) || active_local_accounts != 1 {
         return Err(StorageError::CorruptData(
-            "the local account singleton is missing, duplicated, or inactive".into(),
+            "the bounded account set is empty, oversized, or missing its active local root".into(),
+        ));
+    }
+    let oversized_user_account_set: i64 = connection.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM account_memberships
+               GROUP BY user_id HAVING COUNT(*) > ?1
+           )"#,
+        [MAX_ACCOUNTS_PER_USER],
+        |row| row.get(0),
+    )?;
+    if oversized_user_account_set != 0 {
+        return Err(StorageError::CorruptData(
+            "one or more users exceed the durable account membership ceiling".into(),
         ));
     }
 
@@ -4580,11 +4646,29 @@ fn readiness(
 
     let account_boundary_violation: i64 = connection.query_row(
         r#"SELECT EXISTS(
-               SELECT 1 FROM incidents WHERE account_id IS NOT ?1
+               SELECT 1
+               FROM incidents incident
+               WHERE incident.account_id IS NULL
+                  OR NOT EXISTS(
+                      SELECT 1 FROM accounts account
+                      WHERE account.id = incident.account_id
+                  )
                UNION ALL
-               SELECT 1 FROM sessions WHERE account_id IS NOT ?1
+               SELECT 1
+               FROM sessions session
+               WHERE session.account_id IS NULL
+                  OR NOT EXISTS(
+                      SELECT 1 FROM accounts account
+                      WHERE account.id = session.account_id
+                  )
                UNION ALL
-               SELECT 1 FROM runs WHERE account_id IS NOT ?1
+               SELECT 1
+               FROM runs run
+               WHERE run.account_id IS NULL
+                  OR NOT EXISTS(
+                      SELECT 1 FROM accounts account
+                      WHERE account.id = run.account_id
+                  )
                UNION ALL
                SELECT 1 FROM runtime_identity WHERE account_id IS NOT ?1
                UNION ALL
@@ -4625,22 +4709,22 @@ fn readiness(
                WHERE binding.session_id IS NOT identity.primary_session_id
                UNION ALL
                SELECT 1
-               FROM account_memberships membership
-               WHERE membership.account_id IS NOT ?1
-               UNION ALL
-               SELECT 1
                WHERE NOT EXISTS(SELECT 1 FROM users)
                  AND EXISTS(SELECT 1 FROM account_memberships)
                UNION ALL
                SELECT 1
-               WHERE EXISTS(SELECT 1 FROM users)
-                 AND (SELECT COUNT(*)
-                      FROM account_memberships membership
-                      JOIN users user ON user.id = membership.user_id
-                      WHERE membership.account_id = ?1
-                        AND membership.role = 'owner'
-                        AND membership.status = 'active'
-                        AND user.status = 'active') < 1
+               FROM accounts account
+               WHERE account.status = 'active'
+                 AND EXISTS(SELECT 1 FROM users)
+                 AND NOT EXISTS(
+                     SELECT 1
+                     FROM account_memberships membership
+                     JOIN users user ON user.id = membership.user_id
+                     WHERE membership.account_id = account.id
+                       AND membership.role = 'owner'
+                       AND membership.status = 'active'
+                       AND user.status = 'active'
+                 )
            )"#,
         [LOCAL_ACCOUNT_ID],
         |row| row.get(0),
@@ -4925,21 +5009,24 @@ fn readiness(
     agent::verify_account_agent_prompt_integrity(connection)?;
     compaction::verify_integrity(connection)?;
     execution::verify_agent_execution_integrity(connection)?;
-    let (user_count, owner_count): (i64, i64) = connection.query_row(
+    let (user_count, ownerless_active_accounts): (i64, i64) = connection.query_row(
         r#"SELECT (SELECT COUNT(*) FROM users),
-                  (SELECT COUNT(*)
-                   FROM account_memberships membership
-                   JOIN users user ON user.id = membership.user_id
-                   WHERE membership.account_id = ?1
-                     AND membership.role = 'owner'
-                     AND membership.status = 'active'
-                     AND user.status = 'active')"#,
-        [LOCAL_ACCOUNT_ID],
+                  (SELECT COUNT(*) FROM accounts account
+                   WHERE account.status = 'active'
+                     AND NOT EXISTS(
+                         SELECT 1
+                         FROM account_memberships membership
+                         JOIN users user ON user.id = membership.user_id
+                         WHERE membership.account_id = account.id
+                           AND membership.role = 'owner'
+                           AND membership.status = 'active'
+                           AND user.status = 'active'))"#,
+        [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    if user_count != 0 && owner_count < 1 {
+    if user_count != 0 && ownerless_active_accounts != 0 {
         return Err(StorageError::CorruptData(
-            "configured database must contain at least one active owner".into(),
+            "every active account in a configured database must retain an active owner".into(),
         ));
     }
     let configured_legacy_boundary: i64 = connection.query_row(
@@ -6596,6 +6683,7 @@ fn bootstrap_owner(
 fn query_credential(
     connection: &Connection,
     username: &str,
+    account_id: &str,
 ) -> Result<Option<StoredCredential>, StorageError> {
     let row = connection
         .query_row(
@@ -6610,7 +6698,7 @@ fn query_credential(
                  AND user.status = 'active'
                  AND membership.status = 'active'
                  AND account.status = 'active'"#,
-            params![username, LOCAL_ACCOUNT_ID],
+            params![username, account_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -6650,6 +6738,225 @@ fn query_credential(
         },
     )
     .transpose()
+}
+
+struct StoredAccountRow {
+    id: String,
+    name: String,
+    account_status: String,
+    role: String,
+    membership_status: String,
+    membership_revision: i64,
+    created_at: String,
+    updated_at: String,
+}
+
+impl StoredAccountRow {
+    fn decode(self) -> Result<StoredAccount, StorageError> {
+        let status = match self.account_status.as_str() {
+            "active" => StoredAccountStatus::Active,
+            "suspended" => StoredAccountStatus::Suspended,
+            other => {
+                return Err(StorageError::CorruptData(format!(
+                    "unsupported stored account status `{other}`"
+                )));
+            }
+        };
+        Ok(StoredAccount {
+            id: decode_account_id(self.id)?,
+            name: self.name,
+            status,
+            role: decode_membership_role(&self.role)?,
+            membership_status: decode_membership_status(&self.membership_status)?,
+            membership_revision: decode_membership_revision(self.membership_revision)?,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
+fn decode_account_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAccountRow> {
+    Ok(StoredAccountRow {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        account_status: row.get(2)?,
+        role: row.get(3)?,
+        membership_status: row.get(4)?,
+        membership_revision: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
+}
+
+const ACCOUNT_FOR_USER_SELECT: &str = r#"SELECT account.id, account.name, account.status,
+              membership.role, membership.status, membership.revision,
+              account.created_at, account.updated_at
+       FROM account_memberships membership
+       JOIN accounts account ON account.id = membership.account_id"#;
+
+fn query_accounts_for_user(
+    connection: &Connection,
+    user_id: &str,
+) -> Result<Vec<StoredAccount>, StorageError> {
+    let sql = format!(
+        "{ACCOUNT_FOR_USER_SELECT} WHERE membership.user_id = ?1 ORDER BY account.name COLLATE NOCASE, account.id"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    statement
+        .query_map([user_id], decode_account_row)?
+        .map(|row| row.map_err(StorageError::from)?.decode())
+        .collect()
+}
+
+fn query_account_for_user(
+    connection: &Connection,
+    user_id: &str,
+    account_id: &str,
+) -> Result<Option<StoredAccount>, StorageError> {
+    let sql = format!(
+        "{ACCOUNT_FOR_USER_SELECT} WHERE membership.user_id = ?1 AND membership.account_id = ?2"
+    );
+    connection
+        .query_row(&sql, params![user_id, account_id], decode_account_row)
+        .optional()?
+        .map(StoredAccountRow::decode)
+        .transpose()
+}
+
+fn create_account(
+    connection: &mut Connection,
+    context: &AuthzContext,
+    commit: CreateAccountCommit,
+    limits: &StorageLimits,
+    physical_limits: &SqlitePhysicalLimits,
+) -> Result<CreateAccountResult, StorageError> {
+    if commit.account_id == AccountId::local()
+        || AccountId::parse(commit.account_id.as_str()).is_err()
+    {
+        return Err(StorageError::InvalidAccountData(
+            "new account ID must use the canonical opaque representation".into(),
+        ));
+    }
+    let name = tenancy::AccountName::parse(commit.name)
+        .map_err(|error| StorageError::InvalidAccountData(error.to_string()))?;
+    let timestamp = now();
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_current_authority(&transaction, context, AccountCapability::AccountAdmin)?;
+
+    if let Some(existing) =
+        query_account_for_user(&transaction, &context.user_id, commit.account_id.as_str())?
+    {
+        if existing.name == name.as_str()
+            && existing.status == StoredAccountStatus::Active
+            && existing.role == MembershipRole::Owner
+            && existing.membership_status == StoredMembershipStatus::Active
+            && existing.membership_revision.get() == 1
+        {
+            transaction.commit()?;
+            return Ok(CreateAccountResult {
+                account: existing,
+                replayed: true,
+            });
+        }
+        return Err(StorageError::IdempotencyConflict);
+    }
+    if transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM accounts WHERE id = ?1)",
+        [commit.account_id.as_str()],
+        |row| row.get::<_, i64>(0),
+    )? != 0
+    {
+        return Err(StorageError::IdempotencyConflict);
+    }
+
+    let account_count: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0))?;
+    let user_account_count: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM account_memberships WHERE user_id = ?1",
+        [&context.user_id],
+        |row| row.get(0),
+    )?;
+    if account_count >= MAX_ACCOUNTS_GLOBAL || user_account_count >= MAX_ACCOUNTS_PER_USER {
+        return Err(StorageError::AccountCapacityExceeded);
+    }
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Admission,
+    )?;
+
+    transaction.execute(
+        r#"INSERT INTO accounts(id, name, status, created_at, updated_at)
+           VALUES (?1, ?2, 'active', ?3, ?3)"#,
+        params![commit.account_id.as_str(), name.as_str(), timestamp],
+    )?;
+    transaction.execute(
+        r#"INSERT INTO account_memberships(
+               account_id, user_id, role, status, revision, created_at, updated_at
+           ) VALUES (?1, ?2, 'owner', 'active', 1, ?3, ?3)"#,
+        params![commit.account_id.as_str(), context.user_id, timestamp],
+    )?;
+    transaction.execute(
+        r#"INSERT INTO account_audit_rollups(
+               account_id, through_sequence, event_count, digest, last_event_hash, updated_at
+           ) VALUES (?1, 0, 0, ?2, ?2, ?3)"#,
+        params![
+            commit.account_id.as_str(),
+            ACCOUNT_AUDIT_ZERO_DIGEST,
+            timestamp
+        ],
+    )?;
+    transaction.execute(
+        r#"INSERT INTO account_audit_policies(
+               account_id, detail_rows, legal_hold, archive_required, revision, updated_at
+           ) VALUES (?1, ?2, 0, 0, 1, ?3)"#,
+        params![
+            commit.account_id.as_str(),
+            capacity_limit(limits.account_audit_detail_rows)?,
+            timestamp
+        ],
+    )?;
+    transaction.execute(
+        r#"INSERT INTO account_audit_archive_state(
+               account_id, through_sequence, event_hash, archive_reference, revision, updated_at
+           ) VALUES (?1, 0, ?2, NULL, 1, ?3)"#,
+        params![
+            commit.account_id.as_str(),
+            ACCOUNT_AUDIT_ZERO_DIGEST,
+            timestamp
+        ],
+    )?;
+    prepare_account_audit_admission(
+        &transaction,
+        commit.account_id.as_str(),
+        AuditAdmission::General,
+        limits,
+        &timestamp,
+    )?;
+    append_account_audit_event(
+        &transaction,
+        commit.account_id.as_str(),
+        AccountAuditEventInput {
+            actor_user_id: Some(&context.user_id),
+            action: "account.created",
+            target_kind: "account",
+            target_id: commit.account_id.as_str(),
+            metadata: json!({ "source_account_id": context.account_id.as_str() }),
+        },
+        &timestamp,
+    )?;
+    let account =
+        query_account_for_user(&transaction, &context.user_id, commit.account_id.as_str())?
+            .ok_or_else(|| {
+                StorageError::CorruptData(
+                    "new account membership was not readable after insert".into(),
+                )
+            })?;
+    transaction.commit()?;
+    Ok(CreateAccountResult {
+        account,
+        replayed: false,
+    })
 }
 
 fn create_auth_session(
@@ -6720,6 +7027,104 @@ fn create_auth_session(
         csrf_hash: csrf_hash.to_owned(),
         expires_at: expires_at.to_owned(),
     })
+}
+
+fn switch_auth_session(
+    connection: &mut Connection,
+    commit: SwitchAuthSessionCommit,
+    limits: &StorageLimits,
+    physical_limits: &SqlitePhysicalLimits,
+) -> Result<SwitchAuthSessionResult, StorageError> {
+    let current = validated_authz_context(&commit.current_authz)?;
+    if AccountId::parse(commit.target_account_id.as_str()).is_err() {
+        return Err(StorageError::AuthSessionNotFound);
+    }
+    let current_token_hash = normalized_token_hash(
+        &commit.current_session_token_hash,
+        "current session token hash",
+    )?;
+    normalized_account_value(
+        commit.next_auth_session_id.as_str(),
+        "next authentication session ID",
+        128,
+    )?;
+    let next_token_hash =
+        normalized_token_hash(&commit.next_session_token_hash, "next session token hash")?;
+    let next_csrf_hash = normalized_token_hash(&commit.next_csrf_hash, "next CSRF token hash")?;
+    let next_expires_at = normalized_timestamp(&commit.next_expires_at, "next session expiry")?;
+    let timestamp = now();
+    if next_expires_at <= timestamp.as_str() {
+        return Err(StorageError::InvalidAccountData(
+            "next session expiry must be in the future".into(),
+        ));
+    }
+
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_current_authority(&transaction, &current, AccountCapability::Read)?;
+    let account = query_account_for_user(
+        &transaction,
+        &current.user_id,
+        commit.target_account_id.as_str(),
+    )?
+    .filter(|account| {
+        account.status == StoredAccountStatus::Active
+            && account.membership_status == StoredMembershipStatus::Active
+    })
+    .ok_or(StorageError::AuthSessionNotFound)?;
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Admission,
+    )?;
+    let deleted = transaction.execute(
+        r#"DELETE FROM auth_sessions
+           WHERE id = ?1 AND token_hash = ?2 AND account_id = ?3 AND user_id = ?4
+             AND membership_revision = ?5"#,
+        params![
+            current.auth_session_id.as_str(),
+            current_token_hash,
+            current.account_id.as_str(),
+            current.user_id,
+            u64_to_i64(current.membership_revision.get(), "membership revision")?,
+        ],
+    )?;
+    if deleted != 1 {
+        return Err(StorageError::AuthSessionNotFound);
+    }
+    cleanup_unusable_auth_sessions_in_transaction(
+        &transaction,
+        &timestamp,
+        Some(&current.user_id),
+    )?;
+    require_auth_session_capacity(&transaction, &current.user_id, &timestamp, limits)?;
+    insert_auth_session(
+        &transaction,
+        &AuthSessionInsert {
+            auth_session_id: commit.next_auth_session_id.as_str(),
+            account_id: account.id.as_str(),
+            user_id: &current.user_id,
+            membership_revision: account.membership_revision.get(),
+            token_hash: next_token_hash,
+            csrf_hash: next_csrf_hash,
+            expires_at: next_expires_at,
+            timestamp: &timestamp,
+        },
+    )?;
+    let user = query_user(&transaction, &current.user_id)?;
+    let principal = AuthPrincipal {
+        user,
+        authz: AuthzContext {
+            account_id: account.id.clone(),
+            user_id: current.user_id,
+            membership_role: account.role,
+            membership_revision: account.membership_revision,
+            auth_session_id: commit.next_auth_session_id,
+        },
+        csrf_hash: next_csrf_hash.to_owned(),
+        expires_at: next_expires_at.to_owned(),
+    };
+    transaction.commit()?;
+    Ok(SwitchAuthSessionResult { principal, account })
 }
 
 struct AuthSessionInsert<'a> {

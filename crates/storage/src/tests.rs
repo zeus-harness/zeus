@@ -36,15 +36,16 @@ use crate::{
     AgentModelSuccessCommit, AgentPromptCommit, AgentPromptState, AgentReviewCommit,
     AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
     AgentTurnSpec, AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit,
-    ClaimOutcome, CommitOutcome, CreateMemberCommit, DEFAULT_SESSION_AGENT_PROMPT_REVISION,
-    DEFAULT_SESSION_AGENT_SYSTEM_PROMPT, DispatchCompleteCommit, DispatchJobSpec,
-    DispatchRecoveryCommit, DispatchStartCommit, DispatchStatus, KnowledgeCatalogCommit,
-    MemberSetupCommit, MemberSetupToken, MembershipRevision, MembershipRole, ReplyClaimOutcome,
-    ReplyFailureCommit, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
-    ReplySuccessCommit, ReviewCommit, RotateMemberSetupTokenCommit, RunSnapshot, RuntimeIdentity,
-    SESSION_AGENT_PROMPT_ID, SessionCompactionClaimOutcome, SessionCompactionJobStatus,
-    SessionCompactionSuccessCommit, SqliteOperationLimits, SqlitePhysicalLimits, SqliteStore,
-    StorageError, StorageLimits, StoredMembershipStatus, StoredUserRole, StoredUserStatus,
+    ClaimOutcome, CommitOutcome, CreateAccountCommit, CreateMemberCommit,
+    DEFAULT_SESSION_AGENT_PROMPT_REVISION, DEFAULT_SESSION_AGENT_SYSTEM_PROMPT,
+    DispatchCompleteCommit, DispatchJobSpec, DispatchRecoveryCommit, DispatchStartCommit,
+    DispatchStatus, KnowledgeCatalogCommit, MemberSetupCommit, MemberSetupToken,
+    MembershipRevision, MembershipRole, ReplyClaimOutcome, ReplyFailureCommit, ReplyJobSpec,
+    ReplyJobStatus, ReplyOutcomeUnknownCommit, ReplySuccessCommit, ReviewCommit,
+    RotateMemberSetupTokenCommit, RunSnapshot, RuntimeIdentity, SESSION_AGENT_PROMPT_ID,
+    SessionCompactionClaimOutcome, SessionCompactionJobStatus, SessionCompactionSuccessCommit,
+    SqliteOperationLimits, SqlitePhysicalLimits, SqliteStore, StorageError, StorageLimits,
+    StoredMembershipStatus, StoredUserRole, StoredUserStatus, SwitchAuthSessionCommit,
     TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
 
@@ -2157,6 +2158,198 @@ async fn owner_bootstrap_claims_legacy_state_and_auth_sessions_are_revocable() {
             .await,
         Err(StorageError::AccountAlreadyConfigured)
     ));
+}
+
+#[tokio::test]
+async fn account_creation_replays_and_session_switch_rotates_authority_atomically() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    bootstrap_test_owner(&store).await;
+    let account_id = AccountId::for_creation("user-owner", "create-platform-account");
+
+    let created = store
+        .create_account(
+            &owner_authz(),
+            CreateAccountCommit {
+                account_id: account_id.clone(),
+                name: "Platform Ops".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!created.replayed);
+    assert_eq!(created.account.id, account_id);
+    assert_eq!(created.account.role, MembershipRole::Owner);
+    assert_eq!(created.account.membership_revision.get(), 1);
+
+    let replay = store
+        .create_account(
+            &owner_authz(),
+            CreateAccountCommit {
+                account_id: account_id.clone(),
+                name: "Platform Ops".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.account, created.account);
+    assert!(matches!(
+        store
+            .create_account(
+                &owner_authz(),
+                CreateAccountCommit {
+                    account_id: account_id.clone(),
+                    name: "Different Name".into(),
+                },
+            )
+            .await,
+        Err(StorageError::IdempotencyConflict)
+    ));
+
+    let accounts = store.accounts_for_user(&owner_authz()).await.unwrap();
+    assert_eq!(accounts.len(), 2);
+    assert!(
+        accounts
+            .iter()
+            .any(|account| account.id == AccountId::local())
+    );
+    assert!(accounts.iter().any(|account| account.id == account_id));
+    assert!(
+        store
+            .credential_for_username_in_account("owner", &account_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let local_observer = owner_authz_with_session("asi_local_observer");
+    store
+        .create_auth_session(AuthSessionCommit {
+            authz: local_observer.clone(),
+            session_token_hash: "7".repeat(64),
+            csrf_hash: "8".repeat(64),
+            expires_at: "2999-01-01T00:00:00.000Z".into(),
+        })
+        .await
+        .unwrap();
+
+    let switched = store
+        .switch_auth_session(SwitchAuthSessionCommit {
+            current_authz: owner_authz(),
+            current_session_token_hash: "b".repeat(64),
+            target_account_id: account_id.clone(),
+            next_auth_session_id: AuthSessionId::from_persistence("asi_platform_owner").unwrap(),
+            next_session_token_hash: "d".repeat(64),
+            next_csrf_hash: "e".repeat(64),
+            next_expires_at: "2999-01-01T00:00:00.000Z".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(switched.principal.authz.account_id, account_id);
+    assert!(store.authenticate(&"b".repeat(64)).await.unwrap().is_none());
+    assert_eq!(
+        store
+            .authenticate(&"d".repeat(64))
+            .await
+            .unwrap()
+            .unwrap()
+            .authz
+            .account_id,
+        account_id
+    );
+
+    store
+        .create_session_for_actor(
+            &switched.principal.authz,
+            CreateSessionRequest {
+                id: "session-platform-account".into(),
+                title: "Secondary account session".into(),
+            },
+            "create-platform-session",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .list_sessions_for_actor(&switched.principal.authz)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .list_sessions_for_actor(&local_observer)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let missing = AccountId::for_creation("user-owner", "missing-account");
+    assert!(matches!(
+        store
+            .switch_auth_session(SwitchAuthSessionCommit {
+                current_authz: switched.principal.authz.clone(),
+                current_session_token_hash: "d".repeat(64),
+                target_account_id: missing,
+                next_auth_session_id: AuthSessionId::from_persistence("asi_missing_switch")
+                    .unwrap(),
+                next_session_token_hash: "f".repeat(64),
+                next_csrf_hash: "1".repeat(64),
+                next_expires_at: "2999-01-01T00:00:00.000Z".into(),
+            })
+            .await,
+        Err(StorageError::AuthSessionNotFound)
+    ));
+    assert!(store.authenticate(&"d".repeat(64)).await.unwrap().is_some());
+    store.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn account_creation_enforces_the_per_user_ceiling_without_partial_state() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    bootstrap_test_owner(&store).await;
+
+    // The local root consumes one of the fixed 16 memberships.
+    for index in 0..15 {
+        store
+            .create_account(
+                &owner_authz(),
+                CreateAccountCommit {
+                    account_id: AccountId::for_creation(
+                        "user-owner",
+                        &format!("bounded-account-{index}"),
+                    ),
+                    name: format!("Bounded Account {index}"),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let rejected_account_id = AccountId::for_creation("user-owner", "bounded-account-rejected");
+    assert!(matches!(
+        store
+            .create_account(
+                &owner_authz(),
+                CreateAccountCommit {
+                    account_id: rejected_account_id.clone(),
+                    name: "Rejected Account".into(),
+                },
+            )
+            .await,
+        Err(StorageError::AccountCapacityExceeded)
+    ));
+
+    let accounts = store.accounts_for_user(&owner_authz()).await.unwrap();
+    assert_eq!(accounts.len(), 16);
+    assert!(
+        accounts
+            .iter()
+            .all(|account| account.id != rejected_account_id)
+    );
+    store.verify_integrity().await.unwrap();
 }
 
 #[tokio::test]

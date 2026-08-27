@@ -339,6 +339,8 @@ pub struct AuthStatusResponse {
     pub configured: bool,
     pub authenticated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<AccountUser>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferences: Option<UserPreferences>,
@@ -368,6 +370,8 @@ impl fmt::Debug for BootstrapRequest {
 pub struct LoginRequest {
     pub username: String,
     pub password: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
 }
 
 impl fmt::Debug for LoginRequest {
@@ -376,22 +380,68 @@ impl fmt::Debug for LoginRequest {
             .debug_struct("LoginRequest")
             .field("username", &self.username)
             .field("password", &"[REDACTED]")
+            .field("account_id", &self.account_id)
             .finish()
     }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthenticationResponse {
+    pub account_id: String,
     pub user: AccountUser,
     pub preferences: UserPreferences,
     pub csrf_token: String,
     pub expires_at: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountLifecycleStatus {
+    Active,
+    Suspended,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountSummary {
+    pub id: String,
+    pub name: String,
+    pub status: AccountLifecycleStatus,
+    pub role: AccountRole,
+    pub membership_status: AccountStatus,
+    pub membership_revision: u64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountListResponse {
+    pub current_account_id: String,
+    pub accounts: Vec<AccountSummary>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateAccountRequest {
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateAccountResponse {
+    pub account: AccountSummary,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwitchAccountRequest {
+    pub account_id: String,
+}
+
 impl fmt::Debug for AuthenticationResponse {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AuthenticationResponse")
+            .field("account_id", &self.account_id)
             .field("user", &self.user)
             .field("preferences", &self.preferences)
             .field("csrf_token", &"[REDACTED]")
@@ -1832,6 +1882,7 @@ mod tests {
         let login = LoginRequest {
             username: "owner".into(),
             password: "raw-password-secret".into(),
+            account_id: None,
         };
 
         let bootstrap_debug = format!("{bootstrap:?}");
@@ -1841,6 +1892,33 @@ mod tests {
         assert!(!login_debug.contains("raw-password-secret"));
         assert!(bootstrap_debug.contains("[REDACTED]"));
         assert!(login_debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn login_account_selection_is_optional_and_rejects_unknown_fields() {
+        let legacy: LoginRequest = serde_json::from_value(serde_json::json!({
+            "username": "owner",
+            "password": "Owner-password-2026",
+        }))
+        .unwrap();
+        assert_eq!(legacy.account_id, None);
+
+        let scoped: LoginRequest = serde_json::from_value(serde_json::json!({
+            "username": "owner",
+            "password": "Owner-password-2026",
+            "account_id": "acc_local",
+        }))
+        .unwrap();
+        assert_eq!(scoped.account_id.as_deref(), Some("acc_local"));
+        assert!(
+            serde_json::from_value::<LoginRequest>(serde_json::json!({
+                "username": "owner",
+                "password": "Owner-password-2026",
+                "account_id": "acc_local",
+                "tenant": "ignored",
+            }))
+            .is_err()
+        );
     }
 
     #[test]
