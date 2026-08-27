@@ -279,7 +279,8 @@ Manifest-bound system prompt v1 复用 `0019` 已有的可选 prompt 字段和 i
 不增加 schema migration。升级后旧 queued promptless Agent work 与当前 deployment 不一致，首次
 进入 claim 时 fail closed；terminal history 保持可读。Knowledge v1 纯领域层已生成独立、受治理、
 带完整 digest 的 canonical context snapshot，不修改稳定 system prompt。数据库持久化和 Agent
-request 注入仍是下一阶段，当前不能从 live knowledge 重建 queued request。
+request 注入仍是下一阶段，当前不能从 live knowledge 重建 queued request。LLM 协议层已保留独立
+durable `context` role，并只在 OpenAI-compatible provider wire 上映射为另一条 `user` message。
 
 迁移必须原地保留 Alpha append-only ledger、事件外键与 runtime identity。任何一步失败都回滚整个 migration transaction。
 
@@ -334,7 +335,7 @@ request 注入仍是下一阶段，当前不能从 live knowledge 重建 queued 
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 按项目既有统计口径通过 513 个 Rust 测试（knowledge 24、storage 232、runtime 48、API library 64、API
+- host 按项目既有统计口径通过 517 个 Rust 测试（knowledge 24、storage 232、runtime 48、API library 64、API
   main/config 6）与 28 个 Web Node 测试。
 - `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 

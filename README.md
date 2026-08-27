@@ -603,7 +603,9 @@ fixed integer/tokenizer contract, drops whole entries at a 16 KiB context
 boundary, and emits a canonical digest-bearing selection snapshot. Database
 binding and Agent request integration are not implemented yet; those layers
 must persist the admitted snapshot instead of mutating the system prompt or
-reconstructing a queued request from live state.
+reconstructing a queued request from live state. The provider contract already
+has a distinct durable `context` role, mapped to a separate `user` message only
+at the OpenAI-compatible wire boundary; storage does not emit it yet.
 
 SQLite is the authoritative store for this local single-instance Alpha. Do not
 place it on NFS or share one database volume between multiple Zeus replicas.
@@ -862,7 +864,7 @@ and schema v21 prepared-claim host verification:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --locked`: 513 tests passed
+- `cargo test --workspace --locked`: 517 tests passed
   under the existing project counting convention, including 8 deployment tests,
   24 knowledge tests, 232 storage tests, 48 runtime tests, 64 API library tests, 6 API main/config
   tests, and the real

@@ -306,6 +306,7 @@ impl<'a> TryFrom<&'a ReplyMessage> for ChatCompletionRequestMessage<'a> {
         let (role, content, tool_calls, tool_call_id) = match message.role {
             ReplyRole::System => ("system", Some(message.content.as_str()), None, None),
             ReplyRole::User => ("user", Some(message.content.as_str()), None, None),
+            ReplyRole::Context => ("user", Some(message.content.as_str()), None, None),
             ReplyRole::Assistant => {
                 if let Some(call) = &message.tool_call {
                     (

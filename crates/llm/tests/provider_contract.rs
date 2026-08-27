@@ -240,6 +240,45 @@ async fn openai_compatible_success_sends_bearer_model_and_messages() {
     assert!(request_json.get("tool_choice").is_none());
 }
 
+#[tokio::test]
+async fn openai_compatible_maps_durable_context_to_a_separate_user_message() {
+    let response = serde_json::json!({
+        "choices": [{
+            "message": { "role": "assistant", "content": "Context-bound reply" },
+            "finish_reason": "stop"
+        }]
+    });
+    let mut mock = spawn_mock(
+        "200 OK",
+        &[("Content-Type", "application/json".to_owned())],
+        serde_json::to_vec(&response).unwrap(),
+        Duration::ZERO,
+    )
+    .await;
+    let provider =
+        OpenAiCompatibleProvider::new(&mock.endpoint, "mock-model", "test-api-key").unwrap();
+    let request = ReplyRequest::new([
+        ReplyMessage::new(ReplyRole::System, "Stable instructions"),
+        ReplyMessage::new(ReplyRole::User, "Current question"),
+        ReplyMessage::new(ReplyRole::Context, "Governed knowledge context"),
+    ]);
+    assert_eq!(
+        serde_json::to_value(&request).unwrap()["messages"][2]["role"],
+        "context"
+    );
+
+    provider.reply(request).await.unwrap();
+    let captured = mock.received.take().unwrap().await.unwrap();
+    let request_json: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
+    assert_eq!(request_json["messages"][1]["role"], "user");
+    assert_eq!(request_json["messages"][1]["content"], "Current question");
+    assert_eq!(request_json["messages"][2]["role"], "user");
+    assert_eq!(
+        request_json["messages"][2]["content"],
+        "Governed knowledge context"
+    );
+}
+
 fn lookup_tool() -> ReplyToolDefinition {
     ReplyToolDefinition::new(
         "lookup_order",

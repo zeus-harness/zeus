@@ -36,6 +36,13 @@ pub const REPLY_REQUEST_MAX_HISTORY_PAIRS: usize = (REPLY_REQUEST_MAX_MESSAGES -
 /// message, 27 pairs, and the current user message), reserving eight message
 /// slots for the four fixed tool-call/result pairs.
 pub const AGENT_REQUEST_MAX_HISTORY_PAIRS: usize = 27;
+/// Maximum history when one governed context message is present.
+///
+/// System + 26 pairs + current user + context uses 55 messages, leaving room
+/// for all eight fixed tool call/result messages under the 64-message limit.
+pub const AGENT_REQUEST_MAX_HISTORY_PAIRS_WITH_CONTEXT: usize = 26;
+/// Maximum UTF-8 bytes in one governed, server-derived context message.
+pub const AGENT_CONTEXT_MAX_BYTES: usize = 16 * 1024;
 /// Maximum aggregate transcript bytes admitted to one durable provider request.
 ///
 /// Individual user, assistant, and tool-result messages remain capped at
@@ -79,6 +86,10 @@ pub enum ReplyRole {
     System,
     /// Human-authored input.
     User,
+    /// Governed server-derived context bound to the immediately preceding
+    /// current user message. Provider adapters may map this to a user role,
+    /// but the durable contract keeps it distinct from human input.
+    Context,
     /// Prior model output included for conversational context.
     Assistant,
     /// Result returned for the immediately preceding assistant tool call.
@@ -277,6 +288,45 @@ impl ReplyRequest {
         request
             .messages
             .insert(0, ReplyMessage::new(ReplyRole::System, system_prompt));
+        validate_initial_agent_reply_request(&request)?;
+        Ok(request)
+    }
+
+    /// Build a prompt- and context-bound initial Agent request.
+    ///
+    /// The governed context is kept as its own durable role immediately after
+    /// the current user message. It shares the same 64 KiB initial content
+    /// envelope and reduces retained history by one pair so every fixed tool
+    /// step still fits the 64-message request limit.
+    pub fn from_session_history_for_agent_with_system_prompt_and_context(
+        turns: &[SessionTurn],
+        user_message: impl Into<String>,
+        system_prompt: impl Into<String>,
+        context: impl Into<String>,
+    ) -> Result<Self, ProviderError> {
+        let system_prompt = system_prompt.into();
+        let context = context.into();
+        protocol::validate_user_message(&system_prompt)
+            .map_err(|_| ProviderError::InvalidRequest("invalid system prompt"))?;
+        require_context_content(&context)?;
+        let conversation_budget = AGENT_REQUEST_INITIAL_CONTENT_MAX_BYTES
+            .checked_sub(system_prompt.len())
+            .and_then(|remaining| remaining.checked_sub(context.len()))
+            .ok_or(ProviderError::InvalidRequest(
+                "system prompt and governed context exceed the initial Agent content budget",
+            ))?;
+        let mut request = Self::from_session_history_with_limits(
+            turns,
+            user_message.into(),
+            AGENT_REQUEST_MAX_HISTORY_PAIRS_WITH_CONTEXT,
+            conversation_budget,
+        )?;
+        request
+            .messages
+            .insert(0, ReplyMessage::new(ReplyRole::System, system_prompt));
+        request
+            .messages
+            .push(ReplyMessage::new(ReplyRole::Context, context));
         validate_initial_agent_reply_request(&request)?;
         Ok(request)
     }
@@ -485,23 +535,35 @@ pub fn validate_reply_request(request: &ReplyRequest) -> Result<(), ProviderErro
     enum TranscriptState<'a> {
         ExpectUser,
         AfterUser,
+        AfterContext,
         AfterAssistantFinal,
         AfterAssistantTool(&'a str),
         AfterTool,
     }
 
     let mut state = TranscriptState::ExpectUser;
+    let mut context_seen = false;
     let mut call_ids = HashSet::new();
     for message in &request.messages[index..] {
         state = match (&state, message.role) {
             (TranscriptState::ExpectUser, ReplyRole::User)
-            | (TranscriptState::AfterAssistantFinal, ReplyRole::User) => {
+            | (TranscriptState::AfterAssistantFinal, ReplyRole::User)
+                if !context_seen =>
+            {
                 require_plain_message(message, ReplyRole::User)?;
                 require_user_content(&message.content)?;
                 add_request_bytes(&mut total_bytes, message.content.len())?;
                 TranscriptState::AfterUser
             }
+            (TranscriptState::AfterUser, ReplyRole::Context) if !context_seen => {
+                require_plain_message(message, ReplyRole::Context)?;
+                require_context_content(&message.content)?;
+                add_request_bytes(&mut total_bytes, message.content.len())?;
+                context_seen = true;
+                TranscriptState::AfterContext
+            }
             (TranscriptState::AfterUser, ReplyRole::Assistant)
+            | (TranscriptState::AfterContext, ReplyRole::Assistant)
             | (TranscriptState::AfterTool, ReplyRole::Assistant) => {
                 if let Some(call) = &message.tool_call {
                     if !message.content.is_empty() || message.tool_call_id.is_some() {
@@ -558,10 +620,10 @@ pub fn validate_reply_request(request: &ReplyRequest) -> Result<(), ProviderErro
     }
     if !matches!(
         state,
-        TranscriptState::AfterUser | TranscriptState::AfterTool
+        TranscriptState::AfterUser | TranscriptState::AfterContext | TranscriptState::AfterTool
     ) {
         return Err(ProviderError::InvalidRequest(
-            "request must end with a user message or tool result",
+            "request must end with a user message, governed context, or tool result",
         ));
     }
     Ok(())
@@ -608,6 +670,17 @@ fn require_plain_message(message: &ReplyMessage, role: ReplyRole) -> Result<(), 
 fn require_user_content(content: &str) -> Result<(), ProviderError> {
     protocol::validate_user_message(content)
         .map_err(|_| ProviderError::InvalidRequest("invalid user or system content"))
+}
+
+fn require_context_content(content: &str) -> Result<(), ProviderError> {
+    protocol::validate_user_message(content)
+        .map_err(|_| ProviderError::InvalidRequest("invalid governed context content"))?;
+    if content.len() > AGENT_CONTEXT_MAX_BYTES {
+        return Err(ProviderError::InvalidRequest(
+            "governed context content is too large",
+        ));
+    }
+    Ok(())
 }
 
 fn require_assistant_content(content: &str) -> Result<(), ProviderError> {
@@ -806,7 +879,17 @@ pub fn validate_initial_agent_reply_request(request: &ReplyRequest) -> Result<()
             .first()
             .is_some_and(|message| message.role == ReplyRole::System),
     );
-    let max_messages = AGENT_REQUEST_MAX_HISTORY_PAIRS * 2 + 1 + system_messages;
+    let context_messages = request
+        .messages
+        .iter()
+        .filter(|message| message.role == ReplyRole::Context)
+        .count();
+    let max_history_pairs = if context_messages == 0 {
+        AGENT_REQUEST_MAX_HISTORY_PAIRS
+    } else {
+        AGENT_REQUEST_MAX_HISTORY_PAIRS_WITH_CONTEXT
+    };
+    let max_messages = max_history_pairs * 2 + 1 + system_messages + context_messages;
     if request.messages.len() > max_messages {
         return Err(ProviderError::InvalidRequest(
             "initial Agent request does not reserve the fixed tool-step message budget",
@@ -1080,6 +1163,122 @@ mod tests {
 
         assert_eq!(request.messages.len(), 64);
         assert!(validate_agent_reply_request(&request).is_ok());
+    }
+
+    #[test]
+    fn governed_context_is_distinct_and_reserves_every_tool_step() {
+        let turns = (0..40)
+            .map(|ordinal| {
+                turn(
+                    ordinal,
+                    SessionTurnStatus::Flushed,
+                    format!("user-{ordinal}"),
+                    Some(format!("assistant-{ordinal}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut request =
+            ReplyRequest::from_session_history_for_agent_with_system_prompt_and_context(
+                &turns,
+                "current",
+                "You are Zeus.",
+                r#"{"schema_version":1,"entries":[]}"#,
+            )
+            .unwrap();
+        request.tools = vec![lookup_tool()];
+
+        assert_eq!(request.messages.len(), 55);
+        assert_eq!(request.messages[0].role, ReplyRole::System);
+        assert_eq!(request.messages[1].content, "user-14");
+        assert_eq!(request.messages[53].role, ReplyRole::User);
+        assert_eq!(request.messages[53].content, "current");
+        assert_eq!(request.messages[54].role, ReplyRole::Context);
+
+        for index in 0..4 {
+            let call_id = format!("context_call_{index}");
+            request
+                .messages
+                .push(ReplyMessage::assistant_tool_call(ReplyToolCall::new(
+                    &call_id,
+                    "lookup_order",
+                    serde_json::json!({ "step": index }),
+                )));
+            request
+                .messages
+                .push(ReplyMessage::tool_result(call_id, "known result"));
+        }
+
+        assert_eq!(request.messages.len(), 63);
+        assert!(validate_agent_reply_request(&request).is_ok());
+    }
+
+    #[test]
+    fn governed_context_shares_the_initial_content_budget_and_is_16_kib_bounded() {
+        let system = "system";
+        let context = "c".repeat(AGENT_CONTEXT_MAX_BYTES);
+        let request = ReplyRequest::from_session_history_for_agent_with_system_prompt_and_context(
+            &[],
+            "u".repeat(AGENT_REQUEST_INITIAL_CONTENT_MAX_BYTES - system.len() - context.len()),
+            system,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(
+            request
+                .messages
+                .iter()
+                .map(|message| message.content.len())
+                .sum::<usize>(),
+            AGENT_REQUEST_INITIAL_CONTENT_MAX_BYTES
+        );
+        assert!(validate_initial_agent_reply_request(&request).is_ok());
+
+        assert!(
+            ReplyRequest::from_session_history_for_agent_with_system_prompt_and_context(
+                &[],
+                "user",
+                system,
+                "c".repeat(AGENT_CONTEXT_MAX_BYTES + 1),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn governed_context_is_unique_last_user_bound_and_plain() {
+        let valid = ReplyRequest::new([
+            ReplyMessage::new(ReplyRole::User, "question"),
+            ReplyMessage::new(ReplyRole::Context, "governed context"),
+        ]);
+        assert!(validate_reply_request(&valid).is_ok());
+
+        let before_user = ReplyRequest::new([
+            ReplyMessage::new(ReplyRole::Context, "governed context"),
+            ReplyMessage::new(ReplyRole::User, "question"),
+        ]);
+        assert!(validate_reply_request(&before_user).is_err());
+
+        let duplicate = ReplyRequest::new([
+            ReplyMessage::new(ReplyRole::User, "question"),
+            ReplyMessage::new(ReplyRole::Context, "first"),
+            ReplyMessage::new(ReplyRole::Context, "second"),
+        ]);
+        assert!(validate_reply_request(&duplicate).is_err());
+
+        let user_after_context = ReplyRequest::new([
+            ReplyMessage::new(ReplyRole::User, "question"),
+            ReplyMessage::new(ReplyRole::Context, "governed context"),
+            ReplyMessage::new(ReplyRole::User, "replacement"),
+        ]);
+        assert!(validate_reply_request(&user_after_context).is_err());
+
+        let mut with_tool_field = ReplyMessage::new(ReplyRole::Context, "governed context");
+        with_tool_field.tool_call_id = Some("forged".into());
+        let forged = ReplyRequest::new([
+            ReplyMessage::new(ReplyRole::User, "question"),
+            with_tool_field,
+        ]);
+        assert!(validate_reply_request(&forged).is_err());
     }
 
     #[test]
