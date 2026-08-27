@@ -47,8 +47,10 @@ point detail 恢复，只有权威 `404` 才回退 primary Session。
 
 系统提示词绑定复用现有 manifest 可选 prompt 字段和 immutable request JSON，不增加数据库
 migration。升级后仍 queued 的旧 promptless Agent work 会被当前 deployment manifest 判定为
-drift 并在外部 I/O 前关闭；已终结历史仍可读。动态 knowledge 不拼入稳定系统提示词；后续如
-实现知识注入，必须作为独立、受治理且可重建的 context snapshot 绑定到模型请求。
+drift 并在外部 I/O 前关闭；已终结历史仍可读。动态 knowledge 不拼入稳定系统提示词。Knowledge
+v1 纯领域层已实现 immutable entry revision 校验、固定 tokenizer/整数排序、整条 entry 丢弃、
+16 KiB canonical context 与完整 selection snapshot digest；数据库绑定和 Agent request 接入尚未
+实现，不能把运行时重新检索当作已持久化快照。
 
 ## 事件与状态
 
@@ -472,7 +474,7 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   刷新恢复、owner/member setup/登录、owner 成员与 audit 管理、设置/退出和
   system/light/dark。member 的审批卡只读。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化按项目既有统计口径是 490 个 Rust 测试（其中 deployment 8、storage 232、
+- 当前自动化按项目既有统计口径是 509 个 Rust 测试（其中 deployment 8、knowledge 20、storage 232、
   runtime 48、API library 64、API main/config 6）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 

@@ -597,10 +597,13 @@ and bounded memory, CPU, and PID resources.
   primary Session and Run, policy ID, and policy revision; a mismatch fails
   startup.
 
-Dynamic knowledge is deliberately outside this prompt contract. A future
-knowledge feature must bind a separate, governed context snapshot rather than
-mutating the stable system prompt or reconstructing a queued request from live
-state.
+Dynamic knowledge remains separate from the stable prompt contract. The pure
+Knowledge v1 domain now validates immutable entry revisions, ranks them with a
+fixed integer/tokenizer contract, drops whole entries at a 16 KiB context
+boundary, and emits a canonical digest-bearing selection snapshot. Database
+binding and Agent request integration are not implemented yet; those layers
+must persist the admitted snapshot instead of mutating the system prompt or
+reconstructing a queued request from live state.
 
 SQLite is the authoritative store for this local single-instance Alpha. Do not
 place it on NFS or share one database volume between multiple Zeus replicas.
@@ -859,9 +862,9 @@ and schema v21 prepared-claim host verification:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --all-targets -- --test-threads=1`: 490 tests passed
+- `cargo test --workspace --locked`: 509 tests passed
   under the existing project counting convention, including 8 deployment tests,
-  232 storage tests, 48 runtime tests, 64 API library tests, 6 API main/config
+  20 knowledge tests, 232 storage tests, 48 runtime tests, 64 API library tests, 6 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,
