@@ -5851,8 +5851,8 @@ mod tests {
             .execute(
                 r#"INSERT INTO sessions(
                        id, title, status, created_at, updated_at, sequence,
-                       projection_sequence, active_turn_id, owner_user_id
-                   ) VALUES (?1, ?2, 'ready', ?3, ?3, 0, 0, NULL, ?4)"#,
+                       projection_sequence, active_turn_id, owner_user_id, account_id
+                   ) VALUES (?1, ?2, 'ready', ?3, ?3, 0, 0, NULL, ?4, 'acc_local')"#,
                 params![session_id, title, timestamp, owner_user_id],
             )
             .unwrap();

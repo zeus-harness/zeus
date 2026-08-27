@@ -1,7 +1,13 @@
 # Zeus Harness Alpha+ 设计冻结
 
-状态：主机 Alpha+、Actor Boundary Foundation、API/Terminal Payload Resource Envelope、Bounded Event Feed、Point-query Durable Context、Bounded Read Models、SQLite Capacity Slice 2、SQLite Physical/Operation Capacity 与 Bootstrap Audit Retention 已实现并通过主机全量验收；current-image Apple 指定压力场景及 v11→v12 保留数据卷迁移/重启已通过，Linux Docker PID/OOM authoritative gate 待完成
-前置基线：`8117ed6`（SQLite Physical Capacity）
+状态：主机 Alpha+、Actor Boundary Foundation、API/Terminal Payload Resource Envelope、Bounded
+Event Feed、Point-query Durable Context、Bounded Read Models、SQLite Capacity Slice 2、SQLite
+Physical/Operation Capacity、Bootstrap Audit Retention 与 schema v13 Account Membership
+Foundation 已实现并通过主机全量验收；Apple 保留此前 Operation Capacity 指定压力证据与历史
+v11→v12 迁移证据，current-image 又完成 v12→v13 保留数据卷迁移/重启，Linux Docker PID/OOM
+authoritative gate 待完成。
+
+历史前置基线：`8117ed6`（SQLite Physical Capacity）
 
 ## 1. 产品术语
 
@@ -48,8 +54,9 @@ Health 路由保持公开。公开注册、邮件找回、OAuth/SSO、WebAuthn �
 这些边界只是未来 member 能力的安全底座。当前 API 仍拒绝 member 登录；字段、HTTP/SSE
 连接、事件页边界、内部 point/batch read 和 Session/Run 有界 read model 已经落地，但
 即使 SQLite 行数、活跃队列、event-slot 和事件载荷逻辑字节配额已落地，也不得开放 member。
-SQLite 主库/WAL/磁盘 headroom 门禁和 bootstrap audit bounded retention 已经落地，但 member
-仍须等待 tenant/account membership scope、account-scoped authorization 与安全审计生命周期。
+SQLite 主库/WAL/磁盘 headroom 门禁、bootstrap audit bounded retention，以及 v13 的单一
+`acc_local`/owner membership foundation 已经落地；member 仍须等待 v14 account-scoped durable
+authorization 与 v15 member lifecycle/account security audit，不能因 foundation 表已存在就开放。
 
 Resource Envelope 的固定边界：auth JSON 8 KiB、command JSON 512 KiB；新建 Session/turn
 ID 128 UTF-8 bytes、Session title 256 bytes、user/assistant message 64 KiB、review note 8 KiB；
@@ -206,6 +213,12 @@ POST /sessions/{id}/turns
   sequence 与明确 terminal reason；rotation/open 按当前 detailed-row limit 以最多 64 行批次
   更新 SHA-256 rollup 并删除已承诺前缀，live token 永不压缩。v11 旧顺序按 `rowid` 保留，
   wall-clock 回拨不会阻止 compaction；current-v12 因降限需要写入时先通过 Migration physical gate。
+- `0013_account_membership_foundation.sql`：创建唯一 `acc_local` 与 `account_memberships`，只把既有
+  唯一 active owner 回填为 revision 1 membership；为 Incident/Session/Run/runtime identity 原地
+  回填 immutable `account_id`，并安装 account/revision/last-active-owner/跨根一致性 trigger、索引
+  与 readiness/deep-integrity 检查。迁移先证明旧 owner、actor、receipt、job、reservation 和
+  runtime boundary；member-owned、跨 owner 或外键损坏的 v12 数据整体回滚。v13 不切换现有
+  owner-based API 授权，也不开放 member。
 
 迁移必须原地保留 Alpha append-only ledger、事件外键与 runtime identity。任何一步失败都回滚整个 migration transaction。
 
@@ -234,6 +247,9 @@ POST /sessions/{id}/turns
 - v11 到 v12 保留 token 插入顺序并将旧 terminal reason 标为 `legacy_unknown`；超过 detailed
   window 的 rotation/open、多批 64 行压缩、canonical digest、时钟回拨、current-v12 降限、
   低磁盘 pre-write gate、非法 transition/delete/rollup 回退和 deep corruption 都有自动测试。
+- v12 到 v13 对 fresh/未配置与既有 owner 数据原地建立 `acc_local`；v1/v5/v8/v12 fixture 的
+  account 回填、bootstrap 同事务建 membership、revision/identity/last-owner trigger、root scope
+  immutability、deep integrity，以及 member-owned history/外键破坏时无部分写入回滚都有自动测试。
 - operation gate 的普通 lane fail-fast、单一 deadline、memory progress 优先、等待 future cancel 与
   partial permit 回收、caller abort 后 permit 生命周期、内部 capacity-only retry、worker wake
   合并、最后一个 progress waiter 取消后的主动唤醒、provider/connector panic 的
@@ -247,8 +263,9 @@ POST /sessions/{id}/turns
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 通过 281 个 Rust 测试（storage 131、runtime 28、API library 44、API main/config 4）与
+- host 通过 289 个 Rust 测试（storage 139、runtime 28、API library 44、API main/config 4）与
   25 个 Web Node 测试。
+- `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 
 ## 8. 容器与 OOM 验收边界
 
@@ -259,20 +276,26 @@ POST /sessions/{id}/turns
 - Apple helper 的 release API 默认 2 CPU/1 GiB，可由 `ZEUS_CONTAINER_API_CPUS` 与
   `ZEUS_CONTAINER_API_MEMORY` 调整并在创建后核对。`scripts/apple-container.sh resources` 只读
   输出 inspect、cgroup v2 与 `/proc` 证据。
-- `af29089` 已构建为独立 `zeus-operation-acceptance` current-image 栈；它使用独立 image/network/
+- `af29089` 曾构建为独立 `zeus-operation-acceptance` 验收栈；它使用独立 image/network/
   named volume 与 `18089`，未替换既有 `zeus-alpha`。`build`、`up`、`verify` 和保留 volume 的
   `restart-verify` 均通过，栈保留运行供本地检查。
 - `cdaa211`（schema v12）随后在同一隔离 project 上重建镜像，并保留由 schema v11 创建的 named
   volume。第一次 `up/verify` 完成 v11→v12 migration；再次执行 `restart-verify` 重建容器与网络但
   保留该 volume，API/Web/gateway、认证状态、匿名保护边界与 `configured=false` 未配置状态在重启
-  前后保持一致的检查全部通过。v12 readiness 还会拒绝非当前 schema，因此该路径同时覆盖迁移后
-  的再次打开。
-- API 实际限制为 2 CPU/1 GiB。`/health/ready` 的 30,000 请求、并发 128 压力在 4.493 秒内
+  前后保持一致的检查全部通过。当时 v12 readiness 的 exact-schema 检查还覆盖了迁移后的再次
+  打开。
+- current-image schema v13 又在同一个 `zeus-operation-acceptance` project 上保留上述现为 v12 的
+  named volume，原地完成 v12→v13 migration；保留 volume 的 `restart-verify` 通过，栈继续运行于
+  `127.0.0.1:18089`。API effective limit 核对为 2 CPU/1 GiB，当前资源快照的
+  `memory.events` 为 `oom=0`、`oom_kill=0`。该验证证明 migration/reopen 与匿名产品 gate，
+  不表示 v14-v15 或 member 授权已经完成。
+- 此前 Operation Capacity 指定压力场景中，API 实际限制为 2 CPU/1 GiB。`/health/ready` 的 30,000
+  请求、并发 128 压力在 4.493 秒内
   完成：2,670 个 `200`、27,330 个 fail-fast `503`、transport error 0。第二轮 10,000 请求、
   并发 64 得到 414 个 `200` 与 9,586 个 `503`，所有 `503` code 都是
   `sqlite_operation_capacity_exceeded`。
-- 压力期间及之后 cgroup `memory.peak=97,595,392` bytes（约 93 MiB），Zeus RSS 约 23 MiB，
+- 该历史压力期间及之后 cgroup `memory.peak=97,595,392` bytes（约 93 MiB），Zeus RSS 约 23 MiB，
   `oom=0`、`oom_kill=0`；CPU throttling 证明 2 CPU quota 生效。VM 无 Swap，Apple 1.0 仍没有
-  per-container PID limit，`pids.max=max`。因此只声明该 current-image Apple readiness-pressure
-  场景通过；Linux Docker PID/OOM authoritative evidence 与更低内存/对抗性压力仍是 deployment
-  gate。
+  per-container PID limit，`pids.max=max`。因此只声明此前 Operation Capacity Apple
+  readiness-pressure 与当前 v13 migration/restart 各自通过；v13 本轮没有重跑该压力。Linux
+  Docker PID/OOM authoritative evidence 与更低内存/对抗性压力仍是 deployment gate。

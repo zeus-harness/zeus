@@ -1,10 +1,11 @@
 # Account Membership 与审计保留设计
 
-状态：v12 Bootstrap Audit Retention 已实现，并通过主机全量验收及 current-image v11→v12
-保留数据卷迁移/重启；v13-v15 设计冻结、待实施。本文不表示 member 已可登录，也不授权共享网络
-部署。
+状态：v12 Bootstrap Audit Retention 与 schema v13 Account Membership Foundation 均已实现。
+主机 Rust/Web 全量门禁通过；Apple `zeus-operation-acceptance` 先保留历史 v11→v12 证据，随后又在
+同一 named volume 上完成 v12→v13 原地迁移及保留卷重启验证。v14-v15 仍待实施。本文不表示
+member 已可登录，也不授权共享网络部署。
 
-基线：`2c984e0`。当前产品仍是单实例、单 owner；所有业务 HTTP/SSE 都拒绝 `member`。
+当前实现基线是 schema v13。产品仍是单实例、单 owner；所有业务 HTTP/SSE 都拒绝 `member`。
 
 ## 1. 为什么不能直接开放 member
 
@@ -35,7 +36,7 @@ member 可以创建 Session 和触发 provider，却不能稳定读取或审批�
 - **Actor**：执行某次命令的 User；它是审计作者，不是资源所属者。
 - **Capability**：在一个 Account 内执行某类动作的权限。
 
-目标 schema：
+schema v13 已落地的 foundation 表：
 
 ```sql
 accounts(
@@ -58,7 +59,7 @@ account_memberships(
 );
 ```
 
-v13 只创建一个 `acc_local`，只把既有唯一 owner 回填为 active owner membership。数据库中
+v13 只创建一个 `acc_local`，并只把既有唯一 owner 回填为 active owner membership。数据库中
 手工存在的 member 不自动加入 account；无法证明的授权必须保持关闭。schema 可以容纳多个
 owner，但成员管理事务必须禁止禁用或降级最后一个 active owner。
 
@@ -76,17 +77,19 @@ membership identity 和权限 revision 由 schema trigger 强制：`account_id`�
 - `reply_jobs`、`dispatch_jobs`；
 - Session/Run receipts 与 `finalization_reservations`。
 
-Session/Run 的现有 `owner_user_id` 不再参与访问控制。迁移期间它只作为 legacy creator 来源，
-最终明确命名为 `created_by_user_id`。历史事件 payload 不重写。
+当前 v13 的 `owner_user_id` 仍是访问控制权威。只有 v14 完成授权切换后，它才不再参与访问控制，
+并只作为 legacy creator 来源，最终明确命名为 `created_by_user_id`。历史事件 payload 不重写。
 
 v11 允许通过 storage 构造 member-owned Session，因此 configured migration 不能无条件把所有
-数据并入 `acc_local`。v13 在写入任何 account 字段前必须证明：所有 Session/Run owner 都等于
+数据并入 `acc_local`。v13 迁移在写入任何 account 字段前证明：所有 Session/Run owner 都等于
 唯一旧 owner；receipt、reply/dispatch job 与 reservation actor/scope 都能追溯到该 owner；同一
 Incident 不跨旧 owner。任一条件不成立，migration 整体回滚并停在 v12，不自动给旧 member
 membership，也不扩大旧 owner 的可见范围。无法证明归属的旧 member auth session 在 v14 必须
 撤销，不能猜测绑定到 `acc_local`。
 
 ## 3. 统一授权上下文
+
+本节描述待实施的 v14 授权目标，不是当前 v13 已开放的 API/storage 行为。
 
 HTTP、runtime 和 storage 的业务入口使用一个显式上下文，不能继续只传裸 `actor_user_id`：
 
@@ -102,9 +105,9 @@ struct AuthzContext {
 
 登录 session 绑定 `account_id` 与签发时的 `membership_revision`。每次认证都 JOIN active User、
 active Account 和 active Membership；revision、角色或状态发生变化后，旧 session 立即失效。
-v12-v15 只支持一个 `acc_local`，不提供 account picker 或多 account runtime。未来若增加 account
-切换，一个登录 session 仍只能绑定一个 account，切换必须轮换 session token，避免请求头临时
-选 tenant 带来的 confused-deputy 风险。
+当前 v13 及 v14-v15 设计只支持一个 `acc_local`，不提供 account picker 或多 account runtime。
+未来若增加 account 切换，一个登录 session 仍只能绑定一个 account，切换必须轮换 session
+token，避免请求头临时选 tenant 带来的 confused-deputy 风险。
 
 首版权限矩阵：
 
@@ -139,13 +142,16 @@ Run projection、not-dispatched evidence 与 reservation settlement，SSE 必须
 面向业务的新 handler 只能调用带 `AuthzContext` 的方法。现有无 actor 方法应降为
 crate-private、seed/recovery 专用或删除，避免未来 handler 误用。
 
-v13 过渡期仍保留 `users.role`，并要求全局唯一旧 owner 与 `acc_local` owner membership 完全
+当前 v13 过渡期仍保留 `users.role`，并要求全局唯一旧 owner 与 `acc_local` owner membership 完全
 一致；API member gate 继续读取旧边界。v14 必须把 membership role 变成 account capability 的
 唯一权威，删除或停止使用 `users.role`、`users_single_owner_idx` 和所有 `StoredUserRole`
 授权分支。`AuthPrincipal`、API 返回 role、Run/reply/dispatch 检查全部改读当前 membership；
 旧授权点归零前不能开放 member。
 
 ## 4. 数据与幂等作用域
+
+以下 account-scoped receipt、capacity 与 cursor 也是 v14 目标；当前 v13 仍使用既有 owner/actor
+scope，不得据此开放 member。
 
 - 资源查询以 `account_id` 隔离，actor capability 决定动作；不再要求 actor 直接“拥有”资源。
 - receipt identity 为
@@ -165,7 +171,7 @@ reference、tool policy/config revision、account preferred-model policy、event
 aggregate、legal hold、retention policy、archive/export job，以及 dispatch 的双主体授权证据。
 这些对象都必须有 account FK、revision、明确生命周期和跨 account trigger。
 
-v13 对既有 SQLite 表采用 additive migration，不依赖带默认值的 `NOT NULL REFERENCES`：先增加
+v13 已对既有 SQLite 表采用 additive migration，不依赖带默认值的 `NOT NULL REFERENCES`：先增加
 nullable FK 列，在同一 migration transaction 内完成上述预检和 `acc_local` 回填，再安装
 INSERT trigger 拒绝 NULL、UPDATE trigger 禁止 account_id 变化。deep integrity 必须断言没有
 NULL、孤儿或跨 account 关系，并为 `(account_id, id/order key)` 建索引。只有在后续独立迁移完整
@@ -173,6 +179,9 @@ NULL、孤儿或跨 account 关系，并为 `(account_id, id/order key)` 建索�
 列收紧为 `NOT NULL`。
 
 ## 5. HTTP 错误契约
+
+以下新增错误是 v14-v15 目标。当前 v13 的 member 登录仍保持通用 `401 invalid_credentials`，
+没有 account picker 或成员管理 HTTP API。
 
 - `401 authentication_required`：没有 session，或身份/session 已失效。
 - `401 invalid_credentials`：登录失败；用户名不存在、密码错误、User disabled 必须不可区分。
@@ -247,14 +256,14 @@ Session/Run ledger、receipt、turn、reply/dispatch job 不在本阶段做 rete
 
 ## 8. 实施切片
 
-### v12：Bootstrap Audit Retention
+### v12：Bootstrap Audit Retention（已实现）
 
 - 明确 token lifecycle 原因；
 - 有界详细窗口与单调 rollup；
 - 证明超过 1,024 次 rotation 仍可启动；
 - ledger、receipt、member gate 零变化。
 
-### v13：Account Membership Foundation
+### v13：Account Membership Foundation（已实现）
 
 - 新增 `accounts`、`account_memberships`；
 - 创建 `acc_local`，回填 Incident/Session/Run/runtime identity account scope；
@@ -265,11 +274,11 @@ Session/Run ledger、receipt、turn、reply/dispatch job 不在本阶段做 rete
 - 新增 account 一致性 FK/trigger、revision/identity trigger、点查询与 deep-integrity 校验；
 - API 仍拒绝 member。
 
-v13 采用双轨过渡：只新增/回填 immutable account scope，现有 `owner_user_id` 授权和 trigger
+v13 已采用双轨过渡：只新增/回填 immutable account scope，现有 `owner_user_id` 授权和 trigger
 继续工作。v14 先重建 account-scoped receipt/job/reservation 与一致性 trigger，通过 deep
 integrity 后切换代码，最后删除旧 owner 授权 trigger/index 并把 creator 列明确改名。
 
-### v14：Account-scoped Durable Authorization
+### v14：Account-scoped Durable Authorization（待实施）
 
 - 引入 `AuthzContext`；
 - membership role 取代 `users.role` 成为唯一 capability 权威；
@@ -278,7 +287,7 @@ integrity 后切换代码，最后删除旧 owner 授权 trigger/index 并把 cr
 - 无 actor 业务入口收窄；
 - API 仍拒绝 member，先跑完整迁移与撤权测试。
 
-### v15：Member Lifecycle 与 Account Audit
+### v15：Member Lifecycle 与 Account Audit（待实施）
 
 - owner 创建 member 并返回一次性 setup token；
 - member 设置密码、登录、读写 Account Session；
@@ -288,18 +297,33 @@ integrity 后切换代码，最后删除旧 owner 授权 trigger/index 并把 cr
 - owner-only audit list/export、count-bounded local retention、legal hold 与外部归档接口；
 - 全部验收后才移除 member 登录 gate。
 
-## 9. 验收门槛
+## 9. 验收状态与后续门槛
 
-- fresh、v5、v8、v11 数据库升级；任一歧义或跨边界关系使整个 migration 回滚；
-- 既有事件 payload、sequence、receipt、active reservation 与 worker 状态不改变；
+schema v13 已完成的证据：
+
+- `cargo test --workspace --all-targets` 共 289 个测试通过，其中 storage 139、runtime 28、API
+  library 44、API main/config 4，其余 crates 与 graceful-shutdown 合约也通过；
+- `cargo fmt --all -- --check` 与 workspace all-target clippy 通过；
+- fresh 及既有 v1/v5/v8/v12 数据迁移覆盖 account 回填，member-owned history、外键破坏或无法
+  证明的 owner/actor/scope 会使 v12→v13 整体回滚，不留下部分 account schema；
+- `acc_local`、唯一旧 owner membership、bootstrap 原子建 membership、account/revision/last-owner
+  trigger、root scope immutability 与 deep-integrity corruption 都有确定性 storage 测试；
+- Bootstrap Audit Retention 的 v11→v12 reason 迁移、rotation/open 多批压缩、摘要连续性与非法
+  删除测试继续通过，未因 v13 改写 ledger 或 receipt；
+- Web 25 个 Node 测试及 check、lint、production build 全部通过；
+- Apple current-image `zeus-operation-acceptance` 保留 schema v12 named volume，原地迁移到 v13，
+  `restart-verify` 后仍通过；入口为 `127.0.0.1:18089`，API 限制为 2 CPU/1 GiB，采集到的
+  `memory.events` 为 `oom=0`、`oom_kill=0`。
+
+v14-v15 仍须完成并重新验收：
+
 - Account A 的 actor 对 Account B 的 REST、SSE、cursor、receipt 一律得到 `404`；
 - membership revision 变化后旧 cookie、SSE 与在变更后 claim 的 job 全部失效；
 - member 能调用配置好的 reply provider 完成 Session 对话；provider 配置、tool policy、approval
   与 connector dispatch 保持 owner-only；
 - 同 account 两个 actor 的同名 idempotency key 互不 replay；
-- bootstrap rotation storm、retention failure injection、摘要连续性与非法删除都有确定性测试；
-- Rust fmt/clippy/workspace tests、Web check/test/lint/build 与 current-image container restart
-  验收全部通过。
+- account audit、member setup/disable、legal hold、归档与 retention failure injection 达到本文约束；
+- 全部门禁通过后才移除 member 登录/API gate。当前 v13 不得描述为多租户授权已经完成。
 
 共享网络部署还必须另行完成 TLS/canonical origin、trusted proxy、Secure cookie、per-account
 provider secret/计费隔离与 Linux Docker PID/OOM gate；membership 完成本身不等于可以暴露到

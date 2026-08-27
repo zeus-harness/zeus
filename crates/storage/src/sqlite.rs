@@ -39,7 +39,8 @@ use crate::{
     StoredCredential, StoredPreferences, StoredRun, StoredUser, StoredUserRole, StoredUserStatus,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 12;
+const CURRENT_SCHEMA_VERSION: i64 = 13;
+const LOCAL_ACCOUNT_ID: &str = "acc_local";
 const EVENT_PAYLOAD_VERSION_V1: i64 = 1;
 const EVENT_PAYLOAD_VERSION_V2: i64 = 2;
 const SESSION_EVENT_PAYLOAD_VERSION_V1: i64 = 1;
@@ -56,6 +57,7 @@ const MIGRATION_0009: &str = include_str!("../migrations/0009_point_queries.sql"
 const MIGRATION_0010: &str = include_str!("../migrations/0010_capacity.sql");
 const MIGRATION_0011: &str = include_str!("../migrations/0011_event_payload_bytes.sql");
 const MIGRATION_0012: &str = include_str!("../migrations/0012_bootstrap_audit_retention.sql");
+const MIGRATION_0013: &str = include_str!("../migrations/0013_account_membership_foundation.sql");
 const RECOVERY_BATCH_LIMIT: i64 = 64;
 const AUTH_SESSION_CLEANUP_BATCH_LIMIT: i64 = 64;
 const BOOTSTRAP_AUDIT_ROLLUP_BATCH_LIMIT: i64 = 64;
@@ -2094,6 +2096,196 @@ fn evaluate_physical_capacity(
     Ok(())
 }
 
+fn validate_account_foundation_migration(connection: &Connection) -> Result<(), StorageError> {
+    let foreign_key_violation = connection
+        .query_row(
+            r#"SELECT "table" FROM pragma_foreign_key_check LIMIT 1"#,
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(table) = foreign_key_violation {
+        return Err(StorageError::CorruptData(format!(
+            "schema v13 account migration cannot prove local ownership: foreign key violation in `{table}`"
+        )));
+    }
+
+    let (user_count, owner_count, active_owner_count): (i64, i64, i64) = connection.query_row(
+        r#"SELECT COUNT(*),
+                      COALESCE(SUM(CASE WHEN role = 'owner' THEN 1 ELSE 0 END), 0),
+                      COALESCE(SUM(CASE
+                          WHEN role = 'owner' AND status = 'active' THEN 1 ELSE 0
+                      END), 0)
+               FROM users"#,
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+
+    if user_count == 0 {
+        let violation = connection
+            .query_row(
+                r#"SELECT boundary
+                   FROM (
+                       SELECT 1 AS priority, 'an unconfigured session already has an owner' AS boundary
+                       WHERE EXISTS(SELECT 1 FROM sessions WHERE owner_user_id IS NOT NULL)
+                       UNION ALL
+                       SELECT 2, 'an unconfigured run already has an owner'
+                       WHERE EXISTS(SELECT 1 FROM runs WHERE owner_user_id IS NOT NULL)
+                       UNION ALL
+                       SELECT 3, 'an unconfigured reply job has an actor'
+                       WHERE EXISTS(SELECT 1 FROM reply_jobs)
+                       UNION ALL
+                       SELECT 4, 'an unconfigured database contains an auth session'
+                       WHERE EXISTS(SELECT 1 FROM auth_sessions)
+                       UNION ALL
+                       SELECT 5, 'an unconfigured database contains user preferences'
+                       WHERE EXISTS(SELECT 1 FROM user_preferences)
+                       UNION ALL
+                       SELECT 6, 'an unconfigured session receipt is not in legacy scope'
+                       WHERE EXISTS(
+                           SELECT 1 FROM session_command_receipts
+                           WHERE actor_scope <> '__legacy__'
+                       )
+                       UNION ALL
+                       SELECT 7, 'an unconfigured run receipt is not in legacy scope'
+                       WHERE EXISTS(
+                           SELECT 1 FROM idempotency_receipts
+                           WHERE actor_scope <> '__legacy__'
+                       )
+                       UNION ALL
+                       SELECT 8, 'an unconfigured dispatch job has an approving actor'
+                       WHERE EXISTS(
+                           SELECT 1 FROM dispatch_jobs
+                           WHERE approving_actor_user_id IS NOT NULL
+                       )
+                       UNION ALL
+                       SELECT 9, 'an unconfigured finalization reservation is not in legacy scope'
+                       WHERE EXISTS(
+                           SELECT 1 FROM finalization_reservations
+                           WHERE scope_id <> '__legacy__'
+                       )
+                   )
+                   ORDER BY priority
+                   LIMIT 1"#,
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(boundary) = violation {
+            return Err(StorageError::CorruptData(format!(
+                "schema v13 account migration cannot prove local ownership: {boundary}"
+            )));
+        }
+        return Ok(());
+    }
+
+    if owner_count != 1 || active_owner_count != 1 {
+        return Err(StorageError::CorruptData(
+            "schema v13 account migration requires exactly one active legacy owner".into(),
+        ));
+    }
+    let owner_user_id: String = connection.query_row(
+        "SELECT id FROM users WHERE role = 'owner' AND status = 'active'",
+        [],
+        |row| row.get(0),
+    )?;
+    let violation = connection
+        .query_row(
+            r#"SELECT boundary
+               FROM (
+                   SELECT 1 AS priority, 'a configured session is not owned by the legacy owner' AS boundary
+                   WHERE EXISTS(
+                       SELECT 1 FROM sessions WHERE owner_user_id IS NOT ?1
+                   )
+                   UNION ALL
+                   SELECT 2, 'a configured run is not owned by the legacy owner'
+                   WHERE EXISTS(
+                       SELECT 1 FROM runs WHERE owner_user_id IS NOT ?1
+                   )
+                   UNION ALL
+                   SELECT 3, 'a session-to-run binding crosses a legacy owner boundary'
+                   WHERE EXISTS(
+                       SELECT 1
+                       FROM session_runs binding
+                       JOIN sessions session ON session.id = binding.session_id
+                       JOIN runs run ON run.id = binding.run_id
+                       WHERE session.owner_user_id IS NOT run.owner_user_id
+                   )
+                   UNION ALL
+                   SELECT 4, 'an incident contains runs from different legacy owners'
+                   WHERE EXISTS(
+                       SELECT 1
+                       FROM runs first
+                       JOIN runs second
+                         ON second.incident_id = first.incident_id
+                        AND second.id > first.id
+                       WHERE first.owner_user_id IS NOT second.owner_user_id
+                   )
+                   UNION ALL
+                   SELECT 5, 'a reply job actor is not the legacy owner'
+                   WHERE EXISTS(
+                       SELECT 1 FROM reply_jobs WHERE actor_user_id IS NOT ?1
+                   )
+                   UNION ALL
+                   SELECT 6, 'a session receipt actor scope is not the legacy owner'
+                   WHERE EXISTS(
+                       SELECT 1 FROM session_command_receipts WHERE actor_scope IS NOT ?1
+                   )
+                   UNION ALL
+                   SELECT 7, 'a run receipt actor scope is not the legacy owner'
+                   WHERE EXISTS(
+                       SELECT 1 FROM idempotency_receipts WHERE actor_scope IS NOT ?1
+                   )
+                   UNION ALL
+                   SELECT 8, 'a dispatch approving actor is not the legacy owner'
+                   WHERE EXISTS(
+                       SELECT 1 FROM dispatch_jobs
+                       WHERE approving_actor_user_id IS NOT ?1
+                   )
+                   UNION ALL
+                   SELECT 9, 'a finalization reservation scope is not the legacy owner'
+                   WHERE EXISTS(
+                       SELECT 1 FROM finalization_reservations WHERE scope_id IS NOT ?1
+                   )
+                   UNION ALL
+                   SELECT 10, 'the runtime identity does not resolve to the legacy owner resources'
+                   WHERE EXISTS(
+                       SELECT 1
+                       FROM runtime_identity identity
+                       WHERE NOT EXISTS(
+                                 SELECT 1
+                                 FROM sessions session
+                                 WHERE session.id = identity.primary_session_id
+                                   AND session.owner_user_id IS ?1
+                             )
+                          OR NOT EXISTS(
+                                 SELECT 1
+                                 FROM runs run
+                                 WHERE run.id = identity.primary_run_id
+                                   AND run.owner_user_id IS ?1
+                             )
+                          OR NOT EXISTS(
+                                 SELECT 1
+                                 FROM session_runs binding
+                                 WHERE binding.session_id = identity.primary_session_id
+                                   AND binding.run_id = identity.primary_run_id
+                             )
+                   )
+               )
+               ORDER BY priority
+               LIMIT 1"#,
+            [&owner_user_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(boundary) = violation {
+        return Err(StorageError::CorruptData(format!(
+            "schema v13 account migration cannot prove local ownership: {boundary}"
+        )));
+    }
+    Ok(())
+}
+
 fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), StorageError> {
     connection.execute_batch(
         r#"CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -2242,6 +2434,14 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
         transaction.execute(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
             params![12, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
+    if current < 13 {
+        validate_account_foundation_migration(&transaction)?;
+        transaction.execute_batch(MIGRATION_0013)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![13, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
     compact_existing_bootstrap_audit_to_capacity(&transaction, &now(), limits)?;
@@ -2432,12 +2632,12 @@ fn readiness(
                'session_turns', 'session_events', 'session_command_receipts',
                'users', 'auth_sessions', 'bootstrap_tokens', 'user_preferences',
                'reply_jobs', 'finalization_reservations', 'event_payload_usage',
-               'bootstrap_audit_rollup'
+               'bootstrap_audit_rollup', 'accounts', 'account_memberships'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if table_count != 20 {
+    if table_count != 22 {
         return Err(StorageError::CorruptData(
             "one or more required tables are missing".into(),
         ));
@@ -2462,6 +2662,22 @@ fn readiness(
     if primary_session_columns != 1 {
         return Err(StorageError::CorruptData(
             "runtime_identity.primary_session_id is missing".into(),
+        ));
+    }
+
+    let account_scope_columns: i64 = connection.query_row(
+        r#"SELECT
+               (SELECT COUNT(*) FROM pragma_table_info('incidents') WHERE name = 'account_id')
+             + (SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'account_id')
+             + (SELECT COUNT(*) FROM pragma_table_info('runs') WHERE name = 'account_id')
+             + (SELECT COUNT(*) FROM pragma_table_info('runtime_identity')
+                WHERE name = 'account_id')"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if account_scope_columns != 4 {
+        return Err(StorageError::CorruptData(
+            "account scope columns are missing".into(),
         ));
     }
 
@@ -2524,12 +2740,20 @@ fn readiness(
                'finalization_reservations_kind_active_idx',
                'auth_sessions_expiry_idx',
                'bootstrap_tokens_one_live_idx',
-               'bootstrap_tokens_terminal_sequence_idx'
+               'bootstrap_tokens_terminal_sequence_idx',
+               'account_memberships_user_idx',
+               'account_memberships_active_owner_idx',
+               'incidents_account_id_idx',
+               'sessions_account_id_idx',
+               'sessions_account_updated_idx',
+               'runs_account_id_idx',
+               'runs_account_started_idx',
+               'runs_account_incident_idx'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if point_query_indexes != 14 {
+    if point_query_indexes != 22 {
         return Err(StorageError::CorruptData(
             "one or more point-query indexes are missing".into(),
         ));
@@ -2592,14 +2816,45 @@ fn readiness(
                'event_payload_usage_enforce_monotonic_update',
                'event_payload_usage_reject_delete',
                'session_events_charge_payload_bytes',
-               'run_events_charge_payload_bytes'
+               'run_events_charge_payload_bytes',
+               'accounts_reject_duplicate_insert',
+               'accounts_reject_identity_update',
+               'accounts_reject_delete',
+               'account_memberships_reject_duplicate_insert',
+               'account_memberships_enforce_revision',
+               'account_memberships_preserve_last_active_owner',
+               'account_memberships_reject_delete',
+               'incidents_require_account_on_insert',
+               'incidents_account_is_immutable',
+               'sessions_require_account_on_insert',
+               'sessions_account_is_immutable',
+               'runs_require_account_on_insert',
+               'runs_require_incident_account_on_update',
+               'runs_account_is_immutable',
+               'runtime_identity_require_account_on_insert',
+               'session_runs_require_same_account'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 55 {
+    if trigger_count != 71 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
+        ));
+    }
+
+    let (account_rows, active_local_accounts): (i64, i64) = connection.query_row(
+        r#"SELECT COUNT(*),
+                  COALESCE(SUM(CASE
+                      WHEN id = ?1 AND status = 'active' THEN 1 ELSE 0
+                  END), 0)
+           FROM accounts"#,
+        [LOCAL_ACCOUNT_ID],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if account_rows != 1 || active_local_accounts != 1 {
+        return Err(StorageError::CorruptData(
+            "the local account singleton is missing, duplicated, or inactive".into(),
         ));
     }
 
@@ -2619,6 +2874,91 @@ fn readiness(
             ));
         }
         return Ok(());
+    }
+
+    let account_boundary_violation: i64 = connection.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM incidents WHERE account_id IS NOT ?1
+               UNION ALL
+               SELECT 1 FROM sessions WHERE account_id IS NOT ?1
+               UNION ALL
+               SELECT 1 FROM runs WHERE account_id IS NOT ?1
+               UNION ALL
+               SELECT 1 FROM runtime_identity WHERE account_id IS NOT ?1
+               UNION ALL
+               SELECT 1
+               FROM runs run
+               JOIN incidents incident ON incident.id = run.incident_id
+               WHERE run.account_id IS NOT incident.account_id
+               UNION ALL
+               SELECT 1
+               FROM session_runs binding
+               JOIN sessions session ON session.id = binding.session_id
+               JOIN runs run ON run.id = binding.run_id
+               WHERE session.account_id IS NOT run.account_id
+               UNION ALL
+               SELECT 1
+               FROM runtime_identity identity
+               JOIN sessions session ON session.id = identity.primary_session_id
+               WHERE identity.account_id IS NOT session.account_id
+               UNION ALL
+               SELECT 1
+               FROM runtime_identity identity
+               JOIN runs run ON run.id = identity.primary_run_id
+               WHERE identity.account_id IS NOT run.account_id
+               UNION ALL
+               SELECT 1
+               FROM runtime_identity identity
+               WHERE EXISTS(SELECT 1 FROM runs)
+                 AND NOT EXISTS(
+                     SELECT 1
+                     FROM runs run
+                     WHERE run.id = identity.primary_run_id
+                       AND run.account_id IS identity.account_id
+                 )
+               UNION ALL
+               SELECT 1
+               FROM runtime_identity identity
+               JOIN session_runs binding ON binding.run_id = identity.primary_run_id
+               WHERE binding.session_id IS NOT identity.primary_session_id
+               UNION ALL
+               SELECT 1
+               FROM account_memberships membership
+               JOIN users user ON user.id = membership.user_id
+               WHERE membership.account_id IS NOT ?1
+                  OR membership.role IS NOT user.role
+                  OR membership.status IS NOT user.status
+               UNION ALL
+               SELECT 1
+               WHERE NOT EXISTS(SELECT 1 FROM users)
+                 AND EXISTS(SELECT 1 FROM account_memberships)
+               UNION ALL
+               SELECT 1
+               WHERE EXISTS(SELECT 1 FROM users)
+                 AND (
+                     (SELECT COUNT(*) FROM account_memberships) <> 1
+                     OR
+                     (SELECT COUNT(*)
+                      FROM users
+                      WHERE role = 'owner' AND status = 'active') <> 1
+                     OR
+                     (SELECT COUNT(*)
+                      FROM account_memberships membership
+                      JOIN users user ON user.id = membership.user_id
+                      WHERE membership.account_id = ?1
+                        AND membership.role = 'owner'
+                        AND membership.status = 'active'
+                        AND user.role = 'owner'
+                        AND user.status = 'active') <> 1
+                 )
+           )"#,
+        [LOCAL_ACCOUNT_ID],
+        |row| row.get(0),
+    )?;
+    if account_boundary_violation != 0 {
+        return Err(StorageError::CorruptData(
+            "one or more durable records cross an account boundary".into(),
+        ));
     }
 
     let event_payload_counter_violation: i64 = connection.query_row(
@@ -4025,6 +4365,20 @@ fn bootstrap_owner(
            ) VALUES (?1, 'system', NULL, 1, ?2)"#,
         params![user_id, timestamp],
     )?;
+    let membership_inserted = transaction.execute(
+        r#"INSERT INTO account_memberships(
+               account_id, user_id, role, status, revision, created_at, updated_at
+           )
+           SELECT id, ?1, 'owner', 'active', 1, ?2, ?2
+           FROM accounts
+           WHERE id = ?3 AND status = 'active'"#,
+        params![user_id, timestamp, LOCAL_ACCOUNT_ID],
+    )?;
+    if membership_inserted != 1 {
+        return Err(StorageError::CorruptData(
+            "the local account is missing or inactive during owner bootstrap".into(),
+        ));
+    }
 
     transaction.execute(
         "UPDATE sessions SET owner_user_id = ?1 WHERE owner_user_id IS NULL",
@@ -4392,8 +4746,8 @@ fn bind_runtime_identity(
     transaction.execute(
         r#"INSERT INTO runtime_identity(
                singleton, profile, environment, primary_session_id, primary_run_id,
-               policy_id, policy_revision, bound_at
-           ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+               policy_id, policy_revision, bound_at, account_id
+           ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
         params![
             identity.profile,
             identity.environment,
@@ -4402,6 +4756,7 @@ fn bind_runtime_identity(
             identity.policy_id,
             identity.policy_revision,
             Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            LOCAL_ACCOUNT_ID,
         ],
     )?;
     transaction.commit()?;
@@ -4605,8 +4960,8 @@ fn seed_if_empty(
 
     transaction.execute(
         r#"INSERT INTO incidents(
-               id, title, severity, status, service, region, user_impact, since
-           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+               id, title, severity, status, service, region, user_impact, since, account_id
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
         params![
             snapshot.incident.id,
             snapshot.incident.title,
@@ -4616,14 +4971,15 @@ fn seed_if_empty(
             snapshot.incident.region,
             snapshot.incident.user_impact,
             snapshot.incident.since,
+            LOCAL_ACCOUNT_ID,
         ],
     )?;
     transaction.execute(
         r#"INSERT INTO runs(
                id, incident_id, status, environment, started_at, duration_seconds, agent,
                sequence, projection_sequence, metrics_json, evidence_json, tool_policy_json,
-               execution_status
-           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, ?11, ?12)"#,
+               execution_status, account_id
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, ?11, ?12, ?13)"#,
         params![
             snapshot.run.id,
             snapshot.incident.id,
@@ -4637,6 +4993,7 @@ fn seed_if_empty(
             evidence_json,
             tool_policy_json,
             execution_status_to_db(&snapshot.run.status),
+            LOCAL_ACCOUNT_ID,
         ],
     )?;
     require_run_event_capacity(
@@ -4709,9 +5066,9 @@ fn seed_demo_session(
         transaction.execute(
             r#"INSERT INTO sessions(
                    id, title, status, created_at, updated_at, sequence,
-                   projection_sequence, active_turn_id
-               ) VALUES (?1, ?2, 'ready', ?3, ?3, 0, 0, NULL)"#,
-            params![session_id, title, timestamp],
+                   projection_sequence, active_turn_id, account_id
+               ) VALUES (?1, ?2, 'ready', ?3, ?3, 0, 0, NULL, ?4)"#,
+            params![session_id, title, timestamp, LOCAL_ACCOUNT_ID],
         )?;
         let event = build_session_event(
             session_id,
@@ -5553,9 +5910,15 @@ fn create_session(
     transaction.execute(
         r#"INSERT INTO sessions(
                id, title, status, created_at, updated_at, sequence,
-               projection_sequence, active_turn_id, owner_user_id
-           ) VALUES (?1, ?2, 'ready', ?3, ?3, 0, 0, NULL, ?4)"#,
-        params![request.id, request.title, timestamp, actor_user_id],
+               projection_sequence, active_turn_id, owner_user_id, account_id
+           ) VALUES (?1, ?2, 'ready', ?3, ?3, 0, 0, NULL, ?4, ?5)"#,
+        params![
+            request.id,
+            request.title,
+            timestamp,
+            actor_user_id,
+            LOCAL_ACCOUNT_ID
+        ],
     )?;
     let event = build_session_event(
         &request.id,

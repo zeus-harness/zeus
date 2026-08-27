@@ -17,14 +17,17 @@ real, path-constrained marker executor for testing the complete loop. Restate,
 MinIO, the networkless tool sandbox, and optional PostgreSQL are development
 topology for later milestones; they are not application state authorities.
 
-Alpha+ supports exactly one local owner. A future `member` role is reserved in
-the schema but cannot authenticate through this build; multi-user resource
-isolation is not enabled yet. Keep the service loopback/private-network only,
-and do not expose it as a shared or Internet-facing deployment.
+Alpha+ supports exactly one local owner. Schema v13 now creates the single
+`acc_local` account, its owner membership, and immutable account scope on four
+durable roots. The `member` role still cannot authenticate through this
+build: account-scoped durable authorization, member lifecycle, and account
+security audit remain v14-v15 work. Keep the service loopback/private-network
+only, and do not expose it as a shared or Internet-facing deployment.
 
 The staged account/membership and audit-retention design is documented in
 [`docs/account-membership-audit-retention.zh-CN.md`](docs/account-membership-audit-retention.zh-CN.md).
-It is an implementation contract, not a claim that member access is enabled.
+Its v12-v13 foundation slices are implemented; the v14-v15 sections remain an
+implementation contract, not a claim that member access is enabled.
 
 ## Prerequisites
 
@@ -444,6 +447,12 @@ and bounded memory, CPU, and PID resources.
   credentials ordered lifecycle reasons and a bounded detailed audit window;
   rotation and startup compaction preserve a monotonic digest rollup and no
   longer brick an unconfigured instance when detailed history reaches its cap.
+  Schema v13 adds the deterministic `acc_local` account, enrolls only the
+  existing active owner as revision-1 membership, and backfills immutable
+  account scope onto Incident, Session, Run, and runtime identity. Ambiguous
+  legacy owner/actor/scope or broken foreign-key state aborts v12-to-v13
+  migration before partial account state can commit. Existing owner-based
+  authorization remains authoritative and the member gate stays closed.
   Existing Runs and events are decoded, validated, and migrated in place without
   rewriting their payloads. Runtime identity still binds profile, environment,
   primary Session and Run, policy ID, and policy revision; a mismatch fails
@@ -478,10 +487,10 @@ directly.
 - Every business REST/SSE route requires the active local owner. Protected
   state changes additionally require `X-CSRF-Token` to match the login and an
   exact same-origin request. Alpha+ deliberately rejects the schema-reserved
-  `member` role. Actor isolation and SQLite physical headroom are now present,
-  and bootstrap audit retention is now bounded. Member access remains blocked
-  until the account membership scope, account-scoped authorization, and account
-  security-audit lifecycle land.
+  `member` role. Actor isolation, SQLite physical headroom, bounded bootstrap
+  audit retention, and the schema-v13 account/membership foundation are now
+  present. Member access remains blocked until v14 account-scoped durable
+  authorization and v15 member lifecycle/account security audit land.
 - `GET /api/v1/me/settings` returns the current safe preferences.
   `PATCH /api/v1/me/settings` accepts `theme`, optional allowlisted
   `preferred_model`, and `expected_revision`. Provider endpoints and API keys
@@ -554,8 +563,8 @@ directly.
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Schema v12 retains durable Run attachment during migration and demo seeding,
-but Alpha+ does not expose a public attach-Run HTTP route.
+Current schema v13 retains durable Run attachment during migration and demo
+seeding, but Alpha+ does not expose a public attach-Run HTTP route.
 
 The application boundary now caps auth JSON at 8 KiB and command JSON at
 512 KiB. Newly created Session and turn IDs are capped at 128 UTF-8 bytes;
@@ -574,9 +583,9 @@ approval, dispatch, reply completion, attachment checks, and startup recovery
 use typed point queries or fixed 64-row batches. Production Session list/detail,
 Run detail, and overview reads now use indexed `LIMIT + 1` keyset pages inside
 actor-authorized SQLite snapshots; no production HTTP read loads a complete
-ledger or collection. Schema v12 enforces bounded Session, open-turn, active
-reply/dispatch, auth-session, bootstrap-audit, event-slot, and logical event-
-payload-byte admission. Exact idempotent replay is checked before capacity,
+ledger or collection. Current schema v13 retains bounded Session, open-turn,
+active reply/dispatch, auth-session, bootstrap-audit, event-slot, and logical
+event-payload-byte admission. Exact idempotent replay is checked before capacity,
 while accepted work consumes its reserved terminal slots and payload bytes
 without ordinary admission. Parent-ledger and global counters are charged by
 SQLite triggers from the exact stored UTF-8 `payload_json`; migration backfills
@@ -588,12 +597,14 @@ audit records are not silently pruned; bootstrap token details alone follow the
 explicit bounded rollup policy above. The locally verified Physical Capacity Slice
 now gates the main DB, active-WAL target, and filesystem headroom, subject to
 the documented WAL and `statvfs` limitations. Bounded SQLite operation
-concurrency is also implemented. Account security-audit retention and the
-tenant/member membership scope remain unresolved; shared-network and
-multi-tenant deployment is therefore still out of scope. The specified
-current-image Apple readiness-pressure scenario has passed; authoritative
-Linux Docker PID/OOM and adversarial low-memory acceptance remain separate
-deployment gates.
+concurrency is also implemented. The v13 account/membership foundation is
+implemented, but account-scoped receipt/job/auth/capacity authorization,
+member lifecycle, and account security-audit retention remain unresolved;
+shared-network and multi-tenant deployment is therefore still out of scope.
+The earlier Operation Capacity Apple readiness-pressure scenario and current
+schema-v13 retained-volume migration/restart have passed as separate gates;
+the v13 image did not rerun that pressure workload. Authoritative Linux Docker
+PID/OOM and adversarial low-memory acceptance remain separate deployment gates.
 
 ## Container images
 
@@ -644,11 +655,12 @@ committed data. Use SQLite's backup/checkpoint facilities.
 Current Alpha+ plus Actor Boundary Foundation, API Resource Envelope, Terminal
 Payload Envelope, Bounded Event Feed, Point-query Durable Context, Bounded Read
 Models, SQLite Capacity Slice 2, the SQLite Physical Capacity Slice, and the
-SQLite Operation Capacity Slice, and Bootstrap Audit Retention host verification:
+SQLite Operation Capacity Slice, Bootstrap Audit Retention, and schema v13
+Account Membership Foundation host verification:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --all-targets`: 281 tests passed, including 131
+- `cargo test --workspace --all-targets`: 289 tests passed, including 139
   storage tests, 28 runtime tests, 44 API library tests, and 4 API main/config
   tests, plus the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
@@ -678,6 +690,11 @@ SQLite Operation Capacity Slice, and Bootstrap Audit Retention host verification
   reasons, canonical digest vectors, multi-batch rotation and startup
   compaction, current-v12 limit reduction, wall-clock rollback, pre-write
   physical gating, trigger rollback, and deep-integrity corruption detection.
+  Account-foundation coverage includes fresh/v1/v5/v8/v12 migration, the
+  deterministic local account and owner membership, bootstrap atomicity,
+  revision/identity/last-owner triggers, immutable root scope, deep-integrity
+  corruption, and fail-closed rollback for member-owned history or broken
+  foreign keys without partial v13 schema.
 - `pnpm --filter web test`: 25 tests passed for CSRF headers, stable command
   identity, deep-page active-Session restore, Session-list cursor encoding and
   deduplication, bounded-tail retry reconciliation and Session-switch race
@@ -725,23 +742,33 @@ isolated project while retaining its schema-v11 named volume. The first
 `up/verify` completed the v11-to-v12 migration. A second volume-retaining
 `restart-verify` rebuilt the containers and network and passed API, Web,
 gateway, authentication-status, anonymous-boundary, and `configured=false`
-state-consistency checks across the retained-volume restart. Schema-v12
-readiness requires the exact current
-schema, so this also verifies reopening the migrated volume. The stack remains
-running at `http://127.0.0.1:18089`.
+state-consistency checks across the retained-volume restart. Historical
+schema-v12 readiness required the exact schema, so this also verified reopening
+the v11-to-v12 migrated volume.
 
-The current-image API was verified at 2 CPUs/1 GiB. A 30,000-request
-`/health/ready` run at concurrency 128 completed in 4.493 seconds (about 6,677
-requests/second): 2,670 responses were `200`, 27,330 were the expected
+The current schema-v13 image was subsequently rebuilt in the same
+`zeus-operation-acceptance` project while retaining that now-v12 named volume.
+It completed the in-place v12-to-v13 migration, and volume-retaining
+`restart-verify` passed again. The stack remains available at
+`http://127.0.0.1:18089`; the API effective limit is 2 CPUs/1 GiB and the
+current resource snapshot reports `memory.events` `oom=0` and `oom_kill=0`.
+This verifies migration/reopen and the still-closed anonymous/member product
+boundary, not v14-v15 authorization.
+
+The earlier Operation Capacity readiness-pressure image was verified at 2
+CPUs/1 GiB. A 30,000-request `/health/ready` run at concurrency 128 completed
+in 4.493 seconds (about 6,677 requests/second): 2,670 responses were `200`,
+27,330 were the expected
 fail-fast `503`, and there were no transport errors. A second 10,000-request
 run at concurrency 64 returned 414 `200` and 9,586 `503`; every `503` carried
 `sqlite_operation_capacity_exceeded`. During and after pressure, cgroup memory
 peak remained 97,595,392 bytes (about 93 MiB), Zeus RSS remained around 23 MiB,
 and `memory.events` reported zero `oom`/`oom_kill`. CPU throttling confirmed the
 2-CPU quota was active. Apple `container` 1.0 still exposes no per-container
-PID limit (`pids.max=max`), and the VM had no swap. This is current-image Apple
-acceptance for the stated readiness-pressure scenario, not authoritative Linux
-Docker PID/OOM or adversarial low-memory acceptance.
+PID limit (`pids.max=max`), and the VM had no swap. This is historical Apple
+acceptance for the stated Operation Capacity readiness-pressure scenario, not
+evidence that the v13 image reran it, and not authoritative Linux Docker
+PID/OOM or adversarial low-memory acceptance.
 
 Docker Compose configuration remains available for environments with Docker
 Compose v2; this machine currently has Apple `container` but no Docker CLI, so

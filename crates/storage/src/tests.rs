@@ -1428,7 +1428,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
     let owner: Option<String> = connection
         .query_row(
             "SELECT owner_user_id FROM runs WHERE id = ?1",
@@ -1439,6 +1439,26 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
     assert_eq!(
         owner, None,
         "legacy state is claimed only during owner bootstrap"
+    );
+    let account_backfill: (String, String, String, i64) = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT account_id FROM incidents WHERE id = 'INC-2048'),
+                   (SELECT account_id FROM runs WHERE id = 'ZR-1842'),
+                   (SELECT account_id FROM sessions WHERE id = 'session-ZR-1842'),
+                   (SELECT COUNT(*) FROM account_memberships)"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        account_backfill,
+        (
+            "acc_local".into(),
+            "acc_local".into(),
+            "acc_local".into(),
+            0
+        )
     );
     let run_event_parent: String = connection
         .query_row(
@@ -1548,7 +1568,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
     assert_eq!(
         run_event_payloads(database.path(), &long_run_id),
         payloads_before,
-        "v9-v11 migrations must not rewrite immutable event payloads"
+        "v9-v13 migrations must not rewrite immutable event payloads"
     );
     let connection = rusqlite::Connection::open(database.path()).unwrap();
     let version: i64 = connection
@@ -1556,7 +1576,24 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
+    let configured_account: (String, String, String, i64) = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT account_id FROM runs WHERE id = ?1),
+                   (SELECT account_id FROM incidents WHERE id = 'INC-V8-POINT'),
+                   (SELECT role FROM account_memberships
+                    WHERE account_id = 'acc_local' AND user_id = 'user-v8-owner'),
+                   (SELECT revision FROM account_memberships
+                    WHERE account_id = 'acc_local' AND user_id = 'user-v8-owner')"#,
+            [long_run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        configured_account,
+        ("acc_local".into(), "acc_local".into(), "owner".into(), 1)
+    );
     let approval_plan = explain_query_plan(
         &connection,
         r#"SELECT sequence FROM run_events
@@ -1653,6 +1690,111 @@ async fn v8_gap_aborts_v9_migration_and_restores_the_append_only_schema() {
                 [RUN_ID],
             )
             .is_err()
+    );
+}
+
+#[tokio::test]
+async fn v12_member_owned_history_aborts_v13_without_partial_account_schema() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    bootstrap_test_owner(&store).await;
+    insert_test_member(database.path(), "user-member", "member");
+    store
+        .create_session_for_actor(
+            "user-member",
+            CreateSessionRequest {
+                id: "session-member-history".into(),
+                title: "Member-owned legacy history".into(),
+            },
+            "create-member-history",
+        )
+        .await
+        .unwrap();
+    drop(store);
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    downgrade_account_foundation_fixture_to_v12(&connection);
+    drop(connection);
+
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("member-owned v12 history must not be assigned to the local account"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        StorageError::CorruptData(message)
+            if message.contains("configured session is not owned by the legacy owner")
+    ));
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let state: (i64, i64, i64, String) = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT MAX(version) FROM schema_migrations),
+                   (SELECT COUNT(*) FROM sqlite_schema
+                    WHERE type = 'table' AND name = 'accounts'),
+                   (SELECT COUNT(*) FROM pragma_table_info('sessions')
+                    WHERE name = 'account_id'),
+                   (SELECT owner_user_id FROM sessions
+                    WHERE id = 'session-member-history')"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(state, (12, 0, 0, "user-member".into()));
+}
+
+#[tokio::test]
+async fn v12_foreign_key_corruption_aborts_v13_before_writing_account_state() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    bootstrap_test_owner(&store).await;
+    drop(store);
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    downgrade_account_foundation_fixture_to_v12(&connection);
+    connection
+        .pragma_update(None, "foreign_keys", false)
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO user_preferences(
+                   user_id, theme, preferred_model, revision, updated_at
+               ) VALUES (
+                   'missing-user', 'system', NULL, 1, '2026-08-27T00:00:00.000Z'
+               )"#,
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("foreign-key-corrupt v12 state must not migrate"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        StorageError::CorruptData(message)
+            if message.contains("foreign key violation in `user_preferences`")
+    ));
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        12
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'accounts'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
     );
 }
 
@@ -1794,6 +1936,428 @@ async fn owner_bootstrap_claims_legacy_state_and_auth_sessions_are_revocable() {
             })
             .await,
         Err(StorageError::AccountAlreadyConfigured)
+    ));
+}
+
+#[tokio::test]
+async fn account_foundation_scopes_identity_roots_and_only_enrolls_the_bootstrap_owner() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    store
+        .bind_runtime_identity(production_identity())
+        .await
+        .unwrap();
+    let (snapshot, events) = seed_fixture();
+    assert!(store.seed_if_empty(snapshot, events).await.unwrap());
+    assert!(
+        store
+            .seed_demo_session("session-ZR-1842", "Checkout API latency", RUN_ID)
+            .await
+            .unwrap()
+    );
+    store.verify_integrity().await.unwrap();
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let account: (String, String, String) = connection
+        .query_row("SELECT id, name, status FROM accounts", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(
+        account,
+        ("acc_local".into(), "Local".into(), "active".into())
+    );
+    let scopes: (String, String, String, String) = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT account_id FROM incidents WHERE id = 'INC-2048'),
+                   (SELECT account_id FROM sessions WHERE id = 'session-ZR-1842'),
+                   (SELECT account_id FROM runs WHERE id = 'ZR-1842'),
+                   (SELECT account_id FROM runtime_identity WHERE singleton = 1)"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        scopes,
+        (
+            "acc_local".into(),
+            "acc_local".into(),
+            "acc_local".into(),
+            "acc_local".into()
+        )
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM account_memberships", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+    drop(connection);
+
+    bootstrap_test_owner(&store).await;
+    insert_test_member(database.path(), "user-member", "member");
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let owner_membership: (String, String, String, i64) = connection
+        .query_row(
+            r#"SELECT account_id, role, status, revision
+               FROM account_memberships WHERE user_id = 'user-owner'"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        owner_membership,
+        ("acc_local".into(), "owner".into(), "active".into(), 1)
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM account_memberships WHERE user_id = 'user-member'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0,
+        "legacy member users must not be enrolled implicitly"
+    );
+    drop(connection);
+    store.verify_integrity().await.unwrap();
+    drop(store);
+
+    SqliteStore::open(database.path())
+        .await
+        .unwrap()
+        .verify_integrity()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn v12_identity_and_run_crash_prefix_migrates_then_recovers_the_primary_session() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    store
+        .bind_runtime_identity(production_identity())
+        .await
+        .unwrap();
+    let (snapshot, events) = seed_fixture();
+    assert!(store.seed_if_empty(snapshot, events).await.unwrap());
+    drop(store);
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    downgrade_account_foundation_fixture_to_v12(&connection);
+    drop(connection);
+
+    let reopened = SqliteStore::open(database.path()).await.unwrap();
+    reopened
+        .bind_runtime_identity(production_identity())
+        .await
+        .unwrap();
+    let (snapshot, events) = seed_fixture();
+    assert!(!reopened.seed_if_empty(snapshot, events).await.unwrap());
+    assert!(
+        reopened
+            .seed_demo_session("session-ZR-1842", "Checkout API latency", RUN_ID)
+            .await
+            .unwrap()
+    );
+    reopened.verify_integrity().await.unwrap();
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let recovered: (i64, String, String, String) = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT MAX(version) FROM schema_migrations),
+                   (SELECT account_id FROM runtime_identity WHERE singleton = 1),
+                   (SELECT account_id FROM runs WHERE id = 'ZR-1842'),
+                   (SELECT account_id FROM sessions WHERE id = 'session-ZR-1842')"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        recovered,
+        (
+            13,
+            "acc_local".into(),
+            "acc_local".into(),
+            "acc_local".into()
+        )
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_owner_rolls_back_membership_claims_and_token_on_late_failure() {
+    let database = TestDatabase::new();
+    let store = seeded_file_store(database.path()).await;
+    store
+        .create_session(
+            CreateSessionRequest {
+                id: "session-bootstrap-rollback".into(),
+                title: "Bootstrap rollback".into(),
+            },
+            "create-bootstrap-rollback",
+        )
+        .await
+        .unwrap();
+    let expiry = (chrono::Utc::now() + chrono::Duration::hours(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let commit = BootstrapOwnerCommit {
+        bootstrap_token_hash: "a".repeat(64),
+        user_id: "user-owner".into(),
+        username: "owner".into(),
+        password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA".into(),
+        session_token_hash: "b".repeat(64),
+        csrf_hash: "c".repeat(64),
+        session_expires_at: expiry.clone(),
+    };
+    store
+        .replace_bootstrap_token(&commit.bootstrap_token_hash, &expiry)
+        .await
+        .unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute_batch(
+            r#"CREATE TRIGGER auth_sessions_inject_bootstrap_failure
+               BEFORE INSERT ON auth_sessions
+               BEGIN
+                   SELECT RAISE(ABORT, 'injected auth session failure');
+               END;"#,
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(matches!(
+        store.bootstrap_owner(commit.clone()).await,
+        Err(StorageError::Sqlite(_))
+    ));
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let rolled_back: (i64, i64, i64, i64, i64, i64, i64) = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT COUNT(*) FROM users),
+                   (SELECT COUNT(*) FROM user_preferences),
+                   (SELECT COUNT(*) FROM account_memberships),
+                   (SELECT COUNT(*) FROM auth_sessions),
+                   (SELECT COUNT(*) FROM sessions WHERE owner_user_id IS NOT NULL),
+                   (SELECT COUNT(*) FROM runs WHERE owner_user_id IS NOT NULL),
+                   (SELECT COUNT(*) FROM bootstrap_tokens WHERE terminal_at IS NULL)"#,
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(rolled_back, (0, 0, 0, 0, 0, 0, 1));
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM session_command_receipts WHERE actor_scope = '__legacy__'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    connection
+        .execute_batch("DROP TRIGGER auth_sessions_inject_bootstrap_failure;")
+        .unwrap();
+    drop(connection);
+
+    store.bootstrap_owner(commit).await.unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                r#"SELECT COUNT(*)
+                   FROM account_memberships
+                   WHERE account_id = 'acc_local'
+                     AND user_id = 'user-owner'
+                     AND role = 'owner'
+                     AND status = 'active'
+                     AND revision = 1"#,
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    drop(connection);
+    store.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn account_membership_triggers_enforce_revision_durability_and_last_owner() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    bootstrap_test_owner(&store).await;
+    insert_test_member(database.path(), "user-member", "member");
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO account_memberships(
+                   account_id, user_id, role, status, revision, created_at, updated_at
+               ) VALUES (
+                   'acc_local', 'user-member', 'member', 'active', 1,
+                   '2026-08-27T00:00:00.000Z', '2026-08-27T00:00:00.000Z'
+               )"#,
+            [],
+        )
+        .unwrap();
+
+    assert!(
+        connection
+            .execute(
+                r#"UPDATE account_memberships
+                   SET status = 'disabled', revision = 3,
+                       updated_at = '2999-01-01T00:00:00.000Z'
+                   WHERE account_id = 'acc_local' AND user_id = 'user-member'"#,
+                [],
+            )
+            .is_err()
+    );
+    assert_eq!(
+        connection
+            .execute(
+                r#"UPDATE account_memberships
+                   SET status = 'disabled', revision = 2,
+                       updated_at = '2999-01-01T00:00:00.000Z'
+                   WHERE account_id = 'acc_local' AND user_id = 'user-member'"#,
+                [],
+            )
+            .unwrap(),
+        1
+    );
+    assert!(
+        connection
+            .execute(
+                "DELETE FROM account_memberships WHERE user_id = 'user-member'",
+                [],
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute(
+                r#"UPDATE account_memberships
+                   SET status = 'disabled', revision = 2,
+                       updated_at = '2999-01-01T00:00:00.000Z'
+                   WHERE account_id = 'acc_local' AND user_id = 'user-owner'"#,
+                [],
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute(
+                r#"INSERT OR REPLACE INTO account_memberships(
+                       account_id, user_id, role, status, revision, created_at, updated_at
+                   ) SELECT account_id, user_id, role, status, revision, created_at, updated_at
+                     FROM account_memberships WHERE user_id = 'user-owner'"#,
+                [],
+            )
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn account_scope_triggers_and_deep_integrity_reject_missing_or_changed_scope() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    store
+        .create_session(
+            CreateSessionRequest {
+                id: "session-account-integrity".into(),
+                title: "Account integrity".into(),
+            },
+            "create-account-integrity",
+        )
+        .await
+        .unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO session_runs(session_id, run_id) VALUES ('missing-session', 'missing-run')",
+                [],
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute(
+                r#"INSERT INTO incidents(
+                       id, title, severity, status, service, region, user_impact, since
+                   ) VALUES (
+                       'INC-NO-ACCOUNT', 'No account', 'low', 'investigating',
+                       'test', 'local', 'none', '2026-08-27T00:00:00.000Z'
+                   )"#,
+                [],
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute(
+                "UPDATE sessions SET account_id = NULL WHERE id = 'session-account-integrity'",
+                [],
+            )
+            .is_err()
+    );
+
+    let trigger_sql: String = connection
+        .query_row(
+            r#"SELECT sql FROM sqlite_schema
+               WHERE type = 'trigger' AND name = 'sessions_account_is_immutable'"#,
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    connection
+        .execute_batch("DROP TRIGGER sessions_account_is_immutable;")
+        .unwrap();
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE sessions SET account_id = NULL WHERE id = 'session-account-integrity'",
+                [],
+            )
+            .unwrap(),
+        1
+    );
+    connection.execute_batch(&trigger_sql).unwrap();
+    drop(connection);
+
+    assert!(matches!(
+        store.verify_integrity().await,
+        Err(StorageError::CorruptData(message)) if message.contains("account boundary")
     ));
 }
 
@@ -2341,6 +2905,51 @@ async fn v3_runtime_identity_migrates_with_primary_session_and_allows_other_runs
         .unwrap();
     assert_eq!(session_id, "session-ZR-1842");
     assert_eq!(run_id, RUN_ID);
+}
+
+#[tokio::test]
+async fn v5_configured_database_migrates_to_the_local_owner_membership() {
+    let database = TestDatabase::new();
+    create_v5_database_with_owner(database.path());
+
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    store.verify_integrity().await.unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let migrated: (i64, String, String, String, String, i64) = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT MAX(version) FROM schema_migrations),
+                   (SELECT account_id FROM incidents WHERE id = 'INC-2048'),
+                   (SELECT account_id FROM sessions WHERE id = 'session-ZR-1842'),
+                   (SELECT account_id FROM runs WHERE id = 'ZR-1842'),
+                   (SELECT role FROM account_memberships
+                    WHERE account_id = 'acc_local' AND user_id = 'user-v5-owner'),
+                   (SELECT revision FROM account_memberships
+                    WHERE account_id = 'acc_local' AND user_id = 'user-v5-owner')"#,
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        migrated,
+        (
+            13,
+            "acc_local".into(),
+            "acc_local".into(),
+            "acc_local".into(),
+            "owner".into(),
+            1
+        )
+    );
 }
 
 #[tokio::test]
@@ -4538,7 +5147,7 @@ async fn dispatch_claim_rechecks_owner_and_records_not_dispatched_evidence() {
     assert!(matches!(
         store.verify_integrity().await,
         Err(StorageError::CorruptData(message))
-            if message.contains("exactly one owner")
+            if message.contains("account boundary")
     ));
 }
 
@@ -6376,7 +6985,7 @@ async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempot
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, (1_i64..=12).collect::<Vec<_>>());
+    assert_eq!(versions, (1_i64..=13).collect::<Vec<_>>());
     assert_eq!(
         connection
             .query_row(
@@ -6386,7 +6995,7 @@ async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempot
             )
             .unwrap(),
         expected_global_bytes,
-        "reopening v11 must not charge historical payloads a second time"
+        "reopening the migrated database must not charge historical payloads a second time"
     );
 }
 
@@ -7126,7 +7735,57 @@ fn force_bootstrap_rollup_digest(path: &Path, digest: &str) {
     connection.execute_batch(&trigger_sql).unwrap();
 }
 
+fn downgrade_account_foundation_fixture_to_v12(connection: &rusqlite::Connection) {
+    let version: i64 = connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    if version < 13 {
+        return;
+    }
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER accounts_reject_duplicate_insert;
+               DROP TRIGGER accounts_reject_identity_update;
+               DROP TRIGGER accounts_reject_delete;
+               DROP TRIGGER account_memberships_reject_duplicate_insert;
+               DROP TRIGGER account_memberships_enforce_revision;
+               DROP TRIGGER account_memberships_preserve_last_active_owner;
+               DROP TRIGGER account_memberships_reject_delete;
+               DROP TRIGGER incidents_require_account_on_insert;
+               DROP TRIGGER incidents_account_is_immutable;
+               DROP TRIGGER sessions_require_account_on_insert;
+               DROP TRIGGER sessions_account_is_immutable;
+               DROP TRIGGER runs_require_account_on_insert;
+               DROP TRIGGER runs_require_incident_account_on_update;
+               DROP TRIGGER runs_account_is_immutable;
+               DROP TRIGGER runtime_identity_require_account_on_insert;
+               DROP TRIGGER session_runs_require_same_account;
+
+               DROP INDEX incidents_account_id_idx;
+               DROP INDEX sessions_account_id_idx;
+               DROP INDEX sessions_account_updated_idx;
+               DROP INDEX runs_account_id_idx;
+               DROP INDEX runs_account_started_idx;
+               DROP INDEX runs_account_incident_idx;
+               DROP INDEX account_memberships_user_idx;
+               DROP INDEX account_memberships_active_owner_idx;
+
+               ALTER TABLE incidents DROP COLUMN account_id;
+               ALTER TABLE sessions DROP COLUMN account_id;
+               ALTER TABLE runs DROP COLUMN account_id;
+               ALTER TABLE runtime_identity DROP COLUMN account_id;
+
+               DROP TABLE account_memberships;
+               DROP TABLE accounts;
+               DELETE FROM schema_migrations WHERE version = 13;"#,
+        )
+        .unwrap();
+}
+
 fn downgrade_bootstrap_audit_fixture_to_v11(connection: &rusqlite::Connection) {
+    downgrade_account_foundation_fixture_to_v12(connection);
     connection
         .execute_batch(
             r#"DROP TRIGGER bootstrap_tokens_require_next_sequence;
@@ -7453,8 +8112,10 @@ fn insert_legacy_oversized_reply_fixture(
         .execute(
             r#"INSERT INTO sessions(
                    id, title, status, created_at, updated_at, sequence,
-                   projection_sequence, active_turn_id, owner_user_id
-               ) VALUES (?1, ?2, 'ready', ?3, ?3, 0, 0, NULL, 'user-owner')"#,
+                   projection_sequence, active_turn_id, owner_user_id, account_id
+               ) VALUES (
+                   ?1, ?2, 'ready', ?3, ?3, 0, 0, NULL, 'user-owner', 'acc_local'
+               )"#,
             params![session_id, title, timestamp],
         )
         .unwrap();
@@ -8157,6 +8818,64 @@ fn create_v3_database_with_identity(path: &Path) {
         .unwrap();
 }
 
+fn create_v5_database_with_owner(path: &Path) {
+    create_v1_database(path);
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .unwrap();
+    for (version, migration) in [
+        (2_i64, include_str!("../migrations/0002_tool_execution.sql")),
+        (
+            3_i64,
+            include_str!("../migrations/0003_runtime_identity.sql"),
+        ),
+        (4_i64, include_str!("../migrations/0004_sessions.sql")),
+        (5_i64, include_str!("../migrations/0005_accounts.sql")),
+    ] {
+        connection.execute_batch(migration).unwrap();
+        connection
+            .execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+                params![version, format!("2026-08-26T00:00:0{version}.000Z")],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            r#"INSERT INTO users(
+                   id, username, role, status, password_hash, created_at, updated_at
+               ) VALUES (
+                   'user-v5-owner', 'v5-owner', 'owner', 'active',
+                   '$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA',
+                   '2026-08-26T00:00:05.000Z', '2026-08-26T00:00:05.000Z'
+               )"#,
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO user_preferences(user_id, theme, revision, updated_at)
+               VALUES (
+                   'user-v5-owner', 'system', 1, '2026-08-26T00:00:05.000Z'
+               )"#,
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sessions SET owner_user_id = 'user-v5-owner' WHERE owner_user_id IS NULL",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE runs SET owner_user_id = 'user-v5-owner' WHERE owner_user_id IS NULL",
+            [],
+        )
+        .unwrap();
+}
+
 fn create_v7_database_with_legacy_dispatch(path: &Path) {
     create_v1_database(path);
     let connection = rusqlite::Connection::open(path).unwrap();
@@ -8502,27 +9221,63 @@ fn insert_second_run(path: &Path) {
     connection
         .pragma_update(None, "foreign_keys", true)
         .unwrap();
-    connection
-        .execute(
-            r#"INSERT INTO incidents(
-                   id, title, severity, status, service, region, user_impact, since
-               ) VALUES ('INC-SECOND', 'Second incident', 'low', 'investigating',
-                         'worker', 'local', 'none', '2026-08-26T02:00:00Z')"#,
+    let has_account_scope: i64 = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('incidents') WHERE name = 'account_id')",
             [],
+            |row| row.get(0),
         )
         .unwrap();
-    connection
-        .execute(
-            r#"INSERT INTO runs(
-                   id, incident_id, status, environment, started_at, duration_seconds,
-                   agent, sequence, projection_sequence, metrics_json, evidence_json,
-                   tool_policy_json, execution_status
-               ) VALUES ('ZR-SECOND', 'INC-SECOND', 'waiting_for_approval', 'production',
-                         '2026-08-26T02:00:00Z', 0, 'Zeus Responder', 0, 0,
-                         '[]', '[]', NULL, 'waiting_for_approval')"#,
-            [],
-        )
-        .unwrap();
+    if has_account_scope == 1 {
+        connection
+            .execute(
+                r#"INSERT INTO incidents(
+                       id, title, severity, status, service, region, user_impact, since,
+                       account_id
+                   ) VALUES (
+                       'INC-SECOND', 'Second incident', 'low', 'investigating',
+                       'worker', 'local', 'none', '2026-08-26T02:00:00Z', 'acc_local'
+                   )"#,
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                r#"INSERT INTO runs(
+                       id, incident_id, status, environment, started_at, duration_seconds,
+                       agent, sequence, projection_sequence, metrics_json, evidence_json,
+                       tool_policy_json, execution_status, account_id
+                   ) VALUES (
+                       'ZR-SECOND', 'INC-SECOND', 'waiting_for_approval', 'production',
+                       '2026-08-26T02:00:00Z', 0, 'Zeus Responder', 0, 0,
+                       '[]', '[]', NULL, 'waiting_for_approval', 'acc_local'
+                   )"#,
+                [],
+            )
+            .unwrap();
+    } else {
+        connection
+            .execute(
+                r#"INSERT INTO incidents(
+                       id, title, severity, status, service, region, user_impact, since
+                   ) VALUES ('INC-SECOND', 'Second incident', 'low', 'investigating',
+                             'worker', 'local', 'none', '2026-08-26T02:00:00Z')"#,
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                r#"INSERT INTO runs(
+                       id, incident_id, status, environment, started_at, duration_seconds,
+                       agent, sequence, projection_sequence, metrics_json, evidence_json,
+                       tool_policy_json, execution_status
+                   ) VALUES ('ZR-SECOND', 'INC-SECOND', 'waiting_for_approval', 'production',
+                             '2026-08-26T02:00:00Z', 0, 'Zeus Responder', 0, 0,
+                             '[]', '[]', NULL, 'waiting_for_approval')"#,
+                [],
+            )
+            .unwrap();
+    }
 }
 
 fn event_kind(event_type: &EventType) -> &'static str {

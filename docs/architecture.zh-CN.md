@@ -27,8 +27,9 @@ Client / SvelteKit Web
 - `authz`：精确工具名规则、策略 revision、环境和 effect guard；没有命中即拒绝。
 - `tools`：工具描述、注册表、参数验证和 object-safe executor 边界。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
-- `storage`：schema v12 migration、用户/偏好、独立 Session/Run ledger、typed event lookup、
-  actor-scoped 回执、durable reply/dispatch queue，以及 logical/physical/operation capacity。
+- `storage`：schema v13 migration、`acc_local`/owner membership foundation、用户/偏好、独立
+  Session/Run ledger、typed event lookup、actor-scoped 回执、durable reply/dispatch queue，
+  以及 logical/physical/operation capacity。
 - `runtime`：Session 命令编排、reply/Run worker、提交后 SSE 提示和启动恢复。
 - `zeus-api`：进程组合、owner 认证、CSRF、provider 配置、REST/SSE 和 readiness。
 
@@ -142,7 +143,7 @@ connector 在数据库事务和锁之外运行。
 
 API 监听端口之前按固定顺序完成：
 
-1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v12；按当前
+1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v13；按当前
    detailed-row limit 以最多 64 行 batch 压缩 bootstrap terminal audit prefix，再按
    `(expires_at, token_hash)` 最多清理 64 个过期 auth session。
 2. 绑定并核对 runtime identity、primary Session/Run 和 demo attachment。
@@ -177,9 +178,10 @@ exactly-once 语义。
 - Alpha+ 明确拒绝 schema 预留的 `member` 登录。正式 Run/Session 查询、SSE、resume、turn、
   review 和 receipt 已全部 actor-scoped，并有 Alice/Bob 隔离测试；字段、HTTP/SSE 连接和
   event page 边界、内部 point/batch read、有界 list/detail，以及 SQLite 行数、active queue、
-  event-slot、事件载荷逻辑字节配额和 DB/WAL/disk headroom 门禁已落地。但 member 仍须等待
-  tenant/account membership scope、account-scoped authorization 与安全审计生命周期，不能仅因
-  数据面已隔离就开放。
+  event-slot、事件载荷逻辑字节配额和 DB/WAL/disk headroom 门禁已落地。v13 还建立了唯一
+  `acc_local`、旧 owner membership 与四个 root 的 immutable account scope；但 member 仍须等待
+  v14 account-scoped durable authorization 与 v15 member lifecycle/account security audit，
+  不能仅因 foundation 已落地就开放。
 - auth JSON 明确限制为 8 KiB、command JSON 为 512 KiB；新建 Session/turn ID、title、
   user/assistant message、review note 与严格幂等键分别按 UTF-8 bytes 设置硬上限。typed
   reply response 为 512 KiB，compact tool output 与 dispatch arguments JSON 为 64 KiB，
@@ -228,6 +230,11 @@ exactly-once 语义。
   在同一事务内按最多 64 行 batch 更新 versioned SHA-256 rollup 后删除 terminal 前缀，live
   token 永不压缩。旧 v11 行按 `rowid` 保持插入顺序，时钟回拨不阻断压缩；current-v12 因降限
   需要写入时先通过 Migration physical gate。rollup 只是数据库内 commitment，不是外部可信锚。
+  v13 创建唯一 `acc_local` 和 `account_memberships`，只为既有唯一 active owner 建 revision 1
+  membership，并给 Incident/Session/Run/runtime identity 回填 immutable `account_id`。迁移在任何
+  account 写入前验证 legacy owner、actor、receipt、job、reservation、runtime binding 与外键；
+  member-owned/cross-owner/损坏关系使 v12→v13 整体回滚。v13 保留 `users.role` 与 owner-based
+  API/storage 授权，member gate 不变；account-scoped receipt/job/auth/capacity 属于 v14。
   每个 pre-v4 Run 会绑定到生成的 `session-{run_id}`，原 Run/Event 不重写、不丢弃。
 - runtime identity 持久绑定 profile、environment、primary Session/Run、policy ID 和
   revision；不一致时启动失败。Run attachment 当前用于 migration 和 demo seed，Alpha 不公开
@@ -320,8 +327,10 @@ exactly-once 语义。
 
 ## Alpha+ 验收
 
-- schema v1/v3/v7/v8/v9/v10/v11 原地迁移到 v12 后，原 Run/Event payload 保留，primary Session/Run 绑定稳定；迁移时
-  尚未 bootstrap 的 legacy actor 只允许在首次 owner bootstrap 事务中认领一次。
+- schema v1/v3/v5/v7/v8/v9/v10/v11 原地迁移到 v12 的历史证据继续保留；v12→v13 又原地建立
+  `acc_local`、owner membership 与 root account scope。原 Run/Event payload、receipt 与 primary
+  Session/Run 绑定稳定；迁移时尚未 bootstrap 的 legacy actor 只允许在首次 owner bootstrap
+  事务中认领一次。
 - 重启后用户/偏好、Session/turn/event、reply job、Run/Event、审批决定、dispatch job 和命令
   回执仍存在。
 - Session start 与 reply enqueue 同事务；reply success 把 assistant provenance、连续事件、turn
@@ -340,6 +349,9 @@ exactly-once 语义。
 - bootstrap audit 的 v11 reason 迁移、canonical digest、64 行多批压缩、rotation/open 降限、
   wall-clock rollback、低磁盘 pre-write gate、非法 lifecycle/删除/rollup 回退与 deep corruption
   都有确定性存储测试。
+- account foundation 的 fresh/v1/v5/v8/v12 migration、唯一旧 owner 回填、bootstrap 原子
+  membership、revision/identity/last-owner trigger、root account immutability、deep integrity，
+  以及 member-owned history/外键损坏时无部分 schema 的整体回滚都有确定性存储测试。
 - 第二个进程不能同时打开同一个持久数据库；profile/policy identity 不匹配时 fail closed。
 - 活跃 Run/Session SSE 不能无限拖住进程退出；SIGINT/SIGTERM 的 graceful drain 最长五秒，
   随后关闭剩余连接并释放 SQLite lease。
@@ -356,29 +368,35 @@ exactly-once 语义。
   `404`。审批、派发、reply completion、attachment 和启动恢复已改为 typed point query 或
   固定 64 行 batch；Session list/detail 与 Run detail/overview 也已改为 indexed bounded read
   model。SQLite row/active/event-slot、逻辑 event-payload byte quota 与 physical capacity gate
-  和 operation capacity gate 已落地；bootstrap audit detailed retention 与 rollup 已落地，对外或
-  多租户部署前仍必须完成 tenant/account membership scope 与 account security-audit retention。
-  current-image Apple 指定 readiness-pressure 已通过；完整低内存/
-  对抗性压力与 Linux Docker PID/OOM authoritative evidence 仍是 deployment gate。
+  和 operation capacity gate 已落地；bootstrap audit detailed retention/rollup 与 v13 account
+  membership foundation 已落地。对外或多租户部署前仍必须完成 v14 account-scoped durable
+  authorization、v15 member lifecycle/account security audit，以及共享部署门禁。
+  此前 Operation Capacity Apple 指定 readiness-pressure 与当前 v13 migration/restart 已分别
+  通过；v13 本轮没有重跑该压力。完整低内存/对抗性压力与 Linux Docker PID/OOM authoritative
+  evidence 仍是 deployment gate。
 - Web 保持紧凑时间线、一个内联审批卡和一个 composer；支持真实 New Session、活动 Session
   刷新恢复、owner 设置/退出和 system/light/dark。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化结果是 281 个 Rust 测试（storage 131、runtime 28、API library 44、API
+- 当前自动化结果是 289 个 Rust 测试（storage 139、runtime 28、API library 44、API
   main/config 4）和 25 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
-提交 `af29089` 已构建并运行在独立 `zeus-operation-acceptance` project（端口 `18089`）；既有
-`zeus-alpha` 容器与 volume 未被替换。current-image 的 `build/up/verify/restart-verify` 均通过。
+提交 `af29089` 曾构建并运行在独立 `zeus-operation-acceptance` project（端口 `18089`）；既有
+`zeus-alpha` 容器与 volume 未被替换。当时镜像的 `build/up/verify/restart-verify` 均通过。
 提交 `cdaa211` 的 schema v12 镜像随后在相同隔离 project 上重建，并保留 schema v11 named
 volume；首次启动完成 v11→v12 migration，保留 volume 的第二次 `restart-verify` 也通过。API、
 Web、gateway、认证状态、匿名保护边界均通过，且 `configured=false` 未配置状态在重启前后一致；
-v12 readiness 的 exact-schema 检查覆盖迁移后的再次打开。验收栈继续运行在
-`127.0.0.1:18089`。
-API 限制核对为 2 CPU/1 GiB；30,000 次 readiness、并发 128 的压力结果为 2,670 个 `200`、
+该历史 v12 readiness 的 exact-schema 检查覆盖迁移后的再次打开。
+当前 schema v13 镜像又在同一 `zeus-operation-acceptance` project 上保留上述现为 v12 的 named
+volume，原地完成 v12→v13 migration；保留卷 `restart-verify` 通过，验收栈继续运行在
+`127.0.0.1:18089`。API effective limit 为 2 CPU/1 GiB，当前资源快照的 `memory.events` 为
+`oom=0`、`oom_kill=0`；member 登录/API gate 仍关闭。
+此前 Operation Capacity 指定压力中，API 限制核对为 2 CPU/1 GiB；30,000 次 readiness、并发
+128 的压力结果为 2,670 个 `200`、
 27,330 个预期 operation-capacity `503`、transport error 0、约 6,677 req/s。第二轮 10,000 次、
-并发 64 的 9,586 个 `503` 全部携带 `sqlite_operation_capacity_exceeded`。压力期间/之后
+并发 64 的 9,586 个 `503` 全部携带 `sqlite_operation_capacity_exceeded`。该历史压力期间及之后
 `memory.peak=97,595,392` bytes、Zeus RSS 约 23 MiB、`oom=0`、`oom_kill=0`，且 CPU quota
 发生 throttling。Apple VM 无 Swap，1.0 无 per-container PID limit 且 `pids.max=max`；因此这只
-证明当前镜像在该 Apple readiness-pressure 场景下保持有界，不替代 Linux Docker PID/OOM
-authoritative acceptance 或更低内存/对抗性压力。
+证明当时 Operation Capacity 镜像在该 Apple readiness-pressure 场景下保持有界；v13 本轮没有
+重跑该压力，也不替代 Linux Docker PID/OOM authoritative acceptance 或更低内存/对抗性压力。
 Docker Compose 当前只有静态配置检查；本机缺少 Docker CLI 时不声明 Compose build/up 已通过。
