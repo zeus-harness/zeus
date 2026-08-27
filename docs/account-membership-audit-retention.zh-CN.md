@@ -1,7 +1,8 @@
 # Account Membership 与审计保留设计
 
-状态：v12 Bootstrap Audit Retention 已实现并通过主机验收；v13-v15 设计冻结、待实施。本文不表示
-member 已可登录，也不授权共享网络部署。
+状态：v12 Bootstrap Audit Retention 已实现，并通过主机全量验收及 current-image v11→v12
+保留数据卷迁移/重启；v13-v15 设计冻结、待实施。本文不表示 member 已可登录，也不授权共享网络
+部署。
 
 基线：`2c984e0`。当前产品仍是单实例、单 owner；所有业务 HTTP/SSE 都拒绝 `member`。
 

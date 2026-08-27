@@ -1,6 +1,6 @@
 # Zeus Harness Alpha+ 设计冻结
 
-状态：主机 Alpha+、Actor Boundary Foundation、API/Terminal Payload Resource Envelope、Bounded Event Feed、Point-query Durable Context、Bounded Read Models、SQLite Capacity Slice 2、SQLite Physical/Operation Capacity 与 Bootstrap Audit Retention 已实现并通过主机全量验收；current-image Apple 指定压力场景已通过，v12 current-image restart 与 Linux Docker PID/OOM authoritative gate 待完成
+状态：主机 Alpha+、Actor Boundary Foundation、API/Terminal Payload Resource Envelope、Bounded Event Feed、Point-query Durable Context、Bounded Read Models、SQLite Capacity Slice 2、SQLite Physical/Operation Capacity 与 Bootstrap Audit Retention 已实现并通过主机全量验收；current-image Apple 指定压力场景及 v11→v12 保留数据卷迁移/重启已通过，Linux Docker PID/OOM authoritative gate 待完成
 前置基线：`8117ed6`（SQLite Physical Capacity）
 
 ## 1. 产品术语
@@ -262,6 +262,11 @@ POST /sessions/{id}/turns
 - `af29089` 已构建为独立 `zeus-operation-acceptance` current-image 栈；它使用独立 image/network/
   named volume 与 `18089`，未替换既有 `zeus-alpha`。`build`、`up`、`verify` 和保留 volume 的
   `restart-verify` 均通过，栈保留运行供本地检查。
+- `cdaa211`（schema v12）随后在同一隔离 project 上重建镜像，并保留由 schema v11 创建的 named
+  volume。第一次 `up/verify` 完成 v11→v12 migration；再次执行 `restart-verify` 重建容器与网络但
+  保留该 volume，API/Web/gateway、认证状态、匿名保护边界与 `configured=false` 未配置状态在重启
+  前后保持一致的检查全部通过。v12 readiness 还会拒绝非当前 schema，因此该路径同时覆盖迁移后
+  的再次打开。
 - API 实际限制为 2 CPU/1 GiB。`/health/ready` 的 30,000 请求、并发 128 压力在 4.493 秒内
   完成：2,670 个 `200`、27,330 个 fail-fast `503`、transport error 0。第二轮 10,000 请求、
   并发 64 得到 414 个 `200` 与 9,586 个 `503`，所有 `503` code 都是

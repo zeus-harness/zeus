@@ -720,6 +720,16 @@ isolated `zeus-operation-acceptance` stack uses its own images, network, named
 volume, and port `18089`; `build`, `up`, `verify`, and volume-retaining
 `restart-verify` all passed. It remains available locally for inspection.
 
+The schema-v12 image from commit `cdaa211` was then rebuilt on that same
+isolated project while retaining its schema-v11 named volume. The first
+`up/verify` completed the v11-to-v12 migration. A second volume-retaining
+`restart-verify` rebuilt the containers and network and passed API, Web,
+gateway, authentication-status, anonymous-boundary, and `configured=false`
+state-consistency checks across the retained-volume restart. Schema-v12
+readiness requires the exact current
+schema, so this also verifies reopening the migrated volume. The stack remains
+running at `http://127.0.0.1:18089`.
+
 The current-image API was verified at 2 CPUs/1 GiB. A 30,000-request
 `/health/ready` run at concurrency 128 completed in 4.493 seconds (about 6,677
 requests/second): 2,670 responses were `200`, 27,330 were the expected

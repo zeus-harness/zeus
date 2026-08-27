@@ -369,6 +369,11 @@ exactly-once 语义。
 
 提交 `af29089` 已构建并运行在独立 `zeus-operation-acceptance` project（端口 `18089`）；既有
 `zeus-alpha` 容器与 volume 未被替换。current-image 的 `build/up/verify/restart-verify` 均通过。
+提交 `cdaa211` 的 schema v12 镜像随后在相同隔离 project 上重建，并保留 schema v11 named
+volume；首次启动完成 v11→v12 migration，保留 volume 的第二次 `restart-verify` 也通过。API、
+Web、gateway、认证状态、匿名保护边界均通过，且 `configured=false` 未配置状态在重启前后一致；
+v12 readiness 的 exact-schema 检查覆盖迁移后的再次打开。验收栈继续运行在
+`127.0.0.1:18089`。
 API 限制核对为 2 CPU/1 GiB；30,000 次 readiness、并发 128 的压力结果为 2,670 个 `200`、
 27,330 个预期 operation-capacity `503`、transport error 0、约 6,677 req/s。第二轮 10,000 次、
 并发 64 的 9,586 个 `503` 全部携带 `sqlite_operation_capacity_exceeded`。压力期间/之后
