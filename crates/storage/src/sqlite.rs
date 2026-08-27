@@ -39,15 +39,15 @@ use crate::{
     ClaimOutcome, CommitOutcome, CreateMemberCommit, CreateMemberResult, DispatchCompleteCommit,
     DispatchContext, DispatchJob, DispatchJobSpec, DispatchRecoveryCommit, DispatchRejection,
     DispatchStartCommit, DispatchStatus, InFlightWorkSummary, KnowledgeCatalogCommit,
-    KnowledgeCatalogState, KnowledgeCatalogUpdateResult, MEMBER_SETUP_TOKEN_TTL_SECONDS,
-    MemberSetupCommit, MemberSetupResult, MemberTransitionResult, MembershipRevision,
-    MembershipRole, RecoveredSessionTurn, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit,
-    ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
-    ReplySuccessCommit, ReviewCommit, ReviewContext, ReviewReceipt, RotateMemberSetupTokenCommit,
-    RotateMemberSetupTokenResult, RunSnapshot, RuntimeIdentity, SessionSummaryPage,
-    SqliteOperationLimits, SqlitePhysicalLimits, StorageError, StorageLimits, StoredCredential,
-    StoredMember, StoredMemberPage, StoredMembershipStatus, StoredPreferences, StoredRun,
-    StoredUser, StoredUserRole, StoredUserStatus, TransitionMemberCommit,
+    KnowledgeCatalogRevisionPage, KnowledgeCatalogState, KnowledgeCatalogUpdateResult,
+    MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit, MemberSetupResult, MemberTransitionResult,
+    MembershipRevision, MembershipRole, RecoveredSessionTurn, ReplyClaimOutcome, ReplyCompletion,
+    ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus,
+    ReplyOutcomeUnknownCommit, ReplySuccessCommit, ReviewCommit, ReviewContext, ReviewReceipt,
+    RotateMemberSetupTokenCommit, RotateMemberSetupTokenResult, RunSnapshot, RuntimeIdentity,
+    SessionSummaryPage, SqliteOperationLimits, SqlitePhysicalLimits, StorageError, StorageLimits,
+    StoredCredential, StoredMember, StoredMemberPage, StoredMembershipStatus, StoredPreferences,
+    StoredRun, StoredUser, StoredUserRole, StoredUserStatus, TransitionMemberCommit,
     UpdateAccountAuditPolicyCommit,
 };
 
@@ -1396,6 +1396,38 @@ impl SqliteStore {
         let context = validated_authz_context(context)?;
         self.with_connection(move |connection| {
             agent::query_active_knowledge_corpus_for_actor(connection, &context)
+        })
+        .await
+    }
+
+    pub async fn knowledge_catalog_revision_for_admin(
+        &self,
+        context: &AuthzContext,
+        revision: u64,
+    ) -> Result<KnowledgeCatalogState, StorageError> {
+        let context = validated_authz_context(context)?;
+        self.with_connection(move |connection| {
+            agent::query_account_knowledge_catalog_revision_for_admin(
+                connection, &context, revision,
+            )
+        })
+        .await
+    }
+
+    pub async fn knowledge_catalog_revisions_for_admin(
+        &self,
+        context: &AuthzContext,
+        before_revision: Option<u64>,
+        limit: usize,
+    ) -> Result<KnowledgeCatalogRevisionPage, StorageError> {
+        let context = validated_authz_context(context)?;
+        self.with_connection(move |connection| {
+            agent::query_account_knowledge_catalog_revisions_for_admin(
+                connection,
+                &context,
+                before_revision,
+                limit,
+            )
         })
         .await
     }

@@ -55,16 +55,16 @@ pub use storage::{
     AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurn,
     AgentTurnEnqueueResponse, AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal,
     AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, CreateMemberResult,
-    InFlightWorkSummary, KnowledgeCatalogCommit, KnowledgeCatalogState,
-    KnowledgeCatalogUpdateResult, MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit,
-    MemberSetupResult, MemberSetupToken, MemberTransitionResult, MembershipRevision,
-    MembershipRole, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit, ReplyJob,
-    ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
-    ReplySuccessCommit, RotateMemberSetupTokenResult, SessionSummaryPage, SqliteOperationLimits,
-    SqliteOperationLimitsError, SqlitePhysicalLimits, SqlitePhysicalLimitsError, StorageLimits,
-    StorageLimitsError, StoredCredential, StoredMember, StoredMemberPage, StoredMembershipStatus,
-    StoredPreferences, StoredUser, StoredUserRole, StoredUserStatus, TransitionMemberCommit,
-    UpdateAccountAuditPolicyCommit,
+    InFlightWorkSummary, KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage,
+    KnowledgeCatalogRevisionSummary, KnowledgeCatalogState, KnowledgeCatalogUpdateResult,
+    MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit, MemberSetupResult, MemberSetupToken,
+    MemberTransitionResult, MembershipRevision, MembershipRole, ReplyClaimOutcome, ReplyCompletion,
+    ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus,
+    ReplyOutcomeUnknownCommit, ReplySuccessCommit, RotateMemberSetupTokenResult,
+    SessionSummaryPage, SqliteOperationLimits, SqliteOperationLimitsError, SqlitePhysicalLimits,
+    SqlitePhysicalLimitsError, StorageLimits, StorageLimitsError, StoredCredential, StoredMember,
+    StoredMemberPage, StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserRole,
+    StoredUserStatus, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
 use storage::{
     ClaimOutcome, CommitOutcome, CreateMemberCommit, DispatchCompleteCommit, DispatchContext,
@@ -397,6 +397,8 @@ pub enum StoreError {
     AuditCheckpointConflict,
     #[error("the account knowledge catalog revision changed concurrently")]
     KnowledgeCatalogRevisionConflict,
+    #[error("account knowledge catalog revision {0} was not found")]
+    KnowledgeCatalogRevisionNotFound(u64),
     #[error("invalid account knowledge catalog: {0}")]
     InvalidKnowledgeCatalog(String),
     #[error("the durable storage quota is exhausted")]
@@ -496,6 +498,9 @@ impl From<StorageError> for StoreError {
             StorageError::AuditCheckpointConflict => Self::AuditCheckpointConflict,
             StorageError::KnowledgeCatalogRevisionConflict => {
                 Self::KnowledgeCatalogRevisionConflict
+            }
+            StorageError::KnowledgeCatalogRevisionNotFound(revision) => {
+                Self::KnowledgeCatalogRevisionNotFound(revision)
             }
             StorageError::InvalidKnowledgeCatalog(detail) => Self::InvalidKnowledgeCatalog(detail),
             StorageError::StorageQuotaExceeded => Self::StorageQuotaExceeded,
@@ -1200,6 +1205,29 @@ impl DemoStore {
         context: &AuthzContext,
     ) -> Result<KnowledgeCatalogState, StoreError> {
         Ok(self.storage.knowledge_catalog_for_admin(context).await?)
+    }
+
+    pub async fn knowledge_catalog_revision_for_admin(
+        &self,
+        context: &AuthzContext,
+        revision: u64,
+    ) -> Result<KnowledgeCatalogState, StoreError> {
+        Ok(self
+            .storage
+            .knowledge_catalog_revision_for_admin(context, revision)
+            .await?)
+    }
+
+    pub async fn knowledge_catalog_revisions_for_admin(
+        &self,
+        context: &AuthzContext,
+        before_revision: Option<u64>,
+        limit: usize,
+    ) -> Result<KnowledgeCatalogRevisionPage, StoreError> {
+        Ok(self
+            .storage
+            .knowledge_catalog_revisions_for_admin(context, before_revision, limit)
+            .await?)
     }
 
     pub async fn replace_knowledge_catalog(

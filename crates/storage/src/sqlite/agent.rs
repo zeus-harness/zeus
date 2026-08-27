@@ -13,7 +13,8 @@ use crate::{
     AgentReviewResult, AgentTerminalCompletion, AgentToolCall, AgentToolCallSpec,
     AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
     AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe,
-    KnowledgeCatalogCommit, KnowledgeCatalogState, KnowledgeCatalogUpdateResult,
+    KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage, KnowledgeCatalogRevisionSummary,
+    KnowledgeCatalogState, KnowledgeCatalogUpdateResult,
 };
 use ::execution::{DigestDomain, FactSource, OperationRef, Sha256Digest};
 use deployment::ManifestEnvelope;
@@ -5649,6 +5650,196 @@ pub(super) fn query_active_knowledge_corpus_for_actor(
 ) -> Result<knowledge::CorpusRevisionEnvelope, StorageError> {
     require_current_authority(connection, context, AccountCapability::Reply)?;
     Ok(query_account_knowledge_catalog(connection, context.account_id.as_str())?.corpus)
+}
+
+pub(super) fn query_account_knowledge_catalog_revision_for_admin(
+    connection: &mut Connection,
+    context: &AuthzContext,
+    revision: u64,
+) -> Result<KnowledgeCatalogState, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    require_current_authority(&transaction, context, AccountCapability::AccountAdmin)?;
+    let current = query_account_knowledge_catalog(&transaction, context.account_id.as_str())?;
+    if revision == 0 {
+        let catalog = KnowledgeCatalogState {
+            account_id: context.account_id.clone(),
+            revision: 0,
+            corpus: empty_knowledge_corpus()?,
+            updated_by_user_id: None,
+            updated_by_membership_revision: None,
+            updated_at: None,
+        };
+        transaction.commit()?;
+        return Ok(catalog);
+    }
+    if revision > current.revision {
+        return Err(StorageError::KnowledgeCatalogRevisionNotFound(revision));
+    }
+    let revision_sql = u64_to_i64(revision, "knowledge catalog revision")?;
+    let stored = transaction
+        .query_row(
+            r#"SELECT actor_user_id, actor_membership_revision,
+                      corpus_digest, created_at
+               FROM knowledge_catalog_receipts
+               WHERE account_id = ?1 AND catalog_revision = ?2"#,
+            params![context.account_id.as_str(), revision_sql],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StorageError::CorruptData(format!(
+                "knowledge catalog `{}` is missing committed revision {revision}",
+                context.account_id
+            ))
+        })?;
+    let catalog = KnowledgeCatalogState {
+        account_id: context.account_id.clone(),
+        revision,
+        corpus: query_stored_knowledge_corpus(
+            &transaction,
+            context.account_id.as_str(),
+            &stored.2,
+        )?,
+        updated_by_user_id: Some(stored.0),
+        updated_by_membership_revision: Some(decode_membership_revision(stored.1)?),
+        updated_at: Some(stored.3),
+    };
+    transaction.commit()?;
+    Ok(catalog)
+}
+
+pub(super) fn query_account_knowledge_catalog_revisions_for_admin(
+    connection: &mut Connection,
+    context: &AuthzContext,
+    before_revision: Option<u64>,
+    limit: usize,
+) -> Result<KnowledgeCatalogRevisionPage, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    require_current_authority(&transaction, context, AccountCapability::AccountAdmin)?;
+    let fetch_limit = validated_read_page_limit(limit, COLLECTION_PAGE_MAX_LIMIT)?;
+    let current = query_account_knowledge_catalog(&transaction, context.account_id.as_str())?;
+    let initial_boundary =
+        current
+            .revision
+            .checked_add(1)
+            .ok_or(StorageError::IntegerOutOfRange(
+                "knowledge catalog history boundary",
+            ))?;
+    let boundary = before_revision.unwrap_or(initial_boundary);
+    if boundary == 0 {
+        return Err(StorageError::InvalidPageCursor);
+    }
+    if boundary > initial_boundary {
+        return Err(StorageError::PageCursorBeyondHead {
+            head: current.revision,
+        });
+    }
+    let boundary_sql = u64_to_i64(boundary, "knowledge catalog history boundary")?;
+    let rows = {
+        let mut statement = transaction.prepare(
+            r#"SELECT receipt.catalog_revision, receipt.corpus_digest,
+                      corpus.entry_count, corpus.aggregate_entry_bytes,
+                      receipt.actor_user_id, receipt.actor_membership_revision,
+                      receipt.created_at
+               FROM knowledge_catalog_receipts receipt
+               LEFT JOIN knowledge_corpus_revisions corpus
+                 ON corpus.account_id = receipt.account_id
+                AND corpus.digest = receipt.corpus_digest
+               WHERE receipt.account_id = ?1
+                 AND receipt.catalog_revision < ?2
+               ORDER BY receipt.catalog_revision DESC
+               LIMIT ?3"#,
+        )?;
+        statement
+            .query_map(
+                params![context.account_id.as_str(), boundary_sql, fetch_limit],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut expected_revision = boundary - 1;
+    let mut items = Vec::with_capacity(rows.len());
+    for (revision, digest, entry_count, entry_bytes, actor, actor_revision, created_at) in rows {
+        let revision = i64_to_u64(revision, "knowledge catalog revision")?;
+        if revision != expected_revision {
+            return Err(StorageError::CorruptData(format!(
+                "knowledge catalog `{}` history is not contiguous before revision {boundary}",
+                context.account_id
+            )));
+        }
+        let entry_count = entry_count.ok_or_else(|| {
+            StorageError::CorruptData(format!(
+                "knowledge catalog `{}` revision {revision} has no corpus projection",
+                context.account_id
+            ))
+        })?;
+        let entry_bytes = entry_bytes.ok_or_else(|| {
+            StorageError::CorruptData(format!(
+                "knowledge catalog `{}` revision {revision} has no corpus projection",
+                context.account_id
+            ))
+        })?;
+        items.push(KnowledgeCatalogRevisionSummary {
+            revision,
+            corpus_digest: digest,
+            entry_count: i64_to_u64(entry_count, "knowledge corpus entry count")?,
+            aggregate_entry_bytes: i64_to_u64(
+                entry_bytes,
+                "knowledge corpus aggregate entry bytes",
+            )?,
+            updated_by_user_id: actor,
+            updated_by_membership_revision: decode_membership_revision(actor_revision)?,
+            updated_at: created_at,
+        });
+        expected_revision =
+            expected_revision
+                .checked_sub(1)
+                .ok_or(StorageError::IntegerOutOfRange(
+                    "knowledge catalog history revision",
+                ))?;
+    }
+    let fetch_limit = usize::try_from(fetch_limit)
+        .map_err(|_| StorageError::IntegerOutOfRange("knowledge catalog history fetch limit"))?;
+    if items.len() < fetch_limit && expected_revision != 0 {
+        return Err(StorageError::CorruptData(format!(
+            "knowledge catalog `{}` history is incomplete before revision {boundary}",
+            context.account_id
+        )));
+    }
+    let has_more = items.len() > limit;
+    if has_more {
+        items.truncate(limit);
+    }
+    let next_before_revision = has_more.then(|| {
+        items
+            .last()
+            .expect("a page with another item must return at least one item")
+            .revision
+    });
+    let page = KnowledgeCatalogRevisionPage {
+        current_revision: current.revision,
+        items,
+        next_before_revision,
+    };
+    transaction.commit()?;
+    Ok(page)
 }
 
 fn require_knowledge_corpus_capacity(

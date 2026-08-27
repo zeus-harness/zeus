@@ -293,7 +293,11 @@ OpenAI-compatible provider wire 上映射为另一条 `user` message。schema v2
 runtime 使用隐式空 corpus；配置后 owner/member 的新 Agent 从 active corpus 做确定性选择，并把
 exact corpus/snapshot 固化到该 Agent，之后的 catalog 更新不会改写旧 turn。Actor-scoped
 `GET .../agent/knowledge/explain` 可审计实际 selection 与完整 digest binding，但不会返回未命中的
-account corpus entry；pre-v22 Agent 返回明确的 `legacy_unbound`。
+account corpus entry；pre-v22 Agent 返回明确的 `legacy_unbound`。Owner 还可通过
+`GET /api/v1/knowledge/catalog/revisions` 做 newest-first 有界历史分页，并通过
+`GET /api/v1/knowledge/catalog/revisions/{revision}` 读取 exact immutable corpus。恢复旧版本时把该
+corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revision，不覆盖或删除历史；这组
+只读能力复用 v23 receipt/corpus，不增加 schema migration。
 
 迁移必须原地保留 Alpha append-only ledger、事件外键与 runtime identity。任何一步失败都回滚整个 migration transaction。
 

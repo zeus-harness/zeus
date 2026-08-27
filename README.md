@@ -682,6 +682,13 @@ directly.
   `409 knowledge_catalog_revision_conflict`; the same key with different input
   returns the normal idempotency conflict. Ordinary members cannot administer
   the catalog, but their newly admitted Agents read its active corpus.
+- Owner-only `GET /api/v1/knowledge/catalog/revisions` returns newest-first
+  bounded revision summaries using an exclusive `before_revision` boundary;
+  `GET /api/v1/knowledge/catalog/revisions/{revision}` returns the exact
+  immutable corpus, including the implicit empty revision `0`. Recovery never
+  rewrites history: read the desired historical corpus, then submit its
+  `entries` through the existing CAS `PUT` to create a new catalog revision.
+  Both history routes send `Cache-Control: no-store`.
 - `GET /api/v1/me/settings` returns the current safe preferences.
   `PATCH /api/v1/me/settings` accepts `theme`, optional allowlisted
   `preferred_model`, and `expected_revision`. Provider endpoints and API keys

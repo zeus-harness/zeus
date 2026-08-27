@@ -4804,6 +4804,20 @@ async fn knowledge_catalog_is_owner_governed_idempotent_and_active_for_members()
     assert_eq!(initial.revision, 0);
     assert!(initial.corpus.entries().is_empty());
     assert_eq!(initial.updated_by_user_id, None);
+    let empty_history = store
+        .knowledge_catalog_revisions_for_admin(&owner_authz(), None, 1)
+        .await
+        .unwrap();
+    assert_eq!(empty_history.current_revision, 0);
+    assert!(empty_history.items.is_empty());
+    assert_eq!(empty_history.next_before_revision, None);
+    assert_eq!(
+        store
+            .knowledge_catalog_revision_for_admin(&owner_authz(), 0)
+            .await
+            .unwrap(),
+        initial
+    );
     assert!(
         store
             .active_knowledge_corpus_for_actor(&member)
@@ -4814,6 +4828,16 @@ async fn knowledge_catalog_is_owner_governed_idempotent_and_active_for_members()
     );
     assert!(matches!(
         store.knowledge_catalog_for_admin(&member).await,
+        Err(StorageError::PermissionDenied)
+    ));
+    assert!(matches!(
+        store
+            .knowledge_catalog_revisions_for_admin(&member, None, 1)
+            .await,
+        Err(StorageError::PermissionDenied)
+    ));
+    assert!(matches!(
+        store.knowledge_catalog_revision_for_admin(&member, 0).await,
         Err(StorageError::PermissionDenied)
     ));
 
@@ -4900,7 +4924,7 @@ async fn knowledge_catalog_is_owner_governed_idempotent_and_active_for_members()
                 &owner_authz(),
                 KnowledgeCatalogCommit {
                     expected_revision: 1,
-                    corpus: first_corpus,
+                    corpus: first_corpus.clone(),
                     idempotency_key: "knowledge-catalog-same-active".into(),
                 },
             )
@@ -4928,6 +4952,53 @@ async fn knowledge_catalog_is_owner_governed_idempotent_and_active_for_members()
             .unwrap(),
         second_corpus
     );
+    let latest_page = store
+        .knowledge_catalog_revisions_for_admin(&owner_authz(), None, 1)
+        .await
+        .unwrap();
+    assert_eq!(latest_page.current_revision, 2);
+    assert_eq!(latest_page.items.len(), 1);
+    assert_eq!(latest_page.items[0].revision, 2);
+    assert_eq!(
+        latest_page.items[0].corpus_digest,
+        second.catalog.corpus.digest().to_hex()
+    );
+    assert_eq!(latest_page.items[0].entry_count, 1);
+    assert!(latest_page.items[0].aggregate_entry_bytes > 0);
+    assert_eq!(latest_page.next_before_revision, Some(2));
+
+    let older_page = store
+        .knowledge_catalog_revisions_for_admin(&owner_authz(), Some(2), 1)
+        .await
+        .unwrap();
+    assert_eq!(older_page.current_revision, 2);
+    assert_eq!(older_page.items.len(), 1);
+    assert_eq!(older_page.items[0].revision, 1);
+    assert_eq!(older_page.next_before_revision, None);
+    let first_revision = store
+        .knowledge_catalog_revision_for_admin(&owner_authz(), 1)
+        .await
+        .unwrap();
+    assert_eq!(first_revision.revision, 1);
+    assert_eq!(first_revision.corpus, first_corpus);
+    assert!(matches!(
+        store
+            .knowledge_catalog_revision_for_admin(&owner_authz(), 3)
+            .await,
+        Err(StorageError::KnowledgeCatalogRevisionNotFound(3))
+    ));
+    assert!(matches!(
+        store
+            .knowledge_catalog_revisions_for_admin(&owner_authz(), Some(0), 1)
+            .await,
+        Err(StorageError::InvalidPageCursor)
+    ));
+    assert!(matches!(
+        store
+            .knowledge_catalog_revisions_for_admin(&owner_authz(), Some(4), 1)
+            .await,
+        Err(StorageError::PageCursorBeyondHead { head: 2 })
+    ));
     store.verify_integrity().await.unwrap();
     drop(store);
 
@@ -4937,6 +5008,14 @@ async fn knowledge_catalog_is_owner_governed_idempotent_and_active_for_members()
         .await
         .unwrap();
     assert_eq!(durable, second.catalog);
+    assert_eq!(
+        reopened
+            .knowledge_catalog_revision_for_admin(&owner_authz(), 1)
+            .await
+            .unwrap()
+            .corpus,
+        first_revision.corpus
+    );
     reopened.verify_integrity().await.unwrap();
 }
 

@@ -562,6 +562,33 @@ pub struct KnowledgeCatalogState {
     pub updated_at: Option<String>,
 }
 
+/// One committed account knowledge-catalog revision without the full corpus.
+///
+/// The immutable corpus can be fetched through the actor-scoped point read.
+/// Keeping list rows compact makes the history surface bounded even when a
+/// corpus reaches its maximum envelope size.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct KnowledgeCatalogRevisionSummary {
+    pub revision: u64,
+    pub corpus_digest: String,
+    pub entry_count: u64,
+    pub aggregate_entry_bytes: u64,
+    pub updated_by_user_id: String,
+    pub updated_by_membership_revision: MembershipRevision,
+    pub updated_at: String,
+}
+
+/// Newest-first bounded page of committed knowledge-catalog revisions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct KnowledgeCatalogRevisionPage {
+    /// Catalog head observed in the same SQLite read transaction.
+    pub current_revision: u64,
+    pub items: Vec<KnowledgeCatalogRevisionSummary>,
+    /// Exclusive revision boundary for the next request when another page
+    /// exists. Revision zero is the implicit baseline and is not listed.
+    pub next_before_revision: Option<u64>,
+}
+
 /// Persistence-ready replacement of the active account knowledge corpus.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KnowledgeCatalogCommit {

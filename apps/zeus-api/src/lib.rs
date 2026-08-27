@@ -67,11 +67,11 @@ use runtime::{
     AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion,
     AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork,
     AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthzContext,
-    BootstrapOwnerCommit, DemoStore, EntryRevision, KnowledgeCatalogState,
-    KnowledgeCatalogUpdateResult, MemberSetupCommit, PublishedEvent, ReplyClaimOutcome,
-    ReplyFailureCommit, ReplyJob, ReplyOutcomeUnknownCommit, ReplySuccessCommit, StoreError,
-    StoredMember, StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserStatus,
-    TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
+    BootstrapOwnerCommit, DemoStore, EntryRevision, KnowledgeCatalogRevisionPage,
+    KnowledgeCatalogState, KnowledgeCatalogUpdateResult, MemberSetupCommit, PublishedEvent,
+    ReplyClaimOutcome, ReplyFailureCommit, ReplyJob, ReplyOutcomeUnknownCommit, ReplySuccessCommit,
+    StoreError, StoredMember, StoredMembershipStatus, StoredPreferences, StoredUser,
+    StoredUserStatus, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -725,6 +725,13 @@ struct ReplaceKnowledgeCatalogRequest {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct KnowledgeCatalogRevisionListQuery {
+    before_revision: Option<u64>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SessionDetailQuery {
     run_ids_before: Option<String>,
     run_ids_limit: Option<usize>,
@@ -888,6 +895,14 @@ fn build_authenticated_app(state: ApiState) -> Router {
         .route(
             "/api/v1/knowledge/catalog",
             get(get_knowledge_catalog).put(replace_knowledge_catalog),
+        )
+        .route(
+            "/api/v1/knowledge/catalog/revisions",
+            get(list_knowledge_catalog_revisions),
+        )
+        .route(
+            "/api/v1/knowledge/catalog/revisions/{revision}",
+            get(get_knowledge_catalog_revision),
         )
         .route_layer(middleware::from_fn(require_account_owner))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
@@ -1438,6 +1453,45 @@ async fn replace_knowledge_catalog(
         )
         .await?;
     json_no_store(result)
+}
+
+async fn list_knowledge_catalog_revisions(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    query: Result<Query<KnowledgeCatalogRevisionListQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let Query(query) = query.map_err(ApiError::invalid_query)?;
+    let page: KnowledgeCatalogRevisionPage = state
+        .store
+        .knowledge_catalog_revisions_for_admin(
+            &current.principal.authz,
+            query.before_revision,
+            query.limit.unwrap_or(COLLECTION_PAGE_DEFAULT_LIMIT),
+        )
+        .await?;
+    json_no_store(page)
+}
+
+async fn get_knowledge_catalog_revision(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    Path(revision): Path<String>,
+) -> Result<Response, ApiError> {
+    let parsed_revision = revision.parse::<u64>().ok();
+    let revision = parsed_revision
+        .filter(|parsed| parsed.to_string() == revision)
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "invalid_knowledge_catalog_revision",
+                "Knowledge catalog revision must be a canonical unsigned integer",
+            )
+            .with_no_store()
+        })?;
+    let catalog: KnowledgeCatalogState = state
+        .store
+        .knowledge_catalog_revision_for_admin(&current.principal.authz, revision)
+        .await?;
+    json_no_store(catalog)
 }
 
 async fn create_member(
@@ -4721,6 +4775,13 @@ impl From<StoreError> for ApiError {
                 "knowledge_catalog_revision_conflict",
                 "Knowledge catalog revision conflict",
                 "The account knowledge catalog changed; refresh it and retry",
+            )
+            .with_no_store(),
+            StoreError::KnowledgeCatalogRevisionNotFound(revision) => Self::new(
+                StatusCode::NOT_FOUND,
+                "knowledge_catalog_revision_not_found",
+                "Knowledge catalog revision not found",
+                format!("Knowledge catalog revision {revision} does not exist"),
             )
             .with_no_store(),
             StoreError::InvalidKnowledgeCatalog(reason) => {
@@ -8512,7 +8573,187 @@ mod tests {
         assert_eq!(replay["catalog"], update["catalog"]);
         assert_eq!(replay["replayed"], true);
 
+        let second_body = serde_json::json!({
+            "expected_revision": 1,
+            "entries": [{
+                "entry_id": "knowledge-governance",
+                "revision": "1",
+                "title": "Knowledge governance",
+                "content": "Catalog recovery creates a new revision from exact historical corpus material."
+            }]
+        })
+        .to_string();
+        let second = app
+            .clone()
+            .oneshot(
+                Request::put("/api/v1/knowledge/catalog")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "knowledge-api-second")
+                    .body(Body::from(second_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second: serde_json::Value = response_json(second).await;
+        assert_eq!(second["catalog"]["revision"], 2);
+
+        let history = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/knowledge/catalog/revisions?limit=1")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(history.status(), StatusCode::OK);
+        assert_eq!(history.headers()[header::CACHE_CONTROL], "no-store");
+        let history: serde_json::Value = response_json(history).await;
+        assert_eq!(history["current_revision"], 2);
+        assert_eq!(history["items"].as_array().unwrap().len(), 1);
+        assert_eq!(history["items"][0]["revision"], 2);
+        assert_eq!(history["items"][0]["entry_count"], 1);
+        assert_eq!(history["next_before_revision"], 2);
+
+        let older = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/knowledge/catalog/revisions?before_revision=2&limit=1")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(older.status(), StatusCode::OK);
+        let older: serde_json::Value = response_json(older).await;
+        assert_eq!(older["items"][0]["revision"], 1);
+        assert!(older["next_before_revision"].is_null());
+
+        let historical = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/knowledge/catalog/revisions/1")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(historical.status(), StatusCode::OK);
+        assert_eq!(historical.headers()[header::CACHE_CONTROL], "no-store");
+        let historical: serde_json::Value = response_json(historical).await;
+        assert_eq!(historical["revision"], 1);
+        assert_eq!(
+            historical["corpus"]["entries"][0]["entry_id"],
+            "execution-epochs"
+        );
+
+        let baseline = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/knowledge/catalog/revisions/0")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(baseline.status(), StatusCode::OK);
+        let baseline: serde_json::Value = response_json(baseline).await;
+        assert_eq!(baseline["revision"], 0);
+        assert_eq!(baseline["corpus"]["entries"], serde_json::json!([]));
+
+        let restored = app
+            .clone()
+            .oneshot(
+                Request::put("/api/v1/knowledge/catalog")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "knowledge-api-restore-first")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "expected_revision": 2,
+                            "entries": historical["corpus"]["entries"].clone(),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(restored.status(), StatusCode::OK);
+        let restored: serde_json::Value = response_json(restored).await;
+        assert_eq!(restored["catalog"]["revision"], 3);
+        assert_eq!(
+            restored["catalog"]["corpus"]["digest"],
+            historical["corpus"]["digest"]
+        );
+
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/knowledge/catalog/revisions/4")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            missing,
+            StatusCode::NOT_FOUND,
+            "knowledge_catalog_revision_not_found",
+        )
+        .await;
+
+        let noncanonical = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/knowledge/catalog/revisions/01")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            noncanonical,
+            StatusCode::BAD_REQUEST,
+            "invalid_knowledge_catalog_revision",
+        )
+        .await;
+
+        let invalid_page = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/knowledge/catalog/revisions?before_revision=0")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(invalid_page, StatusCode::BAD_REQUEST, "invalid_page_cursor").await;
+
         let stale = app
+            .clone()
             .oneshot(
                 Request::put("/api/v1/knowledge/catalog")
                     .header(header::HOST, "zeus.test")

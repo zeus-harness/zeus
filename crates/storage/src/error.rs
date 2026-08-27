@@ -66,6 +66,8 @@ pub enum StorageError {
     AuditCheckpointConflict,
     #[error("the account knowledge catalog changed concurrently")]
     KnowledgeCatalogRevisionConflict,
+    #[error("account knowledge catalog revision {0} was not found")]
+    KnowledgeCatalogRevisionNotFound(u64),
     #[error("invalid account knowledge catalog: {0}")]
     InvalidKnowledgeCatalog(String),
     #[error(

@@ -62,7 +62,10 @@ capability 读取当时的 active corpus，随后仍把 exact corpus/snapshot �
 不连续或投影不一致，但与其它本地 commitment 一样，不是防止拥有任意数据库写权限者同时替换数据
 和校验逻辑的外部信任锚。Actor-scoped `agent/knowledge/explain` 返回已经固化的 selection snapshot
 与 binding/corpus/query/context digest，但不返回未命中的完整 account corpus；pre-v22 history 明确
-标记为 `legacy_unbound`，不伪造空 selection。
+标记为 `legacy_unbound`，不伪造空 selection。Owner-only catalog history 以 receipt revision 做
+newest-first 有界分页，列表只返回 digest/count/actor/timestamp 摘要，精确 revision 点查才解码并
+校验完整 corpus。revision 0 始终是隐式空基线；恢复历史 corpus 必须通过现有 expected-revision CAS
+写入新 head，不能原地改写旧 revision。
 
 ## 事件与状态
 
@@ -459,7 +462,9 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   closed。
 - Account knowledge catalog 的 owner/member capability、revision CAS、相同 key 精确重放、异输入
   冲突、重启持久性、receipt 篡改检测，以及“HTTP 入库后 Agent 真实命中 active entry”都有自动化
-  覆盖；catalog 更新不对已经持久化的 Agent 做 live reselection。
+  覆盖；catalog 更新不对已经持久化的 Agent 做 live reselection。历史列表/点查覆盖 owner 权限、
+  newest-first 分页、revision 0、缺失 revision、重启持久性，并证明读取旧 corpus 后通过 CAS `PUT`
+  只会创建新的恢复 revision。
 - 首次 bootstrap 只能消费一次 token；登录、CSRF、同源、Cookie 属性、设置 revision、退出后
   401 以及退出/失效后 SSE 关闭有自动化或 live 验收。
 - bootstrap audit 的 v11 reason 迁移、canonical digest、64 行多批压缩、rotation/open 降限、
