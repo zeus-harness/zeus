@@ -458,10 +458,14 @@ and bounded memory, CPU, and PID resources.
   identity, policy revision, workflow limits, and exact versioned tool
   contracts used for the turn. Model requests derive their visible tool list
   from that same manifest. Before a queued model or tool operation can reach an
-  external provider/executor, claim compares the persisted digest and binding
-  with the current runtime. Missing, corrupted, or drifted authority settles
-  durably as `deployment_unavailable` with zero external calls.
-- The model worker commits a `started` checkpoint before calling a provider.
+  external provider/executor, a durable `prepared` claim compares the persisted
+  digest and binding with the current runtime without authorizing external I/O.
+  The same worker can recover that exact claim after a transient storage error;
+  an expired prepared claim advances to a new generation while the operation
+  remains queued. Missing, corrupted, or drifted authority settles durably as
+  `deployment_unavailable` with zero external calls.
+- The model worker atomically advances the exact prepared claim and its
+  RunEpoch/workflow fact/job to `started` before calling a provider.
   Final text atomically stores the assistant message, appends
   `assistant_message` and `turn_flushed`, and returns the Session to `ready`.
   A tool proposal is matched against the server registry and current policy;
@@ -473,9 +477,11 @@ and bounded memory, CPU, and PID resources.
   bounded continuation cannot be represented, the known result remains known
   and the Agent fails as `continuation_unavailable`; it is never rewritten as
   `outcome_unknown`.
-- Queued Agent jobs survive restart and remain claimable. A model or tool
-  already marked `started` moves to `needs_attention` exactly once and is never
-  automatically replayed because the external call may have taken effect.
+- Queued Agent jobs survive restart and remain claimable. Startup expires
+  prepared-only claims without writing `outcome_unknown`, because they never
+  authorized external I/O. A model or tool already marked `started` moves to
+  `needs_attention` exactly once and is never automatically replayed because
+  the external call may have taken effect.
   Other open turns follow the same interruption/resume contract.
 - Session commands do not change the Run ledger or wake the dispatch worker.
   Session and Run are joined by durable ownership, not by sharing an event
@@ -500,6 +506,10 @@ and bounded memory, CPU, and PID resources.
 - A worker commits `ToolDispatchStarted` before invoking a connector. A queued
   job can resume after restart; a started job without a durable result becomes
   `outcome_unknown` and is never retried automatically.
+- The legacy reply worker observes the queued head without mutation, then
+  retains that exact job ID while retrying its atomic `started` transition.
+  An ambiguous database acknowledgement can therefore replay only the same
+  start; it cannot skip to another reply or cause a second provider call.
 - Reply and dispatch claims revalidate the approving actor's current status,
   role, and resource ownership. Revoked work is durably rejected with
   `authorization_revoked` evidence before any provider or connector can see
@@ -556,7 +566,11 @@ and bounded memory, CPU, and PID resources.
   stores immutable canonical deployment manifests and binds every newly
   admitted Agent turn to one digest; pre-v19 terminal history remains readable,
   while legacy queued work fails closed at claim instead of running under an
-  unproven deployment.
+  unproven deployment. Schema v20 adds immutable RunEpoch authority and an
+  Agent-local hash-chained execution-fact ledger. Schema v21 adds append-only,
+  generation-ordered prepared/start claims for model and tool operations;
+  prepared claims are safely recoverable, while started claims are released
+  only by a durable terminal result or conservative restart recovery.
   Existing Runs and events are decoded, validated, and migrated in place without
   rewriting their payloads. Runtime identity still binds profile, environment,
   primary Session and Run, policy ID, and policy revision; a mismatch fails
@@ -713,7 +727,7 @@ directly.
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Current schema v19 retains durable Run attachment during migration and demo
+Current schema v21 retains durable Run attachment during migration and demo
 seeding, but Alpha+ does not expose a public attach-Run HTTP route.
 
 The application boundary now caps auth JSON at 8 KiB and command JSON at
@@ -734,7 +748,7 @@ approval, dispatch, reply completion, attachment checks, and startup recovery
 use typed point queries or fixed 64-row batches. Production Session list/detail,
 Run detail, and overview reads now use indexed `LIMIT + 1` keyset pages inside
 actor-authorized SQLite snapshots; no production HTTP read loads a complete
-ledger or collection. Current schema v19 retains bounded Session, open-turn,
+ledger or collection. Current schema v21 retains bounded Session, open-turn,
 active reply/dispatch, auth-session, bootstrap-audit, event-slot, and logical
 event-payload-byte admission. Exact idempotent replay is checked before capacity,
 while accepted work consumes its reserved terminal slots and payload bytes
@@ -814,13 +828,14 @@ SQLite Operation Capacity Slice, Bootstrap Audit Retention, schema v13 Account
 Membership Foundation, schema v14 Account-scoped Durable Authorization, and
 schema v15 Member Lifecycle / Account Audit, schema v16 Session Reply Context
 Index, schema v17 Durable Session Agent Loop, schema v18 exact tool-completion
-replay, and schema v19 deployment-manifest binding host verification:
+replay, schema v19 deployment-manifest binding, schema v20 execution-ledger,
+and schema v21 prepared-claim host verification:
 
 - `cargo fmt --all -- --check`
-- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --all-features`: 436 tests passed under
-  the existing project counting convention, including 7 deployment tests, 199
-  storage tests, 47 runtime tests, 61 API library tests, 6 API main/config
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace --all-targets -- --test-threads=1`: 478 tests passed
+  under the existing project counting convention, including 7 deployment tests,
+  225 storage tests, 48 runtime tests, 63 API library tests, 6 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,
@@ -865,7 +880,9 @@ replay, and schema v19 deployment-manifest binding host verification:
   terminal replay queries, one-shot restart settlement of started work,
   canonical secret-free manifests, actor-scoped explainability, exact
   provider-visible tools, completion replay binding, and fail-closed
-  provider/tool/policy/profile drift.
+  provider/tool/policy/profile drift, prepared-claim exact recovery and expiry,
+  one RunEpoch per external start, no replay of started work, and exact replay
+  or conflict detection for a committed dispatch terminal acknowledgement.
 - `pnpm --filter web test`: 28 tests passed for CSRF headers, stable command
   identity, deep-page active-Session restore, Session-list cursor encoding and
   deduplication, bounded-tail retry reconciliation and Session-switch race

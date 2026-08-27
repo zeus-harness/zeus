@@ -42,20 +42,21 @@ pub use storage::{
     AccountAuditArchiveState, AccountAuditCheckpointCommit, AccountAuditEvent, AccountAuditPage,
     AccountAuditPolicy, AccountAuditRollup, AccountAuditState, AccountId, AgentFinalCompletion,
     AgentModelClaimOutcome, AgentModelCompletion, AgentModelFailureCommit, AgentModelJob,
-    AgentModelJobStatus, AgentModelResolution, AgentModelSuccessCommit, AgentReviewCommit,
-    AgentReviewContext, AgentReviewResult, AgentTerminalCompletion, AgentToolCall,
-    AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
-    AgentToolOutcomeUnknownCommit, AgentToolWork, AgentTurn, AgentTurnEnqueueResponse,
-    AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthSessionId, AuthzContext,
-    BootstrapOwnerCommit, CreateMemberResult, InFlightWorkSummary, MEMBER_SETUP_TOKEN_TTL_SECONDS,
-    MemberSetupCommit, MemberSetupResult, MemberSetupToken, MemberTransitionResult,
-    MembershipRevision, MembershipRole, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit,
-    ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
-    ReplySuccessCommit, RotateMemberSetupTokenResult, SessionSummaryPage, SqliteOperationLimits,
-    SqliteOperationLimitsError, SqlitePhysicalLimits, SqlitePhysicalLimitsError, StorageLimits,
-    StorageLimitsError, StoredCredential, StoredMember, StoredMemberPage, StoredMembershipStatus,
-    StoredPreferences, StoredUser, StoredUserRole, StoredUserStatus, TransitionMemberCommit,
-    UpdateAccountAuditPolicyCommit,
+    AgentModelJobStatus, AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit,
+    AgentOperationClaim, AgentOperationKind, AgentPreparedModel, AgentPreparedTool,
+    AgentReviewCommit, AgentReviewContext, AgentReviewResult, AgentTerminalCompletion,
+    AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion,
+    AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork,
+    AgentTurn, AgentTurnEnqueueResponse, AgentTurnSpec, AuthPrincipal, AuthSessionCommit,
+    AuthSessionId, AuthzContext, BootstrapOwnerCommit, CreateMemberResult, InFlightWorkSummary,
+    MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit, MemberSetupResult, MemberSetupToken,
+    MemberTransitionResult, MembershipRevision, MembershipRole, ReplyClaimOutcome, ReplyCompletion,
+    ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus,
+    ReplyOutcomeUnknownCommit, ReplySuccessCommit, RotateMemberSetupTokenResult,
+    SessionSummaryPage, SqliteOperationLimits, SqliteOperationLimitsError, SqlitePhysicalLimits,
+    SqlitePhysicalLimitsError, StorageLimits, StorageLimitsError, StoredCredential, StoredMember,
+    StoredMemberPage, StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserRole,
+    StoredUserStatus, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
 use storage::{
     ClaimOutcome, CommitOutcome, CreateMemberCommit, DispatchCompleteCommit, DispatchContext,
@@ -75,6 +76,7 @@ const SESSION_AGENT_SPEC_REVISION: &str = "1";
 const SESSION_AGENT_DEPLOYMENT_ID_PREFIX: &str = "zeus-session-agent";
 const SESSION_AGENT_DEPLOYMENT_REVISION: &str = "1";
 const INTERNAL_PROGRESS_RETRY_DELAY: Duration = Duration::from_millis(25);
+const INTERNAL_PROGRESS_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 const WORKER_IDLE: u8 = 0;
 const WORKER_RUNNING: u8 = 1;
 const WORKER_PENDING: u8 = 2;
@@ -171,6 +173,34 @@ where
                 tokio::time::sleep(INTERNAL_PROGRESS_RETRY_DELAY).await;
             }
             result => return result,
+        }
+    }
+}
+
+/// Keep one exact durable progress step in memory until its outcome is known.
+/// The closure may read or write durable state but must never invoke the
+/// external operation again.
+async fn retry_durable_progress<T, F, Fut>(label: &str, mut operation: F) -> Result<T, StoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, StoreError>>,
+{
+    let mut attempt = 1_u64;
+    let mut retry_delay = INTERNAL_PROGRESS_RETRY_DELAY;
+    loop {
+        match operation().await {
+            Ok(completion) => return Ok(completion),
+            Err(error) if error.is_retryable_durable_completion_error() => {
+                eprintln!(
+                    "zeus {label} durable attempt {attempt} failed; retrying the exact step without repeating external I/O: {error}"
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = retry_delay
+                    .saturating_mul(2)
+                    .min(INTERNAL_PROGRESS_RETRY_MAX_DELAY);
+                attempt = attempt.saturating_add(1);
+            }
+            Err(error) => return Err(error),
         }
     }
 }
@@ -1400,7 +1430,7 @@ impl DemoStore {
         session_id: &str,
     ) -> Result<SessionSummary, StoreError> {
         validate_durable_reference(session_id, "session ID")?;
-        retry_operation_capacity(|| async {
+        retry_durable_progress("Session progress read", || async {
             Ok(self
                 .storage
                 .session_summary_for_progress(session_id)
@@ -1701,11 +1731,12 @@ impl DemoStore {
         Ok(response)
     }
 
-    /// Durable model-worker claim façade. Storage revalidates the persisted
-    /// initiator before a provider may observe the returned request.
-    pub async fn claim_next_agent_model(
+    /// Durable model-worker preparation façade. This phase does not authorize
+    /// provider I/O and is therefore safe to reclaim after expiry or restart.
+    pub async fn prepare_next_agent_model(
         &self,
         manifest: &ManifestEnvelope,
+        holder_id: &str,
     ) -> Result<AgentModelClaimOutcome, StoreError> {
         let provider = &manifest.manifest.deployment.spec.provider;
         self.validate_session_agent_manifest_binding(
@@ -1715,7 +1746,10 @@ impl DemoStore {
         )?;
         loop {
             match retry_operation_capacity(|| async {
-                Ok(self.storage.claim_next_agent_model(manifest).await?)
+                Ok(self
+                    .storage
+                    .prepare_next_agent_model(manifest, holder_id)
+                    .await?)
             })
             .await?
             {
@@ -1732,12 +1766,68 @@ impl DemoStore {
         }
     }
 
+    /// Release one exact prepared model operation into its durable start
+    /// checkpoint. A rejection is already terminal and is published once.
+    pub async fn start_prepared_agent_model(
+        &self,
+        claim: &AgentOperationClaim,
+        manifest: &ManifestEnvelope,
+    ) -> Result<AgentModelStartOutcome, StoreError> {
+        let provider = &manifest.manifest.deployment.spec.provider;
+        self.validate_session_agent_manifest_binding(
+            manifest,
+            &provider.provider_id,
+            provider.model.as_deref(),
+        )?;
+        let outcome = retry_operation_capacity(|| async {
+            Ok(self
+                .storage
+                .start_prepared_agent_model(claim, manifest)
+                .await?)
+        })
+        .await?;
+        if let AgentModelStartOutcome::Rejected(completion) = &outcome
+            && !completion.replayed
+        {
+            self.publish_session_event(&completion.session.id, completion.event.clone());
+        }
+        Ok(outcome)
+    }
+
+    /// Compatibility façade for direct runtime integrations that expect one
+    /// call to return an already-started model operation. Server workers use
+    /// the explicit prepare/start boundary.
+    pub async fn claim_next_agent_model(
+        &self,
+        manifest: &ManifestEnvelope,
+    ) -> Result<AgentModelClaimOutcome, StoreError> {
+        match self
+            .prepare_next_agent_model(manifest, "runtime-direct-model-v1")
+            .await?
+        {
+            AgentModelClaimOutcome::Prepared(prepared) => {
+                match self
+                    .start_prepared_agent_model(&prepared.claim, manifest)
+                    .await?
+                {
+                    AgentModelStartOutcome::Started(job) => {
+                        Ok(AgentModelClaimOutcome::Claimed(job))
+                    }
+                    AgentModelStartOutcome::Rejected(completion) => {
+                        Ok(AgentModelClaimOutcome::Rejected(completion))
+                    }
+                }
+            }
+            outcome => Ok(outcome),
+        }
+    }
+
     /// Commit one trusted provider response after a claimed model checkpoint.
     pub async fn complete_agent_model_success(
         &self,
         commit: AgentModelSuccessCommit,
     ) -> Result<AgentModelCompletion, StoreError> {
-        let completion = retry_operation_capacity(|| async {
+        let completion = retry_durable_progress("Agent model completion", || async {
             Ok(self
                 .storage
                 .complete_agent_model_success(commit.clone())
@@ -1767,7 +1857,7 @@ impl DemoStore {
         &self,
         commit: AgentModelFailureCommit,
     ) -> Result<AgentTerminalCompletion, StoreError> {
-        let completion = retry_operation_capacity(|| async {
+        let completion = retry_durable_progress("Agent model failure", || async {
             Ok(self
                 .storage
                 .complete_agent_model_failure(commit.clone())
@@ -1780,11 +1870,12 @@ impl DemoStore {
         Ok(completion)
     }
 
-    /// Durable tool-worker claim façade. A rejected claim has already
-    /// terminalized its Session, so it is published and skipped locally.
-    pub async fn claim_next_agent_tool(
+    /// Durable tool-worker preparation façade. A rejected preparation has
+    /// already terminalized its Session, so it is published and skipped.
+    pub async fn prepare_next_agent_tool(
         &self,
         manifest: &ManifestEnvelope,
+        holder_id: &str,
     ) -> Result<AgentToolClaimOutcome, StoreError> {
         let provider = &manifest.manifest.deployment.spec.provider;
         self.validate_session_agent_manifest_binding(
@@ -1794,7 +1885,10 @@ impl DemoStore {
         )?;
         loop {
             match retry_operation_capacity(|| async {
-                Ok(self.storage.claim_next_agent_tool(manifest).await?)
+                Ok(self
+                    .storage
+                    .prepare_next_agent_tool(manifest, holder_id)
+                    .await?)
             })
             .await?
             {
@@ -1811,12 +1905,40 @@ impl DemoStore {
         }
     }
 
+    /// Release one exact prepared tool operation into its durable start
+    /// checkpoint. A rejection is already terminal and is published once.
+    pub async fn start_prepared_agent_tool(
+        &self,
+        claim: &AgentOperationClaim,
+        manifest: &ManifestEnvelope,
+    ) -> Result<AgentToolStartOutcome, StoreError> {
+        let provider = &manifest.manifest.deployment.spec.provider;
+        self.validate_session_agent_manifest_binding(
+            manifest,
+            &provider.provider_id,
+            provider.model.as_deref(),
+        )?;
+        let outcome = retry_operation_capacity(|| async {
+            Ok(self
+                .storage
+                .start_prepared_agent_tool(claim, manifest)
+                .await?)
+        })
+        .await?;
+        if let AgentToolStartOutcome::Rejected(completion) = &outcome
+            && !completion.replayed
+        {
+            self.publish_session_event(&completion.session.id, completion.event.clone());
+        }
+        Ok(outcome)
+    }
+
     /// Commit one known connector result and its immutable continuation.
     pub async fn complete_agent_tool(
         &self,
         commit: AgentToolCompletionCommit,
     ) -> Result<AgentToolCompletion, StoreError> {
-        let completion = retry_operation_capacity(|| async {
+        let completion = retry_durable_progress("Agent tool completion", || async {
             Ok(self.storage.complete_agent_tool(commit.clone()).await?)
         })
         .await?;
@@ -1833,7 +1955,7 @@ impl DemoStore {
         &self,
         commit: AgentToolOutcomeUnknownCommit,
     ) -> Result<AgentTerminalCompletion, StoreError> {
-        let completion = retry_operation_capacity(|| async {
+        let completion = retry_durable_progress("Agent tool unknown outcome", || async {
             Ok(self
                 .storage
                 .complete_agent_tool_outcome_unknown(commit.clone())
@@ -2009,9 +2131,20 @@ impl DemoStore {
     /// storage revalidates the persisted initiating authority atomically.
     pub async fn claim_next_reply(&self) -> Result<ReplyClaimOutcome, StoreError> {
         loop {
-            match retry_operation_capacity(|| async { Ok(self.storage.claim_next_reply().await?) })
-                .await?
-            {
+            let Some(observed) = retry_durable_progress("reply queue observation", || async {
+                Ok(self.storage.peek_next_reply().await?)
+            })
+            .await?
+            else {
+                return Ok(ReplyClaimOutcome::NotAvailable);
+            };
+            let job_id = observed.id;
+            let outcome = retry_durable_progress("reply exact start", || {
+                let job_id = job_id.clone();
+                async move { Ok(self.storage.start_observed_reply(&job_id).await?) }
+            })
+            .await?;
+            match outcome {
                 ReplyClaimOutcome::Rejected(completion) => {
                     // Storage committed the terminal failure before returning.
                     // Publish only as a post-commit wake hint and continue to
@@ -2020,6 +2153,10 @@ impl DemoStore {
                     for event in &completion.events {
                         self.publish_session_event(&completion.session.id, event.clone());
                     }
+                }
+                ReplyClaimOutcome::NotAvailable => {
+                    // The observation lost a race before its exact start. A
+                    // fresh read may now expose the next stable queue head.
                 }
                 outcome => return Ok(outcome),
             }
@@ -2040,7 +2177,7 @@ impl DemoStore {
         &self,
         commit: ReplySuccessCommit,
     ) -> Result<ReplyCompletion, StoreError> {
-        let completion = retry_operation_capacity(|| async {
+        let completion = retry_durable_progress("reply success", || async {
             Ok(self.storage.complete_reply_success(commit.clone()).await?)
         })
         .await?;
@@ -2057,7 +2194,7 @@ impl DemoStore {
         &self,
         commit: ReplyFailureCommit,
     ) -> Result<ReplyCompletion, StoreError> {
-        let completion = retry_operation_capacity(|| async {
+        let completion = retry_durable_progress("reply failure", || async {
             Ok(self.storage.complete_reply_failure(commit.clone()).await?)
         })
         .await?;
@@ -2074,7 +2211,7 @@ impl DemoStore {
         &self,
         commit: ReplyOutcomeUnknownCommit,
     ) -> Result<ReplyCompletion, StoreError> {
-        let completion = retry_operation_capacity(|| async {
+        let completion = retry_durable_progress("reply unknown outcome", || async {
             Ok(self
                 .storage
                 .complete_reply_outcome_unknown(commit.clone())
@@ -2401,10 +2538,22 @@ impl DemoStore {
         }
         let store = self.clone();
         tokio::spawn(async move {
+            let mut retry_delay = INTERNAL_PROGRESS_RETRY_DELAY;
             loop {
-                if let Err(error) = store.dispatch_pending().await {
-                    eprintln!("zeus dispatcher stopped: {error}");
-                    tokio::time::sleep(INTERNAL_PROGRESS_RETRY_DELAY).await;
+                match store.dispatch_pending().await {
+                    Err(error) if error.is_retryable_durable_completion_error() => {
+                        eprintln!("zeus dispatcher retrying durable queue: {error}");
+                        store.dispatcher_wake.request();
+                        tokio::time::sleep(retry_delay).await;
+                        retry_delay = retry_delay
+                            .saturating_mul(2)
+                            .min(INTERNAL_PROGRESS_RETRY_MAX_DELAY);
+                    }
+                    Err(error) => {
+                        eprintln!("zeus dispatcher stopped on a permanent queue error: {error}");
+                        retry_delay = INTERNAL_PROGRESS_RETRY_DELAY;
+                    }
+                    Ok(()) => retry_delay = INTERNAL_PROGRESS_RETRY_DELAY,
                 }
                 if !store.dispatcher_wake.complete_cycle() {
                     return;
@@ -2588,7 +2737,7 @@ impl DemoStore {
             event: transition.event,
             result_json,
         };
-        retry_operation_capacity(|| async {
+        retry_durable_progress("dispatch completion", || async {
             Ok(self.storage.complete_dispatch(commit.clone()).await?)
         })
         .await?;
@@ -2636,7 +2785,7 @@ impl DemoStore {
                     event: transition.event,
                     result_json,
                 };
-                retry_operation_capacity(|| async {
+                retry_durable_progress("dispatch recovery", || async {
                     Ok(self.storage.recover_started(commit.clone()).await?)
                 })
                 .await?;
@@ -2666,7 +2815,7 @@ impl DemoStore {
         &self,
         run_id: &str,
     ) -> Result<RunSnapshot, StoreError> {
-        retry_operation_capacity(|| async {
+        retry_durable_progress("dispatch result snapshot read", || async {
             Ok(self
                 .storage
                 .consistent_snapshot_for_progress(run_id)
@@ -4123,6 +4272,28 @@ mod tests {
             Err(StoreError::RunNotFound(run_id)) if run_id == "fatal"
         ));
         assert_eq!(fatal_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn durable_completion_retry_retains_the_exact_result() {
+        let attempts = Arc::new(AtomicU64::new(0));
+        let observed_result = Arc::new(String::from("exact-dispatch-result"));
+        let result = retry_durable_progress("test dispatch", || {
+            let attempts = Arc::clone(&attempts);
+            let observed_result = Arc::clone(&observed_result);
+            async move {
+                if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                    Err(StoreError::ConcurrentModification)
+                } else {
+                    Ok(observed_result)
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(Arc::ptr_eq(&result, &observed_result));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 
     #[test]

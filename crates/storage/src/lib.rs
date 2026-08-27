@@ -368,8 +368,8 @@ impl fmt::Debug for AuthSessionCommit {
 /// Immutable inputs for one durable assistant reply.
 ///
 /// The provider request is persisted in the same transaction as the user turn.
-/// Provider execution must not begin until [`SqliteStore::claim_next_reply`]
-/// returns this job as claimed.
+/// Provider execution must not begin until a storage claim/start operation
+/// returns this exact job as started.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ReplyJobSpec {
     pub id: String,
@@ -644,8 +644,96 @@ pub struct AgentModelFailureCommit {
     pub outcome_unknown: bool,
 }
 
+/// Durable operation lane protected by one prepared-claim generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentOperationKind {
+    Model,
+    Tool,
+}
+
+/// Single-process durable coordination token between queue preparation and an
+/// external-I/O start checkpoint. It is not a distributed lease.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentOperationClaim {
+    pub kind: AgentOperationKind,
+    pub operation_id: String,
+    pub agent_id: String,
+    pub generation: u64,
+    pub holder_id: String,
+    pub acquired_at: String,
+    pub expires_at: String,
+}
+
+impl AgentOperationClaim {
+    pub(crate) fn validate(&self) -> Result<(), StorageError> {
+        fn validate_identity(
+            value: &str,
+            field: &str,
+            max_bytes: usize,
+        ) -> Result<(), StorageError> {
+            if value.is_empty()
+                || value.len() > max_bytes
+                || value.trim() != value
+                || value.chars().any(char::is_control)
+            {
+                return Err(StorageError::InvalidAgentTransition(format!(
+                    "{field} must be non-empty, canonical, control-free, and at most {max_bytes} UTF-8 bytes"
+                )));
+            }
+            Ok(())
+        }
+
+        validate_identity(&self.operation_id, "Agent operation ID", 384)?;
+        validate_identity(&self.agent_id, "Agent ID", 384)?;
+        validate_identity(&self.holder_id, "Agent operation holder ID", 128)?;
+        if self.generation == 0 || self.generation > i64::MAX as u64 {
+            return Err(StorageError::InvalidAgentTransition(
+                "Agent operation claim generation must be a positive SQLite integer".into(),
+            ));
+        }
+        validate_identity(&self.acquired_at, "Agent operation claim acquired_at", 64)?;
+        validate_identity(&self.expires_at, "Agent operation claim expires_at", 64)?;
+        let acquired_at =
+            chrono::DateTime::parse_from_rfc3339(&self.acquired_at).map_err(|_| {
+                StorageError::InvalidAgentTransition(
+                    "Agent operation claim acquired_at must be RFC 3339".into(),
+                )
+            })?;
+        let expires_at = chrono::DateTime::parse_from_rfc3339(&self.expires_at).map_err(|_| {
+            StorageError::InvalidAgentTransition(
+                "Agent operation claim expires_at must be RFC 3339".into(),
+            )
+        })?;
+        if acquired_at >= expires_at {
+            return Err(StorageError::InvalidAgentTransition(
+                "Agent operation claim must expire after it is acquired".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Immutable model work observed while its operation claim is prepared but
+/// before the billable provider start checkpoint is committed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentPreparedModel {
+    pub claim: AgentOperationClaim,
+    pub job: AgentModelJob,
+}
+
+/// Immutable tool work observed while its operation claim is prepared but
+/// before the side-effecting executor start checkpoint is committed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentPreparedTool {
+    pub claim: AgentOperationClaim,
+    pub work: AgentToolWork,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum AgentModelClaimOutcome {
+    Prepared(Box<AgentPreparedModel>),
+    /// Compatibility projection for callers that deliberately combine the
+    /// prepared and started storage phases. Runtime workers use `Prepared`.
     Claimed(Box<AgentModelJob>),
     Rejected(Box<AgentTerminalCompletion>),
     NotAvailable,
@@ -653,9 +741,30 @@ pub enum AgentModelClaimOutcome {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AgentToolClaimOutcome {
+    Prepared(Box<AgentPreparedTool>),
+    /// Compatibility projection for callers that deliberately combine the
+    /// prepared and started storage phases. Runtime workers use `Prepared`.
     Claimed(Box<AgentToolWork>),
     Rejected(Box<AgentTerminalCompletion>),
     NotAvailable,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AgentModelStartOutcome {
+    /// The exact claim is durably started. This can be an exact response
+    /// replay after an ambiguous commit; a caller must retain one execution
+    /// context and invoke provider I/O at most once for the claim.
+    Started(Box<AgentModelJob>),
+    Rejected(Box<AgentTerminalCompletion>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AgentToolStartOutcome {
+    /// The exact claim is durably started. This can be an exact response
+    /// replay after an ambiguous commit; a caller must retain one execution
+    /// context and invoke connector I/O at most once for the claim.
+    Started(Box<AgentToolWork>),
+    Rejected(Box<AgentTerminalCompletion>),
 }
 
 /// Complete immutable context required to execute one claimed tool and build

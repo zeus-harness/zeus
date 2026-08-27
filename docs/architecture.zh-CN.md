@@ -29,7 +29,7 @@ Client / SvelteKit Web
 - `authz`：account capability matrix，以及精确工具名规则、策略 revision、环境和 effect guard；没有命中即拒绝。
 - `tools`：工具描述、注册表、参数验证和 object-safe executor 边界。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
-- `storage`：schema v19 migration、`acc_local` membership 权威、一次性 member setup、用户/偏好、
+- `storage`：schema v21 migration、`acc_local` membership 权威、一次性 member setup、用户/偏好、
   account audit/rollup/policy/archive state、独立 Session/Run ledger、typed event lookup、
   account+actor-scoped 回执、durable Agent/model/tool/dispatch queue、不可变 deployment manifest，
   以及 actor/account/global logical capacity、physical capacity 和 operation capacity。
@@ -166,16 +166,17 @@ connector 在数据库事务和锁之外运行。
 
 API 监听端口之前按固定顺序完成：
 
-1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v19；按当前
+1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v21；按当前
    detailed-row limit 以最多 64 行 batch 压缩 bootstrap terminal audit prefix，再按稳定
    `(priority actor, expires_at, auth-session ID)` 顺序最多清理 64 个过期或绑定
    missing/disabled/suspended/stale-revision authority 的 auth session。
 2. 绑定并核对 runtime identity、primary Session/Run 和 demo attachment。
 3. 以固定 64 行 batch 读取 `started` 且没有持久结果的 legacy reply job，循环排空：结算为
    `outcome_unknown`，追加 `turn_interrupted`，不得重放可能已经计费的 provider 请求。
-4. 再循环处理 Agent 中已 `started` 的 model/tool operation：两者都结算为 `outcome_unknown`，
-   Agent/Session 进入 `needs_attention`，且绝不重放可能已计费或已产生副作用的外部调用。queued
-   model/tool work 没有 checkpoint，保持可领取；waiting-for-approval 原样保留。
+4. 先把 Agent 中仅 `prepared` 的 model/tool claim 标为 expired；这些 claim 没有外部 I/O
+   权限，底层 operation 仍为 queued，可由下一 generation 安全继续。再循环处理已 `started`
+   的 model/tool operation：两者都结算为 `outcome_unknown`，Agent/Session 进入
+   `needs_attention`，且绝不重放可能已计费或已产生副作用的外部调用；waiting-for-approval 原样保留。
 5. 随后以固定 64 行 batch 处理没有 durable terminal 解释的其它 open Session turn：标记
    `interrupted`、追加 `turn_interrupted`，不生成 flush ack，也不修改 Run ledger。
 6. 以固定 64 行 batch 循环处理 started 且没有 ToolResult 的 Run dispatch：追加 `OutcomeUnknown`，Run 进入
@@ -326,8 +327,11 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   SQLite，`/health/ready` 进入 operation gate 失败时返回脱敏 `503`。
 - 内部 reply/dispatch worker 对 operation capacity 使用固定 25 ms 延迟继续重试，并保留已经
   产生的 provider/connector outcome 直到幂等 completion 成功。wake state 把任意重复 kick
-  合并为一个 running worker 与至多一个 pending cycle；非 capacity 错误只在已有 pending cycle
-  时延迟后再 drain，避免在 worker mutex 后堆积或忙转 Tokio task。
+  合并为一个 running worker 与至多一个 pending cycle。可恢复的 durable queue 错误按 25 ms
+  到 1 s 有界指数退避继续 drain，避免一次错误让 queued work 永久失联，也避免忙转 Tokio task；
+  不可恢复的 contract/corruption 错误记录后停止当前 worker，不做永久 1 Hz 自旋。
+  Agent 的 prepare 不授权外部 I/O；worker 必须持有同一 claim 重试 exact start，只有确认过期后
+  才返回 prepare 取得下一 generation。start 成功后只能重试幂等 completion，不能再次外调。
 - provider 与 connector future 在独立 Tokio task 内执行；panic 不会把 wake state 永久留在
   running，而是在 durable started checkpoint 之后按 at-most-once 语义结算为
   `outcome_unknown`，不重试外部操作。
@@ -390,7 +394,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   事务中认领一次。v13→v14 再原地重建 auth session、receipt、reply/dispatch job 与 reservation；
   configured/unconfigured active work、窄化 NULL claim、owner-only auth 保留和 version-13 原子回滚
   都有确定性覆盖。后续 v15 member/audit、v16 context index、v17 Agent loop、v18 exact tool
-  completion replay 与 v19 deployment manifest 也覆盖 fresh schema 和历史原地迁移。
+  completion replay、v19 deployment manifest、v20 RunEpoch/execution fact ledger 与 v21
+  prepared operation claim 也覆盖 fresh schema 和历史原地迁移。
 - 重启后用户/偏好、Session/turn/event、Agent/model/tool job、deployment manifest、Run/Event、
   审批决定、dispatch job 和命令回执仍存在。
 - Session start 与 Agent/first-model enqueue/manifest binding 同事务；最终 reply 把 assistant
@@ -404,6 +409,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
 - checkpoint 写入失败时外部副作用为零。
 - Agent/legacy reply/dispatch 排队后 actor 被禁用、降权或失去 ownership 时，claim 写入 durable
   `authorization_revoked` 终态，provider/connector 调用数为零。
+- legacy reply worker 先只读观察队首，再在同一执行上下文中保留固定 job ID 重试精确 start；
+  start commit 的 ACK 模糊时只重放同一条 started/rejected 结果，不会选择下一条 queued work。
 - Agent model/tool、legacy reply 或 dispatch 在 started 后模拟崩溃，均恢复为
   `outcome_unknown` 且不发生第二次外部执行。
 - 新 Agent 的 manifest canonical/digest/reuse/secret-free、actor isolation、provider-visible tools
@@ -444,8 +451,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   刷新恢复、owner/member setup/登录、owner 成员与 audit 管理、设置/退出和
   system/light/dark。member 的审批卡只读。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化按项目既有统计口径是 436 个 Rust 测试（其中 deployment 7、storage 199、
-  runtime 47、API library 61、API main/config 6）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化按项目既有统计口径是 478 个 Rust 测试（其中 deployment 7、storage 225、
+  runtime 48、API library 63、API main/config 6）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
 提交 `af29089` 曾构建并运行在独立 `zeus-operation-acceptance` project（端口 `18089`）；既有

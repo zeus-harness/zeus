@@ -253,6 +253,17 @@ POST /sessions/{id}/turns
 - `0016_session_reply_context_index.sql`：为 `assistant_message` Session event 增加 partial index，
   使模型上下文按 `expected_sequence` 直接读取最新至多 31 个完整 user/assistant 对；合法的
   assistant-less flush 被排除，查询不再收集完整 Session ledger。
+- `0017_session_agent_loop.sql`：增加 Session-native Agent、immutable model job、顺序 tool call、
+  approval receipt 与固定 loop limit。
+- `0018_agent_tool_completion_replay.sql`：把 known tool result 绑定到 exact continuation request，
+  completion 重放不能在重启后改变下一次模型输入。
+- `0019_agent_deployment_manifest.sql`：持久化 canonical、secret-free deployment manifest，并把
+  每个新 Agent turn 绑定到不可变 digest；无法证明绑定的 legacy queued work fail closed。
+- `0020_agent_execution_ledger.sql`：为每次真正 external start 写入 immutable RunEpoch，并以
+  Agent-local hash chain 记录 workflow transition；legacy history 只记录诚实的不完整 snapshot。
+- `0021_agent_operation_claims.sql`：在 external start 之前增加 append-only prepared claim 与连续
+  generation。prepared 可过期/重领且不写 unknown；started 不按 TTL 重放，只能由 durable
+  terminal commit 或启动恢复释放。
 
 迁移必须原地保留 Alpha append-only ledger、事件外键与 runtime identity。任何一步失败都回滚整个 migration transaction。
 
@@ -269,7 +280,8 @@ POST /sessions/{id}/turns
   使用 primary Session identity 判断主 Run 展示，不把 attachment tail 误当全集。
 - user message 之后由服务端产生 durable assistant/failure event；浏览器不能提交 assistant content。
 - `system/light/dark` 首屏无闪白，刷新后保持，系统主题变化可跟随。
-- reply job 的 queued/start/success/failure/outcome_unknown 和重启语义有存储测试。
+- reply job 的只读队首观察、固定 job ID 精确 start/replay、queued/start/success/failure/
+  outcome_unknown 和重启语义有存储测试；模糊 start ACK 不会跳到下一条任务。
 - v8 到 v9 的 typed lookup 回填不改写 payload；不连续 ledger 整体回滚，64+1 条恢复任务
   通过两批排空，同 key 并发审批只提交一次并重放其余响应。
 - v9 到 v10 为既有 open turn、queued dispatch 和 started dispatch 分别回填 2/2/1 个
@@ -303,7 +315,7 @@ POST /sessions/{id}/turns
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 按项目既有统计口径通过 342 个 Rust 测试（storage 174、runtime 33、API library 51、API
+- host 按项目既有统计口径通过 478 个 Rust 测试（storage 225、runtime 48、API library 63、API
   main/config 6）与 28 个 Web Node 测试。
 - `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 

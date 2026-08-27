@@ -7,10 +7,11 @@
 use super::*;
 use crate::{
     AgentFinalCompletion, AgentModelClaimOutcome, AgentModelCompletion, AgentModelFailureCommit,
-    AgentModelJobStatus, AgentModelResolution, AgentModelSuccessCommit, AgentReviewCommit,
-    AgentReviewContext, AgentReviewResult, AgentTerminalCompletion, AgentToolCall,
-    AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
-    AgentToolOutcomeUnknownCommit, AgentToolWork,
+    AgentModelJobStatus, AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit,
+    AgentOperationClaim, AgentOperationKind, AgentPreparedModel, AgentPreparedTool,
+    AgentReviewCommit, AgentReviewContext, AgentReviewResult, AgentTerminalCompletion,
+    AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion,
+    AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork,
 };
 use ::execution::{DigestDomain, FactSource, OperationRef, Sha256Digest};
 use deployment::ManifestEnvelope;
@@ -32,21 +33,84 @@ const AGENT_ERROR_JSON_MAX_BYTES: usize = 32 * 1024;
 const AGENT_TOOL_ARGUMENTS_MAX_BYTES: usize = 16 * 1024;
 const AGENT_TOOL_RESULT_JSON_MAX_BYTES: usize = 64 * 1024;
 const AGENT_DEPLOYMENT_MANIFEST_MAX_BYTES: usize = 256 * 1024;
+const AGENT_OPERATION_HOLDER_MAX_BYTES: usize = 128;
+const AGENT_OPERATION_CLAIM_TTL_SECONDS: i64 = 30;
 
 impl SqliteStore {
-    /// Claims one queued model step. The returned job is externally callable
-    /// only because its `started` state and workflow transition have committed.
+    /// Durably prepares one queued model step without authorizing external I/O.
+    /// A process crash in this phase is safe to reclaim because the job and
+    /// Agent workflow both remain queued.
+    pub async fn prepare_next_agent_model(
+        &self,
+        current_manifest: &ManifestEnvelope,
+        holder_id: &str,
+    ) -> Result<AgentModelClaimOutcome, StorageError> {
+        validate_manifest_envelope(current_manifest, "current Agent deployment manifest")?;
+        let holder_id = normalized_account_value(
+            holder_id,
+            "Agent operation holder ID",
+            AGENT_OPERATION_HOLDER_MAX_BYTES,
+        )?
+        .to_owned();
+        let current_manifest = current_manifest.clone();
+        let physical_limits = self.physical_limits.clone();
+        self.with_progress_connection(move |connection| {
+            prepare_next_agent_model(connection, &current_manifest, &holder_id, &physical_limits)
+        })
+        .await
+    }
+
+    /// Releases one exact prepared model claim into the durable `started`
+    /// checkpoint. Only one retained execution context may use the returned
+    /// job for provider I/O; exact response replay does not grant a second
+    /// external invocation.
+    pub async fn start_prepared_agent_model(
+        &self,
+        claim: &AgentOperationClaim,
+        current_manifest: &ManifestEnvelope,
+    ) -> Result<AgentModelStartOutcome, StorageError> {
+        claim.validate()?;
+        if claim.kind != AgentOperationKind::Model {
+            return Err(StorageError::InvalidAgentTransition(
+                "a model start requires a model operation claim".into(),
+            ));
+        }
+        validate_manifest_envelope(current_manifest, "current Agent deployment manifest")?;
+        let claim = claim.clone();
+        let current_manifest = current_manifest.clone();
+        let physical_limits = self.physical_limits.clone();
+        self.with_progress_connection(move |connection| {
+            start_prepared_agent_model(connection, &claim, &current_manifest, &physical_limits)
+        })
+        .await
+    }
+
+    /// Compatibility façade that prepares and starts a model operation before
+    /// returning it. Server workers use the explicit two-phase methods above;
+    /// this keeps direct storage integrations on their original contract.
     pub async fn claim_next_agent_model(
         &self,
         current_manifest: &ManifestEnvelope,
     ) -> Result<AgentModelClaimOutcome, StorageError> {
-        validate_manifest_envelope(current_manifest, "current Agent deployment manifest")?;
-        let current_manifest = current_manifest.clone();
-        let physical_limits = self.physical_limits.clone();
-        self.with_progress_connection(move |connection| {
-            claim_next_agent_model(connection, &current_manifest, &physical_limits)
-        })
-        .await
+        match self
+            .prepare_next_agent_model(current_manifest, "storage-direct-model-v1")
+            .await?
+        {
+            AgentModelClaimOutcome::Prepared(prepared) => {
+                match self
+                    .start_prepared_agent_model(&prepared.claim, current_manifest)
+                    .await?
+                {
+                    AgentModelStartOutcome::Started(job) => {
+                        Ok(AgentModelClaimOutcome::Claimed(job))
+                    }
+                    AgentModelStartOutcome::Rejected(completion) => {
+                        Ok(AgentModelClaimOutcome::Rejected(completion))
+                    }
+                }
+            }
+            outcome => Ok(outcome),
+        }
     }
 
     /// Commits one trusted provider response and the next durable loop state.
@@ -77,20 +141,79 @@ impl SqliteStore {
         .await
     }
 
-    /// Claims one already-admitted tool call after persisting its sole
-    /// `started` checkpoint. The returned model job is the exact transcript
-    /// authority from which the continuation must be built.
+    /// Durably prepares one already-admitted tool call without authorizing
+    /// connector I/O. Its exact model transcript remains attached to the
+    /// returned preparation.
+    pub async fn prepare_next_agent_tool(
+        &self,
+        current_manifest: &ManifestEnvelope,
+        holder_id: &str,
+    ) -> Result<AgentToolClaimOutcome, StorageError> {
+        validate_manifest_envelope(current_manifest, "current Agent deployment manifest")?;
+        let holder_id = normalized_account_value(
+            holder_id,
+            "Agent operation holder ID",
+            AGENT_OPERATION_HOLDER_MAX_BYTES,
+        )?
+        .to_owned();
+        let current_manifest = current_manifest.clone();
+        let physical_limits = self.physical_limits.clone();
+        self.with_progress_connection(move |connection| {
+            prepare_next_agent_tool(connection, &current_manifest, &holder_id, &physical_limits)
+        })
+        .await
+    }
+
+    /// Releases one exact prepared tool claim into the durable `started`
+    /// checkpoint. Only one retained execution context may use the returned
+    /// work for connector I/O; exact response replay does not grant a second
+    /// external invocation.
+    pub async fn start_prepared_agent_tool(
+        &self,
+        claim: &AgentOperationClaim,
+        current_manifest: &ManifestEnvelope,
+    ) -> Result<AgentToolStartOutcome, StorageError> {
+        claim.validate()?;
+        if claim.kind != AgentOperationKind::Tool {
+            return Err(StorageError::InvalidAgentTransition(
+                "a tool start requires a tool operation claim".into(),
+            ));
+        }
+        validate_manifest_envelope(current_manifest, "current Agent deployment manifest")?;
+        let claim = claim.clone();
+        let current_manifest = current_manifest.clone();
+        let physical_limits = self.physical_limits.clone();
+        self.with_progress_connection(move |connection| {
+            start_prepared_agent_tool(connection, &claim, &current_manifest, &physical_limits)
+        })
+        .await
+    }
+
+    /// Compatibility façade that prepares and starts a tool operation before
+    /// returning it. Server workers use the explicit two-phase methods above.
     pub async fn claim_next_agent_tool(
         &self,
         current_manifest: &ManifestEnvelope,
     ) -> Result<AgentToolClaimOutcome, StorageError> {
-        validate_manifest_envelope(current_manifest, "current Agent deployment manifest")?;
-        let current_manifest = current_manifest.clone();
-        let physical_limits = self.physical_limits.clone();
-        self.with_progress_connection(move |connection| {
-            claim_next_agent_tool(connection, &current_manifest, &physical_limits)
-        })
-        .await
+        match self
+            .prepare_next_agent_tool(current_manifest, "storage-direct-tool-v1")
+            .await?
+        {
+            AgentToolClaimOutcome::Prepared(prepared) => {
+                match self
+                    .start_prepared_agent_tool(&prepared.claim, current_manifest)
+                    .await?
+                {
+                    AgentToolStartOutcome::Started(work) => {
+                        Ok(AgentToolClaimOutcome::Claimed(work))
+                    }
+                    AgentToolStartOutcome::Rejected(completion) => {
+                        Ok(AgentToolClaimOutcome::Rejected(completion))
+                    }
+                }
+            }
+            outcome => Ok(outcome),
+        }
     }
 
     /// Commits a known connector result together with the next immutable model
@@ -263,16 +386,45 @@ impl SqliteStore {
     }
 }
 
-fn claim_next_agent_model(
+fn prepare_next_agent_model(
     connection: &mut Connection,
     current_manifest: &ManifestEnvelope,
+    holder_id: &str,
     physical_limits: &SqlitePhysicalLimits,
 ) -> Result<AgentModelClaimOutcome, StorageError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (timestamp, expires_at) = agent_operation_claim_window()?;
+    expire_prepared_agent_operation_claims(&transaction, &timestamp)?;
+    if let Some(claim) = query_prepared_agent_operation_claim_for_holder(
+        &transaction,
+        AgentOperationKind::Model,
+        holder_id,
+    )? {
+        let job = query_agent_model_job_by_id(&transaction, &claim.operation_id)?;
+        if job.agent_id != claim.agent_id
+            || job.status != AgentModelJobStatus::Queued
+            || job.attempt != 0
+        {
+            return Err(StorageError::CorruptData(
+                "a prepared model claim disagrees with its durable job".into(),
+            ));
+        }
+        transaction.commit()?;
+        return Ok(AgentModelClaimOutcome::Prepared(Box::new(
+            AgentPreparedModel { claim, job },
+        )));
+    }
     let job_id = transaction
         .query_row(
             r#"SELECT id FROM agent_model_jobs
-               WHERE status = 'queued' ORDER BY queued_at, id LIMIT 1"#,
+               WHERE status = 'queued'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM agent_operation_claims claim
+                     WHERE claim.operation_kind = 'model'
+                       AND claim.operation_id = agent_model_jobs.id
+                       AND claim.phase IN ('prepared', 'started')
+                 )
+               ORDER BY queued_at, id LIMIT 1"#,
             [],
             |row| row.get::<_, String>(0),
         )
@@ -290,8 +442,6 @@ fn claim_next_agent_model(
         physical_limits,
         PhysicalCapacityGate::ReservedProgress,
     )?;
-    let timestamp = now();
-
     if !agent_deployment_matches_current(&transaction, &agent, Some(&job), None, current_manifest)?
     {
         let error_json = deployment_unavailable_error(
@@ -394,6 +544,160 @@ fn claim_next_agent_model(
         return Ok(AgentModelClaimOutcome::Rejected(Box::new(completion)));
     }
 
+    let claim = insert_prepared_agent_operation_claim(
+        &transaction,
+        AgentOperationKind::Model,
+        &job.id,
+        &job.agent_id,
+        holder_id,
+        &timestamp,
+        &expires_at,
+    )?;
+    transaction.commit()?;
+    Ok(AgentModelClaimOutcome::Prepared(Box::new(
+        AgentPreparedModel { claim, job },
+    )))
+}
+
+fn start_prepared_agent_model(
+    connection: &mut Connection,
+    claim: &AgentOperationClaim,
+    current_manifest: &ManifestEnvelope,
+    physical_limits: &SqlitePhysicalLimits,
+) -> Result<AgentModelStartOutcome, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let timestamp = now();
+    let stored_claim = query_agent_operation_claim(&transaction, claim)?;
+    let job = query_agent_model_job_by_id(&transaction, &claim.operation_id)?;
+    if job.agent_id != claim.agent_id {
+        return Err(StorageError::ConcurrentModification);
+    }
+    if stored_claim.phase == AgentOperationClaimPhase::Started {
+        if job.status != AgentModelJobStatus::Started || job.attempt != 1 {
+            return Err(StorageError::CorruptData(
+                "started model claim disagrees with its durable job".into(),
+            ));
+        }
+        transaction.commit()?;
+        return Ok(AgentModelStartOutcome::Started(Box::new(job)));
+    }
+    require_prepared_agent_operation_claim(&transaction, claim, &timestamp)?;
+    if job.status != AgentModelJobStatus::Queued || job.attempt != 0 {
+        return Err(StorageError::ConcurrentModification);
+    }
+    let mut agent = query_agent_turn(&transaction, &job.agent_id)?;
+    require_open_agent_turn(&transaction, &agent)?;
+    require_agent_finalization_capacity(&transaction, &agent)?;
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::ReservedProgress,
+    )?;
+
+    if !agent_deployment_matches_current(&transaction, &agent, Some(&job), None, current_manifest)?
+    {
+        let error_json = deployment_unavailable_error(
+            "the bound Agent deployment manifest is missing, invalid, or changed before model execution",
+        );
+        let command = WorkflowCommand::DeploymentUnavailable;
+        let transition = reduce(&agent.workflow_state, command.clone())
+            .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+        persist_agent_workflow_transition(
+            &transaction,
+            &mut agent,
+            transition.state().clone(),
+            None,
+            Some(&error_json),
+            Some(&timestamp),
+            AgentTransitionFact {
+                command,
+                external_call: transition.external_call().cloned(),
+                emitted_result: transition.emitted_result().cloned(),
+                emitted_result_digest: None,
+                epoch_digest: None,
+                source: FactSource::Live,
+                subject: Some(model_subject(&job)),
+                input_digest: Some(model_request_digest(&job)?),
+                output_digest: Some(super::execution::digest_json(
+                    DigestDomain::ExecutionError,
+                    &error_json,
+                )?),
+                next_request_digest: None,
+            },
+            &timestamp,
+        )?;
+        let changed = transaction.execute(
+            r#"UPDATE agent_model_jobs
+               SET status = 'failed', attempt = 1, error_json = ?1,
+                   started_at = ?2, finished_at = ?2
+               WHERE id = ?3 AND status = 'queued' AND attempt = 0"#,
+            params![serde_json::to_string(&error_json)?, timestamp, job.id],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::ConcurrentModification);
+        }
+        release_agent_operation_claim(&transaction, claim, &timestamp)?;
+        let completion = interrupt_agent_turn(
+            &transaction,
+            &agent,
+            "agent deployment became unavailable before model execution",
+        )?;
+        transaction.commit()?;
+        return Ok(AgentModelStartOutcome::Rejected(Box::new(completion)));
+    }
+
+    if !agent_actor_is_authorized(&transaction, &agent)? {
+        let error_json = json!({
+            "code": "authorization_revoked",
+            "message": "the agent initiator is no longer authorized for this Session"
+        });
+        let command = WorkflowCommand::AuthorizationRevoked;
+        let transition = reduce(&agent.workflow_state, command.clone())
+            .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+        persist_agent_workflow_transition(
+            &transaction,
+            &mut agent,
+            transition.state().clone(),
+            None,
+            Some(&error_json),
+            Some(&timestamp),
+            AgentTransitionFact {
+                command,
+                external_call: transition.external_call().cloned(),
+                emitted_result: transition.emitted_result().cloned(),
+                emitted_result_digest: None,
+                epoch_digest: None,
+                source: FactSource::Live,
+                subject: Some(model_subject(&job)),
+                input_digest: Some(model_request_digest(&job)?),
+                output_digest: Some(super::execution::digest_json(
+                    DigestDomain::ExecutionError,
+                    &error_json,
+                )?),
+                next_request_digest: None,
+            },
+            &timestamp,
+        )?;
+        let changed = transaction.execute(
+            r#"UPDATE agent_model_jobs
+               SET status = 'failed', attempt = 1, error_json = ?1,
+                   started_at = ?2, finished_at = ?2
+               WHERE id = ?3 AND status = 'queued' AND attempt = 0"#,
+            params![serde_json::to_string(&error_json)?, timestamp, job.id],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::ConcurrentModification);
+        }
+        release_agent_operation_claim(&transaction, claim, &timestamp)?;
+        let completion = interrupt_agent_turn(
+            &transaction,
+            &agent,
+            "agent authorization was revoked before model execution",
+        )?;
+        transaction.commit()?;
+        return Ok(AgentModelStartOutcome::Rejected(Box::new(completion)));
+    }
+
     let command = WorkflowCommand::StartModel;
     let transition = reduce(&agent.workflow_state, command.clone())
         .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
@@ -429,14 +733,15 @@ fn claim_next_agent_model(
         r#"UPDATE agent_model_jobs
            SET status = 'started', attempt = 1, started_at = ?1
            WHERE id = ?2 AND status = 'queued' AND attempt = 0"#,
-        params![timestamp, job_id],
+        params![timestamp, job.id],
     )?;
     if changed != 1 {
         return Err(StorageError::ConcurrentModification);
     }
-    let claimed = query_agent_model_job_by_id(&transaction, &job_id)?;
+    start_agent_operation_claim(&transaction, claim, &timestamp)?;
+    let started = query_agent_model_job_by_id(&transaction, &job.id)?;
     transaction.commit()?;
-    Ok(AgentModelClaimOutcome::Claimed(Box::new(claimed)))
+    Ok(AgentModelStartOutcome::Started(Box::new(started)))
 }
 
 fn complete_agent_model_success(
@@ -796,6 +1101,12 @@ fn complete_agent_model_success(
             }
         }
     };
+    release_started_agent_operation_claim(
+        &transaction,
+        AgentOperationKind::Model,
+        &job.id,
+        &timestamp,
+    )?;
     transaction.commit()?;
     Ok(completion)
 }
@@ -890,6 +1201,12 @@ fn complete_agent_model_failure(
     if changed != 1 {
         return Err(StorageError::ConcurrentModification);
     }
+    release_started_agent_operation_claim(
+        &transaction,
+        AgentOperationKind::Model,
+        &job.id,
+        &timestamp,
+    )?;
     let reason = if commit.outcome_unknown {
         "agent model outcome is unknown"
     } else {
@@ -900,16 +1217,45 @@ fn complete_agent_model_failure(
     Ok(completion)
 }
 
-fn claim_next_agent_tool(
+fn prepare_next_agent_tool(
     connection: &mut Connection,
     current_manifest: &ManifestEnvelope,
+    holder_id: &str,
     physical_limits: &SqlitePhysicalLimits,
 ) -> Result<AgentToolClaimOutcome, StorageError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (timestamp, expires_at) = agent_operation_claim_window()?;
+    expire_prepared_agent_operation_claims(&transaction, &timestamp)?;
+    if let Some(claim) = query_prepared_agent_operation_claim_for_holder(
+        &transaction,
+        AgentOperationKind::Tool,
+        holder_id,
+    )? {
+        let call = query_agent_tool_call(&transaction, &claim.operation_id)?;
+        if call.agent_id != claim.agent_id || call.status != AgentToolCallStatus::Queued {
+            return Err(StorageError::CorruptData(
+                "a prepared tool claim disagrees with its durable call".into(),
+            ));
+        }
+        let model_job = query_agent_model_job(&transaction, &call.agent_id, call.model_step)?;
+        validate_persisted_agent_model_tool_response(&model_job, &call)?;
+        let work = AgentToolWork { call, model_job };
+        transaction.commit()?;
+        return Ok(AgentToolClaimOutcome::Prepared(Box::new(
+            AgentPreparedTool { claim, work },
+        )));
+    }
     let call_id = transaction
         .query_row(
             r#"SELECT call_id FROM agent_tool_calls
-               WHERE status = 'queued' ORDER BY created_at, call_id LIMIT 1"#,
+               WHERE status = 'queued'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM agent_operation_claims claim
+                     WHERE claim.operation_kind = 'tool'
+                       AND claim.operation_id = agent_tool_calls.call_id
+                       AND claim.phase IN ('prepared', 'started')
+                 )
+               ORDER BY created_at, call_id LIMIT 1"#,
             [],
             |row| row.get::<_, String>(0),
         )
@@ -936,7 +1282,6 @@ fn claim_next_agent_tool(
             "queued agent tool does not match the current loop state".into(),
         ));
     }
-    let timestamp = now();
     if !agent_deployment_matches_current(
         &transaction,
         &agent,
@@ -1042,6 +1387,176 @@ fn claim_next_agent_tool(
         transaction.commit()?;
         return Ok(AgentToolClaimOutcome::Rejected(Box::new(completion)));
     }
+    let claim = insert_prepared_agent_operation_claim(
+        &transaction,
+        AgentOperationKind::Tool,
+        &call.call_id,
+        &call.agent_id,
+        holder_id,
+        &timestamp,
+        &expires_at,
+    )?;
+    let work = AgentToolWork { call, model_job };
+    transaction.commit()?;
+    Ok(AgentToolClaimOutcome::Prepared(Box::new(
+        AgentPreparedTool { claim, work },
+    )))
+}
+
+fn start_prepared_agent_tool(
+    connection: &mut Connection,
+    claim: &AgentOperationClaim,
+    current_manifest: &ManifestEnvelope,
+    physical_limits: &SqlitePhysicalLimits,
+) -> Result<AgentToolStartOutcome, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let timestamp = now();
+    let stored_claim = query_agent_operation_claim(&transaction, claim)?;
+    let call = query_agent_tool_call(&transaction, &claim.operation_id)?;
+    if call.agent_id != claim.agent_id {
+        return Err(StorageError::ConcurrentModification);
+    }
+    let model_job = query_agent_model_job(&transaction, &call.agent_id, call.model_step)?;
+    if stored_claim.phase == AgentOperationClaimPhase::Started {
+        if call.status != AgentToolCallStatus::Running {
+            return Err(StorageError::CorruptData(
+                "started tool claim disagrees with its durable call".into(),
+            ));
+        }
+        let work = AgentToolWork { call, model_job };
+        transaction.commit()?;
+        return Ok(AgentToolStartOutcome::Started(Box::new(work)));
+    }
+    require_prepared_agent_operation_claim(&transaction, claim, &timestamp)?;
+    if call.status != AgentToolCallStatus::Queued {
+        return Err(StorageError::ConcurrentModification);
+    }
+    let mut agent = query_agent_turn(&transaction, &call.agent_id)?;
+    validate_persisted_agent_model_tool_response(&model_job, &call)?;
+    require_open_agent_turn(&transaction, &agent)?;
+    require_agent_finalization_capacity(&transaction, &agent)?;
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::ReservedProgress,
+    )?;
+    if agent.status != AgentTurnStatus::ToolQueued
+        || agent.pending_call_id.as_deref() != Some(call.call_id.as_str())
+    {
+        return Err(StorageError::InvalidAgentTransition(
+            "prepared agent tool does not match the current loop state".into(),
+        ));
+    }
+
+    if !agent_deployment_matches_current(
+        &transaction,
+        &agent,
+        Some(&model_job),
+        Some(&call),
+        current_manifest,
+    )? {
+        let error_json = deployment_unavailable_error(
+            "the bound Agent deployment manifest is missing, invalid, or changed before tool execution",
+        );
+        let command = WorkflowCommand::DeploymentUnavailable;
+        let transition = reduce(&agent.workflow_state, command.clone())
+            .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+        persist_agent_workflow_transition(
+            &transaction,
+            &mut agent,
+            transition.state().clone(),
+            None,
+            Some(&error_json),
+            Some(&timestamp),
+            AgentTransitionFact {
+                command,
+                external_call: transition.external_call().cloned(),
+                emitted_result: transition.emitted_result().cloned(),
+                emitted_result_digest: None,
+                epoch_digest: None,
+                source: FactSource::Live,
+                subject: Some(tool_subject(&call)),
+                input_digest: Some(tool_input_digest(&call)?),
+                output_digest: Some(super::execution::digest_json(
+                    DigestDomain::ExecutionError,
+                    &error_json,
+                )?),
+                next_request_digest: None,
+            },
+            &timestamp,
+        )?;
+        let changed = transaction.execute(
+            r#"UPDATE agent_tool_calls
+               SET status = 'not_dispatched', result_json = ?1, finished_at = ?2
+               WHERE call_id = ?3 AND status = 'queued'"#,
+            params![serde_json::to_string(&error_json)?, timestamp, call.call_id],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::ConcurrentModification);
+        }
+        release_agent_operation_claim(&transaction, claim, &timestamp)?;
+        let completion = interrupt_agent_turn(
+            &transaction,
+            &agent,
+            "agent deployment became unavailable before tool execution",
+        )?;
+        transaction.commit()?;
+        return Ok(AgentToolStartOutcome::Rejected(Box::new(completion)));
+    }
+
+    let initiator_authorized = agent_actor_is_authorized(&transaction, &agent)?;
+    let approver_authorized = agent_tool_approver_is_authorized(&transaction, &call)?;
+    if !initiator_authorized || !approver_authorized {
+        let error_json = json!({
+            "code": "authorization_revoked",
+            "message": "the initiating or approving authority was revoked before tool execution"
+        });
+        let command = WorkflowCommand::AuthorizationRevoked;
+        let transition = reduce(&agent.workflow_state, command.clone())
+            .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+        persist_agent_workflow_transition(
+            &transaction,
+            &mut agent,
+            transition.state().clone(),
+            None,
+            Some(&error_json),
+            Some(&timestamp),
+            AgentTransitionFact {
+                command,
+                external_call: transition.external_call().cloned(),
+                emitted_result: transition.emitted_result().cloned(),
+                emitted_result_digest: None,
+                epoch_digest: None,
+                source: FactSource::Live,
+                subject: Some(tool_subject(&call)),
+                input_digest: Some(tool_input_digest(&call)?),
+                output_digest: Some(super::execution::digest_json(
+                    DigestDomain::ExecutionError,
+                    &error_json,
+                )?),
+                next_request_digest: None,
+            },
+            &timestamp,
+        )?;
+        let changed = transaction.execute(
+            r#"UPDATE agent_tool_calls
+               SET status = 'not_dispatched', result_json = ?1, finished_at = ?2
+               WHERE call_id = ?3 AND status = 'queued'"#,
+            params![serde_json::to_string(&error_json)?, timestamp, call.call_id],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::ConcurrentModification);
+        }
+        release_agent_operation_claim(&transaction, claim, &timestamp)?;
+        let completion = interrupt_agent_turn(
+            &transaction,
+            &agent,
+            "agent tool authorization was revoked before execution",
+        )?;
+        transaction.commit()?;
+        return Ok(AgentToolStartOutcome::Rejected(Box::new(completion)));
+    }
+
     let command = WorkflowCommand::StartTool;
     let transition = reduce(&agent.workflow_state, command.clone())
         .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
@@ -1082,12 +1597,13 @@ fn claim_next_agent_tool(
     if changed != 1 {
         return Err(StorageError::ConcurrentModification);
     }
+    start_agent_operation_claim(&transaction, claim, &timestamp)?;
     let work = AgentToolWork {
-        call: query_agent_tool_call(&transaction, &call_id)?,
+        call: query_agent_tool_call(&transaction, &call.call_id)?,
         model_job,
     };
     transaction.commit()?;
-    Ok(AgentToolClaimOutcome::Claimed(Box::new(work)))
+    Ok(AgentToolStartOutcome::Started(Box::new(work)))
 }
 
 fn complete_agent_tool(
@@ -1251,6 +1767,12 @@ fn complete_agent_tool(
             },
         )?))
     };
+    release_started_agent_operation_claim(
+        &transaction,
+        AgentOperationKind::Tool,
+        &call.call_id,
+        &timestamp,
+    )?;
     transaction.commit()?;
     Ok(completion)
 }
@@ -1334,6 +1856,12 @@ fn complete_agent_tool_outcome_unknown(
     if changed != 1 {
         return Err(StorageError::ConcurrentModification);
     }
+    release_started_agent_operation_claim(
+        &transaction,
+        AgentOperationKind::Tool,
+        &call.call_id,
+        &timestamp,
+    )?;
     let completion = interrupt_agent_turn(
         &transaction,
         &agent,
@@ -2929,12 +3457,308 @@ fn agent_review_fingerprint(
     Ok(format!("sha256:{:x}", digest.finalize()))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentOperationClaimPhase {
+    Prepared,
+    Started,
+    Released,
+    Expired,
+}
+
+struct StoredAgentOperationClaim {
+    claim: AgentOperationClaim,
+    phase: AgentOperationClaimPhase,
+}
+
+fn agent_operation_kind_to_db(kind: AgentOperationKind) -> &'static str {
+    match kind {
+        AgentOperationKind::Model => "model",
+        AgentOperationKind::Tool => "tool",
+    }
+}
+
+fn agent_operation_claim_window() -> Result<(String, String), StorageError> {
+    let acquired_at = Utc::now();
+    let expires_at = acquired_at
+        .checked_add_signed(chrono::Duration::seconds(AGENT_OPERATION_CLAIM_TTL_SECONDS))
+        .ok_or(StorageError::IntegerOutOfRange(
+            "Agent operation claim expiry",
+        ))?;
+    Ok((
+        acquired_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+        expires_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+    ))
+}
+
+fn expire_prepared_agent_operation_claims(
+    connection: &Connection,
+    timestamp: &str,
+) -> Result<(), StorageError> {
+    connection.execute(
+        r#"UPDATE agent_operation_claims
+           SET phase = 'expired', released_at = ?1
+           WHERE phase = 'prepared' AND expires_at <= ?1"#,
+        [timestamp],
+    )?;
+    Ok(())
+}
+
+fn expire_all_prepared_agent_operation_claims(
+    connection: &Connection,
+    timestamp: &str,
+) -> Result<(), StorageError> {
+    connection.execute(
+        r#"UPDATE agent_operation_claims
+           SET phase = 'expired', released_at = ?1
+           WHERE phase = 'prepared'"#,
+        [timestamp],
+    )?;
+    Ok(())
+}
+
+fn insert_prepared_agent_operation_claim(
+    connection: &Connection,
+    kind: AgentOperationKind,
+    operation_id: &str,
+    agent_id: &str,
+    holder_id: &str,
+    acquired_at: &str,
+    expires_at: &str,
+) -> Result<AgentOperationClaim, StorageError> {
+    let kind_db = agent_operation_kind_to_db(kind);
+    let generation = connection.query_row(
+        r#"SELECT COALESCE(MAX(generation), 0) + 1
+           FROM agent_operation_claims
+           WHERE operation_kind = ?1 AND operation_id = ?2"#,
+        params![kind_db, operation_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let (model_job_id, tool_call_id) = match kind {
+        AgentOperationKind::Model => (Some(operation_id), None),
+        AgentOperationKind::Tool => (None, Some(operation_id)),
+    };
+    connection.execute(
+        r#"INSERT INTO agent_operation_claims(
+               operation_kind, operation_id, model_job_id, tool_call_id,
+               agent_id, generation, holder_id, phase, acquired_at,
+               expires_at, started_at, released_at
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'prepared', ?8, ?9, NULL, NULL)"#,
+        params![
+            kind_db,
+            operation_id,
+            model_job_id,
+            tool_call_id,
+            agent_id,
+            generation,
+            holder_id,
+            acquired_at,
+            expires_at,
+        ],
+    )?;
+    let claim = AgentOperationClaim {
+        kind,
+        operation_id: operation_id.to_owned(),
+        agent_id: agent_id.to_owned(),
+        generation: i64_to_u64(generation, "Agent operation claim generation")?,
+        holder_id: holder_id.to_owned(),
+        acquired_at: acquired_at.to_owned(),
+        expires_at: expires_at.to_owned(),
+    };
+    claim.validate()?;
+    Ok(claim)
+}
+
+fn query_prepared_agent_operation_claim_for_holder(
+    connection: &Connection,
+    kind: AgentOperationKind,
+    holder_id: &str,
+) -> Result<Option<AgentOperationClaim>, StorageError> {
+    let stored = connection
+        .query_row(
+            r#"SELECT operation_id, agent_id, generation, acquired_at, expires_at
+               FROM agent_operation_claims
+               WHERE operation_kind = ?1 AND holder_id = ?2 AND phase = 'prepared'"#,
+            params![agent_operation_kind_to_db(kind), holder_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let claim = stored
+        .map(
+            |(operation_id, agent_id, generation, acquired_at, expires_at)|
+             -> Result<AgentOperationClaim, StorageError> {
+                Ok(AgentOperationClaim {
+                    kind,
+                    operation_id,
+                    agent_id,
+                    generation: i64_to_u64(generation, "Agent operation claim generation")?,
+                    holder_id: holder_id.to_owned(),
+                    acquired_at,
+                    expires_at,
+                })
+            },
+        )
+        .transpose()?;
+    if let Some(claim) = claim.as_ref() {
+        claim.validate()?;
+    }
+    Ok(claim)
+}
+
+fn query_agent_operation_claim(
+    connection: &Connection,
+    claim: &AgentOperationClaim,
+) -> Result<StoredAgentOperationClaim, StorageError> {
+    let stored = connection
+        .query_row(
+            r#"SELECT agent_id, holder_id, phase, acquired_at, expires_at
+               FROM agent_operation_claims
+               WHERE operation_kind = ?1 AND operation_id = ?2 AND generation = ?3"#,
+            params![
+                agent_operation_kind_to_db(claim.kind),
+                claim.operation_id,
+                u64_to_i64(claim.generation, "Agent operation claim generation")?,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(StorageError::ConcurrentModification)?;
+    let phase = match stored.2.as_str() {
+        "prepared" => AgentOperationClaimPhase::Prepared,
+        "started" => AgentOperationClaimPhase::Started,
+        "released" => AgentOperationClaimPhase::Released,
+        "expired" => AgentOperationClaimPhase::Expired,
+        other => {
+            return Err(StorageError::CorruptData(format!(
+                "unknown Agent operation claim phase `{other}`"
+            )));
+        }
+    };
+    let persisted = AgentOperationClaim {
+        kind: claim.kind,
+        operation_id: claim.operation_id.clone(),
+        agent_id: stored.0,
+        generation: claim.generation,
+        holder_id: stored.1,
+        acquired_at: stored.3,
+        expires_at: stored.4,
+    };
+    persisted.validate()?;
+    if &persisted != claim {
+        return Err(StorageError::ConcurrentModification);
+    }
+    Ok(StoredAgentOperationClaim {
+        claim: persisted,
+        phase,
+    })
+}
+
+fn require_prepared_agent_operation_claim(
+    connection: &Connection,
+    claim: &AgentOperationClaim,
+    timestamp: &str,
+) -> Result<(), StorageError> {
+    let stored = query_agent_operation_claim(connection, claim)?;
+    if stored.phase != AgentOperationClaimPhase::Prepared
+        || stored.claim.expires_at.as_str() <= timestamp
+    {
+        return Err(StorageError::ConcurrentModification);
+    }
+    Ok(())
+}
+
+fn start_agent_operation_claim(
+    connection: &Connection,
+    claim: &AgentOperationClaim,
+    timestamp: &str,
+) -> Result<(), StorageError> {
+    let changed = connection.execute(
+        r#"UPDATE agent_operation_claims
+           SET phase = 'started', started_at = ?1
+           WHERE operation_kind = ?2 AND operation_id = ?3 AND generation = ?4
+             AND holder_id = ?5 AND phase = 'prepared' AND expires_at > ?1"#,
+        params![
+            timestamp,
+            agent_operation_kind_to_db(claim.kind),
+            claim.operation_id,
+            u64_to_i64(claim.generation, "Agent operation claim generation")?,
+            claim.holder_id,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::ConcurrentModification);
+    }
+    Ok(())
+}
+
+fn release_agent_operation_claim(
+    connection: &Connection,
+    claim: &AgentOperationClaim,
+    timestamp: &str,
+) -> Result<(), StorageError> {
+    let changed = connection.execute(
+        r#"UPDATE agent_operation_claims
+           SET phase = 'released', released_at = ?1
+           WHERE operation_kind = ?2 AND operation_id = ?3 AND generation = ?4
+             AND holder_id = ?5 AND phase = 'prepared'"#,
+        params![
+            timestamp,
+            agent_operation_kind_to_db(claim.kind),
+            claim.operation_id,
+            u64_to_i64(claim.generation, "Agent operation claim generation")?,
+            claim.holder_id,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::ConcurrentModification);
+    }
+    Ok(())
+}
+
+fn release_started_agent_operation_claim(
+    connection: &Connection,
+    kind: AgentOperationKind,
+    operation_id: &str,
+    timestamp: &str,
+) -> Result<(), StorageError> {
+    let changed = connection.execute(
+        r#"UPDATE agent_operation_claims
+           SET phase = 'released', released_at = ?1
+           WHERE operation_kind = ?2 AND operation_id = ?3 AND phase = 'started'"#,
+        params![timestamp, agent_operation_kind_to_db(kind), operation_id],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::CorruptData(format!(
+            "started {} operation `{operation_id}` has no active claim",
+            agent_operation_kind_to_db(kind)
+        )));
+    }
+    Ok(())
+}
+
 fn recover_started_agent_work(
     connection: &mut Connection,
     physical_limits: &SqlitePhysicalLimits,
 ) -> Result<Vec<AgentTerminalCompletion>, StorageError> {
     let mut recovered = Vec::new();
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let recovery_timestamp = now();
+    expire_all_prepared_agent_operation_claims(&transaction, &recovery_timestamp)?;
     let mut statement = transaction.prepare(
         r#"SELECT operation_kind, operation_id FROM (
                SELECT 'model' AS operation_kind, id AS operation_id,
@@ -3015,6 +3839,12 @@ fn recover_started_agent_work(
                 if changed != 1 {
                     return Err(StorageError::ConcurrentModification);
                 }
+                release_started_agent_operation_claim(
+                    &transaction,
+                    AgentOperationKind::Model,
+                    &job.id,
+                    &timestamp,
+                )?;
                 recovered.push(interrupt_agent_turn(
                     &transaction,
                     &agent,
@@ -3073,6 +3903,12 @@ fn recover_started_agent_work(
                 if changed != 1 {
                     return Err(StorageError::ConcurrentModification);
                 }
+                release_started_agent_operation_claim(
+                    &transaction,
+                    AgentOperationKind::Tool,
+                    &call.call_id,
+                    &timestamp,
+                )?;
                 recovered.push(interrupt_agent_turn(
                     &transaction,
                     &agent,

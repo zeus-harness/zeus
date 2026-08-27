@@ -50,7 +50,7 @@ use crate::{
     UpdateAccountAuditPolicyCommit,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 20;
+const CURRENT_SCHEMA_VERSION: i64 = 21;
 const LOCAL_ACCOUNT_ID: &str = "acc_local";
 const EVENT_PAYLOAD_VERSION_V1: i64 = 1;
 const EVENT_PAYLOAD_VERSION_V2: i64 = 2;
@@ -77,6 +77,7 @@ const MIGRATION_0017: &str = include_str!("../migrations/0017_session_agent_loop
 const MIGRATION_0018: &str = include_str!("../migrations/0018_agent_tool_completion_replay.sql");
 const MIGRATION_0019: &str = include_str!("../migrations/0019_agent_deployment_manifest.sql");
 const MIGRATION_0020: &str = include_str!("../migrations/0020_agent_execution_ledger.sql");
+const MIGRATION_0021: &str = include_str!("../migrations/0021_agent_operation_claims.sql");
 const RECOVERY_BATCH_LIMIT: i64 = 64;
 const AUTH_SESSION_CLEANUP_BATCH_LIMIT: i64 = 64;
 const BOOTSTRAP_AUDIT_ROLLUP_BATCH_LIMIT: i64 = 64;
@@ -101,6 +102,8 @@ const REPLY_JOB_ID_MAX_BYTES: usize = 384;
 const REPLY_REQUEST_JSON_MAX_BYTES: usize = 512 * 1024;
 const REPLY_RESPONSE_JSON_MAX_BYTES: usize = 512 * 1024;
 const REPLY_ERROR_JSON_MAX_BYTES: usize = 32 * 1024;
+const REPLY_AUTHORIZATION_REVOKED_REASON: &str =
+    "reply authorization was revoked before provider execution";
 const DISPATCH_CALL_ID_MAX_BYTES: usize = 160;
 const DISPATCH_IDENTIFIER_MAX_BYTES: usize = 128;
 const DISPATCH_TOOL_NAME_MAX_BYTES: usize = 96;
@@ -972,10 +975,41 @@ impl SqliteStore {
 
     /// Claims at most one queued reply. The committed `started` transition is
     /// the authorization boundary for provider execution.
+    ///
+    /// This compatibility operation deliberately does not replay a committed
+    /// start. Production workers that retry transient storage errors must use
+    /// [`Self::peek_next_reply`] and [`Self::start_observed_reply`] so the
+    /// exact job ID remains fixed across an ambiguous commit acknowledgement.
     pub async fn claim_next_reply(&self) -> Result<ReplyClaimOutcome, StorageError> {
         let physical_limits = self.physical_limits.clone();
         self.with_progress_connection(move |connection| {
             claim_next_reply(connection, &physical_limits)
+        })
+        .await
+    }
+
+    /// Observes the stable head of the queued reply set without changing any
+    /// durable state. A worker retains this job ID while it retries the exact
+    /// start operation.
+    pub async fn peek_next_reply(&self) -> Result<Option<ReplyJob>, StorageError> {
+        self.with_progress_connection(|connection| peek_next_reply(connection))
+            .await
+    }
+
+    /// Starts the exact reply previously returned by [`Self::peek_next_reply`].
+    ///
+    /// A `started` record is returned again only to resolve an ambiguous
+    /// acknowledgement in the same in-memory execution context. Once this
+    /// method returns `Claimed`, that context must invoke provider I/O at most
+    /// once and must never call this method again for the job.
+    pub async fn start_observed_reply(
+        &self,
+        job_id: &str,
+    ) -> Result<ReplyClaimOutcome, StorageError> {
+        let job_id = normalized_reply_value(job_id, "reply job ID")?.to_owned();
+        let physical_limits = self.physical_limits.clone();
+        self.with_progress_connection(move |connection| {
+            start_observed_reply(connection, &job_id, &physical_limits)
         })
         .await
     }
@@ -2798,6 +2832,13 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
         )?;
         execution::verify_agent_execution_integrity(&transaction)?;
     }
+    if current < 21 {
+        transaction.execute_batch(MIGRATION_0021)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![21, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
     validate_configured_account_audit_policies(&transaction, limits)?;
     compact_existing_bootstrap_audit_to_capacity(&transaction, &now(), limits)?;
     transaction.commit()?;
@@ -3395,12 +3436,13 @@ fn readiness(
                'account_audit_events', 'agent_turns', 'agent_model_jobs',
                'agent_tool_calls', 'agent_review_receipts',
                'agent_deployment_manifests', 'agent_run_epochs',
-               'agent_execution_events', 'agent_execution_heads'
+               'agent_execution_events', 'agent_execution_heads',
+               'agent_operation_claims'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if table_count != 35 {
+    if table_count != 36 {
         return Err(StorageError::CorruptData(
             "one or more required tables are missing".into(),
         ));
@@ -3605,12 +3647,15 @@ fn readiness(
                'agent_run_epochs_agent_created_idx',
                'agent_execution_events_digest_idx',
                'agent_execution_events_epoch_idx',
-               'agent_execution_events_operation_idx'
+               'agent_execution_events_operation_idx',
+               'agent_operation_claims_one_active_idx',
+               'agent_operation_claims_one_prepared_holder_idx',
+               'agent_operation_claims_prepared_expiry_idx'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if point_query_indexes != 57 {
+    if point_query_indexes != 60 {
         return Err(StorageError::CorruptData(
             "one or more point-query indexes are missing".into(),
         ));
@@ -3730,13 +3775,18 @@ fn readiness(
                'agent_execution_heads_require_origin',
                'agent_execution_heads_enforce_forward_update',
                'agent_execution_heads_reject_delete',
+               'agent_operation_claims_require_operation_binding',
+               'agent_operation_claims_require_next_generation',
+               'agent_operation_claims_reject_identity_update',
+               'agent_operation_claims_enforce_forward_transition',
+               'agent_operation_claims_reject_delete',
                'schema_migrations_reject_update',
                'schema_migrations_reject_delete'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 113 {
+    if trigger_count != 118 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
         ));
@@ -3772,6 +3822,26 @@ fn readiness(
     if agent_manifest_fk != 1 {
         return Err(StorageError::CorruptData(
             "the Agent deployment manifest foreign key is missing".into(),
+        ));
+    }
+
+    let agent_operation_claim_fks: i64 = connection.query_row(
+        r#"SELECT COUNT(*) FROM pragma_foreign_key_list('agent_operation_claims')
+           WHERE ("table" = 'agent_model_jobs'
+                  AND "from" = 'model_job_id' AND "to" = 'id'
+                  AND on_delete = 'RESTRICT')
+              OR ("table" = 'agent_tool_calls'
+                  AND "from" = 'tool_call_id' AND "to" = 'call_id'
+                  AND on_delete = 'RESTRICT')
+              OR ("table" = 'agent_turns'
+                  AND "from" = 'agent_id' AND "to" = 'id'
+                  AND on_delete = 'RESTRICT')"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if agent_operation_claim_fks != 3 {
+        return Err(StorageError::CorruptData(
+            "one or more Agent operation claim foreign keys are missing".into(),
         ));
     }
 
@@ -4004,6 +4074,77 @@ fn readiness(
     if actor_boundary_violation != 0 {
         return Err(StorageError::CorruptData(
             "one or more durable records cross an actor ownership boundary".into(),
+        ));
+    }
+
+    let agent_operation_claim_violation: i64 = connection.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1
+               FROM agent_operation_claims claim
+               LEFT JOIN agent_model_jobs model ON model.id = claim.model_job_id
+               LEFT JOIN agent_tool_calls tool ON tool.call_id = claim.tool_call_id
+               WHERE CASE claim.operation_kind
+                   WHEN 'model' THEN claim.model_job_id IS NOT claim.operation_id
+                       OR claim.tool_call_id IS NOT NULL
+                       OR model.agent_id IS NOT claim.agent_id
+                       OR (claim.phase = 'prepared' AND model.status <> 'queued')
+                       OR (claim.phase = 'started' AND model.status <> 'started')
+                   WHEN 'tool' THEN claim.model_job_id IS NOT NULL
+                       OR claim.tool_call_id IS NOT claim.operation_id
+                       OR tool.agent_id IS NOT claim.agent_id
+                       OR (claim.phase = 'prepared' AND tool.status <> 'queued')
+                       OR (claim.phase = 'started' AND tool.status <> 'started')
+                   ELSE 1
+               END
+               UNION ALL
+               SELECT 1
+               FROM agent_operation_claims claim
+               GROUP BY claim.operation_kind, claim.operation_id
+               HAVING MIN(claim.generation) <> 1
+                   OR MAX(claim.generation) <> COUNT(*)
+                   OR SUM(claim.phase IN ('prepared', 'started')) > 1
+               UNION ALL
+               SELECT 1
+               FROM agent_operation_claims claim
+               WHERE NOT (
+                   (claim.phase = 'prepared'
+                    AND claim.started_at IS NULL AND claim.released_at IS NULL)
+                   OR
+                   (claim.phase = 'started'
+                    AND claim.started_at IS NOT NULL AND claim.released_at IS NULL)
+                   OR
+                   (claim.phase = 'released' AND claim.released_at IS NOT NULL)
+                   OR
+                   (claim.phase = 'expired'
+                    AND claim.started_at IS NULL AND claim.released_at IS NOT NULL)
+               )
+               UNION ALL
+               SELECT 1
+               FROM agent_model_jobs model
+               WHERE model.status = 'started'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM agent_operation_claims claim
+                     WHERE claim.operation_kind = 'model'
+                       AND claim.operation_id = model.id
+                       AND claim.phase = 'started'
+                 )
+               UNION ALL
+               SELECT 1
+               FROM agent_tool_calls tool
+               WHERE tool.status = 'started'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM agent_operation_claims claim
+                     WHERE claim.operation_kind = 'tool'
+                       AND claim.operation_id = tool.call_id
+                       AND claim.phase = 'started'
+                 )
+           )"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if agent_operation_claim_violation != 0 {
+        return Err(StorageError::CorruptData(
+            "one or more Agent operation claims are inconsistent".into(),
         ));
     }
 
@@ -9603,12 +9744,8 @@ fn insert_reply_job(
     Ok(())
 }
 
-fn claim_next_reply(
-    connection: &mut Connection,
-    physical_limits: &SqlitePhysicalLimits,
-) -> Result<ReplyClaimOutcome, StorageError> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let job_id = transaction
+fn peek_next_reply(connection: &Connection) -> Result<Option<ReplyJob>, StorageError> {
+    let job_id = connection
         .query_row(
             r#"SELECT id FROM reply_jobs
                WHERE status = 'queued' ORDER BY queued_at, id LIMIT 1"#,
@@ -9616,20 +9753,77 @@ fn claim_next_reply(
             |row| row.get::<_, String>(0),
         )
         .optional()?;
-    let Some(job_id) = job_id else {
+    job_id
+        .map(|job_id| query_reply_job(connection, &job_id))
+        .transpose()
+}
+
+fn claim_next_reply(
+    connection: &mut Connection,
+    physical_limits: &SqlitePhysicalLimits,
+) -> Result<ReplyClaimOutcome, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let Some(job) = peek_next_reply(&transaction)? else {
         transaction.commit()?;
         return Ok(ReplyClaimOutcome::NotAvailable);
     };
+    let outcome = start_reply_job(&transaction, &job.id, physical_limits, false)?;
+    transaction.commit()?;
+    Ok(outcome)
+}
 
-    let job = query_reply_job(&transaction, &job_id)?;
-    let summary = require_open_reply_turn(&transaction, &job)?;
+fn start_observed_reply(
+    connection: &mut Connection,
+    job_id: &str,
+    physical_limits: &SqlitePhysicalLimits,
+) -> Result<ReplyClaimOutcome, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let outcome = start_reply_job(&transaction, job_id, physical_limits, true)?;
+    transaction.commit()?;
+    Ok(outcome)
+}
+
+fn start_reply_job(
+    transaction: &Connection,
+    job_id: &str,
+    physical_limits: &SqlitePhysicalLimits,
+    allow_exact_replay: bool,
+) -> Result<ReplyClaimOutcome, StorageError> {
+    let job = query_reply_job(transaction, job_id)?;
+    match job.status {
+        ReplyJobStatus::Started if allow_exact_replay => {
+            return Ok(ReplyClaimOutcome::Claimed(Box::new(job)));
+        }
+        ReplyJobStatus::Failed if allow_exact_replay => {
+            return Ok(match replay_reply_start_rejection(transaction, &job)? {
+                Some(completion) => ReplyClaimOutcome::Rejected(Box::new(completion)),
+                None => ReplyClaimOutcome::NotAvailable,
+            });
+        }
+        ReplyJobStatus::Queued => {}
+        ReplyJobStatus::Started
+        | ReplyJobStatus::Succeeded
+        | ReplyJobStatus::Failed
+        | ReplyJobStatus::OutcomeUnknown => return Ok(ReplyClaimOutcome::NotAvailable),
+    }
+
+    if allow_exact_replay {
+        let Some(head) = peek_next_reply(transaction)? else {
+            return Ok(ReplyClaimOutcome::NotAvailable);
+        };
+        if head.id != job.id {
+            return Ok(ReplyClaimOutcome::NotAvailable);
+        }
+    }
+
+    let summary = require_open_reply_turn(transaction, &job)?;
     let required_payload_reservation = session_finalization_payload_reservation(
         &job.turn_id,
         Some(&job.provider_name),
         job.model_name.as_deref(),
     )?;
     if require_session_finalization_capacity(
-        &transaction,
+        transaction,
         &job.session_id,
         &job.turn_id,
         2,
@@ -9640,7 +9834,7 @@ fn claim_next_reply(
         return Err(StorageError::FinalizationReservationUnavailable);
     }
     require_connection_physical_capacity(
-        &transaction,
+        transaction,
         physical_limits,
         PhysicalCapacityGate::ReservedProgress,
     )?;
@@ -9653,7 +9847,7 @@ fn claim_next_reply(
     if changed != 1 {
         return Err(StorageError::ConcurrentModification);
     }
-    if !reply_actor_is_authorized(&transaction, &job)? {
+    if !reply_actor_is_authorized(transaction, &job)? {
         let error_json = json!({
             "code": "authorization_revoked",
             "message": "the reply actor is no longer authorized for this session"
@@ -9665,20 +9859,73 @@ fn claim_next_reply(
             "error_json": error_json,
         }))?;
         let completion = interrupt_reply_job(
-            &transaction,
+            transaction,
             job,
             summary.sequence,
             ReplyJobStatus::Failed,
             &error_json,
             &fingerprint,
-            "reply authorization was revoked before provider execution",
+            REPLY_AUTHORIZATION_REVOKED_REASON,
         )?;
-        transaction.commit()?;
         return Ok(ReplyClaimOutcome::Rejected(Box::new(completion)));
     }
-    let claimed = query_reply_job(&transaction, &job_id)?;
-    transaction.commit()?;
+    let claimed = query_reply_job(transaction, job_id)?;
     Ok(ReplyClaimOutcome::Claimed(Box::new(claimed)))
+}
+
+fn replay_reply_start_rejection(
+    connection: &Connection,
+    job: &ReplyJob,
+) -> Result<Option<ReplyCompletion>, StorageError> {
+    let rejection_code = job
+        .error_json
+        .as_ref()
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str);
+    if job.status != ReplyJobStatus::Failed || rejection_code != Some("authorization_revoked") {
+        return Ok(None);
+    }
+    let terminal_sequence = job.terminal_event_sequence.ok_or_else(|| {
+        StorageError::CorruptData(format!(
+            "authorization-rejected reply job `{}` has no terminal event sequence",
+            job.id
+        ))
+    })?;
+    let expected_sequence = terminal_sequence.checked_sub(1).ok_or_else(|| {
+        StorageError::CorruptData(format!(
+            "authorization-rejected reply job `{}` has an invalid terminal event sequence",
+            job.id
+        ))
+    })?;
+    let expected_fingerprint = serde_json::to_string(&json!({
+        "kind": "failed",
+        "job_id": job.id,
+        "expected_sequence": expected_sequence,
+        "error_json": job.error_json,
+    }))?;
+    if query_reply_completion_fingerprint(connection, &job.id)?.as_deref()
+        != Some(expected_fingerprint.as_str())
+    {
+        return Err(StorageError::CorruptData(format!(
+            "authorization-rejected reply job `{}` has an incompatible completion fingerprint",
+            job.id
+        )));
+    }
+
+    let completion = query_reply_completion(connection, &job.id, true)?;
+    if !matches!(
+        completion.events.as_slice(),
+        [SessionEvent {
+            data: SessionEventData::TurnInterrupted { turn_id, reason },
+            ..
+        }] if turn_id == &job.turn_id && reason == REPLY_AUTHORIZATION_REVOKED_REASON
+    ) {
+        return Err(StorageError::CorruptData(format!(
+            "authorization-rejected reply job `{}` points at incompatible interruption evidence",
+            job.id
+        )));
+    }
+    Ok(Some(completion))
 }
 
 fn reply_actor_is_authorized(
@@ -13394,6 +13641,11 @@ fn complete_dispatch(
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let job = query_dispatch_job(&transaction, &commit.call_id)?
         .ok_or_else(|| StorageError::DispatchJobNotFound(commit.call_id.clone()))?;
+    if job.status == DispatchStatus::Finished {
+        let replayed = replay_finished_dispatch(&transaction, job, &commit)?;
+        transaction.commit()?;
+        return Ok(replayed);
+    }
     if job.status != DispatchStatus::Started || job.run_id != commit.snapshot.run.id {
         return Err(StorageError::InvalidDispatchTransition(
             "only the matching started dispatch may be completed".into(),
@@ -13468,6 +13720,66 @@ fn complete_dispatch(
     })?;
     transaction.commit()?;
     Ok(completed)
+}
+
+fn replay_finished_dispatch(
+    connection: &Connection,
+    job: DispatchJob,
+    commit: &DispatchCompleteCommit,
+) -> Result<DispatchJob, StorageError> {
+    let stored_result = job.result_json.as_ref().ok_or_else(|| {
+        StorageError::CorruptData(format!(
+            "finished dispatch `{}` has no durable result",
+            job.call_id
+        ))
+    })?;
+    let result_sequence = job.result_event_sequence.ok_or_else(|| {
+        StorageError::CorruptData(format!(
+            "finished dispatch `{}` has no durable result event",
+            job.call_id
+        ))
+    })?;
+    let stored_event = query_run_event_at(
+        connection,
+        &job.run_id,
+        u64_to_i64(result_sequence, "dispatch result event sequence")?,
+    )?;
+    let stored_snapshot = query_snapshot(connection, &job.run_id)?;
+    validate_run_event_tail(connection, &stored_snapshot)?;
+
+    if stored_snapshot.run.id != job.run_id
+        || stored_snapshot.run.sequence != result_sequence
+        || stored_event.sequence != result_sequence
+    {
+        return Err(StorageError::CorruptData(format!(
+            "finished dispatch `{}` does not match its durable run head",
+            job.call_id
+        )));
+    }
+    match stored_event.data.as_ref() {
+        Some(RunEventData::ToolResult {
+            call_id,
+            outcome,
+            status,
+        }) if call_id == &job.call_id
+            && status == &outcome.call_status()
+            && serde_json::to_value(outcome)? == *stored_result => {}
+        _ => {
+            return Err(StorageError::CorruptData(format!(
+                "finished dispatch `{}` result disagrees with its durable event",
+                job.call_id
+            )));
+        }
+    }
+
+    if commit.call_id != job.call_id
+        || commit.snapshot != stored_snapshot
+        || commit.event != stored_event
+        || commit.result_json != *stored_result
+    {
+        return Err(StorageError::IdempotencyConflict);
+    }
+    Ok(job)
 }
 
 fn recover_started(

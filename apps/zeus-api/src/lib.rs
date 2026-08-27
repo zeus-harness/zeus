@@ -62,10 +62,11 @@ use runtime::{
     AccountAuditCheckpointCommit, AccountAuditEvent as StoredAccountAuditEvent,
     AccountAuditPolicy as StoredAccountAuditPolicy, AccountAuditRollup as StoredAccountAuditRollup,
     AccountAuditState as StoredAccountAuditState, AgentModelClaimOutcome, AgentModelCompletion,
-    AgentModelFailureCommit, AgentModelJob, AgentModelResolution, AgentModelSuccessCommit,
-    AgentReviewCommit, AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome,
-    AgentToolCompletion, AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit, AgentToolWork,
-    AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthzContext, BootstrapOwnerCommit, DemoStore,
+    AgentModelFailureCommit, AgentModelJob, AgentModelResolution, AgentModelStartOutcome,
+    AgentModelSuccessCommit, AgentReviewCommit, AgentToolCall, AgentToolCallSpec,
+    AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
+    AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurnSpec,
+    AuthPrincipal, AuthSessionCommit, AuthzContext, BootstrapOwnerCommit, DemoStore,
     MemberSetupCommit, PublishedEvent, ReplyClaimOutcome, ReplyFailureCommit, ReplyJob,
     ReplyOutcomeUnknownCommit, ReplySuccessCommit, StoreError, StoredMember,
     StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserStatus,
@@ -98,7 +99,10 @@ const SSE_GLOBAL_CONNECTION_LIMIT: usize = 64;
 const SSE_ACTOR_CONNECTION_LIMIT: usize = 4;
 const SSE_CAPACITY_RETRY_AFTER: Duration = Duration::from_secs(2);
 const WORKER_ERROR_RETRY_DELAY: Duration = Duration::from_millis(25);
+const WORKER_ERROR_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 const AGENT_COMPLETION_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
+const AGENT_MODEL_WORKER_HOLDER_ID: &str = "zeus-api-agent-model";
+const AGENT_TOOL_WORKER_HOLDER_ID: &str = "zeus-api-agent-tool";
 const WORKER_IDLE: u8 = 0;
 const WORKER_RUNNING: u8 = 1;
 const WORKER_PENDING: u8 = 2;
@@ -206,6 +210,44 @@ where
                     retry_delay.saturating_mul(2),
                     AGENT_COMPLETION_RETRY_MAX_DELAY,
                 );
+                attempt = attempt.saturating_add(1);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Retry the exact prepared claim until its durable start result is known.
+/// `None` means the claim definitely expired before any external I/O was
+/// authorized, so the caller may safely prepare the next generation.
+async fn retry_prepared_agent_start<T, F, Fut>(
+    label: &str,
+    expires_at: &str,
+    mut operation: F,
+) -> Result<Option<T>, StoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, StoreError>>,
+{
+    let expires_at = chrono::DateTime::parse_from_rfc3339(expires_at).map_err(|_| {
+        StoreError::ExecutionInvariant("a prepared Agent claim has an invalid expiry".into())
+    })?;
+    let mut attempt = 1_u64;
+    let mut retry_delay = WORKER_ERROR_RETRY_DELAY;
+    loop {
+        match operation().await {
+            Ok(started) => return Ok(Some(started)),
+            Err(StoreError::ConcurrentModification) if chrono::Utc::now() >= expires_at => {
+                return Ok(None);
+            }
+            Err(error) if error.is_retryable_durable_completion_error() => {
+                eprintln!(
+                    "zeus {label} prepared-start attempt {attempt} failed; retrying the exact claim before external I/O: {error}"
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = retry_delay
+                    .saturating_mul(2)
+                    .min(AGENT_COMPLETION_RETRY_MAX_DELAY);
                 attempt = attempt.saturating_add(1);
             }
             Err(error) => return Err(error),
@@ -2151,10 +2193,26 @@ fn kick_reply_worker(state: &ApiState) {
     }
     let state = state.clone();
     runtime.spawn(async move {
+        let mut retry_delay = WORKER_ERROR_RETRY_DELAY;
         loop {
-            if let Err(error) = drain_reply_jobs(&state).await {
-                eprintln!("zeus reply worker stopped: {error}");
-                tokio::time::sleep(WORKER_ERROR_RETRY_DELAY).await;
+            match drain_reply_jobs(&state).await {
+                Err(error) if error.is_retryable_durable_completion_error() => {
+                    eprintln!("zeus reply worker retrying durable queue: {error}");
+                    let reply = state
+                        .reply
+                        .as_ref()
+                        .expect("a scheduled reply worker requires a provider");
+                    reply.reply_worker_wake.request();
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = retry_delay
+                        .saturating_mul(2)
+                        .min(WORKER_ERROR_RETRY_MAX_DELAY);
+                }
+                Err(error) => {
+                    eprintln!("zeus reply worker stopped on a permanent queue error: {error}");
+                    retry_delay = WORKER_ERROR_RETRY_DELAY;
+                }
+                Ok(()) => retry_delay = WORKER_ERROR_RETRY_DELAY,
             }
             let reply = state
                 .reply
@@ -2479,8 +2537,7 @@ fn kick_agent_model_worker(state: &ApiState) {
             })
             .await
             {
-                eprintln!("zeus Agent model worker stopped: {error}");
-                tokio::time::sleep(WORKER_ERROR_RETRY_DELAY).await;
+                eprintln!("zeus Agent model worker stopped on a permanent queue error: {error}");
             }
             let executor = state
                 .reply
@@ -2501,14 +2558,34 @@ async fn drain_agent_model_jobs(state: &ApiState) -> Result<(), StoreError> {
     let _drain = executor.agent_model_drain.lock().await;
     let current_manifest = current_agent_manifest(&state.store, executor)?;
     loop {
-        let job = match state
+        let prepared = match state
             .store
-            .claim_next_agent_model(&current_manifest)
+            .prepare_next_agent_model(&current_manifest, AGENT_MODEL_WORKER_HOLDER_ID)
             .await?
         {
-            AgentModelClaimOutcome::Claimed(job) => *job,
+            AgentModelClaimOutcome::Prepared(prepared) => *prepared,
+            AgentModelClaimOutcome::Claimed(_) => {
+                return Err(StoreError::ExecutionInvariant(
+                    "the Agent model prepare path returned an already-started compatibility claim"
+                        .into(),
+                ));
+            }
             AgentModelClaimOutcome::Rejected(_) => continue,
             AgentModelClaimOutcome::NotAvailable => return Ok(()),
+        };
+        let Some(started) =
+            retry_prepared_agent_start("Agent model", &prepared.claim.expires_at, || {
+                state
+                    .store
+                    .start_prepared_agent_model(&prepared.claim, &current_manifest)
+            })
+            .await?
+        else {
+            continue;
+        };
+        let job = match started {
+            AgentModelStartOutcome::Started(job) => *job,
+            AgentModelStartOutcome::Rejected(_) => continue,
         };
         process_agent_model_job(state, job, &current_manifest).await?;
     }
@@ -2809,8 +2886,7 @@ fn kick_agent_tool_worker(state: &ApiState) {
                 retry_agent_durable_progress("Agent tool worker", || drain_agent_tool_calls(&state))
                     .await
             {
-                eprintln!("zeus Agent tool worker stopped: {error}");
-                tokio::time::sleep(WORKER_ERROR_RETRY_DELAY).await;
+                eprintln!("zeus Agent tool worker stopped on a permanent queue error: {error}");
             }
             let executor = state
                 .reply
@@ -2831,10 +2907,34 @@ async fn drain_agent_tool_calls(state: &ApiState) -> Result<(), StoreError> {
     let _drain = executor.agent_tool_drain.lock().await;
     let current_manifest = current_agent_manifest(&state.store, executor)?;
     loop {
-        let work = match state.store.claim_next_agent_tool(&current_manifest).await? {
-            AgentToolClaimOutcome::Claimed(work) => *work,
+        let prepared = match state
+            .store
+            .prepare_next_agent_tool(&current_manifest, AGENT_TOOL_WORKER_HOLDER_ID)
+            .await?
+        {
+            AgentToolClaimOutcome::Prepared(prepared) => *prepared,
+            AgentToolClaimOutcome::Claimed(_) => {
+                return Err(StoreError::ExecutionInvariant(
+                    "the Agent tool prepare path returned an already-started compatibility claim"
+                        .into(),
+                ));
+            }
             AgentToolClaimOutcome::Rejected(_) => continue,
             AgentToolClaimOutcome::NotAvailable => return Ok(()),
+        };
+        let Some(started) =
+            retry_prepared_agent_start("Agent tool", &prepared.claim.expires_at, || {
+                state
+                    .store
+                    .start_prepared_agent_tool(&prepared.claim, &current_manifest)
+            })
+            .await?
+        else {
+            continue;
+        };
+        let work = match started {
+            AgentToolStartOutcome::Started(work) => *work,
+            AgentToolStartOutcome::Rejected(_) => continue,
         };
         process_agent_tool_work(state, work).await?;
     }
@@ -4702,6 +4802,47 @@ mod tests {
         assert_eq!(attempts.load(Ordering::Relaxed), 3);
         assert_eq!(wake.state.load(Ordering::Acquire), WORKER_RUNNING);
         assert!(!wake.complete_cycle());
+    }
+
+    #[tokio::test]
+    async fn prepared_start_retry_keeps_the_exact_claim_until_start_is_known() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let expires_at = (chrono::Utc::now() + chrono::Duration::minutes(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let result = retry_prepared_agent_start("test", &expires_at, || {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                if attempts.fetch_add(1, Ordering::Relaxed) < 2 {
+                    Err(StoreError::ConcurrentModification)
+                } else {
+                    Ok("started")
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result, Some("started"));
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn expired_prepared_start_returns_to_safe_reprepare() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let expires_at = (chrono::Utc::now() - chrono::Duration::seconds(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let result: Option<()> = retry_prepared_agent_start("test", &expires_at, || {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Err(StoreError::ConcurrentModification)
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result, None);
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

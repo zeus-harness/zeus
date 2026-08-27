@@ -29,16 +29,17 @@ use tenancy::{PasswordAuthenticator, PasswordHashRecord};
 
 use crate::{
     AccountAuditCheckpointCommit, AccountId, AgentModelClaimOutcome, AgentModelCompletion,
-    AgentModelFailureCommit, AgentModelResolution, AgentModelSuccessCommit, AgentReviewCommit,
-    AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
-    AgentTurnSpec, AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit,
-    ClaimOutcome, CommitOutcome, CreateMemberCommit, DispatchCompleteCommit, DispatchJobSpec,
-    DispatchRecoveryCommit, DispatchStartCommit, DispatchStatus, MemberSetupCommit,
-    MemberSetupToken, MembershipRevision, MembershipRole, ReplyClaimOutcome, ReplyFailureCommit,
-    ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit, ReplySuccessCommit, ReviewCommit,
-    RotateMemberSetupTokenCommit, RunSnapshot, RuntimeIdentity, SqliteOperationLimits,
-    SqlitePhysicalLimits, SqliteStore, StorageError, StorageLimits, StoredMembershipStatus,
-    StoredUserRole, StoredUserStatus, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
+    AgentModelFailureCommit, AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit,
+    AgentReviewCommit, AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion,
+    AgentToolCompletionCommit, AgentTurnSpec, AuthSessionCommit, AuthSessionId, AuthzContext,
+    BootstrapOwnerCommit, ClaimOutcome, CommitOutcome, CreateMemberCommit, DispatchCompleteCommit,
+    DispatchJobSpec, DispatchRecoveryCommit, DispatchStartCommit, DispatchStatus,
+    MemberSetupCommit, MemberSetupToken, MembershipRevision, MembershipRole, ReplyClaimOutcome,
+    ReplyFailureCommit, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
+    ReplySuccessCommit, ReviewCommit, RotateMemberSetupTokenCommit, RunSnapshot, RuntimeIdentity,
+    SqliteOperationLimits, SqlitePhysicalLimits, SqliteStore, StorageError, StorageLimits,
+    StoredMembershipStatus, StoredUserRole, StoredUserStatus, TransitionMemberCommit,
+    UpdateAccountAuditPolicyCommit,
 };
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
@@ -1630,7 +1631,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
     assert_eq!(
         versions,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
         ]
     );
     let owner: Option<String> = connection
@@ -1772,7 +1773,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
     assert_eq!(
         run_event_payloads(database.path(), &long_run_id),
         payloads_before,
-        "v9-v20 migrations must not rewrite immutable event payloads"
+        "v9-v21 migrations must not rewrite immutable event payloads"
     );
     let connection = rusqlite::Connection::open(database.path()).unwrap();
     let version: i64 = connection
@@ -1780,7 +1781,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 20);
+    assert_eq!(version, 21);
     let configured_account: (String, String, String, i64) = connection
         .query_row(
             r#"SELECT
@@ -2306,7 +2307,7 @@ async fn v12_identity_and_run_crash_prefix_migrates_then_recovers_the_primary_se
     assert_eq!(
         recovered,
         (
-            20,
+            21,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into()
@@ -4053,7 +4054,7 @@ async fn v5_configured_database_migrates_to_the_local_owner_membership() {
     assert_eq!(
         migrated,
         (
-            20,
+            21,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into(),
@@ -4179,7 +4180,7 @@ async fn v13_configured_active_work_migrates_with_account_authority_and_exact_vo
             },
         )
         .unwrap();
-    assert_eq!(migrated_counts, (20, 1, 1, 2, 1));
+    assert_eq!(migrated_counts, (21, 1, 1, 2, 1));
 }
 
 #[tokio::test]
@@ -4541,7 +4542,7 @@ async fn v14_database_migrates_through_v19_with_member_and_audit_roots() {
             },
         )
         .unwrap();
-    assert_eq!(state, (20, 1, 1, 1, 19));
+    assert_eq!(state, (21, 1, 1, 1, 19));
 }
 
 #[tokio::test]
@@ -4580,7 +4581,7 @@ async fn v15_migration_seeds_the_configured_audit_detail_limit() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (20, 2));
+    assert_eq!(state, (21, 2));
 }
 
 #[tokio::test]
@@ -4625,7 +4626,7 @@ async fn v15_reopen_rejects_a_lower_audit_detail_limit_without_mutating_policy()
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (20, 4));
+    assert_eq!(state, (21, 4));
     drop(connection);
 
     let reopened = SqliteStore::open_with_limits(database.path(), original_limits)
@@ -5825,7 +5826,7 @@ async fn v19_agent_manifest_is_canonical_actor_scoped_reused_and_secret_free() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(version, 20);
+    assert_eq!(version, 21);
     assert_eq!(
         manifest_rows, 1,
         "the identical manifest must be deduplicated"
@@ -8392,6 +8393,783 @@ async fn policy_denial_at_result_limit_persists_an_unemitted_call() {
     assert_eq!(emitted_result_digest, None);
     drop(connection);
     store.verify_integrity().await.unwrap();
+}
+
+struct StoredAgentOperationClaim {
+    operation_kind: String,
+    operation_id: String,
+    model_job_id: Option<String>,
+    tool_call_id: Option<String>,
+    agent_id: String,
+    generation: i64,
+    holder_id: String,
+    phase: String,
+    acquired_at: String,
+    expires_at: String,
+    started_at: Option<String>,
+    released_at: Option<String>,
+}
+
+fn load_single_agent_operation_claim(
+    connection: &rusqlite::Connection,
+) -> StoredAgentOperationClaim {
+    connection
+        .query_row(
+            r#"SELECT operation_kind, operation_id, model_job_id, tool_call_id,
+                      agent_id, generation, holder_id, phase, acquired_at,
+                      expires_at, started_at, released_at
+               FROM agent_operation_claims"#,
+            [],
+            |row| {
+                Ok(StoredAgentOperationClaim {
+                    operation_kind: row.get(0)?,
+                    operation_id: row.get(1)?,
+                    model_job_id: row.get(2)?,
+                    tool_call_id: row.get(3)?,
+                    agent_id: row.get(4)?,
+                    generation: row.get(5)?,
+                    holder_id: row.get(6)?,
+                    phase: row.get(7)?,
+                    acquired_at: row.get(8)?,
+                    expires_at: row.get(9)?,
+                    started_at: row.get(10)?,
+                    released_at: row.get(11)?,
+                })
+            },
+        )
+        .unwrap()
+}
+
+#[tokio::test]
+async fn v20_started_model_migrates_to_one_legacy_started_operation_claim() {
+    let database = TestDatabase::new();
+    let job_id = {
+        let store = created_owned_file_session_store(database.path()).await;
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: "turn-v20-started-model-claim".into(),
+                    user_message: "Preserve the in-flight model operation".into(),
+                    expected_sequence: 1,
+                },
+                "v20-started-model-claim-start",
+                agent_turn_spec(
+                    "agent-v20-started-model-claim",
+                    "turn-v20-started-model-claim",
+                ),
+            )
+            .await
+            .unwrap();
+        let AgentModelClaimOutcome::Claimed(job) = store
+            .claim_next_agent_model(&test_agent_manifest())
+            .await
+            .unwrap()
+        else {
+            panic!("the model fixture must be started");
+        };
+        job.id
+    };
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    drop_v21_fixture_objects(&connection);
+    assert_eq!(
+        connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        20
+    );
+    drop(connection);
+
+    let migrated = SqliteStore::open(database.path()).await.unwrap();
+    migrated.verify_integrity().await.unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let row = load_single_agent_operation_claim(&connection);
+    assert_eq!(row.operation_kind, "model");
+    assert_eq!(row.operation_id, job_id);
+    assert_eq!(row.model_job_id.as_deref(), Some(job_id.as_str()));
+    assert_eq!(row.tool_call_id, None);
+    assert_eq!(row.agent_id, "agent-v20-started-model-claim");
+    assert_eq!(row.generation, 1);
+    assert_eq!(row.holder_id, "legacy-v20");
+    assert_eq!(row.phase, "started");
+    assert_eq!(row.acquired_at, row.expires_at);
+    assert_eq!(row.expires_at, row.started_at.unwrap());
+    assert_eq!(row.released_at, None);
+}
+
+#[tokio::test]
+async fn v20_started_tool_migrates_without_claiming_its_terminal_model() {
+    let database = TestDatabase::new();
+    let call_id = "agent-call-v20-started-tool-claim";
+    {
+        let store = created_owned_file_session_store(database.path()).await;
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: "turn-v20-started-tool-claim".into(),
+                    user_message: "Preserve the in-flight tool operation".into(),
+                    expected_sequence: 1,
+                },
+                "v20-started-tool-claim-start",
+                agent_turn_spec(
+                    "agent-v20-started-tool-claim",
+                    "turn-v20-started-tool-claim",
+                ),
+            )
+            .await
+            .unwrap();
+        let AgentModelClaimOutcome::Claimed(job) = store
+            .claim_next_agent_model(&test_agent_manifest())
+            .await
+            .unwrap()
+        else {
+            panic!("the model fixture must be claimable");
+        };
+        let call = agent_tool_call_spec(call_id, PolicyDecision::Allow);
+        store
+            .complete_agent_model_success(AgentModelSuccessCommit {
+                job_id: job.id,
+                response_json: agent_tool_response_json(&call),
+                resolution: AgentModelResolution::ToolCall { call },
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .claim_next_agent_tool(&test_agent_manifest())
+                .await
+                .unwrap(),
+            AgentToolClaimOutcome::Claimed(_)
+        ));
+    }
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    drop_v21_fixture_objects(&connection);
+    drop(connection);
+    let migrated = SqliteStore::open(database.path()).await.unwrap();
+    migrated.verify_integrity().await.unwrap();
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM agent_operation_claims", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 1, "the terminal model must not be backfilled");
+    let row = load_single_agent_operation_claim(&connection);
+    assert_eq!(row.operation_kind, "tool");
+    assert_eq!(row.operation_id, call_id);
+    assert_eq!(row.model_job_id, None);
+    assert_eq!(row.tool_call_id.as_deref(), Some(call_id));
+    assert_eq!(row.agent_id, "agent-v20-started-tool-claim");
+    assert_eq!(row.generation, 1);
+    assert_eq!(row.holder_id, "legacy-v20");
+    assert_eq!(row.phase, "started");
+    assert_eq!(row.acquired_at, row.expires_at);
+    assert_eq!(row.expires_at, row.started_at.unwrap());
+    assert_eq!(row.released_at, None);
+}
+
+#[tokio::test]
+async fn v20_queued_model_migrates_without_an_operation_claim() {
+    let database = TestDatabase::new();
+    {
+        let store = created_owned_file_session_store(database.path()).await;
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: "turn-v20-queued-model-no-claim".into(),
+                    user_message: "Leave queued work unclaimed".into(),
+                    expected_sequence: 1,
+                },
+                "v20-queued-model-no-claim-start",
+                agent_turn_spec(
+                    "agent-v20-queued-model-no-claim",
+                    "turn-v20-queued-model-no-claim",
+                ),
+            )
+            .await
+            .unwrap();
+    }
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    drop_v21_fixture_objects(&connection);
+    drop(connection);
+    let migrated = SqliteStore::open(database.path()).await.unwrap();
+    migrated.verify_integrity().await.unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM agent_operation_claims", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn agent_operation_claims_enforce_binding_generation_and_forward_transitions() {
+    let database = TestDatabase::new();
+    let job_id = {
+        let store = created_owned_file_session_store(database.path()).await;
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: "turn-operation-claim-contract".into(),
+                    user_message: "Exercise the operation claim contract".into(),
+                    expected_sequence: 1,
+                },
+                "operation-claim-contract-start",
+                agent_turn_spec(
+                    "agent-operation-claim-contract",
+                    "turn-operation-claim-contract",
+                ),
+            )
+            .await
+            .unwrap()
+            .job
+            .id
+    };
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .unwrap();
+
+    assert!(
+        connection
+            .execute(
+                r#"INSERT INTO agent_operation_claims(
+                       operation_kind, operation_id, model_job_id, tool_call_id,
+                       agent_id, generation, holder_id, phase, acquired_at,
+                       expires_at, started_at, released_at
+                   ) VALUES ('model', ?1, ?1, NULL, 'agent-wrong-binding', 1,
+                             'holder-a', 'prepared', ?2, ?3, NULL, NULL)"#,
+                params![
+                    job_id,
+                    "2026-08-27T00:00:00.000Z",
+                    "2026-08-27T00:01:00.000Z"
+                ],
+            )
+            .is_err(),
+        "a claim must bind to the operation's Agent"
+    );
+    assert!(
+        connection
+            .execute(
+                r#"INSERT INTO agent_operation_claims(
+                       operation_kind, operation_id, model_job_id, tool_call_id,
+                       agent_id, generation, holder_id, phase, acquired_at,
+                       expires_at, started_at, released_at
+                   ) VALUES ('model', 'different-operation', ?1, NULL,
+                             'agent-operation-claim-contract', 1, 'holder-a',
+                             'prepared', ?2, ?3, NULL, NULL)"#,
+                params![
+                    job_id,
+                    "2026-08-27T00:00:00.000Z",
+                    "2026-08-27T00:01:00.000Z"
+                ],
+            )
+            .is_err(),
+        "operation_id must match the selected nullable operation FK"
+    );
+    assert!(
+        connection
+            .execute(
+                r#"INSERT INTO agent_operation_claims(
+                       operation_kind, operation_id, model_job_id, tool_call_id,
+                       agent_id, generation, holder_id, phase, acquired_at,
+                       expires_at, started_at, released_at
+                   ) VALUES ('model', ?1, NULL, NULL,
+                             'agent-operation-claim-contract', 1, 'holder-a',
+                             'prepared', ?2, ?3, NULL, NULL)"#,
+                params![
+                    job_id,
+                    "2026-08-27T00:00:00.000Z",
+                    "2026-08-27T00:01:00.000Z"
+                ],
+            )
+            .is_err(),
+        "exactly one operation FK is required"
+    );
+    connection
+        .execute(
+            r#"INSERT INTO agent_operation_claims(
+                   operation_kind, operation_id, model_job_id, tool_call_id,
+                   agent_id, generation, holder_id, phase, acquired_at,
+                   expires_at, started_at, released_at
+               ) VALUES ('model', ?1, ?1, NULL,
+                         'agent-operation-claim-contract', 1, 'holder-a',
+                         'prepared', ?2, ?3, NULL, NULL)"#,
+            params![
+                job_id,
+                "2026-08-27T00:00:00.000Z",
+                "2026-08-27T00:01:00.000Z"
+            ],
+        )
+        .unwrap();
+    assert!(
+        connection
+            .execute(
+                r#"INSERT INTO agent_operation_claims(
+                       operation_kind, operation_id, model_job_id, tool_call_id,
+                       agent_id, generation, holder_id, phase, acquired_at,
+                       expires_at, started_at, released_at
+                   ) VALUES ('model', ?1, ?1, NULL,
+                             'agent-operation-claim-contract', 2, 'holder-b',
+                             'prepared', ?2, ?3, NULL, NULL)"#,
+                params![
+                    job_id,
+                    "2026-08-27T00:00:10.000Z",
+                    "2026-08-27T00:01:10.000Z"
+                ],
+            )
+            .is_err(),
+        "one operation cannot have two active claims"
+    );
+    connection
+        .execute(
+            r#"UPDATE agent_operation_claims
+               SET phase = 'released', released_at = ?2
+               WHERE operation_kind = 'model' AND operation_id = ?1 AND generation = 1"#,
+            params![job_id, "2026-08-27T00:00:20.000Z"],
+        )
+        .unwrap();
+    assert!(
+        connection
+            .execute(
+                r#"INSERT INTO agent_operation_claims(
+                       operation_kind, operation_id, model_job_id, tool_call_id,
+                       agent_id, generation, holder_id, phase, acquired_at,
+                       expires_at, started_at, released_at
+                   ) VALUES ('model', ?1, ?1, NULL,
+                             'agent-operation-claim-contract', 3, 'holder-c',
+                             'prepared', ?2, ?3, NULL, NULL)"#,
+                params![
+                    job_id,
+                    "2026-08-27T00:00:30.000Z",
+                    "2026-08-27T00:01:30.000Z"
+                ],
+            )
+            .is_err(),
+        "generation must equal the historical maximum plus one"
+    );
+    connection
+        .execute(
+            r#"INSERT INTO agent_operation_claims(
+                   operation_kind, operation_id, model_job_id, tool_call_id,
+                   agent_id, generation, holder_id, phase, acquired_at,
+                   expires_at, started_at, released_at
+               ) VALUES ('model', ?1, ?1, NULL,
+                         'agent-operation-claim-contract', 2, 'holder-b',
+                         'prepared', ?2, ?3, NULL, NULL)"#,
+            params![
+                job_id,
+                "2026-08-27T00:00:30.000Z",
+                "2026-08-27T00:00:31.000Z"
+            ],
+        )
+        .unwrap();
+    assert!(
+        connection
+            .execute(
+                r#"UPDATE agent_operation_claims SET holder_id = 'holder-mutated'
+                   WHERE operation_kind = 'model' AND operation_id = ?1 AND generation = 2"#,
+                [&job_id],
+            )
+            .is_err(),
+        "claim identity and acquisition fields are immutable"
+    );
+    connection
+        .execute(
+            r#"UPDATE agent_operation_claims
+               SET phase = 'started', started_at = ?2
+               WHERE operation_kind = 'model' AND operation_id = ?1 AND generation = 2"#,
+            params![job_id, "2026-08-27T00:02:00.000Z"],
+        )
+        .unwrap();
+    assert!(
+        connection
+            .execute(
+                r#"UPDATE agent_operation_claims
+                   SET phase = 'expired', started_at = NULL, released_at = ?2
+                   WHERE operation_kind = 'model' AND operation_id = ?1 AND generation = 2"#,
+                params![job_id, "2026-08-27T00:02:10.000Z"],
+            )
+            .is_err(),
+        "a started operation can only be released"
+    );
+    connection
+        .execute(
+            r#"UPDATE agent_operation_claims
+               SET phase = 'released', released_at = ?2
+               WHERE operation_kind = 'model' AND operation_id = ?1 AND generation = 2"#,
+            params![job_id, "2026-08-27T00:02:10.000Z"],
+        )
+        .unwrap();
+    assert!(
+        connection
+            .execute(
+                r#"DELETE FROM agent_operation_claims
+                   WHERE operation_kind = 'model' AND operation_id = ?1 AND generation = 1"#,
+                [&job_id],
+            )
+            .is_err(),
+        "claim history is append-only"
+    );
+    connection
+        .execute(
+            r#"INSERT INTO agent_operation_claims(
+                   operation_kind, operation_id, model_job_id, tool_call_id,
+                   agent_id, generation, holder_id, phase, acquired_at,
+                   expires_at, started_at, released_at
+               ) VALUES ('model', ?1, ?1, NULL,
+                         'agent-operation-claim-contract', 3, 'holder-c',
+                         'prepared', ?2, ?3, NULL, NULL)"#,
+            params![
+                job_id,
+                "2026-08-27T00:03:00.000Z",
+                "2026-08-27T00:04:00.000Z"
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE agent_operation_claims
+               SET phase = 'expired', released_at = ?2
+               WHERE operation_kind = 'model' AND operation_id = ?1 AND generation = 3"#,
+            params![job_id, "2026-08-27T00:04:01.000Z"],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = SqliteStore::open(database.path()).await.unwrap();
+    reopened.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn prepared_model_claim_keeps_work_queued_until_one_exact_start() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-prepared-model-boundary".into(),
+                user_message: "Prepare before committing the external start".into(),
+                expected_sequence: 1,
+            },
+            "prepared-model-boundary-start",
+            agent_turn_spec(
+                "agent-prepared-model-boundary",
+                "turn-prepared-model-boundary",
+            ),
+        )
+        .await
+        .unwrap();
+    let AgentModelClaimOutcome::Prepared(prepared) = store
+        .prepare_next_agent_model(&test_agent_manifest(), "model-worker-a")
+        .await
+        .unwrap()
+    else {
+        panic!("the queued model job must be prepared");
+    };
+    let prepared = *prepared;
+    let AgentModelClaimOutcome::Prepared(replayed_preparation) = store
+        .prepare_next_agent_model(&test_agent_manifest(), "model-worker-a")
+        .await
+        .unwrap()
+    else {
+        panic!("the same holder must recover its exact prepared claim");
+    };
+    assert_eq!(*replayed_preparation, prepared);
+    assert!(matches!(
+        store
+            .prepare_next_agent_model(&test_agent_manifest(), "model-worker-b")
+            .await
+            .unwrap(),
+        AgentModelClaimOutcome::NotAvailable
+    ));
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let before: (String, i64, String, i64, String) = connection
+        .query_row(
+            r#"SELECT job.status, job.attempt, agent.status,
+                      (SELECT COUNT(*) FROM agent_run_epochs epoch
+                       WHERE epoch.agent_id = agent.id),
+                      claim.phase
+               FROM agent_model_jobs job
+               JOIN agent_turns agent ON agent.id = job.agent_id
+               JOIN agent_operation_claims claim
+                 ON claim.operation_kind = 'model'
+                AND claim.operation_id = job.id
+                AND claim.generation = 1
+               WHERE job.id = ?1"#,
+            [&prepared.job.id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        before,
+        (
+            "queued".into(),
+            0,
+            "waiting_model".into(),
+            0,
+            "prepared".into()
+        )
+    );
+    drop(connection);
+
+    let AgentModelStartOutcome::Started(started) = store
+        .start_prepared_agent_model(&prepared.claim, &test_agent_manifest())
+        .await
+        .unwrap()
+    else {
+        panic!("the prepared model claim must start");
+    };
+    let started = *started;
+    let AgentModelStartOutcome::Started(replayed) = store
+        .start_prepared_agent_model(&prepared.claim, &test_agent_manifest())
+        .await
+        .unwrap()
+    else {
+        panic!("the same started claim must replay exactly");
+    };
+    assert_eq!(*replayed, started);
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let after: (String, i64, String, i64, String) = connection
+        .query_row(
+            r#"SELECT job.status, job.attempt, agent.status,
+                      (SELECT COUNT(*) FROM agent_run_epochs epoch
+                       WHERE epoch.agent_id = agent.id),
+                      claim.phase
+               FROM agent_model_jobs job
+               JOIN agent_turns agent ON agent.id = job.agent_id
+               JOIN agent_operation_claims claim
+                 ON claim.operation_kind = 'model'
+                AND claim.operation_id = job.id
+                AND claim.generation = 1
+               WHERE job.id = ?1"#,
+            [&prepared.job.id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        after,
+        (
+            "started".into(),
+            1,
+            "model_running".into(),
+            1,
+            "started".into()
+        )
+    );
+    drop(connection);
+    store.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn prepared_model_crash_expires_without_unknown_and_next_generation_can_start() {
+    let database = TestDatabase::new();
+    let first_claim = {
+        let store = created_owned_file_session_store(database.path()).await;
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: "turn-prepared-model-recovery".into(),
+                    user_message: "Recover a crash before external start".into(),
+                    expected_sequence: 1,
+                },
+                "prepared-model-recovery-start",
+                agent_turn_spec(
+                    "agent-prepared-model-recovery",
+                    "turn-prepared-model-recovery",
+                ),
+            )
+            .await
+            .unwrap();
+        let AgentModelClaimOutcome::Prepared(prepared) = store
+            .prepare_next_agent_model(&test_agent_manifest(), "model-worker-before-crash")
+            .await
+            .unwrap()
+        else {
+            panic!("the queued model job must be prepared");
+        };
+        prepared.claim.clone()
+    };
+
+    let reopened = SqliteStore::open(database.path()).await.unwrap();
+    assert!(
+        reopened
+            .recover_started_agent_work()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let recovered: (String, i64, String, String, i64, i64) = connection
+        .query_row(
+            r#"SELECT job.status, job.attempt, agent.status, claim.phase,
+                      claim.generation,
+                      (SELECT COUNT(*) FROM agent_run_epochs epoch
+                       WHERE epoch.agent_id = agent.id)
+               FROM agent_model_jobs job
+               JOIN agent_turns agent ON agent.id = job.agent_id
+               JOIN agent_operation_claims claim
+                 ON claim.operation_kind = 'model'
+                AND claim.operation_id = job.id
+               WHERE job.id = ?1"#,
+            [&first_claim.operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        recovered,
+        (
+            "queued".into(),
+            0,
+            "waiting_model".into(),
+            "expired".into(),
+            1,
+            0
+        )
+    );
+    drop(connection);
+    assert!(matches!(
+        reopened
+            .start_prepared_agent_model(&first_claim, &test_agent_manifest())
+            .await,
+        Err(StorageError::ConcurrentModification)
+    ));
+
+    let AgentModelClaimOutcome::Prepared(second) = reopened
+        .prepare_next_agent_model(&test_agent_manifest(), "model-worker-after-crash")
+        .await
+        .unwrap()
+    else {
+        panic!("the expired preparation must be reclaimable");
+    };
+    assert_eq!(second.claim.generation, 2);
+    assert!(matches!(
+        reopened
+            .start_prepared_agent_model(&second.claim, &test_agent_manifest())
+            .await
+            .unwrap(),
+        AgentModelStartOutcome::Started(_)
+    ));
+    reopened.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn agent_operation_claim_generation_gap_fails_deep_readiness() {
+    let database = TestDatabase::new();
+    let job_id = {
+        let store = created_owned_file_session_store(database.path()).await;
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: "turn-operation-claim-gap".into(),
+                    user_message: "Reject a claim generation gap".into(),
+                    expected_sequence: 1,
+                },
+                "operation-claim-gap-start",
+                agent_turn_spec("agent-operation-claim-gap", "turn-operation-claim-gap"),
+            )
+            .await
+            .unwrap()
+            .job
+            .id
+    };
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO agent_operation_claims(
+                   operation_kind, operation_id, model_job_id, tool_call_id,
+                   agent_id, generation, holder_id, phase, acquired_at,
+                   expires_at, started_at, released_at
+               ) VALUES ('model', ?1, ?1, NULL, 'agent-operation-claim-gap', 1,
+                         'holder-a', 'released', ?2, ?3, NULL, ?4)"#,
+            params![
+                job_id,
+                "2026-08-27T00:00:00.000Z",
+                "2026-08-27T00:01:00.000Z",
+                "2026-08-27T00:00:10.000Z"
+            ],
+        )
+        .unwrap();
+    let next_generation_trigger = stored_trigger_sql(
+        &connection,
+        "agent_operation_claims_require_next_generation",
+    );
+    connection
+        .execute_batch("DROP TRIGGER agent_operation_claims_require_next_generation;")
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO agent_operation_claims(
+                   operation_kind, operation_id, model_job_id, tool_call_id,
+                   agent_id, generation, holder_id, phase, acquired_at,
+                   expires_at, started_at, released_at
+               ) VALUES ('model', ?1, ?1, NULL, 'agent-operation-claim-gap', 3,
+                         'holder-c', 'released', ?2, ?3, NULL, ?4)"#,
+            params![
+                job_id,
+                "2026-08-27T00:02:00.000Z",
+                "2026-08-27T00:03:00.000Z",
+                "2026-08-27T00:02:10.000Z"
+            ],
+        )
+        .unwrap();
+    connection.execute_batch(&next_generation_trigger).unwrap();
+    drop(connection);
+
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("a non-contiguous operation claim generation must fail startup"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StorageError::CorruptData(message)
+        if message.contains("Agent operation claims are inconsistent")));
 }
 
 #[tokio::test]
@@ -11434,6 +12212,112 @@ async fn reply_claim_rechecks_actor_and_interrupts_without_provider_execution() 
 }
 
 #[tokio::test]
+async fn exact_reply_start_replays_one_observed_job_without_skipping_the_queue() {
+    let store = SqliteStore::open(":memory:").await.unwrap();
+    bootstrap_test_owner(&store).await;
+    for (session_id, turn_id, job_id) in [
+        (
+            "session-exact-reply-a",
+            "turn-exact-reply-a",
+            "reply-exact-a",
+        ),
+        (
+            "session-exact-reply-b",
+            "turn-exact-reply-b",
+            "reply-exact-b",
+        ),
+    ] {
+        store
+            .create_session_for_actor(
+                &owner_authz(),
+                CreateSessionRequest {
+                    id: session_id.into(),
+                    title: format!("Exact start for {job_id}"),
+                },
+                &format!("create-{session_id}"),
+            )
+            .await
+            .unwrap();
+        store
+            .start_turn_and_enqueue_reply_for_actor(
+                &owner_authz(),
+                session_id,
+                StartTurnRequest {
+                    turn_id: turn_id.into(),
+                    user_message: format!("Start {job_id} exactly once"),
+                    expected_sequence: 1,
+                },
+                &format!("enqueue-{job_id}"),
+                reply_job_spec(job_id, turn_id),
+            )
+            .await
+            .unwrap();
+    }
+
+    let observed = store.peek_next_reply().await.unwrap().unwrap();
+    assert_eq!(observed.id, "reply-exact-a");
+    assert_eq!(observed.status, ReplyJobStatus::Queued);
+
+    let first = store.start_observed_reply(&observed.id).await.unwrap();
+    let replayed = store.start_observed_reply(&observed.id).await.unwrap();
+    assert_eq!(replayed, first);
+    let ReplyClaimOutcome::Claimed(first) = first else {
+        panic!("the observed queue head must start");
+    };
+    assert_eq!(first.id, "reply-exact-a");
+    assert_eq!(first.status, ReplyJobStatus::Started);
+    assert_eq!(first.attempt, 1);
+
+    let next = store.peek_next_reply().await.unwrap().unwrap();
+    assert_eq!(next.id, "reply-exact-b");
+    assert_eq!(next.status, ReplyJobStatus::Queued);
+    assert_eq!(next.attempt, 0);
+    store.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn exact_reply_start_replays_a_committed_authorization_rejection() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    store
+        .start_turn_and_enqueue_reply_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-exact-rejected-reply".into(),
+                user_message: "Never reach the provider after revocation".into(),
+                expected_sequence: 1,
+            },
+            "enqueue-exact-rejected-reply",
+            reply_job_spec("reply-exact-rejected", "turn-exact-rejected-reply"),
+        )
+        .await
+        .unwrap();
+    set_test_user_status(database.path(), "user-owner", "disabled");
+
+    let observed = store.peek_next_reply().await.unwrap().unwrap();
+    assert_eq!(observed.id, "reply-exact-rejected");
+    let ReplyClaimOutcome::Rejected(first) =
+        store.start_observed_reply(&observed.id).await.unwrap()
+    else {
+        panic!("the revoked actor must be rejected before provider execution");
+    };
+    assert!(!first.replayed);
+
+    let ReplyClaimOutcome::Rejected(replayed) =
+        store.start_observed_reply(&observed.id).await.unwrap()
+    else {
+        panic!("an ambiguous rejection acknowledgement must replay exactly");
+    };
+    assert!(replayed.replayed);
+    assert_eq!(replayed.job, first.job);
+    assert_eq!(replayed.session, first.session);
+    assert_eq!(replayed.turn, first.turn);
+    assert_eq!(replayed.events, first.events);
+    assert!(store.peek_next_reply().await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn dispatch_claim_rechecks_owner_and_records_not_dispatched_evidence() {
     let database = TestDatabase::new();
     let store = seeded_file_store(database.path()).await;
@@ -12311,6 +13195,73 @@ async fn complete_is_atomic_and_persists_the_typed_result() {
 }
 
 #[tokio::test]
+async fn committed_dispatch_completion_replays_the_exact_terminal_ack() {
+    let store = seeded_memory_store().await;
+    bootstrap_test_owner(&store).await;
+    let (snapshot, _) = seed_fixture();
+    let review = approved_dispatch_commit(&snapshot, "complete-ack-replay-review");
+    store
+        .commit_review_for_actor(&owner_authz(), review.clone())
+        .await
+        .unwrap();
+    let start = start_commit(&review.snapshot);
+    store.claim_next_dispatch(start.clone()).await.unwrap();
+    let completion = completion_commit(&start.snapshot);
+
+    let committed = store.complete_dispatch(completion.clone()).await.unwrap();
+    let replayed = store.complete_dispatch(completion.clone()).await.unwrap();
+
+    assert_eq!(replayed, committed);
+    let loaded = store.load_run(RUN_ID).await.unwrap();
+    assert_eq!(loaded.snapshot, completion.snapshot);
+    assert_eq!(loaded.events.len(), 9);
+    assert_eq!(loaded.events.last(), Some(&completion.event));
+}
+
+#[tokio::test]
+async fn committed_dispatch_completion_rejects_conflicting_terminal_acks() {
+    let store = seeded_memory_store().await;
+    bootstrap_test_owner(&store).await;
+    let (snapshot, _) = seed_fixture();
+    let review = approved_dispatch_commit(&snapshot, "complete-ack-conflict-review");
+    store
+        .commit_review_for_actor(&owner_authz(), review.clone())
+        .await
+        .unwrap();
+    let start = start_commit(&review.snapshot);
+    store.claim_next_dispatch(start.clone()).await.unwrap();
+    let completion = completion_commit(&start.snapshot);
+    let committed = store.complete_dispatch(completion.clone()).await.unwrap();
+
+    let mut different_event = completion.clone();
+    different_event.event.at = "2026-08-26T01:20:03Z".into();
+    assert!(matches!(
+        store.complete_dispatch(different_event).await,
+        Err(StorageError::IdempotencyConflict)
+    ));
+
+    let mut different_result = completion.clone();
+    different_result.result_json = serde_json::to_value(ToolOutcome::Failed {
+        summary: "A different terminal result".into(),
+        error_code: Some("different_result".into()),
+    })
+    .unwrap();
+    assert!(matches!(
+        store.complete_dispatch(different_result).await,
+        Err(StorageError::IdempotencyConflict)
+    ));
+
+    assert_eq!(
+        store.dispatch_job("call-local-001").await.unwrap(),
+        Some(committed)
+    );
+    let loaded = store.load_run(RUN_ID).await.unwrap();
+    assert_eq!(loaded.snapshot, completion.snapshot);
+    assert_eq!(loaded.events.len(), 9);
+    assert_eq!(loaded.events.last(), Some(&completion.event));
+}
+
+#[tokio::test]
 async fn dispatch_storage_rejects_noncanonical_event_and_projection_without_partial_writes() {
     let store = seeded_memory_store().await;
     bootstrap_test_owner(&store).await;
@@ -12406,13 +13357,20 @@ async fn started_job_restart_recovery_records_outcome_unknown_without_requeue() 
     let recovery = recovery_commit(&start.snapshot);
     let recovered = reopened.recover_started(recovery.clone()).await.unwrap();
     assert_eq!(recovered.status, DispatchStatus::Finished);
-    assert_eq!(recovered.result_json, Some(recovery.result_json));
+    assert_eq!(recovered.result_json, Some(recovery.result_json.clone()));
     assert!(reopened.started_dispatches().await.unwrap().is_empty());
     assert!(reopened.peek_next_dispatch().await.unwrap().is_none());
     let loaded = reopened.load_run(RUN_ID).await.unwrap();
     assert_eq!(loaded.snapshot.run.status, RunStatus::NeedsAttention);
     assert_eq!(loaded.snapshot.run.sequence, 9);
     assert_eq!(loaded.events.last(), Some(&recovery.event));
+
+    let replayed = reopened.recover_started(recovery.clone()).await.unwrap();
+    assert_eq!(replayed, recovered);
+    let replayed_run = reopened.load_run(RUN_ID).await.unwrap();
+    assert_eq!(replayed_run.snapshot, recovery.snapshot);
+    assert_eq!(replayed_run.events.len(), 9);
+    assert_eq!(replayed_run.events.last(), Some(&recovery.event));
 
     drop(reopened);
     let reopened_again = SqliteStore::open(database.path()).await.unwrap();
@@ -13692,7 +14650,7 @@ async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempot
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, (1_i64..=20).collect::<Vec<_>>());
+    assert_eq!(versions, (1_i64..=21).collect::<Vec<_>>());
     assert_eq!(
         connection
             .query_row(
@@ -16190,6 +17148,14 @@ fn downgrade_agent_deployment_manifest_fixture_to_v18(connection: &rusqlite::Con
 }
 
 fn drop_v20_fixture_objects(connection: &rusqlite::Connection) {
+    let version: i64 = connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    if version >= 21 {
+        drop_v21_fixture_objects(connection);
+    }
     let model_trigger = migration_trigger_sql(
         include_str!("../migrations/0017_session_agent_loop.sql"),
         "agent_model_jobs_enforce_forward_transition",
@@ -16212,6 +17178,27 @@ fn drop_v20_fixture_objects(connection: &rusqlite::Connection) {
         .unwrap();
     connection.execute_batch(model_trigger).unwrap();
     connection.execute_batch(tool_trigger).unwrap();
+}
+
+fn drop_v21_fixture_objects(connection: &rusqlite::Connection) {
+    let reject_update = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_update",
+    );
+    let reject_delete = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_delete",
+    );
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER schema_migrations_reject_update;
+               DROP TRIGGER schema_migrations_reject_delete;
+               DROP TABLE agent_operation_claims;
+               DELETE FROM schema_migrations WHERE version = 21;"#,
+        )
+        .unwrap();
+    connection.execute_batch(reject_update).unwrap();
+    connection.execute_batch(reject_delete).unwrap();
 }
 
 fn migration_trigger_sql(migration: &'static str, name: &str) -> &'static str {
