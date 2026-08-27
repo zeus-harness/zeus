@@ -37,6 +37,8 @@ pub const DEV_MARKER_TOOL_VERSION: &str = "1";
 pub const MAX_MARKER_BYTES: usize = 128;
 pub const WORKSPACE_READ_FILE_TOOL_NAME: &str = "workspace_read_file";
 pub const WORKSPACE_READ_FILE_TOOL_VERSION: &str = "1";
+pub const WORKSPACE_READ_LINES_TOOL_NAME: &str = "workspace_read_lines";
+pub const WORKSPACE_READ_LINES_TOOL_VERSION: &str = "1";
 pub const WORKSPACE_LIST_DIRECTORY_TOOL_NAME: &str = "workspace_list_directory";
 pub const WORKSPACE_LIST_DIRECTORY_TOOL_VERSION: &str = "1";
 pub const WORKSPACE_SEARCH_TEXT_TOOL_NAME: &str = "workspace_search_text";
@@ -47,6 +49,9 @@ pub const WORKSPACE_CREATE_FILE_TOOL_NAME: &str = "workspace_create_file";
 pub const WORKSPACE_CREATE_FILE_TOOL_VERSION: &str = "1";
 pub const MAX_WORKSPACE_PATH_BYTES: usize = 512;
 pub const MAX_WORKSPACE_FILE_BYTES: usize = 8 * 1024;
+pub const MAX_WORKSPACE_RANGE_FILE_BYTES: usize = 64 * 1024;
+pub const MAX_WORKSPACE_RANGE_OUTPUT_BYTES: usize = 8 * 1024;
+pub const MAX_WORKSPACE_RANGE_LINES: usize = 200;
 pub const MAX_WORKSPACE_DIRECTORY_ENTRIES: usize = 64;
 pub const MAX_WORKSPACE_SEARCH_QUERY_BYTES: usize = 256;
 pub const MAX_WORKSPACE_SEARCH_MATCHES: usize = 32;
@@ -129,6 +134,9 @@ pub fn register_local_workspace_connectors(
     let list_executor = WorkspaceListDirectoryExecutor {
         roots: Arc::clone(&executor.roots),
     };
+    let lines_executor = WorkspaceReadLinesExecutor {
+        roots: Arc::clone(&executor.roots),
+    };
     let search_executor = WorkspaceSearchTextExecutor {
         roots: Arc::clone(&executor.roots),
     };
@@ -139,6 +147,7 @@ pub fn register_local_workspace_connectors(
         roots: Arc::clone(&executor.roots),
     };
     registry.register(workspace_read_file_descriptor(), executor)?;
+    registry.register(workspace_read_lines_descriptor(), lines_executor)?;
     registry.register(workspace_list_directory_descriptor(), list_executor)?;
     registry.register(workspace_search_text_descriptor(), search_executor)?;
     registry.register(workspace_replace_text_descriptor(), replace_executor)?;
@@ -178,6 +187,45 @@ pub fn workspace_read_file_descriptor() -> ToolDescriptor {
                 "path".into(),
                 ParameterSpec::required_string(MAX_WORKSPACE_PATH_BYTES),
             )]),
+        },
+    }
+}
+
+pub fn workspace_read_lines_descriptor() -> ToolDescriptor {
+    ToolDescriptor {
+        name: WORKSPACE_READ_LINES_TOOL_NAME.into(),
+        version: WORKSPACE_READ_LINES_TOOL_VERSION.into(),
+        description: format!(
+            "Read an inclusive line range from one UTF-8 workspace file of at most {MAX_WORKSPACE_RANGE_FILE_BYTES} bytes; start_line and end_line are positive integers, the requested span is at most {MAX_WORKSPACE_RANGE_LINES} lines, end_line past EOF is clamped, and selected output over {MAX_WORKSPACE_RANGE_OUTPUT_BYTES} bytes fails"
+        ),
+        effect: ToolEffect::ReadOnly,
+        sandbox_profile: SandboxProfile::ReadOnly,
+        input_schema: ObjectSchema {
+            max_serialized_bytes: 1024,
+            properties: BTreeMap::from([
+                (
+                    "end_line".into(),
+                    ParameterSpec {
+                        parameter_type: ParameterType::Integer,
+                        required: true,
+                        min_length: None,
+                        max_length: None,
+                    },
+                ),
+                (
+                    "path".into(),
+                    ParameterSpec::required_string(MAX_WORKSPACE_PATH_BYTES),
+                ),
+                (
+                    "start_line".into(),
+                    ParameterSpec {
+                        parameter_type: ParameterType::Integer,
+                        required: true,
+                        min_length: None,
+                        max_length: None,
+                    },
+                ),
+            ]),
         },
     }
 }
@@ -377,6 +425,55 @@ impl ToolExecutor for WorkspaceReadFileExecutor {
 }
 
 #[derive(Clone)]
+struct WorkspaceReadLinesExecutor {
+    roots: Arc<WorkspaceRoots>,
+}
+
+impl ToolExecutor for WorkspaceReadLinesExecutor {
+    fn execute(&self, request: ExecutionRequest) -> ExecutionFuture<'_> {
+        let roots = Arc::clone(&self.roots);
+        Box::pin(async move {
+            if request.environment != LOCAL_DEV_ENVIRONMENT {
+                return Err(workspace_failure(
+                    "environment_denied",
+                    "Workspace line reads are restricted to local-development",
+                    false,
+                ));
+            }
+            let arguments: WorkspaceReadLinesArguments =
+                serde_json::from_value(request.call.arguments.clone()).map_err(|_| {
+                    workspace_failure(
+                        "invalid_arguments",
+                        "Workspace line read arguments are invalid",
+                        false,
+                    )
+                })?;
+            let path = validate_workspace_path(&arguments.path)?;
+            let (start_line, end_line) =
+                validate_workspace_line_range(arguments.start_line, arguments.end_line)?;
+            tokio::task::spawn_blocking(move || {
+                read_workspace_lines(
+                    &roots,
+                    &path,
+                    &arguments.path,
+                    start_line,
+                    end_line,
+                    &request.call.call_id,
+                )
+            })
+            .await
+            .map_err(|_| {
+                workspace_failure(
+                    "workspace_line_reader_join_failed",
+                    "The workspace line reader stopped unexpectedly",
+                    false,
+                )
+            })?
+        })
+    }
+}
+
+#[derive(Clone)]
 struct WorkspaceListDirectoryExecutor {
     roots: Arc<WorkspaceRoots>,
 }
@@ -567,6 +664,14 @@ struct WorkspaceReadArguments {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct WorkspaceReadLinesArguments {
+    path: String,
+    start_line: i64,
+    end_line: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WorkspaceSearchTextArguments {
     path: String,
     query: String,
@@ -641,6 +746,37 @@ fn validate_workspace_search_query(query: &str) -> Result<(), ExecutorError> {
     Ok(())
 }
 
+fn validate_workspace_line_range(
+    start_line: i64,
+    end_line: i64,
+) -> Result<(usize, usize), ExecutorError> {
+    if start_line < 1
+        || end_line < start_line
+        || end_line - start_line + 1 > MAX_WORKSPACE_RANGE_LINES as i64
+    {
+        return Err(workspace_failure(
+            "invalid_workspace_line_range",
+            "Workspace line ranges must be positive, inclusive, ordered, and at most 200 lines",
+            false,
+        ));
+    }
+    let start_line = usize::try_from(start_line).map_err(|_| {
+        workspace_failure(
+            "invalid_workspace_line_range",
+            "Workspace line ranges cannot be represented on this host",
+            false,
+        )
+    })?;
+    let end_line = usize::try_from(end_line).map_err(|_| {
+        workspace_failure(
+            "invalid_workspace_line_range",
+            "Workspace line ranges cannot be represented on this host",
+            false,
+        )
+    })?;
+    Ok((start_line, end_line))
+}
+
 fn validate_workspace_edit_text(text: &str, allow_empty: bool) -> Result<(), ExecutorError> {
     if (!allow_empty && text.is_empty()) || text.len() > MAX_WORKSPACE_EDIT_TEXT_BYTES {
         return Err(workspace_failure(
@@ -699,6 +835,78 @@ fn read_workspace_file(
             "path": display_path,
             "content": content,
             "bytes": content.len(),
+        }),
+        replayed: false,
+        provider_request_id: Some(call_id.to_owned()),
+    })
+}
+
+fn read_workspace_lines(
+    roots: &WorkspaceRoots,
+    path: &Path,
+    display_path: &str,
+    start_line: usize,
+    end_line: usize,
+    call_id: &str,
+) -> Result<ToolOutput, ExecutorError> {
+    reject_workspace_symlinks(&roots.inspection, path)?;
+    let mut file = roots.confined.open(path).map_err(workspace_read_error)?;
+    let metadata = file.metadata().map_err(workspace_read_error)?;
+    if !metadata.is_file() {
+        return Err(workspace_failure(
+            "workspace_not_regular_file",
+            "The requested workspace path is not a regular file",
+            false,
+        ));
+    }
+    if metadata.len() > MAX_WORKSPACE_RANGE_FILE_BYTES as u64 {
+        return Err(workspace_range_file_too_large());
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    Read::by_ref(&mut file)
+        .take((MAX_WORKSPACE_RANGE_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(workspace_read_error)?;
+    if bytes.len() > MAX_WORKSPACE_RANGE_FILE_BYTES {
+        return Err(workspace_range_file_too_large());
+    }
+    let content = String::from_utf8(bytes).map_err(|_| {
+        workspace_failure(
+            "workspace_file_not_utf8",
+            "The requested workspace file is not valid UTF-8 text",
+            false,
+        )
+    })?;
+    let total_lines = content.split_inclusive('\n').count();
+    if start_line > total_lines {
+        return Err(workspace_failure(
+            "workspace_line_start_out_of_range",
+            "Workspace line range starts after the end of the file",
+            false,
+        ));
+    }
+    let actual_end_line = end_line.min(total_lines);
+    let selected = content
+        .split_inclusive('\n')
+        .skip(start_line - 1)
+        .take(actual_end_line - start_line + 1)
+        .collect::<String>();
+    if selected.len() > MAX_WORKSPACE_RANGE_OUTPUT_BYTES {
+        return Err(workspace_failure(
+            "workspace_line_output_too_large",
+            "Workspace line range exceeds the 8192-byte output limit; request a narrower range",
+            false,
+        ));
+    }
+    let selected_bytes = selected.len();
+    Ok(ToolOutput {
+        value: json!({
+            "path": display_path,
+            "start_line": start_line,
+            "end_line": actual_end_line,
+            "total_lines": total_lines,
+            "content": selected,
+            "bytes": selected_bytes,
         }),
         replayed: false,
         provider_request_id: Some(call_id.to_owned()),
@@ -1480,6 +1688,14 @@ fn workspace_file_too_large() -> ExecutorError {
     )
 }
 
+fn workspace_range_file_too_large() -> ExecutorError {
+    workspace_failure(
+        "workspace_range_file_too_large",
+        "The requested workspace file exceeds the 65536-byte line-read limit",
+        false,
+    )
+}
+
 fn workspace_read_error(error: io::Error) -> ExecutorError {
     match error.kind() {
         io::ErrorKind::NotFound => workspace_failure(
@@ -1811,6 +2027,24 @@ mod tests {
         }
     }
 
+    fn workspace_lines_call(step: u32, path: &str, start_line: i64, end_line: i64) -> ToolCall {
+        let arguments = json!({
+            "path": path,
+            "start_line": start_line,
+            "end_line": end_line,
+        });
+        ToolCall {
+            call_id: stable_call_id("run-1", 1, step, WORKSPACE_READ_LINES_TOOL_NAME).unwrap(),
+            tool: WORKSPACE_READ_LINES_TOOL_NAME.into(),
+            tool_version: WORKSPACE_READ_LINES_TOOL_VERSION.into(),
+            arguments_digest: arguments_digest(&arguments),
+            arguments,
+            effect: ToolEffect::ReadOnly,
+            sandbox_profile: SandboxProfile::ReadOnly,
+            executor_status: ToolExecutorStatus::Available,
+        }
+    }
+
     fn workspace_list_call(path: &str) -> ToolCall {
         let arguments = json!({"path": path});
         ToolCall {
@@ -1956,6 +2190,11 @@ mod tests {
                 .descriptor(WORKSPACE_CREATE_FILE_TOOL_NAME)
                 .is_none()
         );
+        assert!(
+            registry
+                .descriptor(WORKSPACE_READ_LINES_TOOL_NAME)
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1991,6 +2230,96 @@ mod tests {
         ] {
             let error = registry
                 .dispatch(workspace_call(path), LOCAL_DEV_ENVIRONMENT)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                RegistryError::Executor(ExecutorError::Failed { ref code, .. })
+                    if code == expected_code
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_line_read_is_precise_bounded_and_reports_file_extent() {
+        let temp = TestDirectory::new();
+        fs::create_dir(temp.0.join("src")).unwrap();
+        let content = (1..=400)
+            .map(|line| format!("line-{line:03}: {}\n", "x".repeat(24)))
+            .collect::<String>();
+        assert!(content.len() > MAX_WORKSPACE_FILE_BYTES);
+        assert!(content.len() <= MAX_WORKSPACE_RANGE_FILE_BYTES);
+        fs::write(temp.0.join("src/large.rs"), &content).unwrap();
+        fs::write(
+            temp.0.join("wide.txt"),
+            "x".repeat(MAX_WORKSPACE_RANGE_OUTPUT_BYTES + 1),
+        )
+        .unwrap();
+        fs::write(
+            temp.0.join("too-large.txt"),
+            vec![b'x'; MAX_WORKSPACE_RANGE_FILE_BYTES + 1],
+        )
+        .unwrap();
+        fs::write(temp.0.join("binary.dat"), [0xff, 0xfe]).unwrap();
+        fs::write(temp.0.join("empty.txt"), []).unwrap();
+        let mut registry = ToolRegistry::new();
+        register_local_workspace_connectors(&mut registry, LOCAL_DEV_ENVIRONMENT, &temp.0).unwrap();
+
+        let expected = (198..=200)
+            .map(|line| format!("line-{line:03}: {}\n", "x".repeat(24)))
+            .collect::<String>();
+        let expected_bytes = expected.len();
+        let output = registry
+            .dispatch(
+                workspace_lines_call(30, "src/large.rs", 198, 200),
+                LOCAL_DEV_ENVIRONMENT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            output.value,
+            serde_json::json!({
+                "path": "src/large.rs",
+                "start_line": 198,
+                "end_line": 200,
+                "total_lines": 400,
+                "content": expected,
+                "bytes": expected_bytes,
+            })
+        );
+
+        let clamped = registry
+            .dispatch(
+                workspace_lines_call(31, "src/large.rs", 399, 500),
+                LOCAL_DEV_ENVIRONMENT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(clamped.value["start_line"], 399);
+        assert_eq!(clamped.value["end_line"], 400);
+        assert_eq!(clamped.value["total_lines"], 400);
+
+        for (step, path, start, end, expected_code) in [
+            (32, "src/large.rs", 0, 1, "invalid_workspace_line_range"),
+            (33, "src/large.rs", 3, 2, "invalid_workspace_line_range"),
+            (34, "src/large.rs", 1, 201, "invalid_workspace_line_range"),
+            (
+                35,
+                "src/large.rs",
+                401,
+                401,
+                "workspace_line_start_out_of_range",
+            ),
+            (36, "wide.txt", 1, 1, "workspace_line_output_too_large"),
+            (37, "too-large.txt", 1, 1, "workspace_range_file_too_large"),
+            (38, "binary.dat", 1, 1, "workspace_file_not_utf8"),
+            (39, "empty.txt", 1, 1, "workspace_line_start_out_of_range"),
+        ] {
+            let error = registry
+                .dispatch(
+                    workspace_lines_call(step, path, start, end),
+                    LOCAL_DEV_ENVIRONMENT,
+                )
                 .await
                 .unwrap_err();
             assert!(matches!(
@@ -2475,6 +2804,19 @@ mod tests {
                 if code == "workspace_symlink_denied"
         ));
         assert!(!temp.0.parent().unwrap().join("created.txt").exists());
+
+        let line_read = registry
+            .dispatch(
+                workspace_lines_call(25, "linked-file", 1, 1),
+                LOCAL_DEV_ENVIRONMENT,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            line_read,
+            RegistryError::Executor(ExecutorError::Failed { ref code, .. })
+                if code == "workspace_symlink_denied"
+        ));
 
         for path in ["linked-file", "nested/linked-dir/outside.txt"] {
             let error = registry

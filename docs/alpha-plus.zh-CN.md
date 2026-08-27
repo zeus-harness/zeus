@@ -220,11 +220,12 @@ POST /sessions/{id}/turns
 - `queued` job 可在重启后继续；`started` 且无持久结果的 job 变为 `outcome_unknown`，不得自动重放可能计费的模型请求。
 - Provider 失败必须形成明确的 durable failure/interrupted 状态，不能做空 flush，也不能伪造 assistant 成功。
 - `local-development` 可显式配置 capability-rooted `workspace_list_directory`、
-  `workspace_search_text`、`workspace_read_file`、`workspace_replace_text` 与
+  `workspace_search_text`、`workspace_read_file`、`workspace_read_lines`、`workspace_replace_text` 与
   `workspace_create_file`：模型可列出根内 canonical relative directory
   的至多 64 个排序子项，以固定目录/文件/深度/字节预算查找至多 32 个字面量文本匹配，再读取
-  canonical relative path 对应的 UTF-8 普通文件，最多 8 KiB；穿越、symlink、越界目录或内容在
-  connector 内 fail closed。前三者以 read-only policy 自动执行。文本替换仅允许在至多 64 KiB
+  canonical relative path 对应的 UTF-8 普通文件，最多 8 KiB；也可从至多 64 KiB 的 UTF-8
+  普通文件读取至多 200 行的 inclusive range，选择结果仍限制为 8 KiB 且不静默截断。穿越、
+  symlink、越界目录或内容在 connector 内 fail closed。前四者以 read-only policy 自动执行。文本替换仅允许在至多 64 KiB
   的现有 UTF-8 普通文件中替换唯一 exact `old_text`，以同目录临时文件、权限复制、原文复验和
   atomic rename 提交，并固定要求 owner approval；同参近期重试返回有界 receipt，异参 call-ID
   重用或目标变化拒绝。文件创建仅接受至多 12 KiB UTF-8 内容和已存在的根内父目录，通过同目录
@@ -374,7 +375,7 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 按项目既有统计口径通过 560 个 Rust 测试（connectors 15、deployment 8、knowledge 29、
+- host 按项目既有统计口径通过 561 个 Rust 测试（connectors 16、deployment 8、knowledge 29、
   storage 248、runtime 48、API library 69、API main/config 6）与 28 个 Web Node 测试。
 - `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 

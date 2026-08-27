@@ -6847,6 +6847,7 @@ mod tests {
     }
 
     const TEST_WORKSPACE_READ_FILE_TOOL_NAME: &str = "workspace_read_file";
+    const TEST_WORKSPACE_READ_LINES_TOOL_NAME: &str = "workspace_read_lines";
     const TEST_WORKSPACE_LIST_DIRECTORY_TOOL_NAME: &str = "workspace_list_directory";
     const TEST_WORKSPACE_SEARCH_TEXT_TOOL_NAME: &str = "workspace_search_text";
     const TEST_WORKSPACE_REPLACE_TEXT_TOOL_NAME: &str = "workspace_replace_text";
@@ -6980,6 +6981,12 @@ mod tests {
                             request
                                 .tools
                                 .iter()
+                                .any(|tool| tool.name == TEST_WORKSPACE_READ_LINES_TOOL_NAME)
+                        );
+                        assert!(
+                            request
+                                .tools
+                                .iter()
                                 .any(|tool| tool.name == TEST_WORKSPACE_LIST_DIRECTORY_TOOL_NAME)
                         );
                         assert!(
@@ -7001,9 +7008,13 @@ mod tests {
                     }
                     2 => ReplyOutput::ToolCall {
                         call: ReplyToolCall::new(
-                            "provider-call-workspace-read-2",
-                            TEST_WORKSPACE_READ_FILE_TOOL_NAME,
-                            serde_json::json!({ "path": "src/lib.rs" }),
+                            "provider-call-workspace-lines-2",
+                            TEST_WORKSPACE_READ_LINES_TOOL_NAME,
+                            serde_json::json!({
+                                "path": "src/lib.rs",
+                                "start_line": 1,
+                                "end_line": 1,
+                            }),
                         ),
                     },
                     3 => ReplyOutput::Final {
@@ -7980,7 +7991,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_only_workspace_search_and_read_execute_without_approval_and_replay_exactly() {
+    async fn read_only_workspace_search_and_line_read_execute_without_approval_and_replay_exactly()
+    {
         let unique = UserId::generate().unwrap();
         let root = std::env::temp_dir().join(format!(
             "zeus-api-workspace-read-{}",
@@ -8076,7 +8088,7 @@ mod tests {
                 "skipped_entries": 0,
             }))
         );
-        assert_eq!(agent.calls[1].tool, TEST_WORKSPACE_READ_FILE_TOOL_NAME);
+        assert_eq!(agent.calls[1].tool, TEST_WORKSPACE_READ_LINES_TOOL_NAME);
         for call in &agent.calls {
             assert!(!call.approval_required);
             assert!(call.review.is_none());
@@ -8086,6 +8098,9 @@ mod tests {
             agent.calls[1].output,
             Some(serde_json::json!({
                 "path": "src/lib.rs",
+                "start_line": 1,
+                "end_line": 1,
+                "total_lines": 1,
                 "content": "pub fn governed_workspace() {}\n",
                 "bytes": 31,
             }))
@@ -8100,10 +8115,10 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&search_result.content).unwrap(),
             agent.calls[0].output.clone().unwrap()
         );
-        let read_result = recorded[2].messages.last().unwrap();
-        assert_eq!(read_result.role, ReplyRole::Tool);
+        let line_result = recorded[2].messages.last().unwrap();
+        assert_eq!(line_result.role, ReplyRole::Tool);
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&read_result.content).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&line_result.content).unwrap(),
             agent.calls[1].output.clone().unwrap()
         );
 

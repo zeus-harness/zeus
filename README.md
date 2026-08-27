@@ -15,7 +15,8 @@ profile has no RDS executor: approving the illustrated change is durably
 recorded, then settles as `not_dispatched / executor_unavailable` without a
 production side effect. An explicit `local-development` profile provides a
 path-constrained marker executor and can additionally register rooted,
-read-only workspace discovery, literal text search, file reading, plus
+read-only workspace discovery, literal text search, bounded whole-file and
+line-range reading, plus
 approval-gated exact text replacement and create-new-only file tools for
 testing a useful complete Agent loop. Restate,
 MinIO, the networkless tool sandbox, and optional PostgreSQL are development
@@ -241,7 +242,10 @@ lists at most 64 sorted entries from one canonical relative directory.
 directory, retaining at most 32 matches while bounding directories, files,
 depth, per-file bytes, and total bytes; it skips `.git`, `.svelte-kit`, `.zeus`,
 `node_modules`, `target`, and `dist`. `workspace_read_file` reads at most 8 KiB
-from one canonical relative UTF-8 regular file. `workspace_replace_text`
+from one canonical relative UTF-8 regular file. `workspace_read_lines` reads an
+inclusive range of at most 200 lines from a UTF-8 regular file of at most 64
+KiB and rejects a selected range larger than 8 KiB instead of clipping it.
+`workspace_replace_text`
 atomically replaces exactly one unique occurrence in an existing UTF-8 regular
 file of at most 64 KiB, preserves file permissions, and requires owner approval
 for its exact persisted arguments. `workspace_create_file` creates one UTF-8
@@ -936,8 +940,8 @@ prompt governance:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 560 tests passed
-  under the existing project counting convention, including 15 connector tests,
+- `cargo test --workspace --all-targets --locked`: 561 tests passed
+  under the existing project counting convention, including 16 connector tests,
   8 deployment tests, 29 knowledge tests, 248 storage tests, 48 runtime tests,
   69 API library tests, 6 API main/config
   tests, and the real

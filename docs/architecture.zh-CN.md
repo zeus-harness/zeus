@@ -389,14 +389,16 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
 - `dev_marker_write` 仅在 `local-development` profile 注册，只能在服务端固定目录写服务器生成的
   marker 文件；参数不能提供路径。
 - `workspace_list_directory`、`workspace_search_text`、`workspace_read_file`、
-  `workspace_replace_text` 与 `workspace_create_file` 仅在显式配置
+  `workspace_read_lines`、`workspace_replace_text` 与 `workspace_create_file` 仅在显式配置
   `ZEUS_LOCAL_WORKSPACE_ROOT` 的 `local-development` profile 注册。服务启动时把该目录转换为
   capability root；模型只能提交 canonical relative UTF-8 path。目录发现最多返回 64 个按名称
   排序的直接子项并标注 file/directory/symlink/other。字面量文本搜索按稳定路径与行号返回最多
   32 个匹配，并固定限制目录数、文件数、深度、单文件 64 KiB 与总扫描 1 MiB；它跳过
   `.git`、`.svelte-kit`、`.zeus`、`node_modules`、`target` 与 `dist`。文件读取拒绝路径穿越、
-  符号链接、非普通文件、非 UTF-8 内容和超过 8 KiB 的文件。前三个工具均不跟随符号链接，均为
-  `read_only + read_only sandbox`，策略自动允许。文本替换只处理现有、至多 64 KiB 的 UTF-8
+  符号链接、非普通文件、非 UTF-8 内容和超过 8 KiB 的文件。行区间读取可处理至多 64 KiB 的
+  UTF-8 普通文件，每次只接受至多 200 行的 inclusive range；超过 EOF 的 end line 向文件末尾
+  收缩，start line 越界或所选内容超过 8 KiB 时明确失败，不做静默截断。前四个工具均不跟随
+  符号链接，均为 `read_only + read_only sandbox`，策略自动允许。文本替换只处理现有、至多 64 KiB 的 UTF-8
   普通文件，要求 `old_text` 唯一出现，使用同目录临时文件、权限复制、file sync、原文复验、
   atomic rename 与 directory sync；相同 call ID 的近期同参重试返回有界内存 receipt，异参重用、
   目标变化、穿越或 symlink 均 fail closed。该工具固定为 `local_write + workspace_write sandbox`
@@ -508,7 +510,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   随后关闭剩余连接并释放 SQLite lease。
 - local-development marker：批准前不存在、拒绝后不存在、allow-once 后只生成一个稳定文件。
 - read-only workspace：真实 Agent tool loop 覆盖免审批执行、root confinement、canonical path、
-  symlink/UTF-8/8 KiB 边界、有界字面量搜索，以及 search → read 的 exact tool result 逐步回灌。
+  symlink/UTF-8/8 KiB 边界、有界字面量搜索、64 KiB 文件中的有界行区间读取，以及
+  search → line read 的 exact tool result 逐步回灌。
 - workspace exact edit：真实 Agent 在 owner 批准前不改文件，批准后只执行一次 unique text
   replacement，结果持久化并回灌下一模型步骤；拒绝、同参重放、异参 call-ID 冲突、目标变化、
   symlink、UTF-8 与 64 KiB 边界均 fail closed。
@@ -538,7 +541,7 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   刷新恢复、owner/member setup/登录、owner 成员与 audit 管理、设置/退出和
   system/light/dark。member 的审批卡只读。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化按项目既有统计口径是 560 个 Rust 测试（其中 connectors 15、deployment 8、knowledge 29、
+- 当前自动化按项目既有统计口径是 561 个 Rust 测试（其中 connectors 16、deployment 8、knowledge 29、
   storage 248、runtime 48、API library 69、API main/config 6）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
