@@ -32,16 +32,18 @@ use tenancy::{PasswordAuthenticator, PasswordHashRecord};
 use crate::{
     AccountAuditCheckpointCommit, AccountId, AgentKnowledgeContextSpec, AgentModelClaimOutcome,
     AgentModelCompletion, AgentModelFailureCommit, AgentModelResolution, AgentModelStartOutcome,
-    AgentModelSuccessCommit, AgentReviewCommit, AgentToolCallSpec, AgentToolClaimOutcome,
-    AgentToolCompletion, AgentToolCompletionCommit, AgentTurnSpec, AuthSessionCommit,
-    AuthSessionId, AuthzContext, BootstrapOwnerCommit, ClaimOutcome, CommitOutcome,
-    CreateMemberCommit, DispatchCompleteCommit, DispatchJobSpec, DispatchRecoveryCommit,
-    DispatchStartCommit, DispatchStatus, KnowledgeCatalogCommit, MemberSetupCommit,
-    MemberSetupToken, MembershipRevision, MembershipRole, ReplyClaimOutcome, ReplyFailureCommit,
-    ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit, ReplySuccessCommit, ReviewCommit,
-    RotateMemberSetupTokenCommit, RunSnapshot, RuntimeIdentity, SqliteOperationLimits,
-    SqlitePhysicalLimits, SqliteStore, StorageError, StorageLimits, StoredMembershipStatus,
-    StoredUserRole, StoredUserStatus, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
+    AgentModelSuccessCommit, AgentPromptCommit, AgentPromptState, AgentReviewCommit,
+    AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
+    AgentTurnSpec, AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit,
+    ClaimOutcome, CommitOutcome, CreateMemberCommit, DEFAULT_SESSION_AGENT_PROMPT_REVISION,
+    DEFAULT_SESSION_AGENT_SYSTEM_PROMPT, DispatchCompleteCommit, DispatchJobSpec,
+    DispatchRecoveryCommit, DispatchStartCommit, DispatchStatus, KnowledgeCatalogCommit,
+    MemberSetupCommit, MemberSetupToken, MembershipRevision, MembershipRole, ReplyClaimOutcome,
+    ReplyFailureCommit, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
+    ReplySuccessCommit, ReviewCommit, RotateMemberSetupTokenCommit, RunSnapshot, RuntimeIdentity,
+    SESSION_AGENT_PROMPT_ID, SqliteOperationLimits, SqlitePhysicalLimits, SqliteStore,
+    StorageError, StorageLimits, StoredMembershipStatus, StoredUserRole, StoredUserStatus,
+    TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
@@ -1633,7 +1635,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
     assert_eq!(
         versions,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
         ]
     );
     let owner: Option<String> = connection
@@ -1775,7 +1777,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
     assert_eq!(
         run_event_payloads(database.path(), &long_run_id),
         payloads_before,
-        "v9-v23 migrations must not rewrite immutable event payloads"
+        "v9-v24 migrations must not rewrite immutable event payloads"
     );
     let connection = rusqlite::Connection::open(database.path()).unwrap();
     let version: i64 = connection
@@ -1783,7 +1785,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 23);
+    assert_eq!(version, 24);
     let configured_account: (String, String, String, i64) = connection
         .query_row(
             r#"SELECT
@@ -2309,7 +2311,7 @@ async fn v12_identity_and_run_crash_prefix_migrates_then_recovers_the_primary_se
     assert_eq!(
         recovered,
         (
-            23,
+            24,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into()
@@ -4056,7 +4058,7 @@ async fn v5_configured_database_migrates_to_the_local_owner_membership() {
     assert_eq!(
         migrated,
         (
-            23,
+            24,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into(),
@@ -4182,7 +4184,7 @@ async fn v13_configured_active_work_migrates_with_account_authority_and_exact_vo
             },
         )
         .unwrap();
-    assert_eq!(migrated_counts, (23, 1, 1, 2, 1));
+    assert_eq!(migrated_counts, (24, 1, 1, 2, 1));
 }
 
 #[tokio::test]
@@ -4544,7 +4546,7 @@ async fn v14_database_migrates_through_v19_with_member_and_audit_roots() {
             },
         )
         .unwrap();
-    assert_eq!(state, (23, 1, 1, 1, 19));
+    assert_eq!(state, (24, 1, 1, 1, 19));
 }
 
 #[tokio::test]
@@ -4583,7 +4585,7 @@ async fn v15_migration_seeds_the_configured_audit_detail_limit() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (23, 2));
+    assert_eq!(state, (24, 2));
 }
 
 #[tokio::test]
@@ -4628,7 +4630,7 @@ async fn v15_reopen_rejects_a_lower_audit_detail_limit_without_mutating_policy()
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (23, 4));
+    assert_eq!(state, (24, 4));
     drop(connection);
 
     let reopened = SqliteStore::open_with_limits(database.path(), original_limits)
@@ -5135,6 +5137,209 @@ async fn knowledge_catalog_rejects_the_first_corpus_beyond_its_history_capacity(
         128
     );
     store.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn agent_prompt_is_owner_governed_idempotent_and_active_for_members() {
+    let store = created_owned_session_store().await;
+    let member = provision_test_member_for_reply(&store).await;
+
+    let default_prompt = store.agent_prompt_for_admin(&owner_authz()).await.unwrap();
+    assert_eq!(default_prompt.revision, 0);
+    assert_eq!(default_prompt.prompt_id, SESSION_AGENT_PROMPT_ID);
+    assert_eq!(
+        default_prompt.binding_revision,
+        DEFAULT_SESSION_AGENT_PROMPT_REVISION
+    );
+    assert_eq!(default_prompt.content, DEFAULT_SESSION_AGENT_SYSTEM_PROMPT);
+    assert_eq!(
+        default_prompt.content_digest,
+        deployment::prompt_content_digest(DEFAULT_SESSION_AGENT_SYSTEM_PROMPT)
+    );
+    assert!(matches!(
+        store.agent_prompt_for_admin(&member).await,
+        Err(StorageError::PermissionDenied)
+    ));
+    assert_eq!(
+        store.active_agent_prompt_for_actor(&member).await.unwrap(),
+        default_prompt
+    );
+    for (key, content) in [
+        ("agent-prompt-empty", String::new()),
+        (
+            "agent-prompt-oversize",
+            "x".repeat(crate::AGENT_SYSTEM_PROMPT_MAX_BYTES + 1),
+        ),
+    ] {
+        assert!(matches!(
+            store
+                .replace_agent_prompt(
+                    &owner_authz(),
+                    AgentPromptCommit {
+                        expected_revision: 0,
+                        content,
+                        idempotency_key: key.into(),
+                    },
+                )
+                .await,
+            Err(StorageError::InvalidAgentPrompt(_))
+        ));
+    }
+
+    let commit = AgentPromptCommit {
+        expected_revision: 0,
+        content: "You are the account-governed Zeus test agent.".into(),
+        idempotency_key: "agent-prompt-first".into(),
+    };
+    assert!(matches!(
+        store.replace_agent_prompt(&member, commit.clone()).await,
+        Err(StorageError::PermissionDenied)
+    ));
+    let first = store
+        .replace_agent_prompt(&owner_authz(), commit.clone())
+        .await
+        .unwrap();
+    assert!(!first.replayed);
+    assert_eq!(first.prompt.revision, 1);
+    assert_eq!(first.prompt.binding_revision, "2");
+    assert_eq!(first.prompt.content, commit.content);
+    assert_eq!(
+        store.active_agent_prompt_for_actor(&member).await.unwrap(),
+        first.prompt
+    );
+
+    let replay = store
+        .replace_agent_prompt(&owner_authz(), commit.clone())
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.prompt, first.prompt);
+    assert!(matches!(
+        store
+            .replace_agent_prompt(
+                &owner_authz(),
+                AgentPromptCommit {
+                    content: "different content under one key".into(),
+                    ..commit.clone()
+                },
+            )
+            .await,
+        Err(StorageError::IdempotencyConflict)
+    ));
+    assert!(matches!(
+        store
+            .replace_agent_prompt(
+                &owner_authz(),
+                AgentPromptCommit {
+                    expected_revision: 0,
+                    content: "a stale compare-and-swap must fail".into(),
+                    idempotency_key: "agent-prompt-stale".into(),
+                },
+            )
+            .await,
+        Err(StorageError::AgentPromptRevisionConflict)
+    ));
+    assert!(matches!(
+        store
+            .replace_agent_prompt(
+                &owner_authz(),
+                AgentPromptCommit {
+                    expected_revision: 1,
+                    content: first.prompt.content.clone(),
+                    idempotency_key: "agent-prompt-same".into(),
+                },
+            )
+            .await,
+        Err(StorageError::InvalidAgentPrompt(_))
+    ));
+    store.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn agent_prompt_update_rejects_queued_work_before_provider_release() {
+    let store = created_owned_session_store().await;
+    let initial = store.agent_prompt_for_admin(&owner_authz()).await.unwrap();
+    let initial_manifest = governed_test_agent_manifest(&initial);
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-agent-prompt-drift".into(),
+                user_message: "Do not release stale prompt work".into(),
+                expected_sequence: 1,
+            },
+            "agent-prompt-drift-start",
+            agent_turn_spec_with_system_prompt(
+                "agent-prompt-drift",
+                "turn-agent-prompt-drift",
+                initial_manifest,
+                &initial.content,
+                "Do not release stale prompt work",
+            ),
+        )
+        .await
+        .unwrap();
+
+    let updated = store
+        .replace_agent_prompt(
+            &owner_authz(),
+            AgentPromptCommit {
+                expected_revision: 0,
+                content: "You are the newly governed Zeus prompt.".into(),
+                idempotency_key: "agent-prompt-drift-update".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let current_manifest = governed_test_agent_manifest(&updated.prompt);
+    let AgentModelClaimOutcome::Rejected(completion) = store
+        .claim_next_agent_model(&current_manifest)
+        .await
+        .unwrap()
+    else {
+        panic!("queued work bound to an old Agent prompt must be rejected");
+    };
+    assert_eq!(completion.agent.status, AgentTurnStatus::Failed);
+    assert_eq!(completion.agent.model_steps, 0);
+    store.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn v23_agent_prompt_migration_preserves_the_exact_builtin_revision_zero() {
+    let database = TestDatabase::new();
+    {
+        let store = created_owned_file_session_store(database.path()).await;
+        assert_eq!(
+            store
+                .agent_prompt_for_admin(&owner_authz())
+                .await
+                .unwrap()
+                .revision,
+            0
+        );
+    }
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    drop_v24_fixture_objects(&connection);
+    assert_eq!(
+        connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        23
+    );
+    drop(connection);
+
+    let reopened = SqliteStore::open(database.path()).await.unwrap();
+    let prompt = reopened
+        .agent_prompt_for_admin(&owner_authz())
+        .await
+        .unwrap();
+    assert_eq!(prompt.revision, 0);
+    assert_eq!(prompt.binding_revision, "1");
+    assert_eq!(prompt.content, DEFAULT_SESSION_AGENT_SYSTEM_PROMPT);
+    reopened.verify_integrity().await.unwrap();
 }
 
 #[tokio::test]
@@ -6441,7 +6646,7 @@ async fn v19_agent_manifest_is_canonical_actor_scoped_reused_and_secret_free() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(version, 23);
+    assert_eq!(version, 24);
     assert_eq!(
         manifest_rows, 1,
         "the identical manifest must be deduplicated"
@@ -16797,7 +17002,7 @@ async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempot
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, (1_i64..=23).collect::<Vec<_>>());
+    assert_eq!(versions, (1_i64..=24).collect::<Vec<_>>());
     assert_eq!(
         connection
             .query_row(
@@ -18866,6 +19071,19 @@ fn prompt_bound_test_agent_manifest(prompt_content: &str) -> ManifestEnvelope {
     })
 }
 
+fn governed_test_agent_manifest(prompt: &AgentPromptState) -> ManifestEnvelope {
+    mutate_test_agent_manifest(|spec| {
+        spec.prompt = Some(
+            ManifestPromptBinding::new(
+                prompt.prompt_id.clone(),
+                prompt.binding_revision.clone(),
+                prompt.content_digest.clone(),
+            )
+            .unwrap(),
+        );
+    })
+}
+
 fn legacy_dotted_test_agent_manifest() -> ManifestEnvelope {
     mutate_test_agent_manifest(|spec| {
         spec.tools[0].name = "workspace.list".into();
@@ -19597,6 +19815,14 @@ fn drop_v22_fixture_objects(connection: &rusqlite::Connection) {
 }
 
 fn drop_v23_fixture_objects(connection: &rusqlite::Connection) {
+    let version: i64 = connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    if version >= 24 {
+        drop_v24_fixture_objects(connection);
+    }
     let schema_reject_update = migration_trigger_sql(
         include_str!("../migrations/0020_agent_execution_ledger.sql"),
         "schema_migrations_reject_update",
@@ -19618,6 +19844,40 @@ fn drop_v23_fixture_objects(connection: &rusqlite::Connection) {
                DROP TABLE knowledge_catalog_receipts;
                DROP TABLE account_knowledge_catalogs;
                DELETE FROM schema_migrations WHERE version = 23;"#,
+        )
+        .unwrap();
+    connection.execute_batch(schema_reject_update).unwrap();
+    connection.execute_batch(schema_reject_delete).unwrap();
+}
+
+fn drop_v24_fixture_objects(connection: &rusqlite::Connection) {
+    let schema_reject_update = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_update",
+    );
+    let schema_reject_delete = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_delete",
+    );
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER schema_migrations_reject_update;
+               DROP TRIGGER schema_migrations_reject_delete;
+               DROP TRIGGER agent_prompt_revisions_reject_update;
+               DROP TRIGGER agent_prompt_revisions_reject_delete;
+               DROP TRIGGER account_agent_prompt_configs_require_current_owner;
+               DROP TRIGGER account_agent_prompt_configs_enforce_revision;
+               DROP TRIGGER account_agent_prompt_configs_reject_delete;
+               DROP TRIGGER agent_prompt_config_receipts_require_current_owner;
+               DROP TRIGGER agent_prompt_config_receipts_reject_update;
+               DROP TRIGGER agent_prompt_config_receipts_reject_delete;
+               DROP INDEX agent_prompt_config_receipts_digest_idx;
+               DROP INDEX account_agent_prompt_configs_active_prompt_idx;
+               DROP INDEX agent_prompt_revisions_account_created_idx;
+               DROP TABLE agent_prompt_config_receipts;
+               DROP TABLE account_agent_prompt_configs;
+               DROP TABLE agent_prompt_revisions;
+               DELETE FROM schema_migrations WHERE version = 24;"#,
         )
         .unwrap();
     connection.execute_batch(schema_reject_update).unwrap();

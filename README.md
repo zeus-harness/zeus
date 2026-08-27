@@ -595,17 +595,18 @@ and bounded memory, CPU, and PID resources.
   readable but cannot execute. Schema v23 adds an owner-governed, revisioned
   account knowledge catalog, immutable ingestion receipts, and a bounded active
   corpus projection consumed by every newly admitted owner or member Agent.
-  Manifest-bound system-prompt v1 uses the existing optional manifest prompt
-  field and immutable request JSON, so it requires no database migration.
-  Previously queued promptless Agent work no longer matches the current
-  deployment and therefore fails closed as deployment drift; terminal history
-  remains readable.
+  Schema v24 adds an owner-governed account Agent prompt with immutable
+  content-addressed revisions, CAS/idempotency receipts, bounded history, and
+  account audit. Revision zero preserves the exact original built-in prompt and
+  manifest revision `1`; the first custom revision binds manifest revision `2`.
+  Existing Agents retain their immutable manifest/request. Queued work whose
+  governed prompt is no longer active fails closed before provider or tool I/O.
   Existing Runs and events are decoded, validated, and migrated in place without
   rewriting their payloads. Runtime identity still binds profile, environment,
   primary Session and Run, policy ID, and policy revision; a mismatch fails
   startup.
 
-Dynamic knowledge remains separate from the stable prompt contract. Knowledge
+Dynamic knowledge remains separate from the governed prompt contract. Knowledge
 v1 validates immutable entry revisions, ranks them with a fixed integer/tokenizer
 contract, drops whole entries at a 16 KiB context boundary, and emits a canonical
 digest-bearing selection snapshot. Schema v22 persists the exact corpus,
@@ -617,6 +618,10 @@ account catalog through an owner-only ingestion API. Revision zero is an
 implicit empty corpus; after the first committed replacement, Agent admission
 selects from the active durable revision and still persists the exact corpus and
 selection snapshot, so later catalog updates cannot rewrite an existing turn.
+Schema v24 governs the system prompt independently from knowledge. New Agent
+admission reads the active prompt, binds only its ID/revision/content digest in
+the secret-free manifest, and persists the exact content in the immutable model
+request. Prompt changes never rewrite an existing Agent or its transcript.
 
 SQLite is the authoritative store for this local single-instance Alpha. Do not
 place it on NFS or share one database volume between multiple Zeus replicas.
@@ -689,6 +694,12 @@ directly.
   rewrites history: read the desired historical corpus, then submit its
   `entries` through the existing CAS `PUT` to create a new catalog revision.
   Both history routes send `Cache-Control: no-store`.
+- Owner-only `GET/PUT /api/v1/agent/prompt` reads or atomically replaces the
+  active account Agent system prompt. `PUT` requires `expected_revision` and a
+  canonical `Idempotency-Key`; content is non-empty, control-safe, and capped at
+  16 KiB. Stale CAS returns `409 agent_prompt_revision_conflict`. Responses use
+  `Cache-Control: no-store`; ordinary members cannot administer the prompt, but
+  their new Agents use the current owner-governed revision.
 - `GET /api/v1/me/settings` returns the current safe preferences.
   `PATCH /api/v1/me/settings` accepts `theme`, optional allowlisted
   `preferred_model`, and `expected_revision`. Provider endpoints and API keys
@@ -790,11 +801,14 @@ directly.
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Current schema v23 retains durable Run attachment during migration and demo
+Current schema v24 retains durable Run attachment during migration and demo
 seeding, but Alpha+ does not expose a public attach-Run HTTP route.
 
 The application boundary now caps auth JSON at 8 KiB, command JSON at 512 KiB,
 and knowledge-catalog JSON at 2 MiB plus 4 KiB of request-envelope headroom.
+Agent-prompt JSON is capped at 100 KiB so escaped JSON can still represent the
+full validated 16 KiB decoded prompt; the larger transport cap does not enlarge
+the stored or model-visible prompt limit.
 Newly created Session and turn IDs are capped at 128 UTF-8 bytes;
 Session titles at 256 bytes; user and assistant messages at 64 KiB; and review
 notes at 8 KiB. A typed reply response is capped at 512 KiB; provider, model,
@@ -812,7 +826,7 @@ approval, dispatch, reply completion, attachment checks, and startup recovery
 use typed point queries or fixed 64-row batches. Production Session list/detail,
 Run detail, and overview reads now use indexed `LIMIT + 1` keyset pages inside
 actor-authorized SQLite snapshots; no production HTTP read loads a complete
-ledger or collection. Current schema v23 retains bounded Session, open-turn,
+ledger or collection. Current schema v24 retains bounded Session, open-turn,
 active reply/dispatch, auth-session, bootstrap-audit, event-slot, and logical
 event-payload-byte admission. Exact idempotent replay is checked before capacity,
 while accepted work consumes its reserved terminal slots and payload bytes
@@ -894,13 +908,14 @@ schema v15 Member Lifecycle / Account Audit, schema v16 Session Reply Context
 Index, schema v17 Durable Session Agent Loop, schema v18 exact tool-completion
 replay, schema v19 deployment-manifest binding, schema v20 execution-ledger,
 schema v21 prepared claims, schema v22 durable knowledge-context binding, and
-schema v23 account knowledge catalog ingestion:
+schema v23 account knowledge catalog ingestion, and schema v24 account Agent
+prompt governance:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 543 tests passed
+- `cargo test --workspace --all-targets --locked`: 547 tests passed
   under the existing project counting convention, including 8 deployment tests,
-  29 knowledge tests, 245 storage tests, 48 runtime tests, 65 API library tests, 6 API main/config
+  29 knowledge tests, 248 storage tests, 48 runtime tests, 66 API library tests, 6 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,

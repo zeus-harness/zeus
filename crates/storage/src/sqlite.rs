@@ -33,7 +33,8 @@ mod execution;
 use crate::operation::{OperationClass, OperationLimiter};
 use crate::{
     AccountAuditArchiveState, AccountAuditCheckpointCommit, AccountAuditEvent, AccountAuditPage,
-    AccountAuditPolicy, AccountAuditRollup, AccountAuditState, AccountId, AgentModelJob, AgentTurn,
+    AccountAuditPolicy, AccountAuditRollup, AccountAuditState, AccountId, AgentModelJob,
+    AgentPromptCommit, AgentPromptState, AgentPromptUpdateResult, AgentTurn,
     AgentTurnEnqueueResponse, AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal,
     AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, BoundedRunRead,
     ClaimOutcome, CommitOutcome, CreateMemberCommit, CreateMemberResult, DispatchCompleteCommit,
@@ -51,7 +52,7 @@ use crate::{
     UpdateAccountAuditPolicyCommit,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 23;
+const CURRENT_SCHEMA_VERSION: i64 = 24;
 const LOCAL_ACCOUNT_ID: &str = "acc_local";
 const EVENT_PAYLOAD_VERSION_V1: i64 = 1;
 const EVENT_PAYLOAD_VERSION_V2: i64 = 2;
@@ -81,6 +82,7 @@ const MIGRATION_0020: &str = include_str!("../migrations/0020_agent_execution_le
 const MIGRATION_0021: &str = include_str!("../migrations/0021_agent_operation_claims.sql");
 const MIGRATION_0022: &str = include_str!("../migrations/0022_agent_knowledge_context.sql");
 const MIGRATION_0023: &str = include_str!("../migrations/0023_account_knowledge_catalog.sql");
+const MIGRATION_0024: &str = include_str!("../migrations/0024_account_agent_prompt.sql");
 const MIGRATION_0022_TRIGGER_NAMES: &[&str] = &[
     "knowledge_corpus_revisions_reject_update",
     "knowledge_corpus_revisions_reject_delete",
@@ -104,6 +106,16 @@ const MIGRATION_0023_TRIGGER_NAMES: &[&str] = &[
     "knowledge_catalog_receipts_require_current_owner",
     "knowledge_catalog_receipts_reject_update",
     "knowledge_catalog_receipts_reject_delete",
+];
+const MIGRATION_0024_TRIGGER_NAMES: &[&str] = &[
+    "agent_prompt_revisions_reject_update",
+    "agent_prompt_revisions_reject_delete",
+    "account_agent_prompt_configs_require_current_owner",
+    "account_agent_prompt_configs_enforce_revision",
+    "account_agent_prompt_configs_reject_delete",
+    "agent_prompt_config_receipts_require_current_owner",
+    "agent_prompt_config_receipts_reject_update",
+    "agent_prompt_config_receipts_reject_delete",
 ];
 const RECOVERY_BATCH_LIMIT: i64 = 64;
 const AUTH_SESSION_CLEANUP_BATCH_LIMIT: i64 = 64;
@@ -1442,6 +1454,63 @@ impl SqliteStore {
         let physical_limits = self.physical_limits.clone();
         self.with_connection(move |connection| {
             agent::replace_account_knowledge_catalog(
+                connection,
+                &context,
+                commit,
+                &limits,
+                &physical_limits,
+            )
+        })
+        .await
+    }
+
+    pub async fn agent_prompt_for_admin(
+        &self,
+        context: &AuthzContext,
+    ) -> Result<AgentPromptState, StorageError> {
+        let context = validated_authz_context(context)?;
+        self.with_connection(move |connection| {
+            agent::query_account_agent_prompt_for_admin(connection, &context)
+        })
+        .await
+    }
+
+    pub async fn active_agent_prompt_for_actor(
+        &self,
+        context: &AuthzContext,
+    ) -> Result<AgentPromptState, StorageError> {
+        let context = validated_authz_context(context)?;
+        self.with_connection(move |connection| {
+            agent::query_active_agent_prompt_for_actor(connection, &context)
+        })
+        .await
+    }
+
+    /// Trusted runtime read used to resolve the manifest checked again inside
+    /// Agent admission/claim transactions. It intentionally has no actor
+    /// parameter and must not be exposed directly as an HTTP authorization
+    /// boundary.
+    pub async fn active_agent_prompt_for_runtime(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<AgentPromptState, StorageError> {
+        let account_id = account_id.clone();
+        self.with_connection(move |connection| {
+            agent::query_account_agent_prompt(connection, account_id.as_str())
+        })
+        .await
+    }
+
+    pub async fn replace_agent_prompt(
+        &self,
+        context: &AuthzContext,
+        commit: AgentPromptCommit,
+    ) -> Result<AgentPromptUpdateResult, StorageError> {
+        let context = validated_authz_context(context)?;
+        let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            agent::replace_account_agent_prompt(
                 connection,
                 &context,
                 commit,
@@ -2985,6 +3054,13 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
             params![23, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 24 {
+        transaction.execute_batch(MIGRATION_0024)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![24, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
     // The execution verifier now understands the v22 knowledge binding. Run
     // it only after every missing schema step has been installed so upgrades
     // from v19 and older never query a column that does not exist yet. This
@@ -2993,6 +3069,7 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
     if current < CURRENT_SCHEMA_VERSION {
         agent::verify_agent_knowledge_context_integrity(&transaction)?;
         agent::verify_account_knowledge_catalog_integrity(&transaction)?;
+        agent::verify_account_agent_prompt_integrity(&transaction)?;
         execution::verify_agent_execution_integrity(&transaction)?;
     }
     validate_configured_account_audit_policies(&transaction, limits)?;
@@ -3799,6 +3876,32 @@ fn readiness(
         ));
     }
 
+    let agent_prompt_columns: i64 = connection.query_row(
+        r#"SELECT
+               (SELECT COUNT(*) FROM pragma_table_info('agent_prompt_revisions')
+                WHERE name IN (
+                    'account_id', 'digest', 'content_bytes', 'content', 'created_at'
+                ))
+             + (SELECT COUNT(*) FROM pragma_table_info('account_agent_prompt_configs')
+                WHERE name IN (
+                    'account_id', 'revision', 'active_prompt_digest',
+                    'updated_by_user_id', 'updated_by_membership_revision', 'updated_at'
+                ))
+             + (SELECT COUNT(*) FROM pragma_table_info('agent_prompt_config_receipts')
+                WHERE name IN (
+                    'account_id', 'actor_user_id', 'actor_membership_revision',
+                    'idempotency_key', 'request_fingerprint', 'prompt_revision',
+                    'prompt_digest', 'created_at'
+                ))"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if agent_prompt_columns != 19 {
+        return Err(StorageError::CorruptData(
+            "account Agent prompt schema is missing".into(),
+        ));
+    }
+
     let agent_execution_columns: i64 = connection.query_row(
         r#"SELECT
                (SELECT COUNT(*) FROM pragma_table_info('agent_run_epochs')
@@ -3928,12 +4031,15 @@ fn readiness(
                'agent_model_jobs_knowledge_context_idx',
                'agent_tool_calls_one_per_model_step_idx',
                'account_knowledge_catalogs_active_corpus_idx',
-               'knowledge_catalog_receipts_corpus_idx'
+               'knowledge_catalog_receipts_corpus_idx',
+               'agent_prompt_revisions_account_created_idx',
+               'account_agent_prompt_configs_active_prompt_idx',
+               'agent_prompt_config_receipts_digest_idx'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if point_query_indexes != 68 {
+    if point_query_indexes != 71 {
         return Err(StorageError::CorruptData(
             "one or more point-query indexes are missing".into(),
         ));
@@ -4099,19 +4205,28 @@ fn readiness(
                'knowledge_catalog_receipts_require_current_owner',
                'knowledge_catalog_receipts_reject_update',
                'knowledge_catalog_receipts_reject_delete',
+               'agent_prompt_revisions_reject_update',
+               'agent_prompt_revisions_reject_delete',
+               'account_agent_prompt_configs_require_current_owner',
+               'account_agent_prompt_configs_enforce_revision',
+               'account_agent_prompt_configs_reject_delete',
+               'agent_prompt_config_receipts_require_current_owner',
+               'agent_prompt_config_receipts_reject_update',
+               'agent_prompt_config_receipts_reject_delete',
                'schema_migrations_reject_update',
                'schema_migrations_reject_delete'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 135 {
+    if trigger_count != 143 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
         ));
     }
     verify_migration_trigger_definitions(connection, MIGRATION_0022, MIGRATION_0022_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0023, MIGRATION_0023_TRIGGER_NAMES)?;
+    verify_migration_trigger_definitions(connection, MIGRATION_0024, MIGRATION_0024_TRIGGER_NAMES)?;
 
     let agent_pending_call_fk: i64 = connection.query_row(
         r#"SELECT COUNT(*)
@@ -4663,6 +4778,7 @@ fn readiness(
     agent::verify_agent_deployment_manifest_integrity(connection)?;
     agent::verify_agent_knowledge_context_integrity(connection)?;
     agent::verify_account_knowledge_catalog_integrity(connection)?;
+    agent::verify_account_agent_prompt_integrity(connection)?;
     execution::verify_agent_execution_integrity(connection)?;
     let (user_count, owner_count): (i64, i64) = connection.query_row(
         r#"SELECT (SELECT COUNT(*) FROM users),

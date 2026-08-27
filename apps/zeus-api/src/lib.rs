@@ -63,15 +63,16 @@ use runtime::{
     AccountAuditPolicy as StoredAccountAuditPolicy, AccountAuditRollup as StoredAccountAuditRollup,
     AccountAuditState as StoredAccountAuditState, AgentKnowledgeContextExplain,
     AgentModelClaimOutcome, AgentModelCompletion, AgentModelFailureCommit, AgentModelJob,
-    AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit, AgentReviewCommit,
-    AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion,
-    AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork,
-    AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthzContext,
-    BootstrapOwnerCommit, DemoStore, EntryRevision, KnowledgeCatalogRevisionPage,
-    KnowledgeCatalogState, KnowledgeCatalogUpdateResult, MemberSetupCommit, PublishedEvent,
-    ReplyClaimOutcome, ReplyFailureCommit, ReplyJob, ReplyOutcomeUnknownCommit, ReplySuccessCommit,
-    StoreError, StoredMember, StoredMembershipStatus, StoredPreferences, StoredUser,
-    StoredUserStatus, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
+    AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit, AgentPromptState,
+    AgentPromptUpdateResult, AgentReviewCommit, AgentToolCall, AgentToolCallSpec,
+    AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
+    AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe,
+    AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthzContext, BootstrapOwnerCommit, DemoStore,
+    EntryRevision, KnowledgeCatalogRevisionPage, KnowledgeCatalogState,
+    KnowledgeCatalogUpdateResult, MemberSetupCommit, PublishedEvent, ReplyClaimOutcome,
+    ReplyFailureCommit, ReplyJob, ReplyOutcomeUnknownCommit, ReplySuccessCommit, StoreError,
+    StoredMember, StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserStatus,
+    TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -90,6 +91,11 @@ const DURABLE_LEDGER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const AUTH_JSON_BODY_MAX_BYTES: usize = 8 * 1024;
 const COMMAND_JSON_BODY_MAX_BYTES: usize = 512 * 1024;
 const KNOWLEDGE_JSON_BODY_MAX_BYTES: usize = 2 * 1024 * 1024 + 4 * 1024;
+// JSON permits one Unicode scalar to be represented as a six-byte `\uXXXX`
+// escape. Keep the transport cap independent from the decoded 16 KiB prompt
+// limit so a valid logical prompt is not rejected solely by its encoding.
+const AGENT_PROMPT_JSON_BODY_MAX_BYTES: usize =
+    runtime::AGENT_SYSTEM_PROMPT_MAX_BYTES * 6 + 4 * 1024;
 const ACCOUNT_AUDIT_EXPORT_MAX_BYTES: usize = 96 * 1024 * 1024;
 const PASSWORD_WORKER_LIMIT: usize = 2;
 const AUTH_RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -723,6 +729,13 @@ struct ReplaceKnowledgeCatalogRequest {
     entries: Vec<EntryRevision>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplaceAgentPromptRequest {
+    expected_revision: u64,
+    content: String,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct KnowledgeCatalogRevisionListQuery {
@@ -908,6 +921,15 @@ fn build_authenticated_app(state: ApiState) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .layer(DefaultBodyLimit::max(KNOWLEDGE_JSON_BODY_MAX_BYTES));
 
+    let agent_prompt_admin = Router::new()
+        .route(
+            "/api/v1/agent/prompt",
+            get(get_agent_prompt).put(replace_agent_prompt),
+        )
+        .route_layer(middleware::from_fn(require_account_owner))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
+        .layer(DefaultBodyLimit::max(AGENT_PROMPT_JSON_BODY_MAX_BYTES));
+
     let public = Router::new()
         .route("/health/live", get(liveness))
         .route("/health/ready", get(readiness))
@@ -922,6 +944,7 @@ fn build_authenticated_app(state: ApiState) -> Router {
         .merge(protected)
         .merge(account_admin)
         .merge(knowledge_admin)
+        .merge(agent_prompt_admin)
         .fallback(not_found)
         .with_state(state.clone());
     kick_reply_worker(&state);
@@ -1449,6 +1472,37 @@ async fn replace_knowledge_catalog(
             &current.principal.authz,
             request.expected_revision,
             request.entries,
+            idempotency_key,
+        )
+        .await?;
+    json_no_store(result)
+}
+
+async fn get_agent_prompt(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+) -> Result<Response, ApiError> {
+    let prompt: AgentPromptState = state
+        .store
+        .agent_prompt_for_admin(&current.principal.authz)
+        .await?;
+    json_no_store(prompt)
+}
+
+async fn replace_agent_prompt(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    headers: HeaderMap,
+    payload: Result<Json<ReplaceAgentPromptRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(request) = payload.map_err(ApiError::invalid_json)?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let result: AgentPromptUpdateResult = state
+        .store
+        .replace_agent_prompt(
+            &current.principal.authz,
+            request.expected_revision,
+            request.content,
             idempotency_key,
         )
         .await?;
@@ -2588,12 +2642,14 @@ fn provider_error_message(error: &ProviderError) -> &'static str {
     }
 }
 
-fn current_agent_manifest(
+async fn current_agent_manifest(
     store: &DemoStore,
     executor: &ReplyExecutor,
 ) -> Result<ManifestEnvelope, StoreError> {
     let metadata = executor.provider.metadata();
-    store.session_agent_manifest(
+    let prompt = store.current_session_agent_prompt().await?;
+    store.session_agent_manifest_with_prompt(
+        &prompt,
         metadata.provider_id.clone(),
         metadata.model.clone(),
         match metadata.reply_kind {
@@ -2672,8 +2728,11 @@ async fn drain_agent_model_jobs(state: &ApiState) -> Result<(), StoreError> {
         .as_ref()
         .expect("the Agent model worker is only started when a provider exists");
     let _drain = executor.agent_model_drain.lock().await;
-    let current_manifest = current_agent_manifest(&state.store, executor)?;
     loop {
+        // Prompt governance is live configuration. Resolve a fresh manifest
+        // for each queue item so a mid-drain update cannot make the worker
+        // reject work admitted under the new head with an older snapshot.
+        let current_manifest = current_agent_manifest(&state.store, executor).await?;
         let prepared = match state
             .store
             .prepare_next_agent_model(&current_manifest, AGENT_MODEL_WORKER_HOLDER_ID)
@@ -3021,8 +3080,8 @@ async fn drain_agent_tool_calls(state: &ApiState) -> Result<(), StoreError> {
         .as_ref()
         .expect("the Agent tool worker is only started when a provider exists");
     let _drain = executor.agent_tool_drain.lock().await;
-    let current_manifest = current_agent_manifest(&state.store, executor)?;
     loop {
+        let current_manifest = current_agent_manifest(&state.store, executor).await?;
         let prepared = match state
             .store
             .prepare_next_agent_tool(&current_manifest, AGENT_TOOL_WORKER_HOLDER_ID)
@@ -3420,6 +3479,7 @@ async fn agent_deployment_explain(
     validate_provider_metadata(executor.provider.metadata())
         .map_err(ApiError::reply_unavailable)?;
     let current_manifest = current_agent_manifest(&state.store, executor)
+        .await
         .map_err(ApiError::from)
         .map_err(ApiError::with_no_store)?;
     let legacy_unbound = persisted_manifest.is_none();
@@ -3549,12 +3609,23 @@ async fn start_turn(
     let Json(request) = payload.map_err(ApiError::invalid_json)?;
     let idempotency_key = required_idempotency_key(&headers)?;
     validate_start_turn_envelope(&request)?;
-    let system_prompt = state.store.session_agent_system_prompt();
-    validate_agent_initial_content_budget(system_prompt, &request.user_message)?;
+    let prompt = state
+        .store
+        .session_agent_prompt_for_actor(&current.principal.authz)
+        .await?;
+    validate_agent_initial_content_budget(&prompt.content, &request.user_message)?;
     let executor = reply_executor(&state)?;
     let metadata = executor.provider.metadata();
     validate_provider_metadata(metadata).map_err(ApiError::reply_unavailable)?;
-    let manifest = current_agent_manifest(&state.store, executor)?;
+    let manifest = state.store.session_agent_manifest_with_prompt(
+        &prompt,
+        metadata.provider_id.clone(),
+        metadata.model.clone(),
+        match metadata.reply_kind {
+            ReplyKind::Model => AssistantReplyKind::Model,
+            ReplyKind::NonModelFallback => AssistantReplyKind::NonModelFallback,
+        },
+    )?;
     let probe = AgentTurnReceiptProbe {
         id: durable_agent_id(&id, &request.turn_id),
         authz: current.principal.authz.clone(),
@@ -3594,7 +3665,7 @@ async fn start_turn(
         ReplyRequest::from_session_history_for_agent_with_optional_system_prompt_and_context(
             &reply_turns,
             request.user_message.clone(),
-            Some(system_prompt),
+            Some(prompt.content.as_str()),
             knowledge.snapshot.snapshot().canonical_context(),
         )
         .map_err(agent_request_builder_error)?;
@@ -4786,6 +4857,16 @@ impl From<StoreError> for ApiError {
             .with_no_store(),
             StoreError::InvalidKnowledgeCatalog(reason) => {
                 Self::bad_request("invalid_knowledge_catalog", reason.clone()).with_no_store()
+            }
+            StoreError::AgentPromptRevisionConflict => Self::new(
+                StatusCode::CONFLICT,
+                "agent_prompt_revision_conflict",
+                "Agent prompt revision conflict",
+                "The account Agent prompt changed; refresh it and retry",
+            )
+            .with_no_store(),
+            StoreError::InvalidAgentPrompt(reason) => {
+                Self::bad_request("invalid_agent_prompt", reason.clone()).with_no_store()
             }
             StoreError::StorageQuotaExceeded => Self::storage_quota_exceeded(),
             StoreError::PhysicalStorageExhausted => Self::physical_storage_exhausted(),
@@ -8436,6 +8517,180 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_prompt_api_binds_the_exact_prompt_to_new_agent_execution() {
+        let store = DemoStore::seeded().await.unwrap();
+        let owner = provision_test_owner(&store, "user-prompt-owner", "prompt-owner").await;
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: "session-prompt-binding".into(),
+                    title: "Prompt binding".into(),
+                },
+                "create-session-prompt-binding",
+            )
+            .await
+            .unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(RecordingProvider::new(Arc::clone(&requests))),
+        )
+        .unwrap()
+        .layer(MockConnectInfo(test_peer()));
+
+        let initial = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/agent/prompt")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(initial.status(), StatusCode::OK);
+        assert_eq!(initial.headers()[header::CACHE_CONTROL], "no-store");
+        let initial: serde_json::Value = response_json(initial).await;
+        assert_eq!(initial["revision"], 0);
+        assert_eq!(initial["binding_revision"], "1");
+        assert_eq!(
+            initial["content"],
+            runtime::DEFAULT_SESSION_AGENT_SYSTEM_PROMPT
+        );
+
+        let content = "You are Zeus under an owner-governed test prompt.";
+        let body = serde_json::json!({
+            "expected_revision": 0,
+            "content": content,
+        })
+        .to_string();
+        let update = app
+            .clone()
+            .oneshot(
+                Request::put("/api/v1/agent/prompt")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "agent-prompt-api-first")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update.status(), StatusCode::OK);
+        assert_eq!(update.headers()[header::CACHE_CONTROL], "no-store");
+        let update: serde_json::Value = response_json(update).await;
+        assert_eq!(update["prompt"]["revision"], 1);
+        assert_eq!(update["prompt"]["binding_revision"], "2");
+        assert_eq!(update["prompt"]["content"], content);
+        assert_eq!(update["replayed"], false);
+
+        let replay = app
+            .clone()
+            .oneshot(
+                Request::put("/api/v1/agent/prompt")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "agent-prompt-api-first")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay: serde_json::Value = response_json(replay).await;
+        assert_eq!(replay["prompt"], update["prompt"]);
+        assert_eq!(replay["replayed"], true);
+
+        let conflict = app
+            .clone()
+            .oneshot(
+                Request::put("/api/v1/agent/prompt")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "agent-prompt-api-stale")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "expected_revision": 0,
+                            "content": "stale replacement",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            conflict,
+            StatusCode::CONFLICT,
+            "agent_prompt_revision_conflict",
+        )
+        .await;
+
+        let started = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-prompt-binding/turns")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "agent-prompt-bound-turn")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-prompt-binding",
+                            "user_message": "Use the governed prompt",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+        wait_for_ready_session(&store, &owner.authz, "session-prompt-binding").await;
+        {
+            let recorded = requests.lock().unwrap();
+            assert_eq!(recorded.len(), 1);
+            assert_eq!(recorded[0].messages[0].role, ReplyRole::System);
+            assert_eq!(recorded[0].messages[0].content, content);
+        }
+
+        let explained = app
+            .oneshot(
+                Request::get(
+                    "/api/v1/sessions/session-prompt-binding/turns/turn-prompt-binding/agent/deployment/explain",
+                )
+                .header(header::HOST, "zeus.test")
+                .header(header::COOKIE, &owner.cookie_header)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(explained.status(), StatusCode::OK);
+        let explained: serde_json::Value = response_json(explained).await;
+        assert_eq!(
+            explained["persisted_manifest"]["manifest"]["deployment"]["spec"]["prompt"]["revision"],
+            "2"
+        );
+        assert_eq!(explained["matches_current"], true);
+    }
+
+    #[tokio::test]
     async fn knowledge_catalog_api_drives_the_active_agent_context() {
         let store = DemoStore::seeded().await.unwrap();
         let owner = provision_test_owner(&store, "user-knowledge-owner", "knowledge-owner").await;
@@ -11259,7 +11514,7 @@ mod tests {
         authz: &AuthzContext,
         session_id: &str,
     ) -> SessionDetail {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let detail = store
                     .get_session_for_actor(

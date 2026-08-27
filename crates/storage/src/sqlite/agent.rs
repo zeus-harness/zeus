@@ -6,18 +6,20 @@
 
 use super::*;
 use crate::{
-    AgentFinalCompletion, AgentKnowledgeContextExplain, AgentModelClaimOutcome,
-    AgentModelCompletion, AgentModelFailureCommit, AgentModelJobStatus, AgentModelResolution,
-    AgentModelStartOutcome, AgentModelSuccessCommit, AgentOperationClaim, AgentOperationKind,
-    AgentPreparedModel, AgentPreparedTool, AgentReviewCommit, AgentReviewContext,
-    AgentReviewResult, AgentTerminalCompletion, AgentToolCall, AgentToolCallSpec,
-    AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
-    AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe,
+    AGENT_SYSTEM_PROMPT_MAX_BYTES, AgentFinalCompletion, AgentKnowledgeContextExplain,
+    AgentModelClaimOutcome, AgentModelCompletion, AgentModelFailureCommit, AgentModelJobStatus,
+    AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit, AgentOperationClaim,
+    AgentOperationKind, AgentPreparedModel, AgentPreparedTool, AgentPromptCommit, AgentPromptState,
+    AgentPromptUpdateResult, AgentReviewCommit, AgentReviewContext, AgentReviewResult,
+    AgentTerminalCompletion, AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome,
+    AgentToolCompletion, AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit,
+    AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe,
+    DEFAULT_SESSION_AGENT_PROMPT_REVISION, DEFAULT_SESSION_AGENT_SYSTEM_PROMPT,
     KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage, KnowledgeCatalogRevisionSummary,
-    KnowledgeCatalogState, KnowledgeCatalogUpdateResult,
+    KnowledgeCatalogState, KnowledgeCatalogUpdateResult, SESSION_AGENT_PROMPT_ID,
 };
 use ::execution::{DigestDomain, FactSource, OperationRef, Sha256Digest};
-use deployment::ManifestEnvelope;
+use deployment::{ManifestEnvelope, prompt_content_digest};
 use protocol::{
     AgentApprovalReview, AgentReviewResponse, AgentToolCallDetail, AgentToolCallStatus,
     AgentTurnDetail, AgentTurnStatus, AssistantReplyKind, PolicyDecision, ReviewDecision,
@@ -47,6 +49,9 @@ const AGENT_OPERATION_CLAIM_TTL_SECONDS: i64 = 30;
 const KNOWLEDGE_CATALOG_MAX_REVISIONS_PER_ACCOUNT: u64 = 256;
 const KNOWLEDGE_CORPUS_MAX_REVISIONS_PER_ACCOUNT: i64 = 128;
 const KNOWLEDGE_CORPUS_MAX_ENVELOPE_BYTES_PER_ACCOUNT: i64 = 64 * 1024 * 1024;
+const AGENT_PROMPT_MAX_REVISIONS_PER_ACCOUNT: u64 = 256;
+const AGENT_PROMPT_MAX_DISTINCT_REVISIONS_PER_ACCOUNT: i64 = 128;
+const AGENT_PROMPT_MAX_CONTENT_BYTES_PER_ACCOUNT: i64 = 2 * 1024 * 1024;
 
 #[derive(Serialize)]
 struct AgentKnowledgeContextBinding<'a> {
@@ -4651,6 +4656,27 @@ fn require_manifest_matches_runtime_identity(
     Ok(())
 }
 
+fn manifest_matches_current_agent_prompt(
+    connection: &Connection,
+    account_id: &str,
+    manifest: &ManifestEnvelope,
+) -> Result<bool, StorageError> {
+    let current = query_account_agent_prompt(connection, account_id)?;
+    let Some(binding) = manifest.manifest.deployment.spec.prompt.as_ref() else {
+        // Historical/direct-storage manifests predate the governed Zeus prompt
+        // identity. Runtime admission still requires its exact resolved
+        // manifest; this transaction-level fence applies once that identity is
+        // present and preserves integrity reads for legacy Agents.
+        return Ok(true);
+    };
+    if binding.prompt_id != SESSION_AGENT_PROMPT_ID {
+        return Ok(true);
+    }
+    Ok(binding.prompt_id == current.prompt_id
+        && binding.revision == current.binding_revision
+        && binding.content_digest == current.content_digest)
+}
+
 pub(super) fn require_manifest_matches_agent_identity(
     connection: &Connection,
     manifest: &ManifestEnvelope,
@@ -4802,6 +4828,16 @@ fn agent_deployment_matches_current(
     call: Option<&AgentToolCall>,
     current_manifest: &ManifestEnvelope,
 ) -> Result<bool, StorageError> {
+    match manifest_matches_current_agent_prompt(
+        connection,
+        agent.account_id.as_str(),
+        current_manifest,
+    ) {
+        Ok(true) => {}
+        Ok(false) => return Ok(false),
+        Err(StorageError::Sqlite(error)) => return Err(StorageError::Sqlite(error)),
+        Err(_) => return Ok(false),
+    }
     let Some(digest) = agent.deployment_manifest_digest.as_deref() else {
         return Ok(false);
     };
@@ -6207,6 +6243,522 @@ pub(super) fn verify_account_knowledge_catalog_integrity(
     Ok(())
 }
 
+fn invalid_agent_prompt(error: impl std::fmt::Display) -> StorageError {
+    StorageError::InvalidAgentPrompt(error.to_string())
+}
+
+fn validate_agent_prompt_content(content: &str) -> Result<(), StorageError> {
+    protocol::validate_user_message(content).map_err(invalid_agent_prompt)?;
+    if content.len() > AGENT_SYSTEM_PROMPT_MAX_BYTES {
+        return Err(StorageError::InvalidAgentPrompt(format!(
+            "Agent prompt exceeds the {AGENT_SYSTEM_PROMPT_MAX_BYTES}-byte limit"
+        )));
+    }
+    Ok(())
+}
+
+fn agent_prompt_binding_revision(revision: u64) -> Result<String, StorageError> {
+    revision
+        .checked_add(1)
+        .map(|revision| revision.to_string())
+        .ok_or(StorageError::IntegerOutOfRange(
+            "Agent prompt binding revision",
+        ))
+}
+
+fn default_agent_prompt_state(account_id: AccountId) -> Result<AgentPromptState, StorageError> {
+    validate_agent_prompt_content(DEFAULT_SESSION_AGENT_SYSTEM_PROMPT)?;
+    Ok(AgentPromptState {
+        account_id,
+        revision: 0,
+        prompt_id: SESSION_AGENT_PROMPT_ID.to_owned(),
+        binding_revision: DEFAULT_SESSION_AGENT_PROMPT_REVISION.to_owned(),
+        content_digest: prompt_content_digest(DEFAULT_SESSION_AGENT_SYSTEM_PROMPT),
+        content: DEFAULT_SESSION_AGENT_SYSTEM_PROMPT.to_owned(),
+        updated_by_user_id: None,
+        updated_by_membership_revision: None,
+        updated_at: None,
+    })
+}
+
+fn query_stored_agent_prompt(
+    connection: &Connection,
+    account_id: &str,
+    digest: &str,
+) -> Result<String, StorageError> {
+    let stored = connection
+        .query_row(
+            r#"SELECT content_bytes, content
+               FROM agent_prompt_revisions
+               WHERE account_id = ?1 AND digest = ?2"#,
+            params![account_id, digest],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StorageError::CorruptData(format!("Agent prompt `{account_id}/{digest}` is missing"))
+        })?;
+    validate_agent_prompt_content(&stored.1).map_err(|error| {
+        StorageError::CorruptData(format!(
+            "Agent prompt `{account_id}/{digest}` is invalid: {error}"
+        ))
+    })?;
+    let content_bytes = i64::try_from(stored.1.len())
+        .map_err(|_| StorageError::IntegerOutOfRange("stored Agent prompt bytes"))?;
+    if stored.0 != content_bytes || prompt_content_digest(&stored.1) != digest {
+        return Err(StorageError::CorruptData(format!(
+            "Agent prompt `{account_id}/{digest}` disagrees with its SQL projection"
+        )));
+    }
+    Ok(stored.1)
+}
+
+pub(super) fn query_account_agent_prompt(
+    connection: &Connection,
+    account_id: &str,
+) -> Result<AgentPromptState, StorageError> {
+    let account_id_value = decode_account_id(account_id.to_owned())?;
+    let stored = connection
+        .query_row(
+            r#"SELECT revision, active_prompt_digest, updated_by_user_id,
+                      updated_by_membership_revision, updated_at
+               FROM account_agent_prompt_configs WHERE account_id = ?1"#,
+            [account_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((revision, digest, actor_user_id, actor_revision, updated_at)) = stored else {
+        return default_agent_prompt_state(account_id_value);
+    };
+    let revision = i64_to_u64(revision, "Agent prompt revision")?;
+    Ok(AgentPromptState {
+        account_id: account_id_value,
+        revision,
+        prompt_id: SESSION_AGENT_PROMPT_ID.to_owned(),
+        binding_revision: agent_prompt_binding_revision(revision)?,
+        content: query_stored_agent_prompt(connection, account_id, &digest)?,
+        content_digest: digest,
+        updated_by_user_id: Some(actor_user_id),
+        updated_by_membership_revision: Some(decode_membership_revision(actor_revision)?),
+        updated_at: Some(updated_at),
+    })
+}
+
+pub(super) fn query_account_agent_prompt_for_admin(
+    connection: &Connection,
+    context: &AuthzContext,
+) -> Result<AgentPromptState, StorageError> {
+    require_current_authority(connection, context, AccountCapability::AccountAdmin)?;
+    query_account_agent_prompt(connection, context.account_id.as_str())
+}
+
+pub(super) fn query_active_agent_prompt_for_actor(
+    connection: &Connection,
+    context: &AuthzContext,
+) -> Result<AgentPromptState, StorageError> {
+    require_current_authority(connection, context, AccountCapability::Reply)?;
+    query_account_agent_prompt(connection, context.account_id.as_str())
+}
+
+fn agent_prompt_fingerprint(
+    expected_revision: u64,
+    prompt_digest: &str,
+) -> Result<String, StorageError> {
+    Ok(serde_json::to_string(&json!({
+        "expected_revision": expected_revision,
+        "prompt_digest": prompt_digest,
+    }))?)
+}
+
+fn require_agent_prompt_capacity(
+    connection: &Connection,
+    account_id: &str,
+    digest: &str,
+    content_bytes: i64,
+) -> Result<(), StorageError> {
+    let exists: i64 = connection.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM agent_prompt_revisions
+               WHERE account_id = ?1 AND digest = ?2
+           )"#,
+        params![account_id, digest],
+        |row| row.get(0),
+    )?;
+    if exists != 0 {
+        return Ok(());
+    }
+    let (count, bytes): (i64, i64) = connection.query_row(
+        r#"SELECT COUNT(*), COALESCE(SUM(content_bytes), 0)
+           FROM agent_prompt_revisions WHERE account_id = ?1"#,
+        [account_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if count >= AGENT_PROMPT_MAX_DISTINCT_REVISIONS_PER_ACCOUNT
+        || bytes
+            .checked_add(content_bytes)
+            .is_none_or(|total| total > AGENT_PROMPT_MAX_CONTENT_BYTES_PER_ACCOUNT)
+    {
+        return Err(StorageError::StorageQuotaExceeded);
+    }
+    Ok(())
+}
+
+pub(super) fn replace_account_agent_prompt(
+    connection: &mut Connection,
+    context: &AuthzContext,
+    commit: AgentPromptCommit,
+    limits: &StorageLimits,
+    physical_limits: &SqlitePhysicalLimits,
+) -> Result<AgentPromptUpdateResult, StorageError> {
+    let key = normalized_key(&commit.idempotency_key)?.to_owned();
+    validate_agent_prompt_content(&commit.content)?;
+    let prompt_digest = prompt_content_digest(&commit.content);
+    let content_bytes = i64::try_from(commit.content.len())
+        .map_err(|_| StorageError::IntegerOutOfRange("Agent prompt bytes"))?;
+    let request_fingerprint = agent_prompt_fingerprint(commit.expected_revision, &prompt_digest)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_current_authority(&transaction, context, AccountCapability::AccountAdmin)?;
+
+    let stored_receipt = transaction
+        .query_row(
+            r#"SELECT actor_membership_revision, request_fingerprint,
+                      prompt_revision, prompt_digest, created_at
+               FROM agent_prompt_config_receipts
+               WHERE account_id = ?1 AND actor_user_id = ?2 AND idempotency_key = ?3"#,
+            params![context.account_id.as_str(), context.user_id, key],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((actor_revision, fingerprint, revision, stored_digest, created_at)) = stored_receipt
+    {
+        if decode_membership_revision(actor_revision)? != context.membership_revision
+            || fingerprint != request_fingerprint
+            || stored_digest != prompt_digest
+        {
+            return Err(StorageError::IdempotencyConflict);
+        }
+        let revision = i64_to_u64(revision, "Agent prompt receipt revision")?;
+        let current = query_account_agent_prompt(&transaction, context.account_id.as_str())?;
+        if current.revision < revision {
+            return Err(StorageError::CorruptData(
+                "Agent prompt receipt is ahead of the configuration head".into(),
+            ));
+        }
+        let prompt = AgentPromptState {
+            account_id: context.account_id.clone(),
+            revision,
+            prompt_id: SESSION_AGENT_PROMPT_ID.to_owned(),
+            binding_revision: agent_prompt_binding_revision(revision)?,
+            content: query_stored_agent_prompt(
+                &transaction,
+                context.account_id.as_str(),
+                &stored_digest,
+            )?,
+            content_digest: stored_digest,
+            updated_by_user_id: Some(context.user_id.clone()),
+            updated_by_membership_revision: Some(context.membership_revision),
+            updated_at: Some(created_at),
+        };
+        transaction.commit()?;
+        return Ok(AgentPromptUpdateResult {
+            prompt,
+            replayed: true,
+        });
+    }
+
+    let current = query_account_agent_prompt(&transaction, context.account_id.as_str())?;
+    if current.revision != commit.expected_revision {
+        return Err(StorageError::AgentPromptRevisionConflict);
+    }
+    if current.content_digest == prompt_digest {
+        return Err(StorageError::InvalidAgentPrompt(
+            "the replacement Agent prompt is already active".into(),
+        ));
+    }
+    if current.revision >= AGENT_PROMPT_MAX_REVISIONS_PER_ACCOUNT {
+        return Err(StorageError::StorageQuotaExceeded);
+    }
+    let next_revision = current
+        .revision
+        .checked_add(1)
+        .ok_or(StorageError::IntegerOutOfRange("Agent prompt revision"))?;
+    require_agent_prompt_capacity(
+        &transaction,
+        context.account_id.as_str(),
+        &prompt_digest,
+        content_bytes,
+    )?;
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Admission,
+    )?;
+    let timestamp = now();
+    prepare_account_audit_admission(
+        &transaction,
+        context.account_id.as_str(),
+        AuditAdmission::General,
+        limits,
+        &timestamp,
+    )?;
+    transaction.execute(
+        r#"INSERT OR IGNORE INTO agent_prompt_revisions(
+               account_id, digest, content_bytes, content, created_at
+           ) VALUES (?1, ?2, ?3, ?4, ?5)"#,
+        params![
+            context.account_id.as_str(),
+            prompt_digest,
+            content_bytes,
+            commit.content,
+            timestamp,
+        ],
+    )?;
+    let persisted_content =
+        query_stored_agent_prompt(&transaction, context.account_id.as_str(), &prompt_digest)?;
+    if persisted_content != commit.content {
+        return Err(StorageError::CorruptData(
+            "content-addressed Agent prompt revision disagrees with the replacement".into(),
+        ));
+    }
+    let next_revision_sql = u64_to_i64(next_revision, "Agent prompt revision")?;
+    let actor_revision_sql = u64_to_i64(
+        context.membership_revision.get(),
+        "Agent prompt membership revision",
+    )?;
+    let changed = if current.revision == 0 {
+        transaction.execute(
+            r#"INSERT INTO account_agent_prompt_configs(
+                   account_id, revision, active_prompt_digest, updated_by_user_id,
+                   updated_by_membership_revision, updated_at
+               ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+            params![
+                context.account_id.as_str(),
+                next_revision_sql,
+                prompt_digest,
+                context.user_id,
+                actor_revision_sql,
+                timestamp,
+            ],
+        )?
+    } else {
+        transaction.execute(
+            r#"UPDATE account_agent_prompt_configs
+               SET revision = ?1, active_prompt_digest = ?2,
+                   updated_by_user_id = ?3, updated_by_membership_revision = ?4,
+                   updated_at = ?5
+               WHERE account_id = ?6 AND revision = ?7"#,
+            params![
+                next_revision_sql,
+                prompt_digest,
+                context.user_id,
+                actor_revision_sql,
+                timestamp,
+                context.account_id.as_str(),
+                u64_to_i64(current.revision, "Agent prompt expected revision")?,
+            ],
+        )?
+    };
+    if changed != 1 {
+        return Err(StorageError::ConcurrentModification);
+    }
+    transaction.execute(
+        r#"INSERT INTO agent_prompt_config_receipts(
+               account_id, actor_user_id, actor_membership_revision,
+               idempotency_key, request_fingerprint, prompt_revision,
+               prompt_digest, created_at
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+        params![
+            context.account_id.as_str(),
+            context.user_id,
+            actor_revision_sql,
+            key,
+            request_fingerprint,
+            next_revision_sql,
+            prompt_digest,
+            timestamp,
+        ],
+    )?;
+    let binding_revision = agent_prompt_binding_revision(next_revision)?;
+    append_account_audit_event(
+        &transaction,
+        context.account_id.as_str(),
+        AccountAuditEventInput {
+            actor_user_id: Some(&context.user_id),
+            action: "agent.prompt.updated",
+            target_kind: "agent_prompt",
+            target_id: SESSION_AGENT_PROMPT_ID,
+            metadata: json!({
+                "previous_revision": current.revision,
+                "revision": next_revision,
+                "binding_revision": binding_revision,
+                "prompt_digest": prompt_digest,
+                "content_bytes": content_bytes,
+            }),
+        },
+        &timestamp,
+    )?;
+    let prompt = AgentPromptState {
+        account_id: context.account_id.clone(),
+        revision: next_revision,
+        prompt_id: SESSION_AGENT_PROMPT_ID.to_owned(),
+        binding_revision,
+        content_digest: prompt_digest,
+        content: commit.content,
+        updated_by_user_id: Some(context.user_id.clone()),
+        updated_by_membership_revision: Some(context.membership_revision),
+        updated_at: Some(timestamp),
+    };
+    transaction.commit()?;
+    Ok(AgentPromptUpdateResult {
+        prompt,
+        replayed: false,
+    })
+}
+
+pub(super) fn verify_account_agent_prompt_integrity(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    let capacity_violation: i64 = connection.query_row(
+        r#"SELECT EXISTS(
+               SELECT account_id
+               FROM agent_prompt_revisions
+               GROUP BY account_id
+               HAVING COUNT(*) > ?1 OR SUM(content_bytes) > ?2
+           )"#,
+        params![
+            AGENT_PROMPT_MAX_DISTINCT_REVISIONS_PER_ACCOUNT,
+            AGENT_PROMPT_MAX_CONTENT_BYTES_PER_ACCOUNT,
+        ],
+        |row| row.get(0),
+    )?;
+    if capacity_violation != 0 {
+        return Err(StorageError::CorruptData(
+            "account Agent prompt history exceeds its durable capacity".into(),
+        ));
+    }
+    let orphan: i64 = connection.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM agent_prompt_config_receipts receipt
+               LEFT JOIN account_agent_prompt_configs config
+                 ON config.account_id = receipt.account_id
+               WHERE config.account_id IS NULL
+           )"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if orphan != 0 {
+        return Err(StorageError::CorruptData(
+            "Agent prompt receipt has no configuration head".into(),
+        ));
+    }
+    let unreferenced_revision: i64 = connection.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM agent_prompt_revisions prompt
+               LEFT JOIN agent_prompt_config_receipts receipt
+                 ON receipt.account_id = prompt.account_id
+                AND receipt.prompt_digest = prompt.digest
+               WHERE receipt.account_id IS NULL
+           )"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if unreferenced_revision != 0 {
+        return Err(StorageError::CorruptData(
+            "Agent prompt revision has no committed receipt".into(),
+        ));
+    }
+    let account_ids = {
+        let mut statement = connection
+            .prepare("SELECT account_id FROM account_agent_prompt_configs ORDER BY account_id")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for account_id in account_ids {
+        let prompt = query_account_agent_prompt(connection, &account_id)?;
+        if prompt.revision == 0 || prompt.revision > AGENT_PROMPT_MAX_REVISIONS_PER_ACCOUNT {
+            return Err(StorageError::CorruptData(format!(
+                "Agent prompt configuration `{account_id}` has an invalid revision"
+            )));
+        }
+        let receipts = {
+            let mut statement = connection.prepare(
+                r#"SELECT actor_user_id, actor_membership_revision,
+                          request_fingerprint, prompt_revision, prompt_digest, created_at
+                   FROM agent_prompt_config_receipts
+                   WHERE account_id = ?1 ORDER BY prompt_revision"#,
+            )?;
+            statement
+                .query_map([&account_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if u64::try_from(receipts.len()).ok() != Some(prompt.revision) {
+            return Err(StorageError::CorruptData(format!(
+                "Agent prompt configuration `{account_id}` receipt chain is incomplete"
+            )));
+        }
+        for (index, (actor, actor_revision, fingerprint, revision, digest, created_at)) in
+            receipts.iter().enumerate()
+        {
+            let expected_revision = u64::try_from(index)
+                .map_err(|_| StorageError::IntegerOutOfRange("Agent prompt receipt index"))?
+                .checked_add(1)
+                .ok_or(StorageError::IntegerOutOfRange(
+                    "Agent prompt receipt revision",
+                ))?;
+            if i64_to_u64(*revision, "Agent prompt receipt revision")? != expected_revision
+                || *fingerprint != agent_prompt_fingerprint(expected_revision - 1, digest)?
+            {
+                return Err(StorageError::CorruptData(format!(
+                    "Agent prompt configuration `{account_id}` receipt chain is inconsistent"
+                )));
+            }
+            decode_membership_revision(*actor_revision)?;
+            query_stored_agent_prompt(connection, &account_id, digest)?;
+            if expected_revision == prompt.revision
+                && (prompt.content_digest != *digest
+                    || prompt.updated_by_user_id.as_deref() != Some(actor.as_str())
+                    || prompt
+                        .updated_by_membership_revision
+                        .as_ref()
+                        .map(|revision| revision.get())
+                        != Some(i64_to_u64(*actor_revision, "Agent prompt actor revision")?)
+                    || prompt.updated_at.as_deref() != Some(created_at.as_str()))
+            {
+                return Err(StorageError::CorruptData(format!(
+                    "Agent prompt configuration `{account_id}` head disagrees with its latest receipt"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn query_legacy_agent_knowledge_boundary(
     connection: &Connection,
     agent_id: &str,
@@ -6841,6 +7393,15 @@ pub(super) fn insert_agent_turn(
 ) -> Result<(AgentTurn, AgentModelJob), StorageError> {
     validate_agent_turn_spec(spec)?;
     require_manifest_matches_runtime_identity(connection, &spec.manifest)?;
+    if !manifest_matches_current_agent_prompt(
+        connection,
+        spec.authz.account_id.as_str(),
+        &spec.manifest,
+    )? {
+        return Err(StorageError::InvalidAgentTransition(
+            "Agent deployment manifest does not bind the active account Agent prompt".into(),
+        ));
+    }
     persist_agent_deployment_manifest(connection, &spec.manifest, queued_at)?;
     let job_id = model_job_id(&spec.id, 1);
     let knowledge_context_digest =

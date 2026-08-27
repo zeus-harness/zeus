@@ -4,7 +4,7 @@
 Event Feed、Point-query Durable Context、Bounded Read Models、SQLite Capacity Slice 2、SQLite
 Physical/Operation Capacity、Bootstrap Audit Retention、schema v13 Account Membership
 Foundation、schema v14 Account-scoped Durable Authorization、schema v15 Member Lifecycle /
-Account Audit、schema v16 Session Reply Context Index 至 schema v23 Account Knowledge Catalog 已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
+Account Audit、schema v16 Session Reply Context Index 至 schema v24 Account Agent Prompt 已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
 v11→v12→v13→v14 迁移证据，current-image 证据见本节验收结果，Linux Docker PID/OOM
 authoritative gate 待完成。
 
@@ -203,8 +203,8 @@ POST /sessions/{id}/turns
 
 - 每次接受 turn 时，以请求中的 `expected_sequence` 为历史边界，只读取已经完整 flush 的
   user/assistant 对，再追加当前 user message。Session-native Agent request 的第一条且唯一一条
-  system message 是稳定的 Zeus system prompt；其 ID、revision 与域分离 content digest 绑定在
-  canonical secret-free deployment manifest，精确内容只随 immutable request 持久化。
+  system message 是当时 active 的 account Agent prompt；其 ID、revision 与域分离 content digest
+  绑定在 canonical secret-free deployment manifest，精确内容只随 immutable request 持久化。
 - system prompt、最新至多 26 对历史消息、当前 user message 及其后的 durable `context` message
   共享 64 KiB 初始 UTF-8 内容预算。初始最多 55 条 message；Agent 全程最多 64 条，为四组 assistant tool call / tool result
   预留八条。当前 user message 无法与固定 prompt 一起装入该预算时，在任何 durable write 前
@@ -282,11 +282,17 @@ POST /sessions/{id}/turns
   receipt。Owner 通过 expected revision CAS 与 canonical `Idempotency-Key` 原子替换 catalog，
   mutation 同事务写 account audit；revision 0 是不落库的隐式空 catalog。Head revision 最多 256，
   每个 account 最多保留 128 个不同 corpus revision 与 64 MiB canonical envelope。
+- `0024_account_agent_prompt.sql`：增加 owner-governed Agent prompt head、immutable
+  content-addressed revision 与 actor-scoped receipt。revision 0 是原内置 prompt 与 manifest
+  revision `1`；第一次自定义更新映射到 manifest revision `2`。内容最多 16 KiB，catalog head
+  最多推进 256 次，每个 account 最多保留 128 个不同内容和 2 MiB aggregate bytes。
 
-Manifest-bound system prompt v1 复用 `0019` 已有的可选 prompt 字段和 immutable request JSON，
-不增加 schema migration。升级后旧 queued promptless Agent work 与当前 deployment 不一致，首次
-进入 claim 时 fail closed；terminal history 保持可读。Knowledge v1 生成独立、受治理、带完整
-digest 的 canonical context snapshot，不修改稳定 system prompt。schema v22 已完成数据库绑定、
+schema v24 的 system prompt governance 复用 `0019` 的 prompt binding，并增加 durable
+head/revision/receipt。Owner-only `GET/PUT /api/v1/agent/prompt` 通过 expected-revision CAS 和
+canonical `Idempotency-Key` 更新；普通 member 不能管理，但新 Agent 使用当时 active revision。
+更新不改写既有 Agent；旧 queued governed revision 在 claim 时 fail closed，已经 started 的工作
+继续使用已持久化 request。Knowledge v1 生成独立、受治理、带完整 digest 的 canonical context
+snapshot，不修改 system prompt。schema v22 已完成数据库绑定、
 Agent request 注入和 exact replay；LLM 协议层使用独立 durable `context` role，并只在
 OpenAI-compatible provider wire 上映射为另一条 `user` message。schema v23 已完成 owner-only
 `GET/PUT /api/v1/knowledge/catalog`、持久 revision/idempotency receipt、权限与篡改校验。未配置时
@@ -315,7 +321,9 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
 - user message 之后由服务端产生 durable assistant/failure event；浏览器不能提交 assistant content。
 - Agent system prompt 的 manifest ID/revision/content digest、request 首位唯一性、64 KiB 初始
   content 与 64-message 全程预算，以及 admission/claim/continuation/deep-integrity fail-closed
-  语义有自动测试；prompt drift 时 provider 调用数为零，恢复复用 exact persisted request。
+  语义有自动测试；revision-0 兼容、owner/member capability、CAS/idempotency、v23→v24 migration、
+  HTTP 到真实 provider request 的 binding 和 queued drift 都有覆盖；prompt drift 时 provider
+  调用数为零，恢复复用 exact persisted request。
 - `system/light/dark` 首屏无闪白，刷新后保持，系统主题变化可跟随。
 - reply job 的只读队首观察、固定 job ID 精确 start/replay、queued/start/success/failure/
   outcome_unknown 和重启语义有存储测试；模糊 start ACK 不会跳到下一条任务。
@@ -352,7 +360,7 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 按项目既有统计口径通过 543 个 Rust 测试（knowledge 29、storage 245、runtime 48、API library 65、API
+- host 按项目既有统计口径通过 547 个 Rust 测试（knowledge 29、storage 248、runtime 48、API library 66、API
   main/config 6）与 28 个 Web Node 测试。
 - `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 

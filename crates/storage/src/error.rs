@@ -70,6 +70,10 @@ pub enum StorageError {
     KnowledgeCatalogRevisionNotFound(u64),
     #[error("invalid account knowledge catalog: {0}")]
     InvalidKnowledgeCatalog(String),
+    #[error("the account Agent prompt changed concurrently")]
+    AgentPromptRevisionConflict,
+    #[error("invalid account Agent prompt: {0}")]
+    InvalidAgentPrompt(String),
     #[error(
         "account audit policy for `{account_id}` retains {detail_rows} detail rows, above the configured limit {configured_limit}"
     )]
