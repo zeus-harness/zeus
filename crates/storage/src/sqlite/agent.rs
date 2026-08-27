@@ -10,8 +10,9 @@ use crate::{
     AgentModelJobStatus, AgentModelResolution, AgentModelSuccessCommit, AgentReviewCommit,
     AgentReviewContext, AgentReviewResult, AgentTerminalCompletion, AgentToolCall,
     AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
-    AgentToolOutcomeUnknownCommit, AgentToolWork, settle_agent_continuation_limit,
+    AgentToolOutcomeUnknownCommit, AgentToolWork,
 };
+use ::execution::{DigestDomain, FactSource, OperationRef, Sha256Digest};
 use deployment::ManifestEnvelope;
 use protocol::{
     AgentApprovalReview, AgentReviewResponse, AgentToolCallDetail, AgentToolCallStatus,
@@ -19,8 +20,8 @@ use protocol::{
     ToolExecutorStatus,
 };
 use workflows::{
-    AgentStatus as WorkflowStatus, Command as WorkflowCommand, ProposalDisposition,
-    State as WorkflowState, TerminalReason, ToolCompletionKind, reduce,
+    AgentStatus as WorkflowStatus, Command as WorkflowCommand, ExternalCall, KnownToolResult,
+    ProposalDisposition, State as WorkflowState, TerminalReason, ToolCompletionKind, reduce,
 };
 
 const AGENT_ID_MAX_BYTES: usize = 384;
@@ -152,6 +153,52 @@ impl SqliteStore {
         .await
     }
 
+    /// Returns one account-scoped, point-in-time view of the immutable
+    /// RunEpoch authorities and append-only execution facts for an Agent turn.
+    pub async fn agent_execution_explain_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<::execution::AgentExecutionExplain, StorageError> {
+        let context = validated_authz_context(context)?;
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        let turn_id = validated_durable_reference(turn_id, "turn ID")?.to_owned();
+        self.with_connection(move |connection| {
+            super::execution::query_agent_execution_explain_for_actor(
+                connection,
+                &context,
+                &session_id,
+                &turn_id,
+            )
+        })
+        .await
+    }
+
+    /// Returns the exact persisted request and outcome for one model RunEpoch.
+    /// Reading this evidence never grants authority to replay the operation.
+    pub async fn agent_run_epoch_explain_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        turn_id: &str,
+        step: u32,
+    ) -> Result<::execution::AgentRunEpochExplain, StorageError> {
+        let context = validated_authz_context(context)?;
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        let turn_id = validated_durable_reference(turn_id, "turn ID")?.to_owned();
+        self.with_connection(move |connection| {
+            super::execution::query_agent_run_epoch_explain_for_actor(
+                connection,
+                &context,
+                &session_id,
+                &turn_id,
+                step,
+            )
+        })
+        .await
+    }
+
     /// Returns the exact server-owned transcript needed to construct an owner
     /// rejection result. Authorization is checked before the call is exposed.
     pub async fn agent_review_context_for_actor(
@@ -243,45 +290,45 @@ fn claim_next_agent_model(
         physical_limits,
         PhysicalCapacityGate::ReservedProgress,
     )?;
-
-    let started = reduce(&agent.workflow_state, WorkflowCommand::StartModel)
-        .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?
-        .into_state();
-    update_agent_workflow(&transaction, &mut agent, started, None, None, None)?;
     let timestamp = now();
-    let changed = transaction.execute(
-        r#"UPDATE agent_model_jobs
-           SET status = 'started', attempt = 1, started_at = ?1
-           WHERE id = ?2 AND status = 'queued' AND attempt = 0"#,
-        params![timestamp, job_id],
-    )?;
-    if changed != 1 {
-        return Err(StorageError::ConcurrentModification);
-    }
 
     if !agent_deployment_matches_current(&transaction, &agent, Some(&job), None, current_manifest)?
     {
         let error_json = deployment_unavailable_error(
             "the bound Agent deployment manifest is missing, invalid, or changed before model execution",
         );
-        let failed = reduce(
-            &agent.workflow_state,
-            WorkflowCommand::DeploymentUnavailable,
-        )
-        .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?
-        .into_state();
-        update_agent_workflow(
+        let command = WorkflowCommand::DeploymentUnavailable;
+        let transition = reduce(&agent.workflow_state, command.clone())
+            .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+        persist_agent_workflow_transition(
             &transaction,
             &mut agent,
-            failed,
+            transition.state().clone(),
             None,
             Some(&error_json),
             Some(&timestamp),
+            AgentTransitionFact {
+                command,
+                external_call: transition.external_call().cloned(),
+                emitted_result: transition.emitted_result().cloned(),
+                emitted_result_digest: None,
+                epoch_digest: None,
+                source: FactSource::Live,
+                subject: Some(model_subject(&job)),
+                input_digest: Some(model_request_digest(&job)?),
+                output_digest: Some(super::execution::digest_json(
+                    DigestDomain::ExecutionError,
+                    &error_json,
+                )?),
+                next_request_digest: None,
+            },
+            &timestamp,
         )?;
         let changed = transaction.execute(
             r#"UPDATE agent_model_jobs
-               SET status = 'failed', error_json = ?1, finished_at = ?2
-               WHERE id = ?3 AND status = 'started' AND attempt = 1"#,
+               SET status = 'failed', attempt = 1, error_json = ?1,
+                   started_at = ?2, finished_at = ?2
+               WHERE id = ?3 AND status = 'queued' AND attempt = 0"#,
             params![serde_json::to_string(&error_json)?, timestamp, job_id],
         )?;
         if changed != 1 {
@@ -301,23 +348,43 @@ fn claim_next_agent_model(
             "code": "authorization_revoked",
             "message": "the agent initiator is no longer authorized for this Session"
         });
-        let failed = reduce(&agent.workflow_state, WorkflowCommand::AuthorizationRevoked)
-            .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?
-            .into_state();
-        update_agent_workflow(
+        let command = WorkflowCommand::AuthorizationRevoked;
+        let transition = reduce(&agent.workflow_state, command.clone())
+            .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+        persist_agent_workflow_transition(
             &transaction,
             &mut agent,
-            failed,
+            transition.state().clone(),
             None,
             Some(&error_json),
             Some(&timestamp),
+            AgentTransitionFact {
+                command,
+                external_call: transition.external_call().cloned(),
+                emitted_result: transition.emitted_result().cloned(),
+                emitted_result_digest: None,
+                epoch_digest: None,
+                source: FactSource::Live,
+                subject: Some(model_subject(&job)),
+                input_digest: Some(model_request_digest(&job)?),
+                output_digest: Some(super::execution::digest_json(
+                    DigestDomain::ExecutionError,
+                    &error_json,
+                )?),
+                next_request_digest: None,
+            },
+            &timestamp,
         )?;
-        transaction.execute(
+        let changed = transaction.execute(
             r#"UPDATE agent_model_jobs
-               SET status = 'failed', error_json = ?1, finished_at = ?2
-               WHERE id = ?3 AND status = 'started'"#,
+               SET status = 'failed', attempt = 1, error_json = ?1,
+                   started_at = ?2, finished_at = ?2
+               WHERE id = ?3 AND status = 'queued' AND attempt = 0"#,
             params![serde_json::to_string(&error_json)?, timestamp, job_id],
         )?;
+        if changed != 1 {
+            return Err(StorageError::ConcurrentModification);
+        }
         let completion = interrupt_agent_turn(
             &transaction,
             &agent,
@@ -327,6 +394,46 @@ fn claim_next_agent_model(
         return Ok(AgentModelClaimOutcome::Rejected(Box::new(completion)));
     }
 
+    let command = WorkflowCommand::StartModel;
+    let transition = reduce(&agent.workflow_state, command.clone())
+        .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+    let epoch_digest = super::execution::insert_model_run_epoch(
+        &transaction,
+        &agent,
+        &job,
+        &current_manifest.digest,
+        &timestamp,
+    )?;
+    persist_agent_workflow_transition(
+        &transaction,
+        &mut agent,
+        transition.state().clone(),
+        None,
+        None,
+        None,
+        AgentTransitionFact {
+            command,
+            external_call: transition.external_call().cloned(),
+            emitted_result: transition.emitted_result().cloned(),
+            emitted_result_digest: None,
+            epoch_digest: Some(epoch_digest),
+            source: FactSource::Live,
+            subject: Some(model_subject(&job)),
+            input_digest: Some(model_request_digest(&job)?),
+            output_digest: None,
+            next_request_digest: None,
+        },
+        &timestamp,
+    )?;
+    let changed = transaction.execute(
+        r#"UPDATE agent_model_jobs
+           SET status = 'started', attempt = 1, started_at = ?1
+           WHERE id = ?2 AND status = 'queued' AND attempt = 0"#,
+        params![timestamp, job_id],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::ConcurrentModification);
+    }
     let claimed = query_agent_model_job_by_id(&transaction, &job_id)?;
     transaction.commit()?;
     Ok(AgentModelClaimOutcome::Claimed(Box::new(claimed)))
@@ -368,29 +475,41 @@ fn complete_agent_model_success(
     )?;
 
     let timestamp = now();
+    let epoch_digest =
+        super::execution::epoch_digest_for_operation(&transaction, "model", &job.id)?;
+    let input_digest = model_request_digest(&job)?;
+    let output_digest =
+        super::execution::digest_json(DigestDomain::ModelResponse, &commit.response_json)?;
     let completion = match &commit.resolution {
         AgentModelResolution::Final {
             assistant_message,
             provenance,
         } => {
-            let completed = reduce(
-                &agent.workflow_state,
-                WorkflowCommand::ModelFinal {
-                    content_bytes: usize_to_u64(
-                        assistant_message.len(),
-                        "agent final message bytes",
-                    )?,
-                },
-            )
-            .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?
-            .into_state();
-            update_agent_workflow(
+            let command = WorkflowCommand::ModelFinal {
+                content_bytes: usize_to_u64(assistant_message.len(), "agent final message bytes")?,
+            };
+            let transition = reduce(&agent.workflow_state, command.clone())
+                .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+            persist_agent_workflow_transition(
                 &transaction,
                 &mut agent,
-                completed,
+                transition.state().clone(),
                 None,
                 None,
                 Some(&timestamp),
+                AgentTransitionFact {
+                    command,
+                    external_call: transition.external_call().cloned(),
+                    emitted_result: transition.emitted_result().cloned(),
+                    emitted_result_digest: None,
+                    epoch_digest: Some(epoch_digest.clone()),
+                    source: FactSource::Live,
+                    subject: Some(model_subject(&job)),
+                    input_digest: Some(input_digest.clone()),
+                    output_digest: Some(output_digest.clone()),
+                    next_request_digest: None,
+                },
+                &timestamp,
             )?;
             finish_agent_model_job_success(&transaction, &job, &commit.response_json, &timestamp)?;
             AgentModelCompletion::Final(Box::new(finalize_agent_success(
@@ -403,22 +522,36 @@ fn complete_agent_model_success(
         }
         AgentModelResolution::ToolCall { call } => {
             let disposition = proposal_disposition(call.policy_decision.clone(), None)?;
-            let proposed = reduce(
-                &agent.workflow_state,
-                WorkflowCommand::ModelToolProposal { disposition },
-            )
-            .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?
-            .into_state();
+            let command = WorkflowCommand::ModelToolProposal { disposition };
+            let transition = reduce(&agent.workflow_state, command.clone())
+                .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+            let proposed = transition.state().clone();
             if proposed.status() == WorkflowStatus::Failed {
-                let error_json =
-                    workflow_terminal_error_for_resolution(&proposed, &commit.resolution)?;
-                update_agent_workflow(
+                let error_json = workflow_terminal_error_for_resolution(
+                    &proposed,
+                    &commit.resolution,
+                    &commit.response_json,
+                )?;
+                persist_agent_workflow_transition(
                     &transaction,
                     &mut agent,
                     proposed,
                     None,
                     Some(&error_json),
                     Some(&timestamp),
+                    AgentTransitionFact {
+                        command,
+                        external_call: transition.external_call().cloned(),
+                        emitted_result: transition.emitted_result().cloned(),
+                        emitted_result_digest: None,
+                        epoch_digest: Some(epoch_digest.clone()),
+                        source: FactSource::Live,
+                        subject: Some(model_subject(&job)),
+                        input_digest: Some(input_digest.clone()),
+                        output_digest: Some(output_digest.clone()),
+                        next_request_digest: None,
+                    },
+                    &timestamp,
                 )?;
                 finish_agent_model_job_success(
                     &transaction,
@@ -442,13 +575,26 @@ fn complete_agent_model_success(
                         ));
                     }
                 };
-                update_agent_workflow(
+                persist_agent_workflow_transition(
                     &transaction,
                     &mut agent,
                     proposed,
                     Some(&call.call_id),
                     None,
                     None,
+                    AgentTransitionFact {
+                        command,
+                        external_call: transition.external_call().cloned(),
+                        emitted_result: transition.emitted_result().cloned(),
+                        emitted_result_digest: None,
+                        epoch_digest: Some(epoch_digest.clone()),
+                        source: FactSource::Live,
+                        subject: Some(model_subject(&job)),
+                        input_digest: Some(input_digest.clone()),
+                        output_digest: Some(output_digest.clone()),
+                        next_request_digest: None,
+                    },
+                    &timestamp,
                 )?;
                 let stored_call = insert_agent_tool_call(
                     &transaction,
@@ -477,28 +623,55 @@ fn complete_agent_model_success(
             next_request_json,
         } => {
             let result_bytes = validate_agent_tool_result(result_json)?;
-            let proposed = reduce(
-                &agent.workflow_state,
-                WorkflowCommand::ModelToolProposal {
-                    disposition: proposal_disposition(
-                        call.policy_decision.clone(),
-                        Some(result_bytes),
-                    )?,
-                },
-            )
-            .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?
-            .into_state();
+            let command = WorkflowCommand::ModelToolProposal {
+                disposition: proposal_disposition(
+                    call.policy_decision.clone(),
+                    Some(result_bytes),
+                )?,
+            };
+            let transition = reduce(&agent.workflow_state, command.clone())
+                .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+            let proposed = transition.state().clone();
             if proposed.status() == WorkflowStatus::Failed {
-                let error_json =
-                    workflow_terminal_error_for_resolution(&proposed, &commit.resolution)?;
-                update_agent_workflow(
+                let result_limit =
+                    proposed.terminal_reason() == Some(TerminalReason::ToolResultBytesLimitReached);
+                let error_json = workflow_terminal_error_for_resolution(
+                    &proposed,
+                    &commit.resolution,
+                    &commit.response_json,
+                )?;
+                persist_agent_workflow_transition(
                     &transaction,
                     &mut agent,
                     proposed,
                     None,
                     Some(&error_json),
                     Some(&timestamp),
+                    AgentTransitionFact {
+                        command,
+                        external_call: transition.external_call().cloned(),
+                        emitted_result: transition.emitted_result().cloned(),
+                        emitted_result_digest: None,
+                        epoch_digest: Some(epoch_digest.clone()),
+                        source: FactSource::Live,
+                        subject: Some(model_subject(&job)),
+                        input_digest: Some(input_digest.clone()),
+                        output_digest: Some(output_digest.clone()),
+                        next_request_digest: None,
+                    },
+                    &timestamp,
                 )?;
+                if result_limit {
+                    insert_agent_tool_call(
+                        &transaction,
+                        &agent,
+                        &job,
+                        call,
+                        AgentToolCallStatus::NotDispatched,
+                        Some(result_json),
+                        &timestamp,
+                    )?;
+                }
                 finish_agent_model_job_success(
                     &transaction,
                     &job,
@@ -511,8 +684,13 @@ fn complete_agent_model_success(
                     "agent loop rejected a policy-denied tool proposal at its fixed limit",
                 )?))
             } else {
-                let (settled, continuation_request) = settle_known_result_continuation(
-                    proposed,
+                let primary_state = proposed;
+                let ContinuationSettlement {
+                    state: settled,
+                    next_request: continuation_request,
+                    transition: settlement_transition,
+                } = settle_known_result_continuation(
+                    primary_state.clone(),
                     next_request_json.as_ref(),
                     "agent continuation request JSON",
                 )?;
@@ -522,18 +700,62 @@ fn complete_agent_model_success(
                     Some(workflow_terminal_error_for_resolution(
                         &settled,
                         &commit.resolution,
+                        &commit.response_json,
                     )?)
                 } else {
                     None
                 };
-                update_agent_workflow(
+                persist_agent_workflow_transition(
                     &transaction,
                     &mut agent,
-                    settled,
+                    primary_state,
                     None,
-                    terminal_error.as_ref(),
-                    terminal_error.as_ref().map(|_| timestamp.as_str()),
+                    None,
+                    None,
+                    AgentTransitionFact {
+                        command,
+                        external_call: transition.external_call().cloned(),
+                        emitted_result: transition.emitted_result().cloned(),
+                        emitted_result_digest: Some(super::execution::digest_json(
+                            DigestDomain::ToolResult,
+                            result_json,
+                        )?),
+                        epoch_digest: Some(epoch_digest.clone()),
+                        source: FactSource::Live,
+                        subject: Some(model_subject(&job)),
+                        input_digest: Some(input_digest.clone()),
+                        output_digest: Some(output_digest.clone()),
+                        next_request_digest: continuation_request
+                            .map(|request| {
+                                super::execution::digest_json(DigestDomain::ModelRequest, request)
+                            })
+                            .transpose()?,
+                    },
+                    &timestamp,
                 )?;
+                if let Some((settlement_command, settlement_transition)) = settlement_transition {
+                    persist_agent_workflow_transition(
+                        &transaction,
+                        &mut agent,
+                        settled,
+                        None,
+                        terminal_error.as_ref(),
+                        terminal_error.as_ref().map(|_| timestamp.as_str()),
+                        AgentTransitionFact {
+                            command: settlement_command,
+                            external_call: settlement_transition.external_call().cloned(),
+                            emitted_result: settlement_transition.emitted_result().cloned(),
+                            emitted_result_digest: None,
+                            epoch_digest: None,
+                            source: FactSource::Live,
+                            subject: None,
+                            input_digest: None,
+                            output_digest: None,
+                            next_request_digest: None,
+                        },
+                        &timestamp,
+                    )?;
+                }
                 let stored_call = insert_agent_tool_call(
                     &transaction,
                     &agent,
@@ -620,17 +842,34 @@ fn complete_agent_model_failure(
     } else {
         WorkflowCommand::ModelFailed
     };
-    let terminal = reduce(&agent.workflow_state, command)
-        .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?
-        .into_state();
+    let transition = reduce(&agent.workflow_state, command.clone())
+        .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
     let timestamp = now();
-    update_agent_workflow(
+    let epoch_digest =
+        super::execution::epoch_digest_for_operation(&transaction, "model", &job.id)?;
+    persist_agent_workflow_transition(
         &transaction,
         &mut agent,
-        terminal,
+        transition.state().clone(),
         None,
         Some(&commit.error_json),
         Some(&timestamp),
+        AgentTransitionFact {
+            command,
+            external_call: transition.external_call().cloned(),
+            emitted_result: transition.emitted_result().cloned(),
+            emitted_result_digest: None,
+            epoch_digest: Some(epoch_digest),
+            source: FactSource::Live,
+            subject: Some(model_subject(&job)),
+            input_digest: Some(model_request_digest(&job)?),
+            output_digest: Some(super::execution::digest_json(
+                DigestDomain::ExecutionError,
+                &commit.error_json,
+            )?),
+            next_request_digest: None,
+        },
+        &timestamp,
     )?;
     let status = if commit.outcome_unknown {
         "outcome_unknown"
@@ -682,6 +921,7 @@ fn claim_next_agent_tool(
     let call = query_agent_tool_call(&transaction, &call_id)?;
     let mut agent = query_agent_turn(&transaction, &call.agent_id)?;
     let model_job = query_agent_model_job(&transaction, &call.agent_id, call.model_step)?;
+    validate_persisted_agent_model_tool_response(&model_job, &call)?;
     require_open_agent_turn(&transaction, &agent)?;
     require_agent_finalization_capacity(&transaction, &agent)?;
     require_connection_physical_capacity(
@@ -696,27 +936,7 @@ fn claim_next_agent_tool(
             "queued agent tool does not match the current loop state".into(),
         ));
     }
-    let started = reduce(&agent.workflow_state, WorkflowCommand::StartTool)
-        .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?
-        .into_state();
-    update_agent_workflow(
-        &transaction,
-        &mut agent,
-        started,
-        Some(&call.call_id),
-        None,
-        None,
-    )?;
     let timestamp = now();
-    let changed = transaction.execute(
-        r#"UPDATE agent_tool_calls
-           SET status = 'started', started_at = ?1
-           WHERE call_id = ?2 AND status = 'queued'"#,
-        params![timestamp, call.call_id],
-    )?;
-    if changed != 1 {
-        return Err(StorageError::ConcurrentModification);
-    }
     if !agent_deployment_matches_current(
         &transaction,
         &agent,
@@ -727,25 +947,37 @@ fn claim_next_agent_tool(
         let error_json = deployment_unavailable_error(
             "the bound Agent deployment manifest is missing, invalid, or changed before tool execution",
         );
-        let terminal = reduce(
-            &agent.workflow_state,
-            WorkflowCommand::DeploymentUnavailable,
-        )
-        .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?
-        .into_state();
-        update_agent_workflow(
+        let command = WorkflowCommand::DeploymentUnavailable;
+        let transition = reduce(&agent.workflow_state, command.clone())
+            .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+        persist_agent_workflow_transition(
             &transaction,
             &mut agent,
-            terminal,
+            transition.state().clone(),
             None,
             Some(&error_json),
             Some(&timestamp),
+            AgentTransitionFact {
+                command,
+                external_call: transition.external_call().cloned(),
+                emitted_result: transition.emitted_result().cloned(),
+                emitted_result_digest: None,
+                epoch_digest: None,
+                source: FactSource::Live,
+                subject: Some(tool_subject(&call)),
+                input_digest: Some(tool_input_digest(&call)?),
+                output_digest: Some(super::execution::digest_json(
+                    DigestDomain::ExecutionError,
+                    &error_json,
+                )?),
+                next_request_digest: None,
+            },
+            &timestamp,
         )?;
         let changed = transaction.execute(
             r#"UPDATE agent_tool_calls
-               SET status = 'not_dispatched', result_json = ?1,
-                   completion_next_request_json = 'null', finished_at = ?2
-               WHERE call_id = ?3 AND status = 'started'"#,
+               SET status = 'not_dispatched', result_json = ?1, finished_at = ?2
+               WHERE call_id = ?3 AND status = 'queued'"#,
             params![serde_json::to_string(&error_json)?, timestamp, call.call_id],
         )?;
         if changed != 1 {
@@ -766,22 +998,37 @@ fn claim_next_agent_tool(
             "code": "authorization_revoked",
             "message": "the initiating or approving authority was revoked before tool execution"
         });
-        let terminal = reduce(&agent.workflow_state, WorkflowCommand::AuthorizationRevoked)
-            .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?
-            .into_state();
-        update_agent_workflow(
+        let command = WorkflowCommand::AuthorizationRevoked;
+        let transition = reduce(&agent.workflow_state, command.clone())
+            .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+        persist_agent_workflow_transition(
             &transaction,
             &mut agent,
-            terminal,
+            transition.state().clone(),
             None,
             Some(&error_json),
             Some(&timestamp),
+            AgentTransitionFact {
+                command,
+                external_call: transition.external_call().cloned(),
+                emitted_result: transition.emitted_result().cloned(),
+                emitted_result_digest: None,
+                epoch_digest: None,
+                source: FactSource::Live,
+                subject: Some(tool_subject(&call)),
+                input_digest: Some(tool_input_digest(&call)?),
+                output_digest: Some(super::execution::digest_json(
+                    DigestDomain::ExecutionError,
+                    &error_json,
+                )?),
+                next_request_digest: None,
+            },
+            &timestamp,
         )?;
         let changed = transaction.execute(
             r#"UPDATE agent_tool_calls
-               SET status = 'not_dispatched', result_json = ?1,
-                   completion_next_request_json = 'null', finished_at = ?2
-               WHERE call_id = ?3 AND status = 'started'"#,
+               SET status = 'not_dispatched', result_json = ?1, finished_at = ?2
+               WHERE call_id = ?3 AND status = 'queued'"#,
             params![serde_json::to_string(&error_json)?, timestamp, call.call_id],
         )?;
         if changed != 1 {
@@ -794,6 +1041,46 @@ fn claim_next_agent_tool(
         )?;
         transaction.commit()?;
         return Ok(AgentToolClaimOutcome::Rejected(Box::new(completion)));
+    }
+    let command = WorkflowCommand::StartTool;
+    let transition = reduce(&agent.workflow_state, command.clone())
+        .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+    let epoch_digest = super::execution::insert_tool_run_epoch(
+        &transaction,
+        &agent,
+        &call,
+        &current_manifest.digest,
+        &timestamp,
+    )?;
+    persist_agent_workflow_transition(
+        &transaction,
+        &mut agent,
+        transition.state().clone(),
+        Some(&call.call_id),
+        None,
+        None,
+        AgentTransitionFact {
+            command,
+            external_call: transition.external_call().cloned(),
+            emitted_result: transition.emitted_result().cloned(),
+            emitted_result_digest: None,
+            epoch_digest: Some(epoch_digest),
+            source: FactSource::Live,
+            subject: Some(tool_subject(&call)),
+            input_digest: Some(tool_input_digest(&call)?),
+            output_digest: None,
+            next_request_digest: None,
+        },
+        &timestamp,
+    )?;
+    let changed = transaction.execute(
+        r#"UPDATE agent_tool_calls
+           SET status = 'started', started_at = ?1
+           WHERE call_id = ?2 AND status = 'queued'"#,
+        params![timestamp, call.call_id],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::ConcurrentModification);
     }
     let work = AgentToolWork {
         call: query_agent_tool_call(&transaction, &call_id)?,
@@ -853,17 +1140,19 @@ fn complete_agent_tool(
         physical_limits,
         PhysicalCapacityGate::Finalization,
     )?;
-    let known = reduce(
-        &agent.workflow_state,
-        WorkflowCommand::ToolResultKnown {
-            kind: completion_kind,
-            result_bytes,
-        },
-    )
-    .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?
-    .into_state();
-    let (settled, continuation_request) = settle_known_result_continuation(
-        known,
+    let command = WorkflowCommand::ToolResultKnown {
+        kind: completion_kind,
+        result_bytes,
+    };
+    let transition = reduce(&agent.workflow_state, command.clone())
+        .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+    let primary_state = transition.state().clone();
+    let ContinuationSettlement {
+        state: settled,
+        next_request: continuation_request,
+        transition: settlement_transition,
+    } = settle_known_result_continuation(
+        transition.state().clone(),
         commit.next_request_json.as_ref(),
         "agent continuation request JSON",
     )?;
@@ -872,14 +1161,61 @@ fn complete_agent_tool(
     let timestamp = now();
     let terminal_error =
         (settled.status() == WorkflowStatus::Failed).then(|| workflow_terminal_error(&settled));
-    update_agent_workflow(
+    let epoch_digest =
+        super::execution::epoch_digest_for_operation(&transaction, "tool", &call.call_id)?;
+    let primary_terminal_error = settlement_transition
+        .is_none()
+        .then_some(terminal_error.as_ref())
+        .flatten();
+    persist_agent_workflow_transition(
         &transaction,
         &mut agent,
-        settled,
+        primary_state,
         None,
-        terminal_error.as_ref(),
-        terminal_error.as_ref().map(|_| timestamp.as_str()),
+        primary_terminal_error,
+        primary_terminal_error.map(|_| timestamp.as_str()),
+        AgentTransitionFact {
+            command,
+            external_call: transition.external_call().cloned(),
+            emitted_result: transition.emitted_result().cloned(),
+            emitted_result_digest: None,
+            epoch_digest: Some(epoch_digest),
+            source: FactSource::Live,
+            subject: Some(tool_subject(&call)),
+            input_digest: Some(tool_input_digest(&call)?),
+            output_digest: Some(super::execution::digest_json(
+                DigestDomain::ToolResult,
+                &commit.result_json,
+            )?),
+            next_request_digest: continuation_request
+                .map(|request| super::execution::digest_json(DigestDomain::ModelRequest, request))
+                .transpose()?,
+        },
+        &timestamp,
     )?;
+    if let Some((settlement_command, settlement_transition)) = settlement_transition {
+        persist_agent_workflow_transition(
+            &transaction,
+            &mut agent,
+            settled,
+            None,
+            terminal_error.as_ref(),
+            terminal_error.as_ref().map(|_| timestamp.as_str()),
+            AgentTransitionFact {
+                command: settlement_command,
+                external_call: settlement_transition.external_call().cloned(),
+                emitted_result: settlement_transition.emitted_result().cloned(),
+                emitted_result_digest: None,
+                epoch_digest: None,
+                source: FactSource::Live,
+                subject: None,
+                input_digest: None,
+                output_digest: None,
+                next_request_digest: None,
+            },
+            &timestamp,
+        )?;
+    }
     let changed = transaction.execute(
         r#"UPDATE agent_tool_calls
            SET status = ?1, result_json = ?2, provider_request_id = ?3,
@@ -955,17 +1291,35 @@ fn complete_agent_tool_outcome_unknown(
         physical_limits,
         PhysicalCapacityGate::Finalization,
     )?;
-    let terminal = reduce(&agent.workflow_state, WorkflowCommand::ToolOutcomeUnknown)
-        .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?
-        .into_state();
+    let command = WorkflowCommand::ToolOutcomeUnknown;
+    let transition = reduce(&agent.workflow_state, command.clone())
+        .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
     let timestamp = now();
-    update_agent_workflow(
+    let epoch_digest =
+        super::execution::epoch_digest_for_operation(&transaction, "tool", &call.call_id)?;
+    persist_agent_workflow_transition(
         &transaction,
         &mut agent,
-        terminal,
+        transition.state().clone(),
         None,
         Some(&commit.error_json),
         Some(&timestamp),
+        AgentTransitionFact {
+            command,
+            external_call: transition.external_call().cloned(),
+            emitted_result: transition.emitted_result().cloned(),
+            emitted_result_digest: None,
+            epoch_digest: Some(epoch_digest),
+            source: FactSource::Live,
+            subject: Some(tool_subject(&call)),
+            input_digest: Some(tool_input_digest(&call)?),
+            output_digest: Some(super::execution::digest_json(
+                DigestDomain::ExecutionError,
+                &commit.error_json,
+            )?),
+            next_request_digest: None,
+        },
+        &timestamp,
     )?;
     let changed = transaction.execute(
         r#"UPDATE agent_tool_calls
@@ -1031,11 +1385,10 @@ fn validate_agent_model_resolution(resolution: &AgentModelResolution) -> Result<
     }
 }
 
-fn validate_agent_response_matches_job(
+fn validate_agent_response_envelope<'a>(
     job: &AgentModelJob,
-    response: &Value,
-    resolution: &AgentModelResolution,
-) -> Result<(), StorageError> {
+    response: &'a Value,
+) -> Result<&'a serde_json::Map<String, Value>, StorageError> {
     let object = response.as_object().ok_or_else(|| {
         StorageError::InvalidAgentTransition("agent model response must be an object".into())
     })?;
@@ -1090,12 +1443,47 @@ fn validate_agent_response_matches_job(
             "agent model response kind does not match its durable job".into(),
         ));
     }
-    let output = object
+    object
         .get("output")
         .and_then(Value::as_object)
         .ok_or_else(|| {
             StorageError::InvalidAgentTransition("agent model output must be typed".into())
-        })?;
+        })
+}
+
+fn validate_agent_tool_response_output(
+    output: &serde_json::Map<String, Value>,
+    provider_call_id: &str,
+    tool_name: &str,
+    arguments_json: &Value,
+) -> Result<(), StorageError> {
+    let provider_call = output.get("call").and_then(Value::as_object);
+    if output.len() != 2
+        || output.get("type").and_then(Value::as_str) != Some("tool_call")
+        || provider_call.map(serde_json::Map::len) != Some(3)
+        || provider_call
+            .and_then(|call| call.get("id"))
+            .and_then(Value::as_str)
+            != Some(provider_call_id)
+        || provider_call
+            .and_then(|call| call.get("name"))
+            .and_then(Value::as_str)
+            != Some(tool_name)
+        || provider_call.and_then(|call| call.get("arguments")) != Some(arguments_json)
+    {
+        return Err(StorageError::InvalidAgentTransition(
+            "agent tool response disagrees with its server-resolved call".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_agent_response_matches_job(
+    job: &AgentModelJob,
+    response: &Value,
+    resolution: &AgentModelResolution,
+) -> Result<(), StorageError> {
+    let output = validate_agent_response_envelope(job, response)?;
     match resolution {
         AgentModelResolution::Final {
             assistant_message,
@@ -1114,25 +1502,143 @@ fn validate_agent_response_matches_job(
         }
         AgentModelResolution::ToolCall { call }
         | AgentModelResolution::PolicyDenied { call, .. } => {
-            let provider_call = output.get("call").and_then(Value::as_object);
-            if output.len() != 2
-                || output.get("type").and_then(Value::as_str) != Some("tool_call")
-                || provider_call
-                    .and_then(|call| call.get("id"))
-                    .and_then(Value::as_str)
-                    != Some(call.provider_call_id.as_str())
-                || provider_call
-                    .and_then(|call| call.get("name"))
-                    .and_then(Value::as_str)
-                    != Some(call.tool_name.as_str())
-                || provider_call.and_then(|call| call.get("arguments"))
-                    != Some(&call.arguments_json)
-            {
-                return Err(StorageError::InvalidAgentTransition(
-                    "agent tool response disagrees with its server-resolved call".into(),
-                ));
-            }
+            validate_agent_tool_response_output(
+                output,
+                &call.provider_call_id,
+                &call.tool_name,
+                &call.arguments_json,
+            )?;
         }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_persisted_agent_model_final_response(
+    job: &AgentModelJob,
+    content_bytes: u64,
+) -> Result<(), StorageError> {
+    let response = job.response_json.as_ref().ok_or_else(|| {
+        StorageError::CorruptData(format!(
+            "Agent model job `{}` is missing its successful response",
+            job.id
+        ))
+    })?;
+    let output = validate_agent_response_envelope(job, response)?;
+    let actual_content_bytes = output
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::len)
+        .and_then(|length| u64::try_from(length).ok());
+    if output.len() != 2
+        || output.get("type").and_then(Value::as_str) != Some("final")
+        || actual_content_bytes != Some(content_bytes)
+    {
+        return Err(StorageError::CorruptData(format!(
+            "Agent model job `{}` final response shape is invalid",
+            job.id
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_persisted_agent_model_tool_response(
+    job: &AgentModelJob,
+    call: &AgentToolCall,
+) -> Result<(), StorageError> {
+    let response = job.response_json.as_ref().ok_or_else(|| {
+        StorageError::CorruptData(format!(
+            "Agent model job `{}` is missing its successful response",
+            job.id
+        ))
+    })?;
+    let output = validate_agent_response_envelope(job, response).map_err(|error| {
+        StorageError::CorruptData(format!(
+            "Agent model job `{}` response envelope is invalid: {error}",
+            job.id
+        ))
+    })?;
+    validate_agent_tool_response_output(
+        output,
+        &call.provider_call_id,
+        &call.tool_name,
+        &call.arguments_json,
+    )
+    .map_err(|_| {
+        StorageError::CorruptData(format!(
+            "Agent model job `{}` response disagrees with tool call `{}`",
+            job.id, call.call_id
+        ))
+    })
+}
+
+pub(super) fn validate_persisted_agent_model_tool_response_shape(
+    job: &AgentModelJob,
+) -> Result<(), StorageError> {
+    let response = job.response_json.as_ref().ok_or_else(|| {
+        StorageError::CorruptData(format!(
+            "Agent model job `{}` is missing its successful response",
+            job.id
+        ))
+    })?;
+    let output = validate_agent_response_envelope(job, response).map_err(|error| {
+        StorageError::CorruptData(format!(
+            "Agent model job `{}` response envelope is invalid: {error}",
+            job.id
+        ))
+    })?;
+    let provider_call = output.get("call").and_then(Value::as_object);
+    if output.len() != 2
+        || output.get("type").and_then(Value::as_str) != Some("tool_call")
+        || provider_call.map(serde_json::Map::len) != Some(3)
+        || provider_call
+            .and_then(|call| call.get("id"))
+            .and_then(Value::as_str)
+            .is_none()
+        || provider_call
+            .and_then(|call| call.get("name"))
+            .and_then(Value::as_str)
+            .is_none()
+        || provider_call
+            .and_then(|call| call.get("arguments"))
+            .is_none()
+    {
+        return Err(StorageError::CorruptData(format!(
+            "Agent model job `{}` tool response shape is invalid",
+            job.id
+        )));
+    }
+    let provider_call = provider_call.expect("validated tool response has a call object");
+    let provider_call_id = provider_call
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("validated tool response has a call ID");
+    let tool_name = provider_call
+        .get("name")
+        .and_then(Value::as_str)
+        .expect("validated tool response has a tool name");
+    let arguments = provider_call
+        .get("arguments")
+        .expect("validated tool response has arguments");
+    let provider_call_id_valid = !provider_call_id.is_empty()
+        && provider_call_id.trim() == provider_call_id
+        && provider_call_id.len() <= DISPATCH_IDENTIFIER_MAX_BYTES
+        && provider_call_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+    if !provider_call_id_valid
+        || normalized_account_value(tool_name, "agent tool name", DISPATCH_TOOL_NAME_MAX_BYTES)
+            .is_err()
+        || validate_reply_json(
+            arguments,
+            "agent tool arguments JSON",
+            AGENT_TOOL_ARGUMENTS_MAX_BYTES,
+        )
+        .is_err()
+    {
+        return Err(StorageError::CorruptData(format!(
+            "Agent model job `{}` tool response material is invalid",
+            job.id
+        )));
     }
     Ok(())
 }
@@ -1241,15 +1747,45 @@ fn workflow_terminal_error(state: &WorkflowState) -> Value {
 fn workflow_terminal_error_for_resolution(
     state: &WorkflowState,
     resolution: &AgentModelResolution,
+    response_json: &Value,
 ) -> Result<Value, StorageError> {
     let mut error = workflow_terminal_error(state);
-    error
+    let object = error
         .as_object_mut()
-        .expect("workflow terminal errors are objects")
-        .insert(
-            "resolution_fingerprint".into(),
-            Value::String(agent_model_resolution_fingerprint(resolution)?),
-        );
+        .expect("workflow terminal errors are objects");
+    object.insert(
+        "resolution_fingerprint".into(),
+        Value::String(agent_model_resolution_fingerprint(resolution)?),
+    );
+    let response_digest =
+        super::execution::digest_json(DigestDomain::ModelResponse, response_json)?;
+    let proposal_evidence = match resolution {
+        AgentModelResolution::Final { .. } => None,
+        AgentModelResolution::ToolCall { call } => Some(json!({
+            "disposition": proposal_disposition(call.policy_decision.clone(), None)?,
+            "model_response_digest": response_digest,
+            "result_digest": Value::Null,
+        })),
+        AgentModelResolution::PolicyDenied {
+            call, result_json, ..
+        } => {
+            let result_bytes = validate_agent_tool_result(result_json)?;
+            Some(json!({
+                "disposition": proposal_disposition(
+                    call.policy_decision.clone(),
+                    Some(result_bytes),
+                )?,
+                "model_response_digest": response_digest,
+                "result_digest": super::execution::digest_json(
+                    DigestDomain::ToolResult,
+                    result_json,
+                )?,
+            }))
+        }
+    };
+    if let Some(proposal_evidence) = proposal_evidence {
+        object.insert("proposal_evidence".into(), proposal_evidence);
+    }
     Ok(error)
 }
 
@@ -1940,7 +2476,7 @@ fn require_agent_review_owner(
     Ok(())
 }
 
-fn agent_turn_detail(
+pub(super) fn agent_turn_detail(
     connection: &Connection,
     agent: &AgentTurn,
 ) -> Result<AgentTurnDetail, StorageError> {
@@ -1967,7 +2503,9 @@ fn agent_turn_detail(
     })
 }
 
-fn agent_tool_call_detail(call: &AgentToolCall) -> Result<AgentToolCallDetail, StorageError> {
+pub(super) fn agent_tool_call_detail(
+    call: &AgentToolCall,
+) -> Result<AgentToolCallDetail, StorageError> {
     let review = match (
         call.approving_actor_user_id.as_ref(),
         call.approving_membership_revision.as_ref(),
@@ -2150,16 +2688,29 @@ fn review_agent_tool_for_actor(
                     "approval accepts no continuation request".into(),
                 ));
             }
-            let approved = reduce(&agent.workflow_state, WorkflowCommand::ApprovalApproved)
-                .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?
-                .into_state();
-            update_agent_workflow(
+            let command = WorkflowCommand::ApprovalApproved;
+            let transition = reduce(&agent.workflow_state, command.clone())
+                .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+            persist_agent_workflow_transition(
                 &transaction,
                 &mut agent,
-                approved,
+                transition.state().clone(),
                 Some(&call.call_id),
                 None,
                 None,
+                AgentTransitionFact {
+                    command,
+                    external_call: transition.external_call().cloned(),
+                    emitted_result: transition.emitted_result().cloned(),
+                    emitted_result_digest: None,
+                    epoch_digest: None,
+                    source: FactSource::Live,
+                    subject: Some(tool_subject(&call)),
+                    input_digest: Some(tool_input_digest(&call)?),
+                    output_digest: None,
+                    next_request_digest: None,
+                },
+                &timestamp,
             )?;
             let changed = transaction.execute(
                 r#"UPDATE agent_tool_calls
@@ -2186,29 +2737,27 @@ fn review_agent_tool_for_actor(
             let result_json =
                 protocol::agent_approval_rejected_result(&call.call_id, commit.note.as_deref());
             let result_bytes = validate_agent_tool_result(&result_json)?;
-            let rejected = reduce(
-                &agent.workflow_state,
-                WorkflowCommand::ApprovalRejected { result_bytes },
-            )
-            .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?
-            .into_state();
-            let (mut settled, mut continuation_request) = settle_known_result_continuation(
-                rejected,
-                commit.next_request_json.as_ref(),
+            let command = WorkflowCommand::ApprovalRejected { result_bytes };
+            let transition = reduce(&agent.workflow_state, command.clone())
+                .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+            let primary_state = transition.state().clone();
+            let deployment_unavailable = agent.deployment_manifest_digest.is_none()
+                && primary_state.status() == WorkflowStatus::ContinuationQueued
+                && commit.next_request_json.is_some();
+            let requested_continuation = if deployment_unavailable {
+                None
+            } else {
+                commit.next_request_json.as_ref()
+            };
+            let ContinuationSettlement {
+                state: settled,
+                next_request: continuation_request,
+                transition: settlement_transition,
+            } = settle_known_result_continuation(
+                primary_state.clone(),
+                requested_continuation,
                 "agent rejection continuation request JSON",
             )?;
-            let deployment_unavailable =
-                agent.deployment_manifest_digest.is_none() && continuation_request.is_some();
-            if deployment_unavailable {
-                // This is a review settlement, not a claim checkpoint. Reuse
-                // the v18-compatible continuation terminal class so the
-                // waiting_approval -> rejected trigger remains valid, while
-                // retaining the precise deployment error in last_error_json.
-                settled = reduce(&settled, WorkflowCommand::ContinuationUnavailable)
-                    .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?
-                    .into_state();
-                continuation_request = None;
-            }
             let continuation_unavailable =
                 settled.terminal_reason() == Some(TerminalReason::ContinuationUnavailable);
             let terminal_error = (settled.status() == WorkflowStatus::Failed).then(|| {
@@ -2220,14 +2769,62 @@ fn review_agent_tool_for_actor(
                     workflow_terminal_error(&settled)
                 }
             });
-            update_agent_workflow(
+            let primary_terminal_error = if settlement_transition.is_none() {
+                terminal_error.as_ref()
+            } else {
+                None
+            };
+            persist_agent_workflow_transition(
                 &transaction,
                 &mut agent,
-                settled,
+                primary_state,
                 None,
-                terminal_error.as_ref(),
-                terminal_error.as_ref().map(|_| timestamp.as_str()),
+                primary_terminal_error,
+                primary_terminal_error.map(|_| timestamp.as_str()),
+                AgentTransitionFact {
+                    command,
+                    external_call: transition.external_call().cloned(),
+                    emitted_result: transition.emitted_result().cloned(),
+                    emitted_result_digest: None,
+                    epoch_digest: None,
+                    source: FactSource::Live,
+                    subject: Some(tool_subject(&call)),
+                    input_digest: Some(tool_input_digest(&call)?),
+                    output_digest: Some(super::execution::digest_json(
+                        DigestDomain::ToolResult,
+                        &result_json,
+                    )?),
+                    next_request_digest: continuation_request
+                        .map(|request| {
+                            super::execution::digest_json(DigestDomain::ModelRequest, request)
+                        })
+                        .transpose()?,
+                },
+                &timestamp,
             )?;
+            if let Some((settlement_command, settlement_transition)) = settlement_transition {
+                persist_agent_workflow_transition(
+                    &transaction,
+                    &mut agent,
+                    settled,
+                    None,
+                    terminal_error.as_ref(),
+                    terminal_error.as_ref().map(|_| timestamp.as_str()),
+                    AgentTransitionFact {
+                        command: settlement_command,
+                        external_call: settlement_transition.external_call().cloned(),
+                        emitted_result: settlement_transition.emitted_result().cloned(),
+                        emitted_result_digest: None,
+                        epoch_digest: None,
+                        source: FactSource::Live,
+                        subject: None,
+                        input_digest: None,
+                        output_digest: None,
+                        next_request_digest: None,
+                    },
+                    &timestamp,
+                )?;
+            }
             let changed = transaction.execute(
                 r#"UPDATE agent_tool_calls
                    SET status = 'rejected', approving_actor_user_id = ?1,
@@ -2337,123 +2934,159 @@ fn recover_started_agent_work(
     physical_limits: &SqlitePhysicalLimits,
 ) -> Result<Vec<AgentTerminalCompletion>, StorageError> {
     let mut recovered = Vec::new();
-    loop {
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut statement = transaction.prepare(
-            r#"SELECT operation_kind, operation_id FROM (
-                   SELECT 'model' AS operation_kind, id AS operation_id,
-                          started_at AS started_at
-                   FROM agent_model_jobs WHERE status = 'started'
-                   UNION ALL
-                   SELECT 'tool' AS operation_kind, call_id AS operation_id,
-                          started_at AS started_at
-                   FROM agent_tool_calls WHERE status = 'started'
-               ) ORDER BY started_at, operation_kind, operation_id LIMIT ?1"#,
-        )?;
-        let operations = statement
-            .query_map([RECOVERY_BATCH_LIMIT], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
-        if operations.is_empty() {
-            transaction.commit()?;
-            break;
-        }
-        require_connection_physical_capacity(
-            &transaction,
-            physical_limits,
-            PhysicalCapacityGate::Finalization,
-        )?;
-        for (kind, operation_id) in operations {
-            match kind.as_str() {
-                "model" => {
-                    let job = query_agent_model_job_by_id(&transaction, &operation_id)?;
-                    let mut agent = query_agent_turn(&transaction, &job.agent_id)?;
-                    require_open_agent_turn(&transaction, &agent)?;
-                    require_agent_finalization_capacity(&transaction, &agent)?;
-                    let error_json = json!({
-                        "code": "model_outcome_unknown_after_restart",
-                        "message": "the process restarted after the model checkpoint without a trustworthy result"
-                    });
-                    let terminal =
-                        reduce(&agent.workflow_state, WorkflowCommand::ModelOutcomeUnknown)
-                            .map_err(|error| {
-                                StorageError::InvalidAgentTransition(error.to_string())
-                            })?
-                            .into_state();
-                    let timestamp = now();
-                    update_agent_workflow(
-                        &transaction,
-                        &mut agent,
-                        terminal,
-                        None,
-                        Some(&error_json),
-                        Some(&timestamp),
-                    )?;
-                    let changed = transaction.execute(
-                        r#"UPDATE agent_model_jobs
-                           SET status = 'outcome_unknown', error_json = ?1, finished_at = ?2
-                           WHERE id = ?3 AND status = 'started' AND attempt = 1"#,
-                        params![serde_json::to_string(&error_json)?, timestamp, job.id],
-                    )?;
-                    if changed != 1 {
-                        return Err(StorageError::ConcurrentModification);
-                    }
-                    recovered.push(interrupt_agent_turn(
-                        &transaction,
-                        &agent,
-                        "agent model outcome became unknown after process restart",
-                    )?);
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut statement = transaction.prepare(
+        r#"SELECT operation_kind, operation_id FROM (
+               SELECT 'model' AS operation_kind, id AS operation_id,
+                      started_at AS started_at
+               FROM agent_model_jobs WHERE status = 'started'
+               UNION ALL
+               SELECT 'tool' AS operation_kind, call_id AS operation_id,
+                      started_at AS started_at
+               FROM agent_tool_calls WHERE status = 'started'
+           ) ORDER BY started_at, operation_kind, operation_id LIMIT ?1"#,
+    )?;
+    let operations = statement
+        .query_map([RECOVERY_BATCH_LIMIT], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    if operations.is_empty() {
+        transaction.commit()?;
+        return Ok(recovered);
+    }
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Finalization,
+    )?;
+    for (kind, operation_id) in operations {
+        match kind.as_str() {
+            "model" => {
+                let job = query_agent_model_job_by_id(&transaction, &operation_id)?;
+                let mut agent = query_agent_turn(&transaction, &job.agent_id)?;
+                require_open_agent_turn(&transaction, &agent)?;
+                require_agent_finalization_capacity(&transaction, &agent)?;
+                let error_json = json!({
+                    "code": "model_outcome_unknown_after_restart",
+                    "message": "the process restarted after the model checkpoint without a trustworthy result"
+                });
+                let command = WorkflowCommand::ModelOutcomeUnknown;
+                let transition = reduce(&agent.workflow_state, command.clone())
+                    .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+                let timestamp = now();
+                let epoch_digest = super::execution::epoch_digest_for_recovery(
+                    &transaction,
+                    &agent,
+                    "model",
+                    &job.id,
+                )?;
+                persist_agent_workflow_transition(
+                    &transaction,
+                    &mut agent,
+                    transition.state().clone(),
+                    None,
+                    Some(&error_json),
+                    Some(&timestamp),
+                    AgentTransitionFact {
+                        command,
+                        external_call: transition.external_call().cloned(),
+                        emitted_result: transition.emitted_result().cloned(),
+                        emitted_result_digest: None,
+                        epoch_digest,
+                        source: FactSource::RestartRecovery,
+                        subject: Some(model_subject(&job)),
+                        input_digest: Some(model_request_digest(&job)?),
+                        output_digest: Some(super::execution::digest_json(
+                            DigestDomain::ExecutionError,
+                            &error_json,
+                        )?),
+                        next_request_digest: None,
+                    },
+                    &timestamp,
+                )?;
+                let changed = transaction.execute(
+                    r#"UPDATE agent_model_jobs
+                       SET status = 'outcome_unknown', error_json = ?1, finished_at = ?2
+                       WHERE id = ?3 AND status = 'started' AND attempt = 1"#,
+                    params![serde_json::to_string(&error_json)?, timestamp, job.id],
+                )?;
+                if changed != 1 {
+                    return Err(StorageError::ConcurrentModification);
                 }
-                "tool" => {
-                    let call = query_agent_tool_call(&transaction, &operation_id)?;
-                    let mut agent = query_agent_turn(&transaction, &call.agent_id)?;
-                    require_open_agent_turn(&transaction, &agent)?;
-                    require_agent_finalization_capacity(&transaction, &agent)?;
-                    let error_json = json!({
-                        "code": "tool_outcome_unknown_after_restart",
-                        "message": "the process restarted after the tool checkpoint without a trustworthy result"
-                    });
-                    let terminal =
-                        reduce(&agent.workflow_state, WorkflowCommand::ToolOutcomeUnknown)
-                            .map_err(|error| {
-                                StorageError::InvalidAgentTransition(error.to_string())
-                            })?
-                            .into_state();
-                    let timestamp = now();
-                    update_agent_workflow(
-                        &transaction,
-                        &mut agent,
-                        terminal,
-                        None,
-                        Some(&error_json),
-                        Some(&timestamp),
-                    )?;
-                    let changed = transaction.execute(
-                        r#"UPDATE agent_tool_calls
-                           SET status = 'outcome_unknown', result_json = ?1, finished_at = ?2
-                           WHERE call_id = ?3 AND status = 'started'"#,
-                        params![serde_json::to_string(&error_json)?, timestamp, call.call_id],
-                    )?;
-                    if changed != 1 {
-                        return Err(StorageError::ConcurrentModification);
-                    }
-                    recovered.push(interrupt_agent_turn(
-                        &transaction,
-                        &agent,
-                        "agent tool outcome became unknown after process restart",
-                    )?);
+                recovered.push(interrupt_agent_turn(
+                    &transaction,
+                    &agent,
+                    "agent model outcome became unknown after process restart",
+                )?);
+            }
+            "tool" => {
+                let call = query_agent_tool_call(&transaction, &operation_id)?;
+                let mut agent = query_agent_turn(&transaction, &call.agent_id)?;
+                require_open_agent_turn(&transaction, &agent)?;
+                require_agent_finalization_capacity(&transaction, &agent)?;
+                let error_json = json!({
+                    "code": "tool_outcome_unknown_after_restart",
+                    "message": "the process restarted after the tool checkpoint without a trustworthy result"
+                });
+                let command = WorkflowCommand::ToolOutcomeUnknown;
+                let transition = reduce(&agent.workflow_state, command.clone())
+                    .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+                let timestamp = now();
+                let epoch_digest = super::execution::epoch_digest_for_recovery(
+                    &transaction,
+                    &agent,
+                    "tool",
+                    &call.call_id,
+                )?;
+                persist_agent_workflow_transition(
+                    &transaction,
+                    &mut agent,
+                    transition.state().clone(),
+                    None,
+                    Some(&error_json),
+                    Some(&timestamp),
+                    AgentTransitionFact {
+                        command,
+                        external_call: transition.external_call().cloned(),
+                        emitted_result: transition.emitted_result().cloned(),
+                        emitted_result_digest: None,
+                        epoch_digest,
+                        source: FactSource::RestartRecovery,
+                        subject: Some(tool_subject(&call)),
+                        input_digest: Some(tool_input_digest(&call)?),
+                        output_digest: Some(super::execution::digest_json(
+                            DigestDomain::ExecutionError,
+                            &error_json,
+                        )?),
+                        next_request_digest: None,
+                    },
+                    &timestamp,
+                )?;
+                let changed = transaction.execute(
+                    r#"UPDATE agent_tool_calls
+                       SET status = 'outcome_unknown', result_json = ?1, finished_at = ?2
+                       WHERE call_id = ?3 AND status = 'started'"#,
+                    params![serde_json::to_string(&error_json)?, timestamp, call.call_id],
+                )?;
+                if changed != 1 {
+                    return Err(StorageError::ConcurrentModification);
                 }
-                other => {
-                    return Err(StorageError::CorruptData(format!(
-                        "unknown started Agent operation kind `{other}`"
-                    )));
-                }
+                recovered.push(interrupt_agent_turn(
+                    &transaction,
+                    &agent,
+                    "agent tool outcome became unknown after process restart",
+                )?);
+            }
+            other => {
+                return Err(StorageError::CorruptData(format!(
+                    "unknown started Agent operation kind `{other}`"
+                )));
             }
         }
-        transaction.commit()?;
     }
+    transaction.commit()?;
     Ok(recovered)
 }
 
@@ -2632,7 +3265,7 @@ fn decode_agent_deployment_manifest(
     Ok(manifest)
 }
 
-fn query_agent_deployment_manifest(
+pub(super) fn query_agent_deployment_manifest(
     connection: &Connection,
     digest: &str,
 ) -> Result<ManifestEnvelope, StorageError> {
@@ -2689,7 +3322,7 @@ fn require_manifest_matches_runtime_identity(
     Ok(())
 }
 
-fn require_manifest_matches_agent_identity(
+pub(super) fn require_manifest_matches_agent_identity(
     connection: &Connection,
     manifest: &ManifestEnvelope,
     agent: &AgentTurn,
@@ -3054,10 +3687,10 @@ pub(super) fn insert_agent_turn(
             queued_at,
         ],
     )?;
-    Ok((
-        query_agent_turn(connection, &spec.id)?,
-        query_agent_model_job(connection, &spec.id, 1)?,
-    ))
+    let agent = query_agent_turn(connection, &spec.id)?;
+    let job = query_agent_model_job(connection, &spec.id, 1)?;
+    super::execution::insert_native_head_and_admission(connection, &agent, &job, queued_at)?;
+    Ok((agent, job))
 }
 
 fn model_job_id(agent_id: &str, step: u32) -> String {
@@ -3135,7 +3768,7 @@ fn query_agent_model_job_optional(
         .transpose()
 }
 
-fn query_agent_model_job_by_id(
+pub(super) fn query_agent_model_job_by_id(
     connection: &Connection,
     job_id: &str,
 ) -> Result<AgentModelJob, StorageError> {
@@ -3282,14 +3915,33 @@ fn tool_completion_kind(status: &AgentToolCallStatus) -> Result<ToolCompletionKi
     }
 }
 
+struct ContinuationSettlement<'a> {
+    state: WorkflowState,
+    next_request: Option<&'a Value>,
+    transition: Option<(WorkflowCommand, workflows::Transition)>,
+}
+
 fn settle_known_result_continuation<'a>(
     continuation: WorkflowState,
     next_request_json: Option<&'a Value>,
     request_field: &'static str,
-) -> Result<(WorkflowState, Option<&'a Value>), StorageError> {
-    let (settled, queue_continuation) = settle_agent_continuation_limit(continuation)?;
-    if !queue_continuation {
-        return Ok((settled, None));
+) -> Result<ContinuationSettlement<'a>, StorageError> {
+    if continuation.status() != WorkflowStatus::ContinuationQueued {
+        return Ok(ContinuationSettlement {
+            state: continuation,
+            next_request: None,
+            transition: None,
+        });
+    }
+    let start_command = WorkflowCommand::StartModel;
+    let start = reduce(&continuation, start_command.clone())
+        .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+    if start.state().status() == WorkflowStatus::Failed {
+        return Ok(ContinuationSettlement {
+            state: start.state().clone(),
+            next_request: None,
+            transition: Some((start_command, start)),
+        });
     }
     if let Some(next_request_json) = next_request_json {
         validate_reply_json(
@@ -3297,12 +3949,20 @@ fn settle_known_result_continuation<'a>(
             request_field,
             AGENT_REQUEST_JSON_MAX_BYTES,
         )?;
-        return Ok((settled, Some(next_request_json)));
+        return Ok(ContinuationSettlement {
+            state: continuation,
+            next_request: Some(next_request_json),
+            transition: None,
+        });
     }
-    let unavailable = reduce(&settled, WorkflowCommand::ContinuationUnavailable)
-        .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?
-        .into_state();
-    Ok((unavailable, None))
+    let unavailable_command = WorkflowCommand::ContinuationUnavailable;
+    let unavailable = reduce(&continuation, unavailable_command.clone())
+        .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+    Ok(ContinuationSettlement {
+        state: unavailable.state().clone(),
+        next_request: None,
+        transition: Some((unavailable_command, unavailable)),
+    })
 }
 
 fn replay_agent_tool_completion(
@@ -3377,6 +4037,103 @@ fn query_agent_tool_completion_next_request(
     Ok(Some(request))
 }
 
+struct AgentTransitionFact {
+    command: WorkflowCommand,
+    external_call: Option<ExternalCall>,
+    emitted_result: Option<KnownToolResult>,
+    emitted_result_digest: Option<Sha256Digest>,
+    epoch_digest: Option<Sha256Digest>,
+    source: FactSource,
+    subject: Option<OperationRef>,
+    input_digest: Option<Sha256Digest>,
+    output_digest: Option<Sha256Digest>,
+    next_request_digest: Option<Sha256Digest>,
+}
+
+fn model_subject(job: &AgentModelJob) -> OperationRef {
+    OperationRef::Model {
+        job_id: job.id.clone(),
+        step: job.step,
+    }
+}
+
+fn tool_subject(call: &AgentToolCall) -> OperationRef {
+    OperationRef::Tool {
+        call_id: call.call_id.clone(),
+        ordinal: call.ordinal,
+        model_step: call.model_step,
+    }
+}
+
+fn model_request_digest(job: &AgentModelJob) -> Result<Sha256Digest, StorageError> {
+    super::execution::digest_json(DigestDomain::ModelRequest, &job.request_json)
+}
+
+fn tool_input_digest(call: &AgentToolCall) -> Result<Sha256Digest, StorageError> {
+    Sha256Digest::from_reference(&call.arguments_digest).map_err(|error| {
+        StorageError::CorruptData(format!(
+            "Agent tool `{}` has an invalid arguments digest: {error}",
+            call.call_id
+        ))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_agent_workflow_transition(
+    connection: &Connection,
+    agent: &mut AgentTurn,
+    state: WorkflowState,
+    pending_call_id: Option<&str>,
+    last_error: Option<&Value>,
+    completed_at: Option<&str>,
+    fact: AgentTransitionFact,
+    timestamp: &str,
+) -> Result<(), StorageError> {
+    let before = agent.clone();
+    let emitted_result_digest = if fact.emitted_result.is_some() {
+        match &fact.command {
+            WorkflowCommand::ModelToolProposal {
+                disposition: ProposalDisposition::Deny { .. },
+            } => fact.emitted_result_digest.clone(),
+            _ => fact
+                .emitted_result_digest
+                .clone()
+                .or_else(|| fact.output_digest.clone()),
+        }
+    } else {
+        None
+    };
+    update_agent_workflow(
+        connection,
+        agent,
+        state.clone(),
+        pending_call_id,
+        last_error,
+        completed_at,
+        timestamp,
+    )?;
+    super::execution::append_transition(
+        connection,
+        &before,
+        agent,
+        super::execution::TransitionFact {
+            command: fact.command,
+            state,
+            external_call: fact.external_call,
+            emitted_result: fact.emitted_result,
+            emitted_result_digest,
+            epoch_digest: fact.epoch_digest.as_ref(),
+            source: fact.source,
+            subject: fact.subject,
+            input_digest: fact.input_digest,
+            output_digest: fact.output_digest,
+            next_request_digest: fact.next_request_digest,
+        },
+        timestamp,
+    )?;
+    Ok(())
+}
+
 fn update_agent_workflow(
     connection: &Connection,
     agent: &mut AgentTurn,
@@ -3384,6 +4141,7 @@ fn update_agent_workflow(
     pending_call_id: Option<&str>,
     last_error: Option<&Value>,
     completed_at: Option<&str>,
+    timestamp: &str,
 ) -> Result<(), StorageError> {
     state
         .validate()
@@ -3406,7 +4164,6 @@ fn update_agent_workflow(
             "agent SQL projection does not match workflow state".into(),
         ));
     }
-    let timestamp = now();
     let next_revision = agent
         .revision
         .checked_add(1)
@@ -3722,7 +4479,7 @@ fn decode_agent_model_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Store
     })
 }
 
-fn query_agent_tool_call(
+pub(super) fn query_agent_tool_call(
     connection: &Connection,
     call_id: &str,
 ) -> Result<AgentToolCall, StorageError> {

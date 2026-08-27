@@ -1630,7 +1630,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
     assert_eq!(
         versions,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
         ]
     );
     let owner: Option<String> = connection
@@ -1772,7 +1772,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
     assert_eq!(
         run_event_payloads(database.path(), &long_run_id),
         payloads_before,
-        "v9-v19 migrations must not rewrite immutable event payloads"
+        "v9-v20 migrations must not rewrite immutable event payloads"
     );
     let connection = rusqlite::Connection::open(database.path()).unwrap();
     let version: i64 = connection
@@ -1780,7 +1780,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 19);
+    assert_eq!(version, 20);
     let configured_account: (String, String, String, i64) = connection
         .query_row(
             r#"SELECT
@@ -2306,7 +2306,7 @@ async fn v12_identity_and_run_crash_prefix_migrates_then_recovers_the_primary_se
     assert_eq!(
         recovered,
         (
-            19,
+            20,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into()
@@ -4053,7 +4053,7 @@ async fn v5_configured_database_migrates_to_the_local_owner_membership() {
     assert_eq!(
         migrated,
         (
-            19,
+            20,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into(),
@@ -4179,7 +4179,7 @@ async fn v13_configured_active_work_migrates_with_account_authority_and_exact_vo
             },
         )
         .unwrap();
-    assert_eq!(migrated_counts, (19, 1, 1, 2, 1));
+    assert_eq!(migrated_counts, (20, 1, 1, 2, 1));
 }
 
 #[tokio::test]
@@ -4355,6 +4355,7 @@ async fn v13_auth_migration_retains_only_the_active_local_owner_session() {
             .unwrap(),
         1
     );
+    drop(connection);
 }
 
 #[tokio::test]
@@ -4540,7 +4541,7 @@ async fn v14_database_migrates_through_v19_with_member_and_audit_roots() {
             },
         )
         .unwrap();
-    assert_eq!(state, (19, 1, 1, 1, 19));
+    assert_eq!(state, (20, 1, 1, 1, 19));
 }
 
 #[tokio::test]
@@ -4579,7 +4580,7 @@ async fn v15_migration_seeds_the_configured_audit_detail_limit() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (19, 2));
+    assert_eq!(state, (20, 2));
 }
 
 #[tokio::test]
@@ -4624,7 +4625,7 @@ async fn v15_reopen_rejects_a_lower_audit_detail_limit_without_mutating_policy()
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (19, 4));
+    assert_eq!(state, (20, 4));
     drop(connection);
 
     let reopened = SqliteStore::open_with_limits(database.path(), original_limits)
@@ -5824,7 +5825,7 @@ async fn v19_agent_manifest_is_canonical_actor_scoped_reused_and_secret_free() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(version, 19);
+    assert_eq!(version, 20);
     assert_eq!(
         manifest_rows, 1,
         "the identical manifest must be deduplicated"
@@ -5864,6 +5865,224 @@ async fn v19_agent_manifest_is_canonical_actor_scoped_reused_and_secret_free() {
             )
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn agent_run_epoch_and_execution_facts_commit_with_model_lifecycle() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    let manifest = test_agent_manifest();
+    let enqueued = store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-execution-ledger".into(),
+                user_message: "Record the exact execution authority".into(),
+                expected_sequence: 1,
+            },
+            "execution-ledger-start",
+            agent_turn_spec_with_manifest(
+                "agent-execution-ledger",
+                "turn-execution-ledger",
+                manifest.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let admitted: (i64, i64, String, String) = connection
+        .query_row(
+            r#"SELECT head.head_sequence, head.projected_agent_revision,
+                      head.history_origin, event.fact_kind
+               FROM agent_execution_heads head
+               JOIN agent_execution_events event
+                 ON event.agent_id = head.agent_id AND event.sequence = 1
+               WHERE head.agent_id = ?1"#,
+            [&enqueued.agent.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(admitted, (1, 1, "native".into(), "agent_admitted".into()));
+    let epoch_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM agent_run_epochs", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        epoch_count, 0,
+        "queued work has not crossed the release checkpoint"
+    );
+    drop(connection);
+
+    let admitted_explain = store
+        .agent_execution_explain_for_actor(&owner_authz(), "session-alpha", "turn-execution-ledger")
+        .await
+        .unwrap();
+    assert_eq!(admitted_explain.agent.revision, 1);
+    assert_eq!(admitted_explain.watermark.fact_head_sequence, 1);
+    assert!(admitted_explain.epochs.is_empty());
+    assert_eq!(admitted_explain.facts.len(), 1);
+    assert_eq!(
+        admitted_explain.history.overall,
+        execution::ReconstructionLevel::Complete
+    );
+    assert!(matches!(
+        store
+            .agent_execution_explain_for_actor(
+                &foreign_authz(),
+                "session-alpha",
+                "turn-execution-ledger",
+            )
+            .await,
+        Err(StorageError::AuthSessionNotFound)
+    ));
+    assert!(matches!(
+        store
+            .agent_run_epoch_explain_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                "turn-execution-ledger",
+                1,
+            )
+            .await,
+        Err(StorageError::AgentModelJobNotFound(_))
+    ));
+
+    let AgentModelClaimOutcome::Claimed(job) =
+        store.claim_next_agent_model(&manifest).await.unwrap()
+    else {
+        panic!("the model job must cross one durable release checkpoint");
+    };
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let (epoch_json, fact_json, head_sequence): (String, String, i64) = connection
+        .query_row(
+            r#"SELECT epoch.envelope_json, event.envelope_json, head.head_sequence
+               FROM agent_run_epochs epoch
+               JOIN agent_execution_events event
+                 ON event.agent_id = epoch.agent_id
+                AND event.epoch_digest = epoch.digest
+               JOIN agent_execution_heads head ON head.agent_id = epoch.agent_id
+               WHERE epoch.model_job_id = ?1"#,
+            [&job.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let epoch = execution::RunEpochEnvelope::from_json_slice(epoch_json.as_bytes()).unwrap();
+    let fact = execution::ExecutionFactEnvelope::from_json_slice(fact_json.as_bytes()).unwrap();
+    assert_eq!(head_sequence, 2);
+    assert_eq!(
+        epoch.epoch.bound_manifest_digest.as_ref().unwrap().as_str(),
+        manifest.digest
+    );
+    assert_eq!(
+        epoch.epoch.observed_manifest_digest.as_str(),
+        manifest.digest
+    );
+    assert_eq!(fact.fact.sequence, 2);
+    assert_eq!(
+        fact.fact.previous_fact_digest.as_ref().unwrap().as_str(),
+        connection
+            .query_row(
+                r#"SELECT fact_digest FROM agent_execution_events
+                   WHERE agent_id = ?1 AND sequence = 1"#,
+                [&enqueued.agent.id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+    );
+    assert!(!epoch_json.contains("Record the exact execution authority"));
+    drop(connection);
+
+    let started_explain = store
+        .agent_run_epoch_explain_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            "turn-execution-ledger",
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(started_explain.request.value, enqueued.job.request_json);
+    assert_eq!(
+        started_explain.epoch.status,
+        execution::EpochExecutionStatus::Started
+    );
+    assert_eq!(
+        started_explain.outcome,
+        execution::EpochOutcomeMaterial::Pending
+    );
+    assert_eq!(started_explain.facts.len(), 2);
+    assert!(
+        started_explain
+            .history
+            .reasons
+            .contains(&execution::ExecutionHistoryReason::OutcomePending)
+    );
+
+    store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: job.id,
+            response_json: agent_final_response_json("Execution is recorded."),
+            resolution: AgentModelResolution::Final {
+                assistant_message: "Execution is recorded.".into(),
+                provenance: agent_model_provenance(),
+            },
+        })
+        .await
+        .unwrap();
+    store.verify_integrity().await.unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let (head_sequence, event_count, epoch_count): (i64, i64, i64) = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT head_sequence FROM agent_execution_heads
+                    WHERE agent_id = ?1),
+                   (SELECT COUNT(*) FROM agent_execution_events WHERE agent_id = ?1),
+                   (SELECT COUNT(*) FROM agent_run_epochs WHERE agent_id = ?1)"#,
+            [&enqueued.agent.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((head_sequence, event_count, epoch_count), (3, 3, 1));
+
+    let completed_explain = store
+        .agent_execution_explain_for_actor(&owner_authz(), "session-alpha", "turn-execution-ledger")
+        .await
+        .unwrap();
+    assert_eq!(completed_explain.watermark.fact_head_sequence, 3);
+    assert_eq!(completed_explain.epochs.len(), 1);
+    assert_eq!(
+        completed_explain.epochs[0].status,
+        execution::EpochExecutionStatus::Succeeded
+    );
+    assert_eq!(
+        completed_explain.history.overall,
+        execution::ReconstructionLevel::Complete
+    );
+    let completed_epoch = store
+        .agent_run_epoch_explain_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            "turn-execution-ledger",
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed_epoch.request.value, enqueued.job.request_json);
+    let execution::EpochOutcomeMaterial::Succeeded {
+        response,
+        provenance,
+    } = completed_epoch.outcome
+    else {
+        panic!("the completed model epoch must expose its persisted response");
+    };
+    assert_eq!(
+        response.value,
+        agent_final_response_json("Execution is recorded.")
+    );
+    assert_eq!(provenance, agent_model_provenance());
 }
 
 #[tokio::test]
@@ -6051,16 +6270,36 @@ async fn agent_tool_claim_rejects_manifest_drift_before_dispatch() {
         Some("deployment_unavailable")
     );
     let connection = rusqlite::Connection::open(database.path()).unwrap();
-    let (status, result_json, completion_request): (String, String, String) = connection
+    let (status, result_json, completion_request, started_at): (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    ) = connection
         .query_row(
-            r#"SELECT status, result_json, completion_next_request_json
+            r#"SELECT status, result_json, completion_next_request_json, started_at
                FROM agent_tool_calls WHERE call_id = ?1"#,
             [&call.call_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap();
     assert_eq!(status, "not_dispatched");
-    assert_eq!(completion_request, "null");
+    assert_eq!(completion_request, None);
+    assert_eq!(
+        started_at, None,
+        "a rejected claim never crossed the tool release checkpoint"
+    );
+    let epoch_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM agent_run_epochs WHERE tool_call_id = ?1",
+            [&call.call_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        epoch_count, 0,
+        "a rejected claim must not create a RunEpoch"
+    );
     assert_eq!(
         serde_json::from_str::<Value>(&result_json).unwrap()["code"],
         "deployment_unavailable"
@@ -6243,6 +6482,11 @@ async fn v18_waiting_approval_review_paths_fail_closed_without_manifest() {
     assert_eq!(rejected.response.call.status, AgentToolCallStatus::Rejected);
     assert!(rejected.queued_model_job.is_none());
     assert!(rejected.terminal_completion.is_some());
+    rejected_store.verify_integrity().await.unwrap();
+    drop(rejected_store);
+    let reopened_rejected = SqliteStore::open(rejected_database.path()).await.unwrap();
+    reopened_rejected.verify_integrity().await.unwrap();
+    drop(reopened_rejected);
 
     let (approved_database, _, approved_call) =
         v18_waiting_approval_manifest_fixture("approve").await;
@@ -6678,10 +6922,11 @@ async fn agent_tool_result_and_continuation_are_atomic_and_idempotent() {
     assert_eq!(claimed.id, enqueued.job.id);
 
     let call = agent_tool_call_spec("agent-call-allow", PolicyDecision::Allow);
+    let proposal_response = agent_tool_response_json(&call);
     let proposed = store
         .complete_agent_model_success(AgentModelSuccessCommit {
             job_id: claimed.id,
-            response_json: agent_tool_response_json(&call),
+            response_json: proposal_response.clone(),
             resolution: AgentModelResolution::ToolCall { call: call.clone() },
         })
         .await
@@ -6776,6 +7021,34 @@ async fn agent_tool_result_and_continuation_are_atomic_and_idempotent() {
     assert_eq!(detail.calls.len(), 1);
     assert_eq!(detail.calls[0].status, AgentToolCallStatus::Succeeded);
     assert_eq!(detail.calls[0].output.as_ref(), Some(&result_json));
+
+    let execution = store
+        .agent_execution_explain_for_actor(&owner_authz(), "session-alpha", "turn-agent-tool")
+        .await
+        .unwrap();
+    assert_eq!(execution.epochs.len(), 2);
+    assert_eq!(execution.facts.len(), 5);
+    assert_eq!(
+        execution
+            .epochs
+            .iter()
+            .map(|epoch| epoch.status)
+            .collect::<Vec<_>>(),
+        [
+            execution::EpochExecutionStatus::Succeeded,
+            execution::EpochExecutionStatus::Succeeded,
+        ]
+    );
+    let model_epoch = store
+        .agent_run_epoch_explain_for_actor(&owner_authz(), "session-alpha", "turn-agent-tool", 1)
+        .await
+        .unwrap();
+    assert_eq!(model_epoch.linked_tools.len(), 1);
+    assert_eq!(model_epoch.linked_tools[0].call_id, stored_call.call_id);
+    let execution::EpochOutcomeMaterial::Succeeded { response, .. } = model_epoch.outcome else {
+        panic!("the model tool proposal must retain its exact provider response");
+    };
+    assert_eq!(response.value, proposal_response);
 
     let AgentModelClaimOutcome::Claimed(continuation) = store
         .claim_next_agent_model(&test_agent_manifest())
@@ -7294,6 +7567,7 @@ async fn terminal_agent_tool_replay_binds_its_unused_continuation_request() {
         exact_replay_after_conflicts,
         AgentToolCompletion::Terminal(completion) if completion.replayed
     ));
+    store.verify_integrity().await.unwrap();
 }
 
 #[tokio::test]
@@ -7954,6 +8228,173 @@ async fn agent_rejection_at_result_limit_terminalizes_without_a_continuation_req
 }
 
 #[tokio::test]
+async fn policy_denial_at_result_limit_persists_an_unemitted_call() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-agent-policy-deny-result-limit".into(),
+                user_message: "Retain a denied proposal that crosses the result limit".into(),
+                expected_sequence: 1,
+            },
+            "agent-policy-deny-result-limit-start",
+            agent_turn_spec(
+                "agent-policy-deny-result-limit",
+                "turn-agent-policy-deny-result-limit",
+            ),
+        )
+        .await
+        .unwrap();
+
+    let large_result = json!({"data": "x".repeat(65_500)});
+    for ordinal in 1..=2 {
+        let AgentModelClaimOutcome::Claimed(job) = store
+            .claim_next_agent_model(&test_agent_manifest())
+            .await
+            .unwrap()
+        else {
+            panic!("large-result model step {ordinal} must be claimable");
+        };
+        let call = agent_tool_call_spec(
+            &format!("agent-call-policy-limit-large-{ordinal}"),
+            PolicyDecision::Allow,
+        );
+        store
+            .complete_agent_model_success(AgentModelSuccessCommit {
+                job_id: job.id,
+                response_json: agent_tool_response_json(&call),
+                resolution: AgentModelResolution::ToolCall { call: call.clone() },
+            })
+            .await
+            .unwrap();
+        let AgentToolClaimOutcome::Claimed(_) = store
+            .claim_next_agent_tool(&test_agent_manifest())
+            .await
+            .unwrap()
+        else {
+            panic!("large-result tool {ordinal} must be claimable");
+        };
+        assert!(matches!(
+            store
+                .complete_agent_tool(AgentToolCompletionCommit {
+                    call_id: call.call_id,
+                    status: AgentToolCallStatus::Succeeded,
+                    result_json: large_result.clone(),
+                    provider_request_id: Some(format!("policy-limit-request-{ordinal}")),
+                    next_request_json: Some(test_agent_request(json!({
+                        "messages": [{
+                            "role": "tool",
+                            "content": format!("large result {ordinal} committed"),
+                            "tool_call_id": call.provider_call_id,
+                        }],
+                    }))),
+                })
+                .await
+                .unwrap(),
+            AgentToolCompletion::ModelQueued { .. }
+        ));
+    }
+
+    let AgentModelClaimOutcome::Claimed(job) = store
+        .claim_next_agent_model(&test_agent_manifest())
+        .await
+        .unwrap()
+    else {
+        panic!("the policy-denied model step must be claimable");
+    };
+    let call = agent_tool_call_spec("agent-call-policy-deny-result-limit", PolicyDecision::Deny);
+    let result_json = json!({
+        "code": "policy_denied",
+        "message": "the durable policy denied this call",
+    });
+    let result_bytes = u64::try_from(serde_json::to_vec(&result_json).unwrap().len()).unwrap();
+    let completed = store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: job.id,
+            response_json: agent_tool_response_json(&call),
+            resolution: AgentModelResolution::PolicyDenied {
+                call: call.clone(),
+                result_json: result_json.clone(),
+                next_request_json: Some(test_agent_request(json!({
+                    "messages": [{
+                        "role": "tool",
+                        "content": "this continuation must not be queued",
+                        "tool_call_id": call.provider_call_id,
+                    }],
+                }))),
+            },
+        })
+        .await
+        .unwrap();
+    let AgentModelCompletion::Terminal(terminal) = completed else {
+        panic!("the cumulative result limit must terminate the Agent");
+    };
+    assert_eq!(terminal.agent.status, AgentTurnStatus::Failed);
+    assert_eq!(terminal.agent.tool_calls, 3);
+    assert_eq!(
+        terminal
+            .agent
+            .last_error_json
+            .as_ref()
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_str),
+        Some("tool_result_bytes_limit_reached")
+    );
+    let detail = store
+        .agent_turn_detail_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            "turn-agent-policy-deny-result-limit",
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail.calls.len(), 3);
+    assert_eq!(detail.calls[2].status, AgentToolCallStatus::NotDispatched);
+    assert_eq!(detail.calls[2].error.as_ref(), Some(&result_json));
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let stored: String = connection
+        .query_row(
+            r#"SELECT envelope_json FROM agent_execution_events
+               WHERE agent_id = 'agent-policy-deny-result-limit'
+               ORDER BY sequence DESC LIMIT 1"#,
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let envelope = execution::ExecutionFactEnvelope::from_json_slice(stored.as_bytes()).unwrap();
+    let execution::ExecutionFactData::WorkflowTransition {
+        command:
+            workflows::Command::ModelToolProposal {
+                disposition:
+                    workflows::ProposalDisposition::Deny {
+                        result_bytes: stored_bytes,
+                    },
+            },
+        state,
+        emitted_result,
+        emitted_result_digest,
+        ..
+    } = envelope.fact.data
+    else {
+        panic!("the terminal tail must be a denied proposal fact");
+    };
+    assert_eq!(stored_bytes, result_bytes);
+    assert_eq!(state.status(), workflows::AgentStatus::Failed);
+    assert_eq!(
+        state.terminal_reason(),
+        Some(workflows::TerminalReason::ToolResultBytesLimitReached)
+    );
+    assert_eq!(emitted_result, None);
+    assert_eq!(emitted_result_digest, None);
+    drop(connection);
+    store.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
 async fn started_agent_model_becomes_unknown_once_after_restart() {
     let database = TestDatabase::new();
     let job_id = {
@@ -8034,6 +8475,1241 @@ async fn started_agent_model_becomes_unknown_once_after_restart() {
             .unwrap(),
         AgentModelClaimOutcome::NotAvailable
     ));
+}
+
+#[tokio::test]
+async fn v19_started_model_recovers_from_one_honest_legacy_snapshot_without_an_epoch() {
+    let database = TestDatabase::new();
+    {
+        let store = created_owned_file_session_store(database.path()).await;
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: "turn-agent-legacy-recovery".into(),
+                    user_message: "Recover an operation that started before v20".into(),
+                    expected_sequence: 1,
+                },
+                "agent-legacy-recovery-start",
+                agent_turn_spec("agent-legacy-recovery", "turn-agent-legacy-recovery"),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .claim_next_agent_model(&test_agent_manifest())
+                .await
+                .unwrap(),
+            AgentModelClaimOutcome::Claimed(_)
+        ));
+    }
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    drop_v20_fixture_objects(&connection);
+    drop(connection);
+
+    let migrated = SqliteStore::open(database.path()).await.unwrap();
+    let before = migrated
+        .agent_execution_explain_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            "turn-agent-legacy-recovery",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        before.history.origin,
+        execution::ExecutionHistoryOrigin::LegacySnapshot
+    );
+    assert!(before.epochs.is_empty());
+    assert_eq!(before.facts.len(), 1);
+    assert!(
+        before
+            .history
+            .reasons
+            .contains(&execution::ExecutionHistoryReason::OutcomePending)
+    );
+
+    let recovered = migrated.recover_started_agent_work().await.unwrap();
+    assert_eq!(recovered.len(), 1);
+    let after = migrated
+        .agent_execution_explain_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            "turn-agent-legacy-recovery",
+        )
+        .await
+        .unwrap();
+    assert!(after.epochs.is_empty());
+    assert_eq!(after.facts.len(), 2);
+    assert!(
+        after
+            .history
+            .reasons
+            .contains(&execution::ExecutionHistoryReason::OutcomeUnknown)
+    );
+    migrated.verify_integrity().await.unwrap();
+}
+
+fn stored_trigger_sql(connection: &rusqlite::Connection, name: &str) -> String {
+    connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
+            [name],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|error| panic!("missing trigger `{name}`: {error}"))
+}
+
+#[tokio::test]
+async fn initial_model_request_tampering_fails_reopen_before_claim() {
+    let database = TestDatabase::new();
+    {
+        let store = created_owned_file_session_store(database.path()).await;
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: "turn-agent-initial-request-binding".into(),
+                    user_message: "Bind the initial model request at admission".into(),
+                    expected_sequence: 1,
+                },
+                "agent-initial-request-binding-start",
+                agent_turn_spec(
+                    "agent-initial-request-binding",
+                    "turn-agent-initial-request-binding",
+                ),
+            )
+            .await
+            .unwrap();
+        store.verify_integrity().await.unwrap();
+    }
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let input_trigger = stored_trigger_sql(&connection, "agent_model_jobs_reject_input_update");
+    let forward_trigger =
+        stored_trigger_sql(&connection, "agent_model_jobs_enforce_forward_transition");
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER agent_model_jobs_reject_input_update;
+               DROP TRIGGER agent_model_jobs_enforce_forward_transition;"#,
+        )
+        .unwrap();
+    let changed_request = test_agent_request(json!({
+        "messages": [{"role": "user", "content": "tampered before first claim"}],
+    }));
+    connection
+        .execute(
+            r#"UPDATE agent_model_jobs SET request_json = ?1
+               WHERE agent_id = 'agent-initial-request-binding' AND step = 1"#,
+            [serde_json::to_string(&changed_request).unwrap()],
+        )
+        .unwrap();
+    connection.execute_batch(&input_trigger).unwrap();
+    connection.execute_batch(&forward_trigger).unwrap();
+    drop(connection);
+
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("an initial request that diverges from admission must fail startup"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StorageError::CorruptData(message)
+            if message.contains("execution origin disagrees")));
+}
+
+#[tokio::test]
+async fn orphaned_native_continuation_job_fails_reopen() {
+    let database = TestDatabase::new();
+    let agent_id = "agent-orphaned-native-continuation-job";
+    {
+        let store = created_owned_file_session_store(database.path()).await;
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: "turn-orphaned-native-continuation-job".into(),
+                    user_message: "Reject a model job without a causative fact".into(),
+                    expected_sequence: 1,
+                },
+                "orphaned-native-continuation-job-start",
+                agent_turn_spec(agent_id, "turn-orphaned-native-continuation-job"),
+            )
+            .await
+            .unwrap();
+        let AgentModelClaimOutcome::Claimed(job) = store
+            .claim_next_agent_model(&test_agent_manifest())
+            .await
+            .unwrap()
+        else {
+            panic!("the initial model job must be claimable");
+        };
+        store
+            .complete_agent_model_success(AgentModelSuccessCommit {
+                job_id: job.id,
+                response_json: agent_final_response_json("terminal response"),
+                resolution: AgentModelResolution::Final {
+                    assistant_message: "terminal response".into(),
+                    provenance: agent_model_provenance(),
+                },
+            })
+            .await
+            .unwrap();
+        store.verify_integrity().await.unwrap();
+    }
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let current_step_trigger =
+        stored_trigger_sql(&connection, "agent_model_jobs_require_current_step");
+    connection
+        .execute_batch("DROP TRIGGER agent_model_jobs_require_current_step;")
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO agent_model_jobs(
+                   id, agent_id, account_id, actor_user_id, actor_membership_revision,
+                   session_id, turn_id, step, provider_name, model_name,
+                   status, attempt, request_json, response_json, error_json,
+                   queued_at, started_at, finished_at
+               )
+               SELECT 'agent-model-orphaned-native-step-2', agent_id, account_id,
+                      actor_user_id, actor_membership_revision, session_id, turn_id,
+                      2, provider_name, model_name, 'queued', 0, request_json,
+                      NULL, NULL, queued_at, NULL, NULL
+               FROM agent_model_jobs
+               WHERE agent_id = ?1 AND step = 1"#,
+            [agent_id],
+        )
+        .unwrap();
+    connection.execute_batch(&current_step_trigger).unwrap();
+    drop(connection);
+
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("a native continuation job without a causative fact must fail startup"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StorageError::CorruptData(message)
+            if message.contains("does not have exactly one continuation request fact")));
+}
+
+#[tokio::test]
+async fn forged_old_timestamp_legacy_continuation_job_fails_reopen() {
+    let database = TestDatabase::new();
+    let agent_id = "agent-forged-legacy-continuation-job";
+    {
+        let store = created_owned_file_session_store(database.path()).await;
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: "turn-forged-legacy-continuation-job".into(),
+                    user_message: "Do not trust a forged legacy queue timestamp".into(),
+                    expected_sequence: 1,
+                },
+                "forged-legacy-continuation-job-start",
+                agent_turn_spec(agent_id, "turn-forged-legacy-continuation-job"),
+            )
+            .await
+            .unwrap();
+        let AgentModelClaimOutcome::Claimed(job) = store
+            .claim_next_agent_model(&test_agent_manifest())
+            .await
+            .unwrap()
+        else {
+            panic!("the initial model job must be claimable");
+        };
+        store
+            .complete_agent_model_success(AgentModelSuccessCommit {
+                job_id: job.id,
+                response_json: agent_final_response_json("legacy terminal response"),
+                resolution: AgentModelResolution::Final {
+                    assistant_message: "legacy terminal response".into(),
+                    provenance: agent_model_provenance(),
+                },
+            })
+            .await
+            .unwrap();
+    }
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    drop_v20_fixture_objects(&connection);
+    drop(connection);
+    let migrated = SqliteStore::open(database.path()).await.unwrap();
+    migrated.verify_integrity().await.unwrap();
+    drop(migrated);
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let current_step_trigger =
+        stored_trigger_sql(&connection, "agent_model_jobs_require_current_step");
+    connection
+        .execute_batch("DROP TRIGGER agent_model_jobs_require_current_step;")
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO agent_model_jobs(
+                   id, agent_id, account_id, actor_user_id, actor_membership_revision,
+                   session_id, turn_id, step, provider_name, model_name,
+                   status, attempt, request_json, response_json, error_json,
+                   queued_at, started_at, finished_at
+               )
+               SELECT 'agent-model-forged-legacy-step-2', agent_id, account_id,
+                      actor_user_id, actor_membership_revision, session_id, turn_id,
+                      2, provider_name, model_name, 'queued', 0, request_json,
+                      NULL, NULL, '2000-01-01T00:00:00.000Z', NULL, NULL
+               FROM agent_model_jobs
+               WHERE agent_id = ?1 AND step = 1"#,
+            [agent_id],
+        )
+        .unwrap();
+    connection.execute_batch(&current_step_trigger).unwrap();
+    drop(connection);
+
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("a backdated legacy continuation job without a fact must fail startup"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StorageError::CorruptData(message)
+            if message.contains("does not have exactly one continuation request fact")));
+}
+
+#[tokio::test]
+async fn v19_queued_continuation_migrates_without_a_causative_v20_fact() {
+    let database = TestDatabase::new();
+    let agent_id = "agent-v19-queued-continuation";
+    {
+        let store = created_owned_file_session_store(database.path()).await;
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: "turn-v19-queued-continuation".into(),
+                    user_message: "Preserve the queued continuation across v20 migration".into(),
+                    expected_sequence: 1,
+                },
+                "v19-queued-continuation-start",
+                agent_turn_spec(agent_id, "turn-v19-queued-continuation"),
+            )
+            .await
+            .unwrap();
+        let AgentModelClaimOutcome::Claimed(job) = store
+            .claim_next_agent_model(&test_agent_manifest())
+            .await
+            .unwrap()
+        else {
+            panic!("the initial model job must be claimable");
+        };
+        let call = agent_tool_call_spec("agent-call-v19-queued-continuation", PolicyDecision::Deny);
+        let next_request = test_agent_request(json!({
+            "messages": [{
+                "role": "tool",
+                "content": "policy denied before v20",
+                "tool_call_id": call.provider_call_id,
+            }],
+        }));
+        store
+            .complete_agent_model_success(AgentModelSuccessCommit {
+                job_id: job.id,
+                response_json: agent_tool_response_json(&call),
+                resolution: AgentModelResolution::PolicyDenied {
+                    call,
+                    result_json: json!({"code": "policy_denied", "message": "blocked"}),
+                    next_request_json: Some(next_request),
+                },
+            })
+            .await
+            .unwrap();
+    }
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    drop_v20_fixture_objects(&connection);
+    drop(connection);
+
+    let migrated = SqliteStore::open(database.path()).await.unwrap();
+    migrated.verify_integrity().await.unwrap();
+    let detail = migrated
+        .agent_turn_detail_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            "turn-v19-queued-continuation",
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail.status, AgentTurnStatus::WaitingModel);
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                r#"SELECT COUNT(*) FROM agent_model_jobs
+                   WHERE agent_id = ?1 AND step = 2 AND status = 'queued'"#,
+                [agent_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    drop(connection);
+
+    let AgentModelClaimOutcome::Claimed(job) = migrated
+        .claim_next_agent_model(&test_agent_manifest())
+        .await
+        .unwrap()
+    else {
+        panic!("the migrated legacy continuation must remain claimable");
+    };
+    assert_eq!(job.step, 2);
+    migrated
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: job.id,
+            response_json: agent_final_response_json("legacy continuation completed"),
+            resolution: AgentModelResolution::Final {
+                assistant_message: "legacy continuation completed".into(),
+                provenance: agent_model_provenance(),
+            },
+        })
+        .await
+        .unwrap();
+    migrated.verify_integrity().await.unwrap();
+    drop(migrated);
+    SqliteStore::open(database.path())
+        .await
+        .unwrap()
+        .verify_integrity()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn tool_continuation_request_pair_tampering_fails_reopen() {
+    let database = TestDatabase::new();
+    let call_id = "agent-call-continuation-request-binding";
+    {
+        let store = created_owned_file_session_store(database.path()).await;
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: "turn-agent-continuation-request-binding".into(),
+                    user_message: "Bind the tool continuation request".into(),
+                    expected_sequence: 1,
+                },
+                "agent-continuation-request-binding-start",
+                agent_turn_spec(
+                    "agent-continuation-request-binding",
+                    "turn-agent-continuation-request-binding",
+                ),
+            )
+            .await
+            .unwrap();
+        let AgentModelClaimOutcome::Claimed(job) = store
+            .claim_next_agent_model(&test_agent_manifest())
+            .await
+            .unwrap()
+        else {
+            panic!("the initial model job must be claimable");
+        };
+        let call = agent_tool_call_spec(call_id, PolicyDecision::Allow);
+        store
+            .complete_agent_model_success(AgentModelSuccessCommit {
+                job_id: job.id,
+                response_json: agent_tool_response_json(&call),
+                resolution: AgentModelResolution::ToolCall { call },
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .claim_next_agent_tool(&test_agent_manifest())
+                .await
+                .unwrap(),
+            AgentToolClaimOutcome::Claimed(_)
+        ));
+        let next_request = test_agent_request(json!({
+            "messages": [{"role": "tool", "content": "known result", "tool_call_id": "provider-call-agent-call-continuation-request-binding"}],
+        }));
+        assert!(matches!(
+            store
+                .complete_agent_tool(AgentToolCompletionCommit {
+                    call_id: call_id.into(),
+                    status: AgentToolCallStatus::Succeeded,
+                    result_json: json!({"ok": true}),
+                    provider_request_id: Some("connector-request-binding".into()),
+                    next_request_json: Some(next_request),
+                })
+                .await
+                .unwrap(),
+            AgentToolCompletion::ModelQueued { .. }
+        ));
+        store.verify_integrity().await.unwrap();
+    }
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let model_input = stored_trigger_sql(&connection, "agent_model_jobs_reject_input_update");
+    let model_forward =
+        stored_trigger_sql(&connection, "agent_model_jobs_enforce_forward_transition");
+    let tool_copy = stored_trigger_sql(
+        &connection,
+        "agent_tool_calls_freeze_completion_next_request",
+    );
+    let tool_forward =
+        stored_trigger_sql(&connection, "agent_tool_calls_enforce_forward_transition");
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER agent_model_jobs_reject_input_update;
+               DROP TRIGGER agent_model_jobs_enforce_forward_transition;
+               DROP TRIGGER agent_tool_calls_freeze_completion_next_request;
+               DROP TRIGGER agent_tool_calls_enforce_forward_transition;"#,
+        )
+        .unwrap();
+    let changed_request = test_agent_request(json!({
+        "messages": [{"role": "user", "content": "coherently changed continuation"}],
+    }));
+    let changed_request = serde_json::to_string(&changed_request).unwrap();
+    connection
+        .execute(
+            r#"UPDATE agent_model_jobs SET request_json = ?1
+               WHERE agent_id = 'agent-continuation-request-binding' AND step = 2"#,
+            [&changed_request],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE agent_tool_calls SET completion_next_request_json = ?1
+               WHERE call_id = ?2"#,
+            params![changed_request, call_id],
+        )
+        .unwrap();
+    connection.execute_batch(&model_input).unwrap();
+    connection.execute_batch(&model_forward).unwrap();
+    connection.execute_batch(&tool_copy).unwrap();
+    connection.execute_batch(&tool_forward).unwrap();
+    drop(connection);
+
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("a coherently changed continuation request must fail startup"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StorageError::CorruptData(message)
+            if message.contains("continuation request fact disagrees")));
+}
+
+fn replace_queued_agent_model_request(path: &Path, agent_id: &str, step: u32, request: &Value) {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    let input_trigger = stored_trigger_sql(&connection, "agent_model_jobs_reject_input_update");
+    let forward_trigger =
+        stored_trigger_sql(&connection, "agent_model_jobs_enforce_forward_transition");
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER agent_model_jobs_reject_input_update;
+               DROP TRIGGER agent_model_jobs_enforce_forward_transition;"#,
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE agent_model_jobs SET request_json = ?1 WHERE agent_id = ?2 AND step = ?3",
+            params![serde_json::to_string(request).unwrap(), agent_id, step],
+        )
+        .unwrap();
+    connection.execute_batch(&input_trigger).unwrap();
+    connection.execute_batch(&forward_trigger).unwrap();
+}
+
+#[tokio::test]
+async fn policy_denied_continuation_request_tampering_fails_reopen() {
+    let database = TestDatabase::new();
+    {
+        let store = created_owned_file_session_store(database.path()).await;
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: "turn-policy-continuation-binding".into(),
+                    user_message: "Bind the policy denial continuation".into(),
+                    expected_sequence: 1,
+                },
+                "policy-continuation-binding-start",
+                agent_turn_spec(
+                    "agent-policy-continuation-binding",
+                    "turn-policy-continuation-binding",
+                ),
+            )
+            .await
+            .unwrap();
+        let AgentModelClaimOutcome::Claimed(job) = store
+            .claim_next_agent_model(&test_agent_manifest())
+            .await
+            .unwrap()
+        else {
+            panic!("the initial model job must be claimable");
+        };
+        let call = agent_tool_call_spec(
+            "agent-call-policy-continuation-binding",
+            PolicyDecision::Deny,
+        );
+        let next_request = test_agent_request(json!({
+            "messages": [{"role": "tool", "content": "policy denied", "tool_call_id": call.provider_call_id}],
+        }));
+        assert!(matches!(
+            store
+                .complete_agent_model_success(AgentModelSuccessCommit {
+                    job_id: job.id,
+                    response_json: agent_tool_response_json(&call),
+                    resolution: AgentModelResolution::PolicyDenied {
+                        call,
+                        result_json: json!({"code": "policy_denied", "message": "blocked"}),
+                        next_request_json: Some(next_request),
+                    },
+                })
+                .await
+                .unwrap(),
+            AgentModelCompletion::ToolCall { .. }
+        ));
+        store.verify_integrity().await.unwrap();
+    }
+
+    replace_queued_agent_model_request(
+        database.path(),
+        "agent-policy-continuation-binding",
+        2,
+        &test_agent_request(json!({
+            "messages": [{"role": "user", "content": "changed policy continuation"}],
+        })),
+    );
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("a changed policy-denied continuation must fail startup"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StorageError::CorruptData(message)
+            if message.contains("continuation request fact disagrees")));
+}
+
+#[tokio::test]
+async fn orphaned_continuation_fact_fails_reopen_even_after_rehash() {
+    let database = TestDatabase::new();
+    let agent_id = "agent-orphaned-continuation";
+    {
+        let store = created_owned_file_session_store(database.path()).await;
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: "turn-orphaned-continuation".into(),
+                    user_message: "Keep continuation causality complete".into(),
+                    expected_sequence: 1,
+                },
+                "orphaned-continuation-start",
+                agent_turn_spec(agent_id, "turn-orphaned-continuation"),
+            )
+            .await
+            .unwrap();
+        let AgentModelClaimOutcome::Claimed(job) = store
+            .claim_next_agent_model(&test_agent_manifest())
+            .await
+            .unwrap()
+        else {
+            panic!("the initial model job must be claimable");
+        };
+        let call = agent_tool_call_spec("agent-call-orphaned-continuation", PolicyDecision::Deny);
+        let next_request = test_agent_request(json!({
+            "messages": [{"role": "tool", "content": "policy denied", "tool_call_id": call.provider_call_id}],
+        }));
+        store
+            .complete_agent_model_success(AgentModelSuccessCommit {
+                job_id: job.id,
+                response_json: agent_tool_response_json(&call),
+                resolution: AgentModelResolution::PolicyDenied {
+                    call,
+                    result_json: json!({"code": "policy_denied", "message": "blocked"}),
+                    next_request_json: Some(next_request),
+                },
+            })
+            .await
+            .unwrap();
+        store.verify_integrity().await.unwrap();
+    }
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let delete_trigger = stored_trigger_sql(&connection, "agent_model_jobs_reject_delete");
+    let event_trigger = stored_trigger_sql(&connection, "agent_execution_events_reject_update");
+    let head_trigger =
+        stored_trigger_sql(&connection, "agent_execution_heads_enforce_forward_update");
+    let stored: String = connection
+        .query_row(
+            r#"SELECT envelope_json FROM agent_execution_events
+               WHERE agent_id = ?1
+                 AND json_extract(envelope_json, '$.fact.data.command.command') = 'model_tool_proposal'"#,
+            [agent_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut envelope =
+        execution::ExecutionFactEnvelope::from_json_slice(stored.as_bytes()).unwrap();
+    let execution::ExecutionFactData::WorkflowTransition {
+        next_request_digest,
+        ..
+    } = &mut envelope.fact.data
+    else {
+        panic!("the continuation fixture must end in a workflow transition");
+    };
+    assert!(next_request_digest.take().is_some());
+    let envelope = execution::ExecutionFactEnvelope::new(envelope.fact).unwrap();
+    let envelope_json = String::from_utf8(envelope.canonical_json_bytes().unwrap()).unwrap();
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER agent_model_jobs_reject_delete;
+               DROP TRIGGER agent_execution_events_reject_update;
+               DROP TRIGGER agent_execution_heads_enforce_forward_update;"#,
+        )
+        .unwrap();
+    connection
+        .execute(
+            "DELETE FROM agent_model_jobs WHERE agent_id = ?1 AND step = 2",
+            [agent_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE agent_execution_events
+               SET fact_digest = ?1, envelope_json = ?2
+               WHERE agent_id = ?3 AND sequence = 3"#,
+            params![envelope.digest.as_str(), envelope_json, agent_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE agent_execution_heads
+               SET head_hash = ?1,
+                   committed_payload_bytes = (
+                       SELECT SUM(length(CAST(envelope_json AS BLOB)))
+                       FROM agent_execution_events WHERE agent_id = ?2
+                   )
+               WHERE agent_id = ?2"#,
+            params![envelope.digest.as_str(), agent_id],
+        )
+        .unwrap();
+    connection.execute_batch(&delete_trigger).unwrap();
+    connection.execute_batch(&event_trigger).unwrap();
+    connection.execute_batch(&head_trigger).unwrap();
+    drop(connection);
+
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("an orphaned continuation fact must fail startup integrity"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StorageError::CorruptData(message)
+            if message.contains("continuation request fact disagrees")));
+}
+
+#[tokio::test]
+async fn approval_rejected_continuation_request_tampering_fails_reopen() {
+    let database = TestDatabase::new();
+    let call_id = "agent-call-review-continuation-binding";
+    {
+        let store = created_owned_file_session_store(database.path()).await;
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: "turn-review-continuation-binding".into(),
+                    user_message: "Bind the review rejection continuation".into(),
+                    expected_sequence: 1,
+                },
+                "review-continuation-binding-start",
+                agent_turn_spec(
+                    "agent-review-continuation-binding",
+                    "turn-review-continuation-binding",
+                ),
+            )
+            .await
+            .unwrap();
+        let AgentModelClaimOutcome::Claimed(job) = store
+            .claim_next_agent_model(&test_agent_manifest())
+            .await
+            .unwrap()
+        else {
+            panic!("the initial model job must be claimable");
+        };
+        let call = agent_tool_call_spec(call_id, PolicyDecision::RequireApproval);
+        store
+            .complete_agent_model_success(AgentModelSuccessCommit {
+                job_id: job.id,
+                response_json: agent_tool_response_json(&call),
+                resolution: AgentModelResolution::ToolCall { call },
+            })
+            .await
+            .unwrap();
+        let next_request = test_agent_request(json!({
+            "messages": [{"role": "tool", "content": "owner rejected", "tool_call_id": "provider-call-agent-call-review-continuation-binding"}],
+        }));
+        let reviewed = store
+            .review_agent_tool_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                "turn-review-continuation-binding",
+                AgentReviewCommit {
+                    call_id: call_id.into(),
+                    decision: ReviewDecision::Reject,
+                    note: Some("reject".into()),
+                    idempotency_key: "review-continuation-binding-reject".into(),
+                    next_request_json: Some(next_request),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(reviewed.queued_model_job.is_some());
+        store.verify_integrity().await.unwrap();
+    }
+
+    replace_queued_agent_model_request(
+        database.path(),
+        "agent-review-continuation-binding",
+        2,
+        &test_agent_request(json!({
+            "messages": [{"role": "user", "content": "changed review continuation"}],
+        })),
+    );
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("a changed approval-rejected continuation must fail startup"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StorageError::CorruptData(message)
+            if message.contains("continuation request fact disagrees")));
+}
+
+#[tokio::test]
+async fn semantic_execution_fact_tampering_fails_reopen_even_with_recomputed_hashes() {
+    let database = TestDatabase::new();
+    {
+        let store = created_owned_file_session_store(database.path()).await;
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: "turn-agent-semantic-tamper".into(),
+                    user_message: "Persist a final response for semantic verification".into(),
+                    expected_sequence: 1,
+                },
+                "agent-semantic-tamper-start",
+                agent_turn_spec("agent-semantic-tamper", "turn-agent-semantic-tamper"),
+            )
+            .await
+            .unwrap();
+        let AgentModelClaimOutcome::Claimed(job) = store
+            .claim_next_agent_model(&test_agent_manifest())
+            .await
+            .unwrap()
+        else {
+            panic!("the semantic tamper fixture must claim its model");
+        };
+        store
+            .complete_agent_model_success(AgentModelSuccessCommit {
+                job_id: job.id,
+                response_json: agent_final_response_json("semantic reply"),
+                resolution: AgentModelResolution::Final {
+                    assistant_message: "semantic reply".into(),
+                    provenance: agent_model_provenance(),
+                },
+            })
+            .await
+            .unwrap();
+    }
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let event_trigger: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE name = 'agent_execution_events_reject_update'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let head_trigger: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE name = 'agent_execution_heads_enforce_forward_update'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let stored: String = connection
+        .query_row(
+            r#"SELECT envelope_json FROM agent_execution_events
+               WHERE agent_id = 'agent-semantic-tamper'
+                 AND json_extract(envelope_json, '$.fact.data.command.command') = 'model_final'"#,
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut envelope =
+        execution::ExecutionFactEnvelope::from_json_slice(stored.as_bytes()).unwrap();
+    let execution::ExecutionFactData::WorkflowTransition {
+        command: workflows::Command::ModelFinal { content_bytes },
+        ..
+    } = &mut envelope.fact.data
+    else {
+        panic!("the fixture tail must be a model-final fact");
+    };
+    *content_bytes = 1;
+    let envelope = execution::ExecutionFactEnvelope::new(envelope.fact).unwrap();
+    let envelope_json = String::from_utf8(envelope.canonical_json_bytes().unwrap()).unwrap();
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER agent_execution_events_reject_update;
+               DROP TRIGGER agent_execution_heads_enforce_forward_update;"#,
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE agent_execution_events
+               SET fact_digest = ?1, envelope_json = ?2
+               WHERE agent_id = 'agent-semantic-tamper' AND sequence = 3"#,
+            params![envelope.digest.as_str(), envelope_json],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE agent_execution_heads
+               SET head_hash = ?1,
+                   committed_payload_bytes = (
+                       SELECT SUM(length(CAST(envelope_json AS BLOB)))
+                       FROM agent_execution_events
+                       WHERE agent_id = 'agent-semantic-tamper'
+                   )
+               WHERE agent_id = 'agent-semantic-tamper'"#,
+            [envelope.digest.as_str()],
+        )
+        .unwrap();
+    connection.execute_batch(&event_trigger).unwrap();
+    connection.execute_batch(&head_trigger).unwrap();
+    drop(connection);
+
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("semantic fact tampering must fail startup integrity"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StorageError::CorruptData(message)
+            if message.contains("final response")));
+}
+
+#[tokio::test]
+async fn rejection_reason_tampering_fails_reopen_even_with_recomputed_hashes() {
+    let database = TestDatabase::new();
+    {
+        let store = created_owned_file_session_store(database.path()).await;
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: "turn-agent-reason-tamper".into(),
+                    user_message: "Reject changed deployment authority".into(),
+                    expected_sequence: 1,
+                },
+                "agent-reason-tamper-start",
+                agent_turn_spec("agent-reason-tamper", "turn-agent-reason-tamper"),
+            )
+            .await
+            .unwrap();
+        let drifted = mutate_test_agent_manifest(|spec| {
+            spec.provider.provider_id = "tampered-provider".into();
+        });
+        assert!(matches!(
+            store.claim_next_agent_model(&drifted).await.unwrap(),
+            AgentModelClaimOutcome::Rejected(_)
+        ));
+    }
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let event_trigger: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE name = 'agent_execution_events_reject_update'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let head_trigger: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE name = 'agent_execution_heads_enforce_forward_update'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let stored: String = connection
+        .query_row(
+            r#"SELECT envelope_json FROM agent_execution_events
+               WHERE agent_id = 'agent-reason-tamper'
+                 AND json_extract(envelope_json, '$.fact.data.command.command') = 'deployment_unavailable'"#,
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut envelope =
+        execution::ExecutionFactEnvelope::from_json_slice(stored.as_bytes()).unwrap();
+    let execution::ExecutionFactData::WorkflowTransition { command, .. } = &mut envelope.fact.data
+    else {
+        panic!("the fixture tail must be a workflow transition");
+    };
+    *command = workflows::Command::AuthorizationRevoked;
+    let envelope = execution::ExecutionFactEnvelope::new(envelope.fact).unwrap();
+    let envelope_json = String::from_utf8(envelope.canonical_json_bytes().unwrap()).unwrap();
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER agent_execution_events_reject_update;
+               DROP TRIGGER agent_execution_heads_enforce_forward_update;"#,
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE agent_execution_events
+               SET fact_digest = ?1, envelope_json = ?2
+               WHERE agent_id = 'agent-reason-tamper' AND sequence = 2"#,
+            params![envelope.digest.as_str(), envelope_json],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE agent_execution_heads
+               SET head_hash = ?1,
+                   committed_payload_bytes = (
+                       SELECT SUM(length(CAST(envelope_json AS BLOB)))
+                       FROM agent_execution_events
+                       WHERE agent_id = 'agent-reason-tamper'
+                   )
+               WHERE agent_id = 'agent-reason-tamper'"#,
+            [envelope.digest.as_str()],
+        )
+        .unwrap();
+    connection.execute_batch(&event_trigger).unwrap();
+    connection.execute_batch(&head_trigger).unwrap();
+    drop(connection);
+
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("rejection reason tampering must fail startup integrity"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StorageError::CorruptData(message)
+            if message.contains("non-release operation fact disagrees")));
+}
+
+#[tokio::test]
+async fn terminal_proposal_disposition_tampering_fails_with_recomputed_hashes() {
+    let database = TestDatabase::new();
+    {
+        let store = created_owned_file_session_store(database.path()).await;
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: "turn-agent-proposal-tamper".into(),
+                    user_message: "Reach a terminal proposal boundary".into(),
+                    expected_sequence: 1,
+                },
+                "agent-proposal-tamper-start",
+                agent_turn_spec("agent-proposal-tamper", "turn-agent-proposal-tamper"),
+            )
+            .await
+            .unwrap();
+        for ordinal in 1..=5 {
+            let AgentModelClaimOutcome::Claimed(job) = store
+                .claim_next_agent_model(&test_agent_manifest())
+                .await
+                .unwrap()
+            else {
+                panic!("denied model step {ordinal} must be claimable");
+            };
+            let call = agent_tool_call_spec(
+                &format!("agent-call-proposal-tamper-{ordinal}"),
+                PolicyDecision::Deny,
+            );
+            let completion = store
+                .complete_agent_model_success(AgentModelSuccessCommit {
+                    job_id: job.id,
+                    response_json: agent_tool_response_json(&call),
+                    resolution: AgentModelResolution::PolicyDenied {
+                        call: call.clone(),
+                        result_json: json!({
+                            "code": "policy_denied",
+                            "message": format!("denied proposal {ordinal}"),
+                        }),
+                        next_request_json: Some(test_agent_request(json!({
+                            "messages": [{
+                                "role": "tool",
+                                "content": format!("denied proposal {ordinal}"),
+                                "tool_call_id": call.provider_call_id,
+                            }],
+                        }))),
+                    },
+                })
+                .await
+                .unwrap();
+            if ordinal < 5 {
+                assert!(matches!(completion, AgentModelCompletion::ToolCall { .. }));
+            } else {
+                assert!(matches!(completion, AgentModelCompletion::Terminal(_)));
+            }
+        }
+    }
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let event_trigger: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE name = 'agent_execution_events_reject_update'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let head_trigger: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE name = 'agent_execution_heads_enforce_forward_update'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let (sequence, stored): (i64, String) = connection
+        .query_row(
+            r#"SELECT sequence, envelope_json FROM agent_execution_events
+               WHERE agent_id = 'agent-proposal-tamper'
+                 AND json_extract(envelope_json, '$.fact.data.command.command') = 'model_tool_proposal'
+               ORDER BY sequence DESC LIMIT 1"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut envelope =
+        execution::ExecutionFactEnvelope::from_json_slice(stored.as_bytes()).unwrap();
+    let execution::ExecutionFactData::WorkflowTransition { command, .. } = &mut envelope.fact.data
+    else {
+        panic!("the fixture tail must be a workflow transition");
+    };
+    *command = workflows::Command::ModelToolProposal {
+        disposition: workflows::ProposalDisposition::Allow,
+    };
+    let envelope = execution::ExecutionFactEnvelope::new(envelope.fact).unwrap();
+    let envelope_json = String::from_utf8(envelope.canonical_json_bytes().unwrap()).unwrap();
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER agent_execution_events_reject_update;
+               DROP TRIGGER agent_execution_heads_enforce_forward_update;"#,
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE agent_execution_events
+               SET fact_digest = ?1, envelope_json = ?2
+               WHERE agent_id = 'agent-proposal-tamper' AND sequence = ?3"#,
+            params![envelope.digest.as_str(), envelope_json, sequence],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE agent_execution_heads
+               SET head_hash = ?1,
+                   committed_payload_bytes = (
+                       SELECT SUM(length(CAST(envelope_json AS BLOB)))
+                       FROM agent_execution_events
+                       WHERE agent_id = 'agent-proposal-tamper'
+                   )
+               WHERE agent_id = 'agent-proposal-tamper'"#,
+            [envelope.digest.as_str()],
+        )
+        .unwrap();
+    connection.execute_batch(&event_trigger).unwrap();
+    connection.execute_batch(&head_trigger).unwrap();
+    drop(connection);
+
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("terminal proposal disposition tampering must fail startup integrity"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StorageError::CorruptData(message)
+            if message.contains("terminal proposal disagrees")));
+}
+
+#[tokio::test]
+async fn persisted_tool_call_tampering_cannot_diverge_from_the_model_response() {
+    let database = TestDatabase::new();
+    {
+        let store = created_owned_file_session_store(database.path()).await;
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: "turn-agent-call-tamper".into(),
+                    user_message: "Bind the executable call to the model response".into(),
+                    expected_sequence: 1,
+                },
+                "agent-call-tamper-start",
+                agent_turn_spec("agent-call-tamper", "turn-agent-call-tamper"),
+            )
+            .await
+            .unwrap();
+        let AgentModelClaimOutcome::Claimed(job) = store
+            .claim_next_agent_model(&test_agent_manifest())
+            .await
+            .unwrap()
+        else {
+            panic!("the tamper fixture must claim its model");
+        };
+        let call = agent_tool_call_spec("agent-call-input-tamper", PolicyDecision::Allow);
+        store
+            .complete_agent_model_success(AgentModelSuccessCommit {
+                job_id: job.id,
+                response_json: agent_tool_response_json(&call),
+                resolution: AgentModelResolution::ToolCall { call },
+            })
+            .await
+            .unwrap();
+    }
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let input_trigger: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE name = 'agent_tool_calls_reject_input_update'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let forward_trigger: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE name = 'agent_tool_calls_enforce_forward_transition'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let changed_arguments = json!({"path": ".", "depth": 3});
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER agent_tool_calls_reject_input_update;
+               DROP TRIGGER agent_tool_calls_enforce_forward_transition;"#,
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE agent_tool_calls
+               SET arguments_json = ?1, arguments_digest = ?2
+               WHERE call_id = 'agent-call-input-tamper'"#,
+            params![
+                serde_json::to_string(&changed_arguments).unwrap(),
+                tools::arguments_digest(&changed_arguments),
+            ],
+        )
+        .unwrap();
+    connection.execute_batch(&input_trigger).unwrap();
+    connection.execute_batch(&forward_trigger).unwrap();
+    drop(connection);
+
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("a durable call that diverges from its model response must fail startup"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StorageError::CorruptData(message)
+            if message.contains("response disagrees with tool call")));
 }
 
 #[tokio::test]
@@ -12016,7 +13692,7 @@ async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempot
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, (1_i64..=19).collect::<Vec<_>>());
+    assert_eq!(versions, (1_i64..=20).collect::<Vec<_>>());
     assert_eq!(
         connection
             .query_row(
@@ -13195,6 +14871,9 @@ fn drop_v17_fixture_objects(connection: &rusqlite::Connection) {
             row.get(0)
         })
         .unwrap();
+    if version >= 20 {
+        drop_v20_fixture_objects(connection);
+    }
     if version >= 19 {
         downgrade_agent_deployment_manifest_fixture_to_v18(connection);
     }
@@ -14480,6 +16159,14 @@ async fn v18_waiting_approval_manifest_fixture(
 }
 
 fn downgrade_agent_deployment_manifest_fixture_to_v18(connection: &rusqlite::Connection) {
+    let version: i64 = connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    if version >= 20 {
+        drop_v20_fixture_objects(connection);
+    }
     connection
         .execute_batch(
             r#"DROP TRIGGER agent_turns_require_deployment_manifest;
@@ -14500,6 +16187,44 @@ fn downgrade_agent_deployment_manifest_fixture_to_v18(connection: &rusqlite::Con
                DELETE FROM schema_migrations WHERE version = 19;"#,
         )
         .unwrap();
+}
+
+fn drop_v20_fixture_objects(connection: &rusqlite::Connection) {
+    let model_trigger = migration_trigger_sql(
+        include_str!("../migrations/0017_session_agent_loop.sql"),
+        "agent_model_jobs_enforce_forward_transition",
+    );
+    let tool_trigger = migration_trigger_sql(
+        include_str!("../migrations/0018_agent_tool_completion_replay.sql"),
+        "agent_tool_calls_enforce_forward_transition",
+    );
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER schema_migrations_reject_update;
+               DROP TRIGGER schema_migrations_reject_delete;
+               DROP TRIGGER agent_model_jobs_enforce_forward_transition;
+               DROP TRIGGER agent_tool_calls_enforce_forward_transition;
+               DROP TABLE agent_execution_heads;
+               DROP TABLE agent_execution_events;
+               DROP TABLE agent_run_epochs;
+               DELETE FROM schema_migrations WHERE version = 20;"#,
+        )
+        .unwrap();
+    connection.execute_batch(model_trigger).unwrap();
+    connection.execute_batch(tool_trigger).unwrap();
+}
+
+fn migration_trigger_sql(migration: &'static str, name: &str) -> &'static str {
+    let marker = format!("CREATE TRIGGER {name}\n");
+    let start = migration
+        .find(&marker)
+        .unwrap_or_else(|| panic!("migration is missing trigger `{name}`"));
+    let trigger = &migration[start..];
+    let end = trigger
+        .find("\nEND;")
+        .unwrap_or_else(|| panic!("migration trigger `{name}` is unterminated"))
+        + "\nEND;".len();
+    &trigger[..end]
 }
 
 fn force_agent_tool_completion_binding(path: &Path, call_id: &str, binding_json: &str) {

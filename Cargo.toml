@@ -34,6 +34,7 @@ zeroize = "1.8.1"
 authz = { path = "crates/authz" }
 connectors = { path = "crates/connectors" }
 deployment = { path = "crates/deployment" }
+execution = { path = "crates/execution" }
 kernel = { path = "crates/kernel" }
 llm = { path = "crates/llm" }
 protocol = { path = "crates/protocol" }

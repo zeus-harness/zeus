@@ -376,7 +376,16 @@ impl State {
                 invariant: StateInvariant::PhaseCounterMismatch,
             });
         }
-        if self.status != AgentStatus::ModelQueued && self.model_steps == 0 {
+        if self.status != AgentStatus::ModelQueued
+            && self.model_steps == 0
+            && !matches!(
+                (self.status, self.terminal_reason),
+                (
+                    AgentStatus::Failed,
+                    Some(TerminalReason::AuthorizationRevoked)
+                )
+            )
+        {
             return Err(Error::InvalidState {
                 invariant: StateInvariant::PhaseCounterMismatch,
             });
@@ -446,7 +455,12 @@ pub fn reduce(state: &State, command: Command) -> Result<Transition, Error> {
         Command::AuthorizationRevoked => {
             require_one_of(
                 state,
-                &[AgentStatus::ModelStarted, AgentStatus::ToolStarted],
+                &[
+                    AgentStatus::ModelQueued,
+                    AgentStatus::ModelStarted,
+                    AgentStatus::ToolQueued,
+                    AgentStatus::ToolStarted,
+                ],
                 command_kind,
             )?;
             next_transition(
@@ -462,6 +476,7 @@ pub fn reduce(state: &State, command: Command) -> Result<Transition, Error> {
             require_one_of(
                 state,
                 &[
+                    AgentStatus::ModelQueued,
                     AgentStatus::ModelStarted,
                     AgentStatus::WaitingApproval,
                     AgentStatus::ToolQueued,
@@ -1116,7 +1131,12 @@ mod tests {
 
     #[test]
     fn revoked_authority_fails_before_any_new_external_call() {
-        for state in [started_model(), started_tool()] {
+        for state in [
+            State::default(),
+            started_model(),
+            queued_tool(),
+            started_tool(),
+        ] {
             let revoked = apply(state, Command::AuthorizationRevoked);
             assert_eq!(revoked.state().status(), AgentStatus::Failed);
             assert_eq!(
@@ -1161,13 +1181,9 @@ mod tests {
             assert_eq!(rejected.emitted_result(), None);
         }
 
-        assert!(matches!(
-            reduce(&State::default(), Command::DeploymentUnavailable),
-            Err(Error::InvalidTransition {
-                status: AgentStatus::ModelQueued,
-                command: CommandKind::DeploymentUnavailable,
-            })
-        ));
+        let queued = apply(State::default(), Command::DeploymentUnavailable);
+        assert_eq!(queued.state().status(), AgentStatus::Failed);
+        assert_eq!(queued.external_call(), None);
     }
 
     #[test]

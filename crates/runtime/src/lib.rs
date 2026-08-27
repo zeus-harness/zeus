@@ -22,6 +22,7 @@ use chrono::{SecondsFormat, Utc};
 use connectors::{ConnectorConfigError, LOCAL_DEV_ENVIRONMENT, register_local_dev_connectors};
 pub use deployment::ManifestEnvelope;
 use deployment::{AgentDeployment, AgentSpec, ManifestPolicy, ManifestProvider, ManifestTool};
+pub use execution::{AgentExecutionExplain, AgentRunEpochExplain};
 use kernel::{
     DemoScenario, KernelError, LOCAL_POLICY_REVISION, PRODUCTION_POLICY_REVISION, apply_review,
     apply_tool_result, start_tool_dispatch,
@@ -1887,6 +1888,64 @@ impl DemoStore {
             })?;
         }
         Ok(manifest)
+    }
+
+    /// Return one authenticated, account-scoped explanation of the complete
+    /// durable Agent execution history observed at a single storage watermark.
+    pub async fn agent_execution_explain_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<AgentExecutionExplain, StoreError> {
+        validate_durable_reference(session_id, "session ID")?;
+        validate_durable_reference(turn_id, "turn ID")?;
+        let explanation = self
+            .storage
+            .agent_execution_explain_for_actor(context, session_id, turn_id)
+            .await
+            .map_err(|error| match error {
+                StorageError::CorruptData(detail) => StoreError::ExecutionInvariant(detail),
+                other => StoreError::from(other),
+            })?;
+        explanation.validate().map_err(|error| {
+            StoreError::ExecutionInvariant(format!(
+                "invalid persisted Session Agent execution explanation: {error}"
+            ))
+        })?;
+        Ok(explanation)
+    }
+
+    /// Return the exact persisted request and outcome for one authenticated
+    /// model RunEpoch. Reconstruction never authorizes provider re-execution.
+    pub async fn agent_run_epoch_explain_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        turn_id: &str,
+        step: u32,
+    ) -> Result<AgentRunEpochExplain, StoreError> {
+        validate_durable_reference(session_id, "session ID")?;
+        validate_durable_reference(turn_id, "turn ID")?;
+        if step == 0 {
+            return Err(StoreError::InvalidAgentTransition(
+                "Agent model step must be greater than zero".into(),
+            ));
+        }
+        let explanation = self
+            .storage
+            .agent_run_epoch_explain_for_actor(context, session_id, turn_id, step)
+            .await
+            .map_err(|error| match error {
+                StorageError::CorruptData(detail) => StoreError::ExecutionInvariant(detail),
+                other => StoreError::from(other),
+            })?;
+        explanation.validate().map_err(|error| {
+            StoreError::ExecutionInvariant(format!(
+                "invalid persisted Session Agent RunEpoch explanation: {error}"
+            ))
+        })?;
+        Ok(explanation)
     }
 
     /// Load the server-owned transcript required to derive an approval

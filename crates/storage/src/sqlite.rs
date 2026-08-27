@@ -29,6 +29,7 @@ use sha2::{Digest, Sha256};
 
 use crate::cursor;
 mod agent;
+mod execution;
 use crate::operation::{OperationClass, OperationLimiter};
 use crate::{
     AccountAuditArchiveState, AccountAuditCheckpointCommit, AccountAuditEvent, AccountAuditPage,
@@ -49,7 +50,7 @@ use crate::{
     UpdateAccountAuditPolicyCommit,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 19;
+const CURRENT_SCHEMA_VERSION: i64 = 20;
 const LOCAL_ACCOUNT_ID: &str = "acc_local";
 const EVENT_PAYLOAD_VERSION_V1: i64 = 1;
 const EVENT_PAYLOAD_VERSION_V2: i64 = 2;
@@ -75,6 +76,7 @@ const MIGRATION_0016: &str = include_str!("../migrations/0016_session_reply_cont
 const MIGRATION_0017: &str = include_str!("../migrations/0017_session_agent_loop.sql");
 const MIGRATION_0018: &str = include_str!("../migrations/0018_agent_tool_completion_replay.sql");
 const MIGRATION_0019: &str = include_str!("../migrations/0019_agent_deployment_manifest.sql");
+const MIGRATION_0020: &str = include_str!("../migrations/0020_agent_execution_ledger.sql");
 const RECOVERY_BATCH_LIMIT: i64 = 64;
 const AUTH_SESSION_CLEANUP_BATCH_LIMIT: i64 = 64;
 const BOOTSTRAP_AUDIT_ROLLUP_BATCH_LIMIT: i64 = 64;
@@ -225,7 +227,7 @@ impl SqliteStore {
                     configure_connection(&connection, false, None)?;
                     migrate(&mut connection, &migration_limits)?;
                     cleanup_unusable_auth_sessions(&mut connection, &now())?;
-                    deep_readiness(&mut connection, false, None)?;
+                    deep_readiness(&connection, false, None)?;
                     Ok::<_, StorageError>(connection)
                 })();
                 drop(permits);
@@ -277,7 +279,7 @@ impl SqliteStore {
                     )?;
                     cleanup_unusable_auth_sessions(&mut connection, &now())?;
                     checkpoint_wal(&connection)?;
-                    deep_readiness(&mut connection, true, Some(&backend_physical_limits))?;
+                    deep_readiness(&connection, true, Some(&backend_physical_limits))?;
                     Ok::<_, StorageError>(FileBackend {
                         path,
                         physical_limits: backend_physical_limits,
@@ -1459,11 +1461,15 @@ impl SqliteStore {
         let expects_wal = matches!(self.backend, Backend::File(_));
         let physical_limits = self.physical_limits.clone();
         self.with_connection(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
             deep_readiness(
-                connection,
+                &transaction,
                 expects_wal,
                 expects_wal.then_some(&physical_limits),
-            )
+            )?;
+            transaction.commit()?;
+            Ok(())
         })
         .await
     }
@@ -2782,6 +2788,16 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
             params![19, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 20 {
+        transaction.execute_batch(MIGRATION_0020)?;
+        let applied_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        execution::backfill_legacy_execution_ledgers(&transaction, &applied_at)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![20, applied_at],
+        )?;
+        execution::verify_agent_execution_integrity(&transaction)?;
+    }
     validate_configured_account_audit_policies(&transaction, limits)?;
     compact_existing_bootstrap_audit_to_capacity(&transaction, &now(), limits)?;
     transaction.commit()?;
@@ -3308,7 +3324,7 @@ fn validate_migrated_run_ledgers(connection: &Connection) -> Result<(), StorageE
 }
 
 fn readiness(
-    connection: &mut Connection,
+    connection: &Connection,
     expects_wal: bool,
     physical_limits: Option<&SqlitePhysicalLimits>,
     require_admission: bool,
@@ -3378,12 +3394,13 @@ fn readiness(
                'account_audit_policies', 'account_audit_archive_state',
                'account_audit_events', 'agent_turns', 'agent_model_jobs',
                'agent_tool_calls', 'agent_review_receipts',
-               'agent_deployment_manifests'
+               'agent_deployment_manifests', 'agent_run_epochs',
+               'agent_execution_events', 'agent_execution_heads'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if table_count != 32 {
+    if table_count != 35 {
         return Err(StorageError::CorruptData(
             "one or more required tables are missing".into(),
         ));
@@ -3470,6 +3487,34 @@ fn readiness(
         ));
     }
 
+    let agent_execution_columns: i64 = connection.query_row(
+        r#"SELECT
+               (SELECT COUNT(*) FROM pragma_table_info('agent_run_epochs')
+                WHERE name IN (
+                    'digest', 'agent_id', 'workflow_revision', 'operation_kind',
+                    'model_job_id', 'tool_call_id', 'bound_manifest_digest',
+                    'observed_manifest_digest', 'input_digest', 'envelope_json'
+                ))
+             + (SELECT COUNT(*) FROM pragma_table_info('agent_execution_events')
+                WHERE name IN (
+                    'agent_id', 'sequence', 'fact_digest', 'previous_fact_digest',
+                    'fact_kind', 'agent_revision', 'epoch_digest', 'envelope_json'
+                ))
+             + (SELECT COUNT(*) FROM pragma_table_info('agent_execution_heads')
+                WHERE name IN (
+                    'agent_id', 'head_sequence', 'projected_agent_revision',
+                    'history_origin', 'history_complete', 'head_hash',
+                    'committed_payload_bytes'
+                ))"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if agent_execution_columns != 25 {
+        return Err(StorageError::CorruptData(
+            "Agent execution ledger schema is missing".into(),
+        ));
+    }
+
     let event_lookup_columns: i64 = connection.query_row(
         r#"SELECT COUNT(*) FROM pragma_table_info('run_events')
            WHERE name IN (
@@ -3553,12 +3598,19 @@ fn readiness(
                'agent_tool_calls_ready_idx',
                'agent_tool_calls_started_idx',
                'agent_tool_calls_one_live_idx',
-               'agent_turns_deployment_manifest_idx'
+               'agent_turns_deployment_manifest_idx',
+               'agent_run_epochs_model_job_idx',
+               'agent_run_epochs_tool_call_idx',
+               'agent_run_epochs_agent_revision_idx',
+               'agent_run_epochs_agent_created_idx',
+               'agent_execution_events_digest_idx',
+               'agent_execution_events_epoch_idx',
+               'agent_execution_events_operation_idx'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if point_query_indexes != 50 {
+    if point_query_indexes != 57 {
         return Err(StorageError::CorruptData(
             "one or more point-query indexes are missing".into(),
         ));
@@ -3666,12 +3718,25 @@ fn readiness(
                'agent_review_receipts_reject_delete',
                'agent_deployment_manifests_reject_update',
                'agent_deployment_manifests_reject_delete',
-               'agent_turns_require_deployment_manifest'
+               'agent_turns_require_deployment_manifest',
+               'agent_run_epochs_require_release_binding',
+               'agent_run_epochs_reject_update',
+               'agent_run_epochs_reject_delete',
+               'agent_execution_events_reject_update',
+               'agent_execution_events_reject_delete',
+               'agent_execution_events_require_next_sequence',
+               'agent_execution_events_require_chain',
+               'agent_execution_events_require_epoch_binding',
+               'agent_execution_heads_require_origin',
+               'agent_execution_heads_enforce_forward_update',
+               'agent_execution_heads_reject_delete',
+               'schema_migrations_reject_update',
+               'schema_migrations_reject_delete'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 100 {
+    if trigger_count != 113 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
         ));
@@ -3990,6 +4055,7 @@ fn readiness(
         ));
     }
     agent::verify_agent_deployment_manifest_integrity(connection)?;
+    execution::verify_agent_execution_integrity(connection)?;
     let (user_count, owner_count): (i64, i64) = connection.query_row(
         r#"SELECT (SELECT COUNT(*) FROM users),
                   (SELECT COUNT(*)
@@ -4411,7 +4477,7 @@ fn verify_account_audit_state(
 }
 
 fn deep_readiness(
-    connection: &mut Connection,
+    connection: &Connection,
     expects_wal: bool,
     physical_limits: Option<&SqlitePhysicalLimits>,
 ) -> Result<(), StorageError> {

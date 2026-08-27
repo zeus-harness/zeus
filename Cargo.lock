@@ -304,6 +304,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "execution"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "deployment",
+ "protocol",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "workflows",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1017,6 +1031,7 @@ dependencies = [
  "chrono",
  "connectors",
  "deployment",
+ "execution",
  "kernel",
  "protocol",
  "rusqlite",
@@ -1224,6 +1239,7 @@ dependencies = [
  "base64",
  "chrono",
  "deployment",
+ "execution",
  "fs2",
  "kernel",
  "protocol",
@@ -1883,6 +1899,7 @@ dependencies = [
  "axum",
  "chrono",
  "deployment",
+ "execution",
  "http-body-util",
  "kernel",
  "llm",

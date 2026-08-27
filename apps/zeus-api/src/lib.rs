@@ -27,6 +27,7 @@ use axum::{
     routing::{get, post},
 };
 use deployment::{ManifestDiff, ManifestEnvelope};
+use execution::{AgentExecutionExplain, AgentRunEpochExplain};
 #[cfg(test)]
 use llm::ReplyRole;
 use llm::{
@@ -763,6 +764,18 @@ fn build_authenticated_app(state: ApiState) -> Router {
             get(agent_deployment_explain),
         )
         .route(
+            "/api/v1/sessions/{id}/turns/{turn_id}/agent/deployment/explain",
+            get(agent_deployment_explain),
+        )
+        .route(
+            "/api/v1/sessions/{id}/turns/{turn_id}/agent/execution/explain",
+            get(agent_execution_explain),
+        )
+        .route(
+            "/api/v1/sessions/{id}/turns/{turn_id}/agent/execution/epochs/{step}",
+            get(agent_run_epoch_explain),
+        )
+        .route(
             "/api/v1/sessions/{id}/turns/{turn_id}/approvals/{call_id}/decision",
             post(agent_review_decision),
         )
@@ -893,6 +906,18 @@ fn build_test_app(state: ApiState, request_auth: TestRequestAuth) -> Router {
         .route(
             "/api/v1/sessions/{id}/turns/{turn_id}/agent/explain",
             get(agent_deployment_explain),
+        )
+        .route(
+            "/api/v1/sessions/{id}/turns/{turn_id}/agent/deployment/explain",
+            get(agent_deployment_explain),
+        )
+        .route(
+            "/api/v1/sessions/{id}/turns/{turn_id}/agent/execution/explain",
+            get(agent_execution_explain),
+        )
+        .route(
+            "/api/v1/sessions/{id}/turns/{turn_id}/agent/execution/epochs/{step}",
+            get(agent_run_epoch_explain),
         )
         .route(
             "/api/v1/sessions/{id}/turns/{turn_id}/approvals/{call_id}/decision",
@@ -3172,15 +3197,21 @@ async fn agent_deployment_explain(
     let agent = state
         .store
         .agent_turn_detail_for_actor(&current.principal.authz, &id, &turn_id)
-        .await?;
+        .await
+        .map_err(ApiError::from)
+        .map_err(ApiError::with_no_store)?;
     let persisted_manifest = state
         .store
         .agent_deployment_manifest_for_actor(&current.principal.authz, &id, &turn_id)
-        .await?;
-    let executor = reply_executor(&state)?;
+        .await
+        .map_err(ApiError::from)
+        .map_err(ApiError::with_no_store)?;
+    let executor = reply_executor(&state).map_err(ApiError::with_no_store)?;
     validate_provider_metadata(executor.provider.metadata())
         .map_err(ApiError::reply_unavailable)?;
-    let current_manifest = current_agent_manifest(&state.store, executor)?;
+    let current_manifest = current_agent_manifest(&state.store, executor)
+        .map_err(ApiError::from)
+        .map_err(ApiError::with_no_store)?;
     let legacy_unbound = persisted_manifest.is_none();
     let matches_current = persisted_manifest
         .as_ref()
@@ -3200,6 +3231,53 @@ async fn agent_deployment_explain(
         matches_current,
         diff,
     })
+}
+
+async fn agent_execution_explain(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    Path((id, turn_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let explanation: AgentExecutionExplain = state
+        .store
+        .agent_execution_explain_for_actor(&current.principal.authz, &id, &turn_id)
+        .await
+        .map_err(ApiError::from)
+        .map_err(ApiError::with_no_store)?;
+    json_no_store(explanation)
+}
+
+async fn agent_run_epoch_explain(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    Path((id, turn_id, step)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    // Resolve account authority before reporting path-specific validation so a
+    // foreign Session remains indistinguishable from a missing Session.
+    state
+        .store
+        .authorize_session_for_actor(&current.principal.authz, &id)
+        .await
+        .map_err(ApiError::from)
+        .map_err(ApiError::with_no_store)?;
+    let step = step
+        .parse::<u32>()
+        .ok()
+        .filter(|step| *step > 0)
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "invalid_agent_epoch_step",
+                "Agent model step must be a positive integer",
+            )
+            .with_no_store()
+        })?;
+    let explanation: AgentRunEpochExplain = state
+        .store
+        .agent_run_epoch_explain_for_actor(&current.principal.authz, &id, &turn_id, step)
+        .await
+        .map_err(ApiError::from)
+        .map_err(ApiError::with_no_store)?;
+    json_no_store(explanation)
 }
 
 async fn resume_session(
@@ -6620,6 +6698,110 @@ mod tests {
             );
         }
 
+        let deployment_alias = app
+            .clone()
+            .oneshot(
+                Request::get(
+                    "/api/v1/sessions/session-reply-context/turns/turn-context-2/agent/deployment/explain",
+                )
+                .header(header::HOST, "zeus.test")
+                .header(header::COOKIE, &owner.cookie_header)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deployment_alias.status(), StatusCode::OK);
+        assert_eq!(
+            deployment_alias.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        let deployment_alias: AgentDeploymentExplainResponse =
+            response_json(deployment_alias).await;
+        assert_eq!(deployment_alias.current_manifest.digest, manifest_digest);
+
+        let execution = app
+            .clone()
+            .oneshot(
+                Request::get(
+                    "/api/v1/sessions/session-reply-context/turns/turn-context-2/agent/execution/explain",
+                )
+                .header(header::HOST, "zeus.test")
+                .header(header::COOKIE, &owner.cookie_header)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(execution.status(), StatusCode::OK);
+        assert_eq!(
+            execution.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        let execution: AgentExecutionExplain = response_json(execution).await;
+        execution.validate().unwrap();
+        assert_eq!(execution.agent.id, agent.id);
+        assert_eq!(
+            execution
+                .manifest
+                .as_ref()
+                .map(|manifest| manifest.digest.as_str()),
+            Some(manifest_digest.as_str())
+        );
+        assert_eq!(execution.epochs.len(), 1);
+        assert!(!execution.facts.is_empty());
+
+        let epoch = app
+            .clone()
+            .oneshot(
+                Request::get(
+                    "/api/v1/sessions/session-reply-context/turns/turn-context-2/agent/execution/epochs/1",
+                )
+                .header(header::HOST, "zeus.test")
+                .header(header::COOKIE, &owner.cookie_header)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(epoch.status(), StatusCode::OK);
+        assert_eq!(
+            epoch.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        let epoch: AgentRunEpochExplain = response_json(epoch).await;
+        epoch.validate().unwrap();
+        assert_eq!(epoch.agent_id, agent.id);
+        assert_eq!(
+            epoch.request.kind,
+            execution::ExactMaterialKind::ModelRequest
+        );
+        assert!(matches!(
+            epoch.outcome,
+            execution::EpochOutcomeMaterial::Succeeded { .. }
+        ));
+
+        let invalid_epoch = app
+            .clone()
+            .oneshot(
+                Request::get(
+                    "/api/v1/sessions/session-reply-context/turns/turn-context-2/agent/execution/epochs/not-a-step",
+                )
+                .header(header::HOST, "zeus.test")
+                .header(header::COOKIE, &owner.cookie_header)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_epoch.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            invalid_epoch.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        let invalid_epoch: ProblemDetails = response_json(invalid_epoch).await;
+        assert_eq!(invalid_epoch.code, "invalid_agent_epoch_step");
+
         let recorded = requests.lock().unwrap().clone();
         assert_eq!(
             recorded.len(),
@@ -8111,6 +8293,50 @@ mod tests {
             .unwrap();
         assert_eq!(detail.status(), StatusCode::NOT_FOUND);
         let problem: ProblemDetails = response_json(detail).await;
+        assert_eq!(problem.code, "session_not_found");
+
+        let foreign_execution_explain = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/sessions/{session_id}/turns/turn-cross-actor/agent/execution/explain"
+                ))
+                .header(header::HOST, "zeus.test")
+                .header(header::COOKIE, &alice.cookie_header)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(foreign_execution_explain.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            foreign_execution_explain
+                .headers()
+                .get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        let problem: ProblemDetails = response_json(foreign_execution_explain).await;
+        assert_eq!(problem.code, "session_not_found");
+
+        let malformed_foreign_epoch = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/sessions/{session_id}/turns/turn-cross-actor/agent/execution/epochs/not-a-step"
+                ))
+                .header(header::HOST, "zeus.test")
+                .header(header::COOKIE, &alice.cookie_header)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(malformed_foreign_epoch.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            malformed_foreign_epoch.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        let problem: ProblemDetails = response_json(malformed_foreign_epoch).await;
         assert_eq!(problem.code, "session_not_found");
 
         let malformed_foreign_cursor = app
