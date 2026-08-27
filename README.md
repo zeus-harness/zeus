@@ -15,8 +15,8 @@ profile has no RDS executor: approving the illustrated change is durably
 recorded, then settles as `not_dispatched / executor_unavailable` without a
 production side effect. An explicit `local-development` profile provides a
 path-constrained marker executor and can additionally register rooted,
-read-only workspace discovery and file-reading tools for testing a useful
-complete Agent loop. Restate,
+read-only workspace discovery, literal text search, and file-reading tools for
+testing a useful complete Agent loop. Restate,
 MinIO, the networkless tool sandbox, and optional PostgreSQL are development
 topology for later milestones; they are not application state authorities.
 
@@ -235,10 +235,13 @@ drain cycle instead of spawning mutex waiters without a bound.
 
 To exercise the local connectors, use a separate database and explicit fixed
 roots. The marker caller cannot choose a path. `workspace_list_directory`
-lists at most 64 sorted entries from one canonical relative directory below the
-configured workspace, while `workspace_read_file` reads at most 8 KiB from one
-canonical relative UTF-8 regular file. Both workspace tools reject traversal
-and symlinked path components. None of these connectors can invoke a host
+lists at most 64 sorted entries from one canonical relative directory.
+`workspace_search_text` searches literal text deterministically below one such
+directory, retaining at most 32 matches while bounding directories, files,
+depth, per-file bytes, and total bytes; it skips `.git`, `.svelte-kit`, `.zeus`,
+`node_modules`, `target`, and `dist`. `workspace_read_file` reads at most 8 KiB
+from one canonical relative UTF-8 regular file. All workspace tools reject
+traversal and never follow symlinks. None of these connectors can invoke a host
 command:
 
 ```sh
@@ -925,8 +928,8 @@ prompt governance:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 553 tests passed
-  under the existing project counting convention, including 10 connector tests,
+- `cargo test --workspace --all-targets --locked`: 555 tests passed
+  under the existing project counting convention, including 12 connector tests,
   8 deployment tests, 29 knowledge tests, 248 storage tests, 48 runtime tests,
   67 API library tests, 6 API main/config
   tests, and the real
@@ -978,8 +981,8 @@ prompt governance:
   or conflict detection for a committed dispatch terminal acknowledgement. The
   rooted workspace connectors additionally cover traversal, symlink, UTF-8,
   regular-file, 8 KiB file and 64-entry directory rejection, deterministic
-  directory ordering, plus an automatic list-directory to read-file to model
-  continuation through the real Agent worker chain.
+  directory ordering, bounded literal search, plus an automatic search-to-read
+  to-model continuation through the real Agent worker chain.
 - `pnpm --filter web test`: 28 tests passed for CSRF headers, stable command
   identity, deep-page active-Session restore, Session-list cursor encoding and
   deduplication, bounded-tail retry reconciliation and Session-switch race

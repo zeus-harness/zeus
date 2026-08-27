@@ -6831,13 +6831,14 @@ mod tests {
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
     }
 
-    struct WorkspaceReadThenFinalProvider {
+    struct WorkspaceSearchThenFinalProvider {
         metadata: ProviderMetadata,
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
     }
 
     const TEST_WORKSPACE_READ_FILE_TOOL_NAME: &str = "workspace_read_file";
     const TEST_WORKSPACE_LIST_DIRECTORY_TOOL_NAME: &str = "workspace_list_directory";
+    const TEST_WORKSPACE_SEARCH_TEXT_TOOL_NAME: &str = "workspace_search_text";
 
     struct HistoryThenToolProvider {
         metadata: ProviderMetadata,
@@ -6933,11 +6934,11 @@ mod tests {
         }
     }
 
-    impl WorkspaceReadThenFinalProvider {
+    impl WorkspaceSearchThenFinalProvider {
         fn new(requests: Arc<StdMutex<Vec<ReplyRequest>>>) -> Self {
             Self {
                 metadata: ProviderMetadata {
-                    provider_id: "test-workspace-read-provider".into(),
+                    provider_id: "test-workspace-search-provider".into(),
                     model: Some("test-model".into()),
                     reply_kind: ReplyKind::Model,
                 },
@@ -6946,7 +6947,7 @@ mod tests {
         }
     }
 
-    impl ReplyProvider for WorkspaceReadThenFinalProvider {
+    impl ReplyProvider for WorkspaceSearchThenFinalProvider {
         fn metadata(&self) -> &ProviderMetadata {
             &self.metadata
         }
@@ -6969,11 +6970,20 @@ mod tests {
                                 .iter()
                                 .any(|tool| tool.name == TEST_WORKSPACE_LIST_DIRECTORY_TOOL_NAME)
                         );
+                        assert!(
+                            request
+                                .tools
+                                .iter()
+                                .any(|tool| tool.name == TEST_WORKSPACE_SEARCH_TEXT_TOOL_NAME)
+                        );
                         ReplyOutput::ToolCall {
                             call: ReplyToolCall::new(
-                                "provider-call-workspace-list-1",
-                                TEST_WORKSPACE_LIST_DIRECTORY_TOOL_NAME,
-                                serde_json::json!({ "path": "." }),
+                                "provider-call-workspace-search-1",
+                                TEST_WORKSPACE_SEARCH_TEXT_TOOL_NAME,
+                                serde_json::json!({
+                                    "path": ".",
+                                    "query": "governed_workspace",
+                                }),
                             ),
                         }
                     }
@@ -7841,7 +7851,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_only_workspace_tool_executes_without_approval_and_is_replayed_to_the_model() {
+    async fn read_only_workspace_search_and_read_execute_without_approval_and_replay_exactly() {
         let unique = UserId::generate().unwrap();
         let root = std::env::temp_dir().join(format!(
             "zeus-api-workspace-read-{}",
@@ -7875,7 +7885,7 @@ mod tests {
         let app = authenticated_app_with_provider(
             store.clone(),
             false,
-            Arc::new(WorkspaceReadThenFinalProvider::new(Arc::clone(&requests))),
+            Arc::new(WorkspaceSearchThenFinalProvider::new(Arc::clone(&requests))),
         )
         .unwrap();
 
@@ -7892,7 +7902,7 @@ mod tests {
                     .body(Body::from(
                         serde_json::json!({
                             "turn_id": "turn-workspace-read",
-                            "user_message": "read the governed workspace file",
+                            "user_message": "find and read the governed workspace function",
                             "expected_sequence": 1,
                         })
                         .to_string(),
@@ -7919,12 +7929,22 @@ mod tests {
         assert_eq!(agent.model_steps, 3);
         assert_eq!(agent.tool_calls, 2);
         assert_eq!(agent.calls.len(), 2);
-        assert_eq!(agent.calls[0].tool, TEST_WORKSPACE_LIST_DIRECTORY_TOOL_NAME);
+        assert_eq!(agent.calls[0].tool, TEST_WORKSPACE_SEARCH_TEXT_TOOL_NAME);
         assert_eq!(
             agent.calls[0].output,
             Some(serde_json::json!({
                 "path": ".",
-                "entries": [{ "name": "src", "kind": "directory" }],
+                "query": "governed_workspace",
+                "matches": [{
+                    "path": "src/lib.rs",
+                    "line": 1,
+                    "text": "pub fn governed_workspace() {}",
+                }],
+                "truncated": false,
+                "scanned_directories": 2,
+                "scanned_files": 1,
+                "scanned_bytes": 31,
+                "skipped_entries": 0,
             }))
         );
         assert_eq!(agent.calls[1].tool, TEST_WORKSPACE_READ_FILE_TOOL_NAME);
@@ -7945,10 +7965,10 @@ mod tests {
 
         let recorded = requests.lock().unwrap().clone();
         assert_eq!(recorded.len(), 3);
-        let list_result = recorded[1].messages.last().unwrap();
-        assert_eq!(list_result.role, ReplyRole::Tool);
+        let search_result = recorded[1].messages.last().unwrap();
+        assert_eq!(search_result.role, ReplyRole::Tool);
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&list_result.content).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&search_result.content).unwrap(),
             agent.calls[0].output.clone().unwrap()
         );
         let read_result = recorded[2].messages.last().unwrap();

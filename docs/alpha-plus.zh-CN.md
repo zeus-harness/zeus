@@ -219,11 +219,12 @@ POST /sessions/{id}/turns
 - Provider 调用前必须存在同一 prepared claim 对应的 durable `started` checkpoint。
 - `queued` job 可在重启后继续；`started` 且无持久结果的 job 变为 `outcome_unknown`，不得自动重放可能计费的模型请求。
 - Provider 失败必须形成明确的 durable failure/interrupted 状态，不能做空 flush，也不能伪造 assistant 成功。
-- `local-development` 可显式配置 capability-rooted `workspace_list_directory` 与
-  `workspace_read_file`：模型可先列出根内 canonical relative directory 的至多 64 个排序子项，
-  再读取 canonical relative path 对应的 UTF-8 普通文件，最多 8 KiB；穿越、symlink、越界目录
-  或内容在 connector 内 fail closed。两者以 read-only policy 自动执行，结果仍按 exact tool
-  completion 持久化后再进入下一模型步骤；没有 shell 或隐式写权限。
+- `local-development` 可显式配置 capability-rooted `workspace_list_directory`、
+  `workspace_search_text` 与 `workspace_read_file`：模型可列出根内 canonical relative directory
+  的至多 64 个排序子项，以固定目录/文件/深度/字节预算查找至多 32 个字面量文本匹配，再读取
+  canonical relative path 对应的 UTF-8 普通文件，最多 8 KiB；穿越、symlink、越界目录或内容在
+  connector 内 fail closed。三者以 read-only policy 自动执行，结果仍按 exact tool completion
+  持久化后再进入下一模型步骤；没有 shell、外部进程或隐式写权限。
 - 本地 fallback 只说明“消息已保存但未配置模型”，事件必须标注 `local-fallback/non-model`，不能冒充智能回复。
 - OpenAI-compatible provider 限制连接/总超时、响应体大小，禁止重定向，并对非 2xx、畸形 JSON 和空 choices fail closed。
 
@@ -367,7 +368,7 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 按项目既有统计口径通过 553 个 Rust 测试（connectors 10、deployment 8、knowledge 29、
+- host 按项目既有统计口径通过 555 个 Rust 测试（connectors 12、deployment 8、knowledge 29、
   storage 248、runtime 48、API library 67、API main/config 6）与 28 个 Web Node 测试。
 - `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 

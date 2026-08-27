@@ -22,7 +22,7 @@ use chrono::{SecondsFormat, Utc};
 use connectors::{
     ConnectorConfigError, LOCAL_DEV_ENVIRONMENT, register_local_dev_connectors,
     register_local_workspace_connectors, workspace_list_directory_descriptor,
-    workspace_read_file_descriptor,
+    workspace_read_file_descriptor, workspace_search_text_descriptor,
 };
 pub use deployment::ManifestEnvelope;
 use deployment::{
@@ -3215,6 +3215,7 @@ impl RuntimeComponents {
                     for descriptor in [
                         workspace_list_directory_descriptor(),
                         workspace_read_file_descriptor(),
+                        workspace_search_text_descriptor(),
                     ] {
                         policy_rules.push(PolicyRule {
                             revision: LOCAL_POLICY_REVISION.into(),

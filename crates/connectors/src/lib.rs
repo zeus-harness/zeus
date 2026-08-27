@@ -1,12 +1,12 @@
 //! Narrow, explicitly configured tool connectors.
 //!
-//! The Alpha ships one real executor, `dev_marker_write`. It is registered only
-//! for `local-development`, accepts no caller-provided path, and atomically publishes a
-//! deterministic file below one fixed root. There is no host-command or remote
-//! provider fallback.
+//! The Alpha ships a local marker executor plus capability-rooted workspace
+//! discovery, literal text search, and file reading. They are registered only
+//! for `local-development`; no connector has a host-command or remote-provider
+//! fallback.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
@@ -36,9 +36,28 @@ pub const WORKSPACE_READ_FILE_TOOL_NAME: &str = "workspace_read_file";
 pub const WORKSPACE_READ_FILE_TOOL_VERSION: &str = "1";
 pub const WORKSPACE_LIST_DIRECTORY_TOOL_NAME: &str = "workspace_list_directory";
 pub const WORKSPACE_LIST_DIRECTORY_TOOL_VERSION: &str = "1";
+pub const WORKSPACE_SEARCH_TEXT_TOOL_NAME: &str = "workspace_search_text";
+pub const WORKSPACE_SEARCH_TEXT_TOOL_VERSION: &str = "1";
 pub const MAX_WORKSPACE_PATH_BYTES: usize = 512;
 pub const MAX_WORKSPACE_FILE_BYTES: usize = 8 * 1024;
 pub const MAX_WORKSPACE_DIRECTORY_ENTRIES: usize = 64;
+pub const MAX_WORKSPACE_SEARCH_QUERY_BYTES: usize = 256;
+pub const MAX_WORKSPACE_SEARCH_MATCHES: usize = 32;
+pub const MAX_WORKSPACE_SEARCH_FILES: usize = 256;
+pub const MAX_WORKSPACE_SEARCH_DIRECTORIES: usize = 64;
+pub const MAX_WORKSPACE_SEARCH_TOTAL_BYTES: usize = 1024 * 1024;
+pub const MAX_WORKSPACE_SEARCH_FILE_BYTES: usize = 64 * 1024;
+pub const MAX_WORKSPACE_SEARCH_DEPTH: usize = 12;
+pub const MAX_WORKSPACE_SEARCH_PREVIEW_BYTES: usize = 256;
+
+const WORKSPACE_SEARCH_IGNORED_DIRECTORIES: [&str; 6] = [
+    ".git",
+    ".svelte-kit",
+    ".zeus",
+    "node_modules",
+    "target",
+    "dist",
+];
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -79,7 +98,7 @@ pub fn register_local_dev_connectors(
     Ok(canonical_root)
 }
 
-/// Register the bounded read-only workspace connector for local development.
+/// Register the bounded read-only workspace connectors for local development.
 ///
 /// The ambient path is resolved once at startup and converted into a rooted
 /// capability. Model-selected paths are always relative to that capability.
@@ -99,8 +118,12 @@ pub fn register_local_workspace_connectors(
     let list_executor = WorkspaceListDirectoryExecutor {
         roots: Arc::clone(&executor.roots),
     };
+    let search_executor = WorkspaceSearchTextExecutor {
+        roots: Arc::clone(&executor.roots),
+    };
     registry.register(workspace_read_file_descriptor(), executor)?;
     registry.register(workspace_list_directory_descriptor(), list_executor)?;
+    registry.register(workspace_search_text_descriptor(), search_executor)?;
     Ok(canonical_root)
 }
 
@@ -155,6 +178,31 @@ pub fn workspace_list_directory_descriptor() -> ToolDescriptor {
                 "path".into(),
                 ParameterSpec::required_string(MAX_WORKSPACE_PATH_BYTES),
             )]),
+        },
+    }
+}
+
+pub fn workspace_search_text_descriptor() -> ToolDescriptor {
+    ToolDescriptor {
+        name: WORKSPACE_SEARCH_TEXT_TOOL_NAME.into(),
+        version: WORKSPACE_SEARCH_TEXT_TOOL_VERSION.into(),
+        description: format!(
+            "Search UTF-8 workspace files for literal text below one relative directory (maximum {MAX_WORKSPACE_SEARCH_MATCHES} matches; use . for the root)"
+        ),
+        effect: ToolEffect::ReadOnly,
+        sandbox_profile: SandboxProfile::ReadOnly,
+        input_schema: ObjectSchema {
+            max_serialized_bytes: 4 * 1024,
+            properties: BTreeMap::from([
+                (
+                    "path".into(),
+                    ParameterSpec::required_string(MAX_WORKSPACE_PATH_BYTES),
+                ),
+                (
+                    "query".into(),
+                    ParameterSpec::required_string(MAX_WORKSPACE_SEARCH_QUERY_BYTES),
+                ),
+            ]),
         },
     }
 }
@@ -270,10 +318,64 @@ impl ToolExecutor for WorkspaceListDirectoryExecutor {
     }
 }
 
+#[derive(Clone)]
+struct WorkspaceSearchTextExecutor {
+    roots: Arc<WorkspaceRoots>,
+}
+
+impl ToolExecutor for WorkspaceSearchTextExecutor {
+    fn execute(&self, request: ExecutionRequest) -> ExecutionFuture<'_> {
+        let roots = Arc::clone(&self.roots);
+        Box::pin(async move {
+            if request.environment != LOCAL_DEV_ENVIRONMENT {
+                return Err(workspace_failure(
+                    "environment_denied",
+                    "Workspace search is restricted to local-development",
+                    false,
+                ));
+            }
+            let arguments: WorkspaceSearchTextArguments =
+                serde_json::from_value(request.call.arguments.clone()).map_err(|_| {
+                    workspace_failure(
+                        "invalid_arguments",
+                        "Workspace search arguments are invalid",
+                        false,
+                    )
+                })?;
+            let path = validate_workspace_directory_path(&arguments.path)?;
+            validate_workspace_search_query(&arguments.query)?;
+            tokio::task::spawn_blocking(move || {
+                search_workspace_text(
+                    &roots,
+                    &path,
+                    &arguments.path,
+                    &arguments.query,
+                    &request.call.call_id,
+                )
+            })
+            .await
+            .map_err(|_| {
+                workspace_failure(
+                    "workspace_search_join_failed",
+                    "The workspace search stopped unexpectedly",
+                    false,
+                )
+            })?
+        })
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkspaceReadArguments {
     path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceSearchTextArguments {
+    path: String,
+    query: String,
 }
 
 fn validate_workspace_path(path: &str) -> Result<PathBuf, ExecutorError> {
@@ -306,6 +408,21 @@ fn validate_workspace_directory_path(path: &str) -> Result<PathBuf, ExecutorErro
         return Ok(PathBuf::from(path));
     }
     validate_workspace_path(path)
+}
+
+fn validate_workspace_search_query(query: &str) -> Result<(), ExecutorError> {
+    if query.is_empty()
+        || query.len() > MAX_WORKSPACE_SEARCH_QUERY_BYTES
+        || query.chars().all(char::is_whitespace)
+        || query.chars().any(char::is_control)
+    {
+        return Err(workspace_failure(
+            "invalid_workspace_search_query",
+            "Workspace search query must be non-blank single-line UTF-8 text within 256 bytes",
+            false,
+        ));
+    }
+    Ok(())
 }
 
 fn invalid_workspace_path() -> ExecutorError {
@@ -422,6 +539,277 @@ fn list_workspace_directory(
         replayed: false,
         provider_request_id: Some(call_id.to_owned()),
     })
+}
+
+#[derive(Debug)]
+struct WorkspaceSearchEntry {
+    name: String,
+    kind: WorkspaceSearchEntryKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceSearchEntryKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+fn search_workspace_text(
+    roots: &WorkspaceRoots,
+    path: &Path,
+    display_path: &str,
+    query: &str,
+    call_id: &str,
+) -> Result<ToolOutput, ExecutorError> {
+    if path != Path::new(".") {
+        reject_workspace_symlinks(&roots.inspection, path)?;
+    }
+
+    let mut pending = VecDeque::from([(path.to_path_buf(), 0_usize)]);
+    let mut matches = Vec::new();
+    let mut scanned_directories = 0_usize;
+    let mut scanned_files = 0_usize;
+    let mut scanned_bytes = 0_usize;
+    let mut skipped_entries = 0_usize;
+    let mut truncated = false;
+
+    'search: while let Some((directory_path, depth)) = pending.pop_front() {
+        if scanned_directories == MAX_WORKSPACE_SEARCH_DIRECTORIES {
+            truncated = true;
+            break;
+        }
+        if directory_path != Path::new(".") {
+            reject_workspace_symlinks(&roots.inspection, &directory_path)?;
+        }
+        scanned_directories += 1;
+        let directory = roots
+            .confined
+            .read_dir(&directory_path)
+            .map_err(workspace_directory_error)?;
+        let mut entries = Vec::new();
+        for entry in directory {
+            if entries.len() == MAX_WORKSPACE_DIRECTORY_ENTRIES {
+                return Err(workspace_failure(
+                    "workspace_search_directory_too_large",
+                    "A searched workspace directory exceeds the 64-entry limit",
+                    false,
+                ));
+            }
+            let entry = entry.map_err(workspace_directory_error)?;
+            let name = entry.file_name().into_string().map_err(|_| {
+                workspace_failure(
+                    "workspace_entry_not_utf8",
+                    "The searched workspace contains a non-UTF-8 entry",
+                    false,
+                )
+            })?;
+            if name.is_empty()
+                || name.len() > MAX_WORKSPACE_PATH_BYTES
+                || name.chars().any(char::is_control)
+            {
+                return Err(workspace_failure(
+                    "workspace_entry_invalid",
+                    "The searched workspace contains an invalid entry name",
+                    false,
+                ));
+            }
+            let file_type = entry.file_type().map_err(workspace_directory_error)?;
+            let kind = if file_type.is_file() {
+                WorkspaceSearchEntryKind::File
+            } else if file_type.is_dir() {
+                WorkspaceSearchEntryKind::Directory
+            } else if file_type.is_symlink() {
+                WorkspaceSearchEntryKind::Symlink
+            } else {
+                WorkspaceSearchEntryKind::Other
+            };
+            entries.push(WorkspaceSearchEntry { name, kind });
+        }
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+
+        for entry in entries {
+            let entry_path = join_workspace_path(&directory_path, &entry.name);
+            let entry_display_path = workspace_display_path(&entry_path)?;
+            if entry_display_path.len() > MAX_WORKSPACE_PATH_BYTES {
+                skipped_entries += 1;
+                truncated = true;
+                continue;
+            }
+            match entry.kind {
+                WorkspaceSearchEntryKind::Directory => {
+                    if WORKSPACE_SEARCH_IGNORED_DIRECTORIES.contains(&entry.name.as_str()) {
+                        skipped_entries += 1;
+                    } else if depth == MAX_WORKSPACE_SEARCH_DEPTH {
+                        skipped_entries += 1;
+                        truncated = true;
+                    } else {
+                        pending.push_back((entry_path, depth + 1));
+                    }
+                }
+                WorkspaceSearchEntryKind::File => {
+                    if scanned_files == MAX_WORKSPACE_SEARCH_FILES {
+                        truncated = true;
+                        break 'search;
+                    }
+                    scanned_files += 1;
+                    reject_workspace_symlinks(&roots.inspection, &entry_path)?;
+                    let mut file = roots
+                        .confined
+                        .open(&entry_path)
+                        .map_err(workspace_read_error)?;
+                    let metadata = file.metadata().map_err(workspace_read_error)?;
+                    if !metadata.is_file()
+                        || metadata.len() > MAX_WORKSPACE_SEARCH_FILE_BYTES as u64
+                    {
+                        skipped_entries += 1;
+                        continue;
+                    }
+                    let declared_bytes = usize::try_from(metadata.len()).map_err(|_| {
+                        workspace_failure(
+                            "workspace_search_size_overflow",
+                            "A searched workspace file has an unsupported size",
+                            false,
+                        )
+                    })?;
+                    if scanned_bytes
+                        .checked_add(declared_bytes)
+                        .is_none_or(|total| total > MAX_WORKSPACE_SEARCH_TOTAL_BYTES)
+                    {
+                        truncated = true;
+                        break 'search;
+                    }
+                    let mut bytes = Vec::with_capacity(declared_bytes);
+                    Read::by_ref(&mut file)
+                        .take((MAX_WORKSPACE_SEARCH_FILE_BYTES + 1) as u64)
+                        .read_to_end(&mut bytes)
+                        .map_err(workspace_read_error)?;
+                    if bytes.len() > MAX_WORKSPACE_SEARCH_FILE_BYTES {
+                        skipped_entries += 1;
+                        continue;
+                    }
+                    if scanned_bytes
+                        .checked_add(bytes.len())
+                        .is_none_or(|total| total > MAX_WORKSPACE_SEARCH_TOTAL_BYTES)
+                    {
+                        truncated = true;
+                        break 'search;
+                    }
+                    scanned_bytes += bytes.len();
+                    let Ok(content) = String::from_utf8(bytes) else {
+                        skipped_entries += 1;
+                        continue;
+                    };
+                    for (line_index, line) in content.lines().enumerate() {
+                        if !line.contains(query) {
+                            continue;
+                        }
+                        if matches.len() == MAX_WORKSPACE_SEARCH_MATCHES {
+                            truncated = true;
+                            break 'search;
+                        }
+                        matches.push(json!({
+                            "path": entry_display_path,
+                            "line": line_index + 1,
+                            "text": workspace_search_preview(line, query),
+                        }));
+                    }
+                }
+                WorkspaceSearchEntryKind::Symlink | WorkspaceSearchEntryKind::Other => {
+                    skipped_entries += 1;
+                }
+            }
+        }
+    }
+
+    Ok(ToolOutput {
+        value: json!({
+            "path": display_path,
+            "query": query,
+            "matches": matches,
+            "truncated": truncated,
+            "scanned_directories": scanned_directories,
+            "scanned_files": scanned_files,
+            "scanned_bytes": scanned_bytes,
+            "skipped_entries": skipped_entries,
+        }),
+        replayed: false,
+        provider_request_id: Some(call_id.to_owned()),
+    })
+}
+
+fn join_workspace_path(directory: &Path, name: &str) -> PathBuf {
+    if directory == Path::new(".") {
+        PathBuf::from(name)
+    } else {
+        directory.join(name)
+    }
+}
+
+fn workspace_display_path(path: &Path) -> Result<String, ExecutorError> {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(component) => components.push(
+                component
+                    .to_str()
+                    .ok_or_else(invalid_workspace_path)?
+                    .to_owned(),
+            ),
+            _ => return Err(invalid_workspace_path()),
+        }
+    }
+    if components.is_empty() {
+        Ok(".".into())
+    } else {
+        Ok(components.join("/"))
+    }
+}
+
+fn workspace_search_preview(line: &str, query: &str) -> String {
+    fn sanitize(text: &str) -> String {
+        text.chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect()
+    }
+
+    if line.len() <= MAX_WORKSPACE_SEARCH_PREVIEW_BYTES {
+        return sanitize(line);
+    }
+    if query.len() > MAX_WORKSPACE_SEARCH_PREVIEW_BYTES - 6 {
+        return sanitize(query);
+    }
+
+    let match_start = line.find(query).unwrap_or(0);
+    let match_end = match_start + query.len();
+    let context_bytes = MAX_WORKSPACE_SEARCH_PREVIEW_BYTES - query.len() - 6;
+    let mut start = match_start.saturating_sub(context_bytes / 2);
+    while !line.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut end = match_end
+        .saturating_add(context_bytes - (match_start - start))
+        .min(line.len());
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    let mut preview = String::with_capacity(MAX_WORKSPACE_SEARCH_PREVIEW_BYTES);
+    if start > 0 {
+        preview.push_str("...");
+    }
+    preview.push_str(&sanitize(&line[start..end]));
+    if end < line.len() {
+        preview.push_str("...");
+    }
+    preview
 }
 
 fn reject_workspace_symlinks(root: &Dir, path: &Path) -> Result<(), ExecutorError> {
@@ -798,6 +1186,31 @@ mod tests {
         }
     }
 
+    fn workspace_search_call(path: &str, query: &str) -> ToolCall {
+        let arguments = json!({"path": path, "query": query});
+        ToolCall {
+            call_id: stable_call_id("run-1", 1, 1, WORKSPACE_SEARCH_TEXT_TOOL_NAME).unwrap(),
+            tool: WORKSPACE_SEARCH_TEXT_TOOL_NAME.into(),
+            tool_version: WORKSPACE_SEARCH_TEXT_TOOL_VERSION.into(),
+            arguments_digest: arguments_digest(&arguments),
+            arguments,
+            effect: ToolEffect::ReadOnly,
+            sandbox_profile: SandboxProfile::ReadOnly,
+            executor_status: ToolExecutorStatus::Available,
+        }
+    }
+
+    #[test]
+    fn workspace_search_preview_keeps_a_late_utf8_match_within_the_byte_limit() {
+        let line = format!("{}目标needle{}", "前".repeat(120), "后".repeat(120));
+        let preview = workspace_search_preview(&line, "目标needle");
+
+        assert!(preview.len() <= MAX_WORKSPACE_SEARCH_PREVIEW_BYTES);
+        assert!(preview.contains("目标needle"));
+        assert!(preview.starts_with("..."));
+        assert!(preview.ends_with("..."));
+    }
+
     #[test]
     fn non_local_registration_fails_before_touching_the_root() {
         let temp = TestDirectory::new();
@@ -942,6 +1355,18 @@ mod tests {
             RegistryError::Executor(ExecutorError::Failed { ref code, .. })
                 if code == "workspace_directory_too_large"
         ));
+        let search_error = registry
+            .dispatch(
+                workspace_search_call("too-many", "entry"),
+                LOCAL_DEV_ENVIRONMENT,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            search_error,
+            RegistryError::Executor(ExecutorError::Failed { ref code, .. })
+                if code == "workspace_search_directory_too_large"
+        ));
 
         let traversal = registry
             .dispatch(workspace_list_call("../outside"), LOCAL_DEV_ENVIRONMENT)
@@ -952,6 +1377,88 @@ mod tests {
             RegistryError::Executor(ExecutorError::Failed { ref code, .. })
                 if code == "invalid_workspace_path"
         ));
+    }
+
+    #[tokio::test]
+    async fn workspace_search_is_literal_deterministic_and_bounded() {
+        let temp = TestDirectory::new();
+        fs::create_dir_all(temp.0.join("src/nested")).unwrap();
+        fs::create_dir(temp.0.join("target")).unwrap();
+        fs::create_dir(temp.0.join("many")).unwrap();
+        fs::write(temp.0.join("src/a.rs"), "alpha\nneedle first\nlast\n").unwrap();
+        fs::write(temp.0.join("src/nested/b.rs"), "needle second\n").unwrap();
+        fs::write(temp.0.join("target/ignored.rs"), "needle ignored\n").unwrap();
+        fs::write(
+            temp.0.join("large.txt"),
+            vec![b'n'; MAX_WORKSPACE_SEARCH_FILE_BYTES + 1],
+        )
+        .unwrap();
+        let many = (0..=MAX_WORKSPACE_SEARCH_MATCHES)
+            .map(|index| format!("needle {index}\n"))
+            .collect::<String>();
+        fs::write(temp.0.join("many/hits.rs"), many).unwrap();
+        let mut registry = ToolRegistry::new();
+        register_local_workspace_connectors(&mut registry, LOCAL_DEV_ENVIRONMENT, &temp.0).unwrap();
+
+        let output = registry
+            .dispatch(
+                workspace_search_call("src", "needle"),
+                LOCAL_DEV_ENVIRONMENT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.value["path"], "src");
+        assert_eq!(output.value["query"], "needle");
+        assert_eq!(
+            output.value["matches"],
+            serde_json::json!([
+                { "path": "src/a.rs", "line": 2, "text": "needle first" },
+                { "path": "src/nested/b.rs", "line": 1, "text": "needle second" },
+            ])
+        );
+        assert_eq!(output.value["truncated"], false);
+        assert_eq!(output.value["scanned_directories"], 2);
+        assert_eq!(output.value["scanned_files"], 2);
+        assert_eq!(output.value["scanned_bytes"], 38);
+        assert_eq!(output.value["skipped_entries"], 0);
+
+        let ignored = registry
+            .dispatch(
+                workspace_search_call(".", "needle ignored"),
+                LOCAL_DEV_ENVIRONMENT,
+            )
+            .await
+            .unwrap();
+        assert!(ignored.value["matches"].as_array().unwrap().is_empty());
+        assert!(ignored.value["skipped_entries"].as_u64().unwrap() >= 2);
+
+        let bounded = registry
+            .dispatch(
+                workspace_search_call("many", "needle"),
+                LOCAL_DEV_ENVIRONMENT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            bounded.value["matches"].as_array().unwrap().len(),
+            MAX_WORKSPACE_SEARCH_MATCHES
+        );
+        assert_eq!(bounded.value["truncated"], true);
+
+        for (path, query, expected_code) in [
+            ("../outside", "needle", "invalid_workspace_path"),
+            ("src", " \t", "invalid_workspace_search_query"),
+        ] {
+            let error = registry
+                .dispatch(workspace_search_call(path, query), LOCAL_DEV_ENVIRONMENT)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                RegistryError::Executor(ExecutorError::Failed { ref code, .. })
+                    if code == expected_code
+            ));
+        }
     }
 
     #[cfg(unix)]
@@ -983,6 +1490,14 @@ mod tests {
                 .iter()
                 .any(|entry| entry["name"] == "linked-file" && entry["kind"] == "symlink")
         );
+        let search = registry
+            .dispatch(
+                workspace_search_call(".", "outside secret"),
+                LOCAL_DEV_ENVIRONMENT,
+            )
+            .await
+            .unwrap();
+        assert!(search.value["matches"].as_array().unwrap().is_empty());
 
         for path in ["linked-file", "nested/linked-dir/outside.txt"] {
             let error = registry
