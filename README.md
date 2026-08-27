@@ -260,9 +260,24 @@ defines a trailing empty logical line consistently for line reads and inserts.
 file of at most 12 KiB below an existing directory, publishes it atomically,
 never overwrites an existing path, and also requires owner approval for the
 exact persisted arguments. Same-process mutation retries replay a bounded
-recent receipt; a changed target or reused call ID with a different tool or
-arguments fails closed. All workspace tools reject traversal and never follow
-symlinks. None of these connectors can invoke a host command:
+recent receipt keyed by the complete server-owned Agent execution scope; a
+changed target, cross-scope call-ID collision, or reused call ID with a
+different tool or arguments fails closed. All workspace tools reject traversal
+and never follow symlinks. None of these connectors can invoke a host command.
+
+Zeus also defines a backend-neutral persistent terminal service and six Agent
+tools: `terminal_open`, `terminal_send`, `terminal_read`, `terminal_signal`,
+`terminal_close`, and `terminal_list`. They enter the model manifest only when
+an embedding application explicitly injects a `TerminalService` backed by a
+configured isolated executor. The shipped API startup path does not construct
+such a backend and never falls back to a host shell. Terminal ownership is the
+complete server-derived account/actor/Session/turn/Agent scope; foreign session
+IDs are concealed as unknown. Open/send/signal/close require exact-call owner
+approval, while bounded read/list are read-only. Mutation receipts use the same
+scope plus call ID. An indeterminate backend result after the durable start
+checkpoint settles as `outcome_unknown` and is never retried automatically.
+
+The rooted workspace connectors can be exercised with:
 
 ```sh
 ZEUS_DATABASE_PATH=.zeus/local-development.db \

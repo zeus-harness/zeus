@@ -404,7 +404,9 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   符号链接，均为 `read_only + read_only sandbox`，策略自动允许。文本替换只处理现有、至多 64 KiB 的 UTF-8
   普通文件，要求 `old_text` 唯一出现，使用同目录临时文件、权限复制、file sync、原文复验、
   atomic rename 与 directory sync；相同 call ID 的近期同参重试返回有界内存 receipt，异参重用、
-  目标变化、穿越或 symlink 均 fail closed。该工具固定为 `local_write + workspace_write sandbox`
+  目标变化、穿越或 symlink 均 fail closed。mutation receipt 以完整的服务端
+  account/actor/Session/turn/Agent execution scope 加 call ID 为键，跨 scope 的 call-ID 碰撞不会
+  复用结果。该工具固定为 `local_write + workspace_write sandbox`
   并要求 owner 对 exact persisted call 批准。行插入以 `after_line=0` 表示文件开头，其余值表示
   指定 logical line 之后；文件末尾换行产生一个可寻址的 trailing empty logical line，与行区间
   读取保持一致。插入文本限制为 4 KiB、结果限制为 64 KiB，并同样使用权限复制、file sync、
@@ -413,6 +415,16 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   原子发布；目标已存在、父目录缺失、穿越或 symlink 均 fail closed，且绝不隐式创建父目录或覆盖
   目标。它同样固定为 `local_write + workspace_write sandbox` 并要求 owner 批准 exact persisted
   call；近期同参重试复用有界 receipt。所有 workspace 工具都没有 shell 权限。
+- persistent terminal 核心由独立、backend-neutral 的 `TerminalService` 管理，不直接启动宿主机进程。
+  只有 embedding runtime 显式注入已配置的 isolated backend 时，才注册 `terminal_open`、
+  `terminal_send`、`terminal_read`、`terminal_signal`、`terminal_close` 与 `terminal_list`；默认 API
+  启动路径不注入 backend，因此 manifest 中不存在这些工具，也不存在 host-shell fallback。
+  每个 terminal session 精确绑定服务端从 durable Agent work 还原的
+  account/actor/Session/turn/Agent scope；其它 scope 查询同一 ID 只得到 unknown。每个 owner 最多
+  4 个 session，send 输入、read 行数和返回字节均有硬上限，同一 session 不允许并发 send。
+  open/send/signal/close 为 approval-gated mutation，read/list 为 read-only allow；mutation receipt
+  同时绑定 scope、call ID、tool 和 arguments digest。durable started 之后 backend 报告不确定结果
+  时结算 `outcome_unknown` 并中断 Agent turn，禁止自动重试可能已产生的副作用。
 - `ZEUS_DEMO_PROFILE=production-guarded` 是默认值；切到 `local-development` 时必须使用独立
   SQLite 数据库，并由 `ZEUS_LOCAL_MARKER_ROOT` 固定写入根目录。只有显式设置
   `ZEUS_LOCAL_WORKSPACE_ROOT` 时才注册 workspace 工具；未设置时保留原 marker-only 行为。
@@ -527,6 +539,9 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
 - workspace create-new：真实 Agent 在 owner 批准前不创建文件，批准后只原子发布一个新文件并把
   exact tool result 持久化、回灌下一模型步骤；目标已存在、父目录缺失、同参重放、异参 call-ID
   冲突、symlink 与 12 KiB 边界均 fail closed。
+- isolated terminal：显式注入 fake isolated backend 的真实 Agent loop 覆盖 open 与 send 两次
+  exact-call approval、完整 server-owned execution scope、精确 tool-result 回灌，以及 backend
+  send 结果不确定时 durable `outcome_unknown`、Session `needs_attention` 且不重试外部操作。
 - 生产 RDS 路径只能得到 executor unavailable，不能得到伪造成功。
 - Session/Run SSE 重连都严格从各自大于 cursor 的 sequence 补齐事件。请求同时携带 query
   cursor 和 `Last-Event-ID` 时，后者优先。

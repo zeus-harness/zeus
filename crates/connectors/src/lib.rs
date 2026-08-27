@@ -24,6 +24,11 @@ use globset::{GlobBuilder, GlobMatcher};
 use protocol::{SandboxProfile, ToolCall, ToolEffect};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use terminal::{
+    MAX_TERMINAL_BACKEND_TYPE_BYTES, MAX_TERMINAL_CWD_BYTES, MAX_TERMINAL_INPUT_BYTES,
+    MAX_TERMINAL_NAME_BYTES, MAX_TERMINAL_READ_LINES, TerminalError, TerminalReadRequest,
+    TerminalSendRequest, TerminalService, TerminalSignal, TerminalSpawnRequest,
+};
 use thiserror::Error;
 use tools::{
     ExecutionFuture, ExecutionRequest, ExecutorError, ObjectSchema, ParameterSpec, ParameterType,
@@ -52,6 +57,14 @@ pub const WORKSPACE_INSERT_TEXT_TOOL_NAME: &str = "workspace_insert_text";
 pub const WORKSPACE_INSERT_TEXT_TOOL_VERSION: &str = "1";
 pub const WORKSPACE_CREATE_FILE_TOOL_NAME: &str = "workspace_create_file";
 pub const WORKSPACE_CREATE_FILE_TOOL_VERSION: &str = "1";
+pub const TERMINAL_OPEN_TOOL_NAME: &str = "terminal_open";
+pub const TERMINAL_SEND_TOOL_NAME: &str = "terminal_send";
+pub const TERMINAL_READ_TOOL_NAME: &str = "terminal_read";
+pub const TERMINAL_SIGNAL_TOOL_NAME: &str = "terminal_signal";
+pub const TERMINAL_CLOSE_TOOL_NAME: &str = "terminal_close";
+pub const TERMINAL_LIST_TOOL_NAME: &str = "terminal_list";
+pub const TERMINAL_TOOL_VERSION: &str = "1";
+pub const MAX_TERMINAL_SESSION_ID_BYTES: usize = 64;
 pub const MAX_WORKSPACE_PATH_BYTES: usize = 512;
 pub const MAX_WORKSPACE_FILE_BYTES: usize = 8 * 1024;
 pub const MAX_WORKSPACE_RANGE_FILE_BYTES: usize = 64 * 1024;
@@ -173,6 +186,47 @@ pub fn register_local_workspace_connectors(
     registry.register(workspace_insert_text_descriptor(), insert_executor)?;
     registry.register(workspace_create_file_descriptor(), create_executor)?;
     Ok(canonical_root)
+}
+
+/// Register owner-scoped terminal tools backed by an explicitly configured
+/// isolated executor service. No service means no terminal descriptors.
+pub fn register_local_terminal_connectors(
+    registry: &mut ToolRegistry,
+    environment: &str,
+    service: Arc<TerminalService>,
+) -> Result<(), ConnectorConfigError> {
+    if environment != LOCAL_DEV_ENVIRONMENT {
+        return Err(ConnectorConfigError::EnvironmentDenied(
+            environment.to_owned(),
+        ));
+    }
+    let mutations = Arc::new(tokio::sync::Mutex::new(TerminalMutationState::default()));
+    let mutation_core = TerminalMutationCore {
+        service: Arc::clone(&service),
+        state: mutations,
+    };
+    registry.register(
+        terminal_open_descriptor(),
+        TerminalOpenExecutor(mutation_core.clone()),
+    )?;
+    registry.register(
+        terminal_send_descriptor(),
+        TerminalSendExecutor(mutation_core.clone()),
+    )?;
+    registry.register(
+        terminal_read_descriptor(),
+        TerminalReadExecutor(Arc::clone(&service)),
+    )?;
+    registry.register(
+        terminal_signal_descriptor(),
+        TerminalSignalExecutor(mutation_core.clone()),
+    )?;
+    registry.register(
+        terminal_close_descriptor(),
+        TerminalCloseExecutor(mutation_core),
+    )?;
+    registry.register(terminal_list_descriptor(), TerminalListExecutor(service))?;
+    Ok(())
 }
 
 pub fn dev_marker_descriptor() -> ToolDescriptor {
@@ -417,6 +471,433 @@ pub fn workspace_create_file_descriptor() -> ToolDescriptor {
     }
 }
 
+pub fn terminal_open_descriptor() -> ToolDescriptor {
+    ToolDescriptor {
+        name: TERMINAL_OPEN_TOOL_NAME.into(),
+        version: TERMINAL_TOOL_VERSION.into(),
+        description: "Open one persistent terminal owned by the initiating Agent in the configured isolated executor; omit backend_type only when exactly one backend is registered".into(),
+        effect: ToolEffect::LocalWrite,
+        sandbox_profile: SandboxProfile::IsolatedContainer,
+        input_schema: ObjectSchema {
+            max_serialized_bytes: 2 * 1024,
+            properties: BTreeMap::from([
+                (
+                    "backend_type".into(),
+                    ParameterSpec {
+                        parameter_type: ParameterType::String,
+                        required: false,
+                        min_length: Some(1),
+                        max_length: Some(MAX_TERMINAL_BACKEND_TYPE_BYTES),
+                    },
+                ),
+                (
+                    "cwd".into(),
+                    ParameterSpec {
+                        parameter_type: ParameterType::String,
+                        required: false,
+                        min_length: Some(1),
+                        max_length: Some(MAX_TERMINAL_CWD_BYTES),
+                    },
+                ),
+                (
+                    "name".into(),
+                    ParameterSpec {
+                        parameter_type: ParameterType::String,
+                        required: false,
+                        min_length: Some(1),
+                        max_length: Some(MAX_TERMINAL_NAME_BYTES),
+                    },
+                ),
+            ]),
+        },
+    }
+}
+
+pub fn terminal_send_descriptor() -> ToolDescriptor {
+    ToolDescriptor {
+        name: TERMINAL_SEND_TOOL_NAME.into(),
+        version: TERMINAL_TOOL_VERSION.into(),
+        description: "Send bounded UTF-8 input to one persistent terminal owned by the initiating Agent; submit defaults to true".into(),
+        effect: ToolEffect::LocalWrite,
+        sandbox_profile: SandboxProfile::IsolatedContainer,
+        input_schema: ObjectSchema {
+            max_serialized_bytes: 20 * 1024,
+            properties: BTreeMap::from([
+                (
+                    "session_id".into(),
+                    ParameterSpec::required_string(MAX_TERMINAL_SESSION_ID_BYTES),
+                ),
+                (
+                    "submit".into(),
+                    ParameterSpec {
+                        parameter_type: ParameterType::Boolean,
+                        required: false,
+                        min_length: None,
+                        max_length: None,
+                    },
+                ),
+                (
+                    "text".into(),
+                    ParameterSpec {
+                        parameter_type: ParameterType::String,
+                        required: true,
+                        min_length: Some(0),
+                        max_length: Some(MAX_TERMINAL_INPUT_BYTES),
+                    },
+                ),
+            ]),
+        },
+    }
+}
+
+pub fn terminal_read_descriptor() -> ToolDescriptor {
+    ToolDescriptor {
+        name: TERMINAL_READ_TOOL_NAME.into(),
+        version: TERMINAL_TOOL_VERSION.into(),
+        description: format!(
+            "Read a newest-relative bounded output page from one persistent terminal owned by the initiating Agent (default and maximum {MAX_TERMINAL_READ_LINES} lines)"
+        ),
+        effect: ToolEffect::ReadOnly,
+        sandbox_profile: SandboxProfile::IsolatedContainer,
+        input_schema: ObjectSchema {
+            max_serialized_bytes: 1024,
+            properties: BTreeMap::from([
+                (
+                    "count".into(),
+                    ParameterSpec {
+                        parameter_type: ParameterType::Integer,
+                        required: false,
+                        min_length: None,
+                        max_length: None,
+                    },
+                ),
+                (
+                    "offset".into(),
+                    ParameterSpec {
+                        parameter_type: ParameterType::Integer,
+                        required: false,
+                        min_length: None,
+                        max_length: None,
+                    },
+                ),
+                (
+                    "session_id".into(),
+                    ParameterSpec::required_string(MAX_TERMINAL_SESSION_ID_BYTES),
+                ),
+            ]),
+        },
+    }
+}
+
+pub fn terminal_signal_descriptor() -> ToolDescriptor {
+    ToolDescriptor {
+        name: TERMINAL_SIGNAL_TOOL_NAME.into(),
+        version: TERMINAL_TOOL_VERSION.into(),
+        description: "Send SIGINT, SIGTERM, SIGKILL, SIGTSTP, or SIGHUP to one persistent terminal owned by the initiating Agent".into(),
+        effect: ToolEffect::LocalWrite,
+        sandbox_profile: SandboxProfile::IsolatedContainer,
+        input_schema: ObjectSchema {
+            max_serialized_bytes: 1024,
+            properties: BTreeMap::from([
+                (
+                    "session_id".into(),
+                    ParameterSpec::required_string(MAX_TERMINAL_SESSION_ID_BYTES),
+                ),
+                ("signal".into(), ParameterSpec::required_string(8)),
+            ]),
+        },
+    }
+}
+
+pub fn terminal_close_descriptor() -> ToolDescriptor {
+    ToolDescriptor {
+        name: TERMINAL_CLOSE_TOOL_NAME.into(),
+        version: TERMINAL_TOOL_VERSION.into(),
+        description: "Close and forget one persistent terminal owned by the initiating Agent"
+            .into(),
+        effect: ToolEffect::Destructive,
+        sandbox_profile: SandboxProfile::IsolatedContainer,
+        input_schema: ObjectSchema {
+            max_serialized_bytes: 512,
+            properties: BTreeMap::from([(
+                "session_id".into(),
+                ParameterSpec::required_string(MAX_TERMINAL_SESSION_ID_BYTES),
+            )]),
+        },
+    }
+}
+
+pub fn terminal_list_descriptor() -> ToolDescriptor {
+    ToolDescriptor {
+        name: TERMINAL_LIST_TOOL_NAME.into(),
+        version: TERMINAL_TOOL_VERSION.into(),
+        description: "List configured isolated terminal backend types and live terminal sessions owned by the initiating Agent".into(),
+        effect: ToolEffect::ReadOnly,
+        sandbox_profile: SandboxProfile::IsolatedContainer,
+        input_schema: ObjectSchema::empty(),
+    }
+}
+
+const MAX_TERMINAL_MUTATION_RECEIPTS: usize = 1024;
+
+#[derive(Default)]
+struct TerminalMutationState {
+    receipts: BTreeMap<(tools::ExecutionScope, String), TerminalMutationReceipt>,
+    order: VecDeque<(tools::ExecutionScope, String)>,
+}
+
+#[derive(Clone)]
+struct TerminalMutationReceipt {
+    tool: String,
+    arguments_digest: String,
+    output: ToolOutput,
+}
+
+#[derive(Clone)]
+struct TerminalMutationCore {
+    service: Arc<TerminalService>,
+    state: Arc<tokio::sync::Mutex<TerminalMutationState>>,
+}
+
+impl TerminalMutationCore {
+    async fn execute<F>(
+        &self,
+        call: &ToolCall,
+        scope: &tools::ExecutionScope,
+        operation: F,
+    ) -> Result<ToolOutput, ExecutorError>
+    where
+        F: std::future::Future<Output = Result<serde_json::Value, ExecutorError>> + Send,
+    {
+        let mut state = self.state.lock().await;
+        let receipt_key = (scope.clone(), call.call_id.clone());
+        if let Some(receipt) = state.receipts.get(&receipt_key) {
+            if receipt.tool != call.tool || receipt.arguments_digest != call.arguments_digest {
+                return Err(terminal_failed(
+                    "terminal_call_conflict",
+                    "A terminal call ID was reused with different arguments",
+                ));
+            }
+            let mut output = receipt.output.clone();
+            output.replayed = true;
+            return Ok(output);
+        }
+        let value = operation.await?;
+        let output = ToolOutput {
+            value,
+            replayed: false,
+            provider_request_id: Some(call.call_id.clone()),
+        };
+        state.receipts.insert(
+            receipt_key.clone(),
+            TerminalMutationReceipt {
+                tool: call.tool.clone(),
+                arguments_digest: call.arguments_digest.clone(),
+                output: output.clone(),
+            },
+        );
+        state.order.push_back(receipt_key);
+        while state.order.len() > MAX_TERMINAL_MUTATION_RECEIPTS {
+            if let Some(expired) = state.order.pop_front() {
+                state.receipts.remove(&expired);
+            }
+        }
+        Ok(output)
+    }
+}
+
+#[derive(Clone)]
+struct TerminalOpenExecutor(TerminalMutationCore);
+
+#[derive(Clone)]
+struct TerminalSendExecutor(TerminalMutationCore);
+
+#[derive(Clone)]
+struct TerminalReadExecutor(Arc<TerminalService>);
+
+#[derive(Clone)]
+struct TerminalSignalExecutor(TerminalMutationCore);
+
+#[derive(Clone)]
+struct TerminalCloseExecutor(TerminalMutationCore);
+
+#[derive(Clone)]
+struct TerminalListExecutor(Arc<TerminalService>);
+
+impl ToolExecutor for TerminalOpenExecutor {
+    fn execute(&self, request: ExecutionRequest) -> ExecutionFuture<'_> {
+        let core = self.0.clone();
+        Box::pin(async move {
+            require_local_terminal_environment(&request)?;
+            let scope = require_terminal_scope(&request)?;
+            let arguments: TerminalOpenArguments = terminal_arguments(&request, "open")?;
+            let backend_type = match arguments.backend_type {
+                Some(backend_type) => backend_type,
+                None => {
+                    let backends = core.service.backend_types();
+                    if backends.len() != 1 {
+                        return Err(terminal_failed(
+                            "terminal_backend_required",
+                            "backend_type is required when the executor exposes multiple backends",
+                        ));
+                    }
+                    backends[0].clone()
+                }
+            };
+            let call = request.call;
+            let service = Arc::clone(&core.service);
+            let receipt_scope = scope.clone();
+            core.execute(&call, &receipt_scope, async move {
+                let snapshot = service
+                    .spawn(
+                        scope,
+                        TerminalSpawnRequest {
+                            backend_type,
+                            name: arguments.name,
+                            cwd: arguments.cwd.unwrap_or_else(|| ".".into()),
+                        },
+                    )
+                    .await
+                    .map_err(|error| terminal_executor_error(error, true))?;
+                serde_json::to_value(snapshot).map_err(|_| terminal_invalid_result())
+            })
+            .await
+        })
+    }
+}
+
+impl ToolExecutor for TerminalSendExecutor {
+    fn execute(&self, request: ExecutionRequest) -> ExecutionFuture<'_> {
+        let core = self.0.clone();
+        Box::pin(async move {
+            require_local_terminal_environment(&request)?;
+            let scope = require_terminal_scope(&request)?;
+            let arguments: TerminalSendArguments = terminal_arguments(&request, "send")?;
+            let call = request.call;
+            let service = Arc::clone(&core.service);
+            let receipt_scope = scope.clone();
+            core.execute(&call, &receipt_scope, async move {
+                let result = service
+                    .send(
+                        &scope,
+                        &arguments.session_id,
+                        TerminalSendRequest {
+                            text: arguments.text,
+                            submit: arguments.submit.unwrap_or(true),
+                        },
+                    )
+                    .await
+                    .map_err(|error| terminal_executor_error(error, true))?;
+                serde_json::to_value(result).map_err(|_| terminal_invalid_result())
+            })
+            .await
+        })
+    }
+}
+
+impl ToolExecutor for TerminalReadExecutor {
+    fn execute(&self, request: ExecutionRequest) -> ExecutionFuture<'_> {
+        let service = Arc::clone(&self.0);
+        Box::pin(async move {
+            require_local_terminal_environment(&request)?;
+            let scope = require_terminal_scope(&request)?;
+            let arguments: TerminalReadArguments = terminal_arguments(&request, "read")?;
+            let offset = terminal_nonnegative_usize(arguments.offset.unwrap_or(0), "offset")?;
+            let count = terminal_nonnegative_usize(
+                arguments.count.unwrap_or(MAX_TERMINAL_READ_LINES as i64),
+                "count",
+            )?;
+            let result = service
+                .read(
+                    &scope,
+                    &arguments.session_id,
+                    TerminalReadRequest { offset, count },
+                )
+                .await
+                .map_err(|error| terminal_executor_error(error, false))?;
+            Ok(ToolOutput {
+                value: serde_json::to_value(result).map_err(|_| terminal_invalid_result())?,
+                replayed: false,
+                provider_request_id: Some(request.call.call_id),
+            })
+        })
+    }
+}
+
+impl ToolExecutor for TerminalSignalExecutor {
+    fn execute(&self, request: ExecutionRequest) -> ExecutionFuture<'_> {
+        let core = self.0.clone();
+        Box::pin(async move {
+            require_local_terminal_environment(&request)?;
+            let scope = require_terminal_scope(&request)?;
+            let arguments: TerminalSignalArguments = terminal_arguments(&request, "signal")?;
+            let signal = terminal_signal(&arguments.signal)?;
+            let call = request.call;
+            let service = Arc::clone(&core.service);
+            let receipt_scope = scope.clone();
+            core.execute(&call, &receipt_scope, async move {
+                let status = service
+                    .signal(&scope, &arguments.session_id, signal)
+                    .await
+                    .map_err(|error| terminal_executor_error(error, true))?;
+                Ok(json!({
+                    "session_id": arguments.session_id,
+                    "delivered": true,
+                    "status": status,
+                }))
+            })
+            .await
+        })
+    }
+}
+
+impl ToolExecutor for TerminalCloseExecutor {
+    fn execute(&self, request: ExecutionRequest) -> ExecutionFuture<'_> {
+        let core = self.0.clone();
+        Box::pin(async move {
+            require_local_terminal_environment(&request)?;
+            let scope = require_terminal_scope(&request)?;
+            let arguments: TerminalSessionArguments = terminal_arguments(&request, "close")?;
+            let call = request.call;
+            let service = Arc::clone(&core.service);
+            let receipt_scope = scope.clone();
+            core.execute(&call, &receipt_scope, async move {
+                let closed = service
+                    .close(&scope, &arguments.session_id)
+                    .await
+                    .map_err(|error| terminal_executor_error(error, true))?;
+                Ok(json!({
+                    "session_id": arguments.session_id,
+                    "outcome": if closed { "closed" } else { "already_closing" },
+                }))
+            })
+            .await
+        })
+    }
+}
+
+impl ToolExecutor for TerminalListExecutor {
+    fn execute(&self, request: ExecutionRequest) -> ExecutionFuture<'_> {
+        let service = Arc::clone(&self.0);
+        Box::pin(async move {
+            require_local_terminal_environment(&request)?;
+            let scope = require_terminal_scope(&request)?;
+            let sessions = service
+                .list(&scope)
+                .await
+                .map_err(|error| terminal_executor_error(error, false))?;
+            Ok(ToolOutput {
+                value: json!({
+                    "backend_types": service.backend_types(),
+                    "sessions": sessions,
+                }),
+                replayed: false,
+                provider_request_id: Some(request.call.call_id),
+            })
+        })
+    }
+}
+
 struct WorkspaceRoots {
     confined: Dir,
     inspection: Dir,
@@ -425,8 +906,8 @@ struct WorkspaceRoots {
 
 #[derive(Default)]
 struct WorkspaceMutationState {
-    receipts: BTreeMap<String, WorkspaceMutationReceipt>,
-    receipt_order: VecDeque<String>,
+    receipts: BTreeMap<(Option<tools::ExecutionScope>, String), WorkspaceMutationReceipt>,
+    receipt_order: VecDeque<(Option<tools::ExecutionScope>, String)>,
 }
 
 #[derive(Clone)]
@@ -721,8 +1202,9 @@ impl ToolExecutor for WorkspaceReplaceTextExecutor {
                     false,
                 ));
             }
+            let execution_scope = request.scope.clone();
             tokio::task::spawn_blocking(move || {
-                replace_workspace_text(&roots, &path, &arguments, &request.call)
+                replace_workspace_text(&roots, &path, &arguments, &request.call, execution_scope)
             })
             .await
             .map_err(|_| {
@@ -782,8 +1264,16 @@ impl ToolExecutor for WorkspaceInsertTextExecutor {
                     false,
                 )
             })?;
+            let execution_scope = request.scope.clone();
             tokio::task::spawn_blocking(move || {
-                insert_workspace_text(&roots, &path, after_line, &arguments, &request.call)
+                insert_workspace_text(
+                    &roots,
+                    &path,
+                    after_line,
+                    &arguments,
+                    &request.call,
+                    execution_scope,
+                )
             })
             .await
             .map_err(|_| {
@@ -829,8 +1319,9 @@ impl ToolExecutor for WorkspaceCreateFileExecutor {
                     false,
                 ));
             }
+            let execution_scope = request.scope.clone();
             tokio::task::spawn_blocking(move || {
-                create_workspace_file(&roots, &path, &arguments, &request.call)
+                create_workspace_file(&roots, &path, &arguments, &request.call, execution_scope)
             })
             .await
             .map_err(|_| {
@@ -893,6 +1384,176 @@ struct WorkspaceInsertTextArguments {
 struct WorkspaceCreateFileArguments {
     path: String,
     content: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TerminalOpenArguments {
+    backend_type: Option<String>,
+    name: Option<String>,
+    cwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TerminalSendArguments {
+    session_id: String,
+    text: String,
+    submit: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TerminalReadArguments {
+    session_id: String,
+    offset: Option<i64>,
+    count: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TerminalSignalArguments {
+    session_id: String,
+    signal: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TerminalSessionArguments {
+    session_id: String,
+}
+
+fn terminal_arguments<T: for<'de> Deserialize<'de>>(
+    request: &ExecutionRequest,
+    operation: &'static str,
+) -> Result<T, ExecutorError> {
+    serde_json::from_value(request.call.arguments.clone()).map_err(|_| {
+        terminal_failed(
+            "invalid_terminal_arguments",
+            match operation {
+                "open" => "Terminal open arguments are invalid",
+                "send" => "Terminal send arguments are invalid",
+                "read" => "Terminal read arguments are invalid",
+                "signal" => "Terminal signal arguments are invalid",
+                "close" => "Terminal close arguments are invalid",
+                _ => "Terminal arguments are invalid",
+            },
+        )
+    })
+}
+
+fn require_local_terminal_environment(request: &ExecutionRequest) -> Result<(), ExecutorError> {
+    if request.environment == LOCAL_DEV_ENVIRONMENT {
+        Ok(())
+    } else {
+        Err(terminal_failed(
+            "environment_denied",
+            "Terminal tools are restricted to local-development",
+        ))
+    }
+}
+
+fn require_terminal_scope(
+    request: &ExecutionRequest,
+) -> Result<tools::ExecutionScope, ExecutorError> {
+    request.scope.clone().ok_or_else(|| {
+        terminal_failed(
+            "terminal_scope_required",
+            "Terminal tools require server-owned Agent execution scope",
+        )
+    })
+}
+
+fn terminal_nonnegative_usize(value: i64, field: &'static str) -> Result<usize, ExecutorError> {
+    usize::try_from(value).map_err(|_| {
+        terminal_failed(
+            "invalid_terminal_range",
+            if field == "offset" {
+                "Terminal read offset must be a non-negative integer"
+            } else {
+                "Terminal read count must be a positive bounded integer"
+            },
+        )
+    })
+}
+
+fn terminal_signal(value: &str) -> Result<TerminalSignal, ExecutorError> {
+    match value {
+        "SIGINT" => Ok(TerminalSignal::Interrupt),
+        "SIGTERM" => Ok(TerminalSignal::Terminate),
+        "SIGKILL" => Ok(TerminalSignal::Kill),
+        "SIGTSTP" => Ok(TerminalSignal::Stop),
+        "SIGHUP" => Ok(TerminalSignal::Hangup),
+        _ => Err(terminal_failed(
+            "invalid_terminal_signal",
+            "Terminal signal must be SIGINT, SIGTERM, SIGKILL, SIGTSTP, or SIGHUP",
+        )),
+    }
+}
+
+fn terminal_executor_error(error: TerminalError, indeterminate: bool) -> ExecutorError {
+    match error {
+        TerminalError::BackendFailed
+        | TerminalError::InvalidBackendResult
+        | TerminalError::StateUnavailable
+            if indeterminate =>
+        {
+            ExecutorError::OutcomeUnknown {
+                message: "The isolated terminal executor could not determine the operation outcome"
+                    .into(),
+            }
+        }
+        TerminalError::InvalidBackendConfiguration | TerminalError::BackendUnavailable => {
+            ExecutorError::Unavailable {
+                reason: "No compatible isolated terminal backend is available".into(),
+            }
+        }
+        TerminalError::InvalidRequest(_) => terminal_failed(
+            "invalid_terminal_request",
+            "The terminal request is invalid or exceeds a configured limit",
+        ),
+        TerminalError::OwnerSessionLimit => terminal_failed(
+            "terminal_session_limit",
+            "The initiating Agent already owns the maximum number of terminal sessions",
+        ),
+        TerminalError::DuplicateName => terminal_failed(
+            "terminal_name_conflict",
+            "The initiating Agent already owns a terminal with this name",
+        ),
+        TerminalError::UnknownSession => terminal_failed(
+            "terminal_session_unknown",
+            "The terminal session is unknown to the initiating Agent",
+        ),
+        TerminalError::SessionClosing => terminal_failed(
+            "terminal_session_closing",
+            "The terminal session is already closing",
+        ),
+        TerminalError::SendInProgress => terminal_failed(
+            "terminal_send_in_progress",
+            "The terminal session already has a send operation in progress",
+        ),
+        TerminalError::BackendFailed
+        | TerminalError::InvalidBackendResult
+        | TerminalError::StateUnavailable => terminal_failed(
+            "terminal_backend_failed",
+            "The isolated terminal backend could not complete the request",
+        ),
+    }
+}
+
+fn terminal_failed(code: &str, message: &str) -> ExecutorError {
+    ExecutorError::Failed {
+        code: code.into(),
+        message: message.into(),
+        retryable: false,
+    }
+}
+
+fn terminal_invalid_result() -> ExecutorError {
+    terminal_failed(
+        "terminal_result_invalid",
+        "The terminal result could not be represented safely",
+    )
 }
 
 fn validate_workspace_path(path: &str) -> Result<PathBuf, ExecutorError> {
@@ -1638,6 +2299,7 @@ fn create_workspace_file(
     path: &Path,
     arguments: &WorkspaceCreateFileArguments,
     call: &ToolCall,
+    execution_scope: Option<tools::ExecutionScope>,
 ) -> Result<ToolOutput, ExecutorError> {
     let mut mutation_state = roots.mutation_state.lock().map_err(|_| {
         workspace_failure(
@@ -1646,7 +2308,8 @@ fn create_workspace_file(
             false,
         )
     })?;
-    if let Some(receipt) = mutation_state.receipts.get(&call.call_id) {
+    let receipt_key = (execution_scope, call.call_id.clone());
+    if let Some(receipt) = mutation_state.receipts.get(&receipt_key) {
         if receipt.tool != call.tool || receipt.arguments_digest != call.arguments_digest {
             return Err(workspace_failure(
                 "workspace_create_idempotency_conflict",
@@ -1720,7 +2383,7 @@ fn create_workspace_file(
     };
     remember_workspace_mutation_receipt(
         &mut mutation_state,
-        call.call_id.clone(),
+        receipt_key,
         WorkspaceMutationReceipt {
             tool: call.tool.clone(),
             arguments_digest: call.arguments_digest.clone(),
@@ -1792,6 +2455,7 @@ fn replace_workspace_text(
     path: &Path,
     arguments: &WorkspaceReplaceTextArguments,
     call: &ToolCall,
+    execution_scope: Option<tools::ExecutionScope>,
 ) -> Result<ToolOutput, ExecutorError> {
     let mut mutation_state = roots.mutation_state.lock().map_err(|_| {
         workspace_failure(
@@ -1800,7 +2464,8 @@ fn replace_workspace_text(
             false,
         )
     })?;
-    if let Some(receipt) = mutation_state.receipts.get(&call.call_id) {
+    let receipt_key = (execution_scope, call.call_id.clone());
+    if let Some(receipt) = mutation_state.receipts.get(&receipt_key) {
         if receipt.tool != call.tool || receipt.arguments_digest != call.arguments_digest {
             return Err(workspace_failure(
                 "workspace_edit_idempotency_conflict",
@@ -1907,7 +2572,7 @@ fn replace_workspace_text(
     };
     remember_workspace_mutation_receipt(
         &mut mutation_state,
-        call.call_id.clone(),
+        receipt_key,
         WorkspaceMutationReceipt {
             tool: call.tool.clone(),
             arguments_digest: call.arguments_digest.clone(),
@@ -1923,6 +2588,7 @@ fn insert_workspace_text(
     after_line: usize,
     arguments: &WorkspaceInsertTextArguments,
     call: &ToolCall,
+    execution_scope: Option<tools::ExecutionScope>,
 ) -> Result<ToolOutput, ExecutorError> {
     let mut mutation_state = roots.mutation_state.lock().map_err(|_| {
         workspace_failure(
@@ -1931,7 +2597,8 @@ fn insert_workspace_text(
             false,
         )
     })?;
-    if let Some(receipt) = mutation_state.receipts.get(&call.call_id) {
+    let receipt_key = (execution_scope, call.call_id.clone());
+    if let Some(receipt) = mutation_state.receipts.get(&receipt_key) {
         if receipt.tool != call.tool || receipt.arguments_digest != call.arguments_digest {
             return Err(workspace_failure(
                 "workspace_insert_idempotency_conflict",
@@ -2035,7 +2702,7 @@ fn insert_workspace_text(
     };
     remember_workspace_mutation_receipt(
         &mut mutation_state,
-        call.call_id.clone(),
+        receipt_key,
         WorkspaceMutationReceipt {
             tool: call.tool.clone(),
             arguments_digest: call.arguments_digest.clone(),
@@ -2047,16 +2714,16 @@ fn insert_workspace_text(
 
 fn remember_workspace_mutation_receipt(
     mutation_state: &mut WorkspaceMutationState,
-    call_id: String,
+    receipt_key: (Option<tools::ExecutionScope>, String),
     receipt: WorkspaceMutationReceipt,
 ) {
     if mutation_state.receipts.len() == MAX_WORKSPACE_MUTATION_RECEIPTS
-        && let Some(expired_call_id) = mutation_state.receipt_order.pop_front()
+        && let Some(expired_receipt_key) = mutation_state.receipt_order.pop_front()
     {
-        mutation_state.receipts.remove(&expired_call_id);
+        mutation_state.receipts.remove(&expired_receipt_key);
     }
-    mutation_state.receipt_order.push_back(call_id.clone());
-    mutation_state.receipts.insert(call_id, receipt);
+    mutation_state.receipt_order.push_back(receipt_key.clone());
+    mutation_state.receipts.insert(receipt_key, receipt);
 }
 
 fn read_workspace_edit_file(
@@ -2471,19 +3138,114 @@ fn sync_directory(_root: &Path) -> Result<(), ExecutorError> {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::atomic::{AtomicU64, Ordering},
+        sync::atomic::{AtomicU64, AtomicUsize, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use protocol::{ToolCall, ToolExecutorStatus};
     use serde_json::json;
-    use tools::{RegistryError, arguments_digest, stable_call_id};
+    use tools::{ExecutionScope, RegistryError, arguments_digest, stable_call_id};
 
     use super::*;
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
     struct TestDirectory(PathBuf);
+
+    struct TestTerminalBackend {
+        spawns: Arc<AtomicUsize>,
+        sends: Arc<AtomicUsize>,
+    }
+
+    struct TestTerminalSession {
+        sends: Arc<AtomicUsize>,
+    }
+
+    impl terminal::TerminalBackend for TestTerminalBackend {
+        fn backend_type(&self) -> &str {
+            "stub"
+        }
+
+        fn spawn(
+            &self,
+            _request: terminal::BackendSpawnRequest,
+        ) -> terminal::TerminalFuture<'_, Arc<dyn terminal::TerminalBackendSession>> {
+            self.spawns.fetch_add(1, Ordering::Relaxed);
+            let session: Arc<dyn terminal::TerminalBackendSession> =
+                Arc::new(TestTerminalSession {
+                    sends: Arc::clone(&self.sends),
+                });
+            Box::pin(async move { Ok(session) })
+        }
+    }
+
+    impl terminal::TerminalBackendSession for TestTerminalSession {
+        fn snapshot(&self) -> terminal::TerminalFuture<'_, terminal::TerminalStatus> {
+            Box::pin(async { Ok(terminal::TerminalStatus::Running) })
+        }
+
+        fn send(
+            &self,
+            request: TerminalSendRequest,
+        ) -> terminal::TerminalFuture<'_, terminal::TerminalSendResult> {
+            self.sends.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                if request.text == "unknown" {
+                    return Err(TerminalError::BackendFailed);
+                }
+                Ok(terminal::TerminalSendResult {
+                    viewport: format!("ran:{}", request.text),
+                    wait_reason: terminal::TerminalWaitReason::InferredIdle,
+                    status: terminal::TerminalStatus::Running,
+                    truncated: false,
+                })
+            })
+        }
+
+        fn read(
+            &self,
+            request: TerminalReadRequest,
+        ) -> terminal::TerminalFuture<'_, terminal::TerminalReadResult> {
+            Box::pin(async move {
+                Ok(terminal::TerminalReadResult {
+                    text: "history".into(),
+                    total_lines: 1,
+                    line_begin: request.offset.min(1),
+                    line_end: 1,
+                    truncated: false,
+                })
+            })
+        }
+
+        fn signal(
+            &self,
+            _signal: TerminalSignal,
+        ) -> terminal::TerminalFuture<'_, terminal::TerminalStatus> {
+            Box::pin(async { Ok(terminal::TerminalStatus::Running) })
+        }
+
+        fn close(&self) -> terminal::TerminalFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn test_terminal_service() -> (Arc<TerminalService>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let sends = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn terminal::TerminalBackend> = Arc::new(TestTerminalBackend {
+            spawns: Arc::clone(&spawns),
+            sends: Arc::clone(&sends),
+        });
+        (
+            Arc::new(TerminalService::new([backend]).unwrap()),
+            spawns,
+            sends,
+        )
+    }
+
+    fn terminal_scope(actor: &str) -> tools::ExecutionScope {
+        tools::ExecutionScope::new("account-1", actor, "session-1", "turn-1", "agent-1").unwrap()
+    }
 
     impl TestDirectory {
         fn new() -> Self {
@@ -2648,6 +3410,24 @@ mod tests {
         }
     }
 
+    fn terminal_call(
+        step: u32,
+        tool: &str,
+        arguments: serde_json::Value,
+        effect: ToolEffect,
+    ) -> ToolCall {
+        ToolCall {
+            call_id: stable_call_id("run-terminal", 1, step, tool).unwrap(),
+            tool: tool.into(),
+            tool_version: TERMINAL_TOOL_VERSION.into(),
+            arguments_digest: arguments_digest(&arguments),
+            arguments,
+            effect,
+            sandbox_profile: SandboxProfile::IsolatedContainer,
+            executor_status: ToolExecutorStatus::Available,
+        }
+    }
+
     #[test]
     fn workspace_search_preview_keeps_a_late_utf8_match_within_the_byte_limit() {
         let line = format!("{}目标needle{}", "前".repeat(120), "后".repeat(120));
@@ -2665,7 +3445,7 @@ mod tests {
         for index in 0..=MAX_WORKSPACE_MUTATION_RECEIPTS {
             remember_workspace_mutation_receipt(
                 &mut state,
-                format!("call-{index}"),
+                (None, format!("call-{index}")),
                 WorkspaceMutationReceipt {
                     tool: WORKSPACE_REPLACE_TEXT_TOOL_NAME.into(),
                     arguments_digest: format!("digest-{index}"),
@@ -2680,13 +3460,50 @@ mod tests {
 
         assert_eq!(state.receipts.len(), MAX_WORKSPACE_MUTATION_RECEIPTS);
         assert_eq!(state.receipt_order.len(), MAX_WORKSPACE_MUTATION_RECEIPTS);
-        assert!(!state.receipts.contains_key("call-0"));
-        assert_eq!(state.receipt_order.front().unwrap(), "call-1");
+        assert!(!state.receipts.contains_key(&(None, "call-0".into())));
+        assert_eq!(
+            state.receipt_order.front().unwrap(),
+            &(None, "call-1".into())
+        );
         assert!(
             state
                 .receipts
-                .contains_key(&format!("call-{MAX_WORKSPACE_MUTATION_RECEIPTS}"))
+                .contains_key(&(None, format!("call-{MAX_WORKSPACE_MUTATION_RECEIPTS}")))
         );
+    }
+
+    #[tokio::test]
+    async fn workspace_mutation_receipts_never_replay_across_execution_scopes() {
+        let temp = TestDirectory::new();
+        fs::write(temp.0.join("lib.rs"), "before\n").unwrap();
+        let mut registry = ToolRegistry::new();
+        register_local_workspace_connectors(&mut registry, LOCAL_DEV_ENVIRONMENT, &temp.0).unwrap();
+        let call = workspace_replace_call(1, "lib.rs", "before", "after");
+        let first_scope =
+            ExecutionScope::new("account-a", "actor-a", "session-a", "turn-a", "agent-a").unwrap();
+        let second_scope =
+            ExecutionScope::new("account-b", "actor-b", "session-b", "turn-b", "agent-b").unwrap();
+
+        let first = registry
+            .dispatch_scoped(call.clone(), LOCAL_DEV_ENVIRONMENT, first_scope.clone())
+            .await
+            .unwrap();
+        assert!(!first.replayed);
+        let replay = registry
+            .dispatch_scoped(call.clone(), LOCAL_DEV_ENVIRONMENT, first_scope)
+            .await
+            .unwrap();
+        assert!(replay.replayed);
+
+        let foreign = registry
+            .dispatch_scoped(call, LOCAL_DEV_ENVIRONMENT, second_scope)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            foreign,
+            RegistryError::Executor(ExecutorError::Failed { ref code, .. })
+                if code == "workspace_edit_text_not_found"
+        ));
     }
 
     #[test]
@@ -2745,6 +3562,198 @@ mod tests {
                 .descriptor(WORKSPACE_FIND_PATHS_TOOL_NAME)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn non_local_terminal_registration_fails_without_exposing_descriptors() {
+        let (service, _, _) = test_terminal_service();
+        let mut registry = ToolRegistry::new();
+
+        let error =
+            register_local_terminal_connectors(&mut registry, "production", service).unwrap_err();
+
+        assert_eq!(
+            error,
+            ConnectorConfigError::EnvironmentDenied("production".into())
+        );
+        assert!(registry.descriptor(TERMINAL_OPEN_TOOL_NAME).is_none());
+        assert!(registry.descriptor(TERMINAL_LIST_TOOL_NAME).is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_tools_are_scoped_bounded_idempotent_and_outcome_safe() {
+        let (service, spawns, sends) = test_terminal_service();
+        let mut registry = ToolRegistry::new();
+        register_local_terminal_connectors(
+            &mut registry,
+            LOCAL_DEV_ENVIRONMENT,
+            Arc::clone(&service),
+        )
+        .unwrap();
+        for name in [
+            TERMINAL_OPEN_TOOL_NAME,
+            TERMINAL_SEND_TOOL_NAME,
+            TERMINAL_READ_TOOL_NAME,
+            TERMINAL_SIGNAL_TOOL_NAME,
+            TERMINAL_CLOSE_TOOL_NAME,
+            TERMINAL_LIST_TOOL_NAME,
+        ] {
+            assert!(registry.descriptor(name).is_some(), "missing {name}");
+        }
+
+        let open = terminal_call(
+            1,
+            TERMINAL_OPEN_TOOL_NAME,
+            json!({"name": "main", "cwd": "."}),
+            ToolEffect::LocalWrite,
+        );
+        let unscoped = registry
+            .dispatch(open.clone(), LOCAL_DEV_ENVIRONMENT)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            unscoped,
+            RegistryError::Executor(ExecutorError::Failed { ref code, .. })
+                if code == "terminal_scope_required"
+        ));
+
+        let owner = terminal_scope("user-1");
+        let opened = registry
+            .dispatch_scoped(open.clone(), LOCAL_DEV_ENVIRONMENT, owner.clone())
+            .await
+            .unwrap();
+        assert_eq!(opened.value["session_id"], "pty-1");
+        assert_eq!(opened.value["backend_type"], "stub");
+        assert_eq!(spawns.load(Ordering::Relaxed), 1);
+        let replayed = registry
+            .dispatch_scoped(open, LOCAL_DEV_ENVIRONMENT, owner.clone())
+            .await
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.value, opened.value);
+        assert_eq!(spawns.load(Ordering::Relaxed), 1);
+
+        let listed = registry
+            .dispatch_scoped(
+                terminal_call(2, TERMINAL_LIST_TOOL_NAME, json!({}), ToolEffect::ReadOnly),
+                LOCAL_DEV_ENVIRONMENT,
+                owner.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.value["backend_types"], json!(["stub"]));
+        assert_eq!(listed.value["sessions"].as_array().unwrap().len(), 1);
+        let foreign_owner = terminal_scope("user-2");
+        let foreign = registry
+            .dispatch_scoped(
+                terminal_call(2, TERMINAL_LIST_TOOL_NAME, json!({}), ToolEffect::ReadOnly),
+                LOCAL_DEV_ENVIRONMENT,
+                foreign_owner.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(foreign.value["sessions"].as_array().unwrap().is_empty());
+        let foreign_opened = registry
+            .dispatch_scoped(
+                terminal_call(
+                    1,
+                    TERMINAL_OPEN_TOOL_NAME,
+                    json!({"name": "main", "cwd": "."}),
+                    ToolEffect::LocalWrite,
+                ),
+                LOCAL_DEV_ENVIRONMENT,
+                foreign_owner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(foreign_opened.value["session_id"], "pty-2");
+        assert!(!foreign_opened.replayed);
+        assert_eq!(spawns.load(Ordering::Relaxed), 2);
+
+        let send = terminal_call(
+            3,
+            TERMINAL_SEND_TOOL_NAME,
+            json!({"session_id": "pty-1", "text": "echo hi"}),
+            ToolEffect::LocalWrite,
+        );
+        let sent = registry
+            .dispatch_scoped(send.clone(), LOCAL_DEV_ENVIRONMENT, owner.clone())
+            .await
+            .unwrap();
+        assert_eq!(sent.value["viewport"], "ran:echo hi");
+        assert_eq!(sends.load(Ordering::Relaxed), 1);
+        assert!(
+            registry
+                .dispatch_scoped(send, LOCAL_DEV_ENVIRONMENT, owner.clone())
+                .await
+                .unwrap()
+                .replayed
+        );
+        assert_eq!(sends.load(Ordering::Relaxed), 1);
+
+        let read = registry
+            .dispatch_scoped(
+                terminal_call(
+                    4,
+                    TERMINAL_READ_TOOL_NAME,
+                    json!({"session_id": "pty-1", "offset": 0, "count": 10}),
+                    ToolEffect::ReadOnly,
+                ),
+                LOCAL_DEV_ENVIRONMENT,
+                owner.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.value["text"], "history");
+
+        let signaled = registry
+            .dispatch_scoped(
+                terminal_call(
+                    5,
+                    TERMINAL_SIGNAL_TOOL_NAME,
+                    json!({"session_id": "pty-1", "signal": "SIGINT"}),
+                    ToolEffect::LocalWrite,
+                ),
+                LOCAL_DEV_ENVIRONMENT,
+                owner.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(signaled.value["delivered"], true);
+        assert_eq!(signaled.value["status"]["kind"], "running");
+
+        let unknown = registry
+            .dispatch_scoped(
+                terminal_call(
+                    6,
+                    TERMINAL_SEND_TOOL_NAME,
+                    json!({"session_id": "pty-1", "text": "unknown"}),
+                    ToolEffect::LocalWrite,
+                ),
+                LOCAL_DEV_ENVIRONMENT,
+                owner.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            unknown,
+            RegistryError::Executor(ExecutorError::OutcomeUnknown { .. })
+        ));
+
+        let closed = registry
+            .dispatch_scoped(
+                terminal_call(
+                    7,
+                    TERMINAL_CLOSE_TOOL_NAME,
+                    json!({"session_id": "pty-1"}),
+                    ToolEffect::Destructive,
+                ),
+                LOCAL_DEV_ENVIRONMENT,
+                owner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(closed.value["outcome"], "closed");
     }
 
     #[tokio::test]

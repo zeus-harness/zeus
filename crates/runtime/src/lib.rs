@@ -21,11 +21,13 @@ use authz::{PolicyBuildError, PolicyContext, PolicyEngine, PolicyEvaluation, Pol
 use chrono::{SecondsFormat, Utc};
 use connectors::{
     ConnectorConfigError, LOCAL_DEV_ENVIRONMENT, register_local_dev_connectors,
-    register_local_workspace_connectors, workspace_create_file_descriptor,
-    workspace_find_paths_descriptor, workspace_insert_text_descriptor,
-    workspace_list_directory_descriptor, workspace_read_file_descriptor,
-    workspace_read_lines_descriptor, workspace_replace_text_descriptor,
-    workspace_search_text_descriptor,
+    register_local_terminal_connectors, register_local_workspace_connectors,
+    terminal_close_descriptor, terminal_list_descriptor, terminal_open_descriptor,
+    terminal_read_descriptor, terminal_send_descriptor, terminal_signal_descriptor,
+    workspace_create_file_descriptor, workspace_find_paths_descriptor,
+    workspace_insert_text_descriptor, workspace_list_directory_descriptor,
+    workspace_read_file_descriptor, workspace_read_lines_descriptor,
+    workspace_replace_text_descriptor, workspace_search_text_descriptor,
 };
 pub use deployment::ManifestEnvelope;
 use deployment::{
@@ -82,9 +84,10 @@ use storage::{
     ReviewContext, ReviewReceipt, RotateMemberSetupTokenCommit, RunSnapshot, RuntimeIdentity,
     SqliteStore, StorageError,
 };
+use terminal::TerminalService;
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast};
-pub use tools::ToolOutput;
+pub use tools::{ExecutionScope, ToolOutput};
 use tools::{ExecutorError, RegistryError, ToolRegistry, arguments_digest, stable_agent_call_id};
 
 const PRODUCTION_POLICY_ID: &str = "production-guarded";
@@ -273,6 +276,16 @@ pub struct ResolvedSessionAgentTool {
     call: ToolCall,
     environment: String,
     policy_evaluation: PolicyEvaluation,
+}
+
+/// A verified Agent tool call paired with server-derived execution ownership.
+///
+/// The private fields ensure stateful executors never receive model-selected
+/// or caller-substituted ownership context.
+#[derive(Debug, PartialEq)]
+pub struct ScopedSessionAgentTool {
+    resolved: ResolvedSessionAgentTool,
+    scope: ExecutionScope,
 }
 
 impl ResolvedSessionAgentTool {
@@ -570,6 +583,18 @@ impl StoreError {
             _ => false,
         }
     }
+
+    /// Return whether an already-started executor reported an indeterminate
+    /// side-effect outcome. This must settle as `outcome_unknown`, never as a
+    /// known failure or a retryable operation.
+    pub fn is_executor_outcome_unknown(&self) -> bool {
+        matches!(
+            self,
+            Self::Registry(RegistryError::Executor(
+                ExecutorError::OutcomeUnknown { .. }
+            ))
+        )
+    }
 }
 
 impl DemoStore {
@@ -644,6 +669,60 @@ impl DemoStore {
             },
         )
         .await
+    }
+
+    /// Opens local development with an explicitly configured isolated
+    /// terminal service and no workspace-file capability.
+    pub async fn open_local_with_terminal(
+        path: impl AsRef<Path>,
+        marker_root: impl Into<PathBuf>,
+        terminal_service: Arc<TerminalService>,
+    ) -> Result<Self, StoreError> {
+        Self::open_local_with_optional_workspace_and_terminal(
+            path,
+            marker_root.into(),
+            None,
+            terminal_service,
+        )
+        .await
+    }
+
+    /// Opens local development with rooted workspace tools and an explicitly
+    /// configured isolated terminal service. The runtime never constructs a
+    /// host-process fallback for this capability.
+    pub async fn open_local_with_workspace_and_terminal(
+        path: impl AsRef<Path>,
+        marker_root: impl Into<PathBuf>,
+        workspace_root: impl Into<PathBuf>,
+        terminal_service: Arc<TerminalService>,
+    ) -> Result<Self, StoreError> {
+        Self::open_local_with_optional_workspace_and_terminal(
+            path,
+            marker_root.into(),
+            Some(workspace_root.into()),
+            terminal_service,
+        )
+        .await
+    }
+
+    async fn open_local_with_optional_workspace_and_terminal(
+        path: impl AsRef<Path>,
+        marker_root: PathBuf,
+        workspace_root: Option<PathBuf>,
+        terminal_service: Arc<TerminalService>,
+    ) -> Result<Self, StoreError> {
+        let profile = DemoProfile::LocalDevelopment {
+            marker_root,
+            workspace_root,
+        };
+        let storage = SqliteStore::open_with_limits_and_physical_and_operations(
+            path,
+            StorageLimits::default(),
+            SqlitePhysicalLimits::default(),
+            SqliteOperationLimits::default(),
+        )
+        .await?;
+        Self::from_storage_with_terminal(storage, profile, true, Some(terminal_service)).await
     }
 
     pub async fn open_local_with_limits(
@@ -785,7 +864,16 @@ impl DemoStore {
         profile: DemoProfile,
         auto_dispatch: bool,
     ) -> Result<Self, StoreError> {
-        let components = RuntimeComponents::build(profile)?;
+        Self::from_storage_with_terminal(storage, profile, auto_dispatch, None).await
+    }
+
+    async fn from_storage_with_terminal(
+        storage: SqliteStore,
+        profile: DemoProfile,
+        auto_dispatch: bool,
+        terminal_service: Option<Arc<TerminalService>>,
+    ) -> Result<Self, StoreError> {
+        let components = RuntimeComponents::build(profile, terminal_service)?;
         let profile_id = components.profile_id;
         let primary_session_id = components.primary_session_id;
         let primary_run_id = components.scenario.run.id.clone();
@@ -1197,6 +1285,41 @@ impl DemoStore {
         Ok(resolved)
     }
 
+    /// Rehydrate one complete durable Agent tool work item and bind it to its
+    /// server-owned execution scope.
+    pub fn verify_persisted_session_agent_tool_work(
+        &self,
+        work: &AgentToolWork,
+    ) -> Result<ScopedSessionAgentTool, StoreError> {
+        for (field, matches) in [
+            ("agent_id", work.call.agent_id == work.model_job.agent_id),
+            (
+                "account_id",
+                work.call.account_id == work.model_job.account_id,
+            ),
+            (
+                "session_id",
+                work.call.session_id == work.model_job.session_id,
+            ),
+            ("turn_id", work.call.turn_id == work.model_job.turn_id),
+        ] {
+            if !matches {
+                return Err(StoreError::PolicyChanged(format!(
+                    "the persisted agent tool {field} does not match its initiating model job"
+                )));
+            }
+        }
+        let resolved = self.verify_persisted_session_agent_tool(&work.call)?;
+        let scope = ExecutionScope::new(
+            work.call.account_id.as_str(),
+            work.model_job.actor_user_id.as_str(),
+            work.call.session_id.as_str(),
+            work.call.turn_id.as_str(),
+            work.call.agent_id.as_str(),
+        )?;
+        Ok(ScopedSessionAgentTool { resolved, scope })
+    }
+
     /// Re-evaluate policy and the complete registry contract immediately before
     /// executing a previously resolved call.
     ///
@@ -1204,9 +1327,10 @@ impl DemoStore {
     /// invoking this method. This façade never retries an executor.
     pub async fn dispatch_session_agent_tool_after_checkpoint(
         &self,
-        resolved: ResolvedSessionAgentTool,
+        scoped: ScopedSessionAgentTool,
         approval: Option<&Approval>,
     ) -> Result<ToolOutput, StoreError> {
+        let ScopedSessionAgentTool { resolved, scope } = scoped;
         if resolved.environment != self.environment.as_ref() {
             return Err(StoreError::PolicyChanged(
                 "the resolved tool environment no longer matches this runtime".into(),
@@ -1233,7 +1357,7 @@ impl DemoStore {
             ));
         }
         self.registry
-            .dispatch(resolved.call, &resolved.environment)
+            .dispatch_scoped(resolved.call, &resolved.environment, scope)
             .await
             .map_err(StoreError::from)
     }
@@ -3166,9 +3290,18 @@ struct RuntimeComponents {
 }
 
 impl RuntimeComponents {
-    fn build(profile: DemoProfile) -> Result<Self, StoreError> {
+    fn build(
+        profile: DemoProfile,
+        terminal_service: Option<Arc<TerminalService>>,
+    ) -> Result<Self, StoreError> {
         match profile {
             DemoProfile::ProductionGuarded => {
+                if terminal_service.is_some() {
+                    return Err(StoreError::ExecutionInvariant(
+                        "terminal services are not accepted by the guarded production profile"
+                            .into(),
+                    ));
+                }
                 let scenario = DemoScenario::zr_1842();
                 let call = requested_call(&scenario.events)?;
                 let policy = PolicyEngine::new(vec![PolicyRule {
@@ -3249,6 +3382,38 @@ impl RuntimeComponents {
                         &mut registry,
                         &scenario.run.environment,
                         workspace_root,
+                    )?;
+                }
+                if let Some(terminal_service) = terminal_service {
+                    for descriptor in [terminal_read_descriptor(), terminal_list_descriptor()] {
+                        policy_rules.push(PolicyRule {
+                            revision: LOCAL_POLICY_REVISION.into(),
+                            tool: descriptor.name,
+                            environment: scenario.run.environment.clone(),
+                            effect: descriptor.effect,
+                            sandbox_profile: descriptor.sandbox_profile,
+                            decision: PolicyDecision::Allow,
+                        });
+                    }
+                    for descriptor in [
+                        terminal_open_descriptor(),
+                        terminal_send_descriptor(),
+                        terminal_signal_descriptor(),
+                        terminal_close_descriptor(),
+                    ] {
+                        policy_rules.push(PolicyRule {
+                            revision: LOCAL_POLICY_REVISION.into(),
+                            tool: descriptor.name,
+                            environment: scenario.run.environment.clone(),
+                            effect: descriptor.effect,
+                            sandbox_profile: descriptor.sandbox_profile,
+                            decision: PolicyDecision::RequireApproval,
+                        });
+                    }
+                    register_local_terminal_connectors(
+                        &mut registry,
+                        &scenario.run.environment,
+                        terminal_service,
                     )?;
                 }
                 let policy = PolicyEngine::new(policy_rules)?;
@@ -3408,6 +3573,7 @@ fn registry_error_outcome(error: RegistryError) -> ToolOutcome {
         RegistryError::InvalidDescriptor(_)
         | RegistryError::DuplicateTool(_)
         | RegistryError::InvalidCall(_)
+        | RegistryError::InvalidExecutionScope(_)
         | RegistryError::InvalidArguments(_)
         | RegistryError::ContractMismatch { .. } => not_dispatched(
             NotDispatchedReason::PolicyChanged,
@@ -3432,6 +3598,9 @@ fn registry_error_outcome(error: RegistryError) -> ToolOutcome {
                 .into(),
             error_code: Some("executor_unavailable_after_dispatch".into()),
         },
+        RegistryError::Executor(ExecutorError::OutcomeUnknown { message }) => {
+            ToolOutcome::OutcomeUnknown { summary: message }
+        }
         RegistryError::Executor(ExecutorError::Failed { code, message, .. }) => {
             ToolOutcome::Failed {
                 summary: message,
@@ -3608,6 +3777,23 @@ mod tests {
             arguments_digest: Some(resolved.call().arguments_digest.clone()),
             sandbox_profile: Some(resolved.call().sandbox_profile.clone()),
             scope: Some(ApprovalScope::AllowOnce),
+        }
+    }
+
+    fn scoped_resolved_tool(
+        resolved: ResolvedSessionAgentTool,
+        agent_id: &str,
+    ) -> ScopedSessionAgentTool {
+        ScopedSessionAgentTool {
+            resolved,
+            scope: ExecutionScope::new(
+                AccountId::local().as_str(),
+                TEST_OWNER_ID,
+                "session-agent-runtime",
+                "turn-agent-runtime",
+                agent_id,
+            )
+            .unwrap(),
         }
     }
 
@@ -4319,7 +4505,10 @@ mod tests {
 
         let approval = approval_for_resolved_tool(&rehydrated);
         store
-            .dispatch_session_agent_tool_after_checkpoint(rehydrated, Some(&approval))
+            .dispatch_session_agent_tool_after_checkpoint(
+                scoped_resolved_tool(rehydrated, agent_id),
+                Some(&approval),
+            )
             .await
             .unwrap();
         assert_eq!(directory_entries(&paths.marker_root), 1);
@@ -4401,7 +4590,10 @@ mod tests {
         };
 
         let missing_approval = store
-            .dispatch_session_agent_tool_after_checkpoint(resolve().unwrap(), None)
+            .dispatch_session_agent_tool_after_checkpoint(
+                scoped_resolved_tool(resolve().unwrap(), "agent-turn-8"),
+                None,
+            )
             .await
             .unwrap_err();
         assert!(matches!(missing_approval, StoreError::PolicyChanged(_)));
@@ -4411,7 +4603,10 @@ mod tests {
         let approval = approval_for_resolved_tool(&resolved);
         let expected_call_id = resolved.call().call_id.clone();
         let output = store
-            .dispatch_session_agent_tool_after_checkpoint(resolved, Some(&approval))
+            .dispatch_session_agent_tool_after_checkpoint(
+                scoped_resolved_tool(resolved, "agent-turn-8"),
+                Some(&approval),
+            )
             .await
             .unwrap();
         assert!(!output.replayed);
@@ -4449,7 +4644,10 @@ mod tests {
         );
 
         let error = store
-            .dispatch_session_agent_tool_after_checkpoint(resolved, Some(&approval))
+            .dispatch_session_agent_tool_after_checkpoint(
+                scoped_resolved_tool(resolved, "agent-turn-9"),
+                Some(&approval),
+            )
             .await
             .unwrap_err();
         assert!(matches!(

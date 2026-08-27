@@ -44,5 +44,6 @@ protocol = { path = "crates/protocol" }
 runtime = { path = "crates/runtime" }
 storage = { path = "crates/storage" }
 tenancy = { path = "crates/tenancy" }
+terminal = { path = "crates/terminal" }
 tools = { path = "crates/tools" }
 workflows = { path = "crates/workflows" }

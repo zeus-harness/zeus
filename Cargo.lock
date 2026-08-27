@@ -277,6 +277,7 @@ dependencies = [
  "protocol",
  "serde",
  "serde_json",
+ "terminal",
  "thiserror",
  "tokio",
  "tools",
@@ -1175,6 +1176,7 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "storage",
+ "terminal",
  "thiserror",
  "tokio",
  "tools",
@@ -1478,6 +1480,16 @@ dependencies = [
  "subtle",
  "thiserror",
  "zeroize",
+]
+
+[[package]]
+name = "terminal"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+ "tokio",
+ "tools",
 ]
 
 [[package]]
@@ -2083,6 +2095,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tenancy",
+ "terminal",
  "tokio",
  "tower",
  "zeroize",

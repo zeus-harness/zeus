@@ -236,6 +236,13 @@ POST /sessions/{id}/turns
   临时文件、file sync、create-new hard-link publication 与 directory sync 原子发布，绝不覆盖
   现有路径或隐式创建父目录，并同样要求 owner approval。所有结果仍按 exact tool completion
   持久化后再进入下一模型步骤；没有 shell、外部进程或隐式写权限。
+- persistent terminal 只在 embedding runtime 显式注入 isolated backend 时进入 Agent manifest；
+  Zeus 核心自身不启动 host process，也不提供 host-shell fallback。session owner 使用 durable work
+  中服务端校验的 account/actor/Session/turn/Agent scope，foreign scope 只能得到 unknown；每 owner
+  最多 4 个 session，输入、输出和 read 行数均有硬上限。open/send/signal/close 必须逐次 owner
+  approval，read/list 为 read-only allow；mutation receipt 绑定 scope、call ID、tool 与 arguments
+  digest。started checkpoint 后无法确认副作用结果时必须 durable settle 为 `outcome_unknown`，终止
+  当前 Agent turn 且不得自动重试。
 - 本地 fallback 只说明“消息已保存但未配置模型”，事件必须标注 `local-fallback/non-model`，不能冒充智能回复。
 - OpenAI-compatible provider 限制连接/总超时、响应体大小，禁止重定向，并对非 2xx、畸形 JSON 和空 choices fail closed。
 

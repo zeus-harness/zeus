@@ -3170,7 +3170,7 @@ async fn drain_agent_tool_calls(state: &ApiState) -> Result<(), StoreError> {
 }
 
 async fn process_agent_tool_work(state: &ApiState, work: AgentToolWork) -> Result<(), StoreError> {
-    let resolved = match state.store.verify_persisted_session_agent_tool(&work.call) {
+    let scoped = match state.store.verify_persisted_session_agent_tool_work(&work) {
         Ok(resolved) => resolved,
         Err(error) => {
             eprintln!("zeus refused a drifted persisted Agent tool: {error}");
@@ -3192,7 +3192,7 @@ async fn process_agent_tool_work(state: &ApiState, work: AgentToolWork) -> Resul
     let store = state.store.clone();
     let outcome = tokio::spawn(async move {
         store
-            .dispatch_session_agent_tool_after_checkpoint(resolved, approval.as_ref())
+            .dispatch_session_agent_tool_after_checkpoint(scoped, approval.as_ref())
             .await
     })
     .await;
@@ -3204,6 +3204,16 @@ async fn process_agent_tool_work(state: &ApiState, work: AgentToolWork) -> Resul
                 AgentToolCallStatus::Succeeded,
                 output.value,
                 output.provider_request_id,
+            )
+            .await
+        }
+        Ok(Err(error)) if error.is_executor_outcome_unknown() => {
+            eprintln!("zeus Agent tool executor reported outcome_unknown");
+            settle_agent_tool_outcome_unknown(
+                state,
+                &work.call,
+                "executor_outcome_unknown",
+                "The executor could not determine the outcome after the durable start checkpoint",
             )
             .await
         }
@@ -5072,6 +5082,11 @@ mod tests {
     };
     use rusqlite::{Connection, params};
     use tenancy::BootstrapToken;
+    use terminal::{
+        BackendSpawnRequest, TerminalBackend, TerminalBackendSession, TerminalError,
+        TerminalFuture, TerminalReadRequest, TerminalReadResult, TerminalSendRequest,
+        TerminalSendResult, TerminalService, TerminalSignal, TerminalStatus, TerminalWaitReason,
+    };
     use tower::ServiceExt;
 
     use super::*;
@@ -6856,6 +6871,100 @@ mod tests {
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
     }
 
+    struct TerminalOpenSendThenFinalProvider {
+        metadata: ProviderMetadata,
+        requests: Arc<StdMutex<Vec<ReplyRequest>>>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum RecordedTerminalAction {
+        Spawn(BackendSpawnRequest),
+        Send {
+            session_id: String,
+            request: TerminalSendRequest,
+        },
+    }
+
+    struct RecordingTerminalBackend {
+        actions: Arc<StdMutex<Vec<RecordedTerminalAction>>>,
+        fail_send: bool,
+    }
+
+    struct RecordingTerminalSession {
+        session_id: String,
+        actions: Arc<StdMutex<Vec<RecordedTerminalAction>>>,
+        fail_send: bool,
+    }
+
+    impl TerminalBackend for RecordingTerminalBackend {
+        fn backend_type(&self) -> &str {
+            "test-isolated"
+        }
+
+        fn spawn(
+            &self,
+            request: BackendSpawnRequest,
+        ) -> TerminalFuture<'_, Arc<dyn TerminalBackendSession>> {
+            self.actions
+                .lock()
+                .unwrap()
+                .push(RecordedTerminalAction::Spawn(request.clone()));
+            let session: Arc<dyn TerminalBackendSession> = Arc::new(RecordingTerminalSession {
+                session_id: request.session_id,
+                actions: Arc::clone(&self.actions),
+                fail_send: self.fail_send,
+            });
+            Box::pin(async move { Ok(session) })
+        }
+    }
+
+    impl TerminalBackendSession for RecordingTerminalSession {
+        fn snapshot(&self) -> TerminalFuture<'_, TerminalStatus> {
+            Box::pin(async { Ok(TerminalStatus::Running) })
+        }
+
+        fn send(&self, request: TerminalSendRequest) -> TerminalFuture<'_, TerminalSendResult> {
+            self.actions
+                .lock()
+                .unwrap()
+                .push(RecordedTerminalAction::Send {
+                    session_id: self.session_id.clone(),
+                    request,
+                });
+            if self.fail_send {
+                return Box::pin(async { Err(TerminalError::BackendFailed) });
+            }
+            Box::pin(async {
+                Ok(TerminalSendResult {
+                    viewport: "zeus ready\n".into(),
+                    wait_reason: TerminalWaitReason::InferredIdle,
+                    status: TerminalStatus::Running,
+                    truncated: false,
+                })
+            })
+        }
+
+        fn read(&self, _request: TerminalReadRequest) -> TerminalFuture<'_, TerminalReadResult> {
+            Box::pin(async {
+                Ok(TerminalReadResult {
+                    text: "zeus ready\n".into(),
+                    total_lines: 1,
+                    line_begin: 0,
+                    line_end: 1,
+                    truncated: false,
+                })
+            })
+        }
+
+        fn signal(&self, _signal: TerminalSignal) -> TerminalFuture<'_, TerminalStatus> {
+            Box::pin(async { Ok(TerminalStatus::Running) })
+        }
+
+        fn close(&self) -> TerminalFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     const TEST_WORKSPACE_READ_FILE_TOOL_NAME: &str = "workspace_read_file";
     const TEST_WORKSPACE_READ_LINES_TOOL_NAME: &str = "workspace_read_lines";
     const TEST_WORKSPACE_LIST_DIRECTORY_TOOL_NAME: &str = "workspace_list_directory";
@@ -6864,6 +6973,12 @@ mod tests {
     const TEST_WORKSPACE_REPLACE_TEXT_TOOL_NAME: &str = "workspace_replace_text";
     const TEST_WORKSPACE_CREATE_FILE_TOOL_NAME: &str = "workspace_create_file";
     const TEST_WORKSPACE_INSERT_TEXT_TOOL_NAME: &str = "workspace_insert_text";
+    const TEST_TERMINAL_OPEN_TOOL_NAME: &str = "terminal_open";
+    const TEST_TERMINAL_SEND_TOOL_NAME: &str = "terminal_send";
+    const TEST_TERMINAL_READ_TOOL_NAME: &str = "terminal_read";
+    const TEST_TERMINAL_SIGNAL_TOOL_NAME: &str = "terminal_signal";
+    const TEST_TERMINAL_CLOSE_TOOL_NAME: &str = "terminal_close";
+    const TEST_TERMINAL_LIST_TOOL_NAME: &str = "terminal_list";
     static WORKSPACE_DISCOVERY_AGENT_TEST_LOCK: tokio::sync::Mutex<()> =
         tokio::sync::Mutex::const_new(());
 
@@ -6948,6 +7063,82 @@ mod tests {
                         content: "tool completed".into(),
                     },
                     call => panic!("unexpected Agent provider call {call}"),
+                }
+            };
+            let provider = self.metadata.clone();
+            Box::pin(async move {
+                Ok(ReplyResponse {
+                    output,
+                    finish_reason: Some("stop".into()),
+                    provider,
+                })
+            })
+        }
+    }
+
+    impl TerminalOpenSendThenFinalProvider {
+        fn new(requests: Arc<StdMutex<Vec<ReplyRequest>>>) -> Self {
+            Self {
+                metadata: ProviderMetadata {
+                    provider_id: "test-terminal-open-send-provider".into(),
+                    model: Some("test-model".into()),
+                    reply_kind: ReplyKind::Model,
+                },
+                requests,
+            }
+        }
+    }
+
+    impl ReplyProvider for TerminalOpenSendThenFinalProvider {
+        fn metadata(&self) -> &ProviderMetadata {
+            &self.metadata
+        }
+
+        fn reply(&self, request: ReplyRequest) -> ReplyFuture<'_> {
+            let output = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(request.clone());
+                match requests.len() {
+                    1 => {
+                        for tool_name in [
+                            TEST_TERMINAL_OPEN_TOOL_NAME,
+                            TEST_TERMINAL_SEND_TOOL_NAME,
+                            TEST_TERMINAL_READ_TOOL_NAME,
+                            TEST_TERMINAL_SIGNAL_TOOL_NAME,
+                            TEST_TERMINAL_CLOSE_TOOL_NAME,
+                            TEST_TERMINAL_LIST_TOOL_NAME,
+                        ] {
+                            assert!(
+                                request.tools.iter().any(|tool| tool.name == tool_name),
+                                "terminal-enabled manifest must expose {tool_name}"
+                            );
+                        }
+                        ReplyOutput::ToolCall {
+                            call: ReplyToolCall::new(
+                                "provider-call-terminal-open-1",
+                                TEST_TERMINAL_OPEN_TOOL_NAME,
+                                serde_json::json!({
+                                    "name": "zeus-core",
+                                    "cwd": ".",
+                                }),
+                            ),
+                        }
+                    }
+                    2 => ReplyOutput::ToolCall {
+                        call: ReplyToolCall::new(
+                            "provider-call-terminal-send-2",
+                            TEST_TERMINAL_SEND_TOOL_NAME,
+                            serde_json::json!({
+                                "session_id": "pty-1",
+                                "text": "echo zeus",
+                                "submit": true,
+                            }),
+                        ),
+                    },
+                    3 => ReplyOutput::Final {
+                        content: "isolated terminal command completed".into(),
+                    },
+                    call => panic!("unexpected terminal provider call {call}"),
                 }
             };
             let provider = self.metadata.clone();
@@ -8124,6 +8315,388 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&tool_result.content).unwrap(),
             agent.calls[0].output.clone().unwrap()
         );
+
+        drop(app);
+        drop(store);
+        tokio::task::yield_now().await;
+        cleanup_test_database(&path);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn isolated_terminal_open_and_send_each_wait_for_approval_and_preserve_agent_scope() {
+        let unique = UserId::generate().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "zeus-api-terminal-agent-{}",
+            unique.as_str().replace(':', "-")
+        ));
+        let path = root.join("zeus.db");
+        let marker_root = root.join("markers");
+        std::fs::create_dir_all(&root).unwrap();
+        let backend_actions = Arc::new(StdMutex::new(Vec::new()));
+        let terminal_service = Arc::new(
+            TerminalService::new([Arc::new(RecordingTerminalBackend {
+                actions: Arc::clone(&backend_actions),
+                fail_send: false,
+            }) as Arc<dyn TerminalBackend>])
+            .unwrap(),
+        );
+        let store = DemoStore::open_local_with_terminal(&path, &marker_root, terminal_service)
+            .await
+            .unwrap();
+        let owner = provision_test_owner(&store, "user-terminal-agent", "terminal-owner").await;
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: "session-terminal-agent".into(),
+                    title: "Use isolated terminal".into(),
+                },
+                "create-terminal-agent",
+            )
+            .await
+            .unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(TerminalOpenSendThenFinalProvider::new(Arc::clone(
+                &requests,
+            ))),
+        )
+        .unwrap();
+
+        let started = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-terminal-agent/turns")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "start-terminal-agent")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-terminal-agent",
+                            "user_message": "open an isolated terminal and run echo zeus",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+
+        let waiting_open = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            "session-terminal-agent",
+            "turn-terminal-agent",
+            protocol::AgentTurnStatus::WaitingApproval,
+        )
+        .await;
+        let open_call_id = waiting_open.pending_call_id.clone().unwrap();
+        assert_eq!(waiting_open.calls.len(), 1);
+        assert_eq!(waiting_open.calls[0].tool, TEST_TERMINAL_OPEN_TOOL_NAME);
+        assert!(waiting_open.calls[0].approval_required);
+        assert!(backend_actions.lock().unwrap().is_empty());
+
+        let approved_open = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/v1/sessions/session-terminal-agent/turns/turn-terminal-agent/approvals/{open_call_id}/decision"
+                ))
+                .header(header::HOST, "zeus.test")
+                .header(header::ORIGIN, "http://zeus.test")
+                .header(header::COOKIE, &owner.cookie_header)
+                .header(CSRF_HEADER, &owner.csrf_token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("idempotency-key", "approve-terminal-open")
+                .body(Body::from(
+                    serde_json::json!({
+                        "decision": "approve",
+                        "note": "open only the exact isolated terminal",
+                        "idempotency_key": "approve-terminal-open",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(approved_open.status(), StatusCode::OK);
+
+        let waiting_send = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            "session-terminal-agent",
+            "turn-terminal-agent",
+            protocol::AgentTurnStatus::WaitingApproval,
+        )
+        .await;
+        let send_call_id = waiting_send.pending_call_id.clone().unwrap();
+        assert_ne!(send_call_id, open_call_id);
+        assert_eq!(waiting_send.calls.len(), 2);
+        assert_eq!(waiting_send.calls[1].tool, TEST_TERMINAL_SEND_TOOL_NAME);
+        assert!(waiting_send.calls[1].approval_required);
+        {
+            let actions = backend_actions.lock().unwrap();
+            assert_eq!(actions.len(), 1);
+            let RecordedTerminalAction::Spawn(request) = &actions[0] else {
+                panic!("terminal open must be the first isolated backend action");
+            };
+            assert_eq!(request.session_id, "pty-1");
+            assert_eq!(request.cwd, ".");
+            assert_eq!(request.owner.account_id, owner.authz.account_id.as_str());
+            assert_eq!(request.owner.actor_id, owner.authz.user_id.as_str());
+            assert_eq!(request.owner.session_id, "session-terminal-agent");
+            assert_eq!(request.owner.turn_id, "turn-terminal-agent");
+            assert_eq!(
+                request.owner.agent_id,
+                durable_agent_id("session-terminal-agent", "turn-terminal-agent")
+            );
+        }
+
+        let approved_send = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/v1/sessions/session-terminal-agent/turns/turn-terminal-agent/approvals/{send_call_id}/decision"
+                ))
+                .header(header::HOST, "zeus.test")
+                .header(header::ORIGIN, "http://zeus.test")
+                .header(header::COOKIE, &owner.cookie_header)
+                .header(CSRF_HEADER, &owner.csrf_token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("idempotency-key", "approve-terminal-send")
+                .body(Body::from(
+                    serde_json::json!({
+                        "decision": "approve",
+                        "note": "send only the exact persisted command",
+                        "idempotency_key": "approve-terminal-send",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(approved_send.status(), StatusCode::OK);
+
+        let session = wait_for_ready_session(&store, &owner.authz, "session-terminal-agent").await;
+        assert_eq!(
+            session.turns[0].assistant_message.as_deref(),
+            Some("isolated terminal command completed")
+        );
+        let agent = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            "session-terminal-agent",
+            "turn-terminal-agent",
+            protocol::AgentTurnStatus::Succeeded,
+        )
+        .await;
+        assert_eq!(agent.model_steps, 3);
+        assert_eq!(agent.tool_calls, 2);
+        assert_eq!(agent.calls.len(), 2);
+        assert_eq!(agent.calls[0].tool, TEST_TERMINAL_OPEN_TOOL_NAME);
+        assert_eq!(agent.calls[1].tool, TEST_TERMINAL_SEND_TOOL_NAME);
+        for call in &agent.calls {
+            assert!(call.approval_required);
+            assert_eq!(call.status, AgentToolCallStatus::Succeeded);
+        }
+        assert_eq!(
+            agent.calls[0].output,
+            Some(serde_json::json!({
+                "session_id": "pty-1",
+                "name": "zeus-core",
+                "backend_type": "test-isolated",
+                "status": { "kind": "running" },
+            }))
+        );
+        assert_eq!(
+            agent.calls[1].output,
+            Some(serde_json::json!({
+                "viewport": "zeus ready\n",
+                "wait_reason": "inferred_idle",
+                "status": { "kind": "running" },
+                "truncated": false,
+            }))
+        );
+        let actions = backend_actions.lock().unwrap().clone();
+        assert_eq!(actions.len(), 2);
+        assert_eq!(
+            actions[1],
+            RecordedTerminalAction::Send {
+                session_id: "pty-1".into(),
+                request: TerminalSendRequest {
+                    text: "echo zeus".into(),
+                    submit: true,
+                },
+            }
+        );
+
+        let recorded = requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 3);
+        for (request_index, call_index) in [(1, 0), (2, 1)] {
+            let tool_result = recorded[request_index].messages.last().unwrap();
+            assert_eq!(tool_result.role, ReplyRole::Tool);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&tool_result.content).unwrap(),
+                agent.calls[call_index].output.clone().unwrap()
+            );
+        }
+
+        drop(app);
+        drop(store);
+        tokio::task::yield_now().await;
+        cleanup_test_database(&path);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn indeterminate_terminal_send_settles_outcome_unknown_without_retry() {
+        let unique = UserId::generate().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "zeus-api-terminal-unknown-{}",
+            unique.as_str().replace(':', "-")
+        ));
+        let path = root.join("zeus.db");
+        let marker_root = root.join("markers");
+        std::fs::create_dir_all(&root).unwrap();
+        let backend_actions = Arc::new(StdMutex::new(Vec::new()));
+        let terminal_service = Arc::new(
+            TerminalService::new([Arc::new(RecordingTerminalBackend {
+                actions: Arc::clone(&backend_actions),
+                fail_send: true,
+            }) as Arc<dyn TerminalBackend>])
+            .unwrap(),
+        );
+        let store = DemoStore::open_local_with_terminal(&path, &marker_root, terminal_service)
+            .await
+            .unwrap();
+        let owner =
+            provision_test_owner(&store, "user-terminal-unknown", "terminal-unknown-owner").await;
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: "session-terminal-unknown".into(),
+                    title: "Unknown terminal outcome".into(),
+                },
+                "create-terminal-unknown",
+            )
+            .await
+            .unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(TerminalOpenSendThenFinalProvider::new(Arc::clone(
+                &requests,
+            ))),
+        )
+        .unwrap();
+
+        let started = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-terminal-unknown/turns")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "start-terminal-unknown")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-terminal-unknown",
+                            "user_message": "run the command whose terminal result becomes indeterminate",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+
+        let waiting_open = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            "session-terminal-unknown",
+            "turn-terminal-unknown",
+            protocol::AgentTurnStatus::WaitingApproval,
+        )
+        .await;
+        approve_agent_tool(
+            &app,
+            &owner,
+            "session-terminal-unknown",
+            "turn-terminal-unknown",
+            waiting_open.pending_call_id.as_deref().unwrap(),
+            "approve-terminal-unknown-open",
+        )
+        .await;
+
+        let waiting_send = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            "session-terminal-unknown",
+            "turn-terminal-unknown",
+            protocol::AgentTurnStatus::WaitingApproval,
+        )
+        .await;
+        assert_eq!(waiting_send.calls.len(), 2);
+        assert_eq!(waiting_send.calls[1].tool, TEST_TERMINAL_SEND_TOOL_NAME);
+        approve_agent_tool(
+            &app,
+            &owner,
+            "session-terminal-unknown",
+            "turn-terminal-unknown",
+            waiting_send.pending_call_id.as_deref().unwrap(),
+            "approve-terminal-unknown-send",
+        )
+        .await;
+
+        let agent = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            "session-terminal-unknown",
+            "turn-terminal-unknown",
+            protocol::AgentTurnStatus::NeedsAttention,
+        )
+        .await;
+        assert_eq!(agent.model_steps, 2);
+        assert_eq!(agent.tool_calls, 2);
+        assert_eq!(agent.calls[0].status, AgentToolCallStatus::Succeeded);
+        assert_eq!(agent.calls[1].status, AgentToolCallStatus::OutcomeUnknown);
+        assert_eq!(
+            agent.calls[1]
+                .error
+                .as_ref()
+                .and_then(|error| error.get("code"))
+                .and_then(serde_json::Value::as_str),
+            Some("executor_outcome_unknown")
+        );
+        assert_eq!(
+            agent
+                .last_error
+                .as_ref()
+                .and_then(|error| error.get("code"))
+                .and_then(serde_json::Value::as_str),
+            Some("executor_outcome_unknown")
+        );
+        assert_eq!(backend_actions.lock().unwrap().len(), 2);
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(backend_actions.lock().unwrap().len(), 2);
+        assert_eq!(requests.lock().unwrap().len(), 2);
 
         drop(app);
         drop(store);
@@ -12746,6 +13319,42 @@ mod tests {
         authz: AuthzContext,
         cookie_header: String,
         csrf_token: String,
+    }
+
+    async fn approve_agent_tool(
+        app: &Router,
+        identity: &TestIdentity,
+        session_id: &str,
+        turn_id: &str,
+        call_id: &str,
+        idempotency_key: &str,
+    ) -> AgentReviewResponse {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/v1/sessions/{session_id}/turns/{turn_id}/approvals/{call_id}/decision"
+                ))
+                .header(header::HOST, "zeus.test")
+                .header(header::ORIGIN, "http://zeus.test")
+                .header(header::COOKIE, &identity.cookie_header)
+                .header(CSRF_HEADER, &identity.csrf_token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("idempotency-key", idempotency_key)
+                .body(Body::from(
+                    serde_json::json!({
+                        "decision": "approve",
+                        "note": "approve the exact persisted isolated terminal operation",
+                        "idempotency_key": idempotency_key,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response_json(response).await
     }
 
     async fn authenticated_file_app(label: &str) -> (Router, DemoStore, TestIdentity, PathBuf) {

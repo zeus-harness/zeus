@@ -22,6 +22,7 @@ use thiserror::Error;
 const MAX_TOOL_NAME_BYTES: usize = 64;
 const MAX_CALL_ID_BYTES: usize = 160;
 const MAX_ENVIRONMENT_BYTES: usize = 64;
+const MAX_EXECUTION_SCOPE_FIELD_BYTES: usize = 384;
 /// Maximum compact-JSON bytes accepted from one executor result value.
 pub const TOOL_OUTPUT_MAX_SERIALIZED_BYTES: usize = 64 * 1024;
 /// Maximum bytes accepted for an opaque executor request identifier.
@@ -234,11 +235,69 @@ impl ToolDescriptor {
     }
 }
 
-/// The request visible to a provider after all registry checks have passed.
+/// Server-derived ownership context for one Agent tool execution.
+///
+/// These fields never come from model arguments. Stateful executors use the
+/// complete scope to prevent resources such as terminal sessions from being
+/// observed or controlled by another account, actor, Session, turn, or Agent.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExecutionScope {
+    pub account_id: String,
+    pub actor_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub agent_id: String,
+}
+
+impl ExecutionScope {
+    pub fn new(
+        account_id: impl Into<String>,
+        actor_id: impl Into<String>,
+        session_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        agent_id: impl Into<String>,
+    ) -> Result<Self, RegistryError> {
+        let scope = Self {
+            account_id: account_id.into(),
+            actor_id: actor_id.into(),
+            session_id: session_id.into(),
+            turn_id: turn_id.into(),
+            agent_id: agent_id.into(),
+        };
+        scope.validate()?;
+        Ok(scope)
+    }
+
+    fn validate(&self) -> Result<(), RegistryError> {
+        for (field, value) in [
+            ("account_id", self.account_id.as_str()),
+            ("actor_id", self.actor_id.as_str()),
+            ("session_id", self.session_id.as_str()),
+            ("turn_id", self.turn_id.as_str()),
+            ("agent_id", self.agent_id.as_str()),
+        ] {
+            if value.is_empty()
+                || value.len() > MAX_EXECUTION_SCOPE_FIELD_BYTES
+                || value.trim() != value
+                || value.chars().any(char::is_control)
+            {
+                return Err(RegistryError::InvalidExecutionScope(format!(
+                    "{field} must be non-empty, canonical, control-free, and at most {MAX_EXECUTION_SCOPE_FIELD_BYTES} UTF-8 bytes"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The request visible to an executor after all registry checks have passed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionRequest {
     pub call: ToolCall,
     pub environment: String,
+    /// Present only for a server-owned Agent execution path. Legacy Run tools
+    /// remain explicitly unscoped and cannot use stateful Agent resources.
+    pub scope: Option<ExecutionScope>,
     /// Deterministic per logical call. Providers should use it for retries.
     pub provider_idempotency_key: String,
 }
@@ -258,6 +317,11 @@ pub struct ToolOutput {
 pub enum ExecutorError {
     #[error("tool executor is unavailable: {reason}")]
     Unavailable { reason: String },
+    /// The executor crossed its side-effect boundary but could not determine
+    /// whether the operation completed. Callers must never turn this into a
+    /// retryable known failure.
+    #[error("tool execution outcome is unknown: {message}")]
+    OutcomeUnknown { message: String },
     #[error("tool execution failed ({code}): {message}")]
     Failed {
         code: String,
@@ -277,6 +341,8 @@ pub enum RegistryError {
     UnknownTool(String),
     #[error("invalid tool call: {0}")]
     InvalidCall(String),
+    #[error("invalid tool execution scope: {0}")]
+    InvalidExecutionScope(String),
     #[error("invalid tool arguments: {0}")]
     InvalidArguments(String),
     #[error("tool call contract mismatch for `{field}`")]
@@ -364,6 +430,28 @@ impl ToolRegistry {
         call: ToolCall,
         environment: &str,
     ) -> Result<ToolOutput, RegistryError> {
+        self.dispatch_inner(call, environment, None).await
+    }
+
+    /// Dispatch a tool with server-derived Agent ownership context.
+    ///
+    /// The scope is validated before the executor can observe the request.
+    pub async fn dispatch_scoped(
+        &self,
+        call: ToolCall,
+        environment: &str,
+        scope: ExecutionScope,
+    ) -> Result<ToolOutput, RegistryError> {
+        scope.validate()?;
+        self.dispatch_inner(call, environment, Some(scope)).await
+    }
+
+    async fn dispatch_inner(
+        &self,
+        call: ToolCall,
+        environment: &str,
+        scope: Option<ExecutionScope>,
+    ) -> Result<ToolOutput, RegistryError> {
         validate_call_id(&call.call_id)?;
         validate_environment(environment)?;
 
@@ -406,6 +494,7 @@ impl ToolRegistry {
             .execute(ExecutionRequest {
                 call,
                 environment: environment.to_owned(),
+                scope,
                 provider_idempotency_key,
             })
             .await;
@@ -444,6 +533,13 @@ fn validate_executor_error(error: &ExecutorError) -> Result<(), RegistryError> {
             protocol::validate_tool_outcome_summary(reason).map_err(|_| {
                 RegistryError::InvalidExecutorDiagnostic {
                     field: "unavailable reason",
+                }
+            })?;
+        }
+        ExecutorError::OutcomeUnknown { message } => {
+            protocol::validate_tool_outcome_summary(message).map_err(|_| {
+                RegistryError::InvalidExecutorDiagnostic {
+                    field: "outcome-unknown message",
                 }
             })?;
         }
@@ -919,6 +1015,31 @@ mod tests {
     }
 
     #[test]
+    fn execution_scope_is_complete_bounded_and_control_free() {
+        let scope =
+            ExecutionScope::new("account-1", "user-1", "session-1", "turn-1", "agent-1").unwrap();
+        assert_eq!(scope.account_id, "account-1");
+        assert_eq!(scope.actor_id, "user-1");
+
+        for invalid in ["", " leading", "trailing ", "line\nbreak"] {
+            assert!(matches!(
+                ExecutionScope::new(invalid, "user", "session", "turn", "agent"),
+                Err(RegistryError::InvalidExecutionScope(_))
+            ));
+        }
+        assert!(matches!(
+            ExecutionScope::new(
+                "a".repeat(MAX_EXECUTION_SCOPE_FIELD_BYTES + 1),
+                "user",
+                "session",
+                "turn",
+                "agent",
+            ),
+            Err(RegistryError::InvalidExecutionScope(_))
+        ));
+    }
+
+    #[test]
     fn provider_json_schema_is_closed_typed_and_deterministic() {
         let schema = ObjectSchema {
             max_serialized_bytes: 512,
@@ -1060,6 +1181,31 @@ mod tests {
         let calls = recorder.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].provider_idempotency_key, expected_key);
+        assert!(calls[0].scope.is_none());
+    }
+
+    #[tokio::test]
+    async fn scoped_dispatch_supplies_exact_server_owned_context() {
+        let recorder = RecordingExecutor::new(json!({"ok": true}));
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(descriptor("known_query"), recorder.clone())
+            .unwrap();
+        let scope =
+            ExecutionScope::new("account-1", "user-1", "session-1", "turn-1", "agent-1").unwrap();
+
+        registry
+            .dispatch_scoped(
+                call("known_query", json!({"query": "safe"})),
+                "local-development",
+                scope.clone(),
+            )
+            .await
+            .unwrap();
+
+        let calls = recorder.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].scope.as_ref(), Some(&scope));
     }
 
     #[tokio::test]
