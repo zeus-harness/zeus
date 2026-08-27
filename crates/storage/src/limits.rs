@@ -31,6 +31,12 @@ pub const DEFAULT_SESSION_EVENT_PAYLOAD_BYTES_PER_SESSION: usize = 64 * 1024 * 1
 pub const DEFAULT_RUN_EVENT_PAYLOAD_BYTES_PER_RUN: usize = 256 * 1024 * 1024;
 pub const DEFAULT_EVENT_PAYLOAD_BYTES_GLOBAL: usize = 1024 * 1024 * 1024;
 pub const DEFAULT_BOOTSTRAP_AUDIT_ROWS: usize = 1_024;
+pub const DEFAULT_ACCOUNT_AUDIT_DETAIL_ROWS: usize = 4_096;
+pub const DEFAULT_ACCOUNT_AUDIT_ROWS_PER_ACCOUNT: usize = 8_192;
+pub const DEFAULT_ACCOUNT_AUDIT_ROWS_GLOBAL: usize = 32_768;
+pub const DEFAULT_ACCOUNT_AUDIT_PROGRESS_ROWS_PER_ACCOUNT: usize = 64;
+pub const DEFAULT_ACCOUNT_AUDIT_PROGRESS_ROWS_GLOBAL: usize = 256;
+pub const DEFAULT_ACCOUNT_AUDIT_COMPACTION_BATCH: usize = 64;
 
 pub const HARD_MAX_SESSIONS_PER_ACTOR: usize = 10_000;
 pub const HARD_MAX_SESSIONS_PER_ACCOUNT: usize = 100_000;
@@ -52,6 +58,12 @@ pub const HARD_MAX_SESSION_EVENT_PAYLOAD_BYTES_PER_SESSION: usize = 256 * 1024 *
 pub const HARD_MAX_RUN_EVENT_PAYLOAD_BYTES_PER_RUN: usize = 1024 * 1024 * 1024;
 pub const HARD_MAX_EVENT_PAYLOAD_BYTES_GLOBAL: usize = 2 * 1024 * 1024 * 1024;
 pub const HARD_MAX_BOOTSTRAP_AUDIT_ROWS: usize = 65_536;
+pub const HARD_MAX_ACCOUNT_AUDIT_DETAIL_ROWS: usize = 4_096;
+pub const HARD_MAX_ACCOUNT_AUDIT_ROWS_PER_ACCOUNT: usize = 8_192;
+pub const HARD_MAX_ACCOUNT_AUDIT_ROWS_GLOBAL: usize = 32_768;
+pub const HARD_MAX_ACCOUNT_AUDIT_PROGRESS_ROWS_PER_ACCOUNT: usize = 64;
+pub const HARD_MAX_ACCOUNT_AUDIT_PROGRESS_ROWS_GLOBAL: usize = 256;
+pub const HARD_MAX_ACCOUNT_AUDIT_COMPACTION_BATCH: usize = 64;
 
 /// Logical capacity limits enforced by the SQLite storage transaction layer.
 ///
@@ -85,6 +97,18 @@ pub struct StorageLimits {
     /// Maximum serialized Session and Run event payload bytes plus all reserves.
     pub event_payload_bytes_global: usize,
     pub bootstrap_audit_rows: usize,
+    /// Count-bounded detailed security-audit window retained per account.
+    pub account_audit_detail_rows: usize,
+    /// Absolute audit-row ceiling for one account, including progress reserve.
+    pub account_audit_rows_per_account: usize,
+    /// Absolute audit-row ceiling across the SQLite database.
+    pub account_audit_rows_global: usize,
+    /// Rows withheld from ordinary mutations for revocation/progress per account.
+    pub account_audit_progress_rows_per_account: usize,
+    /// Rows withheld from ordinary mutations for revocation/progress globally.
+    pub account_audit_progress_rows_global: usize,
+    /// Maximum number of oldest detailed audit rows compacted per transaction.
+    pub account_audit_compaction_batch: usize,
 }
 
 impl StorageLimits {
@@ -110,6 +134,12 @@ impl StorageLimits {
         run_event_payload_bytes_per_run: DEFAULT_RUN_EVENT_PAYLOAD_BYTES_PER_RUN,
         event_payload_bytes_global: DEFAULT_EVENT_PAYLOAD_BYTES_GLOBAL,
         bootstrap_audit_rows: DEFAULT_BOOTSTRAP_AUDIT_ROWS,
+        account_audit_detail_rows: DEFAULT_ACCOUNT_AUDIT_DETAIL_ROWS,
+        account_audit_rows_per_account: DEFAULT_ACCOUNT_AUDIT_ROWS_PER_ACCOUNT,
+        account_audit_rows_global: DEFAULT_ACCOUNT_AUDIT_ROWS_GLOBAL,
+        account_audit_progress_rows_per_account: DEFAULT_ACCOUNT_AUDIT_PROGRESS_ROWS_PER_ACCOUNT,
+        account_audit_progress_rows_global: DEFAULT_ACCOUNT_AUDIT_PROGRESS_ROWS_GLOBAL,
+        account_audit_compaction_batch: DEFAULT_ACCOUNT_AUDIT_COMPACTION_BATCH,
     };
 
     /// Absolute ceilings accepted by this binary.
@@ -137,6 +167,12 @@ impl StorageLimits {
         run_event_payload_bytes_per_run: HARD_MAX_RUN_EVENT_PAYLOAD_BYTES_PER_RUN,
         event_payload_bytes_global: HARD_MAX_EVENT_PAYLOAD_BYTES_GLOBAL,
         bootstrap_audit_rows: HARD_MAX_BOOTSTRAP_AUDIT_ROWS,
+        account_audit_detail_rows: HARD_MAX_ACCOUNT_AUDIT_DETAIL_ROWS,
+        account_audit_rows_per_account: HARD_MAX_ACCOUNT_AUDIT_ROWS_PER_ACCOUNT,
+        account_audit_rows_global: HARD_MAX_ACCOUNT_AUDIT_ROWS_GLOBAL,
+        account_audit_progress_rows_per_account: HARD_MAX_ACCOUNT_AUDIT_PROGRESS_ROWS_PER_ACCOUNT,
+        account_audit_progress_rows_global: HARD_MAX_ACCOUNT_AUDIT_PROGRESS_ROWS_GLOBAL,
+        account_audit_compaction_batch: HARD_MAX_ACCOUNT_AUDIT_COMPACTION_BATCH,
     };
 
     /// Validates every limit before a database is opened or mutated.
@@ -242,6 +278,36 @@ impl StorageLimits {
                 self.bootstrap_audit_rows,
                 HARD_MAX_BOOTSTRAP_AUDIT_ROWS,
             ),
+            (
+                "account_audit_detail_rows",
+                self.account_audit_detail_rows,
+                HARD_MAX_ACCOUNT_AUDIT_DETAIL_ROWS,
+            ),
+            (
+                "account_audit_rows_per_account",
+                self.account_audit_rows_per_account,
+                HARD_MAX_ACCOUNT_AUDIT_ROWS_PER_ACCOUNT,
+            ),
+            (
+                "account_audit_rows_global",
+                self.account_audit_rows_global,
+                HARD_MAX_ACCOUNT_AUDIT_ROWS_GLOBAL,
+            ),
+            (
+                "account_audit_progress_rows_per_account",
+                self.account_audit_progress_rows_per_account,
+                HARD_MAX_ACCOUNT_AUDIT_PROGRESS_ROWS_PER_ACCOUNT,
+            ),
+            (
+                "account_audit_progress_rows_global",
+                self.account_audit_progress_rows_global,
+                HARD_MAX_ACCOUNT_AUDIT_PROGRESS_ROWS_GLOBAL,
+            ),
+            (
+                "account_audit_compaction_batch",
+                self.account_audit_compaction_batch,
+                HARD_MAX_ACCOUNT_AUDIT_COMPACTION_BATCH,
+            ),
         ] {
             validate_field(field, value, hard_ceiling)?;
         }
@@ -311,6 +377,58 @@ impl StorageLimits {
             self.run_event_payload_bytes_per_run,
             "event_payload_bytes_global",
             self.event_payload_bytes_global,
+        )?;
+        validate_scope_pair(
+            "account_audit_detail_rows",
+            self.account_audit_detail_rows,
+            "account_audit_ordinary_rows_per_account",
+            self.account_audit_rows_per_account
+                .saturating_sub(self.account_audit_progress_rows_per_account),
+        )?;
+        validate_scope_pair(
+            "account_audit_progress_rows_per_account",
+            self.account_audit_progress_rows_per_account,
+            "account_audit_rows_per_account",
+            self.account_audit_rows_per_account,
+        )?;
+        validate_scope_pair(
+            "account_audit_rows_per_account",
+            self.account_audit_rows_per_account,
+            "account_audit_rows_global",
+            self.account_audit_rows_global,
+        )?;
+        validate_scope_pair(
+            "account_audit_ordinary_rows_per_account",
+            self.account_audit_rows_per_account
+                .saturating_sub(self.account_audit_progress_rows_per_account),
+            "account_audit_ordinary_rows_global",
+            self.account_audit_rows_global
+                .saturating_sub(self.account_audit_progress_rows_global),
+        )?;
+        validate_scope_pair(
+            "account_audit_detail_rows",
+            self.account_audit_detail_rows,
+            "account_audit_ordinary_rows_global",
+            self.account_audit_rows_global
+                .saturating_sub(self.account_audit_progress_rows_global),
+        )?;
+        validate_scope_pair(
+            "account_audit_progress_rows_per_account",
+            self.account_audit_progress_rows_per_account,
+            "account_audit_progress_rows_global",
+            self.account_audit_progress_rows_global,
+        )?;
+        validate_scope_pair(
+            "account_audit_progress_rows_global",
+            self.account_audit_progress_rows_global,
+            "account_audit_rows_global",
+            self.account_audit_rows_global,
+        )?;
+        validate_scope_pair(
+            "account_audit_compaction_batch",
+            self.account_audit_compaction_batch,
+            "account_audit_detail_rows",
+            self.account_audit_detail_rows,
         )?;
 
         Ok(())
@@ -484,6 +602,30 @@ mod tests {
                 defaults.bootstrap_audit_rows,
                 StorageLimits::HARD_CEILINGS.bootstrap_audit_rows,
             ),
+            (
+                defaults.account_audit_detail_rows,
+                StorageLimits::HARD_CEILINGS.account_audit_detail_rows,
+            ),
+            (
+                defaults.account_audit_rows_per_account,
+                StorageLimits::HARD_CEILINGS.account_audit_rows_per_account,
+            ),
+            (
+                defaults.account_audit_rows_global,
+                StorageLimits::HARD_CEILINGS.account_audit_rows_global,
+            ),
+            (
+                defaults.account_audit_progress_rows_per_account,
+                StorageLimits::HARD_CEILINGS.account_audit_progress_rows_per_account,
+            ),
+            (
+                defaults.account_audit_progress_rows_global,
+                StorageLimits::HARD_CEILINGS.account_audit_progress_rows_global,
+            ),
+            (
+                defaults.account_audit_compaction_batch,
+                StorageLimits::HARD_CEILINGS.account_audit_compaction_batch,
+            ),
         ] {
             assert!(value > 0);
             assert!(value <= hard_ceiling);
@@ -507,8 +649,27 @@ mod tests {
     }
 
     #[test]
+    fn account_audit_defaults_and_hard_ceilings_are_exact() {
+        let defaults = StorageLimits::default();
+        let hard_ceilings = StorageLimits::HARD_CEILINGS;
+
+        assert_eq!(defaults.account_audit_detail_rows, 4_096);
+        assert_eq!(defaults.account_audit_rows_per_account, 8_192);
+        assert_eq!(defaults.account_audit_rows_global, 32_768);
+        assert_eq!(defaults.account_audit_progress_rows_per_account, 64);
+        assert_eq!(defaults.account_audit_progress_rows_global, 256);
+        assert_eq!(defaults.account_audit_compaction_batch, 64);
+        assert_eq!(hard_ceilings.account_audit_detail_rows, 4_096);
+        assert_eq!(hard_ceilings.account_audit_rows_per_account, 8_192);
+        assert_eq!(hard_ceilings.account_audit_rows_global, 32_768);
+        assert_eq!(hard_ceilings.account_audit_progress_rows_per_account, 64);
+        assert_eq!(hard_ceilings.account_audit_progress_rows_global, 256);
+        assert_eq!(hard_ceilings.account_audit_compaction_batch, 64);
+    }
+
+    #[test]
     fn every_zero_field_is_rejected_with_its_name() {
-        let mutations: [LimitMutation; 20] = [
+        let mutations: [LimitMutation; 26] = [
             ("sessions_per_actor", |limits| limits.sessions_per_actor = 0),
             ("sessions_per_account", |limits| {
                 limits.sessions_per_account = 0
@@ -563,6 +724,24 @@ mod tests {
             ("bootstrap_audit_rows", |limits| {
                 limits.bootstrap_audit_rows = 0
             }),
+            ("account_audit_detail_rows", |limits| {
+                limits.account_audit_detail_rows = 0
+            }),
+            ("account_audit_rows_per_account", |limits| {
+                limits.account_audit_rows_per_account = 0
+            }),
+            ("account_audit_rows_global", |limits| {
+                limits.account_audit_rows_global = 0
+            }),
+            ("account_audit_progress_rows_per_account", |limits| {
+                limits.account_audit_progress_rows_per_account = 0
+            }),
+            ("account_audit_progress_rows_global", |limits| {
+                limits.account_audit_progress_rows_global = 0
+            }),
+            ("account_audit_compaction_batch", |limits| {
+                limits.account_audit_compaction_batch = 0
+            }),
         ];
 
         for (expected_field, mutate) in mutations {
@@ -579,7 +758,7 @@ mod tests {
 
     #[test]
     fn every_value_above_its_hard_ceiling_is_rejected() {
-        let mutations: [CeilingMutation; 20] = [
+        let mutations: [CeilingMutation; 26] = [
             (
                 "sessions_per_actor",
                 HARD_MAX_SESSIONS_PER_ACTOR,
@@ -700,6 +879,48 @@ mod tests {
                 HARD_MAX_BOOTSTRAP_AUDIT_ROWS,
                 |limits| limits.bootstrap_audit_rows = HARD_MAX_BOOTSTRAP_AUDIT_ROWS + 1,
             ),
+            (
+                "account_audit_detail_rows",
+                HARD_MAX_ACCOUNT_AUDIT_DETAIL_ROWS,
+                |limits| limits.account_audit_detail_rows = HARD_MAX_ACCOUNT_AUDIT_DETAIL_ROWS + 1,
+            ),
+            (
+                "account_audit_rows_per_account",
+                HARD_MAX_ACCOUNT_AUDIT_ROWS_PER_ACCOUNT,
+                |limits| {
+                    limits.account_audit_rows_per_account =
+                        HARD_MAX_ACCOUNT_AUDIT_ROWS_PER_ACCOUNT + 1
+                },
+            ),
+            (
+                "account_audit_rows_global",
+                HARD_MAX_ACCOUNT_AUDIT_ROWS_GLOBAL,
+                |limits| limits.account_audit_rows_global = HARD_MAX_ACCOUNT_AUDIT_ROWS_GLOBAL + 1,
+            ),
+            (
+                "account_audit_progress_rows_per_account",
+                HARD_MAX_ACCOUNT_AUDIT_PROGRESS_ROWS_PER_ACCOUNT,
+                |limits| {
+                    limits.account_audit_progress_rows_per_account =
+                        HARD_MAX_ACCOUNT_AUDIT_PROGRESS_ROWS_PER_ACCOUNT + 1
+                },
+            ),
+            (
+                "account_audit_progress_rows_global",
+                HARD_MAX_ACCOUNT_AUDIT_PROGRESS_ROWS_GLOBAL,
+                |limits| {
+                    limits.account_audit_progress_rows_global =
+                        HARD_MAX_ACCOUNT_AUDIT_PROGRESS_ROWS_GLOBAL + 1
+                },
+            ),
+            (
+                "account_audit_compaction_batch",
+                HARD_MAX_ACCOUNT_AUDIT_COMPACTION_BATCH,
+                |limits| {
+                    limits.account_audit_compaction_batch =
+                        HARD_MAX_ACCOUNT_AUDIT_COMPACTION_BATCH + 1
+                },
+            ),
         ];
 
         for (expected_field, hard_ceiling, mutate) in mutations {
@@ -807,6 +1028,28 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn account_audit_ordinary_capacity_order_is_enforced() {
+        let ordinary_scope_exceeds_global = StorageLimits {
+            account_audit_detail_rows: 1,
+            account_audit_rows_per_account: 8,
+            account_audit_rows_global: 8,
+            account_audit_progress_rows_per_account: 2,
+            account_audit_progress_rows_global: 8,
+            account_audit_compaction_batch: 1,
+            ..StorageLimits::default()
+        };
+        assert_eq!(
+            ordinary_scope_exceeds_global.validate(),
+            Err(StorageLimitsError::ScopeExceedsGlobal {
+                scope_field: "account_audit_ordinary_rows_per_account",
+                scope_value: 6,
+                global_field: "account_audit_ordinary_rows_global",
+                global_value: 0,
+            })
+        );
     }
 
     #[test]

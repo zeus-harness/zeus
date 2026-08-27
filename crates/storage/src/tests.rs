@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        Arc,
+        Arc, Barrier,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
@@ -21,15 +21,18 @@ use protocol::{
 };
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
+use tenancy::{PasswordAuthenticator, PasswordHashRecord};
 
 use crate::{
-    AccountId, AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, ClaimOutcome,
-    CommitOutcome, DispatchCompleteCommit, DispatchJobSpec, DispatchRecoveryCommit,
-    DispatchStartCommit, DispatchStatus, MembershipRevision, MembershipRole, ReplyClaimOutcome,
+    AccountAuditCheckpointCommit, AccountId, AuthSessionCommit, AuthSessionId, AuthzContext,
+    BootstrapOwnerCommit, ClaimOutcome, CommitOutcome, CreateMemberCommit, DispatchCompleteCommit,
+    DispatchJobSpec, DispatchRecoveryCommit, DispatchStartCommit, DispatchStatus,
+    MemberSetupCommit, MemberSetupToken, MembershipRevision, MembershipRole, ReplyClaimOutcome,
     ReplyFailureCommit, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
-    ReplySuccessCommit, ReviewCommit, RunSnapshot, RuntimeIdentity, SqliteOperationLimits,
-    SqlitePhysicalLimits, SqliteStore, StorageError, StorageLimits, StoredUserRole,
-    StoredUserStatus,
+    ReplySuccessCommit, ReviewCommit, RotateMemberSetupTokenCommit, RunSnapshot, RuntimeIdentity,
+    SqliteOperationLimits, SqlitePhysicalLimits, SqliteStore, StorageError, StorageLimits,
+    StoredMembershipStatus, StoredUserRole, StoredUserStatus, TransitionMemberCommit,
+    UpdateAccountAuditPolicyCommit,
 };
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
@@ -446,6 +449,145 @@ async fn durable_progress_uses_the_reserved_lane_when_general_work_is_saturated(
             .unwrap(),
         "progress"
     );
+
+    release_tx.send(()).unwrap();
+    blocker.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn member_enablement_cannot_consume_the_reserved_operation_lane() {
+    let database = TestDatabase::new();
+    let store = operation_limited_store(database.path(), test_operation_limits(2, 1)).await;
+    bootstrap_test_owner(&store).await;
+
+    for (user_id, username, auth_session_id, token_hash, csrf_hash) in [
+        (
+            "user-operation-enable-a",
+            "operation-enable-a",
+            "asi_operation_enable_a",
+            "d",
+            "8",
+        ),
+        (
+            "user-operation-enable-b",
+            "operation-enable-b",
+            "asi_operation_enable_b",
+            "e",
+            "9",
+        ),
+    ] {
+        let (token, presented) = member_setup_token_pair();
+        store
+            .create_member(
+                &owner_authz(),
+                CreateMemberCommit {
+                    user_id: user_id.into(),
+                    username: username.into(),
+                    setup_token: token,
+                },
+            )
+            .await
+            .unwrap();
+        let mut setup = member_setup_commit(&presented, auth_session_id, token_hash);
+        setup.csrf_hash = csrf_hash.repeat(64);
+        store.complete_member_setup(setup).await.unwrap();
+    }
+
+    store
+        .transition_member(
+            &owner_authz(),
+            TransitionMemberCommit {
+                user_id: "user-operation-enable-a".into(),
+                expected_revision: MembershipRevision::new(1).unwrap(),
+                expected_role: MembershipRole::Member,
+                expected_status: StoredMembershipStatus::Active,
+                role: MembershipRole::Member,
+                status: StoredMembershipStatus::Disabled,
+            },
+        )
+        .await
+        .unwrap();
+
+    let blocker_store = store.clone();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let blocker = tokio::spawn(async move {
+        blocker_store
+            .test_general_operation(move |_| {
+                let _ = started_tx.send(());
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .await
+    });
+    started_rx.await.unwrap();
+
+    assert!(matches!(
+        store
+            .transition_member(
+                &owner_authz(),
+                TransitionMemberCommit {
+                    user_id: "user-operation-enable-a".into(),
+                    expected_revision: MembershipRevision::new(2).unwrap(),
+                    expected_role: MembershipRole::Member,
+                    expected_status: StoredMembershipStatus::Disabled,
+                    role: MembershipRole::Member,
+                    status: StoredMembershipStatus::Disabled,
+                },
+            )
+            .await,
+        Err(StorageError::OperationCapacityExceeded)
+    ));
+
+    assert!(matches!(
+        store
+            .transition_member(
+                &owner_authz(),
+                TransitionMemberCommit {
+                    user_id: "user-operation-enable-a".into(),
+                    expected_revision: MembershipRevision::new(2).unwrap(),
+                    expected_role: MembershipRole::Member,
+                    expected_status: StoredMembershipStatus::Disabled,
+                    role: MembershipRole::Member,
+                    status: StoredMembershipStatus::Active,
+                },
+            )
+            .await,
+        Err(StorageError::OperationCapacityExceeded)
+    ));
+
+    assert!(matches!(
+        store
+            .transition_member(
+                &owner_authz(),
+                TransitionMemberCommit {
+                    user_id: "user-operation-enable-b".into(),
+                    expected_revision: MembershipRevision::new(1).unwrap(),
+                    expected_role: MembershipRole::Member,
+                    expected_status: StoredMembershipStatus::Active,
+                    role: MembershipRole::Owner,
+                    status: StoredMembershipStatus::Disabled,
+                },
+            )
+            .await,
+        Err(StorageError::OperationCapacityExceeded)
+    ));
+
+    let revoked = store
+        .transition_member(
+            &owner_authz(),
+            TransitionMemberCommit {
+                user_id: "user-operation-enable-b".into(),
+                expected_revision: MembershipRevision::new(1).unwrap(),
+                expected_role: MembershipRole::Member,
+                expected_status: StoredMembershipStatus::Active,
+                role: MembershipRole::Member,
+                status: StoredMembershipStatus::Disabled,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(revoked.member.status, StoredMembershipStatus::Disabled);
 
     release_tx.send(()).unwrap();
     blocker.await.unwrap().unwrap();
@@ -1481,7 +1623,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         .unwrap();
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
     let owner: Option<String> = connection
         .query_row(
@@ -1622,7 +1764,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
     assert_eq!(
         run_event_payloads(database.path(), &long_run_id),
         payloads_before,
-        "v9-v14 migrations must not rewrite immutable event payloads"
+        "v9-v15 migrations must not rewrite immutable event payloads"
     );
     let connection = rusqlite::Connection::open(database.path()).unwrap();
     let version: i64 = connection
@@ -1630,7 +1772,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
     let configured_account: (String, String, String, i64) = connection
         .query_row(
             r#"SELECT
@@ -2156,7 +2298,7 @@ async fn v12_identity_and_run_crash_prefix_migrates_then_recovers_the_primary_se
     assert_eq!(
         recovered,
         (
-            14,
+            15,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into()
@@ -2348,6 +2490,898 @@ async fn account_membership_triggers_enforce_revision_durability_and_last_owner(
             )
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn member_lifecycle_recovers_pending_disable_enable_and_revokes_completed_sessions() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    bootstrap_test_owner(&store).await;
+
+    let (initial_token, initial_presented) = member_setup_token_pair();
+    let created = store
+        .create_member(
+            &owner_authz(),
+            CreateMemberCommit {
+                user_id: "user-lifecycle".into(),
+                username: "lifecycle".into(),
+                setup_token: initial_token,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!created.replayed);
+    assert!(created.member.setup_required);
+    assert!(created.member.setup_token_expires_at.is_some());
+    assert_eq!(created.member.revision.get(), 1);
+    let create_replay = store
+        .create_member(
+            &owner_authz(),
+            CreateMemberCommit {
+                user_id: "user-lifecycle".into(),
+                username: "lifecycle".into(),
+                setup_token: MemberSetupToken::from_presented(&initial_presented).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(create_replay.replayed);
+    assert_eq!(create_replay.member, created.member);
+
+    let pending_disabled = store
+        .transition_member(
+            &owner_authz(),
+            TransitionMemberCommit {
+                user_id: "user-lifecycle".into(),
+                expected_revision: MembershipRevision::new(1).unwrap(),
+                expected_role: MembershipRole::Member,
+                expected_status: StoredMembershipStatus::Active,
+                role: MembershipRole::Member,
+                status: StoredMembershipStatus::Disabled,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(pending_disabled.member.setup_required);
+    assert!(pending_disabled.member.setup_token_expires_at.is_none());
+    assert_eq!(pending_disabled.revoked_setup_tokens, 1);
+
+    let pending_enabled = store
+        .transition_member(
+            &owner_authz(),
+            TransitionMemberCommit {
+                user_id: "user-lifecycle".into(),
+                expected_revision: MembershipRevision::new(2).unwrap(),
+                expected_role: MembershipRole::Member,
+                expected_status: StoredMembershipStatus::Disabled,
+                role: MembershipRole::Member,
+                status: StoredMembershipStatus::Active,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(pending_enabled.member.setup_required);
+    assert!(pending_enabled.member.setup_token_expires_at.is_none());
+    assert!(matches!(
+        store
+            .complete_member_setup(member_setup_commit(
+                &initial_presented,
+                "asi_lifecycle_stale",
+                "d",
+            ))
+            .await,
+        Err(StorageError::InvalidMemberSetupToken)
+    ));
+
+    let (recovery_token, recovery_presented) = member_setup_token_pair();
+    let rotated = store
+        .rotate_member_setup_token(
+            &owner_authz(),
+            RotateMemberSetupTokenCommit {
+                user_id: "user-lifecycle".into(),
+                expected_revision: MembershipRevision::new(3).unwrap(),
+                setup_token: recovery_token,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(rotated.member.setup_required);
+    assert!(rotated.member.setup_token_expires_at.is_some());
+    let rotate_replay = store
+        .rotate_member_setup_token(
+            &owner_authz(),
+            RotateMemberSetupTokenCommit {
+                user_id: "user-lifecycle".into(),
+                expected_revision: MembershipRevision::new(3).unwrap(),
+                setup_token: MemberSetupToken::from_presented(&recovery_presented).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(rotate_replay.replayed);
+    assert_eq!(rotate_replay.member, rotated.member);
+
+    let setup = store
+        .complete_member_setup(member_setup_commit(
+            &recovery_presented,
+            "asi_lifecycle_member",
+            "e",
+        ))
+        .await
+        .unwrap();
+    assert!(!setup.member.setup_required);
+    assert!(setup.member.setup_token_expires_at.is_none());
+    assert_eq!(setup.principal.authz.membership_revision.get(), 3);
+    assert!(store.authenticate(&"e".repeat(64)).await.unwrap().is_some());
+    assert!(matches!(
+        store
+            .complete_member_setup(member_setup_commit(
+                &recovery_presented,
+                "asi_lifecycle_replay",
+                "f",
+            ))
+            .await,
+        Err(StorageError::InvalidMemberSetupToken)
+    ));
+
+    let disabled = store
+        .transition_member(
+            &owner_authz(),
+            TransitionMemberCommit {
+                user_id: "user-lifecycle".into(),
+                expected_revision: MembershipRevision::new(3).unwrap(),
+                expected_role: MembershipRole::Member,
+                expected_status: StoredMembershipStatus::Active,
+                role: MembershipRole::Member,
+                status: StoredMembershipStatus::Disabled,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!disabled.member.setup_required);
+    assert_eq!(disabled.revoked_auth_sessions, 1);
+    assert!(store.authenticate(&"e".repeat(64)).await.unwrap().is_none());
+
+    let enabled = store
+        .transition_member(
+            &owner_authz(),
+            TransitionMemberCommit {
+                user_id: "user-lifecycle".into(),
+                expected_revision: MembershipRevision::new(4).unwrap(),
+                expected_role: MembershipRole::Member,
+                expected_status: StoredMembershipStatus::Disabled,
+                role: MembershipRole::Member,
+                status: StoredMembershipStatus::Active,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!enabled.member.setup_required);
+    let actions = store
+        .list_account_audit_events(&owner_authz(), None, 20)
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|event| event.action)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actions,
+        vec![
+            "member.enabled",
+            "member.disabled",
+            "member.setup_completed",
+            "member.setup_token_rotated",
+            "member.enabled",
+            "member.disabled",
+            "member.created",
+        ]
+    );
+    store.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn pending_member_password_sentinel_is_supported_and_never_verifies() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    bootstrap_test_owner(&store).await;
+    let (setup_token, _) = member_setup_token_pair();
+    store
+        .create_member(
+            &owner_authz(),
+            CreateMemberCommit {
+                user_id: "user-pending-sentinel".into(),
+                username: "pending-sentinel".into(),
+                setup_token,
+            },
+        )
+        .await
+        .unwrap();
+    let persisted: String = rusqlite::Connection::open(database.path())
+        .unwrap()
+        .query_row(
+            "SELECT password_hash FROM users WHERE id = 'user-pending-sentinel'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let record = PasswordHashRecord::parse(persisted).unwrap();
+    let authenticator = PasswordAuthenticator::new().unwrap();
+    assert!(
+        !authenticator
+            .verify(Some(&record), "Wrong-password-2026")
+            .unwrap()
+    );
+    assert!(
+        store
+            .credential_for_username("pending-sentinel")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .credential_for_username("missing-pending-sentinel")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn last_owner_rejection_is_atomic_and_does_not_revoke_the_owner_session() {
+    let store = SqliteStore::open(":memory:").await.unwrap();
+    bootstrap_test_owner(&store).await;
+    let before = store.account_audit_state(&owner_authz()).await.unwrap();
+    assert!(matches!(
+        store
+            .transition_member(
+                &owner_authz(),
+                TransitionMemberCommit {
+                    user_id: "user-owner".into(),
+                    expected_revision: MembershipRevision::new(1).unwrap(),
+                    expected_role: MembershipRole::Owner,
+                    expected_status: StoredMembershipStatus::Active,
+                    role: MembershipRole::Member,
+                    status: StoredMembershipStatus::Disabled,
+                },
+            )
+            .await,
+        Err(StorageError::LastAccountOwner)
+    ));
+    let owner = store
+        .get_member(&owner_authz(), "user-owner")
+        .await
+        .unwrap();
+    assert_eq!(owner.role, MembershipRole::Owner);
+    assert_eq!(owner.status, StoredMembershipStatus::Active);
+    assert_eq!(owner.revision.get(), 1);
+    assert_eq!(
+        store.account_audit_state(&owner_authz()).await.unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn expired_member_setup_is_non_consuming_visible_and_rotation_recovers() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    bootstrap_test_owner(&store).await;
+    let (token, presented) = member_setup_token_pair();
+    store
+        .create_member(
+            &owner_authz(),
+            CreateMemberCommit {
+                user_id: "user-expired-setup".into(),
+                username: "expired-setup".into(),
+                setup_token: token,
+            },
+        )
+        .await
+        .unwrap();
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER member_setup_tokens_reject_update;
+               UPDATE member_setup_tokens
+               SET created_at = '2000-01-01T00:00:00.000Z',
+                   expires_at = '2000-01-02T00:00:00.000Z'
+               WHERE user_id = 'user-expired-setup';
+               CREATE TRIGGER member_setup_tokens_reject_update
+               BEFORE UPDATE ON member_setup_tokens
+               BEGIN
+                   SELECT RAISE(ABORT, 'member setup tokens are immutable; rotate by replacement');
+               END;"#,
+        )
+        .unwrap();
+    drop(connection);
+
+    let expired = store
+        .get_member(&owner_authz(), "user-expired-setup")
+        .await
+        .unwrap();
+    assert!(expired.setup_required);
+    assert_eq!(
+        expired.setup_token_expires_at.as_deref(),
+        Some("2000-01-02T00:00:00.000Z")
+    );
+    let audit_before = store.account_audit_state(&owner_authz()).await.unwrap();
+    assert!(matches!(
+        store
+            .complete_member_setup(member_setup_commit(&presented, "asi_expired_setup", "6",))
+            .await,
+        Err(StorageError::MemberSetupExpired)
+    ));
+    assert_eq!(
+        store.account_audit_state(&owner_authz()).await.unwrap(),
+        audit_before
+    );
+
+    let (rotated_token, rotated_presented) = member_setup_token_pair();
+    store
+        .rotate_member_setup_token(
+            &owner_authz(),
+            RotateMemberSetupTokenCommit {
+                user_id: "user-expired-setup".into(),
+                expected_revision: MembershipRevision::new(1).unwrap(),
+                setup_token: rotated_token,
+            },
+        )
+        .await
+        .unwrap();
+    let completed = store
+        .complete_member_setup(member_setup_commit(
+            &rotated_presented,
+            "asi_expired_setup_recovered",
+            "7",
+        ))
+        .await
+        .unwrap();
+    assert!(!completed.member.setup_required);
+}
+
+#[tokio::test]
+async fn account_audit_hash_chain_is_cursor_bounded_and_detects_valid_json_tampering() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    bootstrap_test_owner(&store).await;
+    for index in 0..3 {
+        let (token, _) = member_setup_token_pair();
+        store
+            .create_member(
+                &owner_authz(),
+                CreateMemberCommit {
+                    user_id: format!("user-audit-{index}"),
+                    username: format!("audit-{index}"),
+                    setup_token: token,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let first = store
+        .list_account_audit_events(&owner_authz(), None, 2)
+        .await
+        .unwrap();
+    assert_eq!(first.items.len(), 2);
+    assert!(first.next_cursor.is_some());
+    assert_eq!(first.items[0].sequence, 3);
+    assert_eq!(first.items[1].sequence, 2);
+    let second = store
+        .list_account_audit_events(&owner_authz(), first.next_cursor.as_deref(), 2)
+        .await
+        .unwrap();
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(second.items[0].sequence, 1);
+    assert!(second.next_cursor.is_none());
+    assert_eq!(second.items[0].previous_hash, "0".repeat(64));
+    assert_eq!(second.items[1..].len(), 0);
+    assert!(matches!(
+        store
+            .list_account_audit_events(&foreign_authz(), first.next_cursor.as_deref(), 0)
+            .await,
+        Err(StorageError::AuthSessionNotFound)
+    ));
+    store.verify_integrity().await.unwrap();
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER account_audit_events_reject_update;
+               UPDATE account_audit_events
+               SET metadata_json = '{"tampered":true}'
+               WHERE account_id = 'acc_local' AND sequence = 2;
+               CREATE TRIGGER account_audit_events_reject_update
+               BEFORE UPDATE ON account_audit_events
+               BEGIN
+                   SELECT RAISE(ABORT, 'account audit events are append-only');
+               END;"#,
+        )
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        store.verify_integrity().await,
+        Err(StorageError::CorruptData(message))
+            if message.contains("account audit event hash")
+    ));
+}
+
+#[tokio::test]
+async fn v15_reopen_fails_closed_when_an_audit_index_or_trigger_is_missing() {
+    let missing_index_database = TestDatabase::new();
+    drop(
+        SqliteStore::open(missing_index_database.path())
+            .await
+            .unwrap(),
+    );
+    rusqlite::Connection::open(missing_index_database.path())
+        .unwrap()
+        .execute_batch("DROP INDEX account_audit_events_hash_idx;")
+        .unwrap();
+    let index_error = match SqliteStore::open(missing_index_database.path()).await {
+        Ok(_) => panic!("a schema-v15 database missing an audit index must not reopen"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        index_error,
+        StorageError::CorruptData(message)
+            if message == "one or more point-query indexes are missing"
+    ));
+
+    let missing_trigger_database = TestDatabase::new();
+    drop(
+        SqliteStore::open(missing_trigger_database.path())
+            .await
+            .unwrap(),
+    );
+    rusqlite::Connection::open(missing_trigger_database.path())
+        .unwrap()
+        .execute_batch("DROP TRIGGER account_audit_events_reject_update;")
+        .unwrap();
+    let trigger_error = match SqliteStore::open(missing_trigger_database.path()).await {
+        Ok(_) => panic!("a schema-v15 database missing an audit trigger must not reopen"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        trigger_error,
+        StorageError::CorruptData(message)
+            if message == "one or more durability triggers are missing"
+    ));
+}
+
+#[tokio::test]
+async fn legal_hold_uses_progress_reserve_at_ordinary_capacity_and_release_is_atomic() {
+    let limits = StorageLimits {
+        account_audit_detail_rows: 2,
+        account_audit_rows_per_account: 3,
+        account_audit_rows_global: 3,
+        account_audit_progress_rows_per_account: 1,
+        account_audit_progress_rows_global: 1,
+        account_audit_compaction_batch: 1,
+        ..StorageLimits::default()
+    };
+    let store = SqliteStore::open_with_limits(":memory:", limits)
+        .await
+        .unwrap();
+    bootstrap_test_owner(&store).await;
+    for index in 0..2 {
+        let (token, _) = member_setup_token_pair();
+        store
+            .create_member(
+                &owner_authz(),
+                CreateMemberCommit {
+                    user_id: format!("user-hold-{index}"),
+                    username: format!("hold-{index}"),
+                    setup_token: token,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let ordinary_full = store.account_audit_state(&owner_authz()).await.unwrap();
+    assert_eq!(ordinary_full.detailed_rows, 2);
+    assert_eq!(ordinary_full.ordinary_capacity_remaining, 0);
+    assert_eq!(ordinary_full.progress_capacity_remaining, 1);
+
+    assert!(matches!(
+        store
+            .update_account_audit_policy(
+                &owner_authz(),
+                UpdateAccountAuditPolicyCommit {
+                    expected_revision: 0,
+                    detail_rows: 2,
+                    legal_hold: true,
+                    archive_required: false,
+                },
+            )
+            .await,
+        Err(StorageError::AuditPolicyConflict)
+    ));
+    assert_eq!(
+        store
+            .account_audit_state(&owner_authz())
+            .await
+            .unwrap()
+            .policy
+            .revision,
+        1
+    );
+
+    let held = store
+        .update_account_audit_policy(
+            &owner_authz(),
+            UpdateAccountAuditPolicyCommit {
+                expected_revision: 1,
+                detail_rows: 2,
+                legal_hold: true,
+                archive_required: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(held.policy.legal_hold);
+    assert_eq!(held.detailed_rows, 3);
+    assert_eq!(held.progress_capacity_remaining, 0);
+    assert!(matches!(
+        store.readiness().await,
+        Err(StorageError::AuditLegalHold)
+    ));
+
+    let (blocked_token, _) = member_setup_token_pair();
+    assert!(matches!(
+        store
+            .create_member(
+                &owner_authz(),
+                CreateMemberCommit {
+                    user_id: "user-hold-blocked".into(),
+                    username: "hold-blocked".into(),
+                    setup_token: blocked_token,
+                },
+            )
+            .await,
+        Err(StorageError::AuditLegalHold)
+    ));
+    assert!(matches!(
+        store.get_member(&owner_authz(), "user-hold-blocked").await,
+        Err(StorageError::MemberNotFound(_))
+    ));
+    assert_eq!(
+        store
+            .account_audit_state(&owner_authz())
+            .await
+            .unwrap()
+            .detailed_rows,
+        3
+    );
+
+    let released = store
+        .update_account_audit_policy(
+            &owner_authz(),
+            UpdateAccountAuditPolicyCommit {
+                expected_revision: 2,
+                detail_rows: 2,
+                legal_hold: false,
+                archive_required: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!released.policy.legal_hold);
+    assert_eq!(released.rollup.through_sequence, 1);
+    assert_eq!(released.detailed_rows, 3);
+    store.readiness().await.unwrap();
+}
+
+#[tokio::test]
+async fn legal_hold_reserves_the_last_progress_row_for_revocation_not_member_enablement() {
+    let limits = StorageLimits {
+        account_audit_detail_rows: 6,
+        account_audit_rows_per_account: 7,
+        account_audit_rows_global: 7,
+        account_audit_progress_rows_per_account: 1,
+        account_audit_progress_rows_global: 1,
+        account_audit_compaction_batch: 1,
+        ..StorageLimits::default()
+    };
+    let store = SqliteStore::open_with_limits(":memory:", limits)
+        .await
+        .unwrap();
+    bootstrap_test_owner(&store).await;
+
+    for (user_id, username, auth_session_id, token_hash, csrf_hash) in [
+        (
+            "user-hold-enable-a",
+            "hold-enable-a",
+            "asi_hold_enable_a",
+            "d",
+            "8",
+        ),
+        (
+            "user-hold-enable-b",
+            "hold-enable-b",
+            "asi_hold_enable_b",
+            "e",
+            "9",
+        ),
+    ] {
+        let (token, presented) = member_setup_token_pair();
+        store
+            .create_member(
+                &owner_authz(),
+                CreateMemberCommit {
+                    user_id: user_id.into(),
+                    username: username.into(),
+                    setup_token: token,
+                },
+            )
+            .await
+            .unwrap();
+        let mut setup = member_setup_commit(&presented, auth_session_id, token_hash);
+        setup.csrf_hash = csrf_hash.repeat(64);
+        store.complete_member_setup(setup).await.unwrap();
+    }
+
+    store
+        .update_account_audit_policy(
+            &owner_authz(),
+            UpdateAccountAuditPolicyCommit {
+                expected_revision: 1,
+                detail_rows: 6,
+                legal_hold: true,
+                archive_required: false,
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .transition_member(
+            &owner_authz(),
+            TransitionMemberCommit {
+                user_id: "user-hold-enable-a".into(),
+                expected_revision: MembershipRevision::new(1).unwrap(),
+                expected_role: MembershipRole::Member,
+                expected_status: StoredMembershipStatus::Active,
+                role: MembershipRole::Member,
+                status: StoredMembershipStatus::Disabled,
+            },
+        )
+        .await
+        .unwrap();
+    let ordinary_full = store.account_audit_state(&owner_authz()).await.unwrap();
+    assert_eq!(ordinary_full.detailed_rows, 6);
+    assert_eq!(ordinary_full.ordinary_capacity_remaining, 0);
+    assert_eq!(ordinary_full.progress_capacity_remaining, 1);
+
+    assert!(matches!(
+        store
+            .transition_member(
+                &owner_authz(),
+                TransitionMemberCommit {
+                    user_id: "user-hold-enable-a".into(),
+                    expected_revision: MembershipRevision::new(2).unwrap(),
+                    expected_role: MembershipRole::Member,
+                    expected_status: StoredMembershipStatus::Disabled,
+                    role: MembershipRole::Member,
+                    status: StoredMembershipStatus::Active,
+                },
+            )
+            .await,
+        Err(StorageError::AuditLegalHold)
+    ));
+    let still_disabled = store
+        .get_member(&owner_authz(), "user-hold-enable-a")
+        .await
+        .unwrap();
+    assert_eq!(still_disabled.revision.get(), 2);
+    assert_eq!(still_disabled.status, StoredMembershipStatus::Disabled);
+
+    let final_revocation = store
+        .transition_member(
+            &owner_authz(),
+            TransitionMemberCommit {
+                user_id: "user-hold-enable-b".into(),
+                expected_revision: MembershipRevision::new(1).unwrap(),
+                expected_role: MembershipRole::Member,
+                expected_status: StoredMembershipStatus::Active,
+                role: MembershipRole::Member,
+                status: StoredMembershipStatus::Disabled,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        final_revocation.member.status,
+        StoredMembershipStatus::Disabled
+    );
+    let exhausted = store.account_audit_state(&owner_authz()).await.unwrap();
+    assert_eq!(exhausted.detailed_rows, 7);
+    assert_eq!(exhausted.progress_capacity_remaining, 0);
+}
+
+#[tokio::test]
+async fn archive_required_blocks_ordinary_mutation_until_matching_checkpoint() {
+    let limits = StorageLimits {
+        account_audit_detail_rows: 1,
+        account_audit_rows_per_account: 3,
+        account_audit_rows_global: 3,
+        account_audit_progress_rows_per_account: 1,
+        account_audit_progress_rows_global: 1,
+        account_audit_compaction_batch: 1,
+        ..StorageLimits::default()
+    };
+    let store = SqliteStore::open_with_limits(":memory:", limits)
+        .await
+        .unwrap();
+    bootstrap_test_owner(&store).await;
+    let (first_token, _) = member_setup_token_pair();
+    store
+        .create_member(
+            &owner_authz(),
+            CreateMemberCommit {
+                user_id: "user-archive-first".into(),
+                username: "archive-first".into(),
+                setup_token: first_token,
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .update_account_audit_policy(
+            &owner_authz(),
+            UpdateAccountAuditPolicyCommit {
+                expected_revision: 1,
+                detail_rows: 1,
+                legal_hold: false,
+                archive_required: true,
+            },
+        )
+        .await
+        .unwrap();
+
+    let (blocked_token, _) = member_setup_token_pair();
+    assert!(matches!(
+        store
+            .create_member(
+                &owner_authz(),
+                CreateMemberCommit {
+                    user_id: "user-archive-blocked".into(),
+                    username: "archive-blocked".into(),
+                    setup_token: blocked_token,
+                },
+            )
+            .await,
+        Err(StorageError::AuditArchiveRequired)
+    ));
+    assert!(matches!(
+        store.readiness().await,
+        Err(StorageError::AuditArchiveRequired)
+    ));
+    let page = store
+        .list_account_audit_events(&owner_authz(), None, 10)
+        .await
+        .unwrap();
+    let tail = page.items.first().unwrap();
+    let checkpointed = store
+        .checkpoint_account_audit_archive(
+            &owner_authz(),
+            AccountAuditCheckpointCommit {
+                expected_revision: 1,
+                through_sequence: tail.sequence,
+                event_hash: tail.event_hash.clone(),
+                archive_reference: "archive://account/local/checkpoint-1".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(checkpointed.archive.through_sequence, tail.sequence);
+    assert!(checkpointed.rollup.through_sequence >= 1);
+    store.readiness().await.unwrap();
+
+    let (recovered_token, _) = member_setup_token_pair();
+    store
+        .create_member(
+            &owner_authz(),
+            CreateMemberCommit {
+                user_id: "user-archive-recovered".into(),
+                username: "archive-recovered".into(),
+                setup_token: recovered_token,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn account_audit_global_ordinary_capacity_rolls_back_the_cross_account_mutation() {
+    let limits = StorageLimits {
+        account_audit_detail_rows: 2,
+        account_audit_rows_per_account: 3,
+        account_audit_rows_global: 4,
+        account_audit_progress_rows_per_account: 1,
+        account_audit_progress_rows_global: 1,
+        account_audit_compaction_batch: 1,
+        ..StorageLimits::default()
+    };
+    let database = TestDatabase::new();
+    let store = SqliteStore::open_with_limits(database.path(), limits)
+        .await
+        .unwrap();
+    bootstrap_test_owner(&store).await;
+    let secondary = insert_secondary_test_account(database.path());
+
+    for (context, user_id, username) in [
+        (owner_authz(), "user-global-local-1", "global-local-1"),
+        (secondary.clone(), "user-global-other-1", "global-other-1"),
+        (secondary.clone(), "user-global-other-2", "global-other-2"),
+    ] {
+        let (token, _) = member_setup_token_pair();
+        store
+            .create_member(
+                &context,
+                CreateMemberCommit {
+                    user_id: user_id.into(),
+                    username: username.into(),
+                    setup_token: token,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let (blocked_token, _) = member_setup_token_pair();
+    assert!(matches!(
+        store
+            .create_member(
+                &owner_authz(),
+                CreateMemberCommit {
+                    user_id: "user-global-blocked".into(),
+                    username: "global-blocked".into(),
+                    setup_token: blocked_token,
+                },
+            )
+            .await,
+        Err(StorageError::AuditStorageExhausted)
+    ));
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let atomic_state: (i64, i64, i64) = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT COUNT(*) FROM account_audit_events),
+                   (SELECT COUNT(*) FROM users WHERE id = 'user-global-blocked'),
+                   (SELECT COUNT(*) FROM member_setup_tokens
+                    WHERE user_id = 'user-global-blocked')"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(atomic_state, (3, 0, 0));
+
+    // The saturated secondary account can compact one row on its next
+    // admission, proving the global ceiling is recoverable in a small batch.
+    let (recovery_token, _) = member_setup_token_pair();
+    store
+        .create_member(
+            &secondary,
+            CreateMemberCommit {
+                user_id: "user-global-recovered".into(),
+                username: "global-recovered".into(),
+                setup_token: recovery_token,
+            },
+        )
+        .await
+        .unwrap();
+    let recovered: (i64, i64) = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT COUNT(*) FROM account_audit_events),
+                   (SELECT through_sequence FROM account_audit_rollups
+                    WHERE account_id = 'acc_secondary')"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(recovered, (3, 1));
 }
 
 #[tokio::test]
@@ -3011,7 +4045,7 @@ async fn v5_configured_database_migrates_to_the_local_owner_membership() {
     assert_eq!(
         migrated,
         (
-            14,
+            15,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into(),
@@ -3137,7 +4171,7 @@ async fn v13_configured_active_work_migrates_with_account_authority_and_exact_vo
             },
         )
         .unwrap();
-    assert_eq!(migrated_counts, (14, 1, 1, 2, 1));
+    assert_eq!(migrated_counts, (15, 1, 1, 2, 1));
 }
 
 #[tokio::test]
@@ -3222,8 +4256,8 @@ async fn v13_unconfigured_null_authority_migrates_and_only_bootstrap_owner_claim
                    (SELECT COUNT(*) FROM session_command_receipts
                     WHERE actor_user_id = 'user-owner'),
                    (SELECT COUNT(*) FROM dispatch_jobs
-                    WHERE initiating_actor_user_id = 'user-owner'
-                      AND initiating_membership_revision = 1
+                    WHERE initiating_actor_user_id IS NULL
+                      AND initiating_membership_revision IS NULL
                       AND approving_actor_user_id = 'user-owner'
                       AND approving_membership_revision = 1),
                    (SELECT COUNT(*) FROM finalization_reservations
@@ -3416,6 +4450,234 @@ async fn v14_rejects_a_disabled_legacy_owner_before_committing_any_schema_change
             .unwrap(),
         1
     );
+}
+
+#[tokio::test]
+async fn v14_database_migrates_to_v15_with_member_and_audit_roots() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    bootstrap_test_owner(&store).await;
+    drop(store);
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    downgrade_member_lifecycle_fixture_to_v14(&connection);
+    assert_eq!(
+        connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        14
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                r#"SELECT COUNT(*) FROM sqlite_schema
+                   WHERE name IN (
+                       'member_setup_tokens', 'account_audit_rollups',
+                       'account_audit_policies', 'account_audit_archive_state',
+                       'account_audit_events'
+                   )"#,
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    drop(connection);
+
+    let migrated = SqliteStore::open(database.path()).await.unwrap();
+    migrated.readiness().await.unwrap();
+    assert!(
+        migrated
+            .authenticate(&"b".repeat(64))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let state: (i64, i64, i64, i64, i64) = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT MAX(version) FROM schema_migrations),
+                   (SELECT COUNT(*) FROM account_audit_rollups),
+                   (SELECT COUNT(*) FROM account_audit_policies),
+                   (SELECT COUNT(*) FROM account_audit_archive_state),
+                   (SELECT COUNT(*) FROM sqlite_schema
+                    WHERE name IN (
+                        'member_setup_tokens', 'account_audit_rollups',
+                        'account_audit_policies', 'account_audit_archive_state',
+                        'account_audit_events', 'member_setup_tokens_expiry_idx',
+                        'account_audit_events_hash_idx', 'account_audit_events_time_idx',
+                        'member_setup_tokens_require_pending_member',
+                        'member_setup_tokens_reject_update',
+                        'account_audit_events_require_chain',
+                        'account_audit_events_reject_update',
+                        'account_audit_events_require_rollup_before_delete',
+                        'account_audit_rollups_enforce_forward_update',
+                        'account_audit_rollups_reject_delete',
+                        'account_audit_policies_enforce_revision',
+                        'account_audit_policies_reject_delete',
+                        'account_audit_archive_state_enforce_revision',
+                        'account_audit_archive_state_reject_delete'
+                    ))"#,
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(state, (15, 1, 1, 1, 19));
+}
+
+#[tokio::test]
+async fn v15_migration_seeds_the_configured_audit_detail_limit() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    bootstrap_test_owner(&store).await;
+    drop(store);
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    downgrade_member_lifecycle_fixture_to_v14(&connection);
+    drop(connection);
+
+    let limits = StorageLimits {
+        account_audit_detail_rows: 2,
+        account_audit_rows_per_account: 4,
+        account_audit_rows_global: 4,
+        account_audit_progress_rows_per_account: 1,
+        account_audit_progress_rows_global: 1,
+        account_audit_compaction_batch: 1,
+        ..StorageLimits::default()
+    };
+    let migrated = SqliteStore::open_with_limits(database.path(), limits)
+        .await
+        .unwrap();
+    migrated.readiness().await.unwrap();
+    drop(migrated);
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let state: (i64, i64) = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT MAX(version) FROM schema_migrations),
+                   (SELECT detail_rows FROM account_audit_policies
+                    WHERE account_id = 'acc_local')"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, (15, 2));
+}
+
+#[tokio::test]
+async fn v15_reopen_rejects_a_lower_audit_detail_limit_without_mutating_policy() {
+    let database = TestDatabase::new();
+    let original_limits = StorageLimits {
+        account_audit_detail_rows: 4,
+        account_audit_rows_per_account: 6,
+        account_audit_rows_global: 6,
+        account_audit_progress_rows_per_account: 1,
+        account_audit_progress_rows_global: 1,
+        account_audit_compaction_batch: 1,
+        ..StorageLimits::default()
+    };
+    let store = SqliteStore::open_with_limits(database.path(), original_limits.clone())
+        .await
+        .unwrap();
+    bootstrap_test_owner(&store).await;
+    drop(store);
+
+    let lower_limits = StorageLimits {
+        account_audit_detail_rows: 2,
+        ..original_limits.clone()
+    };
+    assert!(matches!(
+        SqliteStore::open_with_limits(database.path(), lower_limits).await,
+        Err(StorageError::AccountAuditPolicyExceedsConfiguredLimit {
+            account_id,
+            detail_rows: 4,
+            configured_limit: 2,
+        }) if account_id == "acc_local"
+    ));
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let state: (i64, i64) = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT MAX(version) FROM schema_migrations),
+                   (SELECT detail_rows FROM account_audit_policies
+                    WHERE account_id = 'acc_local')"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, (15, 4));
+    drop(connection);
+
+    let reopened = SqliteStore::open_with_limits(database.path(), original_limits)
+        .await
+        .unwrap();
+    reopened.readiness().await.unwrap();
+}
+
+#[tokio::test]
+async fn v15_migration_failure_rolls_back_dispatch_rebuild_and_schema_version() {
+    let database = TestDatabase::new();
+    drop(SqliteStore::open(database.path()).await.unwrap());
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    downgrade_member_lifecycle_fixture_to_v14(&connection);
+    let dispatch_v14_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'dispatch_jobs'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            r#"CREATE TABLE account_audit_rollups(
+                   injected INTEGER PRIMARY KEY
+               ) STRICT;"#,
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(SqliteStore::open(database.path()).await.is_err());
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let rollback_state: (i64, i64, i64, String, String) = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT MAX(version) FROM schema_migrations),
+                   (SELECT COUNT(*) FROM sqlite_schema
+                    WHERE name = 'member_setup_tokens'),
+                   (SELECT COUNT(*) FROM sqlite_schema
+                    WHERE name LIKE '%_v14_provenance'),
+                   (SELECT sql FROM sqlite_schema
+                    WHERE type = 'table' AND name = 'dispatch_jobs'),
+                   (SELECT "table" FROM pragma_foreign_key_list('finalization_reservations')
+                    WHERE "from" = 'call_id')"#,
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(rollback_state.0, 14);
+    assert_eq!(rollback_state.1, 0);
+    assert_eq!(rollback_state.2, 0);
+    assert_eq!(rollback_state.3, dispatch_v14_sql);
+    assert_eq!(rollback_state.4, "dispatch_jobs");
 }
 
 #[tokio::test]
@@ -5672,6 +6934,239 @@ async fn review_receipts_are_actor_scoped_and_authorization_precedes_replay() {
 }
 
 #[tokio::test]
+async fn queued_reply_is_rejected_when_member_revision_changes_before_claim() {
+    let store = SqliteStore::open(":memory:").await.unwrap();
+    bootstrap_test_owner(&store).await;
+    let member = provision_test_member_for_reply(&store).await;
+    store
+        .create_session_for_actor(
+            &member,
+            CreateSessionRequest {
+                id: "session-member-before-claim".into(),
+                title: "Member disabled before claim".into(),
+            },
+            "create-member-before-claim",
+        )
+        .await
+        .unwrap();
+    store
+        .start_turn_and_enqueue_reply_for_actor(
+            &member,
+            "session-member-before-claim",
+            StartTurnRequest {
+                turn_id: "turn-member-before-claim".into(),
+                user_message: "This provider call must never start".into(),
+                expected_sequence: 1,
+            },
+            "enqueue-member-before-claim",
+            ReplyJobSpec {
+                id: "reply-member-before-claim".into(),
+                authz: member.clone(),
+                provider_name: "provider-must-not-run".into(),
+                model_name: Some("model-must-not-run".into()),
+                request_json: json!({"prompt": "must remain durable only"}),
+            },
+        )
+        .await
+        .unwrap();
+    let transition = store
+        .transition_member(
+            &owner_authz(),
+            TransitionMemberCommit {
+                user_id: member.user_id.clone(),
+                expected_revision: member.membership_revision,
+                expected_role: MembershipRole::Member,
+                expected_status: StoredMembershipStatus::Active,
+                role: MembershipRole::Member,
+                status: StoredMembershipStatus::Disabled,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(transition.in_flight.reply_job_ids.is_empty());
+
+    let ReplyClaimOutcome::Rejected(completion) = store.claim_next_reply().await.unwrap() else {
+        panic!("stale queued member authority must be rejected at claim");
+    };
+    assert_eq!(completion.job.status, ReplyJobStatus::Failed);
+    assert_eq!(completion.job.attempt, 1);
+    assert_eq!(
+        completion
+            .job
+            .error_json
+            .as_ref()
+            .and_then(|value| value.get("code"))
+            .and_then(Value::as_str),
+        Some("authorization_revoked")
+    );
+    assert!(matches!(
+        store
+            .reply_job_for_actor(&member, "reply-member-before-claim")
+            .await,
+        Err(StorageError::AuthSessionNotFound)
+    ));
+}
+
+#[tokio::test]
+async fn started_reply_completion_survives_member_revision_change_after_claim() {
+    let store = SqliteStore::open(":memory:").await.unwrap();
+    bootstrap_test_owner(&store).await;
+    let member = provision_test_member_for_reply(&store).await;
+    store
+        .create_session_for_actor(
+            &member,
+            CreateSessionRequest {
+                id: "session-member-after-claim".into(),
+                title: "Member disabled after claim".into(),
+            },
+            "create-member-after-claim",
+        )
+        .await
+        .unwrap();
+    store
+        .start_turn_and_enqueue_reply_for_actor(
+            &member,
+            "session-member-after-claim",
+            StartTurnRequest {
+                turn_id: "turn-member-after-claim".into(),
+                user_message: "This accepted provider call must settle once".into(),
+                expected_sequence: 1,
+            },
+            "enqueue-member-after-claim",
+            ReplyJobSpec {
+                id: "reply-member-after-claim".into(),
+                authz: member.clone(),
+                provider_name: "test-provider".into(),
+                model_name: Some("test-model".into()),
+                request_json: json!({"prompt": "settle after claim"}),
+            },
+        )
+        .await
+        .unwrap();
+    let ReplyClaimOutcome::Claimed(claimed) = store.claim_next_reply().await.unwrap() else {
+        panic!("current member authority must be claimable");
+    };
+    assert_eq!(claimed.status, ReplyJobStatus::Started);
+    let transition = store
+        .transition_member(
+            &owner_authz(),
+            TransitionMemberCommit {
+                user_id: member.user_id.clone(),
+                expected_revision: member.membership_revision,
+                expected_role: MembershipRole::Member,
+                expected_status: StoredMembershipStatus::Active,
+                role: MembershipRole::Member,
+                status: StoredMembershipStatus::Disabled,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        transition.in_flight.reply_job_ids,
+        ["reply-member-after-claim"]
+    );
+    let expected_sequence = store
+        .session_summary_for_progress("session-member-after-claim")
+        .await
+        .unwrap()
+        .sequence;
+    let commit = ReplySuccessCommit {
+        job_id: "reply-member-after-claim".into(),
+        expected_sequence,
+        assistant_message: "The already-started call settled".into(),
+        provenance: AssistantReplyProvenance {
+            provider_id: "test-provider".into(),
+            model: Some("test-model".into()),
+            reply_kind: AssistantReplyKind::Model,
+        },
+        response_json: model_reply_json("The already-started call settled"),
+    };
+    let completed = store.complete_reply_success(commit.clone()).await.unwrap();
+    assert_eq!(completed.job.status, ReplyJobStatus::Succeeded);
+    assert!(!completed.replayed);
+    let replayed = store.complete_reply_success(commit).await.unwrap();
+    assert!(replayed.replayed);
+    assert_eq!(replayed.events, completed.events);
+    assert!(matches!(
+        store
+            .reply_job_for_actor(&member, "reply-member-after-claim")
+            .await,
+        Err(StorageError::AuthSessionNotFound)
+    ));
+}
+
+#[tokio::test]
+async fn reply_job_for_actor_uses_one_snapshot_across_concurrent_revocation() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    store
+        .start_turn_and_enqueue_reply_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-atomic-reply-read".into(),
+                user_message: "Keep the authority and job read in one snapshot".into(),
+                expected_sequence: 1,
+            },
+            "start-atomic-reply-read",
+            reply_job_spec("reply-atomic-read", "turn-atomic-reply-read"),
+        )
+        .await
+        .unwrap();
+
+    let authority_observed = Arc::new(Barrier::new(2));
+    let allow_job_read = Arc::new(Barrier::new(2));
+    let reader_path = database.path().to_owned();
+    let reader_context = owner_authz();
+    let reader_authority_observed = Arc::clone(&authority_observed);
+    let reader_allow_job_read = Arc::clone(&allow_job_read);
+    let reader = thread::spawn(move || {
+        let mut connection = rusqlite::Connection::open(reader_path).unwrap();
+        connection.busy_timeout(Duration::from_secs(5)).unwrap();
+        crate::sqlite::query_reply_job_for_actor_with_snapshot_hook(
+            &mut connection,
+            &reader_context,
+            "reply-atomic-read",
+            || {
+                reader_authority_observed.wait();
+                reader_allow_job_read.wait();
+            },
+        )
+    });
+
+    authority_observed.wait();
+    assert!(
+        store
+            .revoke_auth_session(&owner_authz(), &"b".repeat(64))
+            .await
+            .unwrap()
+    );
+    assert!(matches!(
+        store.claim_next_reply().await.unwrap(),
+        ReplyClaimOutcome::Claimed(_)
+    ));
+    allow_job_read.wait();
+
+    let snapshot_job = reader.join().unwrap().unwrap().unwrap();
+    assert_eq!(snapshot_job.status, ReplyJobStatus::Queued);
+    assert_eq!(
+        store
+            .reply_job("reply-atomic-read")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        ReplyJobStatus::Started
+    );
+    assert!(matches!(
+        store
+            .reply_job_for_actor(&owner_authz(), "reply-atomic-read")
+            .await,
+        Err(StorageError::AuthSessionNotFound)
+    ));
+}
+
+#[tokio::test]
 async fn reply_claim_rechecks_actor_and_interrupts_without_provider_execution() {
     let database = TestDatabase::new();
     let store = created_owned_file_session_store(database.path()).await;
@@ -7569,7 +9064,7 @@ async fn distinct_dispatch_initiator_owns_capacity_and_finalization_reservation(
         "APR-OWNER-CAPACITY",
     );
     let mut review = approved_dispatch_commit(&snapshot, "distinct-dispatch-actors");
-    review.dispatch.as_mut().unwrap().initiating_authz = member_authz();
+    review.dispatch.as_mut().unwrap().initiating_authz = Some(member_authz());
     assert_eq!(
         store
             .commit_review_for_actor(&owner_authz(), review)
@@ -7631,7 +9126,7 @@ async fn distinct_dispatch_rejects_when_the_initiator_actor_quota_is_full() {
         "APR-MEMBER-CAPACITY",
     );
     let mut review = approved_dispatch_commit(&snapshot, "full-initiator-dispatch-capacity");
-    review.dispatch.as_mut().unwrap().initiating_authz = member_authz();
+    review.dispatch.as_mut().unwrap().initiating_authz = Some(member_authz());
     assert!(matches!(
         store.commit_review_for_actor(&owner_authz(), review).await,
         Err(StorageError::DispatchQueueCapacityExceeded)
@@ -7968,7 +9463,7 @@ async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempot
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, (1_i64..=14).collect::<Vec<_>>());
+    assert_eq!(versions, (1_i64..=15).collect::<Vec<_>>());
     assert_eq!(
         connection
             .query_row(
@@ -8764,13 +10259,17 @@ fn force_bootstrap_rollup_digest(path: &Path, digest: &str) {
 }
 
 fn downgrade_account_foundation_fixture_to_v12(connection: &rusqlite::Connection) {
-    let version: i64 = connection
+    let mut version: i64 = connection
         .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
             row.get(0)
         })
         .unwrap();
     if version < 13 {
         return;
+    }
+    if version >= 15 {
+        drop_v15_fixture_objects(connection);
+        version = 14;
     }
     if version >= 14 {
         downgrade_durable_authorization_fixture_to_v13(connection);
@@ -8816,6 +10315,14 @@ fn downgrade_account_foundation_fixture_to_v12(connection: &rusqlite::Connection
 }
 
 fn downgrade_durable_authorization_fixture_to_v13(connection: &rusqlite::Connection) {
+    let version: i64 = connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    if version >= 15 {
+        drop_v15_fixture_objects(connection);
+    }
     let template = rusqlite::Connection::open_in_memory().unwrap();
     template
         .execute_batch(include_str!("../migrations/0001_init.sql"))
@@ -9091,6 +10598,37 @@ fn downgrade_durable_authorization_fixture_to_v13(connection: &rusqlite::Connect
         .unwrap();
 }
 
+fn drop_v15_fixture_objects(connection: &rusqlite::Connection) {
+    connection
+        .execute_batch(
+            r#"DROP TABLE account_audit_events;
+               DROP TABLE account_audit_archive_state;
+               DROP TABLE account_audit_policies;
+               DROP TABLE account_audit_rollups;
+               DROP TABLE member_setup_tokens;
+               DELETE FROM schema_migrations WHERE version = 15;"#,
+        )
+        .unwrap();
+}
+
+fn downgrade_member_lifecycle_fixture_to_v14(connection: &rusqlite::Connection) {
+    downgrade_durable_authorization_fixture_to_v13(connection);
+    connection.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    connection
+        .execute_batch(include_str!(
+            "../migrations/0014_account_scoped_durable_authorization.sql"
+        ))
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO schema_migrations(version, applied_at)
+               VALUES (14, '2026-08-27T00:00:00.000Z')"#,
+            [],
+        )
+        .unwrap();
+    connection.execute_batch("COMMIT;").unwrap();
+}
+
 fn downgrade_bootstrap_audit_fixture_to_v11(connection: &rusqlite::Connection) {
     downgrade_account_foundation_fixture_to_v12(connection);
     connection
@@ -9358,6 +10896,124 @@ async fn bootstrap_test_owner(store: &SqliteStore) {
         })
         .await
         .unwrap();
+}
+
+fn member_setup_token_pair() -> (MemberSetupToken, String) {
+    let token = MemberSetupToken::generate().unwrap();
+    let presented = token.expose_secret().to_owned();
+    (token, presented)
+}
+
+fn member_setup_commit(
+    presented: &str,
+    auth_session_id: &str,
+    hash_nibble: &str,
+) -> MemberSetupCommit {
+    MemberSetupCommit {
+        setup_token: MemberSetupToken::from_presented(presented).unwrap(),
+        password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA".into(),
+        auth_session_id: AuthSessionId::from_persistence(auth_session_id).unwrap(),
+        session_token_hash: hash_nibble.repeat(64),
+        csrf_hash: "8".repeat(64),
+        session_expires_at: "2999-01-01T00:00:00.000Z".into(),
+    }
+}
+
+async fn provision_test_member_for_reply(store: &SqliteStore) -> AuthzContext {
+    let (token, presented) = member_setup_token_pair();
+    store
+        .create_member(
+            &owner_authz(),
+            CreateMemberCommit {
+                user_id: "user-member".into(),
+                username: "member".into(),
+                setup_token: token,
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .complete_member_setup(member_setup_commit(&presented, "asi_test_member", "e"))
+        .await
+        .unwrap()
+        .principal
+        .authz
+}
+
+fn insert_secondary_test_account(path: &Path) -> AuthzContext {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .unwrap();
+    connection
+        .execute_batch(
+            r#"INSERT INTO accounts(id, name, status, created_at, updated_at)
+               VALUES (
+                   'acc_secondary', 'Secondary', 'active',
+                   '2026-08-27T00:00:00.000Z', '2026-08-27T00:00:00.000Z'
+               );
+               INSERT INTO users(
+                   id, username, role, status, password_hash, created_at, updated_at
+               ) VALUES (
+                   'user-secondary-owner', 'secondary-owner', 'owner', 'active',
+                   '$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA',
+                   '2026-08-27T00:00:00.000Z', '2026-08-27T00:00:00.000Z'
+               );
+               INSERT INTO account_memberships(
+                   account_id, user_id, role, status, revision, created_at, updated_at
+               ) VALUES (
+                   'acc_secondary', 'user-secondary-owner', 'owner', 'active', 1,
+                   '2026-08-27T00:00:00.000Z', '2026-08-27T00:00:00.000Z'
+               );
+               INSERT INTO user_preferences(
+                   user_id, theme, preferred_model, revision, updated_at
+               ) VALUES (
+                   'user-secondary-owner', 'system', NULL, 1,
+                   '2026-08-27T00:00:00.000Z'
+               );
+               INSERT INTO auth_sessions(
+                   id, token_hash, account_id, user_id, membership_revision,
+                   csrf_hash, created_at, expires_at, last_seen_at
+               ) VALUES (
+                   'asi_secondary_owner',
+                   '9999999999999999999999999999999999999999999999999999999999999999',
+                   'acc_secondary', 'user-secondary-owner', 1,
+                   '8888888888888888888888888888888888888888888888888888888888888888',
+                   '2026-08-27T00:00:00.000Z', '2999-01-01T00:00:00.000Z',
+                   '2026-08-27T00:00:00.000Z'
+               );
+               INSERT INTO account_audit_rollups(
+                   account_id, through_sequence, event_count, digest,
+                   last_event_hash, updated_at
+               ) VALUES (
+                   'acc_secondary', 0, 0,
+                   '0000000000000000000000000000000000000000000000000000000000000000',
+                   '0000000000000000000000000000000000000000000000000000000000000000',
+                   '2026-08-27T00:00:00.000Z'
+               );
+               INSERT INTO account_audit_policies(
+                   account_id, detail_rows, legal_hold, archive_required,
+                   revision, updated_at
+               ) VALUES (
+                   'acc_secondary', 2, 0, 0, 1, '2026-08-27T00:00:00.000Z'
+               );
+               INSERT INTO account_audit_archive_state(
+                   account_id, through_sequence, event_hash, archive_reference,
+                   revision, updated_at
+               ) VALUES (
+                   'acc_secondary', 0,
+                   '0000000000000000000000000000000000000000000000000000000000000000',
+                   NULL, 1, '2026-08-27T00:00:00.000Z'
+               );"#,
+        )
+        .unwrap();
+    AuthzContext {
+        account_id: AccountId::from_persistence("acc_secondary").unwrap(),
+        user_id: "user-secondary-owner".into(),
+        membership_role: MembershipRole::Owner,
+        membership_revision: MembershipRevision::new(1).unwrap(),
+        auth_session_id: AuthSessionId::from_persistence("asi_secondary_owner").unwrap(),
+    }
 }
 
 fn set_test_user_status(path: &Path, user_id: &str, status: &str) {
@@ -9973,7 +11629,7 @@ fn approved_dispatch_commit(seed: &RunSnapshot, key: &str) -> ReviewCommit {
     let dispatch = DispatchJobSpec {
         call_id: "call-local-001".into(),
         approval_id: "APR-901".into(),
-        initiating_authz: owner_authz(),
+        initiating_authz: Some(owner_authz()),
         approving_authz: owner_authz(),
         tool_name: "local.echo".into(),
         tool_version: "1.0.0".into(),

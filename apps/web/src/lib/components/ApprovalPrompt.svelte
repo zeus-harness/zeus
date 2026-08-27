@@ -6,12 +6,13 @@
 		approval: ApprovalState;
 		summary: string;
 		policy?: ToolPolicy;
+		canReview: boolean;
 		pendingDecision: ReviewDecision | null;
 		error: string;
 		onReview: (decision: ReviewDecision) => void;
 	}
 
-	let { approval, summary, policy, pendingDecision, error, onReview }: Props = $props();
+	let { approval, summary, policy, canReview, pendingDecision, error, onReview }: Props = $props();
 	const hasBindingDetails = $derived(
 		Boolean(approval.call_id || approval.policy_revision || approval.sandbox_profile)
 	);
@@ -91,27 +92,35 @@
 				<p class="mt-3 text-xs leading-5 text-zeus-red" role="alert">{error}</p>
 			{/if}
 
-			<div class="mt-4 gap-2 flex justify-end">
-				<Button
-					variant="outline"
-					class="bg-zeus-bg h-11 rounded-lg px-4 text-sm sm:h-9"
-					disabled={pendingDecision !== null}
-					onclick={() => onReview('reject')}
+			{#if canReview}
+				<div class="mt-4 gap-2 flex justify-end">
+					<Button
+						variant="outline"
+						class="bg-zeus-bg h-11 rounded-lg px-4 text-sm sm:h-9"
+						disabled={pendingDecision !== null}
+						onclick={() => onReview('reject')}
+					>
+						{pendingDecision === 'reject' ? 'Declining…' : 'Decline'}
+					</Button>
+					<Button
+						class="h-11 rounded-lg px-4 text-sm sm:h-9"
+						disabled={pendingDecision !== null}
+						onclick={() => onReview('approve')}
+					>
+						{pendingDecision === 'approve'
+							? 'Approving…'
+							: approval.scope === 'allow_once'
+								? 'Approve once'
+								: 'Approve'}
+					</Button>
+				</div>
+			{:else}
+				<p
+					class="border-zeus-border bg-zeus-surface mt-4 rounded-lg px-3 py-2.5 text-xs text-zeus-muted border"
 				>
-					{pendingDecision === 'reject' ? 'Declining…' : 'Decline'}
-				</Button>
-				<Button
-					class="h-11 rounded-lg px-4 text-sm sm:h-9"
-					disabled={pendingDecision !== null}
-					onclick={() => onReview('approve')}
-				>
-					{pendingDecision === 'approve'
-						? 'Approving…'
-						: approval.scope === 'allow_once'
-							? 'Approve once'
-							: 'Approve'}
-				</Button>
-			</div>
+					An owner must review this action. You can continue reading the session while it waits.
+				</p>
+			{/if}
 		</div>
 	</div>
 </section>

@@ -164,6 +164,30 @@ fn configured_storage_limits() -> Result<StorageLimits, io::Error> {
             "ZEUS_MAX_BOOTSTRAP_AUDIT_ROWS",
             defaults.bootstrap_audit_rows,
         )?,
+        account_audit_detail_rows: environment_capacity(
+            "ZEUS_MAX_ACCOUNT_AUDIT_DETAIL_ROWS",
+            defaults.account_audit_detail_rows,
+        )?,
+        account_audit_rows_per_account: environment_capacity(
+            "ZEUS_MAX_ACCOUNT_AUDIT_ROWS_PER_ACCOUNT",
+            defaults.account_audit_rows_per_account,
+        )?,
+        account_audit_rows_global: environment_capacity(
+            "ZEUS_MAX_ACCOUNT_AUDIT_ROWS_GLOBAL",
+            defaults.account_audit_rows_global,
+        )?,
+        account_audit_progress_rows_per_account: environment_capacity(
+            "ZEUS_RESERVED_ACCOUNT_AUDIT_PROGRESS_ROWS_PER_ACCOUNT",
+            defaults.account_audit_progress_rows_per_account,
+        )?,
+        account_audit_progress_rows_global: environment_capacity(
+            "ZEUS_RESERVED_ACCOUNT_AUDIT_PROGRESS_ROWS_GLOBAL",
+            defaults.account_audit_progress_rows_global,
+        )?,
+        account_audit_compaction_batch: environment_capacity(
+            "ZEUS_ACCOUNT_AUDIT_COMPACTION_BATCH",
+            defaults.account_audit_compaction_batch,
+        )?,
     }
     .validated()
     .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))

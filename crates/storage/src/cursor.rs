@@ -12,6 +12,8 @@ const SESSION_RUN_IDS_KIND: &str = "session_run_ids";
 const SESSION_TURNS_KIND: &str = "session_turns";
 const SESSION_EVENTS_KIND: &str = "session_events";
 const RUN_EVENTS_KIND: &str = "run_events";
+const ACCOUNT_MEMBERS_KIND: &str = "account_members";
+const ACCOUNT_AUDIT_KIND: &str = "account_audit";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -172,6 +174,64 @@ pub(crate) fn decode_run_events(
     run_id: &str,
 ) -> Result<u64, StorageError> {
     decode_position(value, RUN_EVENTS_KIND, account_id, actor_user_id, run_id)
+}
+
+pub(crate) fn encode_account_members(
+    account_id: &str,
+    actor_user_id: &str,
+    username: &str,
+    user_id: &str,
+) -> Result<String, StorageError> {
+    encode_scoped_text_key(
+        ACCOUNT_MEMBERS_KIND,
+        account_id,
+        actor_user_id,
+        "collection",
+        username,
+        user_id,
+    )
+}
+
+pub(crate) fn decode_account_members(
+    value: &str,
+    account_id: &str,
+    actor_user_id: &str,
+) -> Result<TextKeyCursor, StorageError> {
+    decode_text_key(
+        value,
+        ACCOUNT_MEMBERS_KIND,
+        account_id,
+        actor_user_id,
+        "collection",
+    )
+}
+
+pub(crate) fn encode_account_audit(
+    account_id: &str,
+    actor_user_id: &str,
+    sequence: u64,
+) -> Result<String, StorageError> {
+    encode_scoped_position(
+        ACCOUNT_AUDIT_KIND,
+        account_id,
+        actor_user_id,
+        "collection",
+        sequence,
+    )
+}
+
+pub(crate) fn decode_account_audit(
+    value: &str,
+    account_id: &str,
+    actor_user_id: &str,
+) -> Result<u64, StorageError> {
+    decode_position(
+        value,
+        ACCOUNT_AUDIT_KIND,
+        account_id,
+        actor_user_id,
+        "collection",
+    )
 }
 
 fn encode_scoped_text_key(
@@ -406,6 +466,25 @@ mod tests {
         let run_cursor = encode_run_events("acc-a", "actor-a", "run-old", 11).unwrap();
         assert!(decode_run_events(&run_cursor, "acc-a", "actor-a", "run-new").is_err());
         assert!(decode_run_events(&run_cursor, "acc-a", "actor-b", "run-old").is_err());
+    }
+
+    #[test]
+    fn member_and_audit_collection_cursors_are_actor_scoped_and_distinct() {
+        let members = encode_account_members("acc-a", "actor-a", "member-a", "user-a").unwrap();
+        assert_eq!(
+            decode_account_members(&members, "acc-a", "actor-a").unwrap(),
+            TextKeyCursor {
+                first: "member-a".into(),
+                second: "user-a".into(),
+            }
+        );
+        assert!(decode_account_members(&members, "acc-a", "actor-b").is_err());
+        assert!(decode_account_audit(&members, "acc-a", "actor-a").is_err());
+
+        let audit = encode_account_audit("acc-a", "actor-a", 7).unwrap();
+        assert_eq!(decode_account_audit(&audit, "acc-a", "actor-a").unwrap(), 7);
+        assert!(decode_account_audit(&audit, "acc-b", "actor-a").is_err());
+        assert!(decode_account_members(&audit, "acc-a", "actor-a").is_err());
     }
 
     #[test]

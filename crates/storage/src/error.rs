@@ -40,6 +40,38 @@ pub enum StorageError {
     AuthSessionNotFound,
     #[error("the current account membership lacks the required capability")]
     PermissionDenied,
+    #[error("account member `{0}` was not found")]
+    MemberNotFound(String),
+    #[error("account member `{0}` already exists")]
+    MemberAlreadyExists(String),
+    #[error("the account membership revision changed concurrently")]
+    MembershipRevisionConflict,
+    #[error("an account must retain at least one active owner")]
+    LastAccountOwner,
+    #[error("the member setup credential is invalid or already used")]
+    InvalidMemberSetupToken,
+    #[error("the member setup credential has expired")]
+    MemberSetupExpired,
+    #[error("member setup is already complete")]
+    MemberSetupAlreadyCompleted,
+    #[error("the account security audit has exhausted its bounded local capacity")]
+    AuditStorageExhausted,
+    #[error("account audit detail compaction is blocked by legal hold")]
+    AuditLegalHold,
+    #[error("account audit detail compaction requires an archive checkpoint")]
+    AuditArchiveRequired,
+    #[error("the account audit policy changed concurrently")]
+    AuditPolicyConflict,
+    #[error("the account audit archive checkpoint changed concurrently or is invalid")]
+    AuditCheckpointConflict,
+    #[error(
+        "account audit policy for `{account_id}` retains {detail_rows} detail rows, above the configured limit {configured_limit}"
+    )]
+    AccountAuditPolicyExceedsConfiguredLimit {
+        account_id: String,
+        detail_rows: i64,
+        configured_limit: i64,
+    },
     #[error("the durable storage quota is exhausted")]
     StorageQuotaExceeded,
     #[error("SQLite physical storage cannot safely accept this operation")]

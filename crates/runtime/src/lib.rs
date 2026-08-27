@@ -7,6 +7,7 @@
 //! being retried.
 
 use std::{
+    fmt,
     future::Future,
     path::{Path, PathBuf},
     sync::{
@@ -33,17 +34,24 @@ use protocol::{
     StartTurnRequest, StartTurnResponse, ToolCall, ToolExecutorStatus, ToolOutcome,
 };
 pub use storage::{
-    AccountId, AuthPrincipal, AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit,
-    MembershipRevision, MembershipRole, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit,
-    ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
-    ReplySuccessCommit, SessionSummaryPage, SqliteOperationLimits, SqliteOperationLimitsError,
-    SqlitePhysicalLimits, SqlitePhysicalLimitsError, StorageLimits, StorageLimitsError,
-    StoredCredential, StoredPreferences, StoredUser, StoredUserRole, StoredUserStatus,
+    AccountAuditArchiveState, AccountAuditCheckpointCommit, AccountAuditEvent, AccountAuditPage,
+    AccountAuditPolicy, AccountAuditRollup, AccountAuditState, AccountId, AuthPrincipal,
+    AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, CreateMemberResult,
+    InFlightWorkSummary, MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit, MemberSetupResult,
+    MemberSetupToken, MemberTransitionResult, MembershipRevision, MembershipRole,
+    ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse,
+    ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit, ReplySuccessCommit,
+    RotateMemberSetupTokenResult, SessionSummaryPage, SqliteOperationLimits,
+    SqliteOperationLimitsError, SqlitePhysicalLimits, SqlitePhysicalLimitsError, StorageLimits,
+    StorageLimitsError, StoredCredential, StoredMember, StoredMemberPage, StoredMembershipStatus,
+    StoredPreferences, StoredUser, StoredUserRole, StoredUserStatus, TransitionMemberCommit,
+    UpdateAccountAuditPolicyCommit,
 };
 use storage::{
-    ClaimOutcome, CommitOutcome, DispatchCompleteCommit, DispatchContext, DispatchJob,
-    DispatchJobSpec, DispatchRecoveryCommit, DispatchStartCommit, ReviewCommit, ReviewContext,
-    ReviewReceipt, RunSnapshot, RuntimeIdentity, SqliteStore, StorageError,
+    ClaimOutcome, CommitOutcome, CreateMemberCommit, DispatchCompleteCommit, DispatchContext,
+    DispatchJob, DispatchJobSpec, DispatchRecoveryCommit, DispatchStartCommit, ReviewCommit,
+    ReviewContext, ReviewReceipt, RotateMemberSetupTokenCommit, RunSnapshot, RuntimeIdentity,
+    SqliteStore, StorageError,
 };
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast};
@@ -209,6 +217,35 @@ pub struct SessionEventPageFeed {
     pub receiver: broadcast::Receiver<PublishedSessionEvent>,
 }
 
+/// A one-transport member setup bearer paired with its durable mutation.
+///
+/// The bearer is deliberately not `Clone` or directly `Debug`; callers should
+/// move it into the HTTP response and must never log or persist it.
+pub struct IssuedMemberSetupToken<T> {
+    pub result: T,
+    setup_token: String,
+}
+
+impl<T> IssuedMemberSetupToken<T> {
+    pub fn expose_secret(&self) -> &str {
+        &self.setup_token
+    }
+
+    pub fn into_parts(self) -> (T, String) {
+        (self.result, self.setup_token)
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for IssuedMemberSetupToken<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IssuedMemberSetupToken")
+            .field("result", &self.result)
+            .field("setup_token", &"[REDACTED]")
+            .finish()
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("run {0} was not found")]
@@ -231,6 +268,32 @@ pub enum StoreError {
     AuthSessionNotFound,
     #[error("the current account membership lacks the required capability")]
     PermissionDenied,
+    #[error("account member {0} was not found")]
+    MemberNotFound(String),
+    #[error("account member {0} already exists")]
+    MemberAlreadyExists(String),
+    #[error("the account membership revision changed concurrently")]
+    MembershipRevisionConflict,
+    #[error("an account must retain at least one active owner")]
+    LastAccountOwner,
+    #[error("the member setup credential is invalid or already used")]
+    InvalidMemberSetupToken,
+    #[error("the member setup credential has expired")]
+    MemberSetupExpired,
+    #[error("member setup is already complete")]
+    MemberSetupAlreadyCompleted,
+    #[error("secure member setup credential generation is unavailable")]
+    MemberSetupTokenGenerationUnavailable,
+    #[error("the account security audit has exhausted its bounded local capacity")]
+    AuditStorageExhausted,
+    #[error("account audit detail compaction is blocked by legal hold")]
+    AuditLegalHold,
+    #[error("account audit detail compaction requires an archive checkpoint")]
+    AuditArchiveRequired,
+    #[error("the account audit policy revision changed concurrently")]
+    AuditPolicyConflict,
+    #[error("the account audit archive checkpoint changed concurrently or is invalid")]
+    AuditCheckpointConflict,
     #[error("the durable storage quota is exhausted")]
     StorageQuotaExceeded,
     #[error("SQLite physical storage cannot safely accept this operation")]
@@ -306,6 +369,18 @@ impl From<StorageError> for StoreError {
             StorageError::UserDisabled(id) => Self::UserDisabled(id),
             StorageError::AuthSessionNotFound => Self::AuthSessionNotFound,
             StorageError::PermissionDenied => Self::PermissionDenied,
+            StorageError::MemberNotFound(id) => Self::MemberNotFound(id),
+            StorageError::MemberAlreadyExists(id) => Self::MemberAlreadyExists(id),
+            StorageError::MembershipRevisionConflict => Self::MembershipRevisionConflict,
+            StorageError::LastAccountOwner => Self::LastAccountOwner,
+            StorageError::InvalidMemberSetupToken => Self::InvalidMemberSetupToken,
+            StorageError::MemberSetupExpired => Self::MemberSetupExpired,
+            StorageError::MemberSetupAlreadyCompleted => Self::MemberSetupAlreadyCompleted,
+            StorageError::AuditStorageExhausted => Self::AuditStorageExhausted,
+            StorageError::AuditLegalHold => Self::AuditLegalHold,
+            StorageError::AuditArchiveRequired => Self::AuditArchiveRequired,
+            StorageError::AuditPolicyConflict => Self::AuditPolicyConflict,
+            StorageError::AuditCheckpointConflict => Self::AuditCheckpointConflict,
             StorageError::StorageQuotaExceeded => Self::StorageQuotaExceeded,
             StorageError::PhysicalStorageExhausted => Self::PhysicalStorageExhausted,
             StorageError::OperationCapacityExceeded => Self::OperationCapacityExceeded,
@@ -665,6 +740,131 @@ impl DemoStore {
             .await?)
     }
 
+    pub async fn get_member(
+        &self,
+        context: &AuthzContext,
+        user_id: &str,
+    ) -> Result<StoredMember, StoreError> {
+        Ok(self.storage.get_member(context, user_id).await?)
+    }
+
+    pub async fn list_members(
+        &self,
+        context: &AuthzContext,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<StoredMemberPage, StoreError> {
+        Ok(self.storage.list_members(context, cursor, limit).await?)
+    }
+
+    pub async fn create_member(
+        &self,
+        context: &AuthzContext,
+        user_id: String,
+        username: String,
+    ) -> Result<IssuedMemberSetupToken<CreateMemberResult>, StoreError> {
+        let setup_token = MemberSetupToken::generate()
+            .map_err(|_| StoreError::MemberSetupTokenGenerationUnavailable)?;
+        let exposed_token = setup_token.expose_secret().to_owned();
+        let result = self
+            .storage
+            .create_member(
+                context,
+                CreateMemberCommit {
+                    user_id,
+                    username,
+                    setup_token,
+                },
+            )
+            .await?;
+        Ok(IssuedMemberSetupToken {
+            result,
+            setup_token: exposed_token,
+        })
+    }
+
+    pub async fn rotate_member_setup_token(
+        &self,
+        context: &AuthzContext,
+        user_id: String,
+        expected_revision: MembershipRevision,
+    ) -> Result<IssuedMemberSetupToken<RotateMemberSetupTokenResult>, StoreError> {
+        let setup_token = MemberSetupToken::generate()
+            .map_err(|_| StoreError::MemberSetupTokenGenerationUnavailable)?;
+        let exposed_token = setup_token.expose_secret().to_owned();
+        let result = self
+            .storage
+            .rotate_member_setup_token(
+                context,
+                RotateMemberSetupTokenCommit {
+                    user_id,
+                    expected_revision,
+                    setup_token,
+                },
+            )
+            .await?;
+        Ok(IssuedMemberSetupToken {
+            result,
+            setup_token: exposed_token,
+        })
+    }
+
+    pub async fn complete_member_setup(
+        &self,
+        commit: MemberSetupCommit,
+    ) -> Result<MemberSetupResult, StoreError> {
+        Ok(self.storage.complete_member_setup(commit).await?)
+    }
+
+    pub async fn transition_member(
+        &self,
+        context: &AuthzContext,
+        commit: TransitionMemberCommit,
+    ) -> Result<MemberTransitionResult, StoreError> {
+        Ok(self.storage.transition_member(context, commit).await?)
+    }
+
+    pub async fn account_audit_state(
+        &self,
+        context: &AuthzContext,
+    ) -> Result<AccountAuditState, StoreError> {
+        Ok(self.storage.account_audit_state(context).await?)
+    }
+
+    pub async fn list_account_audit_events(
+        &self,
+        context: &AuthzContext,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<AccountAuditPage, StoreError> {
+        Ok(self
+            .storage
+            .list_account_audit_events(context, cursor, limit)
+            .await?)
+    }
+
+    pub async fn update_account_audit_policy(
+        &self,
+        context: &AuthzContext,
+        commit: UpdateAccountAuditPolicyCommit,
+    ) -> Result<AccountAuditState, StoreError> {
+        Ok(self
+            .storage
+            .update_account_audit_policy(context, commit)
+            .await?)
+    }
+
+    pub async fn checkpoint_account_audit_archive(
+        &self,
+        context: &AuthzContext,
+        commit: AccountAuditCheckpointCommit,
+    ) -> Result<AccountAuditState, StoreError> {
+        Ok(self
+            .storage
+            .checkpoint_account_audit_archive(context, commit)
+            .await?)
+    }
+
     /// Returns the primary workspace only when the complete authority context
     /// still has read capability for the account that owns its primary Run.
     /// Storage intentionally maps missing, cross-account, disabled, stale, or
@@ -811,12 +1011,6 @@ impl DemoStore {
             .storage
             .session_summary_page_for_actor(context, cursor, limit)
             .await?)
-    }
-
-    #[cfg(test)]
-    async fn get_session(&self, session_id: &str) -> Result<SessionDetail, StoreError> {
-        validate_durable_reference(session_id, "session ID")?;
-        Ok(self.storage.get_session(session_id).await?)
     }
 
     /// Performs the narrow account-scoped point authorization used by API
@@ -1106,17 +1300,7 @@ impl DemoStore {
         context: &AuthzContext,
         job_id: &str,
     ) -> Result<Option<ReplyJob>, StoreError> {
-        self.storage.preferences(context).await?;
-        Ok(self
-            .storage
-            .reply_job(job_id)
-            .await?
-            .filter(|job| job.account_id == context.account_id))
-    }
-
-    #[cfg(test)]
-    async fn reply_job(&self, job_id: &str) -> Result<Option<ReplyJob>, StoreError> {
-        Ok(self.storage.reply_job(job_id).await?)
+        Ok(self.storage.reply_job_for_actor(context, job_id).await?)
     }
 
     /// Durable worker-only completion after a successful claimed provider call.
@@ -1214,13 +1398,38 @@ impl DemoStore {
         request: ReviewRequest,
         idempotency_key: &str,
     ) -> Result<ReviewResponse, StoreError> {
-        self.review_inner(Some(context), run_id, approval_id, request, idempotency_key)
+        self.review_inner(context, None, run_id, approval_id, request, idempotency_key)
             .await
+    }
+
+    /// Test-only entrypoint for exercising dispatch after a requested-call
+    /// fixture supplies explicit initiating authority. Production review has
+    /// no such provenance in the current payload and must always pass `None`.
+    #[cfg(test)]
+    async fn review_for_actor_with_initiator(
+        &self,
+        context: &AuthzContext,
+        initiating_context: &AuthzContext,
+        run_id: &str,
+        approval_id: &str,
+        request: ReviewRequest,
+        idempotency_key: &str,
+    ) -> Result<ReviewResponse, StoreError> {
+        self.review_inner(
+            context,
+            Some(initiating_context),
+            run_id,
+            approval_id,
+            request,
+            idempotency_key,
+        )
+        .await
     }
 
     async fn review_inner(
         &self,
-        context: Option<&AuthzContext>,
+        context: &AuthzContext,
+        initiating_context: Option<&AuthzContext>,
         run_id: &str,
         approval_id: &str,
         request: ReviewRequest,
@@ -1234,28 +1443,19 @@ impl DemoStore {
         // pending approval visible across a same-key commit race; the final
         // write transaction can then replay the winning receipt instead of
         // incorrectly reporting that the approval is no longer pending.
-        let review_context = if let Some(context) = context {
-            self.storage
-                .review_context_for_actor(context, run_id, approval_id)
-                .await?
-        } else {
-            self.storage.review_context(run_id, approval_id).await?
-        };
+        let review_context = self
+            .storage
+            .review_context_for_actor(context, run_id, approval_id)
+            .await?;
         let idempotency_key = normalized_idempotency_key(idempotency_key)?;
         validate_review_request_value(&request)?;
         let fingerprint = review_fingerprint(run_id, approval_id, &request)?;
 
-        if let Some(context) = context {
-            if let Some(receipt) = self
-                .storage
-                .review_receipt_for_actor(context, run_id, idempotency_key)
-                .await?
-            {
-                let response = replay_receipt(receipt, &fingerprint)?;
-                self.kick_dispatcher();
-                return Ok(response);
-            }
-        } else if let Some(receipt) = self.storage.review_receipt(idempotency_key).await? {
+        if let Some(receipt) = self
+            .storage
+            .review_receipt_for_actor(context, run_id, idempotency_key)
+            .await?
+        {
             let response = replay_receipt(receipt, &fingerprint)?;
             self.kick_dispatcher();
             return Ok(response);
@@ -1277,11 +1477,6 @@ impl DemoStore {
         )?;
 
         let dispatch = if approving {
-            let approving_context = context.ok_or_else(|| {
-                StoreError::ExecutionInvariant(
-                    "approval execution requires an authenticated owner actor".into(),
-                )
-            })?;
             let approved = transition.event.approval.as_ref().ok_or_else(|| {
                 StoreError::ExecutionInvariant(
                     "an approved transition is missing its approval binding".into(),
@@ -1298,14 +1493,13 @@ impl DemoStore {
             Some(DispatchJobSpec {
                 call_id: call.call_id.clone(),
                 approval_id: approved.id.clone(),
-                // v14 keeps the authenticated API owner gate closed and the
-                // historical ToolCallRequested payload has no initiator
-                // authority. Persist two independent subjects now, using the
-                // current owner for both. A future member-capable request path
-                // must supply traceable initiator provenance rather than infer
-                // it from the approver.
-                initiating_authz: approving_context.clone(),
-                approving_authz: approving_context.clone(),
+                // ToolCallRequested does not yet carry trustworthy initiating
+                // authority. Never substitute the approver: `None` persists
+                // the missing provenance and claim rejects it before external
+                // I/O. A future request payload must supply the exact durable
+                // actor context before production may enqueue `Some` here.
+                initiating_authz: initiating_context.cloned(),
+                approving_authz: context.clone(),
                 tool_name: call.tool.clone(),
                 tool_version: call.tool_version.clone(),
                 effect: call.effect.clone(),
@@ -1340,13 +1534,10 @@ impl DemoStore {
             response: response.clone(),
             dispatch,
         };
-        let outcome = if let Some(context) = context {
-            self.storage
-                .commit_review_for_actor(context, commit)
-                .await?
-        } else {
-            self.storage.commit_review(commit).await?
-        };
+        let outcome = self
+            .storage
+            .commit_review_for_actor(context, commit)
+            .await?;
 
         match outcome {
             CommitOutcome::Committed => {
@@ -2202,6 +2393,136 @@ mod tests {
         assert!(!wake.complete_cycle());
         assert!(wake.request());
         assert!(!wake.complete_cycle());
+    }
+
+    #[test]
+    fn issued_member_setup_token_has_a_redacted_debug_boundary() {
+        let issued = IssuedMemberSetupToken {
+            result: "member-created",
+            setup_token: "one-time-member-setup-secret".into(),
+        };
+        let debug = format!("{issued:?}");
+        assert!(debug.contains("member-created"));
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("one-time-member-setup-secret"));
+        assert_eq!(issued.expose_secret(), "one-time-member-setup-secret");
+
+        let (result, token) = issued.into_parts();
+        assert_eq!(result, "member-created");
+        assert_eq!(token, "one-time-member-setup-secret");
+    }
+
+    #[tokio::test]
+    async fn member_lifecycle_facades_revoke_authority_and_expose_owner_only_audit() {
+        let store = production_store(false).await;
+        let owner = test_authz(TEST_OWNER_ID);
+        let member_user_id = "user-runtime-lifecycle-member";
+        let member = provision_runtime_member(&store, member_user_id).await;
+
+        let members = store.list_members(&owner, None, 16).await.unwrap();
+        assert_eq!(members.items.len(), 2);
+        assert!(
+            members
+                .items
+                .iter()
+                .any(|item| item.user_id == member_user_id)
+        );
+        assert!(matches!(
+            store.list_members(&member, None, 16).await,
+            Err(StoreError::PermissionDenied)
+        ));
+        assert!(matches!(
+            store.account_audit_state(&member).await,
+            Err(StoreError::PermissionDenied)
+        ));
+        assert!(matches!(
+            store
+                .create_member(
+                    &member,
+                    "user-runtime-member-admin-bypass".into(),
+                    "member-admin-bypass".into(),
+                )
+                .await,
+            Err(StoreError::PermissionDenied)
+        ));
+        assert!(matches!(
+            store
+                .transition_member(
+                    &member,
+                    TransitionMemberCommit {
+                        user_id: TEST_OWNER_ID.into(),
+                        expected_revision: owner.membership_revision,
+                        expected_role: MembershipRole::Owner,
+                        expected_status: StoredMembershipStatus::Active,
+                        role: MembershipRole::Owner,
+                        status: StoredMembershipStatus::Active,
+                    },
+                )
+                .await,
+            Err(StoreError::PermissionDenied)
+        ));
+
+        store
+            .create_session_for_actor(
+                &member,
+                CreateSessionRequest {
+                    id: "session-runtime-lifecycle-member".into(),
+                    title: "Member lifecycle authority".into(),
+                },
+                "create-runtime-lifecycle-member",
+            )
+            .await
+            .unwrap();
+
+        let transition = store
+            .transition_member(
+                &owner,
+                TransitionMemberCommit {
+                    user_id: member_user_id.into(),
+                    expected_revision: member.membership_revision,
+                    expected_role: MembershipRole::Member,
+                    expected_status: StoredMembershipStatus::Active,
+                    role: MembershipRole::Member,
+                    status: StoredMembershipStatus::Disabled,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(transition.member.status, StoredMembershipStatus::Disabled);
+        assert_eq!(transition.revoked_auth_sessions, 1);
+        assert!(transition.in_flight.reply_job_ids.is_empty());
+        assert!(transition.in_flight.dispatch_call_ids.is_empty());
+        assert!(matches!(
+            store
+                .create_session_for_actor(
+                    &member,
+                    CreateSessionRequest {
+                        id: "session-runtime-revoked-member".into(),
+                        title: "Revoked member must fail".into(),
+                    },
+                    "create-runtime-revoked-member",
+                )
+                .await,
+            Err(StoreError::AuthSessionNotFound)
+        ));
+
+        let audit = store
+            .list_account_audit_events(&owner, None, 32)
+            .await
+            .unwrap();
+        let actions = audit
+            .items
+            .iter()
+            .map(|event| event.action.as_str())
+            .collect::<Vec<_>>();
+        assert!(actions.contains(&"member.created"));
+        assert!(actions.contains(&"member.setup_completed"));
+        assert!(actions.contains(&"member.disabled"));
+        assert!(audit.items.iter().any(|event| {
+            event.action == "member.disabled"
+                && event.target_id == member_user_id
+                && event.outcome == "succeeded"
+        }));
     }
 
     #[tokio::test]
@@ -3273,11 +3594,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_approval_is_never_reported_as_execution_success() {
+    async fn approval_without_trusted_initiator_is_rejected_before_external_execution() {
         let store = production_store(false).await;
+        let owner = test_authz(TEST_OWNER_ID);
+        let member = provision_runtime_member(&store, "user-runtime-non-approver").await;
+        assert!(matches!(
+            store
+                .review_for_actor(
+                    &member,
+                    protocol::DEMO_RUN_ID,
+                    "APR-901",
+                    approval_request(ReviewDecision::Approve),
+                    "member-must-not-approve",
+                )
+                .await,
+            Err(StoreError::PermissionDenied)
+        ));
+        assert!(
+            store
+                .storage
+                .dispatch_job(PRODUCTION_DEMO_CALL_ID)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
         let response = store
             .review_for_actor(
-                &test_authz(TEST_OWNER_ID),
+                &owner,
                 protocol::DEMO_RUN_ID,
                 "APR-901",
                 approval_request(ReviewDecision::Approve),
@@ -3294,7 +3638,7 @@ mod tests {
             detail.events.last().and_then(|event| event.data.as_ref()),
             Some(RunEventData::ToolResult {
                 outcome: ToolOutcome::NotDispatched {
-                    reason: NotDispatchedReason::ExecutorUnavailable,
+                    reason: NotDispatchedReason::AuthorizationRevoked,
                     ..
                 },
                 status: ToolCallStatus::NotDispatched,
@@ -3308,20 +3652,24 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(job.account_id, AccountId::local());
-        assert_eq!(job.initiating_actor_user_id.as_deref(), Some(TEST_OWNER_ID));
+        assert!(job.initiating_actor_user_id.is_none());
         assert_eq!(job.approving_actor_user_id.as_deref(), Some(TEST_OWNER_ID));
-        assert_eq!(
-            job.initiating_membership_revision
-                .map(|revision| revision.get()),
-            Some(1)
-        );
+        assert!(job.initiating_membership_revision.is_none());
         assert_eq!(
             job.approving_membership_revision
                 .map(|revision| revision.get()),
             Some(1)
         );
-        assert_eq!(job.status, DispatchStatus::Finished);
-        assert_eq!(job.attempt, 1);
+        assert_eq!(job.status, DispatchStatus::Rejected);
+        assert_eq!(job.attempt, 0);
+        assert!(job.started_at.is_none());
+        assert_eq!(
+            job.authorization_error_json
+                .as_ref()
+                .and_then(|error| error.get("code"))
+                .and_then(serde_json::Value::as_str),
+            Some("authorization_revoked")
+        );
     }
 
     #[tokio::test]
@@ -3330,7 +3678,8 @@ mod tests {
         let store = local_store(&paths, false).await;
         let request = approval_request(ReviewDecision::Approve);
         let first = store
-            .review_for_actor(
+            .review_for_actor_with_initiator(
+                &test_authz(TEST_OWNER_ID),
                 &test_authz(TEST_OWNER_ID),
                 LOCAL_DEMO_RUN_ID,
                 "APR-DEV-1",
@@ -3349,7 +3698,8 @@ mod tests {
         assert_eq!(directory_entries(&paths.marker_root), 1);
 
         let replay = store
-            .review_for_actor(
+            .review_for_actor_with_initiator(
+                &test_authz(TEST_OWNER_ID),
                 &test_authz(TEST_OWNER_ID),
                 LOCAL_DEMO_RUN_ID,
                 "APR-DEV-1",
@@ -3392,7 +3742,8 @@ mod tests {
         store.registry = Arc::new(registry);
 
         let approved = store
-            .review_for_actor(
+            .review_for_actor_with_initiator(
+                &test_authz(TEST_OWNER_ID),
                 &test_authz(TEST_OWNER_ID),
                 LOCAL_DEMO_RUN_ID,
                 "APR-DEV-1",
@@ -3459,7 +3810,8 @@ mod tests {
         ));
 
         let approved = store
-            .review_for_actor(
+            .review_for_actor_with_initiator(
+                &test_authz(TEST_OWNER_ID),
                 &test_authz(TEST_OWNER_ID),
                 LOCAL_DEMO_RUN_ID,
                 "APR-DEV-1",
@@ -3511,97 +3863,122 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn revoked_owner_dispatch_is_rejected_before_the_connector_runs() {
-        for revocation in [ActorRevocation::Revision, ActorRevocation::Disabled] {
-            let label = format!("dispatch-revoked-{}", revocation.label());
-            let paths = TestPaths::new(&label);
-            let store = local_store(&paths, false).await;
-            let approved = store
-                .review_for_actor(
-                    &test_authz(TEST_OWNER_ID),
-                    LOCAL_DEMO_RUN_ID,
-                    "APR-DEV-1",
-                    approval_request(ReviewDecision::Approve),
-                    &format!("approve-{label}"),
-                )
-                .await
-                .unwrap();
-            assert_eq!(approved.run.status, RunStatus::Queued);
-            let mut feed = store
-                .event_feed_for_actor(
-                    &test_authz(TEST_OWNER_ID),
-                    LOCAL_DEMO_RUN_ID,
-                    approved.event.sequence,
-                )
-                .await
-                .unwrap();
+    async fn disabled_dispatch_initiator_is_rejected_before_the_connector_runs() {
+        let paths = TestPaths::new("dispatch-disabled-before-claim");
+        let store = local_store(&paths, false).await;
+        let owner = test_authz(TEST_OWNER_ID);
+        let member_user_id = "user-runtime-disabled-dispatch";
+        let member = provision_runtime_member(&store, member_user_id).await;
+        let approved = store
+            .review_for_actor_with_initiator(
+                &owner,
+                &member,
+                LOCAL_DEMO_RUN_ID,
+                "APR-DEV-1",
+                approval_request(ReviewDecision::Approve),
+                "approve-dispatch-disabled-before-claim",
+            )
+            .await
+            .unwrap();
+        assert_eq!(approved.run.status, RunStatus::Queued);
+        let mut feed = store
+            .event_feed_for_actor(&owner, LOCAL_DEMO_RUN_ID, approved.event.sequence)
+            .await
+            .unwrap();
 
-            revoke_test_actor(&paths.database, revocation);
-            store.dispatch_pending().await.unwrap();
+        let transition = store
+            .transition_member(
+                &owner,
+                TransitionMemberCommit {
+                    user_id: member_user_id.into(),
+                    expected_revision: member.membership_revision,
+                    expected_role: MembershipRole::Member,
+                    expected_status: StoredMembershipStatus::Active,
+                    role: MembershipRole::Member,
+                    status: StoredMembershipStatus::Disabled,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(transition.in_flight.reply_job_ids.is_empty());
+        assert!(transition.in_flight.dispatch_call_ids.is_empty());
+        store.dispatch_pending().await.unwrap();
 
-            assert_eq!(directory_entries(&paths.marker_root), 0);
-            let job = store
-                .storage
-                .dispatch_job(LOCAL_MARKER_CALL_ID)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(job.status, DispatchStatus::Rejected);
-            assert_eq!(job.attempt, 0);
-            assert!(job.started_at.is_none());
-            assert!(job.start_event_sequence.is_none());
-            assert_eq!(
-                job.authorization_error_json
-                    .as_ref()
-                    .and_then(|error| error.get("code"))
-                    .and_then(serde_json::Value::as_str),
-                Some("authorization_revoked")
-            );
+        assert_eq!(directory_entries(&paths.marker_root), 0);
+        let job = store
+            .storage
+            .dispatch_job(LOCAL_MARKER_CALL_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, DispatchStatus::Rejected);
+        assert_eq!(job.attempt, 0);
+        assert!(job.started_at.is_none());
+        assert!(job.start_event_sequence.is_none());
+        assert_eq!(
+            job.authorization_error_json
+                .as_ref()
+                .and_then(|error| error.get("code"))
+                .and_then(serde_json::Value::as_str),
+            Some("authorization_revoked")
+        );
 
-            let detail = store.run_detail(LOCAL_DEMO_RUN_ID).await.unwrap();
-            assert_eq!(detail.run.status, RunStatus::NeedsAttention);
-            let rejection = detail.events.last().unwrap();
-            assert_eq!(
-                rejection.metadata.get("executor_invoked"),
-                Some(&serde_json::Value::Bool(false))
-            );
-            assert_eq!(
-                job.result_event_sequence,
-                Some(rejection.sequence),
-                "the rejected queue record must reference the durable rejection event"
-            );
-            assert!(matches!(
-                rejection.data.as_ref(),
-                Some(RunEventData::ToolResult {
-                    outcome: ToolOutcome::NotDispatched {
-                        reason: NotDispatchedReason::AuthorizationRevoked,
-                        ..
-                    },
-                    status: ToolCallStatus::NotDispatched,
+        let detail = store.run_detail(LOCAL_DEMO_RUN_ID).await.unwrap();
+        assert_eq!(detail.run.status, RunStatus::NeedsAttention);
+        let rejection = detail.events.last().unwrap();
+        assert_eq!(
+            rejection.metadata.get("executor_invoked"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        assert_eq!(
+            job.result_event_sequence,
+            Some(rejection.sequence),
+            "the rejected queue record must reference the durable rejection event"
+        );
+        assert!(matches!(
+            rejection.data.as_ref(),
+            Some(RunEventData::ToolResult {
+                outcome: ToolOutcome::NotDispatched {
+                    reason: NotDispatchedReason::AuthorizationRevoked,
                     ..
-                })
-            ));
-            let published =
-                tokio::time::timeout(std::time::Duration::from_secs(1), feed.receiver.recv())
-                    .await
-                    .expect("runtime must publish the committed authorization rejection")
-                    .unwrap();
-            assert_eq!(published.run_id, LOCAL_DEMO_RUN_ID);
-            assert_eq!(published.event, *rejection);
-            assert!(matches!(
-                feed.receiver.try_recv(),
-                Err(broadcast::error::TryRecvError::Empty)
-            ));
-        }
+                },
+                status: ToolCallStatus::NotDispatched,
+                ..
+            })
+        ));
+        let published =
+            tokio::time::timeout(std::time::Duration::from_secs(1), feed.receiver.recv())
+                .await
+                .expect("runtime must publish the committed authorization rejection")
+                .unwrap();
+        assert_eq!(published.run_id, LOCAL_DEMO_RUN_ID);
+        assert_eq!(published.event, *rejection);
+        assert!(matches!(
+            feed.receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        let audit = store
+            .list_account_audit_events(&owner, None, 32)
+            .await
+            .unwrap();
+        assert!(audit.items.iter().any(|event| {
+            event.action == "member.disabled"
+                && event.target_id == member_user_id
+                && event.outcome == "succeeded"
+        }));
     }
 
     #[tokio::test]
-    async fn claimed_dispatch_completes_after_a_later_membership_revision() {
+    async fn claimed_dispatch_completes_after_a_later_initiator_disable() {
         let paths = TestPaths::new("dispatch-revision-after-claim");
         let store = local_store(&paths, false).await;
+        let owner = test_authz(TEST_OWNER_ID);
+        let member_user_id = "user-runtime-claimed-dispatch";
+        let member = provision_runtime_member(&store, member_user_id).await;
         store
-            .review_for_actor(
-                &test_authz(TEST_OWNER_ID),
+            .review_for_actor_with_initiator(
+                &owner,
+                &member,
                 LOCAL_DEMO_RUN_ID,
                 "APR-DEV-1",
                 approval_request(ReviewDecision::Approve),
@@ -3613,14 +3990,39 @@ mod tests {
         assert_eq!(claimed.job.status, DispatchStatus::Started);
         assert_eq!(directory_entries(&paths.marker_root), 0);
 
+        let transition = store
+            .transition_member(
+                &owner,
+                TransitionMemberCommit {
+                    user_id: member_user_id.into(),
+                    expected_revision: member.membership_revision,
+                    expected_role: MembershipRole::Member,
+                    expected_status: StoredMembershipStatus::Active,
+                    role: MembershipRole::Member,
+                    status: StoredMembershipStatus::Disabled,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(transition.in_flight.reply_job_ids.is_empty());
+        assert_eq!(
+            transition.in_flight.dispatch_call_ids,
+            [LOCAL_MARKER_CALL_ID]
+        );
+
         // The claim is the last authorization boundary before external I/O.
-        // Revocation after that checkpoint cannot safely cancel an operation
-        // that may already have happened, and must not block its completion.
-        revoke_test_actor(&paths.database, ActorRevocation::Revision);
+        // Disable after that checkpoint cannot safely cancel an operation that
+        // may already have happened, and must not block its one settlement.
         let outcome = store.dispatch_outcome(&claimed).await;
         assert!(matches!(outcome, ToolOutcome::Succeeded { .. }));
         assert_eq!(directory_entries(&paths.marker_root), 1);
         store.complete_dispatch(claimed, outcome).await.unwrap();
+        store.dispatch_pending().await.unwrap();
+        assert_eq!(
+            directory_entries(&paths.marker_root),
+            1,
+            "a terminal claimed call must not be executed or settled twice"
+        );
 
         let job = store
             .storage
@@ -3630,16 +4032,32 @@ mod tests {
             .unwrap();
         assert_eq!(job.status, DispatchStatus::Finished);
         assert_eq!(job.attempt, 1);
+        assert!(matches!(
+            store.current_run_for_actor(&member).await,
+            Err(StoreError::AuthSessionNotFound)
+        ));
+        let audit = store
+            .list_account_audit_events(&owner, None, 32)
+            .await
+            .unwrap();
+        assert!(audit.items.iter().any(|event| {
+            event.action == "member.disabled"
+                && event.target_id == member_user_id
+                && event.outcome == "succeeded"
+        }));
     }
 
     #[tokio::test]
     async fn disabled_reply_actor_is_interrupted_without_exposing_a_claimed_job() {
         let paths = TestPaths::new("reply-actor-disabled");
         let store = local_store(&paths, false).await;
+        let owner = test_authz(TEST_OWNER_ID);
+        let member_user_id = "user-runtime-disabled-reply";
+        let member = provision_runtime_member(&store, member_user_id).await;
         let job_id = "reply-runtime-authorization-revoked";
         let enqueued = store
             .start_turn_and_enqueue_reply_for_actor(
-                &test_authz(TEST_OWNER_ID),
+                &member,
                 LOCAL_DEMO_SESSION_ID,
                 StartTurnRequest {
                     turn_id: "turn-runtime-authorization-revoked".into(),
@@ -3649,7 +4067,7 @@ mod tests {
                 "enqueue-runtime-authorization-revoked",
                 ReplyJobSpec {
                     id: job_id.into(),
-                    authz: test_authz(TEST_OWNER_ID),
+                    authz: member.clone(),
                     provider_name: "provider-must-not-run".into(),
                     model_name: Some("model-must-not-run".into()),
                     request_json: serde_json::json!({"prompt": "must remain durable only"}),
@@ -3660,20 +4078,42 @@ mod tests {
         assert_eq!(enqueued.job.status, ReplyJobStatus::Queued);
         let mut feed = store
             .session_event_feed_for_actor(
-                &test_authz(TEST_OWNER_ID),
+                &member,
                 LOCAL_DEMO_SESSION_ID,
                 enqueued.start.event.sequence,
             )
             .await
             .unwrap();
 
-        revoke_test_actor(&paths.database, ActorRevocation::Disabled);
+        let transition = store
+            .transition_member(
+                &owner,
+                TransitionMemberCommit {
+                    user_id: member_user_id.into(),
+                    expected_revision: member.membership_revision,
+                    expected_role: MembershipRole::Member,
+                    expected_status: StoredMembershipStatus::Active,
+                    role: MembershipRole::Member,
+                    status: StoredMembershipStatus::Disabled,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(transition.in_flight.reply_job_ids.is_empty());
         assert!(matches!(
             store.claim_next_reply().await.unwrap(),
             ReplyClaimOutcome::NotAvailable
         ));
+        assert!(matches!(
+            store.reply_job_for_actor(&member, job_id).await,
+            Err(StoreError::AuthSessionNotFound)
+        ));
 
-        let job = store.reply_job(job_id).await.unwrap().unwrap();
+        let job = store
+            .reply_job_for_actor(&owner, job_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(job.status, ReplyJobStatus::Failed);
         assert_eq!(job.attempt, 1);
         assert_eq!(
@@ -3683,7 +4123,19 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("authorization_revoked")
         );
-        let detail = store.get_session(LOCAL_DEMO_SESSION_ID).await.unwrap();
+        let detail = store
+            .get_session_for_actor(
+                &owner,
+                LOCAL_DEMO_SESSION_ID,
+                None,
+                protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                None,
+                protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                None,
+                protocol::EVENT_PAGE_DEFAULT_LIMIT,
+            )
+            .await
+            .unwrap();
         assert_eq!(detail.session.status, SessionStatus::NeedsAttention);
         let interruption = detail.events.last().unwrap();
         assert!(matches!(
@@ -3702,16 +4154,28 @@ mod tests {
             feed.receiver.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+        let audit = store
+            .list_account_audit_events(&owner, None, 32)
+            .await
+            .unwrap();
+        assert!(audit.items.iter().any(|event| {
+            event.action == "member.disabled"
+                && event.target_id == member_user_id
+                && event.outcome == "succeeded"
+        }));
     }
 
     #[tokio::test]
-    async fn claimed_reply_completion_survives_a_later_membership_revision() {
+    async fn claimed_reply_completion_survives_a_later_member_disable() {
         let paths = TestPaths::new("reply-revision-after-claim");
         let store = local_store(&paths, false).await;
+        let owner = test_authz(TEST_OWNER_ID);
+        let member_user_id = "user-runtime-claimed-reply";
+        let member = provision_runtime_member(&store, member_user_id).await;
         let job_id = "reply-runtime-revision-after-claim";
         store
             .start_turn_and_enqueue_reply_for_actor(
-                &test_authz(TEST_OWNER_ID),
+                &member,
                 LOCAL_DEMO_SESSION_ID,
                 StartTurnRequest {
                     turn_id: "turn-runtime-revision-after-claim".into(),
@@ -3721,7 +4185,7 @@ mod tests {
                 "enqueue-runtime-revision-after-claim",
                 ReplyJobSpec {
                     id: job_id.into(),
-                    authz: test_authz(TEST_OWNER_ID),
+                    authz: member.clone(),
                     provider_name: "test-provider".into(),
                     model_name: Some("test-model".into()),
                     request_json: serde_json::json!({"prompt": "settle after claim"}),
@@ -3734,37 +4198,75 @@ mod tests {
         };
         assert_eq!(claimed.status, ReplyJobStatus::Started);
 
-        revoke_test_actor(&paths.database, ActorRevocation::Revision);
+        let transition = store
+            .transition_member(
+                &owner,
+                TransitionMemberCommit {
+                    user_id: member_user_id.into(),
+                    expected_revision: member.membership_revision,
+                    expected_role: MembershipRole::Member,
+                    expected_status: StoredMembershipStatus::Active,
+                    role: MembershipRole::Member,
+                    status: StoredMembershipStatus::Disabled,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(transition.in_flight.reply_job_ids, [job_id]);
+        assert!(transition.in_flight.dispatch_call_ids.is_empty());
         let expected_sequence = store
             .session_summary_for_progress(LOCAL_DEMO_SESSION_ID)
             .await
             .unwrap()
             .sequence;
-        let completion = store
-            .complete_reply_success(ReplySuccessCommit {
-                job_id: job_id.into(),
-                expected_sequence,
-                assistant_message: "The already-started provider call settled once.".into(),
-                provenance: protocol::AssistantReplyProvenance {
-                    provider_id: "test-provider".into(),
-                    model: Some("test-model".into()),
-                    reply_kind: protocol::AssistantReplyKind::Model,
-                },
-                response_json: serde_json::json!({
-                    "content": "The already-started provider call settled once.",
-                    "finish_reason": "stop",
-                    "provider": {
-                        "provider_id": "test-provider",
-                        "model": "test-model",
-                        "reply_kind": "model"
-                    }
-                }),
-            })
-            .await
-            .unwrap();
+        let commit = ReplySuccessCommit {
+            job_id: job_id.into(),
+            expected_sequence,
+            assistant_message: "The already-started provider call settled once.".into(),
+            provenance: protocol::AssistantReplyProvenance {
+                provider_id: "test-provider".into(),
+                model: Some("test-model".into()),
+                reply_kind: protocol::AssistantReplyKind::Model,
+            },
+            response_json: serde_json::json!({
+                "content": "The already-started provider call settled once.",
+                "finish_reason": "stop",
+                "provider": {
+                    "provider_id": "test-provider",
+                    "model": "test-model",
+                    "reply_kind": "model"
+                }
+            }),
+        };
+        let completion = store.complete_reply_success(commit.clone()).await.unwrap();
         assert_eq!(completion.job.status, ReplyJobStatus::Succeeded);
         assert_eq!(completion.session.status, SessionStatus::Ready);
         assert_eq!(completion.events.len(), 2);
+        let replay = store.complete_reply_success(commit).await.unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.events, completion.events);
+        assert_eq!(replay.session.sequence, completion.session.sequence);
+        assert!(matches!(
+            store
+                .session_events_after_for_actor(&member, LOCAL_DEMO_SESSION_ID, 0)
+                .await,
+            Err(StoreError::AuthSessionNotFound)
+        ));
+        let persisted = store
+            .reply_job_for_actor(&owner, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.status, ReplyJobStatus::Succeeded);
+        let audit = store
+            .list_account_audit_events(&owner, None, 32)
+            .await
+            .unwrap();
+        assert!(audit.items.iter().any(|event| {
+            event.action == "member.disabled"
+                && event.target_id == member_user_id
+                && event.outcome == "succeeded"
+        }));
     }
 
     #[tokio::test]
@@ -3772,7 +4274,8 @@ mod tests {
         let paths = TestPaths::new("recovery");
         let store = local_store(&paths, false).await;
         store
-            .review_for_actor(
+            .review_for_actor_with_initiator(
+                &test_authz(TEST_OWNER_ID),
                 &test_authz(TEST_OWNER_ID),
                 LOCAL_DEMO_RUN_ID,
                 "APR-DEV-1",
@@ -3787,7 +4290,7 @@ mod tests {
         // Authorization is consumed by the durable started checkpoint. A
         // later membership revision must not turn recovery into a retry or
         // prevent the outcome_unknown terminal record.
-        revoke_test_actor(&paths.database, ActorRevocation::Revision);
+        advance_test_actor_membership_revision(&paths.database);
         drop(store);
 
         let storage = SqliteStore::open(&paths.database).await.unwrap();
@@ -3836,7 +4339,8 @@ mod tests {
         store.registry = Arc::new(registry);
 
         store
-            .review_for_actor(
+            .review_for_actor_with_initiator(
+                &test_authz(TEST_OWNER_ID),
                 &test_authz(TEST_OWNER_ID),
                 LOCAL_DEMO_RUN_ID,
                 "APR-DEV-1",
@@ -4032,7 +4536,7 @@ mod tests {
                     dispatch: Some(DispatchJobSpec {
                         call_id: call.call_id.clone(),
                         approval_id: pending.id,
-                        initiating_authz: test_authz(TEST_OWNER_ID),
+                        initiating_authz: Some(test_authz(TEST_OWNER_ID)),
                         approving_authz: test_authz(TEST_OWNER_ID),
                         tool_name: call.tool,
                         tool_version: call.tool_version,
@@ -4103,72 +4607,81 @@ mod tests {
         assert_eq!(owner.id, TEST_OWNER_ID);
     }
 
-    #[derive(Clone, Copy)]
-    enum ActorRevocation {
-        Revision,
-        Disabled,
+    async fn provision_runtime_member(store: &DemoStore, user_id: &str) -> AuthzContext {
+        let issued = store
+            .create_member(
+                &test_authz(TEST_OWNER_ID),
+                user_id.into(),
+                "runtime-member".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(issued.result.member.role, MembershipRole::Member);
+        assert_eq!(issued.result.member.status, StoredMembershipStatus::Active);
+        assert!(issued.result.member.setup_required);
+        assert!(issued.result.member.setup_token_expires_at.is_some());
+        let (_, setup_token) = issued.into_parts();
+        let result = store
+            .complete_member_setup(MemberSetupCommit {
+                setup_token: MemberSetupToken::from_presented(setup_token).unwrap(),
+                password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA".into(),
+                auth_session_id: AuthSessionId::from_persistence(format!("runtime-test-{user_id}"))
+                    .unwrap(),
+                session_token_hash: "7".repeat(64),
+                csrf_hash: "8".repeat(64),
+                session_expires_at: "2999-01-01T00:00:00.000Z".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.member.user_id, user_id);
+        assert!(!result.member.setup_required);
+        assert!(result.member.setup_token_expires_at.is_none());
+        result.principal.authz
     }
 
-    impl ActorRevocation {
-        fn label(self) -> &'static str {
-            match self {
-                Self::Revision => "revision",
-                Self::Disabled => "disabled",
-            }
-        }
-    }
-
-    fn revoke_test_actor(path: &Path, revocation: ActorRevocation) {
+    fn advance_test_actor_membership_revision(path: &Path) {
         let connection = Connection::open(path).unwrap();
         connection
             .busy_timeout(std::time::Duration::from_secs(1))
             .unwrap();
         let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-        let changed = match revocation {
-            ActorRevocation::Revision => {
-                // Membership revisions may only advance alongside a real
-                // authority change, and an account must retain an active
-                // owner. Install a backup owner membership before downgrading
-                // the test actor so this exercises the production invariant
-                // instead of bypassing its triggers.
-                connection
-                    .execute(
-                        r#"INSERT INTO users(
-                               id, username, role, status, password_hash,
-                               created_at, updated_at
-                           ) VALUES (?1, ?2, 'member', 'active', ?3, ?4, ?4)"#,
-                        params![
-                            "user-runtime-backup-owner",
-                            "runtime-backup-owner",
-                            "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA",
-                            timestamp
-                        ],
-                    )
-                    .unwrap();
-                connection
-                    .execute(
-                        r#"INSERT INTO account_memberships(
-                               account_id, user_id, role, status, revision,
-                               created_at, updated_at
-                           ) VALUES (
-                               'acc_local', ?1, 'owner', 'active', 1, ?2, ?2
-                           )"#,
-                        params!["user-runtime-backup-owner", timestamp],
-                    )
-                    .unwrap();
-                connection.execute(
-                    r#"UPDATE account_memberships
-                       SET role = 'member', revision = revision + 1, updated_at = ?1
-                       WHERE account_id = 'acc_local' AND user_id = ?2"#,
-                    params![timestamp, TEST_OWNER_ID],
-                )
-            }
-            ActorRevocation::Disabled => connection.execute(
-                "UPDATE users SET status = 'disabled', updated_at = ?1 WHERE id = ?2",
+        // Membership revisions may only advance alongside a real authority
+        // change, and an account must retain an active owner. Install a backup
+        // owner membership before downgrading the test actor so this exercises
+        // the production invariant instead of bypassing its triggers.
+        connection
+            .execute(
+                r#"INSERT INTO users(
+                       id, username, role, status, password_hash,
+                       created_at, updated_at
+                   ) VALUES (?1, ?2, 'member', 'active', ?3, ?4, ?4)"#,
+                params![
+                    "user-runtime-backup-owner",
+                    "runtime-backup-owner",
+                    "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA",
+                    timestamp
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                r#"INSERT INTO account_memberships(
+                       account_id, user_id, role, status, revision,
+                       created_at, updated_at
+                   ) VALUES (
+                       'acc_local', ?1, 'owner', 'active', 1, ?2, ?2
+                   )"#,
+                params!["user-runtime-backup-owner", timestamp],
+            )
+            .unwrap();
+        let changed = connection
+            .execute(
+                r#"UPDATE account_memberships
+                   SET role = 'member', revision = revision + 1, updated_at = ?1
+                   WHERE account_id = 'acc_local' AND user_id = ?2"#,
                 params![timestamp, TEST_OWNER_ID],
-            ),
-        }
-        .unwrap();
+            )
+            .unwrap();
         assert_eq!(changed, 1);
     }
 

@@ -40,6 +40,7 @@ const INVALID_PASSWORD_SENTINEL: &str = "invalid-candidate-for-uniform-verificat
 const SESSION_TOKEN_DOMAIN: &[u8] = b"zeus.session-token.v1\0";
 const CSRF_TOKEN_DOMAIN: &[u8] = b"zeus.csrf-token.v1\0";
 const BOOTSTRAP_TOKEN_DOMAIN: &[u8] = b"zeus.bootstrap-token.v1\0";
+const MEMBER_SETUP_TOKEN_DOMAIN: &[u8] = b"zeus.member-setup-token.v1\0";
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct UserId(String);
@@ -526,6 +527,15 @@ impl OpaqueToken {
     fn expose_secret(&self) -> &str {
         self.0.as_str()
     }
+
+    fn from_presented(value: impl Into<String>) -> Result<Self, PresentedTokenError> {
+        let mut value = value.into();
+        if let Err(error) = validate_presented_token(&value) {
+            value.zeroize();
+            return Err(error);
+        }
+        Ok(Self(Zeroizing::new(value)))
+    }
 }
 
 impl fmt::Debug for OpaqueToken {
@@ -675,6 +685,20 @@ macro_rules! define_token_types {
 define_token_types!(SessionToken, SessionTokenDigest, SESSION_TOKEN_DOMAIN);
 define_token_types!(CsrfToken, CsrfTokenDigest, CSRF_TOKEN_DOMAIN);
 define_token_types!(BootstrapToken, BootstrapTokenDigest, BOOTSTRAP_TOKEN_DOMAIN);
+define_token_types!(
+    MemberSetupToken,
+    MemberSetupTokenDigest,
+    MEMBER_SETUP_TOKEN_DOMAIN
+);
+
+impl MemberSetupToken {
+    /// Parses the one public setup bearer boundary into a zeroizing value.
+    /// Unlike session/CSRF lookup, setup consumption passes the secret-bearing
+    /// type to storage so persistence can derive its purpose-specific digest.
+    pub fn from_presented(value: impl Into<String>) -> Result<Self, PresentedTokenError> {
+        Ok(Self(OpaqueToken::from_presented(value)?))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -866,15 +890,57 @@ mod tests {
     }
 
     #[test]
+    fn member_setup_tokens_are_one_transport_bearers_with_a_distinct_digest_domain() {
+        let token = MemberSetupToken::generate().unwrap();
+        assert_eq!(
+            URL_SAFE_NO_PAD.decode(token.expose_secret()).unwrap().len(),
+            TOKEN_RANDOM_BYTES
+        );
+
+        let digest = token.digest();
+        let persisted = digest.to_persistence();
+        assert_eq!(persisted.len(), 64);
+        assert!(digest.verify(token.expose_secret()));
+        assert!(!persisted.contains(token.expose_secret()));
+        assert!(!format!("{token:?}").contains(token.expose_secret()));
+        assert!(!format!("{digest:?}").contains(&persisted));
+
+        let restored = MemberSetupTokenDigest::from_persistence(&persisted).unwrap();
+        assert_eq!(restored.to_persistence(), persisted);
+        assert!(restored.verify(token.expose_secret()));
+        assert_ne!(
+            persisted,
+            SessionTokenDigest::from_presented(token.expose_secret())
+                .unwrap()
+                .to_persistence()
+        );
+        assert_ne!(
+            persisted,
+            BootstrapTokenDigest::from_presented(token.expose_secret())
+                .unwrap()
+                .to_persistence()
+        );
+
+        let presented = MemberSetupToken::from_presented(token.expose_secret()).unwrap();
+        assert_eq!(presented.expose_secret(), token.expose_secret());
+        assert_eq!(presented.digest(), token.digest());
+        assert!(MemberSetupToken::from_presented("not-a-canonical-token").is_err());
+    }
+
+    #[test]
     fn all_token_purposes_are_domain_separated_for_the_same_bearer() {
         let bearer = "same-opaque-bearer-value";
         let session = TokenDigest::new(SESSION_TOKEN_DOMAIN, bearer);
         let csrf = TokenDigest::new(CSRF_TOKEN_DOMAIN, bearer);
         let bootstrap = TokenDigest::new(BOOTSTRAP_TOKEN_DOMAIN, bearer);
+        let member_setup = TokenDigest::new(MEMBER_SETUP_TOKEN_DOMAIN, bearer);
 
         assert_ne!(session, csrf);
         assert_ne!(session, bootstrap);
+        assert_ne!(session, member_setup);
         assert_ne!(csrf, bootstrap);
+        assert_ne!(csrf, member_setup);
+        assert_ne!(bootstrap, member_setup);
     }
 
     #[test]
@@ -885,12 +951,15 @@ mod tests {
         let session = SessionTokenDigest::from_presented(value).unwrap();
         let csrf = CsrfTokenDigest::from_presented(value).unwrap();
         let bootstrap = BootstrapTokenDigest::from_presented(value).unwrap();
+        let member_setup = MemberSetupTokenDigest::from_presented(value).unwrap();
         assert_eq!(session, token.digest());
         assert!(session.verify(value));
         assert!(csrf.verify(value));
         assert!(bootstrap.verify(value));
+        assert!(member_setup.verify(value));
         assert_ne!(session.to_persistence(), csrf.to_persistence());
         assert_ne!(session.to_persistence(), bootstrap.to_persistence());
+        assert_ne!(session.to_persistence(), member_setup.to_persistence());
         assert!(!format!("{session:?}").contains(value));
     }
 
@@ -919,6 +988,10 @@ mod tests {
             );
             assert_eq!(
                 BootstrapTokenDigest::from_presented(malformed),
+                Err(PresentedTokenError::InvalidFormat)
+            );
+            assert_eq!(
+                MemberSetupTokenDigest::from_presented(malformed),
                 Err(PresentedTokenError::InvalidFormat)
             );
         }

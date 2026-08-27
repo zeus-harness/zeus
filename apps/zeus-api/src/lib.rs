@@ -1,7 +1,7 @@
 //! HTTP composition for the durable Zeus Alpha slice.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::Infallible,
     net::{IpAddr, SocketAddr},
     sync::{
@@ -13,6 +13,7 @@ use std::{
 
 use axum::{
     Extension, Json, Router,
+    body::Body,
     extract::{
         ConnectInfo, DefaultBodyLimit, Path, Query, Request, State,
         rejection::{JsonRejection, QueryRejection},
@@ -30,24 +31,37 @@ use llm::{
     ReplyRole, validate_provider_metadata, validate_reply_response,
 };
 use protocol::{
-    AccountRole, AccountStatus, AccountUser, AssistantReplyKind, AssistantReplyProvenance,
-    AuthStatusResponse, AuthenticationResponse, BootstrapRequest, COLLECTION_PAGE_DEFAULT_LIMIT,
-    CreateSessionRequest, CreateSessionResponse, EVENT_PAGE_DEFAULT_LIMIT, HealthResponse,
-    LoginRequest, LogoutResponse, ProblemDetails, ResumeSessionRequest, ResumeSessionResponse,
-    ReviewRequest, ReviewResponse, RunDetail, SessionDetail, SessionEvent, SessionTurn,
-    StartTurnRequest, ThemePreference, UpdatePreferencesRequest, UserPreferences,
+    ACCOUNT_AUDIT_EVENT_SCHEMA, ACCOUNT_AUDIT_EXPORT_MANIFEST_KIND,
+    ACCOUNT_AUDIT_EXPORT_SCHEMA_VERSION,
+    AccountAuditArchiveState as AccountAuditArchiveStateResponse, AccountAuditCheckpointResponse,
+    AccountAuditEvent, AccountAuditEventPage, AccountAuditExportManifest,
+    AccountAuditPolicy as AccountAuditPolicyResponse,
+    AccountAuditRollup as AccountAuditRollupResponse,
+    AccountAuditState as AccountAuditStateResponse, AccountMember, AccountMemberPage, AccountRole,
+    AccountStatus, AccountUser, AssistantReplyKind, AssistantReplyProvenance, AuthStatusResponse,
+    AuthenticationResponse, BootstrapRequest, COLLECTION_PAGE_DEFAULT_LIMIT,
+    CreateAccountAuditCheckpointRequest, CreateMemberRequest, CreateSessionRequest,
+    CreateSessionResponse, EVENT_PAGE_DEFAULT_LIMIT, HealthResponse, InFlightWorkSummary,
+    LoginRequest, LogoutResponse, MemberSetupRequest, MemberSetupTokenResponse, ProblemDetails,
+    ResumeSessionRequest, ResumeSessionResponse, ReviewRequest, ReviewResponse,
+    RotateMemberSetupTokenRequest, RunDetail, SessionDetail, SessionEvent, SessionTurn,
+    StartTurnRequest, ThemePreference, UpdateAccountAuditPolicyRequest, UpdateMemberRequest,
+    UpdateMemberResponse, UpdatePreferencesRequest, UserPreferences,
 };
 use runtime::{
-    AuthPrincipal, AuthSessionCommit, AuthzContext, BootstrapOwnerCommit, DemoStore,
-    PublishedEvent, ReplyClaimOutcome, ReplyFailureCommit, ReplyJob, ReplyJobSpec,
-    ReplyOutcomeUnknownCommit, ReplySuccessCommit, StoreError, StoredPreferences, StoredUser,
-    StoredUserStatus,
+    AccountAuditCheckpointCommit, AccountAuditEvent as StoredAccountAuditEvent,
+    AccountAuditPolicy as StoredAccountAuditPolicy, AccountAuditRollup as StoredAccountAuditRollup,
+    AccountAuditState as StoredAccountAuditState, AuthPrincipal, AuthSessionCommit, AuthzContext,
+    BootstrapOwnerCommit, DemoStore, MemberSetupCommit, PublishedEvent, ReplyClaimOutcome,
+    ReplyFailureCommit, ReplyJob, ReplyJobSpec, ReplyOutcomeUnknownCommit, ReplySuccessCommit,
+    StoreError, StoredMember, StoredMembershipStatus, StoredPreferences, StoredUser,
+    StoredUserStatus, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tenancy::{
-    AccountId, AuthSessionId, BootstrapTokenDigest, CsrfToken, CsrfTokenDigest, MembershipRole,
-    Password, PasswordAuthenticator, PasswordHashRecord, SessionToken, SessionTokenDigest, UserId,
-    Username, hash_password,
+    AccountId, AuthSessionId, BootstrapTokenDigest, CsrfToken, CsrfTokenDigest, MemberSetupToken,
+    MembershipRole, Password, PasswordAuthenticator, PasswordHashRecord, SessionToken,
+    SessionTokenDigest, UserId, Username, hash_password,
 };
 use tokio::{
     sync::{Mutex, OwnedSemaphorePermit, Semaphore, broadcast},
@@ -58,6 +72,7 @@ use zeroize::{Zeroize, Zeroizing};
 const DURABLE_LEDGER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const AUTH_JSON_BODY_MAX_BYTES: usize = 8 * 1024;
 const COMMAND_JSON_BODY_MAX_BYTES: usize = 512 * 1024;
+const ACCOUNT_AUDIT_EXPORT_MAX_BYTES: usize = 96 * 1024 * 1024;
 const PASSWORD_WORKER_LIMIT: usize = 2;
 const AUTH_RATE_WINDOW: Duration = Duration::from_secs(60);
 const AUTH_RATE_KEY_CAPACITY: usize = 4_096;
@@ -172,6 +187,15 @@ const BOOTSTRAP_RATE_POLICY: RateLimitPolicy = RateLimitPolicy {
     entry_ttl: AUTH_RATE_ENTRY_TTL,
 };
 
+const MEMBER_SETUP_RATE_POLICY: RateLimitPolicy = RateLimitPolicy {
+    global_limit: 30,
+    source_limit: 5,
+    account_limit: None,
+    window: AUTH_RATE_WINDOW,
+    key_capacity: AUTH_RATE_KEY_CAPACITY,
+    entry_ttl: AUTH_RATE_ENTRY_TTL,
+};
+
 #[derive(Clone)]
 struct ApiState {
     store: DemoStore,
@@ -214,6 +238,7 @@ struct RateLimitPolicy {
 struct AuthRateLimits {
     login: AttemptRateLimiter,
     bootstrap: AttemptRateLimiter,
+    member_setup: AttemptRateLimiter,
 }
 
 impl AuthRateLimits {
@@ -226,9 +251,19 @@ impl AuthRateLimits {
         login: RateLimitPolicy,
         bootstrap: RateLimitPolicy,
     ) -> Self {
+        Self::with_all_policies(clock, login, bootstrap, MEMBER_SETUP_RATE_POLICY)
+    }
+
+    fn with_all_policies(
+        clock: Arc<dyn RateLimitClock>,
+        login: RateLimitPolicy,
+        bootstrap: RateLimitPolicy,
+        member_setup: RateLimitPolicy,
+    ) -> Self {
         Self {
             login: AttemptRateLimiter::new(login, Arc::clone(&clock)),
-            bootstrap: AttemptRateLimiter::new(bootstrap, clock),
+            bootstrap: AttemptRateLimiter::new(bootstrap, Arc::clone(&clock)),
+            member_setup: AttemptRateLimiter::new(member_setup, clock),
         }
     }
 }
@@ -563,6 +598,20 @@ struct SessionListQuery {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct MemberListQuery {
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditListQuery {
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SessionDetailQuery {
     run_ids_before: Option<String>,
     run_ids_limit: Option<usize>,
@@ -652,16 +701,46 @@ fn build_authenticated_app(state: ApiState) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .layer(DefaultBodyLimit::max(COMMAND_JSON_BODY_MAX_BYTES));
 
+    let account_admin = Router::new()
+        .route("/api/v1/members", get(list_members).post(create_member))
+        .route(
+            "/api/v1/members/{user_id}",
+            axum::routing::patch(update_member),
+        )
+        .route(
+            "/api/v1/members/{user_id}/setup-token",
+            post(rotate_member_setup_token),
+        )
+        .route("/api/v1/audit/events", get(list_account_audit_events))
+        .route("/api/v1/audit/export", get(export_account_audit_events))
+        .route(
+            "/api/v1/audit/policy",
+            get(get_account_audit_policy).put(update_account_audit_policy),
+        )
+        .route(
+            "/api/v1/audit/archive/checkpoint",
+            post(checkpoint_account_audit_archive),
+        )
+        .route_layer(middleware::from_fn(
+            reject_unsupported_account_admin_idempotency,
+        ))
+        .route_layer(middleware::from_fn(require_account_owner))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
+        .layer(DefaultBodyLimit::max(AUTH_JSON_BODY_MAX_BYTES));
+
     let public = Router::new()
         .route("/health/live", get(liveness))
         .route("/health/ready", get(readiness))
         .route("/api/v1/auth/status", get(auth_status))
         .route("/api/v1/auth/bootstrap", post(bootstrap))
         .route("/api/v1/auth/login", post(login))
+        .route("/api/v1/auth/member-setup", post(member_setup))
+        .route("/api/auth/member-setup", post(member_setup))
         .layer(DefaultBodyLimit::max(AUTH_JSON_BODY_MAX_BYTES));
 
     let router = public
         .merge(protected)
+        .merge(account_admin)
         .fallback(not_found)
         .with_state(state.clone());
     kick_reply_worker(&state);
@@ -1004,7 +1083,6 @@ async fn login(
         verified
             && credential.user.status == StoredUserStatus::Active
             && credential.account_id == AccountId::local()
-            && credential.membership_role == MembershipRole::Owner
     });
     let Some(credential) = credential else {
         return Err(ApiError::invalid_login());
@@ -1044,6 +1122,545 @@ async fn login(
         context.membership_role,
         preferences,
     )
+}
+
+async fn member_setup(
+    State(state): State<ApiState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    payload: Result<Json<MemberSetupRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    enforce_same_origin(&headers)?;
+    let auth = auth_config(&state)?;
+    charge_auth_rate_limit(
+        &auth.rate_limits.member_setup,
+        peer.ip(),
+        None,
+        "member_setup_rate_limited",
+        "Member setup temporarily limited",
+    )?;
+    reject_unsupported_idempotency(&headers)?;
+    let Json(request) = payload.map_err(ApiError::invalid_json)?;
+    let setup_token = MemberSetupToken::from_presented(request.setup_token)
+        .map_err(|_| ApiError::invalid_member_setup())?;
+    let password_hash = hash_new_password(auth, request.password).await?;
+    let (auth_session_id, session_token, csrf_token, expires_at) = fresh_auth_tokens()?;
+    let result = state
+        .store
+        .complete_member_setup(MemberSetupCommit {
+            setup_token,
+            password_hash: password_hash.as_phc().to_owned(),
+            auth_session_id,
+            session_token_hash: session_token.digest().to_persistence(),
+            csrf_hash: csrf_token.digest().to_persistence(),
+            session_expires_at: expires_at.clone(),
+        })
+        .await
+        .map_err(|error| match error {
+            StoreError::InvalidMemberSetupToken
+            | StoreError::MemberSetupExpired
+            | StoreError::MemberSetupAlreadyCompleted => ApiError::invalid_member_setup(),
+            other => other.into(),
+        })?;
+    let context = result.principal.authz.clone();
+    let preferences = state.store.preferences(&context).await?;
+    authentication_response(
+        &state,
+        &session_token,
+        &csrf_token,
+        &expires_at,
+        result.principal.user,
+        context.membership_role,
+        preferences,
+    )
+}
+
+async fn hash_new_password(
+    auth: &AuthConfig,
+    mut presented: String,
+) -> Result<PasswordHashRecord, ApiError> {
+    let password_value = std::mem::take(&mut presented);
+    presented.zeroize();
+    let password = Password::new(password_value)
+        .map_err(|error| ApiError::bad_request("invalid_password", error.to_string()))?;
+    let permit = auth
+        .password_workers
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::auth_unavailable("password workers are busy"))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        hash_password(&password)
+    })
+    .await
+    .map_err(|error| ApiError::auth_unavailable(&error))?
+    .map_err(|error| ApiError::auth_unavailable(&error))
+}
+
+async fn list_members(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    query: Result<Query<MemberListQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let Query(query) = query.map_err(ApiError::invalid_query)?;
+    let page = state
+        .store
+        .list_members(
+            &current.principal.authz,
+            query.cursor.as_deref(),
+            query.limit.unwrap_or(COLLECTION_PAGE_DEFAULT_LIMIT),
+        )
+        .await?;
+    json_no_store(AccountMemberPage {
+        members: page.items.iter().map(account_member).collect(),
+        next_cursor: page.next_cursor,
+    })
+}
+
+async fn create_member(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    payload: Result<Json<CreateMemberRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(request) = payload.map_err(ApiError::invalid_json)?;
+    let username = Username::parse(request.username)
+        .map_err(|error| ApiError::bad_request("invalid_username", error.to_string()))?;
+    let user_id = UserId::generate().map_err(|error| ApiError::auth_unavailable(&error))?;
+    let issued = state
+        .store
+        .create_member(
+            &current.principal.authz,
+            user_id.as_str().to_owned(),
+            username.as_str().to_owned(),
+        )
+        .await?;
+    let (result, setup_token) = issued.into_parts();
+    member_setup_token_response(result.member, setup_token, StatusCode::CREATED)
+}
+
+async fn rotate_member_setup_token(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    Path(user_id): Path<String>,
+    payload: Result<Json<RotateMemberSetupTokenRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    state
+        .store
+        .get_member(&current.principal.authz, &user_id)
+        .await?;
+    let Json(request) = payload.map_err(ApiError::invalid_json)?;
+    let expected_revision = membership_revision(request.expected_revision)?;
+    let issued = state
+        .store
+        .rotate_member_setup_token(&current.principal.authz, user_id, expected_revision)
+        .await
+        .map_err(|error| match error {
+            StoreError::InvalidMemberSetupToken | StoreError::MemberSetupAlreadyCompleted => {
+                ApiError::member_setup_not_pending()
+            }
+            other => other.into(),
+        })?;
+    let (result, setup_token) = issued.into_parts();
+    member_setup_token_response(result.member, setup_token, StatusCode::OK)
+}
+
+async fn update_member(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    Path(user_id): Path<String>,
+    payload: Result<Json<UpdateMemberRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let existing = state
+        .store
+        .get_member(&current.principal.authz, &user_id)
+        .await?;
+    let Json(request) = payload.map_err(ApiError::invalid_json)?;
+    if request.role.is_none() && request.status.is_none() {
+        return Err(ApiError::bad_request(
+            "empty_member_update",
+            "At least one of role or status must be supplied",
+        ));
+    }
+    let expected_revision = membership_revision(request.expected_revision)?;
+    let role = request.role.map(membership_role).unwrap_or(existing.role);
+    let status = request
+        .status
+        .map(stored_membership_status)
+        .unwrap_or(existing.status);
+    let result = state
+        .store
+        .transition_member(
+            &current.principal.authz,
+            TransitionMemberCommit {
+                user_id,
+                expected_revision,
+                expected_role: existing.role,
+                expected_status: existing.status,
+                role,
+                status,
+            },
+        )
+        .await?;
+    json_no_store(UpdateMemberResponse {
+        member: account_member(&result.member),
+        in_flight: InFlightWorkSummary {
+            reply_job_ids: result.in_flight.reply_job_ids,
+            dispatch_call_ids: result.in_flight.dispatch_call_ids,
+        },
+    })
+}
+
+fn member_setup_token_response(
+    member: StoredMember,
+    setup_token: String,
+    status: StatusCode,
+) -> Result<Response, ApiError> {
+    let setup_token_expires_at = member
+        .setup_token_expires_at
+        .clone()
+        .ok_or_else(|| ApiError::internal_contract("issued member setup token has no expiry"))?;
+    let mut response = json_no_store(MemberSetupTokenResponse {
+        member: account_member(&member),
+        setup_token,
+        setup_token_expires_at,
+    })?;
+    *response.status_mut() = status;
+    Ok(response)
+}
+
+fn membership_revision(value: u64) -> Result<tenancy::MembershipRevision, ApiError> {
+    tenancy::MembershipRevision::new(value).map_err(|_| ApiError::membership_revision_conflict())
+}
+
+fn membership_role(role: AccountRole) -> MembershipRole {
+    match role {
+        AccountRole::Owner => MembershipRole::Owner,
+        AccountRole::Member => MembershipRole::Member,
+    }
+}
+
+fn stored_membership_status(status: AccountStatus) -> StoredMembershipStatus {
+    match status {
+        AccountStatus::Active => StoredMembershipStatus::Active,
+        AccountStatus::Disabled => StoredMembershipStatus::Disabled,
+    }
+}
+
+fn account_member(member: &StoredMember) -> AccountMember {
+    AccountMember {
+        user_id: member.user_id.clone(),
+        username: member.username.clone(),
+        role: match member.role {
+            MembershipRole::Owner => AccountRole::Owner,
+            MembershipRole::Member => AccountRole::Member,
+        },
+        status: match member.status {
+            StoredMembershipStatus::Active => AccountStatus::Active,
+            StoredMembershipStatus::Disabled => AccountStatus::Disabled,
+        },
+        revision: member.revision.get(),
+        setup_required: member.setup_required,
+        setup_token_expires_at: member.setup_token_expires_at.clone(),
+        created_at: member.created_at.clone(),
+        updated_at: member.updated_at.clone(),
+    }
+}
+
+async fn list_account_audit_events(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    query: Result<Query<AuditListQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    state
+        .store
+        .account_audit_state(&current.principal.authz)
+        .await?;
+    let Query(query) = query.map_err(ApiError::invalid_query)?;
+    let page = state
+        .store
+        .list_account_audit_events(
+            &current.principal.authz,
+            query.cursor.as_deref(),
+            query.limit.unwrap_or(COLLECTION_PAGE_DEFAULT_LIMIT),
+        )
+        .await?;
+    json_no_store(AccountAuditEventPage {
+        events: page.items.into_iter().map(account_audit_event).collect(),
+        next_cursor: page.next_cursor,
+        state: account_audit_state(page.state),
+    })
+}
+
+async fn export_account_audit_events(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+) -> Result<Response, ApiError> {
+    let authz = current.principal.authz;
+    let mut page = state
+        .store
+        .list_account_audit_events(&authz, None, protocol::COLLECTION_PAGE_MAX_LIMIT)
+        .await?;
+    let baseline_rollup = page.state.rollup.clone();
+    let expected_detailed_rows = page.state.detailed_rows;
+    let expected_head_sequence = baseline_rollup
+        .through_sequence
+        .checked_add(expected_detailed_rows)
+        .ok_or_else(|| {
+            ApiError::internal_contract("account audit export sequence range overflowed")
+        })?;
+    let snapshot_event_count = baseline_rollup
+        .event_count
+        .checked_add(expected_detailed_rows)
+        .ok_or_else(|| ApiError::internal_contract("account audit event count overflowed"))?;
+    if snapshot_event_count != expected_head_sequence {
+        return Err(ApiError::internal_contract(
+            "account audit rollup count does not match its sequence boundary",
+        ));
+    }
+    let mut seen_cursors = HashSet::new();
+    let mut body = Vec::new();
+    append_account_audit_ndjson_line(
+        &mut body,
+        &AccountAuditExportManifest {
+            kind: ACCOUNT_AUDIT_EXPORT_MANIFEST_KIND.into(),
+            schema_version: ACCOUNT_AUDIT_EXPORT_SCHEMA_VERSION,
+            event_schema: ACCOUNT_AUDIT_EVENT_SCHEMA.into(),
+            exported_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            rollup: account_audit_rollup(baseline_rollup.clone()),
+            snapshot_head_sequence: expected_head_sequence,
+            snapshot_event_count,
+            detailed_event_count: expected_detailed_rows,
+        },
+        ACCOUNT_AUDIT_EXPORT_MAX_BYTES,
+    )?;
+    let mut exported_rows = 0_u64;
+    let mut newer_chain_link: Option<(u64, String)> = None;
+    let mut oldest_chain_link: Option<(u64, String)> = None;
+    loop {
+        if page.state.rollup != baseline_rollup {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "audit_export_changed",
+                "Account audit changed",
+                "Detailed audit history was compacted while the export was being prepared; retry the export",
+            )
+            .with_no_store());
+        }
+        let next_cursor = page.next_cursor.take();
+        for event in page.items {
+            let event = account_audit_event(event);
+            if let Some((newer_sequence, newer_previous_hash)) = &newer_chain_link {
+                if newer_sequence.checked_sub(1) != Some(event.sequence)
+                    || newer_previous_hash != &event.event_hash
+                {
+                    return Err(ApiError::internal_contract(
+                        "account audit export rows are not one contiguous hash chain",
+                    ));
+                }
+            } else if event.sequence != expected_head_sequence {
+                return Err(ApiError::internal_contract(
+                    "account audit export head does not match durable state",
+                ));
+            }
+            exported_rows = exported_rows.checked_add(1).ok_or_else(|| {
+                ApiError::internal_contract("account audit export row count overflowed")
+            })?;
+            newer_chain_link = Some((event.sequence, event.previous_hash.clone()));
+            oldest_chain_link = Some((event.sequence, event.previous_hash.clone()));
+
+            append_account_audit_ndjson_line(&mut body, &event, ACCOUNT_AUDIT_EXPORT_MAX_BYTES)?;
+        }
+        let Some(cursor) = next_cursor else {
+            break;
+        };
+        if !seen_cursors.insert(cursor.clone()) {
+            return Err(ApiError::internal_contract(
+                "account audit export pagination repeated a cursor",
+            ));
+        }
+        page = state
+            .store
+            .list_account_audit_events(&authz, Some(&cursor), protocol::COLLECTION_PAGE_MAX_LIMIT)
+            .await?;
+    }
+    if exported_rows != expected_detailed_rows {
+        return Err(ApiError::internal_contract(
+            "account audit export row count does not match durable state",
+        ));
+    }
+    match oldest_chain_link {
+        Some((oldest_sequence, oldest_previous_hash))
+            if baseline_rollup
+                .through_sequence
+                .checked_add(1)
+                .is_some_and(|expected| expected == oldest_sequence)
+                && oldest_previous_hash == baseline_rollup.last_event_hash => {}
+        None if expected_detailed_rows == 0 => {}
+        _ => {
+            return Err(ApiError::internal_contract(
+                "account audit export boundary does not match the durable rollup",
+            ));
+        }
+    }
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=zeus-account-audit.ndjson"),
+    );
+    no_store(response.headers_mut());
+    Ok(response)
+}
+
+fn append_account_audit_ndjson_line<T: Serialize>(
+    body: &mut Vec<u8>,
+    value: &T,
+    max_bytes: usize,
+) -> Result<(), ApiError> {
+    let encoded = serde_json::to_vec(value).map_err(|error| {
+        eprintln!("zeus account audit export serialization failed: {error}");
+        ApiError::internal_contract("account audit export value could not be serialized")
+    })?;
+    let required = encoded
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| ApiError::audit_export_too_large(max_bytes))?;
+    let maximum_prior_length = max_bytes
+        .checked_sub(required)
+        .ok_or_else(|| ApiError::audit_export_too_large(max_bytes))?;
+    if body.len() > maximum_prior_length {
+        return Err(ApiError::audit_export_too_large(max_bytes));
+    }
+    body.try_reserve(required).map_err(|error| {
+        eprintln!("zeus account audit export allocation failed: {error}");
+        ApiError::audit_export_too_large(max_bytes)
+    })?;
+    body.extend_from_slice(&encoded);
+    body.push(b'\n');
+    Ok(())
+}
+
+async fn get_account_audit_policy(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+) -> Result<Response, ApiError> {
+    let state = state
+        .store
+        .account_audit_state(&current.principal.authz)
+        .await?;
+    json_no_store(account_audit_policy(state.policy))
+}
+
+async fn update_account_audit_policy(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    payload: Result<Json<UpdateAccountAuditPolicyRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    state
+        .store
+        .account_audit_state(&current.principal.authz)
+        .await?;
+    let Json(request) = payload.map_err(ApiError::invalid_json)?;
+    let state = state
+        .store
+        .update_account_audit_policy(
+            &current.principal.authz,
+            UpdateAccountAuditPolicyCommit {
+                expected_revision: request.expected_revision,
+                detail_rows: request.detail_rows,
+                legal_hold: request.legal_hold,
+                archive_required: request.archive_required,
+            },
+        )
+        .await?;
+    json_no_store(account_audit_policy(state.policy))
+}
+
+async fn checkpoint_account_audit_archive(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    payload: Result<Json<CreateAccountAuditCheckpointRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    state
+        .store
+        .account_audit_state(&current.principal.authz)
+        .await?;
+    let Json(request) = payload.map_err(ApiError::invalid_json)?;
+    let state = state
+        .store
+        .checkpoint_account_audit_archive(
+            &current.principal.authz,
+            AccountAuditCheckpointCommit {
+                expected_revision: request.expected_revision,
+                through_sequence: request.through_sequence,
+                event_hash: request.event_hash,
+                archive_reference: request.archive_reference,
+            },
+        )
+        .await?;
+    let state = account_audit_state(state);
+    json_no_store(AccountAuditCheckpointResponse {
+        archive: state.archive.clone(),
+        state,
+    })
+}
+
+fn account_audit_event(event: StoredAccountAuditEvent) -> AccountAuditEvent {
+    let target_user_id =
+        matches!(event.target_kind.as_str(), "member" | "user").then(|| event.target_id.clone());
+    AccountAuditEvent {
+        sequence: event.sequence,
+        actor_user_id: event.actor_user_id,
+        action: event.action,
+        outcome: event.outcome,
+        target_kind: event.target_kind,
+        target_id: event.target_id,
+        target_user_id,
+        occurred_at: event.occurred_at,
+        metadata: event.metadata,
+        previous_hash: event.previous_hash,
+        event_hash: event.event_hash,
+    }
+}
+
+fn account_audit_policy(policy: StoredAccountAuditPolicy) -> AccountAuditPolicyResponse {
+    AccountAuditPolicyResponse {
+        detail_rows: policy.detail_rows,
+        legal_hold: policy.legal_hold,
+        archive_required: policy.archive_required,
+        revision: policy.revision,
+        updated_at: policy.updated_at,
+    }
+}
+
+fn account_audit_rollup(rollup: StoredAccountAuditRollup) -> AccountAuditRollupResponse {
+    AccountAuditRollupResponse {
+        through_sequence: rollup.through_sequence,
+        digest: rollup.digest,
+        event_count: rollup.event_count,
+        last_event_hash: rollup.last_event_hash,
+        updated_at: rollup.updated_at,
+    }
+}
+
+fn account_audit_state(state: StoredAccountAuditState) -> AccountAuditStateResponse {
+    AccountAuditStateResponse {
+        policy: account_audit_policy(state.policy),
+        rollup: account_audit_rollup(state.rollup),
+        archive: AccountAuditArchiveStateResponse {
+            through_sequence: state.archive.through_sequence,
+            event_hash: state.archive.event_hash,
+            archive_reference: state.archive.archive_reference,
+            revision: state.archive.revision,
+            updated_at: state.archive.updated_at,
+        },
+        detailed_rows: state.detailed_rows,
+        ordinary_capacity_remaining: state.ordinary_capacity_remaining,
+        progress_capacity_remaining: state.progress_capacity_remaining,
+    }
 }
 
 async fn logout(
@@ -1120,10 +1737,6 @@ async fn require_auth(State(state): State<ApiState>, mut request: Request, next:
             .authenticate(&digest)
             .await?
             .ok_or_else(ApiError::unauthorized)?;
-        if principal.authz.membership_role != MembershipRole::Owner {
-            return Err(ApiError::unauthorized());
-        }
-
         if is_unsafe_method(request.method()) {
             enforce_same_origin(headers)?;
             let presented = headers
@@ -1145,6 +1758,38 @@ async fn require_auth(State(state): State<ApiState>, mut request: Request, next:
     }
     .await;
     result.unwrap_or_else(IntoResponse::into_response)
+}
+
+async fn require_account_owner(request: Request, next: Next) -> Response {
+    let Some(current) = request.extensions().get::<CurrentAuth>() else {
+        return ApiError::unauthorized().into_response();
+    };
+    if current.principal.authz.membership_role != MembershipRole::Owner {
+        return ApiError::permission_denied().into_response();
+    }
+    next.run(request).await
+}
+
+async fn reject_unsupported_account_admin_idempotency(request: Request, next: Next) -> Response {
+    if is_unsafe_method(request.method())
+        && let Err(error) = reject_unsupported_idempotency(request.headers())
+    {
+        return error.into_response();
+    }
+    next.run(request).await
+}
+
+fn reject_unsupported_idempotency(headers: &HeaderMap) -> Result<(), ApiError> {
+    if headers.contains_key("idempotency-key") {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "idempotency_not_supported",
+            "Idempotency is not supported",
+            "This endpoint does not accept Idempotency-Key; refresh durable state after an indeterminate response",
+        )
+        .with_no_store());
+    }
+    Ok(())
 }
 
 const SESSION_COOKIE: &str = "zeus_session";
@@ -1235,11 +1880,7 @@ async fn authenticate_headers(
     let Ok(digest) = SessionTokenDigest::from_presented(&token) else {
         return Ok(None);
     };
-    Ok(state
-        .store
-        .authenticate(&digest.to_persistence())
-        .await?
-        .filter(|principal| principal.authz.membership_role == MembershipRole::Owner))
+    Ok(state.store.authenticate(&digest.to_persistence()).await?)
 }
 
 fn account_user(user: &StoredUser, membership_role: MembershipRole) -> AccountUser {
@@ -1362,6 +2003,12 @@ fn append_cookie(headers: &mut HeaderMap, value: String) -> Result<(), ApiError>
 
 fn no_store(headers: &mut HeaderMap) {
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+}
+
+fn json_no_store<T: Serialize>(value: T) -> Result<Response, ApiError> {
+    let mut response = Json(value).into_response();
+    no_store(response.headers_mut());
+    Ok(response)
 }
 
 fn reply_executor(state: &ApiState) -> Result<&ReplyExecutor, ApiError> {
@@ -2340,7 +2987,6 @@ async fn sse_auth_is_current(store: &DemoStore, current: &CurrentAuth) -> bool {
         store.authenticate(&current.session_token_hash).await,
         Ok(Some(principal))
             if principal.authz == current.principal.authz
-                && principal.authz.membership_role == MembershipRole::Owner
     )
 }
 
@@ -2495,6 +3141,89 @@ impl ApiError {
             "invalid_bootstrap_token",
             "Owner setup failed",
             "The bootstrap token is invalid, expired, or already used",
+        )
+        .with_no_store()
+    }
+
+    fn invalid_member_setup() -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_member_setup_token",
+            "Member setup failed",
+            "The member setup token is invalid, expired, or already used",
+        )
+        .with_no_store()
+    }
+
+    fn member_setup_not_pending() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "member_setup_not_pending",
+            "Member setup is not pending",
+            "Setup tokens can only be rotated for an active member that has not completed setup",
+        )
+        .with_no_store()
+    }
+
+    fn permission_denied() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "permission_denied",
+            "Permission denied",
+            "The current account membership cannot perform this operation",
+        )
+        .with_no_store()
+    }
+
+    fn membership_revision_conflict() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "membership_revision_conflict",
+            "Membership revision conflict",
+            "The account membership changed; refresh it and retry",
+        )
+        .with_no_store()
+    }
+
+    fn audit_storage_exhausted() -> Self {
+        Self::new(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "audit_storage_exhausted",
+            "Account audit storage exhausted",
+            "Export account audit history or release legal hold before retrying",
+        )
+        .with_no_store()
+    }
+
+    fn audit_policy_revision_conflict() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "audit_policy_revision_conflict",
+            "Account audit policy revision conflict",
+            "The account audit policy changed; refresh it and retry",
+        )
+        .with_no_store()
+    }
+
+    fn audit_export_too_large(max_bytes: usize) -> Self {
+        Self::new(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "audit_export_too_large",
+            "Account audit export is too large",
+            format!(
+                "The complete audit export exceeds the {max_bytes}-byte response limit; use the paginated events endpoint"
+            ),
+        )
+        .with_no_store()
+    }
+
+    fn internal_contract(detail: &str) -> Self {
+        eprintln!("zeus API encountered an internal response contract failure: {detail}");
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime_unavailable",
+            "Runtime is unavailable",
+            "The runtime could not produce a safe response",
         )
         .with_no_store()
     }
@@ -2719,11 +3448,42 @@ impl From<StoreError> for ApiError {
             StoreError::InvalidBootstrapToken => Self::invalid_bootstrap(),
             StoreError::UserNotFound(_) | StoreError::UserDisabled(_) => Self::invalid_login(),
             StoreError::AuthSessionNotFound => Self::unauthorized(),
-            StoreError::PermissionDenied => Self::new(
-                StatusCode::FORBIDDEN,
-                "permission_denied",
-                "Permission denied",
-                "The current account membership cannot perform this operation",
+            StoreError::PermissionDenied => Self::permission_denied(),
+            StoreError::MemberNotFound(id) => Self::new(
+                StatusCode::NOT_FOUND,
+                "member_not_found",
+                "Member not found",
+                format!("Account member `{id}` does not exist"),
+            )
+            .with_no_store(),
+            StoreError::MemberAlreadyExists(_) => Self::new(
+                StatusCode::CONFLICT,
+                "member_already_exists",
+                "Member already exists",
+                "An account member already uses that identity or username",
+            )
+            .with_no_store(),
+            StoreError::MembershipRevisionConflict => Self::membership_revision_conflict(),
+            StoreError::LastAccountOwner => Self::new(
+                StatusCode::CONFLICT,
+                "last_account_owner",
+                "Last account owner",
+                "The account must retain at least one active owner",
+            )
+            .with_no_store(),
+            StoreError::InvalidMemberSetupToken
+            | StoreError::MemberSetupExpired
+            | StoreError::MemberSetupAlreadyCompleted => Self::invalid_member_setup(),
+            StoreError::MemberSetupTokenGenerationUnavailable => Self::auth_unavailable(&error),
+            StoreError::AuditStorageExhausted
+            | StoreError::AuditLegalHold
+            | StoreError::AuditArchiveRequired => Self::audit_storage_exhausted(),
+            StoreError::AuditPolicyConflict => Self::audit_policy_revision_conflict(),
+            StoreError::AuditCheckpointConflict => Self::new(
+                StatusCode::CONFLICT,
+                "audit_checkpoint_conflict",
+                "Account audit checkpoint conflict",
+                "The audit archive state changed or the checkpoint does not match durable history",
             )
             .with_no_store(),
             StoreError::StorageQuotaExceeded => Self::storage_quota_exceeded(),
@@ -2914,6 +3674,22 @@ mod tests {
             key_capacity: 32,
             entry_ttl: AUTH_RATE_ENTRY_TTL,
         }
+    }
+
+    #[test]
+    fn audit_ndjson_builder_enforces_the_complete_response_byte_bound() {
+        let value = serde_json::json!({ "kind": "test" });
+        let exact = serde_json::to_vec(&value).unwrap().len() + 1;
+        let mut body = Vec::new();
+        append_account_audit_ndjson_line(&mut body, &value, exact).unwrap();
+        assert_eq!(body.len(), exact);
+        assert_eq!(body.last(), Some(&b'\n'));
+
+        let before = body.clone();
+        let error = append_account_audit_ndjson_line(&mut body, &value, exact).unwrap_err();
+        assert_eq!(error.status, StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(error.problem.code, "audit_export_too_large");
+        assert_eq!(body, before, "a rejected line must not partially append");
     }
 
     #[test]
@@ -3318,7 +4094,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_member_disabled_and_non_local_login_failures_are_indistinguishable() {
+    async fn public_member_setup_is_rate_limited_before_token_or_password_work() {
+        let store = DemoStore::seeded().await.unwrap();
+        let clock = ManualRateLimitClock::new();
+        let rate_clock: Arc<dyn RateLimitClock> = clock;
+        let auth = Arc::new(AuthConfig {
+            authenticator: Arc::new(PasswordAuthenticator::new().unwrap()),
+            password_workers: Arc::new(Semaphore::new(0)),
+            rate_limits: AuthRateLimits::with_all_policies(
+                rate_clock,
+                LOGIN_RATE_POLICY,
+                BOOTSTRAP_RATE_POLICY,
+                test_rate_policy(10, 1, None),
+            ),
+            cookie_secure: false,
+        });
+        let state = ApiState {
+            store,
+            durable_ledger_poll_interval: DURABLE_LEDGER_POLL_INTERVAL,
+            broadcast_hints_enabled: true,
+            auth: Some(auth),
+            reply: Some(Arc::new(ReplyExecutor {
+                provider: Arc::new(LocalFallbackProvider::new()),
+                drain: Mutex::new(()),
+                worker_wake: WorkerWakeState::default(),
+            })),
+            sse_capacity: SseCapacity::production(),
+        };
+        let app = build_authenticated_app(state).layer(MockConnectInfo(test_peer()));
+
+        let invalid = app
+            .clone()
+            .oneshot(member_setup_request(
+                "/api/v1/auth/member-setup",
+                "invalid",
+                "Member-password-2026",
+            ))
+            .await
+            .unwrap();
+        assert_problem(
+            invalid,
+            StatusCode::UNAUTHORIZED,
+            "invalid_member_setup_token",
+        )
+        .await;
+
+        let limited = app
+            .oneshot(member_setup_request(
+                "/api/auth/member-setup",
+                "also-invalid",
+                "Member-password-2026",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(limited.headers()[header::RETRY_AFTER], "60");
+        assert_eq!(limited.headers()[header::CACHE_CONTROL], "no-store");
+        assert_problem(
+            limited,
+            StatusCode::TOO_MANY_REQUESTS,
+            "member_setup_rate_limited",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn member_login_succeeds_while_other_invalid_credentials_remain_indistinguishable() {
         let fixture = configured_auth_test_app("login-equivalence", LOGIN_RATE_POLICY).await;
         let mut failures = Vec::new();
 
@@ -3341,14 +4181,17 @@ mod tests {
 
         insert_test_member(&fixture.path, "user-login-member", "member");
         copy_test_password(&fixture.path, "owner", "member");
-        failures.push(
-            fixture
-                .app
-                .clone()
-                .oneshot(login_request("member", TEST_OWNER_PASSWORD))
-                .await
-                .unwrap(),
-        );
+        let member_login = fixture
+            .app
+            .clone()
+            .oneshot(login_request("member", TEST_OWNER_PASSWORD))
+            .await
+            .unwrap();
+        assert_eq!(member_login.status(), StatusCode::OK);
+        assert_eq!(member_login.headers()[header::CACHE_CONTROL], "no-store");
+        let member_authentication: AuthenticationResponse = response_json(member_login).await;
+        assert_eq!(member_authentication.user.username, "member");
+        assert_eq!(member_authentication.user.role, AccountRole::Member);
         insert_test_non_local_owner(&fixture.path);
         copy_test_password(&fixture.path, "owner", "other-owner");
         failures.push(
@@ -3408,6 +4251,895 @@ mod tests {
         assert_eq!(success.status(), StatusCode::OK);
 
         fixture.cleanup();
+    }
+
+    #[tokio::test]
+    async fn owner_creates_rotates_and_disables_a_member_with_live_sse_revocation() {
+        let (app, store, owner, path) = authenticated_file_app("member-lifecycle-http").await;
+        let app = app.layer(MockConnectInfo(test_peer()));
+        let unsupported_idempotency = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/members")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "member-create-is-not-receipted")
+                    .body(Body::from(r#"{"username":"member-http"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            unsupported_idempotency,
+            StatusCode::BAD_REQUEST,
+            "idempotency_not_supported",
+        )
+        .await;
+
+        let concealed_missing_member = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/members/user-missing/setup-token")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("not-json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            concealed_missing_member,
+            StatusCode::NOT_FOUND,
+            "member_not_found",
+        )
+        .await;
+
+        let last_owner = app
+            .clone()
+            .oneshot(
+                Request::patch(format!("/api/v1/members/{}", owner.user_id))
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "expected_revision": owner.authz.membership_revision.get(),
+                            "role": "member",
+                            "status": "disabled"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(last_owner, StatusCode::CONFLICT, "last_account_owner").await;
+
+        let create = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/members")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"username":"member-http"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        assert_eq!(create.headers()[header::CACHE_CONTROL], "no-store");
+        let created: MemberSetupTokenResponse = response_json(create).await;
+        assert_eq!(created.member.role, AccountRole::Member);
+        assert!(created.member.setup_required);
+
+        let pending_login = app
+            .clone()
+            .oneshot(login_request("member-http", "Wrong-password-2026"))
+            .await
+            .unwrap();
+        let missing_login = app
+            .clone()
+            .oneshot(login_request("missing-member-http", "Wrong-password-2026"))
+            .await
+            .unwrap();
+        assert_eq!(pending_login.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(missing_login.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(pending_login.headers(), missing_login.headers());
+        let pending_problem: ProblemDetails = response_json(pending_login).await;
+        let missing_problem: ProblemDetails = response_json(missing_login).await;
+        assert_eq!(pending_problem.code, "invalid_credentials");
+        assert_eq!(pending_problem, missing_problem);
+
+        let expired_at = "2020-01-01T00:00:00.000Z";
+        let mut connection = Connection::open(&path).unwrap();
+        connection.busy_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM auth_sessions WHERE user_id = ?1",
+                    [&created.member.user_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        let credential_before = connection
+            .query_row(
+                "SELECT status, password_hash FROM users WHERE id = ?1",
+                [&created.member.user_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+        let setup_row = transaction
+            .query_row(
+                r#"SELECT token_digest, account_id, user_id, created_by_user_id
+                   FROM member_setup_tokens WHERE user_id = ?1"#,
+                [&created.member.user_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            transaction
+                .execute(
+                    "DELETE FROM member_setup_tokens WHERE user_id = ?1",
+                    [&created.member.user_id,]
+                )
+                .unwrap(),
+            1
+        );
+        transaction
+            .execute(
+                r#"INSERT INTO member_setup_tokens(
+                       token_digest, account_id, user_id, created_by_user_id,
+                       created_at, expires_at
+                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+                params![
+                    setup_row.0,
+                    setup_row.1,
+                    setup_row.2,
+                    setup_row.3,
+                    "2019-01-01T00:00:00.000Z",
+                    expired_at,
+                ],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+
+        let expired_setup = app
+            .clone()
+            .oneshot(member_setup_request(
+                "/api/v1/auth/member-setup",
+                &created.setup_token,
+                "Member-password-2026",
+            ))
+            .await
+            .unwrap();
+        assert_problem(
+            expired_setup,
+            StatusCode::UNAUTHORIZED,
+            "invalid_member_setup_token",
+        )
+        .await;
+        let connection = Connection::open(&path).unwrap();
+        connection.busy_timeout(Duration::from_secs(1)).unwrap();
+        let credential_after = connection
+            .query_row(
+                "SELECT status, password_hash FROM users WHERE id = ?1",
+                [&created.member.user_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(credential_after, credential_before);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM auth_sessions WHERE user_id = ?1",
+                    [&created.member.user_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        drop(connection);
+
+        let expired_list = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/members")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let expired_members: AccountMemberPage = response_json(expired_list).await;
+        assert!(
+            expired_members
+                .members
+                .iter()
+                .any(|member| member.user_id == created.member.user_id),
+            "expired setup member missing from owner list: {:?}",
+            expired_members.members
+        );
+        let expired_member = expired_members
+            .members
+            .into_iter()
+            .find(|member| member.user_id == created.member.user_id)
+            .unwrap();
+        assert!(expired_member.setup_required);
+        assert_eq!(
+            expired_member.setup_token_expires_at.as_deref(),
+            Some(expired_at)
+        );
+
+        let pending_disable = app
+            .clone()
+            .oneshot(
+                Request::patch(format!("/api/v1/members/{}", created.member.user_id))
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "expected_revision": expired_member.revision,
+                            "status": "disabled"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending_disable.status(), StatusCode::OK);
+        let pending_disabled: UpdateMemberResponse = response_json(pending_disable).await;
+        assert_eq!(pending_disabled.member.status, AccountStatus::Disabled);
+        assert!(pending_disabled.member.setup_required);
+        assert!(pending_disabled.member.setup_token_expires_at.is_none());
+
+        let pending_enable = app
+            .clone()
+            .oneshot(
+                Request::patch(format!("/api/v1/members/{}", created.member.user_id))
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "expected_revision": pending_disabled.member.revision,
+                            "status": "active"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending_enable.status(), StatusCode::OK);
+        let pending_enabled: UpdateMemberResponse = response_json(pending_enable).await;
+        assert_eq!(pending_enabled.member.status, AccountStatus::Active);
+        assert!(pending_enabled.member.setup_required);
+        assert!(pending_enabled.member.setup_token_expires_at.is_none());
+
+        let rotate = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/v1/members/{}/setup-token",
+                    created.member.user_id
+                ))
+                .header(header::HOST, "zeus.test")
+                .header(header::ORIGIN, "http://zeus.test")
+                .header(header::COOKIE, &owner.cookie_header)
+                .header(CSRF_HEADER, &owner.csrf_token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "expected_revision": pending_enabled.member.revision
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rotate.status(), StatusCode::OK);
+        let first_rotation: MemberSetupTokenResponse = response_json(rotate).await;
+        assert_ne!(first_rotation.setup_token, created.setup_token);
+        assert_eq!(
+            first_rotation.member.revision,
+            pending_enabled.member.revision
+        );
+
+        let recovery_rotation = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/v1/members/{}/setup-token",
+                    created.member.user_id
+                ))
+                .header(header::HOST, "zeus.test")
+                .header(header::ORIGIN, "http://zeus.test")
+                .header(header::COOKIE, &owner.cookie_header)
+                .header(CSRF_HEADER, &owner.csrf_token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "expected_revision": pending_enabled.member.revision
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovery_rotation.status(), StatusCode::OK);
+        let rotated: MemberSetupTokenResponse = response_json(recovery_rotation).await;
+        assert_ne!(rotated.setup_token, first_rotation.setup_token);
+        assert_eq!(rotated.member.revision, pending_enabled.member.revision);
+
+        let mut unsupported_setup = member_setup_request(
+            "/api/v1/auth/member-setup",
+            &rotated.setup_token,
+            "Member-password-2026",
+        );
+        unsupported_setup.headers_mut().insert(
+            "idempotency-key",
+            HeaderValue::from_static("member-setup-is-one-time"),
+        );
+        let unsupported_setup = app.clone().oneshot(unsupported_setup).await.unwrap();
+        assert_problem(
+            unsupported_setup,
+            StatusCode::BAD_REQUEST,
+            "idempotency_not_supported",
+        )
+        .await;
+
+        let stale_setup = app
+            .clone()
+            .oneshot(member_setup_request(
+                "/api/v1/auth/member-setup",
+                &created.setup_token,
+                "Member-password-2026",
+            ))
+            .await
+            .unwrap();
+        assert_problem(
+            stale_setup,
+            StatusCode::UNAUTHORIZED,
+            "invalid_member_setup_token",
+        )
+        .await;
+
+        let setup = app
+            .clone()
+            .oneshot(member_setup_request(
+                "/api/auth/member-setup",
+                &rotated.setup_token,
+                "Member-password-2026",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(setup.status(), StatusCode::OK);
+        assert_eq!(setup.headers()[header::CACHE_CONTROL], "no-store");
+        let member_cookie = authentication_cookie_header(setup.headers());
+        let member_auth: AuthenticationResponse = response_json(setup).await;
+        assert_eq!(member_auth.user.role, AccountRole::Member);
+        assert_eq!(member_auth.user.username, "member-http");
+
+        let replayed_setup = app
+            .clone()
+            .oneshot(member_setup_request(
+                "/api/v1/auth/member-setup",
+                &rotated.setup_token,
+                "Different-member-password-2026",
+            ))
+            .await
+            .unwrap();
+        assert_problem(
+            replayed_setup,
+            StatusCode::UNAUTHORIZED,
+            "invalid_member_setup_token",
+        )
+        .await;
+
+        let completed_rotation = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/v1/members/{}/setup-token",
+                    created.member.user_id
+                ))
+                .header(header::HOST, "zeus.test")
+                .header(header::ORIGIN, "http://zeus.test")
+                .header(header::COOKIE, &owner.cookie_header)
+                .header(CSRF_HEADER, &owner.csrf_token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "expected_revision": rotated.member.revision }).to_string(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            completed_rotation,
+            StatusCode::CONFLICT,
+            "member_setup_not_pending",
+        )
+        .await;
+
+        let overview = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/overview")
+                    .header(header::COOKIE, &member_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(overview.status(), StatusCode::OK);
+
+        let member_admin = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/members?limit=not-a-number")
+                    .header(header::COOKIE, &member_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(member_admin, StatusCode::FORBIDDEN, "permission_denied").await;
+
+        let member_audit = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/audit/events?limit=not-a-number")
+                    .header(header::COOKIE, &member_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(member_audit, StatusCode::FORBIDDEN, "permission_denied").await;
+
+        let member_mutation = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/members")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &member_cookie)
+                    .header(CSRF_HEADER, &member_auth.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "must-not-mask-member-forbidden")
+                    .body(Body::from(r#"{"username":"nested-member"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(member_mutation, StatusCode::FORBIDDEN, "permission_denied").await;
+
+        let approval = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/v1/runs/{DEMO_RUN_ID}/approvals/APR-901/decision"
+                ))
+                .header(header::HOST, "zeus.test")
+                .header(header::ORIGIN, "http://zeus.test")
+                .header(header::COOKIE, &member_cookie)
+                .header(CSRF_HEADER, &member_auth.csrf_token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("idempotency-key", "member-cannot-approve")
+                .body(Body::from(r#"{"decision":"approve"}"#))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(approval, StatusCode::FORBIDDEN, "permission_denied").await;
+
+        let sse = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/sessions/session-ZR-1842/events?after=2")
+                    .header(header::COOKIE, &member_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sse.status(), StatusCode::OK);
+        let mut sse_body = sse.into_body();
+        let opened = tokio::time::timeout(Duration::from_secs(1), sse_body.frame())
+            .await
+            .expect("member SSE should open immediately")
+            .expect("member SSE should produce an opening frame")
+            .expect("member SSE opening frame should be valid");
+        assert!(
+            String::from_utf8(opened.into_data().unwrap().to_vec())
+                .unwrap()
+                .contains("stream-open")
+        );
+
+        let list = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/members")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let members: AccountMemberPage = response_json(list).await;
+        let member = members
+            .members
+            .into_iter()
+            .find(|member| member.user_id == created.member.user_id)
+            .unwrap();
+        let stale_disable = app
+            .clone()
+            .oneshot(
+                Request::patch(format!("/api/v1/members/{}", member.user_id))
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "expected_revision": member.revision + 1,
+                            "status": "disabled"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            stale_disable,
+            StatusCode::CONFLICT,
+            "membership_revision_conflict",
+        )
+        .await;
+
+        let disable = app
+            .clone()
+            .oneshot(
+                Request::patch(format!("/api/v1/members/{}", member.user_id))
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "expected_revision": member.revision,
+                            "status": "disabled"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(disable.status(), StatusCode::OK);
+        let disabled: UpdateMemberResponse = response_json(disable).await;
+        assert_eq!(disabled.member.status, AccountStatus::Disabled);
+
+        let ended = tokio::time::timeout(Duration::from_secs(3), sse_body.frame())
+            .await
+            .expect("member disable should close SSE by the durable auth poll");
+        assert!(ended.is_none(), "disabled member SSE emitted another frame");
+        let status = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/auth/status")
+                    .header(header::COOKIE, &member_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status: AuthStatusResponse = response_json(status).await;
+        assert!(!status.authenticated);
+
+        drop(sse_body);
+        drop(app);
+        drop(store);
+        cleanup_test_database(&path);
+    }
+
+    #[tokio::test]
+    async fn owner_reads_exports_configures_and_checkpoints_account_audit_history() {
+        let (app, store, owner, path) = authenticated_file_app("account-audit-http").await;
+        let app = app.layer(MockConnectInfo(test_peer()));
+
+        let create = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/members")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"username":"audit-member"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        // Keep the HTTP export on its real multi-page path (100 rows/page)
+        // without weakening the production page size just for a test.
+        for index in 0..100 {
+            let user_id = UserId::generate().unwrap();
+            store
+                .create_member(
+                    &owner.authz,
+                    user_id.as_str().to_owned(),
+                    format!("audit-member-{index:03}"),
+                )
+                .await
+                .unwrap();
+        }
+
+        let first_page = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/audit/events?limit=1")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_page.status(), StatusCode::OK);
+        assert_eq!(first_page.headers()[header::CACHE_CONTROL], "no-store");
+        let first_page: AccountAuditEventPage = response_json(first_page).await;
+        assert_eq!(first_page.events.len(), 1);
+        assert_eq!(first_page.events[0].action, "member.created");
+        assert_eq!(first_page.events[0].outcome, "succeeded");
+        assert_eq!(
+            first_page.events[0].target_user_id.as_deref(),
+            Some(first_page.events[0].target_id.as_str())
+        );
+        assert_eq!(first_page.state.detailed_rows, 101);
+
+        let policy = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/audit/policy")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(policy.status(), StatusCode::OK);
+        assert_eq!(policy.headers()[header::CACHE_CONTROL], "no-store");
+        let policy: AccountAuditPolicyResponse = response_json(policy).await;
+
+        let updated_policy = app
+            .clone()
+            .oneshot(
+                Request::put("/api/v1/audit/policy")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "detail_rows": policy.detail_rows,
+                            "legal_hold": policy.legal_hold,
+                            "archive_required": policy.archive_required,
+                            "expected_revision": policy.revision,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated_policy.status(), StatusCode::OK);
+        assert_eq!(updated_policy.headers()[header::CACHE_CONTROL], "no-store");
+        let updated_policy: AccountAuditPolicyResponse = response_json(updated_policy).await;
+        assert_eq!(updated_policy.revision, policy.revision + 1);
+
+        let stale_policy = app
+            .clone()
+            .oneshot(
+                Request::put("/api/v1/audit/policy")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "detail_rows": policy.detail_rows,
+                            "legal_hold": policy.legal_hold,
+                            "archive_required": policy.archive_required,
+                            "expected_revision": policy.revision,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            stale_policy,
+            StatusCode::CONFLICT,
+            "audit_policy_revision_conflict",
+        )
+        .await;
+
+        let events = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/audit/events?limit=100")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let events: AccountAuditEventPage = response_json(events).await;
+        assert_eq!(events.events[0].action, "audit.policy_updated");
+        assert!(
+            events
+                .events
+                .iter()
+                .any(|event| event.action == "member.created")
+        );
+        let checkpoint_event = events.events[0].clone();
+        let archive_revision = events.state.archive.revision;
+
+        let export = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/audit/export")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(export.status(), StatusCode::OK);
+        assert_eq!(export.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            export.headers()[header::CONTENT_TYPE],
+            "application/x-ndjson"
+        );
+        assert_eq!(
+            export.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=zeus-account-audit.ndjson"
+        );
+        let export_bytes = export.into_body().collect().await.unwrap().to_bytes();
+        assert!(export_bytes.len() < ACCOUNT_AUDIT_EXPORT_MAX_BYTES);
+        assert_eq!(export_bytes.last(), Some(&b'\n'));
+        let mut export_lines = export_bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty());
+        let manifest = serde_json::from_slice::<AccountAuditExportManifest>(
+            export_lines.next().expect("export manifest line"),
+        )
+        .unwrap();
+        assert_eq!(manifest.kind, ACCOUNT_AUDIT_EXPORT_MANIFEST_KIND);
+        assert_eq!(manifest.schema_version, ACCOUNT_AUDIT_EXPORT_SCHEMA_VERSION);
+        assert_eq!(manifest.event_schema, ACCOUNT_AUDIT_EVENT_SCHEMA);
+        assert_eq!(manifest.rollup, events.state.rollup);
+        assert_eq!(manifest.snapshot_head_sequence, events.events[0].sequence);
+        assert_eq!(manifest.snapshot_event_count, events.state.detailed_rows);
+        assert_eq!(manifest.detailed_event_count, events.state.detailed_rows);
+        let exported = export_lines
+            .map(|line| serde_json::from_slice::<AccountAuditEvent>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(exported.len() as u64, events.state.detailed_rows);
+        assert_eq!(exported.first(), events.events.first());
+        assert!(exported.windows(2).all(|window| {
+            window[0].sequence.checked_sub(1) == Some(window[1].sequence)
+                && window[0].previous_hash == window[1].event_hash
+        }));
+
+        let checkpoint = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/audit/archive/checkpoint")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "expected_revision": archive_revision,
+                            "through_sequence": checkpoint_event.sequence,
+                            "event_hash": checkpoint_event.event_hash,
+                            "archive_reference": "test://zeus/account-audit/http",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(checkpoint.status(), StatusCode::OK);
+        assert_eq!(checkpoint.headers()[header::CACHE_CONTROL], "no-store");
+        let checkpoint: AccountAuditCheckpointResponse = response_json(checkpoint).await;
+        assert_eq!(
+            checkpoint.archive.through_sequence,
+            checkpoint_event.sequence
+        );
+        assert_eq!(
+            checkpoint.archive.archive_reference.as_deref(),
+            Some("test://zeus/account-audit/http")
+        );
+        assert_eq!(checkpoint.archive, checkpoint.state.archive);
+
+        let stale_checkpoint = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/audit/archive/checkpoint")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "expected_revision": archive_revision,
+                            "through_sequence": checkpoint_event.sequence,
+                            "event_hash": checkpoint_event.event_hash,
+                            "archive_reference": "test://zeus/account-audit/stale",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            stale_checkpoint,
+            StatusCode::CONFLICT,
+            "audit_checkpoint_conflict",
+        )
+        .await;
+
+        drop(app);
+        drop(store);
+        cleanup_test_database(&path);
     }
 
     #[tokio::test]
@@ -4542,7 +6274,7 @@ mod tests {
         let sessions: Vec<SessionSummary> = response_json(sessions).await;
         assert!(!sessions.iter().any(|session| session.id == session_id));
 
-        let member_cookie = app
+        let member_owned = app
             .clone()
             .oneshot(
                 Request::get("/api/v1/sessions/session-ZR-1842")
@@ -4552,7 +6284,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(member_cookie.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(member_owned.status(), StatusCode::OK);
 
         drop(app);
         drop(store);
@@ -5836,7 +7568,7 @@ mod tests {
             .unwrap();
         assert_eq!(reviewed.event.sequence, 9);
 
-        let detail = tokio::time::timeout(Duration::from_secs(2), async {
+        let detail = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let detail = store
                     .run_detail_for_actor(
@@ -5847,7 +7579,7 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                if detail.run.sequence >= 11 {
+                if detail.run.sequence >= 10 {
                     break detail;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -5856,7 +7588,14 @@ mod tests {
         .await
         .expect("the guarded demo dispatcher should settle durably");
         let hinted = detail.events.last().cloned().unwrap();
-        assert_eq!(hinted.sequence, 11);
+        assert_eq!(hinted.sequence, 10);
+        assert!(matches!(
+            &hinted.data,
+            Some(protocol::RunEventData::ToolResult {
+                status: protocol::ToolCallStatus::NotDispatched,
+                ..
+            })
+        ));
 
         let replay = run_events_for_hint(
             &store,
@@ -5878,7 +7617,7 @@ mod tests {
                 .iter()
                 .map(|event| event.sequence)
                 .collect::<Vec<_>>(),
-            vec![9, 10, 11]
+            vec![9, 10]
         );
     }
 
@@ -5967,6 +7706,76 @@ mod tests {
             assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
             let problem: ProblemDetails = response_json(response).await;
             assert_eq!(problem.code, code);
+        }
+    }
+
+    #[tokio::test]
+    async fn member_and_audit_errors_use_stable_concealment_and_capacity_contracts() {
+        for (error, status, code) in [
+            (
+                StoreError::MemberNotFound("foreign-or-missing".into()),
+                StatusCode::NOT_FOUND,
+                "member_not_found",
+            ),
+            (
+                StoreError::MembershipRevisionConflict,
+                StatusCode::CONFLICT,
+                "membership_revision_conflict",
+            ),
+            (
+                StoreError::LastAccountOwner,
+                StatusCode::CONFLICT,
+                "last_account_owner",
+            ),
+            (
+                StoreError::AuditStorageExhausted,
+                StatusCode::INSUFFICIENT_STORAGE,
+                "audit_storage_exhausted",
+            ),
+            (
+                StoreError::AuditLegalHold,
+                StatusCode::INSUFFICIENT_STORAGE,
+                "audit_storage_exhausted",
+            ),
+            (
+                StoreError::AuditArchiveRequired,
+                StatusCode::INSUFFICIENT_STORAGE,
+                "audit_storage_exhausted",
+            ),
+            (
+                StoreError::AuditPolicyConflict,
+                StatusCode::CONFLICT,
+                "audit_policy_revision_conflict",
+            ),
+            (
+                StoreError::AuditCheckpointConflict,
+                StatusCode::CONFLICT,
+                "audit_checkpoint_conflict",
+            ),
+        ] {
+            let response = ApiError::from(error).into_response();
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            let problem: ProblemDetails = response_json(response).await;
+            assert_eq!(problem.code, code);
+        }
+
+        let mut expected = None;
+        for error in [
+            StoreError::InvalidMemberSetupToken,
+            StoreError::MemberSetupExpired,
+            StoreError::MemberSetupAlreadyCompleted,
+        ] {
+            let response = ApiError::from(error).into_response();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            let problem: ProblemDetails = response_json(response).await;
+            assert_eq!(problem.code, "invalid_member_setup_token");
+            if let Some(expected) = &expected {
+                assert_eq!(&problem, expected);
+            } else {
+                expected = Some(problem);
+            }
         }
     }
 
@@ -6160,6 +7969,21 @@ mod tests {
             .body(Body::from(
                 serde_json::json!({
                     "username": username,
+                    "password": password,
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    fn member_setup_request(path: &str, setup_token: &str, password: &str) -> Request<Body> {
+        Request::post(path)
+            .header(header::HOST, "zeus.test")
+            .header(header::ORIGIN, "http://zeus.test")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "setup_token": setup_token,
                     "password": password,
                 })
                 .to_string(),

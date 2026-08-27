@@ -27,11 +27,13 @@ Client / SvelteKit Web
 - `authz`：account capability matrix，以及精确工具名规则、策略 revision、环境和 effect guard；没有命中即拒绝。
 - `tools`：工具描述、注册表、参数验证和 object-safe executor 边界。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
-- `storage`：schema v14 migration、`acc_local` membership 权威、用户/偏好、独立 Session/Run
-  ledger、typed event lookup、account+actor-scoped 回执、durable reply/dispatch queue，以及
-  actor/account/global logical capacity、physical capacity 和 operation capacity。
+- `storage`：schema v15 migration、`acc_local` membership 权威、一次性 member setup、用户/偏好、
+  account audit/rollup/policy/archive state、独立 Session/Run ledger、typed event lookup、
+  account+actor-scoped 回执、durable reply/dispatch queue，以及 actor/account/global logical
+  capacity、physical capacity 和 operation capacity。
 - `runtime`：Session 命令编排、reply/Run worker、提交后 SSE 提示和启动恢复。
-- `zeus-api`：进程组合、owner 认证、CSRF、provider 配置、REST/SSE 和 readiness。
+- `zeus-api`：进程组合、owner/member 认证、CSRF、owner-only 管理面、provider 配置、REST/SSE
+  和 readiness。
 
 SQLite 是本地单实例 Alpha+ 的权威存储。Restate、MinIO 和 PostgreSQL 当前不是第二套事实源。
 当前 Web 认证后列出用户 Session，恢复仍存在的上次活动 Session，并行订阅 Run/Session SSE；
@@ -146,7 +148,7 @@ connector 在数据库事务和锁之外运行。
 
 API 监听端口之前按固定顺序完成：
 
-1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v14；按当前
+1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v15；按当前
    detailed-row limit 以最多 64 行 batch 压缩 bootstrap terminal audit prefix，再按稳定
    `(priority actor, expires_at, auth-session ID)` 顺序最多清理 64 个过期或绑定
    missing/disabled/suspended/stale-revision authority 的 auth session。
@@ -175,17 +177,20 @@ exactly-once 语义。
 
 ## 策略与执行边界
 
-- 除 health、auth status、首次 bootstrap 和 login 外，真实服务的业务 REST/SSE 都要求 active
-  owner。bootstrap/login 必须 exact same-origin；写请求还要求与登录会话绑定的 CSRF token。
+- 除 health、auth status、首次 bootstrap、login 和一次性 member setup 外，真实服务的业务
+  REST/SSE 都要求 active account membership。bootstrap/login/member setup 必须 exact
+  same-origin；已认证写请求还要求与登录会话绑定的 CSRF token。
   session cookie 为 opaque、`HttpOnly; SameSite=Strict`；HTTPS 部署必须显式设置
   `ZEUS_COOKIE_SECURE=true` 才附加 `Secure`。
-- Alpha+ 仍明确拒绝 schema 预留的 `member` 登录。正式 Run/Session 查询、SSE、resume、turn、
-  review 和 receipt 已全部 account+actor-scoped，并有跨 account/actor 隔离测试；字段、HTTP/SSE 连接和
+- Alpha+ 允许 `member` 登录并执行 Run/Session 查询、SSE、resume、turn 和 reply；review、
+  connector dispatch、member/audit 管理保持 owner-only。正式业务路径已全部 account+actor-scoped，
+  并有跨 account/actor 隔离测试；字段、HTTP/SSE 连接和
   event page 边界、内部 point/batch read、有界 list/detail，以及 SQLite 行数、active queue、
   event-slot、事件载荷逻辑字节配额和 DB/WAL/disk headroom 门禁已落地。v14 已把唯一
   `acc_local` membership 切为 capability 权威，并为 auth session、receipt、reply/dispatch、
-  reservation、cursor 和 capacity 建立 account/actor 边界；member 仍须等待 v15 lifecycle 与
-  account security audit，不能仅因底层 capability 已落地就开放。
+  reservation、cursor 和 capacity 建立 account/actor 边界；v15 再用 setup token、revisioned
+  disable/role change、两秒 SSE authority poll 和 account audit 完成产品路径。管理 middleware
+  不是最终授权点，storage mutation 与 worker claim 仍在同一事务内复核 durable capability。
 - auth JSON 明确限制为 8 KiB、command JSON 为 512 KiB；新建 Session/turn ID、title、
   user/assistant message、review note 与严格幂等键分别按 UTF-8 bytes 设置硬上限。typed
   reply response 为 512 KiB，compact tool output 与 dispatch arguments JSON 为 64 KiB，
@@ -243,13 +248,19 @@ exactly-once 语义。
   receipt、reply/dispatch job 与 finalization reservation，固化 account、actor 和 membership
   revision；`account_memberships` 成为唯一 capability 权威，`users.role`/`owner_user_id` 只保留
   creator metadata。迁移前后在同一事务核对 row/FK/index/trigger/actor state，无法证明的旧
-  authority 整体回滚；member 产品 gate 保持关闭。
+  authority 整体回滚；member 产品 gate 在 v14 保持关闭。v15 新增 member setup token、account
+  audit event/hash chain、bounded rollup、policy 与 archive checkpoint；token 只保存
+  `SHA256("zeus.member-setup-token.v1\0" || canonical_token)`，明文只在创建/轮换响应中出现。
+  owner 的 role/status transition、auth/setup-token revoke、in-flight 摘要和审计事件在同一
+  `BEGIN IMMEDIATE` 事务提交；最后一个 active owner 不能被禁用或降级。
   每个 pre-v4 Run 会绑定到生成的 `session-{run_id}`，原 Run/Event 不重写、不丢弃。
 - runtime identity 持久绑定 profile、environment、primary Session/Run、policy ID 和
   revision；不一致时启动失败。Run attachment 当前用于 migration 和 demo seed，Alpha 不公开
   attach-Run HTTP route。
 - queue claim 在任何外部调用前再次核对固化 account、User、membership role/status/revision、
-  capability、job 的 Run、policy ID 和 revision；已经 claim 的 completion 不因后续撤权重放外部调用。
+  capability、job 的 Run、policy ID 和 revision；dispatch 同时复核可信 initiating 与 approving
+  主体。没有持久 initiator provenance 的 actorless 请求在 connector 前 fail closed，不能用
+  approver 身份补造。已经 claim 的 completion 不因后续撤权重放外部调用。
 - Session/Run command 在鉴权与 exact receipt replay 之后、状态写入之前检查 actor/account/global
   三层 logical capacity；每个窄层配置都必须小于等于下一层。
   turn admission 预留两个 Session event slots 与完整终结载荷预算；dispatch admission 预留两个
@@ -259,6 +270,14 @@ exactly-once 语义。
   使用 `429 + Cache-Control: no-store`，reply/dispatch queue 另返回 `Retry-After: 2`。
   字节计量只覆盖两张 event ledger 的序列化 `payload_json`，不等于 SQLite 主库、WAL、索引、
   page overhead 或宿主磁盘保证。
+- Account audit 默认保留每 account 4,096 条详细事件，普通 hard ceiling 为每 account 8,192、
+  global 32,768，并额外为 active→disabled、active owner→member、audit policy update 与 archive
+  checkpoint 保留每 account 64、global 256 个 progress slot；member create、token rotate、setup、
+  enable 与 member→owner 使用 ordinary lane。compaction 每事务最多推进 64 条。legal hold 禁止
+  删除详细行，`archive_required`
+  只允许压缩已由 owner checkpoint 覆盖的前缀。普通可审计 mutation 无容量时原子回滚并返回
+  `507 audit_storage_exhausted`；进度 reserve 也有绝对上限，不承诺无限写入。hash chain 与
+  rollup 只是 SQLite 内 commitment，不是外部防篡改锚。
 - SQLite Physical Capacity Slice 已实现并通过本地主机验证：主库 4 GiB（hard ceiling 32 GiB）、WAL
   target 16 MiB（hard ceiling 256 MiB）、最小可用空间 256 MiB（hard ceiling 8 GiB）、
   admission headroom watermark 512 MiB（hard ceiling 8 GiB）。配置必须满足 `WAL target < admission
@@ -371,7 +390,7 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
 - 生产 RDS 路径只能得到 executor unavailable，不能得到伪造成功。
 - Session/Run SSE 重连都严格从各自大于 cursor 的 sequence 补齐事件。请求同时携带 query
   cursor 和 `Last-Event-ID` 时，后者优先。
-- 请求或状态错误按 400/401/403/404/409/413/415/422/429 返回 problem details；内部执行不变量返回脱敏的
+- 请求或状态错误按 400/401/403/404/409/413/415/422/429/507 返回 problem details；内部执行不变量返回脱敏的
   `500 runtime_unavailable`；storage/config/registry 不可用返回脱敏的
   `503 runtime_unavailable`。内部错误只写服务端日志。
 - 本地 Alpha+ 已按 UTF-8 bytes 限制 Session ID/title/user+assistant message/review note、
@@ -381,16 +400,17 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   固定 64 行 batch；Session list/detail 与 Run detail/overview 也已改为 indexed bounded read
   model。SQLite row/active/event-slot、逻辑 event-payload byte quota 与 physical capacity gate
   和 operation capacity gate 已落地；bootstrap audit detailed retention/rollup、v13 account
-  membership foundation 与 v14 account-scoped durable authorization 已落地。对外或多租户部署前
-  仍必须完成 v15 member lifecycle/account security audit，以及共享部署门禁。
-  此前 Operation Capacity Apple 指定 readiness-pressure 与当前 v14 migration/restart 已分别
-  通过；v14 本轮没有重跑该压力。完整低内存/对抗性压力与 Linux Docker PID/OOM authoritative
+  membership foundation、v14 account-scoped durable authorization 与 v15 member lifecycle /
+  account audit 已落地。对外或多租户部署仍必须完成共享部署门禁。
+  此前 Operation Capacity Apple 指定 readiness-pressure 与历史 v14 migration/restart 已分别
+  通过；v14 当轮没有重跑该压力。完整低内存/对抗性压力与 Linux Docker PID/OOM authoritative
   evidence 仍是 deployment gate。
 - Web 保持紧凑时间线、一个内联审批卡和一个 composer；支持真实 New Session、活动 Session
-  刷新恢复、owner 设置/退出和 system/light/dark。持久 command identity 在刷新后恢复，丢失
+  刷新恢复、owner/member setup/登录、owner 成员与 audit 管理、设置/退出和
+  system/light/dark。member 的审批卡只读。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化按项目既有统计口径是 312 个 Rust 测试（storage 153、runtime 31、API library 46、
-  API main/config 6）和 25 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化按项目既有统计口径是 342 个 Rust 测试（storage 174、runtime 33、API library 51、
+  API main/config 6）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
 提交 `af29089` 曾构建并运行在独立 `zeus-operation-acceptance` project（端口 `18089`）；既有
@@ -401,11 +421,19 @@ Web、gateway、认证状态、匿名保护边界均通过，且 `configured=fal
 该历史 v12 readiness 的 exact-schema 检查覆盖迁移后的再次打开。
 schema v13 镜像又在同一 `zeus-operation-acceptance` project 上保留上述现为 v12 的 named
 volume，原地完成 v12→v13 migration；保留卷 `restart-verify` 通过。
-当前 schema v14 镜像继续保留上述现为 v13 的 named volume，原地完成 v13→v14 migration；
-`verify` 与保留卷 `restart-verify` 均通过，验收栈继续运行在 `127.0.0.1:18089`。API effective
-limit 为 2 CPU/1 GiB；重启后 `memory.current=79,466,496`、`memory.peak=98,201,600`、Zeus
-RSS 9,824 KiB、`pids.current=6`，`memory.events` 为 `oom=0`、`oom_kill=0`；member 登录/API
-gate 仍关闭，Apple `pids.max=max`。
+历史 schema v14 镜像继续保留上述现为 v13 的 named volume，原地完成 v13→v14 migration；
+`verify` 与保留卷 `restart-verify` 均通过。当时 API effective limit 为 2 CPU/1 GiB；重启后
+`memory.current=79,466,496`、`memory.peak=98,201,600`、Zeus RSS 9,824 KiB、
+`pids.current=6`，`memory.events` 为 `oom=0`、`oom_kill=0`；member 登录/API gate 当时仍关闭，
+Apple `pids.max=max`。
+当前 schema v15 镜像继续保留 now-v14 volume，在 `127.0.0.1:18089` 完成 v14→v15 migration；
+`verify` 与保留卷 `restart-verify` 通过且 `configured=false` 保持一致。API 仍为 2 CPU/1 GiB，
+`memory.peak=99,479,552`、Zeus RSS 10,252 KiB、`pids.current=7`，OOM/kill 为 0。
+独立 fresh `zeus-audit-acceptance` 以 detail 2、每 account ceiling 8、progress reserve 2 完成真实
+member setup/reply、403、checkpoint、legal-hold 507、普通容量拒绝、disable reserve、session revoke、
+NDJSON manifest 与 release-hold readiness 验收；浏览器覆盖 New Session、消息回复、Settings、
+Members、Audit、dark mode 且无 console warning/error。保留卷 restart 后 `configured=true`，
+`memory.peak=43,433,984`、Zeus RSS 10,340 KiB、OOM/kill 为 0。
 此前 Operation Capacity 指定压力中，API 限制核对为 2 CPU/1 GiB；30,000 次 readiness、并发
 128 的压力结果为 2,670 个 `200`、
 27,330 个预期 operation-capacity `503`、transport error 0、约 6,677 req/s。第二轮 10,000 次、

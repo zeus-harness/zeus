@@ -1,12 +1,21 @@
 import type {
+	AccountAuditCheckpointRequest,
+	AccountAuditCheckpointResponse,
+	AccountAuditPageResponse,
+	AccountAuditPolicy,
 	AuthenticationResponse,
 	AuthStatusResponse,
 	BootstrapRequest,
+	CreateMemberRequest,
 	CreateSessionRequest,
 	CreateSessionResponse,
 	LoginRequest,
 	LogoutResponse,
+	MemberListResponse,
+	MemberSetupRequest,
+	MemberSetupTokenResponse,
 	OverviewResponse,
+	RotateMemberSetupTokenRequest,
 	ResumeSessionResponse,
 	ReviewDecision,
 	ReviewRequest,
@@ -16,10 +25,14 @@ import type {
 	SessionEvent,
 	SessionSummary,
 	SessionTurn,
-	StartTurnResponse
+	StartTurnResponse,
+	UpdateAccountAuditPolicyRequest,
+	UpdateMemberRequest,
+	UpdateMemberResponse
 } from './types';
 import { apiFetch } from './http';
 import { buildSessionListPath, type SessionListQuery } from './session-list';
+import { createStreamAuthorizationProbe } from './stream-auth';
 
 export type StreamStatus = 'connected' | 'reconnecting';
 
@@ -160,6 +173,143 @@ export async function login(request: LoginRequest): Promise<AuthenticationRespon
 	return response.json() as Promise<AuthenticationResponse>;
 }
 
+export async function completeMemberSetup(
+	request: MemberSetupRequest
+): Promise<AuthenticationResponse> {
+	const response = await apiFetch('/api/v1/auth/member-setup', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+		body: JSON.stringify(request)
+	});
+	if (!response.ok) throw await responseError(response, 'Member setup API');
+	return response.json() as Promise<AuthenticationResponse>;
+}
+
+export async function listMembers(
+	cursor?: string,
+	limit = 50,
+	signal?: AbortSignal
+): Promise<MemberListResponse> {
+	const query = new URLSearchParams({ limit: String(limit) });
+	if (cursor) query.set('cursor', cursor);
+	const response = await apiFetch(`/api/v1/members?${query}`, {
+		headers: { Accept: 'application/json' },
+		signal
+	});
+	if (!response.ok) throw await responseError(response, 'Members API');
+	return response.json() as Promise<MemberListResponse>;
+}
+
+export async function createMember(
+	request: CreateMemberRequest
+): Promise<MemberSetupTokenResponse> {
+	const response = await apiFetch('/api/v1/members', {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json',
+			Accept: 'application/json'
+		},
+		body: JSON.stringify(request)
+	});
+	if (!response.ok) throw await responseError(response, 'Create member API');
+	return response.json() as Promise<MemberSetupTokenResponse>;
+}
+
+export async function updateMember(
+	userId: string,
+	request: UpdateMemberRequest
+): Promise<UpdateMemberResponse> {
+	const response = await apiFetch(`/api/v1/members/${encodeURIComponent(userId)}`, {
+		method: 'PATCH',
+		headers: {
+			'Content-Type': 'application/json',
+			Accept: 'application/json'
+		},
+		body: JSON.stringify(request)
+	});
+	if (!response.ok) throw await responseError(response, 'Update member API');
+	return response.json() as Promise<UpdateMemberResponse>;
+}
+
+export async function rotateMemberSetupToken(
+	userId: string,
+	request: RotateMemberSetupTokenRequest
+): Promise<MemberSetupTokenResponse> {
+	const response = await apiFetch(`/api/v1/members/${encodeURIComponent(userId)}/setup-token`, {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json',
+			Accept: 'application/json'
+		},
+		body: JSON.stringify(request)
+	});
+	if (!response.ok) throw await responseError(response, 'Rotate member setup token API');
+	return response.json() as Promise<MemberSetupTokenResponse>;
+}
+
+export async function listAccountAuditEvents(
+	cursor?: string,
+	limit = 50,
+	signal?: AbortSignal
+): Promise<AccountAuditPageResponse> {
+	const query = new URLSearchParams({ limit: String(limit) });
+	if (cursor) query.set('cursor', cursor);
+	const response = await apiFetch(`/api/v1/audit/events?${query}`, {
+		headers: { Accept: 'application/json' },
+		signal
+	});
+	if (!response.ok) throw await responseError(response, 'Account audit API');
+	return response.json() as Promise<AccountAuditPageResponse>;
+}
+
+export async function getAccountAuditPolicy(signal?: AbortSignal): Promise<AccountAuditPolicy> {
+	const response = await apiFetch('/api/v1/audit/policy', {
+		headers: { Accept: 'application/json' },
+		signal
+	});
+	if (!response.ok) throw await responseError(response, 'Account audit policy API');
+	return response.json() as Promise<AccountAuditPolicy>;
+}
+
+export async function updateAccountAuditPolicy(
+	request: UpdateAccountAuditPolicyRequest
+): Promise<AccountAuditPolicy> {
+	const response = await apiFetch('/api/v1/audit/policy', {
+		method: 'PUT',
+		headers: {
+			'Content-Type': 'application/json',
+			Accept: 'application/json'
+		},
+		body: JSON.stringify(request)
+	});
+	if (!response.ok) throw await responseError(response, 'Update account audit policy API');
+	return response.json() as Promise<AccountAuditPolicy>;
+}
+
+export async function downloadAccountAuditExport(signal?: AbortSignal): Promise<Blob> {
+	const response = await apiFetch('/api/v1/audit/export', {
+		headers: { Accept: 'application/x-ndjson' },
+		signal
+	});
+	if (!response.ok) throw await responseError(response, 'Account audit export API');
+	return response.blob();
+}
+
+export async function createAccountAuditCheckpoint(
+	request: AccountAuditCheckpointRequest
+): Promise<AccountAuditCheckpointResponse> {
+	const response = await apiFetch('/api/v1/audit/archive/checkpoint', {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json',
+			Accept: 'application/json'
+		},
+		body: JSON.stringify(request)
+	});
+	if (!response.ok) throw await responseError(response, 'Account audit checkpoint API');
+	return response.json() as Promise<AccountAuditCheckpointResponse>;
+}
+
 export async function logout(): Promise<LogoutResponse> {
 	const response = await apiFetch('/api/v1/auth/logout', {
 		method: 'POST',
@@ -245,13 +395,24 @@ export function subscribeToRun(
 	runId: string,
 	after: number,
 	onEvent: (event: RunEvent) => void,
-	onStatus: (status: StreamStatus) => void
+	onStatus: (status: StreamStatus) => void,
+	onUnauthorized: () => void = () => {}
 ): () => void {
 	const stream = new EventSource(
 		`/api/v1/runs/${encodeURIComponent(runId)}/events?after=${encodeURIComponent(after)}`
 	);
+	const authorization = createStreamAuthorizationProbe(
+		() => getAuthStatus(),
+		() => {
+			stream.close();
+			onUnauthorized();
+		}
+	);
 	stream.onopen = () => onStatus('connected');
-	stream.onerror = () => onStatus('reconnecting');
+	stream.onerror = () => {
+		onStatus('reconnecting');
+		authorization.check();
+	};
 	const handleMessage = (message: MessageEvent<string>) => {
 		try {
 			onEvent(JSON.parse(message.data) as RunEvent);
@@ -261,20 +422,34 @@ export function subscribeToRun(
 	};
 	stream.addEventListener('run.event', handleMessage);
 	stream.onmessage = handleMessage;
-	return () => stream.close();
+	return () => {
+		authorization.stop();
+		stream.close();
+	};
 }
 
 export function subscribeToSession(
 	sessionId: string,
 	after: number,
 	onEvent: (event: SessionEvent) => void,
-	onStatus: (status: StreamStatus) => void
+	onStatus: (status: StreamStatus) => void,
+	onUnauthorized: () => void = () => {}
 ): () => void {
 	const stream = new EventSource(
 		`/api/v1/sessions/${encodeURIComponent(sessionId)}/events?after=${encodeURIComponent(after)}`
 	);
+	const authorization = createStreamAuthorizationProbe(
+		() => getAuthStatus(),
+		() => {
+			stream.close();
+			onUnauthorized();
+		}
+	);
 	stream.onopen = () => onStatus('connected');
-	stream.onerror = () => onStatus('reconnecting');
+	stream.onerror = () => {
+		onStatus('reconnecting');
+		authorization.check();
+	};
 	const handleMessage = (message: MessageEvent<string>) => {
 		try {
 			onEvent(JSON.parse(message.data) as SessionEvent);
@@ -284,5 +459,8 @@ export function subscribeToSession(
 	};
 	stream.addEventListener('session.event', handleMessage);
 	stream.onmessage = handleMessage;
-	return () => stream.close();
+	return () => {
+		authorization.stop();
+		stream.close();
+	};
 }

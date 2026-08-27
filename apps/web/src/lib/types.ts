@@ -342,6 +342,130 @@ export interface AccountUser {
 	created_at: string;
 }
 
+export interface AccountMember {
+	user_id: string;
+	username: string;
+	role: AccountRole;
+	status: AccountStatus;
+	revision: number;
+	setup_required: boolean;
+	setup_token_expires_at?: string;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface MemberListResponse {
+	members: AccountMember[];
+	next_cursor?: string;
+}
+
+export interface CreateMemberRequest {
+	username: string;
+}
+
+export interface MemberSetupTokenResponse {
+	member: AccountMember;
+	setup_token: string;
+	setup_token_expires_at: string;
+}
+
+export interface UpdateMemberRequest {
+	expected_revision: number;
+	role?: AccountRole;
+	status?: AccountStatus;
+}
+
+export interface InFlightWorkSummary {
+	reply_job_ids: string[];
+	dispatch_call_ids: string[];
+}
+
+export interface UpdateMemberResponse {
+	member: AccountMember;
+	in_flight: InFlightWorkSummary;
+}
+
+export interface RotateMemberSetupTokenRequest {
+	expected_revision: number;
+}
+
+export interface MemberSetupRequest {
+	setup_token: string;
+	password: string;
+}
+
+export interface AccountAuditEvent {
+	sequence: number;
+	actor_user_id?: string;
+	action: string;
+	outcome: string;
+	target_kind: string;
+	target_id: string;
+	target_user_id?: string;
+	metadata: Record<string, unknown>;
+	occurred_at: string;
+	previous_hash: string;
+	event_hash: string;
+}
+
+export interface AccountAuditRollup {
+	through_sequence: number;
+	event_count: number;
+	digest: string;
+	last_event_hash: string;
+	updated_at: string;
+}
+
+export interface AccountAuditPolicy {
+	detail_rows: number;
+	legal_hold: boolean;
+	archive_required: boolean;
+	revision: number;
+	updated_at: string;
+}
+
+export interface AccountAuditArchiveState {
+	through_sequence: number;
+	event_hash: string;
+	archive_reference?: string;
+	revision: number;
+	updated_at: string;
+}
+
+export interface AccountAuditState {
+	policy: AccountAuditPolicy;
+	rollup: AccountAuditRollup;
+	archive: AccountAuditArchiveState;
+	detailed_rows: number;
+	ordinary_capacity_remaining: number;
+	progress_capacity_remaining: number;
+}
+
+export interface AccountAuditPageResponse {
+	events: AccountAuditEvent[];
+	next_cursor?: string;
+	state: AccountAuditState;
+}
+
+export interface UpdateAccountAuditPolicyRequest {
+	expected_revision: number;
+	detail_rows: number;
+	legal_hold: boolean;
+	archive_required: boolean;
+}
+
+export interface AccountAuditCheckpointRequest {
+	expected_revision: number;
+	through_sequence: number;
+	event_hash: string;
+	archive_reference: string;
+}
+
+export interface AccountAuditCheckpointResponse {
+	archive: AccountAuditArchiveState;
+	state: AccountAuditState;
+}
+
 export interface UserPreferences {
 	theme: ThemePreference;
 	preferred_model?: string;

@@ -17,19 +17,21 @@ real, path-constrained marker executor for testing the complete loop. Restate,
 MinIO, the networkless tool sandbox, and optional PostgreSQL are development
 topology for later milestones; they are not application state authorities.
 
-Alpha+ supports exactly one local owner. Schema v14 keeps the single
-`acc_local` account and makes its durable membership the sole capability
-authority for authentication, REST/SSE access, receipts, reply/dispatch work,
-and worker claim. The `member` role still cannot authenticate through this
-build: member lifecycle and account security audit remain v15 work. Keep the
-service loopback/private-network only, and do not expose it as a shared or
-Internet-facing deployment.
+Alpha+ supports one local `acc_local` account with owner and member roles.
+Schema v14 made durable membership the sole capability authority for
+authentication, REST/SSE access, receipts, reply/dispatch work, and worker
+claim. Schema v15 adds owner-managed member setup/disable, immediate revision
+revocation, bounded account security audit, legal hold, and archive
+checkpoints. Members can use ordinary Session/Run and reply paths; approval,
+connector dispatch, member administration, and audit administration remain
+owner-only. Keep the service loopback/private-network only, and do not expose
+it as a shared or Internet-facing deployment.
 
 The staged account/membership and audit-retention design is documented in
 [`docs/account-membership-audit-retention.zh-CN.md`](docs/account-membership-audit-retention.zh-CN.md).
-Its v12-v14 foundation and durable-authorization slices are implemented; the
-v15 section remains an implementation contract, not a claim that member access
-is enabled.
+Its v12-v15 storage, authorization, member-lifecycle, and local-audit slices
+are implemented. It also documents the deployment gates that remain outside
+this local collaboration milestone.
 
 ## Prerequisites
 
@@ -469,7 +471,9 @@ and bounded memory, CPU, and PID resources.
   `(account, actor, membership revision)` authority. It removes legacy owner
   checks from authorization, scopes cursors and active-work capacity by account
   and actor, and revalidates both dispatch subjects before worker claim. The
-  product-level member login gate stays closed until v15.
+  product-level member login gate remains closed in v14. Schema v15 adds
+  one-time member setup tokens, revisioned lifecycle transitions, account audit
+  state, and the final capability-gated member surface.
   Existing Runs and events are decoded, validated, and migrated in place without
   rewriting their payloads. Runtime identity still binds profile, environment,
   primary Session and Run, policy ID, and policy revision; a mismatch fails
@@ -489,25 +493,49 @@ directly.
 
 - `GET /health/live` and `GET /health/ready` are public. The remaining public
   surface is limited to `GET /api/v1/auth/status`, first-owner
-  `POST /api/v1/auth/bootstrap`, and `POST /api/v1/auth/login`.
+  `POST /api/v1/auth/bootstrap`, `POST /api/v1/auth/login`, and one-time
+  `POST /api/v1/auth/member-setup` (with `/api/auth/member-setup` as a
+  compatibility alias).
 - Bootstrap and login require an exact same-origin `Origin`/`Host` pair. A
   successful bootstrap or login issues an opaque `HttpOnly; SameSite=Strict`
   login cookie plus a separate CSRF cookie. When the browser-facing origin is
   HTTPS, the operator must set `ZEUS_COOKIE_SECURE=true`; then both cookies are
   emitted with `Secure`.
-- Bootstrap and login are charged before Argon2 work against bounded, in-memory
+- Bootstrap, login, and member setup are charged before Argon2 work against bounded, in-memory
   fixed-window limits. Login defaults to 60 attempts globally, 10 per direct
   peer IP, and 5 per canonical account per minute; bootstrap defaults to 10
-  globally and 3 per direct peer IP. Zeus ignores `Forwarded` and
+  globally and 3 per direct peer IP; member setup defaults to 30 globally and
+  5 per direct peer IP. Zeus ignores `Forwarded` and
   `X-Forwarded-For` unless a future explicit trusted-proxy contract is added.
   Rejection is a generic `429` with `Retry-After` and `Cache-Control: no-store`.
-- Every business REST/SSE route requires the active local owner. Protected
-  state changes additionally require `X-CSRF-Token` to match the login and an
-  exact same-origin request. Alpha+ deliberately rejects the schema-reserved
-  `member` role. Actor isolation, SQLite physical headroom, bounded bootstrap
-  audit retention, the account/membership foundation, and schema-v14 durable
-  authorization are now present. Member access remains blocked until v15
-  member lifecycle/account security audit lands.
+- Every business REST/SSE route requires an active durable account membership.
+  Protected state changes additionally require `X-CSRF-Token` to match the
+  login and an exact same-origin request. Members may read and write Account
+  Session/Run state and use the reply provider; approval/dispatch, member
+  administration, and account-audit routes require owner capability. Actor
+  isolation, SQLite physical headroom, bounded bootstrap/account audit
+  retention, durable authorization, and member revision revocation are
+  enforced below HTTP.
+- An owner creates a member through `POST /api/v1/members`; the plaintext setup
+  token appears only in that response, expires after 24 hours, and is stored by
+  Zeus only as a domain-separated SHA-256 digest. `POST
+  /api/v1/auth/member-setup` consumes it once while setting the password and
+  issuing the login session. Member lifecycle and audit administration are
+  owner-only and return `Cache-Control: no-store`.
+- Active Run/Session SSE connections revalidate durable account authority at
+  most two seconds apart and close after disable, role revision, or session
+  revocation. Middleware is only an entry filter: storage and worker claim
+  transactions still revalidate account, actor, revision, and capability.
+- Owner-only `GET/POST /api/v1/members`, `PATCH /api/v1/members/{user_id}`,
+  and `POST /api/v1/members/{user_id}/setup-token` provide bounded keyset
+  listing, optimistic membership revisions, last-owner protection, token
+  rotation, and a response listing work already claimed before disable.
+- Owner-only `GET /api/v1/audit/events`, `GET /api/v1/audit/export`,
+  `GET/PUT /api/v1/audit/policy`, and `POST
+  /api/v1/audit/archive/checkpoint` expose bounded account audit state. The
+  NDJSON export is fully collected and validated before its `200` response and
+  fails above 96 MiB; a checkpoint is an operator assertion, not proof that an
+  external archive exists.
 - `GET /api/v1/me/settings` returns the current safe preferences.
   `PATCH /api/v1/me/settings` accepts `theme`, optional allowlisted
   `preferred_model`, and `expected_revision`. Provider endpoints and API keys
@@ -564,7 +592,11 @@ directly.
 - Session creation, turn start, resume, and approval-decision commands require
   exactly one canonical `Idempotency-Key`: 1–128 ASCII graphic bytes, with no
   trimming or reinterpretation. Authentication/logout and optimistic settings
-  updates use their own replay/concurrency rules. Malformed input returns 400,
+  updates use their own replay/concurrency rules. Member setup/admin and audit
+  mutations do not implement HTTP idempotency receipts and explicitly reject
+  `Idempotency-Key` as `400 idempotency_not_supported`. A lost member-create
+  response is recovered by listing the pending member and rotating its setup
+  token. Malformed input returns 400,
   oversized JSON returns 413, a wrong content type returns 415, schema mismatch
   or unknown fields return 422, and capacity/rate rejection returns 429.
   Durable capacity problems use `storage_quota_exceeded`,
@@ -574,13 +606,19 @@ directly.
   Missing or unowned resources return 404; unauthenticated requests return 401;
   CSRF/origin rejection returns 403; duplicate identity, idempotency conflict,
   invalid state, or sequence conflict returns 409 as
-  `application/problem+json`.
+  `application/problem+json`. Member and audit conflicts use
+  `member_already_exists`, `member_setup_not_pending`,
+  `audit_policy_revision_conflict`, or `audit_checkpoint_conflict` as
+  applicable. Audit ordinary-capacity exhaustion returns
+  `507 audit_storage_exhausted` and never commits the partially audited
+  mutation; a complete export that would exceed the response bound returns
+  `507 audit_export_too_large` instead of a truncated `200`.
 - Internal execution-invariant failures return a stable, redacted
   `500 runtime_unavailable`. Storage, policy-build, connector-configuration, or
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Current schema v14 retains durable Run attachment during migration and demo
+Current schema v15 retains durable Run attachment during migration and demo
 seeding, but Alpha+ does not expose a public attach-Run HTTP route.
 
 The application boundary now caps auth JSON at 8 KiB and command JSON at
@@ -600,7 +638,7 @@ approval, dispatch, reply completion, attachment checks, and startup recovery
 use typed point queries or fixed 64-row batches. Production Session list/detail,
 Run detail, and overview reads now use indexed `LIMIT + 1` keyset pages inside
 actor-authorized SQLite snapshots; no production HTTP read loads a complete
-ledger or collection. Current schema v14 retains bounded Session, open-turn,
+ledger or collection. Current schema v15 retains bounded Session, open-turn,
 active reply/dispatch, auth-session, bootstrap-audit, event-slot, and logical
 event-payload-byte admission. Exact idempotent replay is checked before capacity,
 while accepted work consumes its reserved terminal slots and payload bytes
@@ -610,19 +648,21 @@ existing bytes and conservatively reserves active work so historical databases
 can still drain even when they exceed a newly configured limit. Expired auth
 sessions and sessions bound to missing, disabled, suspended, or stale-revision
 authority are deleted in deterministic batches of at most 64 on startup and
-before session creation. Append-only ledgers, receipts, jobs, turns, and account
-audit records are not silently pruned; bootstrap token details alone follow the
-explicit bounded rollup policy above. The locally verified Physical Capacity Slice
+before session creation. Append-only ledgers, receipts, jobs, and turns are not
+silently pruned. Bootstrap-token and account-audit details follow their explicit
+bounded rollup policies; account audit additionally supports legal hold and an
+owner-recorded external archive checkpoint. The locally verified Physical Capacity Slice
 now gates the main DB, active-WAL target, and filesystem headroom, subject to
 the documented WAL and `statvfs` limitations. Bounded SQLite operation
-concurrency is also implemented. Schema v14 now provides account-scoped
-receipt/job/auth/cursor/capacity authorization and durable membership-revision
-checks. Member lifecycle and account security-audit retention remain
-unresolved; shared-network and multi-tenant deployment is therefore still out
-of scope.
-The earlier Operation Capacity Apple readiness-pressure scenario and current
-schema-v14 retained-volume migration/restart have passed as separate gates;
-the v14 image did not rerun that pressure workload. Authoritative Linux Docker
+concurrency is also implemented. Schema v15 builds on account-scoped
+receipt/job/auth/cursor/capacity authorization with one-time member setup,
+revisioned lifecycle transitions, SSE revocation, dual-subject worker claims,
+and count-bounded account audit. Shared-network and multi-tenant deployment is
+still out of scope.
+The earlier Operation Capacity Apple readiness-pressure scenario and historical
+schema-v14 retained-volume migration/restart passed as separate gates; the v14
+image did not rerun that pressure workload. Current v15 retained-volume and
+fresh small-capacity Apple acceptance also passed; authoritative Linux Docker
 PID/OOM and adversarial low-memory acceptance remain separate deployment gates.
 
 ## Container images
@@ -675,14 +715,14 @@ Current Alpha+ plus Actor Boundary Foundation, API Resource Envelope, Terminal
 Payload Envelope, Bounded Event Feed, Point-query Durable Context, Bounded Read
 Models, SQLite Capacity Slice 2, the SQLite Physical Capacity Slice, and the
 SQLite Operation Capacity Slice, Bootstrap Audit Retention, schema v13 Account
-Membership Foundation, and schema v14 Account-scoped Durable Authorization host
-verification:
+Membership Foundation, schema v14 Account-scoped Durable Authorization, and
+schema v15 Member Lifecycle / Account Audit host verification:
 
 - `cargo fmt --all -- --check`
-- `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --all-targets`: 312 tests passed under the existing
-  project counting convention, including 153 storage tests, 31 runtime tests,
-  46 API library tests, 6 API main/config tests, and the real
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo test --workspace --all-targets --all-features`: 342 tests passed under
+  the existing project counting convention, including 174 storage tests, 33
+  runtime tests, 51 API library tests, 6 API main/config tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,
   body/field/idempotency boundaries, atomic login limits, SSE lease capacity,
@@ -717,7 +757,7 @@ verification:
   corruption, account/actor cursor and receipt isolation, three-tier capacity,
   stale-session relogin, dual-subject dispatch, worker claim revocation, and
   fail-closed rollback without a partial v13 or v14 schema.
-- `pnpm --filter web test`: 25 tests passed for CSRF headers, stable command
+- `pnpm --filter web test`: 28 tests passed for CSRF headers, stable command
   identity, deep-page active-Session restore, Session-list cursor encoding and
   deduplication, bounded-tail retry reconciliation and Session-switch race
   guards, primary-Run identity, Session event merging, and theme behavior.
@@ -773,15 +813,38 @@ The schema-v13 image was subsequently rebuilt in the same
 It completed the in-place v12-to-v13 migration, and volume-retaining
 `restart-verify` passed again.
 
-The current schema-v14 image was then built from this worktree on the same
+The historical schema-v14 image was then built from this worktree on the same
 isolated project while retaining the now-v13 volume. `up` completed the
 v13-to-v14 migration; `verify` and volume-retaining `restart-verify` passed API,
 Web, gateway, auth-status, anonymous-boundary, and `configured=false` state
-consistency checks. The stack remains available at `http://127.0.0.1:18089`.
-The API effective limit is 2 CPUs/1 GiB; the post-restart snapshot reports
+consistency checks. At that point the API effective limit was 2 CPUs/1 GiB; its
+post-restart snapshot reported
 `memory.current=79,466,496`, `memory.peak=98,201,600`, Zeus RSS 9,824 KiB,
 `pids.current=6`, and `memory.events` `oom=0`/`oom_kill=0`. Apple `container`
 still reports `pids.max=max`, so this is not a PID-limit guarantee.
+
+The current schema-v15 images then retained the now-v14 volume in the same
+`zeus-operation-acceptance` project. `up`, `verify`, and volume-retaining
+`restart-verify` passed the v14-to-v15 migration, a second reopen, Web/API/
+gateway routes, the anonymous boundary, and `configured=false` recovery at
+`http://127.0.0.1:18089`. The API remained limited to 2 CPUs/1 GiB; the recorded
+snapshot was `memory.current=80,617,472`, `memory.peak=99,479,552`, Zeus RSS
+10,252 KiB, `pids.current=7`, and zero OOM/OOM-kill events.
+
+A separate fresh `zeus-audit-acceptance` project at
+`http://127.0.0.1:18090` used a two-row detail target, eight-row per-account
+ceiling, and two-row progress reserve. Live API acceptance covered owner
+bootstrap, one-time member setup/login, a member Session reply settled through
+the durable local fallback, member audit `403`, archive checkpoint, legal-hold
+`507`, ordinary-capacity exhaustion after three additional creates, member
+disable through progress reserve, session revocation, complete NDJSON manifest,
+hold release, and readiness recovery. Browser acceptance clicked New Session,
+sent a message through event sequence 4, opened Settings/Members/Audit, applied
+dark mode, and found no console warning or error. Volume-retaining
+`restart-verify` preserved `configured=true`; afterward the API reported
+`memory.current=24,735,744`, `memory.peak=43,433,984`, Zeus RSS 10,340 KiB,
+`pids.current=7`, and zero OOM/OOM-kill events. The VM had no swap and still
+reported `pids.max=max`.
 
 The earlier Operation Capacity readiness-pressure image was verified at 2
 CPUs/1 GiB. A 30,000-request `/health/ready` run at concurrency 128 completed

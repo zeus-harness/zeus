@@ -20,6 +20,7 @@
 	import {
 		ApiError,
 		bootstrapOwner,
+		completeMemberSetup,
 		createSession,
 		getAuthStatus,
 		getOverview,
@@ -63,6 +64,7 @@
 		BootstrapRequest,
 		DataSource,
 		LoginRequest,
+		MemberSetupRequest,
 		OverviewResponse,
 		ReviewDecision,
 		RunEvent,
@@ -239,6 +241,13 @@
 		composerDraft = '';
 		composerError = '';
 		source = 'demo';
+	}
+
+	function handleAuthorizationRevoked() {
+		if (!authStatus?.authenticated) return;
+		settingsOpen = false;
+		clearWorkspace();
+		authStatus = { configured: true, authenticated: false };
 	}
 
 	async function refreshOverview() {
@@ -459,7 +468,8 @@
 			},
 			(status) => {
 				if (activeSessionId === sessionId) sessionStreamStatus = status;
-			}
+			},
+			handleAuthorizationRevoked
 		);
 	}
 
@@ -479,7 +489,8 @@
 					void refreshOverview().catch(() => undefined);
 				}
 			},
-			(status) => (runStreamStatus = status)
+			(status) => (runStreamStatus = status),
+			handleAuthorizationRevoked
 		);
 	}
 
@@ -581,6 +592,12 @@
 
 	async function handleLogin(request: LoginRequest) {
 		const response = await login(request);
+		authStatus = authenticatedStatus(response);
+		await initializeWorkspace();
+	}
+
+	async function handleMemberSetup(request: MemberSetupRequest) {
+		const response = await completeMemberSetup(request);
 		authStatus = authenticatedStatus(response);
 		await initializeWorkspace();
 	}
@@ -940,6 +957,7 @@
 			configured={authStatus.configured}
 			onBootstrap={handleBootstrap}
 			onLogin={handleLogin}
+			onMemberSetup={handleMemberSetup}
 		/>
 	{/key}
 {:else if currentUser}
@@ -986,6 +1004,7 @@
 				user={currentUser}
 				onClose={closeSettings}
 				onLogout={handleLogout}
+				onUnauthorized={handleAuthorizationRevoked}
 			/>
 
 			<div class="min-w-0 flex flex-1 flex-col overflow-hidden">
@@ -1006,6 +1025,7 @@
 							approval={pendingApprovalEvent.approval}
 							summary={pendingApprovalEvent.summary ?? pendingApprovalEvent.approval.action}
 							policy={overview.tool_policy}
+							canReview={currentUser.role === 'owner'}
 							{pendingDecision}
 							error={reviewError}
 							onReview={handlePendingReview}

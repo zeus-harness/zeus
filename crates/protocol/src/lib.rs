@@ -400,6 +400,214 @@ pub struct LogoutResponse {
     pub status: String,
 }
 
+/// Account membership row exposed by owner-only lifecycle administration.
+/// `setup_required` is intentionally separate from the durable membership
+/// status: a pending credential does not invent a third authorization state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountMember {
+    pub user_id: String,
+    pub username: String,
+    pub role: AccountRole,
+    pub status: AccountStatus,
+    pub revision: u64,
+    pub setup_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_token_expires_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountMemberPage {
+    pub members: Vec<AccountMember>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateMemberRequest {
+    pub username: String,
+}
+
+/// The bearer is returned exactly once by a successful creation or rotation.
+/// Its `Debug` representation must remain redacted because API errors and test
+/// diagnostics commonly format response values.
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberSetupTokenResponse {
+    pub member: AccountMember,
+    pub setup_token: String,
+    pub setup_token_expires_at: String,
+}
+
+impl fmt::Debug for MemberSetupTokenResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MemberSetupTokenResponse")
+            .field("member", &self.member)
+            .field("setup_token", &"[REDACTED]")
+            .field("setup_token_expires_at", &self.setup_token_expires_at)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateMemberRequest {
+    pub expected_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<AccountRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<AccountStatus>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RotateMemberSetupTokenRequest {
+    pub expected_revision: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InFlightWorkSummary {
+    pub reply_job_ids: Vec<String>,
+    pub dispatch_call_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateMemberResponse {
+    pub member: AccountMember,
+    pub in_flight: InFlightWorkSummary,
+}
+
+/// Public one-time credential setup. The username is deliberately absent: the
+/// token is durably bound to exactly one account membership.
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemberSetupRequest {
+    pub setup_token: String,
+    pub password: String,
+}
+
+impl fmt::Debug for MemberSetupRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MemberSetupRequest")
+            .field("setup_token", &"[REDACTED]")
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// One account-scoped security/administration event. Action and outcome remain
+/// strings so readers can safely retain events introduced by newer servers.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AccountAuditEvent {
+    pub sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_user_id: Option<String>,
+    pub action: String,
+    pub outcome: String,
+    pub target_kind: String,
+    pub target_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_user_id: Option<String>,
+    pub occurred_at: String,
+    #[serde(default)]
+    pub metadata: Value,
+    pub previous_hash: String,
+    pub event_hash: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AccountAuditEventPage {
+    pub events: Vec<AccountAuditEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub state: AccountAuditState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountAuditPolicy {
+    pub detail_rows: u64,
+    pub legal_hold: bool,
+    pub archive_required: bool,
+    pub revision: u64,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateAccountAuditPolicyRequest {
+    pub detail_rows: u64,
+    pub legal_hold: bool,
+    pub archive_required: bool,
+    pub expected_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountAuditRollup {
+    pub through_sequence: u64,
+    pub digest: String,
+    pub event_count: u64,
+    pub last_event_hash: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountAuditArchiveState {
+    pub through_sequence: u64,
+    pub event_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_reference: Option<String>,
+    pub revision: u64,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountAuditState {
+    pub policy: AccountAuditPolicy,
+    pub rollup: AccountAuditRollup,
+    pub archive: AccountAuditArchiveState,
+    pub detailed_rows: u64,
+    pub ordinary_capacity_remaining: u64,
+    pub progress_capacity_remaining: u64,
+}
+
+pub const ACCOUNT_AUDIT_EXPORT_MANIFEST_KIND: &str = "zeus.account_audit.export_manifest";
+pub const ACCOUNT_AUDIT_EXPORT_SCHEMA_VERSION: u32 = 1;
+pub const ACCOUNT_AUDIT_EVENT_SCHEMA: &str = "zeus.account_audit.event.v1";
+
+/// First line of an account-audit NDJSON export. The rollup remains a
+/// database-local commitment rather than an independently tamper-proof anchor,
+/// but carrying it in the file preserves the exact chain boundary needed to
+/// verify every following detailed event without consulting live state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountAuditExportManifest {
+    pub kind: String,
+    pub schema_version: u32,
+    pub event_schema: String,
+    pub exported_at: String,
+    pub rollup: AccountAuditRollup,
+    pub snapshot_head_sequence: u64,
+    pub snapshot_event_count: u64,
+    pub detailed_event_count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateAccountAuditCheckpointRequest {
+    pub expected_revision: u64,
+    pub through_sequence: u64,
+    pub event_hash: String,
+    pub archive_reference: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountAuditCheckpointResponse {
+    pub archive: AccountAuditArchiveState,
+    pub state: AccountAuditState,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
@@ -1510,5 +1718,118 @@ mod tests {
         );
         assert_eq!(EVENT_PAGE_DEFAULT_LIMIT, 128);
         assert_eq!(EVENT_PAGE_MAX_LIMIT, 256);
+    }
+
+    #[test]
+    fn member_lifecycle_contract_redacts_secrets_and_rejects_ambiguous_input() {
+        let setup = MemberSetupRequest {
+            setup_token: "member-setup-secret".into(),
+            password: "member-password-secret".into(),
+        };
+        let setup_debug = format!("{setup:?}");
+        assert!(!setup_debug.contains("member-setup-secret"));
+        assert!(!setup_debug.contains("member-password-secret"));
+        assert!(setup_debug.contains("[REDACTED]"));
+        assert!(
+            serde_json::from_value::<MemberSetupRequest>(json!({
+                "setup_token": "token",
+                "password": "password",
+                "username": "must-not-be-client-selected"
+            }))
+            .is_err()
+        );
+
+        let response = MemberSetupTokenResponse {
+            member: AccountMember {
+                user_id: "usr_member".into(),
+                username: "member".into(),
+                role: AccountRole::Member,
+                status: AccountStatus::Active,
+                revision: 1,
+                setup_required: true,
+                setup_token_expires_at: Some("2026-08-28T00:00:00.000Z".into()),
+                created_at: "2026-08-27T00:00:00.000Z".into(),
+                updated_at: "2026-08-27T00:00:00.000Z".into(),
+            },
+            setup_token: "one-time-bearer".into(),
+            setup_token_expires_at: "2026-08-28T00:00:00.000Z".into(),
+        };
+        assert!(!format!("{response:?}").contains("one-time-bearer"));
+        assert_eq!(
+            serde_json::to_value(&response).unwrap()["setup_token"],
+            "one-time-bearer"
+        );
+
+        assert!(
+            serde_json::from_value::<UpdateMemberRequest>(json!({
+                "expected_revision": 1,
+                "role": "member",
+                "unexpected": true
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn account_audit_contract_has_stable_owner_facing_fields() {
+        let event = AccountAuditEvent {
+            sequence: 7,
+            actor_user_id: Some("usr_owner".into()),
+            action: "member.disabled".into(),
+            outcome: "succeeded".into(),
+            target_kind: "member".into(),
+            target_id: "usr_member".into(),
+            target_user_id: Some("usr_member".into()),
+            occurred_at: "2026-08-27T00:00:00.000Z".into(),
+            metadata: json!({ "previous_revision": 2 }),
+            previous_hash: "0".repeat(64),
+            event_hash: "a".repeat(64),
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["sequence"], 7);
+        assert_eq!(value["actor_user_id"], "usr_owner");
+        assert_eq!(value["target_user_id"], "usr_member");
+        assert_eq!(value["metadata"]["previous_revision"], 2);
+
+        let policy = UpdateAccountAuditPolicyRequest {
+            detail_rows: 4_096,
+            legal_hold: true,
+            archive_required: false,
+            expected_revision: 3,
+        };
+        assert_eq!(
+            serde_json::to_value(policy).unwrap(),
+            json!({
+                "detail_rows": 4096,
+                "legal_hold": true,
+                "archive_required": false,
+                "expected_revision": 3
+            })
+        );
+
+        let manifest = AccountAuditExportManifest {
+            kind: ACCOUNT_AUDIT_EXPORT_MANIFEST_KIND.into(),
+            schema_version: ACCOUNT_AUDIT_EXPORT_SCHEMA_VERSION,
+            event_schema: ACCOUNT_AUDIT_EVENT_SCHEMA.into(),
+            exported_at: "2026-08-27T00:00:01.000Z".into(),
+            rollup: AccountAuditRollup {
+                through_sequence: 5,
+                digest: "b".repeat(64),
+                event_count: 5,
+                last_event_hash: "c".repeat(64),
+                updated_at: "2026-08-27T00:00:00.000Z".into(),
+            },
+            snapshot_head_sequence: 7,
+            snapshot_event_count: 7,
+            detailed_event_count: 2,
+        };
+        let manifest_value = serde_json::to_value(manifest).unwrap();
+        assert_eq!(manifest_value["kind"], ACCOUNT_AUDIT_EXPORT_MANIFEST_KIND);
+        assert_eq!(
+            manifest_value["schema_version"],
+            ACCOUNT_AUDIT_EXPORT_SCHEMA_VERSION
+        );
+        assert_eq!(manifest_value["rollup"]["through_sequence"], 5);
+        assert_eq!(manifest_value["snapshot_head_sequence"], 7);
     }
 }

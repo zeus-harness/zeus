@@ -25,7 +25,219 @@ use protocol::{
 use serde::Serialize;
 use serde_json::Value;
 pub use sqlite::SqliteStore;
-pub use tenancy::{AccountId, AuthSessionId, AuthzContext, MembershipRevision, MembershipRole};
+pub use tenancy::{
+    AccountId, AuthSessionId, AuthzContext, MemberSetupToken, MembershipRevision, MembershipRole,
+};
+
+pub const MEMBER_SETUP_TOKEN_TTL_SECONDS: i64 = 86_400;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoredMembershipStatus {
+    Active,
+    Disabled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredMember {
+    pub account_id: AccountId,
+    pub user_id: String,
+    pub username: String,
+    pub role: MembershipRole,
+    pub status: StoredMembershipStatus,
+    pub revision: MembershipRevision,
+    /// True until the member has durably completed credential setup. This is
+    /// independent of whether a current setup token exists.
+    pub setup_required: bool,
+    /// Present while a current one-time setup token row exists, including an
+    /// expired row that an owner may rotate.
+    pub setup_token_expires_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredMemberPage {
+    pub items: Vec<StoredMember>,
+    pub next_cursor: Option<String>,
+}
+
+pub struct CreateMemberCommit {
+    pub user_id: String,
+    pub username: String,
+    pub setup_token: MemberSetupToken,
+}
+
+impl fmt::Debug for CreateMemberCommit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CreateMemberCommit")
+            .field("user_id", &self.user_id)
+            .field("username", &self.username)
+            .field("setup_token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateMemberResult {
+    pub member: StoredMember,
+    pub replayed: bool,
+}
+
+pub struct RotateMemberSetupTokenCommit {
+    pub user_id: String,
+    pub expected_revision: MembershipRevision,
+    pub setup_token: MemberSetupToken,
+}
+
+impl fmt::Debug for RotateMemberSetupTokenCommit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RotateMemberSetupTokenCommit")
+            .field("user_id", &self.user_id)
+            .field("expected_revision", &self.expected_revision)
+            .field("setup_token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RotateMemberSetupTokenResult {
+    pub member: StoredMember,
+    pub replayed: bool,
+}
+
+pub struct MemberSetupCommit {
+    pub setup_token: MemberSetupToken,
+    pub password_hash: String,
+    pub auth_session_id: AuthSessionId,
+    pub session_token_hash: String,
+    pub csrf_hash: String,
+    pub session_expires_at: String,
+}
+
+impl fmt::Debug for MemberSetupCommit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MemberSetupCommit")
+            .field("setup_token", &"[REDACTED]")
+            .field("password_hash", &"[REDACTED]")
+            .field("auth_session_id", &self.auth_session_id)
+            .field("session_token_hash", &"[REDACTED]")
+            .field("csrf_hash", &"[REDACTED]")
+            .field("session_expires_at", &self.session_expires_at)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberSetupResult {
+    pub principal: AuthPrincipal,
+    pub member: StoredMember,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransitionMemberCommit {
+    pub user_id: String,
+    pub expected_revision: MembershipRevision,
+    pub expected_role: MembershipRole,
+    pub expected_status: StoredMembershipStatus,
+    pub role: MembershipRole,
+    pub status: StoredMembershipStatus,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InFlightWorkSummary {
+    pub reply_job_ids: Vec<String>,
+    pub dispatch_call_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberTransitionResult {
+    pub member: StoredMember,
+    pub replayed: bool,
+    pub revoked_auth_sessions: u64,
+    pub revoked_setup_tokens: u64,
+    pub in_flight: InFlightWorkSummary,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AccountAuditEvent {
+    pub account_id: AccountId,
+    pub sequence: u64,
+    pub actor_user_id: Option<String>,
+    pub action: String,
+    pub outcome: String,
+    pub target_kind: String,
+    pub target_id: String,
+    pub metadata: Value,
+    pub occurred_at: String,
+    pub previous_hash: String,
+    pub event_hash: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountAuditRollup {
+    pub account_id: AccountId,
+    pub through_sequence: u64,
+    pub event_count: u64,
+    pub digest: String,
+    pub last_event_hash: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountAuditPolicy {
+    pub account_id: AccountId,
+    pub detail_rows: u64,
+    pub legal_hold: bool,
+    pub archive_required: bool,
+    pub revision: u64,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountAuditArchiveState {
+    pub account_id: AccountId,
+    pub through_sequence: u64,
+    pub event_hash: String,
+    pub archive_reference: Option<String>,
+    pub revision: u64,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountAuditState {
+    pub policy: AccountAuditPolicy,
+    pub rollup: AccountAuditRollup,
+    pub archive: AccountAuditArchiveState,
+    pub detailed_rows: u64,
+    pub ordinary_capacity_remaining: u64,
+    pub progress_capacity_remaining: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AccountAuditPage {
+    pub items: Vec<AccountAuditEvent>,
+    pub next_cursor: Option<String>,
+    pub state: AccountAuditState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdateAccountAuditPolicyCommit {
+    pub expected_revision: u64,
+    pub detail_rows: u64,
+    pub legal_hold: bool,
+    pub archive_required: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountAuditCheckpointCommit {
+    pub expected_revision: u64,
+    pub through_sequence: u64,
+    pub event_hash: String,
+    pub archive_reference: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoredUserRole {
@@ -358,8 +570,10 @@ pub enum CommitOutcome {
 pub struct DispatchJobSpec {
     pub call_id: String,
     pub approval_id: String,
-    /// The actor whose request initiated this immutable dispatch.
-    pub initiating_authz: AuthzContext,
+    /// The actor whose request initiated this immutable dispatch, when the
+    /// durable requested-call provenance actually records one. `None` is
+    /// fail-closed at claim time and must never be filled from the approver.
+    pub initiating_authz: Option<AuthzContext>,
     /// The owner whose approval authorized this immutable dispatch.
     pub approving_authz: AuthzContext,
     pub tool_name: String,

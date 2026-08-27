@@ -30,18 +30,24 @@ use sha2::{Digest, Sha256};
 use crate::cursor;
 use crate::operation::{OperationClass, OperationLimiter};
 use crate::{
-    AccountId, AuthPrincipal, AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit,
-    BoundedRunRead, ClaimOutcome, CommitOutcome, DispatchCompleteCommit, DispatchContext,
-    DispatchJob, DispatchJobSpec, DispatchRecoveryCommit, DispatchRejection, DispatchStartCommit,
-    DispatchStatus, MembershipRevision, MembershipRole, RecoveredSessionTurn, ReplyClaimOutcome,
-    ReplyCompletion, ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec,
-    ReplyJobStatus, ReplyOutcomeUnknownCommit, ReplySuccessCommit, ReviewCommit, ReviewContext,
-    ReviewReceipt, RunSnapshot, RuntimeIdentity, SessionSummaryPage, SqliteOperationLimits,
-    SqlitePhysicalLimits, StorageError, StorageLimits, StoredCredential, StoredPreferences,
-    StoredRun, StoredUser, StoredUserRole, StoredUserStatus,
+    AccountAuditArchiveState, AccountAuditCheckpointCommit, AccountAuditEvent, AccountAuditPage,
+    AccountAuditPolicy, AccountAuditRollup, AccountAuditState, AccountId, AuthPrincipal,
+    AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, BoundedRunRead,
+    ClaimOutcome, CommitOutcome, CreateMemberCommit, CreateMemberResult, DispatchCompleteCommit,
+    DispatchContext, DispatchJob, DispatchJobSpec, DispatchRecoveryCommit, DispatchRejection,
+    DispatchStartCommit, DispatchStatus, InFlightWorkSummary, MEMBER_SETUP_TOKEN_TTL_SECONDS,
+    MemberSetupCommit, MemberSetupResult, MemberTransitionResult, MembershipRevision,
+    MembershipRole, RecoveredSessionTurn, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit,
+    ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
+    ReplySuccessCommit, ReviewCommit, ReviewContext, ReviewReceipt, RotateMemberSetupTokenCommit,
+    RotateMemberSetupTokenResult, RunSnapshot, RuntimeIdentity, SessionSummaryPage,
+    SqliteOperationLimits, SqlitePhysicalLimits, StorageError, StorageLimits, StoredCredential,
+    StoredMember, StoredMemberPage, StoredMembershipStatus, StoredPreferences, StoredRun,
+    StoredUser, StoredUserRole, StoredUserStatus, TransitionMemberCommit,
+    UpdateAccountAuditPolicyCommit,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 14;
+const CURRENT_SCHEMA_VERSION: i64 = 15;
 const LOCAL_ACCOUNT_ID: &str = "acc_local";
 const EVENT_PAYLOAD_VERSION_V1: i64 = 1;
 const EVENT_PAYLOAD_VERSION_V2: i64 = 2;
@@ -62,11 +68,27 @@ const MIGRATION_0012: &str = include_str!("../migrations/0012_bootstrap_audit_re
 const MIGRATION_0013: &str = include_str!("../migrations/0013_account_membership_foundation.sql");
 const MIGRATION_0014: &str =
     include_str!("../migrations/0014_account_scoped_durable_authorization.sql");
+const MIGRATION_0015: &str = include_str!("../migrations/0015_member_lifecycle_account_audit.sql");
 const RECOVERY_BATCH_LIMIT: i64 = 64;
 const AUTH_SESSION_CLEANUP_BATCH_LIMIT: i64 = 64;
 const BOOTSTRAP_AUDIT_ROLLUP_BATCH_LIMIT: i64 = 64;
 const BOOTSTRAP_AUDIT_ZERO_DIGEST: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
+const ACCOUNT_AUDIT_ZERO_DIGEST: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+const ACCOUNT_AUDIT_EVENT_DOMAIN: &[u8] = b"zeus.account-audit-event.v1\0";
+const ACCOUNT_AUDIT_ROLLUP_DOMAIN: &[u8] = b"zeus.account-audit-rollup.v1\0";
+const ACCOUNT_AUDIT_PAGE_MAX_LIMIT: usize = 256;
+const ACCOUNT_MEMBER_PAGE_MAX_LIMIT: usize = 100;
+const ACCOUNT_AUDIT_METADATA_MAX_BYTES: usize = 8 * 1024;
+// A syntactically valid Argon2id record with a 16-byte salt and a deliberately
+// unissued all-zero 32-byte output. No setup path accepts this sentinel as a
+// new credential; pending members stay non-loginable while parsing remains
+// indistinguishable from a normal supported record.
+const PENDING_MEMBER_PASSWORD_HASH: &str = concat!(
+    "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+);
 const REPLY_JOB_ID_MAX_BYTES: usize = 384;
 const REPLY_REQUEST_JSON_MAX_BYTES: usize = 512 * 1024;
 const REPLY_RESPONSE_JSON_MAX_BYTES: usize = 512 * 1024;
@@ -829,6 +851,22 @@ impl SqliteStore {
             .await
     }
 
+    /// Atomically revalidates the current login authority and returns the job
+    /// only when it belongs to the same account. Foreign jobs are concealed as
+    /// absent from the same SQLite snapshot.
+    pub async fn reply_job_for_actor(
+        &self,
+        context: &AuthzContext,
+        job_id: &str,
+    ) -> Result<Option<ReplyJob>, StorageError> {
+        let context = validated_authz_context(context)?;
+        let job_id = normalized_reply_value(job_id, "reply job ID")?.to_owned();
+        self.with_connection(move |connection| {
+            query_reply_job_for_actor(connection, &context, &job_id)
+        })
+        .await
+    }
+
     /// Claims at most one queued reply. The committed `started` transition is
     /// the authorization boundary for provider execution.
     pub async fn claim_next_reply(&self) -> Result<ReplyClaimOutcome, StorageError> {
@@ -1145,9 +1183,161 @@ impl SqliteStore {
         .await
     }
 
+    pub async fn get_member(
+        &self,
+        context: &AuthzContext,
+        user_id: &str,
+    ) -> Result<StoredMember, StorageError> {
+        let context = validated_authz_context(context)?;
+        let user_id = normalized_account_value(user_id, "member user ID", 128)?.to_owned();
+        self.with_connection(move |connection| {
+            query_member_for_admin(connection, &context, &user_id)
+        })
+        .await
+    }
+
+    pub async fn list_members(
+        &self,
+        context: &AuthzContext,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<StoredMemberPage, StorageError> {
+        let context = validated_authz_context(context)?;
+        let cursor = cursor.map(str::to_owned);
+        self.with_connection(move |connection| {
+            query_member_page(connection, &context, cursor.as_deref(), limit)
+        })
+        .await
+    }
+
+    pub async fn create_member(
+        &self,
+        context: &AuthzContext,
+        commit: CreateMemberCommit,
+    ) -> Result<CreateMemberResult, StorageError> {
+        let context = validated_authz_context(context)?;
+        let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            create_member(connection, &context, commit, &limits, &physical_limits)
+        })
+        .await
+    }
+
+    pub async fn rotate_member_setup_token(
+        &self,
+        context: &AuthzContext,
+        commit: RotateMemberSetupTokenCommit,
+    ) -> Result<RotateMemberSetupTokenResult, StorageError> {
+        let context = validated_authz_context(context)?;
+        let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            rotate_member_setup_token(connection, &context, commit, &limits, &physical_limits)
+        })
+        .await
+    }
+
+    pub async fn complete_member_setup(
+        &self,
+        commit: MemberSetupCommit,
+    ) -> Result<MemberSetupResult, StorageError> {
+        let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            complete_member_setup(connection, commit, &limits, &physical_limits)
+        })
+        .await
+    }
+
+    pub async fn transition_member(
+        &self,
+        context: &AuthzContext,
+        commit: TransitionMemberCommit,
+    ) -> Result<MemberTransitionResult, StorageError> {
+        let context = validated_authz_context(context)?;
+        let use_progress = commit.expected_status == StoredMembershipStatus::Active
+            && commit.role == MembershipRole::Member
+            && (commit.status == StoredMembershipStatus::Disabled
+                || commit.expected_role == MembershipRole::Owner);
+        let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
+        let operation = move |connection: &mut Connection| {
+            transition_member(connection, &context, commit, &limits, &physical_limits)
+        };
+        if use_progress {
+            self.with_progress_connection(operation).await
+        } else {
+            self.with_connection(operation).await
+        }
+    }
+
+    pub async fn account_audit_state(
+        &self,
+        context: &AuthzContext,
+    ) -> Result<AccountAuditState, StorageError> {
+        let context = validated_authz_context(context)?;
+        let limits = self.limits.clone();
+        self.with_connection(move |connection| {
+            require_current_authority(connection, &context, AccountCapability::AuditRead)?;
+            query_account_audit_state(connection, context.account_id.as_str(), &limits)
+        })
+        .await
+    }
+
+    pub async fn list_account_audit_events(
+        &self,
+        context: &AuthzContext,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<AccountAuditPage, StorageError> {
+        let context = validated_authz_context(context)?;
+        let cursor = cursor.map(str::to_owned);
+        let limits = self.limits.clone();
+        self.with_connection(move |connection| {
+            query_account_audit_page(connection, &context, cursor.as_deref(), limit, &limits)
+        })
+        .await
+    }
+
+    pub async fn update_account_audit_policy(
+        &self,
+        context: &AuthzContext,
+        commit: UpdateAccountAuditPolicyCommit,
+    ) -> Result<AccountAuditState, StorageError> {
+        let context = validated_authz_context(context)?;
+        let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
+        self.with_progress_connection(move |connection| {
+            update_account_audit_policy(connection, &context, commit, &limits, &physical_limits)
+        })
+        .await
+    }
+
+    pub async fn checkpoint_account_audit_archive(
+        &self,
+        context: &AuthzContext,
+        commit: AccountAuditCheckpointCommit,
+    ) -> Result<AccountAuditState, StorageError> {
+        let context = validated_authz_context(context)?;
+        let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
+        self.with_progress_connection(move |connection| {
+            checkpoint_account_audit_archive(
+                connection,
+                &context,
+                commit,
+                &limits,
+                &physical_limits,
+            )
+        })
+        .await
+    }
+
     pub async fn readiness(&self) -> Result<(), StorageError> {
         let expects_wal = matches!(self.backend, Backend::File(_));
         let physical_limits = self.physical_limits.clone();
+        let limits = self.limits.clone();
         self.with_connection(move |connection| {
             readiness(
                 connection,
@@ -1155,6 +1345,7 @@ impl SqliteStore {
                 expects_wal.then_some(&physical_limits),
                 true,
                 false,
+                Some(&limits),
             )
         })
         .await
@@ -2439,8 +2630,123 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
             params![14, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 15 {
+        transaction.execute_batch(MIGRATION_0015)?;
+        let detail_rows = capacity_limit(limits.account_audit_detail_rows)?;
+        let applied_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        transaction.execute(
+            r#"INSERT INTO account_audit_policies(
+                   account_id, detail_rows, legal_hold, archive_required, revision, updated_at
+               )
+               SELECT id, ?1, 0, 0, 1, ?2 FROM accounts"#,
+            params![detail_rows, applied_at],
+        )?;
+        validate_v15_migration_postflight(&transaction)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![15, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
+    validate_configured_account_audit_policies(&transaction, limits)?;
     compact_existing_bootstrap_audit_to_capacity(&transaction, &now(), limits)?;
     transaction.commit()?;
+    Ok(())
+}
+
+fn validate_configured_account_audit_policies(
+    connection: &Connection,
+    limits: &StorageLimits,
+) -> Result<(), StorageError> {
+    let configured_limit = capacity_limit(limits.account_audit_detail_rows)?;
+    let exceeding_policy = connection
+        .query_row(
+            r#"SELECT account_id, detail_rows
+               FROM account_audit_policies
+               WHERE detail_rows > ?1
+               ORDER BY account_id
+               LIMIT 1"#,
+            [configured_limit],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    if let Some((account_id, detail_rows)) = exceeding_policy {
+        return Err(StorageError::AccountAuditPolicyExceedsConfiguredLimit {
+            account_id,
+            detail_rows,
+            configured_limit,
+        });
+    }
+    Ok(())
+}
+
+fn validate_v15_migration_postflight(connection: &Connection) -> Result<(), StorageError> {
+    let account_count: i64 =
+        connection.query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0))?;
+    for (table, count) in [
+        (
+            "account_audit_rollups",
+            table_row_count_query(connection, "SELECT COUNT(*) FROM account_audit_rollups")?,
+        ),
+        (
+            "account_audit_policies",
+            table_row_count_query(connection, "SELECT COUNT(*) FROM account_audit_policies")?,
+        ),
+        (
+            "account_audit_archive_state",
+            table_row_count_query(
+                connection,
+                "SELECT COUNT(*) FROM account_audit_archive_state",
+            )?,
+        ),
+    ] {
+        if count != account_count {
+            return Err(StorageError::CorruptData(format!(
+                "schema v15 migration did not create one {table} row per account"
+            )));
+        }
+    }
+
+    let schema_object_count: i64 = connection.query_row(
+        r#"SELECT COUNT(*) FROM sqlite_schema
+           WHERE name IN (
+               'member_setup_tokens', 'account_audit_rollups',
+               'account_audit_policies', 'account_audit_archive_state',
+               'account_audit_events', 'member_setup_tokens_expiry_idx',
+               'account_audit_events_hash_idx', 'account_audit_events_time_idx',
+               'member_setup_tokens_require_pending_member',
+               'member_setup_tokens_reject_update',
+               'account_audit_events_require_chain',
+               'account_audit_events_reject_update',
+               'account_audit_events_require_rollup_before_delete',
+               'account_audit_rollups_enforce_forward_update',
+               'account_audit_rollups_reject_delete',
+               'account_audit_policies_enforce_revision',
+               'account_audit_policies_reject_delete',
+               'account_audit_archive_state_enforce_revision',
+               'account_audit_archive_state_reject_delete'
+           )"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if schema_object_count != 19 {
+        return Err(StorageError::CorruptData(
+            "schema v15 member lifecycle/audit objects are incomplete".into(),
+        ));
+    }
+
+    if connection
+        .query_row(
+            "SELECT 1 FROM pragma_foreign_key_check LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some()
+    {
+        return Err(StorageError::CorruptData(
+            "schema v15 migration introduced a foreign-key violation".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -2872,6 +3178,7 @@ fn readiness(
     physical_limits: Option<&SqlitePhysicalLimits>,
     require_admission: bool,
     deep_invariants: bool,
+    audit_admission_limits: Option<&StorageLimits>,
 ) -> Result<(), StorageError> {
     let version: i64 = connection.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
@@ -2931,12 +3238,15 @@ fn readiness(
                'session_turns', 'session_events', 'session_command_receipts',
                'users', 'auth_sessions', 'bootstrap_tokens', 'user_preferences',
                'reply_jobs', 'finalization_reservations', 'event_payload_usage',
-               'bootstrap_audit_rollup', 'accounts', 'account_memberships'
+               'bootstrap_audit_rollup', 'accounts', 'account_memberships',
+               'member_setup_tokens', 'account_audit_rollups',
+               'account_audit_policies', 'account_audit_archive_state',
+               'account_audit_events'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if table_count != 22 {
+    if table_count != 27 {
         return Err(StorageError::CorruptData(
             "one or more required tables are missing".into(),
         ));
@@ -3061,12 +3371,15 @@ fn readiness(
                'sessions_account_updated_idx',
                'runs_account_id_idx',
                'runs_account_started_idx',
-               'runs_account_incident_idx'
+               'runs_account_incident_idx',
+               'member_setup_tokens_expiry_idx',
+               'account_audit_events_hash_idx',
+               'account_audit_events_time_idx'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if point_query_indexes != 36 {
+    if point_query_indexes != 39 {
         return Err(StorageError::CorruptData(
             "one or more point-query indexes are missing".into(),
         ));
@@ -3106,6 +3419,17 @@ fn readiness(
                'idempotency_receipts_require_authority',
                'incidents_account_is_immutable',
                'incidents_require_account_on_insert',
+               'member_setup_tokens_require_pending_member',
+               'member_setup_tokens_reject_update',
+               'account_audit_events_require_chain',
+               'account_audit_events_reject_update',
+               'account_audit_events_require_rollup_before_delete',
+               'account_audit_rollups_enforce_forward_update',
+               'account_audit_rollups_reject_delete',
+               'account_audit_policies_enforce_revision',
+               'account_audit_policies_reject_delete',
+               'account_audit_archive_state_enforce_revision',
+               'account_audit_archive_state_reject_delete',
                'reply_jobs_enforce_forward_transition',
                'reply_jobs_reject_delete',
                'reply_jobs_reject_input_update',
@@ -3146,7 +3470,7 @@ fn readiness(
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 67 {
+    if trigger_count != 78 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
         ));
@@ -3168,6 +3492,10 @@ fn readiness(
     }
 
     verify_bootstrap_audit_state(connection, deep_invariants)?;
+    verify_account_audit_state(connection, deep_invariants)?;
+    if let Some(limits) = audit_admission_limits {
+        require_account_audit_capacity_readiness(connection, limits)?;
+    }
 
     if !deep_invariants {
         let (usage_rows, singleton, used_bytes): (i64, i64, i64) = connection.query_row(
@@ -3247,7 +3575,7 @@ fn readiness(
                       WHERE membership.account_id = ?1
                         AND membership.role = 'owner'
                         AND membership.status = 'active'
-                        AND user.status = 'active') <> 1
+                        AND user.status = 'active') < 1
            )"#,
         [LOCAL_ACCOUNT_ID],
         |row| row.get(0),
@@ -3320,7 +3648,10 @@ fn readiness(
                 AND job.run_id = reservation.run_id
                WHERE reservation.kind = 'dispatch'
                  AND (reservation.account_id IS NOT job.account_id
-                      OR reservation.actor_user_id IS NOT job.initiating_actor_user_id)
+                      OR reservation.actor_user_id IS NOT COALESCE(
+                          job.initiating_actor_user_id,
+                          job.approving_actor_user_id
+                      ))
            )"#,
         [],
         |row| row.get(0),
@@ -3342,9 +3673,9 @@ fn readiness(
         [LOCAL_ACCOUNT_ID],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    if user_count != 0 && owner_count != 1 {
+    if user_count != 0 && owner_count < 1 {
         return Err(StorageError::CorruptData(
-            "configured database must contain exactly one owner".into(),
+            "configured database must contain at least one active owner".into(),
         ));
     }
     let configured_legacy_boundary: i64 = connection.query_row(
@@ -3355,8 +3686,7 @@ fn readiness(
                SELECT 1 FROM idempotency_receipts WHERE actor_user_id IS NULL
                UNION ALL
                SELECT 1 FROM dispatch_jobs
-               WHERE initiating_actor_user_id IS NULL
-                  OR approving_actor_user_id IS NULL
+               WHERE approving_actor_user_id IS NULL
                UNION ALL
                SELECT 1 FROM finalization_reservations WHERE actor_user_id IS NULL
            )"#,
@@ -3551,12 +3881,203 @@ fn verify_bootstrap_audit_state(
     Ok(())
 }
 
+fn verify_account_audit_state(
+    connection: &Connection,
+    deep_invariants: bool,
+) -> Result<(), StorageError> {
+    let account_count: i64 =
+        connection.query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0))?;
+    let singleton_counts: (i64, i64, i64) = connection.query_row(
+        r#"SELECT
+               (SELECT COUNT(*) FROM account_audit_rollups),
+               (SELECT COUNT(*) FROM account_audit_policies),
+               (SELECT COUNT(*) FROM account_audit_archive_state)"#,
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if singleton_counts != (account_count, account_count, account_count) {
+        return Err(StorageError::CorruptData(
+            "account audit singleton rows do not match the account set".into(),
+        ));
+    }
+
+    let setup_token_violation: i64 = connection.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1
+               FROM member_setup_tokens token
+               JOIN users user ON user.id = token.user_id
+               JOIN accounts account ON account.id = token.account_id
+               JOIN account_memberships membership
+                 ON membership.account_id = token.account_id
+                AND membership.user_id = token.user_id
+               WHERE account.status <> 'active'
+                  OR membership.role <> 'member'
+                  OR membership.status <> 'active'
+                  OR user.status <> 'disabled'
+                  OR EXISTS (
+                      SELECT 1 FROM user_preferences preference
+                      WHERE preference.user_id = token.user_id
+                  )
+                  OR unixepoch(token.expires_at) - unixepoch(token.created_at) <> ?1
+           )"#,
+        [MEMBER_SETUP_TOKEN_TTL_SECONDS],
+        |row| row.get(0),
+    )?;
+    if setup_token_violation != 0 {
+        return Err(StorageError::CorruptData(
+            "one or more member setup tokens cross their pending-member boundary".into(),
+        ));
+    }
+
+    let global_rows: i64 =
+        connection.query_row("SELECT COUNT(*) FROM account_audit_events", [], |row| {
+            row.get(0)
+        })?;
+    if global_rows > capacity_limit(StorageLimits::HARD_CEILINGS.account_audit_rows_global)? {
+        return Err(StorageError::CorruptData(
+            "account audit detail exceeds the global hard ceiling".into(),
+        ));
+    }
+
+    let mut account_statement = connection.prepare("SELECT id FROM accounts ORDER BY id")?;
+    let account_ids = account_statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(account_statement);
+    for account_id in account_ids {
+        let (through_sequence, event_count, digest, last_event_hash): (i64, i64, String, String) =
+            connection.query_row(
+                r#"SELECT through_sequence, event_count, digest, last_event_hash
+               FROM account_audit_rollups WHERE account_id = ?1"#,
+                [&account_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        let (detail_rows, legal_hold, archive_required): (i64, i64, i64) = connection.query_row(
+            r#"SELECT detail_rows, legal_hold, archive_required
+                   FROM account_audit_policies WHERE account_id = ?1"#,
+            [&account_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let (archive_through, archive_hash, archive_reference): (i64, String, Option<String>) =
+            connection.query_row(
+                r#"SELECT through_sequence, event_hash, archive_reference
+               FROM account_audit_archive_state WHERE account_id = ?1"#,
+                [&account_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        if through_sequence < 0
+            || through_sequence != event_count
+            || !is_lower_hex_digest(&digest)
+            || !is_lower_hex_digest(&last_event_hash)
+            || (through_sequence == 0
+                && (digest != ACCOUNT_AUDIT_ZERO_DIGEST
+                    || last_event_hash != ACCOUNT_AUDIT_ZERO_DIGEST))
+            || !(1..=capacity_limit(StorageLimits::HARD_CEILINGS.account_audit_detail_rows)?)
+                .contains(&detail_rows)
+            || !matches!(legal_hold, 0 | 1)
+            || !matches!(archive_required, 0 | 1)
+            || archive_through < 0
+            || !is_lower_hex_digest(&archive_hash)
+            || (archive_through == 0
+                && (archive_hash != ACCOUNT_AUDIT_ZERO_DIGEST || archive_reference.is_some()))
+            || (archive_through > 0 && archive_reference.is_none())
+        {
+            return Err(StorageError::CorruptData(format!(
+                "account audit roots are structurally inconsistent for `{account_id}`"
+            )));
+        }
+
+        let sql = format!(
+            r#"{ACCOUNT_AUDIT_EVENT_SELECT}
+               WHERE account_id = ?1 ORDER BY sequence"#
+        );
+        let mut event_statement = connection.prepare(&sql)?;
+        let rows = event_statement
+            .query_map([&account_id], decode_account_audit_event_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(event_statement);
+        if rows.len() > StorageLimits::HARD_CEILINGS.account_audit_rows_per_account {
+            return Err(StorageError::CorruptData(format!(
+                "account audit detail exceeds the account hard ceiling for `{account_id}`"
+            )));
+        }
+        let mut expected_sequence = through_sequence
+            .checked_add(1)
+            .ok_or(StorageError::IntegerOutOfRange("account audit sequence"))?;
+        let mut expected_previous_hash = last_event_hash.clone();
+        for row in &rows {
+            if row.sequence != expected_sequence
+                || row.previous_hash != expected_previous_hash
+                || row.account_id != account_id
+            {
+                return Err(StorageError::CorruptData(format!(
+                    "account audit detailed chain is not contiguous for `{account_id}`"
+                )));
+            }
+            let metadata: Value = serde_json::from_str(&row.metadata_json)?;
+            if !metadata.is_object() {
+                return Err(StorageError::CorruptData(format!(
+                    "account audit metadata is not an object for `{account_id}`"
+                )));
+            }
+            if deep_invariants {
+                let expected_hash = account_audit_event_hash(
+                    &row.previous_hash,
+                    row.sequence,
+                    &row.account_id,
+                    row.actor_user_id.as_deref(),
+                    &row.action,
+                    &row.outcome,
+                    &row.target_kind,
+                    &row.target_id,
+                    &row.metadata_json,
+                    &row.occurred_at,
+                )?;
+                if row.event_hash != expected_hash {
+                    return Err(StorageError::CorruptData(format!(
+                        "account audit event hash is inconsistent for `{account_id}`"
+                    )));
+                }
+            }
+            expected_sequence = expected_sequence
+                .checked_add(1)
+                .ok_or(StorageError::IntegerOutOfRange("account audit sequence"))?;
+            expected_previous_hash.clone_from(&row.event_hash);
+        }
+        let tail_sequence = rows.last().map_or(through_sequence, |row| row.sequence);
+        if archive_through > tail_sequence
+            || (archive_required != 0 && archive_through < through_sequence)
+        {
+            return Err(StorageError::CorruptData(format!(
+                "account audit archive checkpoint exceeds its durable chain for `{account_id}`"
+            )));
+        }
+        if archive_through == through_sequence && archive_hash != last_event_hash {
+            return Err(StorageError::CorruptData(format!(
+                "account audit archive checkpoint does not match its rollup boundary for `{account_id}`"
+            )));
+        }
+        if archive_through > through_sequence {
+            let matching_hash = rows
+                .iter()
+                .find(|row| row.sequence == archive_through)
+                .map(|row| row.event_hash.as_str());
+            if matching_hash != Some(archive_hash.as_str()) {
+                return Err(StorageError::CorruptData(format!(
+                    "account audit archive checkpoint does not match its detailed event for `{account_id}`"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn deep_readiness(
     connection: &mut Connection,
     expects_wal: bool,
     physical_limits: Option<&SqlitePhysicalLimits>,
 ) -> Result<(), StorageError> {
-    readiness(connection, expects_wal, physical_limits, false, true)?;
+    readiness(connection, expects_wal, physical_limits, false, true, None)?;
 
     let exact_payload_counter_violation: i64 = connection.query_row(
         r#"SELECT EXISTS(
@@ -4743,9 +5264,7 @@ fn bootstrap_owner(
     )?;
     transaction.execute(
         r#"UPDATE dispatch_jobs
-           SET initiating_actor_user_id = ?1,
-               initiating_membership_revision = 1,
-               approving_actor_user_id = ?1,
+           SET approving_actor_user_id = ?1,
                approving_membership_revision = 1
            WHERE approving_actor_user_id IS NULL"#,
         [user_id],
@@ -4800,7 +5319,6 @@ fn query_credential(
                JOIN accounts account ON account.id = membership.account_id
                WHERE user.username = ?1 COLLATE NOCASE
                  AND membership.account_id = ?2
-                 AND membership.role = 'owner'
                  AND user.status = 'active'
                  AND membership.status = 'active'
                  AND account.status = 'active'"#,
@@ -5178,6 +5696,1679 @@ fn update_preferences(
     let preferences = query_preferences(&transaction, &context.user_id)?;
     transaction.commit()?;
     Ok(preferences)
+}
+
+fn decode_membership_status(value: &str) -> Result<StoredMembershipStatus, StorageError> {
+    match value {
+        "active" => Ok(StoredMembershipStatus::Active),
+        "disabled" => Ok(StoredMembershipStatus::Disabled),
+        other => Err(StorageError::CorruptData(format!(
+            "unsupported stored membership status `{other}`"
+        ))),
+    }
+}
+
+fn membership_status_label(status: StoredMembershipStatus) -> &'static str {
+    match status {
+        StoredMembershipStatus::Active => "active",
+        StoredMembershipStatus::Disabled => "disabled",
+    }
+}
+
+fn decode_member_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMemberRow> {
+    Ok(StoredMemberRow {
+        account_id: row.get(0)?,
+        user_id: row.get(1)?,
+        username: row.get(2)?,
+        role: row.get(3)?,
+        status: row.get(4)?,
+        revision: row.get(5)?,
+        setup_required: row.get::<_, i64>(6)? != 0,
+        setup_token_expires_at: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
+    })
+}
+
+struct StoredMemberRow {
+    account_id: String,
+    user_id: String,
+    username: String,
+    role: String,
+    status: String,
+    revision: i64,
+    setup_required: bool,
+    setup_token_expires_at: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl StoredMemberRow {
+    fn decode(self) -> Result<StoredMember, StorageError> {
+        Ok(StoredMember {
+            account_id: decode_account_id(self.account_id)?,
+            user_id: self.user_id,
+            username: self.username,
+            role: decode_membership_role(&self.role)?,
+            status: decode_membership_status(&self.status)?,
+            revision: decode_membership_revision(self.revision)?,
+            setup_required: self.setup_required,
+            setup_token_expires_at: self.setup_token_expires_at,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
+const MEMBER_SELECT: &str = r#"SELECT membership.account_id, membership.user_id, user.username,
+              membership.role, membership.status, membership.revision,
+              NOT EXISTS(
+                  SELECT 1 FROM user_preferences preference
+                  WHERE preference.user_id = membership.user_id
+              ) AS setup_required,
+              setup.expires_at, membership.created_at, membership.updated_at
+       FROM account_memberships membership
+       JOIN users user ON user.id = membership.user_id
+       LEFT JOIN member_setup_tokens setup
+         ON setup.account_id = membership.account_id
+        AND setup.user_id = membership.user_id"#;
+
+fn query_member_optional(
+    connection: &Connection,
+    account_id: &str,
+    user_id: &str,
+) -> Result<Option<StoredMember>, StorageError> {
+    let sql =
+        format!("{MEMBER_SELECT} WHERE membership.account_id = ?1 AND membership.user_id = ?2");
+    connection
+        .query_row(&sql, params![account_id, user_id], decode_member_row)
+        .optional()?
+        .map(StoredMemberRow::decode)
+        .transpose()
+}
+
+fn query_member(
+    connection: &Connection,
+    account_id: &str,
+    user_id: &str,
+) -> Result<StoredMember, StorageError> {
+    query_member_optional(connection, account_id, user_id)?
+        .ok_or_else(|| StorageError::MemberNotFound(user_id.to_owned()))
+}
+
+fn query_member_for_admin(
+    connection: &Connection,
+    context: &AuthzContext,
+    user_id: &str,
+) -> Result<StoredMember, StorageError> {
+    require_current_authority(connection, context, AccountCapability::AccountAdmin)?;
+    query_member(connection, context.account_id.as_str(), user_id)
+}
+
+fn query_member_page(
+    connection: &Connection,
+    context: &AuthzContext,
+    cursor_value: Option<&str>,
+    limit: usize,
+) -> Result<StoredMemberPage, StorageError> {
+    require_current_authority(connection, context, AccountCapability::AccountAdmin)?;
+    let fetch_limit = validated_read_page_limit(limit, ACCOUNT_MEMBER_PAGE_MAX_LIMIT)?;
+    let cursor = cursor_value
+        .map(|value| {
+            cursor::decode_account_members(value, context.account_id.as_str(), &context.user_id)
+        })
+        .transpose()?;
+    let sql = format!(
+        r#"{MEMBER_SELECT}
+           WHERE membership.account_id = ?1
+             AND (?2 IS NULL
+                  OR user.username COLLATE NOCASE > ?2 COLLATE NOCASE
+                  OR (user.username = ?2 COLLATE NOCASE AND user.id > ?3))
+           ORDER BY user.username COLLATE NOCASE, user.id
+           LIMIT ?4"#
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let mut items = statement
+        .query_map(
+            params![
+                context.account_id.as_str(),
+                cursor.as_ref().map(|cursor| cursor.first.as_str()),
+                cursor.as_ref().map(|cursor| cursor.second.as_str()),
+                fetch_limit,
+            ],
+            decode_member_row,
+        )?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(StoredMemberRow::decode)
+        .collect::<Result<Vec<_>, _>>()?;
+    let has_more = items.len() > limit;
+    if has_more {
+        items.pop();
+    }
+    let next_cursor = if has_more {
+        let tail = items
+            .last()
+            .expect("a page with more rows has a visible tail");
+        Some(cursor::encode_account_members(
+            context.account_id.as_str(),
+            &context.user_id,
+            &tail.username,
+            &tail.user_id,
+        )?)
+    } else {
+        None
+    };
+    Ok(StoredMemberPage { items, next_cursor })
+}
+
+fn create_member(
+    connection: &mut Connection,
+    context: &AuthzContext,
+    commit: CreateMemberCommit,
+    limits: &StorageLimits,
+    physical_limits: &SqlitePhysicalLimits,
+) -> Result<CreateMemberResult, StorageError> {
+    let user_id = normalized_account_value(&commit.user_id, "member user ID", 128)?;
+    let username = normalized_account_value(&commit.username, "member username", 64)?;
+    if username.len() < 3 {
+        return Err(StorageError::InvalidAccountData(
+            "member username must contain at least 3 bytes".into(),
+        ));
+    }
+    let setup_digest = commit.setup_token.digest().to_persistence();
+    let created = Utc::now();
+    let timestamp = created.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let expires_at = created
+        .checked_add_signed(chrono::Duration::seconds(MEMBER_SETUP_TOKEN_TTL_SECONDS))
+        .ok_or(StorageError::IntegerOutOfRange("member setup token expiry"))?
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_current_authority(&transaction, context, AccountCapability::AccountAdmin)?;
+
+    if let Some(existing) =
+        query_member_optional(&transaction, context.account_id.as_str(), user_id)?
+    {
+        let stored_digest = transaction
+            .query_row(
+                r#"SELECT token_digest FROM member_setup_tokens
+                   WHERE account_id = ?1 AND user_id = ?2"#,
+                params![context.account_id.as_str(), user_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if existing.username.eq_ignore_ascii_case(username)
+            && existing.role == MembershipRole::Member
+            && existing.status == StoredMembershipStatus::Active
+            && existing.setup_required
+            && stored_digest.as_deref() == Some(setup_digest.as_str())
+        {
+            transaction.commit()?;
+            return Ok(CreateMemberResult {
+                member: existing,
+                replayed: true,
+            });
+        }
+        return Err(StorageError::MemberAlreadyExists(user_id.to_owned()));
+    }
+    if transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 OR username = ?2 COLLATE NOCASE)",
+        params![user_id, username],
+        |row| row.get::<_, i64>(0),
+    )? != 0
+    {
+        return Err(StorageError::MemberAlreadyExists(username.to_owned()));
+    }
+
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Admission,
+    )?;
+    prepare_account_audit_admission(
+        &transaction,
+        context.account_id.as_str(),
+        AuditAdmission::General,
+        limits,
+        &timestamp,
+    )?;
+    transaction.execute(
+        r#"INSERT INTO users(
+               id, username, role, status, password_hash, created_at, updated_at
+           ) VALUES (?1, ?2, 'member', 'disabled', ?3, ?4, ?4)"#,
+        params![user_id, username, PENDING_MEMBER_PASSWORD_HASH, timestamp,],
+    )?;
+    transaction.execute(
+        r#"INSERT INTO account_memberships(
+               account_id, user_id, role, status, revision, created_at, updated_at
+           ) VALUES (?1, ?2, 'member', 'active', 1, ?3, ?3)"#,
+        params![context.account_id.as_str(), user_id, timestamp],
+    )?;
+    transaction.execute(
+        r#"INSERT INTO member_setup_tokens(
+               token_digest, account_id, user_id, created_by_user_id,
+               created_at, expires_at
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+        params![
+            setup_digest,
+            context.account_id.as_str(),
+            user_id,
+            context.user_id,
+            timestamp,
+            expires_at,
+        ],
+    )?;
+    append_account_audit_event(
+        &transaction,
+        context.account_id.as_str(),
+        AccountAuditEventInput {
+            actor_user_id: Some(&context.user_id),
+            action: "member.created",
+            target_kind: "member",
+            target_id: user_id,
+            metadata: json!({
+                "role": "member",
+                "status": "active",
+                "setup_token_expires_at": expires_at,
+            }),
+        },
+        &timestamp,
+    )?;
+    let member = query_member(&transaction, context.account_id.as_str(), user_id)?;
+    transaction.commit()?;
+    Ok(CreateMemberResult {
+        member,
+        replayed: false,
+    })
+}
+
+fn rotate_member_setup_token(
+    connection: &mut Connection,
+    context: &AuthzContext,
+    commit: RotateMemberSetupTokenCommit,
+    limits: &StorageLimits,
+    physical_limits: &SqlitePhysicalLimits,
+) -> Result<RotateMemberSetupTokenResult, StorageError> {
+    let user_id = normalized_account_value(&commit.user_id, "member user ID", 128)?;
+    let setup_digest = commit.setup_token.digest().to_persistence();
+    let created = Utc::now();
+    let timestamp = created.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let expires_at = created
+        .checked_add_signed(chrono::Duration::seconds(MEMBER_SETUP_TOKEN_TTL_SECONDS))
+        .ok_or(StorageError::IntegerOutOfRange("member setup token expiry"))?
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_current_authority(&transaction, context, AccountCapability::AccountAdmin)?;
+    let member = query_member(&transaction, context.account_id.as_str(), user_id)?;
+    if member.revision != commit.expected_revision {
+        return Err(StorageError::MembershipRevisionConflict);
+    }
+    let user_status: String =
+        transaction.query_row("SELECT status FROM users WHERE id = ?1", [user_id], |row| {
+            row.get(0)
+        })?;
+    if user_status != "disabled" {
+        return Err(StorageError::MemberSetupAlreadyCompleted);
+    }
+    if member.role != MembershipRole::Member
+        || member.status != StoredMembershipStatus::Active
+        || !member.setup_required
+    {
+        return Err(StorageError::InvalidMemberSetupToken);
+    }
+    let current_digest = transaction
+        .query_row(
+            r#"SELECT token_digest FROM member_setup_tokens
+               WHERE account_id = ?1 AND user_id = ?2"#,
+            params![context.account_id.as_str(), user_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if current_digest.as_deref() == Some(setup_digest.as_str()) {
+        transaction.commit()?;
+        return Ok(RotateMemberSetupTokenResult {
+            member,
+            replayed: true,
+        });
+    }
+
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Admission,
+    )?;
+    prepare_account_audit_admission(
+        &transaction,
+        context.account_id.as_str(),
+        AuditAdmission::General,
+        limits,
+        &timestamp,
+    )?;
+    transaction.execute(
+        "DELETE FROM member_setup_tokens WHERE account_id = ?1 AND user_id = ?2",
+        params![context.account_id.as_str(), user_id],
+    )?;
+    transaction.execute(
+        r#"INSERT INTO member_setup_tokens(
+               token_digest, account_id, user_id, created_by_user_id,
+               created_at, expires_at
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+        params![
+            setup_digest,
+            context.account_id.as_str(),
+            user_id,
+            context.user_id,
+            timestamp,
+            expires_at,
+        ],
+    )?;
+    append_account_audit_event(
+        &transaction,
+        context.account_id.as_str(),
+        AccountAuditEventInput {
+            actor_user_id: Some(&context.user_id),
+            action: "member.setup_token_rotated",
+            target_kind: "member",
+            target_id: user_id,
+            metadata: json!({ "setup_token_expires_at": expires_at }),
+        },
+        &timestamp,
+    )?;
+    let member = query_member(&transaction, context.account_id.as_str(), user_id)?;
+    transaction.commit()?;
+    Ok(RotateMemberSetupTokenResult {
+        member,
+        replayed: false,
+    })
+}
+
+fn complete_member_setup(
+    connection: &mut Connection,
+    commit: MemberSetupCommit,
+    limits: &StorageLimits,
+    physical_limits: &SqlitePhysicalLimits,
+) -> Result<MemberSetupResult, StorageError> {
+    let setup_digest = commit.setup_token.digest().to_persistence();
+    let password_hash = normalized_password_hash(&commit.password_hash)?;
+    let session_token_hash =
+        normalized_token_hash(&commit.session_token_hash, "session token hash")?;
+    let csrf_hash = normalized_token_hash(&commit.csrf_hash, "CSRF token hash")?;
+    let session_expires_at = normalized_timestamp(&commit.session_expires_at, "session expiry")?;
+    let timestamp = now();
+    if session_expires_at <= timestamp.as_str() {
+        return Err(StorageError::InvalidAccountData(
+            "session expiry must be in the future".into(),
+        ));
+    }
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let pending = transaction
+        .query_row(
+            r#"SELECT token.account_id, token.user_id, token.expires_at,
+                      membership.role, membership.status, membership.revision,
+                      user.status
+               FROM member_setup_tokens token
+               JOIN accounts account ON account.id = token.account_id
+               JOIN account_memberships membership
+                 ON membership.account_id = token.account_id
+                AND membership.user_id = token.user_id
+               JOIN users user ON user.id = token.user_id
+               WHERE token.token_digest = ?1 AND account.status = 'active'"#,
+            [&setup_digest],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((account_id, user_id, token_expires_at, role, status, revision, user_status)) =
+        pending
+    else {
+        return Err(StorageError::InvalidMemberSetupToken);
+    };
+    if token_expires_at <= timestamp {
+        return Err(StorageError::MemberSetupExpired);
+    }
+    if user_status != "disabled" {
+        return Err(StorageError::MemberSetupAlreadyCompleted);
+    }
+    if transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM user_preferences WHERE user_id = ?1)",
+        [&user_id],
+        |row| row.get::<_, i64>(0),
+    )? != 0
+    {
+        return Err(StorageError::MemberSetupAlreadyCompleted);
+    }
+    let membership_role = decode_membership_role(&role)?;
+    let membership_status = decode_membership_status(&status)?;
+    let membership_revision = decode_membership_revision(revision)?;
+    if membership_role != MembershipRole::Member
+        || membership_status != StoredMembershipStatus::Active
+    {
+        return Err(StorageError::InvalidMemberSetupToken);
+    }
+
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Admission,
+    )?;
+    prepare_account_audit_admission(
+        &transaction,
+        &account_id,
+        AuditAdmission::General,
+        limits,
+        &timestamp,
+    )?;
+    cleanup_unusable_auth_sessions_in_transaction(&transaction, &timestamp, Some(&user_id))?;
+    require_auth_session_capacity(&transaction, &user_id, &timestamp, limits)?;
+    let changed = transaction.execute(
+        r#"UPDATE users
+           SET password_hash = ?1, status = 'active', updated_at = ?2
+           WHERE id = ?3 AND status = 'disabled'"#,
+        params![password_hash, timestamp, user_id],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::MemberSetupAlreadyCompleted);
+    }
+    transaction.execute(
+        r#"INSERT INTO user_preferences(
+               user_id, theme, preferred_model, revision, updated_at
+           ) VALUES (?1, 'system', NULL, 1, ?2)"#,
+        params![user_id, timestamp],
+    )?;
+    let consumed = transaction.execute(
+        "DELETE FROM member_setup_tokens WHERE token_digest = ?1",
+        [&setup_digest],
+    )?;
+    if consumed != 1 {
+        return Err(StorageError::InvalidMemberSetupToken);
+    }
+    insert_auth_session(
+        &transaction,
+        &AuthSessionInsert {
+            auth_session_id: commit.auth_session_id.as_str(),
+            account_id: &account_id,
+            user_id: &user_id,
+            membership_revision: membership_revision.get(),
+            token_hash: session_token_hash,
+            csrf_hash,
+            expires_at: session_expires_at,
+            timestamp: &timestamp,
+        },
+    )?;
+    append_account_audit_event(
+        &transaction,
+        &account_id,
+        AccountAuditEventInput {
+            actor_user_id: Some(&user_id),
+            action: "member.setup_completed",
+            target_kind: "member",
+            target_id: &user_id,
+            metadata: json!({ "membership_revision": membership_revision.get() }),
+        },
+        &timestamp,
+    )?;
+    let member = query_member(&transaction, &account_id, &user_id)?;
+    let user = query_user(&transaction, &user_id)?;
+    let principal = AuthPrincipal {
+        user,
+        authz: AuthzContext {
+            account_id: decode_account_id(account_id)?,
+            user_id,
+            membership_role,
+            membership_revision,
+            auth_session_id: commit.auth_session_id,
+        },
+        csrf_hash: csrf_hash.to_owned(),
+        expires_at: session_expires_at.to_owned(),
+    };
+    transaction.commit()?;
+    Ok(MemberSetupResult { principal, member })
+}
+
+fn transition_member(
+    connection: &mut Connection,
+    context: &AuthzContext,
+    commit: TransitionMemberCommit,
+    limits: &StorageLimits,
+    physical_limits: &SqlitePhysicalLimits,
+) -> Result<MemberTransitionResult, StorageError> {
+    let user_id = normalized_account_value(&commit.user_id, "member user ID", 128)?;
+    let timestamp = now();
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_current_authority(&transaction, context, AccountCapability::AccountAdmin)?;
+    let current = query_member(&transaction, context.account_id.as_str(), user_id)?;
+
+    if current.revision != commit.expected_revision {
+        let replay_revision = commit
+            .expected_revision
+            .get()
+            .checked_add(1)
+            .and_then(|revision| MembershipRevision::new(revision).ok());
+        if replay_revision == Some(current.revision)
+            && current.role == commit.role
+            && current.status == commit.status
+        {
+            let in_flight =
+                query_in_flight_work(&transaction, context.account_id.as_str(), user_id)?;
+            transaction.commit()?;
+            return Ok(MemberTransitionResult {
+                member: current,
+                replayed: true,
+                revoked_auth_sessions: 0,
+                revoked_setup_tokens: 0,
+                in_flight,
+            });
+        }
+        return Err(StorageError::MembershipRevisionConflict);
+    }
+    if current.role != commit.expected_role || current.status != commit.expected_status {
+        return Err(StorageError::MembershipRevisionConflict);
+    }
+    if current.role == commit.role && current.status == commit.status {
+        let in_flight = query_in_flight_work(&transaction, context.account_id.as_str(), user_id)?;
+        transaction.commit()?;
+        return Ok(MemberTransitionResult {
+            member: current,
+            replayed: true,
+            revoked_auth_sessions: 0,
+            revoked_setup_tokens: 0,
+            in_flight,
+        });
+    }
+
+    let user_state: (String, i64) = transaction.query_row(
+        r#"SELECT user.status,
+                  EXISTS(SELECT 1 FROM user_preferences preference
+                         WHERE preference.user_id = user.id)
+           FROM users user WHERE user.id = ?1"#,
+        [user_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let setup_completed = user_state.1 != 0;
+    if commit.role == MembershipRole::Owner
+        && (commit.status != StoredMembershipStatus::Active || !setup_completed)
+    {
+        return Err(StorageError::InvalidAccountData(
+            "an owner membership must be active and have completed setup".into(),
+        ));
+    }
+    let removes_active_owner = current.role == MembershipRole::Owner
+        && current.status == StoredMembershipStatus::Active
+        && (commit.role != MembershipRole::Owner
+            || commit.status != StoredMembershipStatus::Active);
+    if removes_active_owner {
+        let active_owner_count: i64 = transaction.query_row(
+            r#"SELECT COUNT(*) FROM account_memberships
+               WHERE account_id = ?1 AND role = 'owner' AND status = 'active'"#,
+            [context.account_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if active_owner_count <= 1 {
+            return Err(StorageError::LastAccountOwner);
+        }
+    }
+
+    let revokes_authority = current.status == StoredMembershipStatus::Active
+        && (commit.status == StoredMembershipStatus::Disabled
+            || (current.role == MembershipRole::Owner && commit.role == MembershipRole::Member));
+    let (physical_gate, admission) = if revokes_authority {
+        (
+            PhysicalCapacityGate::ReservedProgress,
+            AuditAdmission::Progress,
+        )
+    } else {
+        (PhysicalCapacityGate::Admission, AuditAdmission::General)
+    };
+    require_connection_physical_capacity(&transaction, physical_limits, physical_gate)?;
+    prepare_account_audit_admission(
+        &transaction,
+        context.account_id.as_str(),
+        admission,
+        limits,
+        &timestamp,
+    )?;
+
+    let next_revision = current
+        .revision
+        .get()
+        .checked_add(1)
+        .ok_or(StorageError::IntegerOutOfRange("membership revision"))?;
+    let changed = transaction.execute(
+        r#"UPDATE account_memberships
+           SET role = ?1, status = ?2, revision = ?3, updated_at = ?4
+           WHERE account_id = ?5 AND user_id = ?6 AND revision = ?7"#,
+        params![
+            commit.role.as_str(),
+            membership_status_label(commit.status),
+            u64_to_i64(next_revision, "membership revision")?,
+            timestamp,
+            context.account_id.as_str(),
+            user_id,
+            u64_to_i64(current.revision.get(), "membership revision")?,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::MembershipRevisionConflict);
+    }
+
+    let user_status = if commit.status == StoredMembershipStatus::Disabled {
+        "disabled"
+    } else if setup_completed {
+        "active"
+    } else {
+        "disabled"
+    };
+    transaction.execute(
+        r#"UPDATE users SET role = ?1, status = ?2, updated_at = ?3 WHERE id = ?4"#,
+        params![commit.role.as_str(), user_status, timestamp, user_id],
+    )?;
+    let revoked_auth_sessions = transaction.execute(
+        "DELETE FROM auth_sessions WHERE account_id = ?1 AND user_id = ?2",
+        params![context.account_id.as_str(), user_id],
+    )?;
+    let revoked_setup_tokens = transaction.execute(
+        "DELETE FROM member_setup_tokens WHERE account_id = ?1 AND user_id = ?2",
+        params![context.account_id.as_str(), user_id],
+    )?;
+    let in_flight = query_in_flight_work(&transaction, context.account_id.as_str(), user_id)?;
+
+    let action = if current.status == StoredMembershipStatus::Active
+        && commit.status == StoredMembershipStatus::Disabled
+    {
+        "member.disabled"
+    } else if current.status == StoredMembershipStatus::Disabled
+        && commit.status == StoredMembershipStatus::Active
+    {
+        "member.enabled"
+    } else {
+        "member.role_changed"
+    };
+    append_account_audit_event(
+        &transaction,
+        context.account_id.as_str(),
+        AccountAuditEventInput {
+            actor_user_id: Some(&context.user_id),
+            action,
+            target_kind: "member",
+            target_id: user_id,
+            metadata: json!({
+                "from": {
+                    "role": current.role.as_str(),
+                    "status": membership_status_label(current.status),
+                    "revision": current.revision.get(),
+                },
+                "to": {
+                    "role": commit.role.as_str(),
+                    "status": membership_status_label(commit.status),
+                    "revision": next_revision,
+                },
+                "revoked_auth_sessions": revoked_auth_sessions,
+                "revoked_setup_tokens": revoked_setup_tokens,
+                "in_flight_reply_jobs": in_flight.reply_job_ids.len(),
+                "in_flight_dispatch_jobs": in_flight.dispatch_call_ids.len(),
+            }),
+        },
+        &timestamp,
+    )?;
+    let member = query_member(&transaction, context.account_id.as_str(), user_id)?;
+    transaction.commit()?;
+    Ok(MemberTransitionResult {
+        member,
+        replayed: false,
+        revoked_auth_sessions: u64::try_from(revoked_auth_sessions)
+            .map_err(|_| StorageError::IntegerOutOfRange("revoked authentication sessions"))?,
+        revoked_setup_tokens: u64::try_from(revoked_setup_tokens)
+            .map_err(|_| StorageError::IntegerOutOfRange("revoked setup tokens"))?,
+        in_flight,
+    })
+}
+
+fn query_in_flight_work(
+    connection: &Connection,
+    account_id: &str,
+    user_id: &str,
+) -> Result<InFlightWorkSummary, StorageError> {
+    let mut reply_statement = connection.prepare(
+        r#"SELECT id FROM reply_jobs
+           WHERE account_id = ?1 AND actor_user_id = ?2 AND status = 'started'
+           ORDER BY id"#,
+    )?;
+    let reply_job_ids = reply_statement
+        .query_map(params![account_id, user_id], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+    let mut dispatch_statement = connection.prepare(
+        r#"SELECT call_id FROM dispatch_jobs
+           WHERE account_id = ?1 AND status = 'started'
+             AND (initiating_actor_user_id = ?2 OR approving_actor_user_id = ?2)
+           ORDER BY call_id"#,
+    )?;
+    let dispatch_call_ids = dispatch_statement
+        .query_map(params![account_id, user_id], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+    Ok(InFlightWorkSummary {
+        reply_job_ids,
+        dispatch_call_ids,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuditAdmission {
+    General,
+    Progress,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuditCompactionOutcome {
+    NotNeeded,
+    Compacted,
+    BlockedByLegalHold,
+    BlockedByArchive,
+}
+
+fn account_audit_compaction_error(outcome: AuditCompactionOutcome) -> StorageError {
+    match outcome {
+        AuditCompactionOutcome::BlockedByLegalHold => StorageError::AuditLegalHold,
+        AuditCompactionOutcome::BlockedByArchive => StorageError::AuditArchiveRequired,
+        AuditCompactionOutcome::NotNeeded | AuditCompactionOutcome::Compacted => {
+            StorageError::AuditStorageExhausted
+        }
+    }
+}
+
+/// Evaluates the next compaction without changing the rollup or detailed rows.
+/// Readiness uses this to distinguish a full-but-recoverable window from a
+/// full window held in place by legal hold or a missing archive checkpoint.
+fn inspect_account_audit_compaction(
+    connection: &Connection,
+    account_id: &str,
+    limits: &StorageLimits,
+) -> Result<AuditCompactionOutcome, StorageError> {
+    let (detail_rows, legal_hold, archive_required, archive_through): (i64, i64, i64, i64) =
+        connection.query_row(
+            r#"SELECT policy.detail_rows, policy.legal_hold, policy.archive_required,
+                      archive.through_sequence
+               FROM account_audit_policies policy
+               JOIN account_audit_archive_state archive
+                 ON archive.account_id = policy.account_id
+               WHERE policy.account_id = ?1"#,
+            [account_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+    let detailed_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM account_audit_events WHERE account_id = ?1",
+        [account_id],
+        |row| row.get(0),
+    )?;
+    if detailed_count < detail_rows {
+        return Ok(AuditCompactionOutcome::NotNeeded);
+    }
+    if legal_hold != 0 {
+        return Ok(AuditCompactionOutcome::BlockedByLegalHold);
+    }
+    let desired = detailed_count
+        .checked_add(1)
+        .and_then(|value| value.checked_sub(detail_rows))
+        .ok_or(StorageError::IntegerOutOfRange(
+            "account audit compaction target",
+        ))?;
+    let batch_size = desired
+        .min(capacity_limit(limits.account_audit_compaction_batch)?)
+        .max(1);
+    if archive_required != 0 {
+        let tail: Option<i64> = connection
+            .query_row(
+                r#"SELECT sequence FROM account_audit_events
+                   WHERE account_id = ?1
+                   ORDER BY sequence LIMIT 1 OFFSET ?2"#,
+                params![account_id, batch_size - 1],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let tail = tail.ok_or_else(|| {
+            StorageError::CorruptData(
+                "the account audit compaction window has no durable tail".into(),
+            )
+        })?;
+        if archive_through < tail {
+            return Ok(AuditCompactionOutcome::BlockedByArchive);
+        }
+    }
+    Ok(AuditCompactionOutcome::Compacted)
+}
+
+fn require_account_audit_capacity_readiness(
+    connection: &Connection,
+    limits: &StorageLimits,
+) -> Result<(), StorageError> {
+    let account_ordinary = capacity_limit(
+        limits
+            .account_audit_rows_per_account
+            .checked_sub(limits.account_audit_progress_rows_per_account)
+            .ok_or(StorageError::IntegerOutOfRange(
+                "account audit ordinary capacity",
+            ))?,
+    )?;
+    let global_ordinary = capacity_limit(
+        limits
+            .account_audit_rows_global
+            .checked_sub(limits.account_audit_progress_rows_global)
+            .ok_or(StorageError::IntegerOutOfRange(
+                "global audit ordinary capacity",
+            ))?,
+    )?;
+    let global_count: i64 =
+        connection.query_row("SELECT COUNT(*) FROM account_audit_events", [], |row| {
+            row.get(0)
+        })?;
+    let global_full = global_count >= global_ordinary;
+    let mut statement = connection.prepare(
+        r#"SELECT account.id, COUNT(event.sequence)
+           FROM accounts account
+           LEFT JOIN account_audit_events event ON event.account_id = account.id
+           GROUP BY account.id ORDER BY account.id"#,
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    let mut global_compactable = false;
+    let mut global_legal_hold = false;
+    let mut global_archive_required = false;
+    for (account_id, account_count) in rows {
+        let account_full = account_count >= account_ordinary;
+        if !account_full && !global_full {
+            continue;
+        }
+        let outcome = inspect_account_audit_compaction(connection, &account_id, limits)?;
+        if account_full && outcome != AuditCompactionOutcome::Compacted {
+            return Err(account_audit_compaction_error(outcome));
+        }
+        if global_full {
+            match outcome {
+                AuditCompactionOutcome::Compacted => global_compactable = true,
+                AuditCompactionOutcome::BlockedByLegalHold => global_legal_hold = true,
+                AuditCompactionOutcome::BlockedByArchive => global_archive_required = true,
+                AuditCompactionOutcome::NotNeeded => {}
+            }
+        }
+    }
+    if global_full && !global_compactable {
+        return Err(if global_legal_hold {
+            StorageError::AuditLegalHold
+        } else if global_archive_required {
+            StorageError::AuditArchiveRequired
+        } else {
+            StorageError::AuditStorageExhausted
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct AccountAuditEventRow {
+    account_id: String,
+    sequence: i64,
+    actor_user_id: Option<String>,
+    action: String,
+    outcome: String,
+    target_kind: String,
+    target_id: String,
+    metadata_json: String,
+    occurred_at: String,
+    previous_hash: String,
+    event_hash: String,
+}
+
+impl AccountAuditEventRow {
+    fn decode(self) -> Result<AccountAuditEvent, StorageError> {
+        Ok(AccountAuditEvent {
+            account_id: decode_account_id(self.account_id)?,
+            sequence: i64_to_u64(self.sequence, "account audit sequence")?,
+            actor_user_id: self.actor_user_id,
+            action: self.action,
+            outcome: self.outcome,
+            target_kind: self.target_kind,
+            target_id: self.target_id,
+            metadata: serde_json::from_str(&self.metadata_json)?,
+            occurred_at: self.occurred_at,
+            previous_hash: self.previous_hash,
+            event_hash: self.event_hash,
+        })
+    }
+}
+
+fn decode_account_audit_event_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<AccountAuditEventRow> {
+    Ok(AccountAuditEventRow {
+        account_id: row.get(0)?,
+        sequence: row.get(1)?,
+        actor_user_id: row.get(2)?,
+        action: row.get(3)?,
+        outcome: row.get(4)?,
+        target_kind: row.get(5)?,
+        target_id: row.get(6)?,
+        metadata_json: row.get(7)?,
+        occurred_at: row.get(8)?,
+        previous_hash: row.get(9)?,
+        event_hash: row.get(10)?,
+    })
+}
+
+const ACCOUNT_AUDIT_EVENT_SELECT: &str = r#"SELECT account_id, sequence, actor_user_id, action, outcome,
+              target_kind, target_id, metadata_json, occurred_at,
+              previous_hash, event_hash
+       FROM account_audit_events"#;
+
+fn prepare_account_audit_admission(
+    connection: &Connection,
+    account_id: &str,
+    admission: AuditAdmission,
+    limits: &StorageLimits,
+    timestamp: &str,
+) -> Result<(), StorageError> {
+    let compaction = compact_account_audit_once(connection, account_id, limits, timestamp)?;
+    let account_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM account_audit_events WHERE account_id = ?1",
+        [account_id],
+        |row| row.get(0),
+    )?;
+    let global_count: i64 =
+        connection.query_row("SELECT COUNT(*) FROM account_audit_events", [], |row| {
+            row.get(0)
+        })?;
+    let account_hard = capacity_limit(limits.account_audit_rows_per_account)?;
+    let global_hard = capacity_limit(limits.account_audit_rows_global)?;
+    let account_progress = capacity_limit(limits.account_audit_progress_rows_per_account)?;
+    let global_progress = capacity_limit(limits.account_audit_progress_rows_global)?;
+    let (account_limit, global_limit) =
+        match admission {
+            AuditAdmission::General => {
+                (
+                    account_hard.checked_sub(account_progress).ok_or(
+                        StorageError::IntegerOutOfRange("account audit ordinary capacity"),
+                    )?,
+                    global_hard.checked_sub(global_progress).ok_or(
+                        StorageError::IntegerOutOfRange("global audit ordinary capacity"),
+                    )?,
+                )
+            }
+            AuditAdmission::Progress => (account_hard, global_hard),
+        };
+    if account_count >= account_limit || global_count >= global_limit {
+        return Err(account_audit_compaction_error(compaction));
+    }
+    Ok(())
+}
+
+fn compact_account_audit_once(
+    connection: &Connection,
+    account_id: &str,
+    limits: &StorageLimits,
+    timestamp: &str,
+) -> Result<AuditCompactionOutcome, StorageError> {
+    let (detail_rows, legal_hold, archive_required): (i64, i64, i64) = connection.query_row(
+        r#"SELECT detail_rows, legal_hold, archive_required
+           FROM account_audit_policies WHERE account_id = ?1"#,
+        [account_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let detailed_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM account_audit_events WHERE account_id = ?1",
+        [account_id],
+        |row| row.get(0),
+    )?;
+    if detailed_count < detail_rows {
+        return Ok(AuditCompactionOutcome::NotNeeded);
+    }
+    if legal_hold != 0 {
+        return Ok(AuditCompactionOutcome::BlockedByLegalHold);
+    }
+    let desired = detailed_count
+        .checked_add(1)
+        .and_then(|value| value.checked_sub(detail_rows))
+        .ok_or(StorageError::IntegerOutOfRange(
+            "account audit compaction target",
+        ))?;
+    let batch_limit = capacity_limit(limits.account_audit_compaction_batch)?;
+    let batch_size = desired.min(batch_limit).max(1);
+    compact_account_audit_batch(
+        connection,
+        account_id,
+        batch_size,
+        archive_required != 0,
+        timestamp,
+    )
+}
+
+fn compact_account_audit_batch(
+    connection: &Connection,
+    account_id: &str,
+    batch_size: i64,
+    archive_required: bool,
+    timestamp: &str,
+) -> Result<AuditCompactionOutcome, StorageError> {
+    if batch_size <= 0 {
+        return Ok(AuditCompactionOutcome::NotNeeded);
+    }
+    let (through_sequence, event_count, previous_digest, previous_event_hash): (
+        i64,
+        i64,
+        String,
+        String,
+    ) = connection.query_row(
+        r#"SELECT through_sequence, event_count, digest, last_event_hash
+           FROM account_audit_rollups WHERE account_id = ?1"#,
+        [account_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    if through_sequence != event_count
+        || !is_lower_hex_digest(&previous_digest)
+        || !is_lower_hex_digest(&previous_event_hash)
+    {
+        return Err(StorageError::CorruptData(
+            "the account audit rollup is structurally inconsistent".into(),
+        ));
+    }
+    let sql = format!(
+        r#"{ACCOUNT_AUDIT_EVENT_SELECT}
+           WHERE account_id = ?1 AND sequence > ?2
+           ORDER BY sequence LIMIT ?3"#
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement
+        .query_map(
+            params![account_id, through_sequence, batch_size],
+            decode_account_audit_event_row,
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.is_empty() {
+        return Ok(AuditCompactionOutcome::NotNeeded);
+    }
+    for (offset, row) in rows.iter().enumerate() {
+        let expected_sequence = through_sequence
+            .checked_add(i64::try_from(offset + 1).map_err(|_| {
+                StorageError::IntegerOutOfRange("account audit compaction sequence offset")
+            })?)
+            .ok_or(StorageError::IntegerOutOfRange(
+                "account audit compaction sequence",
+            ))?;
+        if row.sequence != expected_sequence {
+            return Err(StorageError::CorruptData(
+                "the account audit detailed prefix is not contiguous".into(),
+            ));
+        }
+    }
+    let tail = rows
+        .last()
+        .expect("a non-empty audit compaction batch has a tail");
+    if archive_required {
+        let archived_through: i64 = connection.query_row(
+            "SELECT through_sequence FROM account_audit_archive_state WHERE account_id = ?1",
+            [account_id],
+            |row| row.get(0),
+        )?;
+        if archived_through < tail.sequence {
+            return Ok(AuditCompactionOutcome::BlockedByArchive);
+        }
+    }
+    let new_digest = account_audit_rollup_digest(&previous_digest, &rows)?;
+    let changed = connection.execute(
+        r#"UPDATE account_audit_rollups
+           SET through_sequence = ?1, event_count = ?1, digest = ?2,
+               last_event_hash = ?3, updated_at = ?4
+           WHERE account_id = ?5 AND through_sequence = ?6 AND digest = ?7"#,
+        params![
+            tail.sequence,
+            new_digest,
+            tail.event_hash,
+            timestamp,
+            account_id,
+            through_sequence,
+            previous_digest,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::CorruptData(
+            "the account audit rollup changed during compaction".into(),
+        ));
+    }
+    let deleted = connection.execute(
+        r#"DELETE FROM account_audit_events
+           WHERE account_id = ?1 AND sequence > ?2 AND sequence <= ?3"#,
+        params![account_id, through_sequence, tail.sequence],
+    )?;
+    if deleted != rows.len() {
+        return Err(StorageError::CorruptData(
+            "the account audit detailed prefix changed during compaction".into(),
+        ));
+    }
+    Ok(AuditCompactionOutcome::Compacted)
+}
+
+fn account_audit_rollup_digest(
+    previous_digest: &str,
+    rows: &[AccountAuditEventRow],
+) -> Result<String, StorageError> {
+    if !is_lower_hex_digest(previous_digest) {
+        return Err(StorageError::CorruptData(
+            "the account audit rollup digest is malformed".into(),
+        ));
+    }
+    let mut digest = previous_digest.to_owned();
+    for row in rows {
+        let mut hasher = Sha256::new();
+        hasher.update(ACCOUNT_AUDIT_ROLLUP_DOMAIN);
+        hasher.update(digest.as_bytes());
+        hasher.update(row.sequence.to_be_bytes());
+        hasher.update(row.event_hash.as_bytes());
+        digest = format!("{:x}", hasher.finalize());
+    }
+    Ok(digest)
+}
+
+struct AccountAuditEventInput<'a> {
+    actor_user_id: Option<&'a str>,
+    action: &'a str,
+    target_kind: &'a str,
+    target_id: &'a str,
+    metadata: Value,
+}
+
+fn append_account_audit_event(
+    connection: &Connection,
+    account_id: &str,
+    input: AccountAuditEventInput<'_>,
+    timestamp: &str,
+) -> Result<AccountAuditEvent, StorageError> {
+    let AccountAuditEventInput {
+        actor_user_id,
+        action,
+        target_kind,
+        target_id,
+        metadata,
+    } = input;
+    normalized_account_value(account_id, "audit account ID", 128)?;
+    if let Some(actor_user_id) = actor_user_id {
+        normalized_account_value(actor_user_id, "audit actor user ID", 128)?;
+    }
+    normalized_account_value(action, "audit action", 96)?;
+    normalized_account_value(target_kind, "audit target kind", 64)?;
+    normalized_account_value(target_id, "audit target ID", 384)?;
+    if !metadata.is_object() {
+        return Err(StorageError::InvalidAccountData(
+            "audit metadata must be a JSON object".into(),
+        ));
+    }
+    let metadata_json = serde_json::to_string(&metadata)?;
+    if metadata_json.len() > ACCOUNT_AUDIT_METADATA_MAX_BYTES {
+        return Err(StorageError::InvalidAccountData(
+            "audit metadata exceeds its supported bound".into(),
+        ));
+    }
+    let tail = connection
+        .query_row(
+            r#"SELECT sequence, event_hash FROM account_audit_events
+               WHERE account_id = ?1 ORDER BY sequence DESC LIMIT 1"#,
+            [account_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let (previous_sequence, previous_hash) = match tail {
+        Some(tail) => tail,
+        None => connection.query_row(
+            r#"SELECT through_sequence, last_event_hash
+               FROM account_audit_rollups WHERE account_id = ?1"#,
+            [account_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?,
+    };
+    let sequence = previous_sequence
+        .checked_add(1)
+        .ok_or(StorageError::IntegerOutOfRange("account audit sequence"))?;
+    let event_hash = account_audit_event_hash(
+        &previous_hash,
+        sequence,
+        account_id,
+        actor_user_id,
+        action,
+        "succeeded",
+        target_kind,
+        target_id,
+        &metadata_json,
+        timestamp,
+    )?;
+    connection.execute(
+        r#"INSERT INTO account_audit_events(
+               account_id, sequence, actor_user_id, action, outcome,
+               target_kind, target_id, metadata_json, occurred_at,
+               previous_hash, event_hash
+           ) VALUES (?1, ?2, ?3, ?4, 'succeeded', ?5, ?6, ?7, ?8, ?9, ?10)"#,
+        params![
+            account_id,
+            sequence,
+            actor_user_id,
+            action,
+            target_kind,
+            target_id,
+            metadata_json,
+            timestamp,
+            previous_hash,
+            event_hash,
+        ],
+    )?;
+    Ok(AccountAuditEvent {
+        account_id: decode_account_id(account_id.to_owned())?,
+        sequence: i64_to_u64(sequence, "account audit sequence")?,
+        actor_user_id: actor_user_id.map(str::to_owned),
+        action: action.to_owned(),
+        outcome: "succeeded".into(),
+        target_kind: target_kind.to_owned(),
+        target_id: target_id.to_owned(),
+        metadata,
+        occurred_at: timestamp.to_owned(),
+        previous_hash,
+        event_hash,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn account_audit_event_hash(
+    previous_hash: &str,
+    sequence: i64,
+    account_id: &str,
+    actor_user_id: Option<&str>,
+    action: &str,
+    outcome: &str,
+    target_kind: &str,
+    target_id: &str,
+    metadata_json: &str,
+    occurred_at: &str,
+) -> Result<String, StorageError> {
+    if sequence <= 0 || !is_lower_hex_digest(previous_hash) {
+        return Err(StorageError::CorruptData(
+            "the account audit event chain boundary is malformed".into(),
+        ));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(ACCOUNT_AUDIT_EVENT_DOMAIN);
+    hasher.update(previous_hash.as_bytes());
+    hasher.update(sequence.to_be_bytes());
+    for field in [
+        account_id.as_bytes(),
+        actor_user_id.unwrap_or_default().as_bytes(),
+        action.as_bytes(),
+        outcome.as_bytes(),
+        target_kind.as_bytes(),
+        target_id.as_bytes(),
+        metadata_json.as_bytes(),
+        occurred_at.as_bytes(),
+    ] {
+        let length = u64::try_from(field.len())
+            .map_err(|_| StorageError::IntegerOutOfRange("account audit hash field"))?;
+        hasher.update(length.to_be_bytes());
+        hasher.update(field);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn query_account_audit_state(
+    connection: &Connection,
+    account_id: &str,
+    limits: &StorageLimits,
+) -> Result<AccountAuditState, StorageError> {
+    let policy_row: (i64, i64, i64, i64, String) = connection.query_row(
+        r#"SELECT detail_rows, legal_hold, archive_required, revision, updated_at
+           FROM account_audit_policies WHERE account_id = ?1"#,
+        [account_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    let rollup_row: (i64, i64, String, String, String) = connection.query_row(
+        r#"SELECT through_sequence, event_count, digest, last_event_hash, updated_at
+           FROM account_audit_rollups WHERE account_id = ?1"#,
+        [account_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    let archive_row: (i64, String, Option<String>, i64, String) = connection.query_row(
+        r#"SELECT through_sequence, event_hash, archive_reference, revision, updated_at
+           FROM account_audit_archive_state WHERE account_id = ?1"#,
+        [account_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    let account_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM account_audit_events WHERE account_id = ?1",
+        [account_id],
+        |row| row.get(0),
+    )?;
+    let global_count: i64 =
+        connection.query_row("SELECT COUNT(*) FROM account_audit_events", [], |row| {
+            row.get(0)
+        })?;
+    let account_hard = capacity_limit(limits.account_audit_rows_per_account)?;
+    let global_hard = capacity_limit(limits.account_audit_rows_global)?;
+    let account_ordinary = account_hard
+        .checked_sub(capacity_limit(
+            limits.account_audit_progress_rows_per_account,
+        )?)
+        .ok_or(StorageError::IntegerOutOfRange(
+            "account audit ordinary capacity",
+        ))?;
+    let global_ordinary = global_hard
+        .checked_sub(capacity_limit(limits.account_audit_progress_rows_global)?)
+        .ok_or(StorageError::IntegerOutOfRange(
+            "global audit ordinary capacity",
+        ))?;
+    let ordinary_remaining = account_ordinary
+        .saturating_sub(account_count)
+        .max(0)
+        .min(global_ordinary.saturating_sub(global_count).max(0));
+    let progress_remaining = account_hard
+        .saturating_sub(account_count)
+        .max(0)
+        .min(global_hard.saturating_sub(global_count).max(0));
+    let account = decode_account_id(account_id.to_owned())?;
+    Ok(AccountAuditState {
+        policy: AccountAuditPolicy {
+            account_id: account.clone(),
+            detail_rows: i64_to_u64(policy_row.0, "account audit detail rows")?,
+            legal_hold: policy_row.1 != 0,
+            archive_required: policy_row.2 != 0,
+            revision: i64_to_u64(policy_row.3, "account audit policy revision")?,
+            updated_at: policy_row.4,
+        },
+        rollup: AccountAuditRollup {
+            account_id: account.clone(),
+            through_sequence: i64_to_u64(rollup_row.0, "account audit rollup sequence")?,
+            event_count: i64_to_u64(rollup_row.1, "account audit rollup event count")?,
+            digest: rollup_row.2,
+            last_event_hash: rollup_row.3,
+            updated_at: rollup_row.4,
+        },
+        archive: AccountAuditArchiveState {
+            account_id: account,
+            through_sequence: i64_to_u64(archive_row.0, "account audit archive sequence")?,
+            event_hash: archive_row.1,
+            archive_reference: archive_row.2,
+            revision: i64_to_u64(archive_row.3, "account audit archive revision")?,
+            updated_at: archive_row.4,
+        },
+        detailed_rows: i64_to_u64(account_count, "account audit detailed rows")?,
+        ordinary_capacity_remaining: i64_to_u64(
+            ordinary_remaining,
+            "account audit ordinary capacity",
+        )?,
+        progress_capacity_remaining: i64_to_u64(
+            progress_remaining,
+            "account audit progress capacity",
+        )?,
+    })
+}
+
+fn query_account_audit_page(
+    connection: &Connection,
+    context: &AuthzContext,
+    cursor_value: Option<&str>,
+    limit: usize,
+    limits: &StorageLimits,
+) -> Result<AccountAuditPage, StorageError> {
+    require_current_authority(connection, context, AccountCapability::AuditRead)?;
+    let fetch_limit = validated_read_page_limit(limit, ACCOUNT_AUDIT_PAGE_MAX_LIMIT)?;
+    let cursor = cursor_value
+        .map(|value| {
+            cursor::decode_account_audit(value, context.account_id.as_str(), &context.user_id)
+        })
+        .transpose()?;
+    let sql = format!(
+        r#"{ACCOUNT_AUDIT_EVENT_SELECT}
+           WHERE account_id = ?1 AND (?2 IS NULL OR sequence < ?2)
+           ORDER BY sequence DESC LIMIT ?3"#
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let mut items = statement
+        .query_map(
+            params![context.account_id.as_str(), cursor, fetch_limit],
+            decode_account_audit_event_row,
+        )?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(AccountAuditEventRow::decode)
+        .collect::<Result<Vec<_>, _>>()?;
+    let has_more = items.len() > limit;
+    if has_more {
+        items.pop();
+    }
+    let next_cursor = if has_more {
+        let tail = items
+            .last()
+            .expect("an audit page with more rows has a tail");
+        Some(cursor::encode_account_audit(
+            context.account_id.as_str(),
+            &context.user_id,
+            tail.sequence,
+        )?)
+    } else {
+        None
+    };
+    Ok(AccountAuditPage {
+        items,
+        next_cursor,
+        state: query_account_audit_state(connection, context.account_id.as_str(), limits)?,
+    })
+}
+
+fn update_account_audit_policy(
+    connection: &mut Connection,
+    context: &AuthzContext,
+    commit: UpdateAccountAuditPolicyCommit,
+    limits: &StorageLimits,
+    physical_limits: &SqlitePhysicalLimits,
+) -> Result<AccountAuditState, StorageError> {
+    let timestamp = now();
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_current_authority(&transaction, context, AccountCapability::AccountAdmin)?;
+    if commit.detail_rows == 0
+        || commit.detail_rows
+            > u64::try_from(limits.account_audit_detail_rows)
+                .map_err(|_| StorageError::IntegerOutOfRange("account audit detail rows"))?
+    {
+        return Err(StorageError::InvalidAccountData(format!(
+            "account audit detail rows must be between 1 and {}",
+            limits.account_audit_detail_rows
+        )));
+    }
+    let current: (i64, i64, i64, i64) = transaction.query_row(
+        r#"SELECT detail_rows, legal_hold, archive_required, revision
+           FROM account_audit_policies WHERE account_id = ?1"#,
+        [context.account_id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    if i64_to_u64(current.3, "account audit policy revision")? != commit.expected_revision {
+        return Err(StorageError::AuditPolicyConflict);
+    }
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::ReservedProgress,
+    )?;
+    transaction.execute(
+        r#"UPDATE account_audit_policies
+           SET detail_rows = ?1, legal_hold = ?2, archive_required = ?3,
+               revision = revision + 1, updated_at = ?4
+           WHERE account_id = ?5 AND revision = ?6"#,
+        params![
+            u64_to_i64(commit.detail_rows, "account audit detail rows")?,
+            i64::from(commit.legal_hold),
+            i64::from(commit.archive_required),
+            timestamp,
+            context.account_id.as_str(),
+            current.3,
+        ],
+    )?;
+    prepare_account_audit_admission(
+        &transaction,
+        context.account_id.as_str(),
+        AuditAdmission::Progress,
+        limits,
+        &timestamp,
+    )?;
+    append_account_audit_event(
+        &transaction,
+        context.account_id.as_str(),
+        AccountAuditEventInput {
+            actor_user_id: Some(&context.user_id),
+            action: "audit.policy_updated",
+            target_kind: "account_audit_policy",
+            target_id: context.account_id.as_str(),
+            metadata: json!({
+                "detail_rows": commit.detail_rows,
+                "legal_hold": commit.legal_hold,
+                "archive_required": commit.archive_required,
+                "revision": commit.expected_revision + 1,
+            }),
+        },
+        &timestamp,
+    )?;
+    let state = query_account_audit_state(&transaction, context.account_id.as_str(), limits)?;
+    transaction.commit()?;
+    Ok(state)
+}
+
+fn checkpoint_account_audit_archive(
+    connection: &mut Connection,
+    context: &AuthzContext,
+    commit: AccountAuditCheckpointCommit,
+    limits: &StorageLimits,
+    physical_limits: &SqlitePhysicalLimits,
+) -> Result<AccountAuditState, StorageError> {
+    let timestamp = now();
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_current_authority(&transaction, context, AccountCapability::AccountAdmin)?;
+    if commit.through_sequence == 0 || !is_lower_hex_digest(&commit.event_hash) {
+        return Err(StorageError::AuditCheckpointConflict);
+    }
+    let archive_reference = normalized_account_value(
+        &commit.archive_reference,
+        "account audit archive reference",
+        512,
+    )?;
+    let through_sequence =
+        u64_to_i64(commit.through_sequence, "account audit checkpoint sequence")?;
+    let current: (i64, i64) = transaction.query_row(
+        r#"SELECT through_sequence, revision FROM account_audit_archive_state
+           WHERE account_id = ?1"#,
+        [context.account_id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if i64_to_u64(current.1, "account audit archive revision")? != commit.expected_revision
+        || through_sequence < current.0
+    {
+        return Err(StorageError::AuditCheckpointConflict);
+    }
+    let rollup: (i64, String) = transaction.query_row(
+        r#"SELECT through_sequence, last_event_hash FROM account_audit_rollups
+           WHERE account_id = ?1"#,
+        [context.account_id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let durable_hash = if through_sequence == rollup.0 {
+        Some(rollup.1)
+    } else if through_sequence > rollup.0 {
+        transaction
+            .query_row(
+                r#"SELECT event_hash FROM account_audit_events
+                   WHERE account_id = ?1 AND sequence = ?2"#,
+                params![context.account_id.as_str(), through_sequence],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+    } else {
+        None
+    };
+    if durable_hash.as_deref() != Some(commit.event_hash.as_str()) {
+        return Err(StorageError::AuditCheckpointConflict);
+    }
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::ReservedProgress,
+    )?;
+    transaction.execute(
+        r#"UPDATE account_audit_archive_state
+           SET through_sequence = ?1, event_hash = ?2, archive_reference = ?3,
+               revision = revision + 1, updated_at = ?4
+           WHERE account_id = ?5 AND revision = ?6"#,
+        params![
+            through_sequence,
+            commit.event_hash,
+            archive_reference,
+            timestamp,
+            context.account_id.as_str(),
+            current.1,
+        ],
+    )?;
+    prepare_account_audit_admission(
+        &transaction,
+        context.account_id.as_str(),
+        AuditAdmission::Progress,
+        limits,
+        &timestamp,
+    )?;
+    append_account_audit_event(
+        &transaction,
+        context.account_id.as_str(),
+        AccountAuditEventInput {
+            actor_user_id: Some(&context.user_id),
+            action: "audit.archive_checkpointed",
+            target_kind: "account_audit_archive",
+            target_id: context.account_id.as_str(),
+            metadata: json!({
+                "through_sequence": commit.through_sequence,
+                "event_hash": commit.event_hash,
+                "archive_reference": archive_reference,
+                "revision": commit.expected_revision + 1,
+            }),
+        },
+        &timestamp,
+    )?;
+    let state = query_account_audit_state(&transaction, context.account_id.as_str(), limits)?;
+    transaction.commit()?;
+    Ok(state)
 }
 
 fn bind_runtime_identity(
@@ -7811,6 +10002,56 @@ fn query_reply_job_optional(
         .transpose()
 }
 
+fn query_reply_job_optional_for_account(
+    connection: &Connection,
+    account_id: &str,
+    job_id: &str,
+) -> Result<Option<ReplyJob>, StorageError> {
+    connection
+        .query_row(
+            r#"SELECT id, account_id, actor_user_id, actor_membership_revision,
+                      session_id, turn_id, provider_name, model_name,
+                      status, attempt, request_json, response_json, error_json,
+                      queued_at, started_at, finished_at, completion_fingerprint,
+                      assistant_event_sequence, terminal_event_sequence
+               FROM reply_jobs WHERE account_id = ?1 AND id = ?2"#,
+            params![account_id, job_id],
+            decode_reply_job_row,
+        )
+        .optional()?
+        .map(StoredReplyJobRow::decode)
+        .transpose()
+}
+
+fn query_reply_job_for_actor(
+    connection: &mut Connection,
+    context: &AuthzContext,
+    job_id: &str,
+) -> Result<Option<ReplyJob>, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    require_current_authority(&transaction, context, AccountCapability::Read)?;
+    let job =
+        query_reply_job_optional_for_account(&transaction, context.account_id.as_str(), job_id)?;
+    transaction.commit()?;
+    Ok(job)
+}
+
+#[cfg(test)]
+pub(crate) fn query_reply_job_for_actor_with_snapshot_hook(
+    connection: &mut Connection,
+    context: &AuthzContext,
+    job_id: &str,
+    after_authority: impl FnOnce(),
+) -> Result<Option<ReplyJob>, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    require_current_authority(&transaction, context, AccountCapability::Read)?;
+    after_authority();
+    let job =
+        query_reply_job_optional_for_account(&transaction, context.account_id.as_str(), job_id)?;
+    transaction.commit()?;
+    Ok(job)
+}
+
 fn query_reply_job(connection: &Connection, job_id: &str) -> Result<ReplyJob, StorageError> {
     query_reply_job_optional(connection, job_id)?
         .ok_or_else(|| StorageError::ReplyJobNotFound(job_id.to_owned()))
@@ -9869,7 +12110,10 @@ fn commit_review(
         require_active_run_owner(&transaction, &commit.snapshot.run.id, context)?;
         if commit.dispatch.as_ref().is_some_and(|dispatch| {
             dispatch.approving_authz != *context
-                || dispatch.initiating_authz.account_id != context.account_id
+                || dispatch
+                    .initiating_authz
+                    .as_ref()
+                    .is_some_and(|initiator| initiator.account_id != context.account_id)
         }) {
             return Err(StorageError::RunNotFound(commit.snapshot.run.id.clone()));
         }
@@ -9911,10 +12155,14 @@ fn commit_review(
 
     let account_id = authz.map_or(LOCAL_ACCOUNT_ID, |context| context.account_id.as_str());
     let actor_user_id = authz.map(|context| context.user_id.as_str());
-    let dispatch_actor_user_id = commit
-        .dispatch
-        .as_ref()
-        .map(|dispatch| dispatch.initiating_authz.user_id.as_str());
+    let dispatch_actor_user_id = commit.dispatch.as_ref().map(|dispatch| {
+        dispatch
+            .initiating_authz
+            .as_ref()
+            .unwrap_or(&dispatch.approving_authz)
+            .user_id
+            .as_str()
+    });
     if commit.dispatch.is_some() {
         require_dispatch_queue_capacity(&transaction, account_id, dispatch_actor_user_id, limits)?;
     }
@@ -10628,11 +12876,15 @@ fn insert_dispatch_job(
             run_id,
             job.approval_id,
             approval_event_sequence,
-            job.initiating_authz.user_id,
-            u64_to_i64(
-                job.initiating_authz.membership_revision.get(),
-                "membership revision"
-            )?,
+            job.initiating_authz
+                .as_ref()
+                .map(|context| context.user_id.as_str()),
+            job.initiating_authz
+                .as_ref()
+                .map(|context| {
+                    u64_to_i64(context.membership_revision.get(), "membership revision")
+                })
+                .transpose()?,
             job.approving_authz.user_id,
             u64_to_i64(
                 job.approving_authz.membership_revision.get(),
@@ -10872,9 +13124,15 @@ fn validate_dispatch_spec(job: &DispatchJobSpec) -> Result<(), StorageError> {
         "approval ID",
         DISPATCH_IDENTIFIER_MAX_BYTES,
     )?;
-    validated_authz_context(&job.initiating_authz)?;
+    if let Some(initiator) = &job.initiating_authz {
+        validated_authz_context(initiator)?;
+    }
     validated_authz_context(&job.approving_authz)?;
-    if job.initiating_authz.account_id != job.approving_authz.account_id {
+    if job
+        .initiating_authz
+        .as_ref()
+        .is_some_and(|initiator| initiator.account_id != job.approving_authz.account_id)
+    {
         return Err(StorageError::InvalidDispatchTransition(
             "dispatch actors must belong to the same account".into(),
         ));
