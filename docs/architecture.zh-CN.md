@@ -326,6 +326,12 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   `debug` 和 `sandbox` 是独立 profile。Compose `.env` 和 project name 只作用于这条路径。
   API、Web、gateway 已分别静态接线可配置的 CPU/memory/PID ceiling；`full` 的 API 是
   `cargo-watch` 开发服务，默认 4 CPU/4 GiB/512 PID 包含编译余量，不是 runtime/OOM 基准。
+- Linux release-runtime 验收使用独立 `compose.linux-acceptance.yaml`，只有 API、Web、gateway，
+  以两个 internal network 隔离 API/Web，由 gateway 双连并只发布动态 loopback port。三个服务
+  都使用 exact CPU/memory/no-swap/PID、非 root、read-only root、`cap_drop: ALL`、
+  `no-new-privileges` 和 `restart: "no"`。配套脚本执行 fresh bootstrap、两路 Argon2、durable
+  reply、operation-pressure/cgroup 时间序列与保留卷重建；normal/low-memory CI 会保存脱敏证据。
+  当前主机无 Docker，因此只完成静态校验，不能把 Linux live gate 写成已通过。
 - Apple `container` helper 只运行 production-guarded API、Web 和 gateway，不启动 Compose
   基础设施或 local marker executor。默认 project 是 `zeus-alpha`，资源名为
   `zeus-alpha-{api,web,gateway,net,data}`。只有 gateway 尝试发布 loopback `18088`；API 和

@@ -1,0 +1,172 @@
+name: ${ZEUS_LINUX_ACCEPTANCE_PROJECT:?ZEUS_LINUX_ACCEPTANCE_PROJECT is required}
+
+x-common-logging: &common-logging
+  driver: local
+  options:
+    max-size: "10m"
+    max-file: "2"
+
+services:
+  api:
+    image: ${ZEUS_LINUX_ACCEPTANCE_API_IMAGE:?ZEUS_LINUX_ACCEPTANCE_API_IMAGE is required}
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: infra/docker/rust.Dockerfile
+      target: runtime
+      labels:
+        dev.zeus-harness.source-commit: ${ZEUS_LINUX_ACCEPTANCE_SOURCE_COMMIT:?ZEUS_LINUX_ACCEPTANCE_SOURCE_COMMIT is required}
+        dev.zeus-harness.source-tree: ${ZEUS_LINUX_ACCEPTANCE_SOURCE_TREE:?ZEUS_LINUX_ACCEPTANCE_SOURCE_TREE is required}
+        dev.zeus-harness.acceptance-image: api
+      args:
+        RUST_VERSION: "1.97.1"
+    init: true
+    restart: "no"
+    cpus: ${ZEUS_LINUX_ACCEPTANCE_API_CPUS:-2.0}
+    mem_limit: ${ZEUS_LINUX_ACCEPTANCE_API_MEMORY:-1g}
+    memswap_limit: ${ZEUS_LINUX_ACCEPTANCE_API_MEMORY:-1g}
+    pids_limit: ${ZEUS_LINUX_ACCEPTANCE_API_PIDS:-128}
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    environment:
+      ZEUS_LISTEN_ADDR: 0.0.0.0:8081
+      ZEUS_DATABASE_PATH: /var/lib/zeus/zeus.db
+      ZEUS_DEMO_PROFILE: production-guarded
+      ZEUS_LOCAL_MARKER_ROOT: /var/lib/zeus/local-markers
+      ZEUS_COOKIE_SECURE: "false"
+      ZEUS_LLM_ENDPOINT: ""
+      ZEUS_LLM_MODEL: ""
+      ZEUS_LLM_API_KEY: ""
+      ZEUS_SQLITE_MAX_CONCURRENT_OPERATIONS: "2"
+      ZEUS_SQLITE_RESERVED_PROGRESS_OPERATIONS: "1"
+      ZEUS_SQLITE_OPERATION_ACQUIRE_TIMEOUT_MS: "1"
+      RUST_LOG: zeus=info,tower_http=info
+      RUST_BACKTRACE: "1"
+    volumes:
+      - zeus_data:/var/lib/zeus
+    expose: ["8081"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/health/live"]
+      interval: 2s
+      timeout: 2s
+      retries: 90
+      start_period: 5s
+    stop_grace_period: 10s
+    networks: [api_net]
+    logging: *common-logging
+
+  web:
+    image: ${ZEUS_LINUX_ACCEPTANCE_WEB_IMAGE:?ZEUS_LINUX_ACCEPTANCE_WEB_IMAGE is required}
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: infra/docker/web.Dockerfile
+      target: runtime
+      labels:
+        dev.zeus-harness.source-commit: ${ZEUS_LINUX_ACCEPTANCE_SOURCE_COMMIT:?ZEUS_LINUX_ACCEPTANCE_SOURCE_COMMIT is required}
+        dev.zeus-harness.source-tree: ${ZEUS_LINUX_ACCEPTANCE_SOURCE_TREE:?ZEUS_LINUX_ACCEPTANCE_SOURCE_TREE is required}
+        dev.zeus-harness.acceptance-image: web
+      args:
+        NODE_VERSION: "24.18.0"
+        PNPM_VERSION: "10.33.0"
+    init: true
+    restart: "no"
+    cpus: ${ZEUS_LINUX_ACCEPTANCE_WEB_CPUS:-1.0}
+    mem_limit: ${ZEUS_LINUX_ACCEPTANCE_WEB_MEMORY:-512m}
+    memswap_limit: ${ZEUS_LINUX_ACCEPTANCE_WEB_MEMORY:-512m}
+    pids_limit: ${ZEUS_LINUX_ACCEPTANCE_WEB_PIDS:-128}
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    environment:
+      HOST: 0.0.0.0
+      PORT: "3000"
+    expose: ["3000"]
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
+      interval: 2s
+      timeout: 2s
+      retries: 90
+      start_period: 5s
+    stop_grace_period: 10s
+    networks: [web_net]
+    logging: *common-logging
+
+  gateway:
+    image: ${ZEUS_LINUX_ACCEPTANCE_GATEWAY_IMAGE:?ZEUS_LINUX_ACCEPTANCE_GATEWAY_IMAGE is required}
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: infra/docker/caddy.Dockerfile
+      labels:
+        dev.zeus-harness.source-commit: ${ZEUS_LINUX_ACCEPTANCE_SOURCE_COMMIT:?ZEUS_LINUX_ACCEPTANCE_SOURCE_COMMIT is required}
+        dev.zeus-harness.source-tree: ${ZEUS_LINUX_ACCEPTANCE_SOURCE_TREE:?ZEUS_LINUX_ACCEPTANCE_SOURCE_TREE is required}
+        dev.zeus-harness.acceptance-image: gateway
+    user: "65532:65532"
+    restart: "no"
+    cpus: ${ZEUS_LINUX_ACCEPTANCE_GATEWAY_CPUS:-0.5}
+    mem_limit: ${ZEUS_LINUX_ACCEPTANCE_GATEWAY_MEMORY:-128m}
+    memswap_limit: ${ZEUS_LINUX_ACCEPTANCE_GATEWAY_MEMORY:-128m}
+    pids_limit: ${ZEUS_LINUX_ACCEPTANCE_GATEWAY_PIDS:-64}
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /config:rw,noexec,nosuid,nodev,uid=65532,gid=65532,mode=0700,size=16m
+      - /data:rw,noexec,nosuid,nodev,uid=65532,gid=65532,mode=0700,size=16m
+      - /tmp:rw,noexec,nosuid,nodev,uid=65532,gid=65532,mode=0700,size=8m
+    environment:
+      ZEUS_UPSTREAM: api:8081
+      WEB_UPSTREAM: web:3000
+    ports:
+      - name: http
+        target: 8080
+        published: "0"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "-q",
+          "-O",
+          "/dev/null",
+          "http://127.0.0.1:8080/health/live",
+        ]
+      interval: 2s
+      timeout: 2s
+      retries: 90
+      start_period: 2s
+    stop_grace_period: 5s
+    networks: [api_net, web_net]
+    logging: *common-logging
+
+networks:
+  api_net:
+    name: ${ZEUS_LINUX_ACCEPTANCE_PROJECT:?ZEUS_LINUX_ACCEPTANCE_PROJECT is required}-api-network
+    internal: true
+  web_net:
+    name: ${ZEUS_LINUX_ACCEPTANCE_PROJECT:?ZEUS_LINUX_ACCEPTANCE_PROJECT is required}-web-network
+    internal: true
+
+volumes:
+  zeus_data:
+    name: ${ZEUS_LINUX_ACCEPTANCE_PROJECT:?ZEUS_LINUX_ACCEPTANCE_PROJECT is required}-data

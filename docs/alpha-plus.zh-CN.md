@@ -305,6 +305,12 @@ POST /sessions/{id}/turns
   gateway 的 CPU/memory/PID ceiling 已通过
   `ZEUS_COMPOSE_{API,WEB,GATEWAY}_{CPUS,MEMORY,PIDS_LIMIT}` 静态接线；本机没有 Docker CLI，
   因而不声明 Compose build/up 或 Linux OOM 验收通过。
+- 独立 `compose.linux-acceptance.yaml` 与 `scripts/linux-container-acceptance.sh` 现已定义 Linux
+  release-runtime 门禁：normal API 2 CPU/1 GiB/128 PID，low-memory API 1 CPU/256 MiB/64 PID，
+  两者均令 memory-swap 等于 memory，并核对 release image、非 root/read-only/cap-drop、internal
+  network、cgroup v2、Argon2、durable reply、operation pressure、OOM/PID 时间序列与保留卷重启。
+  GitHub Actions 会运行两个 profile 并上传脱敏证据；在真实 Linux job 通过前，这仍是“自动化已
+  落地、live gate 未通过”，精确契约见 `docs/linux-container-acceptance.zh-CN.md`。
 - Apple helper 的 release API 默认 2 CPU/1 GiB，可由 `ZEUS_CONTAINER_API_CPUS` 与
   `ZEUS_CONTAINER_API_MEMORY` 调整并在创建后核对。`scripts/apple-container.sh resources` 只读
   输出 inspect、cgroup v2 与 `/proc` 证据。

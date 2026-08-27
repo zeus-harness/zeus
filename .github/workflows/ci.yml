@@ -3,7 +3,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [ main ]
+    branches: [main]
 
 permissions:
   contents: read
@@ -29,9 +29,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Test
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --all-features
 
   web:
     name: Web

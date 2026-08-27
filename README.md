@@ -287,6 +287,48 @@ docker compose --profile full up --build
 Its marker root defaults to `/var/lib/zeus/local-markers` inside the dedicated
 `zeus_data` volume. The normal Compose defaults remain `production-guarded`.
 
+### Linux Docker release-runtime acceptance
+
+The authoritative Linux resource gate uses the independent
+`compose.linux-acceptance.yaml`, not the development `full` profile. It builds
+the API and Web `runtime` targets plus the checked-in Caddy image, publishes
+only a dynamic loopback gateway port, and creates a one-run SQLite volume and
+two internal networks. Every service has an exact CPU, memory, no-swap, and PID
+ceiling together with a read-only root, all capabilities dropped,
+`no-new-privileges`, a non-root runtime user, and `restart: "no"`.
+
+On a Linux Docker Engine with cgroup v2:
+
+```sh
+scripts/linux-container-acceptance.sh config
+scripts/linux-container-acceptance.sh run
+```
+
+The live verifier safely consumes a fresh owner token, checks two concurrent
+Argon2 paths, settles a durable local-fallback turn, runs bounded readiness
+pressure, samples all three services before/during/after it, and recreates the
+stack while retaining its SQLite volume. Fresh and restarted cgroups must begin
+with zero OOM/OOM-kill/PID-max/swap counters. It rejects any response other than
+`200` or a `503` carrying `sqlite_operation_capacity_exceeded`, and fails if any
+service records OOM/PID exhaustion, transport errors, an unexpected restart, or
+resource drift. The fixed normal profile is API/Web/gateway at
+2/1/0.5 CPUs, 1 GiB/512 MiB/128 MiB, and 128/128/64 PIDs; CI reuses the same
+source-bound images for the fixed 1/0.5/0.25 CPU, 256/256/64 MiB, and 64/64/32
+PID low-memory profile. Both disable container swap.
+
+The generated evidence is written under `.zeus-linux-acceptance/` without
+bootstrap tokens, passwords, cookies, CSRF tokens, provider keys, or complete
+API logs. Authoritative runs require a clean worktree, validate commit/tree/role
+image labels, fail closed on teardown or evidence finalization errors, and hash
+the stable bundle including `run.log`. The current gate does not run a
+disposable OOM/PID negative-control container; its result is evidence that the
+Zeus services stayed inside their enforced cgroup v2 envelopes, not a separate
+calibration of deliberate runner limit violations. See
+[`docs/linux-container-acceptance.zh-CN.md`](docs/linux-container-acceptance.zh-CN.md)
+for the exact contract. This workstation has no Docker CLI, so the automation
+is statically checked here but the Linux live gate remains pending until its
+CI or controlled-run evidence passes.
+
 ### Apple container mode: runtime images on macOS
 
 The Apple helper builds the same non-root API and Web runtime stages, then runs
@@ -518,10 +560,10 @@ directly.
   enforced below HTTP.
 - An owner creates a member through `POST /api/v1/members`; the plaintext setup
   token appears only in that response, expires after 24 hours, and is stored by
-  Zeus only as a domain-separated SHA-256 digest. `POST
-  /api/v1/auth/member-setup` consumes it once while setting the password and
-  issuing the login session. Member lifecycle and audit administration are
-  owner-only and return `Cache-Control: no-store`.
+  Zeus only as a domain-separated SHA-256 digest. The single-use
+  `POST /api/v1/auth/member-setup` endpoint consumes it while setting the
+  password and issuing the login session. Member lifecycle and audit
+  administration are owner-only and return `Cache-Control: no-store`.
 - Active Run/Session SSE connections revalidate durable account authority at
   most two seconds apart and close after disable, role revision, or session
   revocation. Middleware is only an entry filter: storage and worker claim
@@ -531,11 +573,11 @@ directly.
   listing, optimistic membership revisions, last-owner protection, token
   rotation, and a response listing work already claimed before disable.
 - Owner-only `GET /api/v1/audit/events`, `GET /api/v1/audit/export`,
-  `GET/PUT /api/v1/audit/policy`, and `POST
-  /api/v1/audit/archive/checkpoint` expose bounded account audit state. The
-  NDJSON export is fully collected and validated before its `200` response and
-  fails above 96 MiB; a checkpoint is an operator assertion, not proof that an
-  external archive exists.
+  `GET/PUT /api/v1/audit/policy`, and
+  `POST /api/v1/audit/archive/checkpoint` expose bounded account audit state.
+  The NDJSON export is fully collected and validated before its `200` response
+  and fails above 96 MiB; a checkpoint is an operator assertion, not proof that
+  an external archive exists.
 - `GET /api/v1/me/settings` returns the current safe preferences.
   `PATCH /api/v1/me/settings` accepts `theme`, optional allowlisted
   `preferred_model`, and `expected_revision`. Provider endpoints and API keys
@@ -861,6 +903,8 @@ acceptance for the stated Operation Capacity readiness-pressure scenario, not
 evidence that the v14 image reran it, and not authoritative Linux Docker
 PID/OOM or adversarial low-memory acceptance.
 
-Docker Compose configuration remains available for environments with Docker
-Compose v2; this machine currently has Apple `container` but no Docker CLI, so
-Compose startup is statically configured rather than live-verified here.
+The isolated Linux release-runtime Compose, verifier, normal/low-memory CI
+matrix, and evidence contract are now checked in. This machine currently has
+Apple `container` but no Docker CLI, so these new files are statically verified
+but their authoritative Linux live result remains pending. The development
+Compose configuration remains separate and is not used as that resource gate.
