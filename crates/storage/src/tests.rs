@@ -16,6 +16,7 @@ use deployment::{
     ManifestProvider, ManifestTool,
 };
 use knowledge::{CorpusRevisionEnvelope, EntryRevision, SelectionSnapshotEnvelope, select_context};
+use llm::{ReplyRequest, ReplyRole};
 use protocol::{
     AgentToolCallStatus, AgentTurnStatus, Approval, ApprovalScope, ApprovalStatus,
     AssistantReplyKind, AssistantReplyProvenance, AttachRunRequest, CreateSessionRequest,
@@ -41,7 +42,8 @@ use crate::{
     MemberSetupCommit, MemberSetupToken, MembershipRevision, MembershipRole, ReplyClaimOutcome,
     ReplyFailureCommit, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
     ReplySuccessCommit, ReviewCommit, RotateMemberSetupTokenCommit, RunSnapshot, RuntimeIdentity,
-    SESSION_AGENT_PROMPT_ID, SqliteOperationLimits, SqlitePhysicalLimits, SqliteStore,
+    SESSION_AGENT_PROMPT_ID, SessionCompactionClaimOutcome, SessionCompactionJobStatus,
+    SessionCompactionSuccessCommit, SqliteOperationLimits, SqlitePhysicalLimits, SqliteStore,
     StorageError, StorageLimits, StoredMembershipStatus, StoredUserRole, StoredUserStatus,
     TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
@@ -1636,6 +1638,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         versions,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25,
         ]
     );
     let owner: Option<String> = connection
@@ -1777,7 +1780,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
     assert_eq!(
         run_event_payloads(database.path(), &long_run_id),
         payloads_before,
-        "v9-v24 migrations must not rewrite immutable event payloads"
+        "v9-v25 migrations must not rewrite immutable event payloads"
     );
     let connection = rusqlite::Connection::open(database.path()).unwrap();
     let version: i64 = connection
@@ -1785,7 +1788,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 24);
+    assert_eq!(version, 25);
     let configured_account: (String, String, String, i64) = connection
         .query_row(
             r#"SELECT
@@ -2311,7 +2314,7 @@ async fn v12_identity_and_run_crash_prefix_migrates_then_recovers_the_primary_se
     assert_eq!(
         recovered,
         (
-            24,
+            25,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into()
@@ -4058,7 +4061,7 @@ async fn v5_configured_database_migrates_to_the_local_owner_membership() {
     assert_eq!(
         migrated,
         (
-            24,
+            25,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into(),
@@ -4184,7 +4187,7 @@ async fn v13_configured_active_work_migrates_with_account_authority_and_exact_vo
             },
         )
         .unwrap();
-    assert_eq!(migrated_counts, (24, 1, 1, 2, 1));
+    assert_eq!(migrated_counts, (25, 1, 1, 2, 1));
 }
 
 #[tokio::test]
@@ -4546,7 +4549,7 @@ async fn v14_database_migrates_through_v19_with_member_and_audit_roots() {
             },
         )
         .unwrap();
-    assert_eq!(state, (24, 1, 1, 1, 19));
+    assert_eq!(state, (25, 1, 1, 1, 19));
 }
 
 #[tokio::test]
@@ -4585,7 +4588,7 @@ async fn v15_migration_seeds_the_configured_audit_detail_limit() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (24, 2));
+    assert_eq!(state, (25, 2));
 }
 
 #[tokio::test]
@@ -4630,7 +4633,7 @@ async fn v15_reopen_rejects_a_lower_audit_detail_limit_without_mutating_policy()
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (24, 4));
+    assert_eq!(state, (25, 4));
     drop(connection);
 
     let reopened = SqliteStore::open_with_limits(database.path(), original_limits)
@@ -6736,7 +6739,7 @@ async fn v19_agent_manifest_is_canonical_actor_scoped_reused_and_secret_free() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(version, 24);
+    assert_eq!(version, 25);
     assert_eq!(
         manifest_rows, 1,
         "the identical manifest must be deduplicated"
@@ -17092,7 +17095,7 @@ async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempot
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, (1_i64..=24).collect::<Vec<_>>());
+    assert_eq!(versions, (1_i64..=25).collect::<Vec<_>>());
     assert_eq!(
         connection
             .query_row(
@@ -19018,6 +19021,358 @@ fn insert_legacy_oversized_reply_fixture(
         .unwrap();
 }
 
+async fn complete_compaction_source_turn(
+    store: &SqliteStore,
+    manifest: &ManifestEnvelope,
+    ordinal: u64,
+) {
+    let summary = store.session_summary("session-alpha").await.unwrap();
+    let user_message = format!("compaction user {ordinal}");
+    let history = store
+        .session_reply_turns_after_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            0,
+            summary.sequence,
+            llm::AGENT_REQUEST_MAX_HISTORY_PAIRS_WITH_CONTEXT,
+        )
+        .await
+        .unwrap();
+    let corpus = CorpusRevisionEnvelope::new(Vec::new()).unwrap();
+    let snapshot =
+        SelectionSnapshotEnvelope::new(select_context(&user_message, corpus.entries()).unwrap())
+            .unwrap();
+    let mut request =
+        ReplyRequest::from_session_history_for_agent_with_optional_system_prompt_checkpoint_and_context(
+            &history,
+            &user_message,
+            None,
+            None,
+            snapshot.snapshot().canonical_context(),
+        )
+        .unwrap();
+    request.tools = manifest
+        .manifest
+        .deployment
+        .spec
+        .tools
+        .iter()
+        .map(|tool| {
+            llm::ReplyToolDefinition::new(&tool.name, tool.input_schema.clone())
+                .with_description(&tool.description)
+        })
+        .collect();
+    let turn_id = format!("turn-compaction-{ordinal}");
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: turn_id.clone(),
+                user_message: user_message.clone(),
+                expected_sequence: summary.sequence,
+            },
+            &format!("start-compaction-{ordinal}"),
+            AgentTurnSpec {
+                id: format!("agent-compaction-{ordinal}"),
+                authz: owner_authz(),
+                manifest: manifest.clone(),
+                environment: "local".into(),
+                provider_name: "test-provider".into(),
+                model_name: Some("test-model".into()),
+                request_json: serde_json::to_value(request).unwrap(),
+                knowledge: AgentKnowledgeContextSpec { corpus, snapshot },
+            },
+        )
+        .await
+        .unwrap();
+    let AgentModelClaimOutcome::Claimed(job) =
+        store.claim_next_agent_model(manifest).await.unwrap()
+    else {
+        panic!("Agent model work must start");
+    };
+    let assistant_message = format!("compaction assistant {ordinal}");
+    assert!(matches!(
+        store
+            .complete_agent_model_success(AgentModelSuccessCommit {
+                job_id: job.id,
+                response_json: agent_final_response_json(&assistant_message),
+                resolution: AgentModelResolution::Final {
+                    assistant_message,
+                    provenance: agent_model_provenance(),
+                },
+            })
+            .await
+            .unwrap(),
+        AgentModelCompletion::Final(_)
+    ));
+}
+
+#[tokio::test]
+async fn session_compaction_is_durable_at_most_once_and_preserves_raw_turns() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    let manifest = test_agent_manifest();
+
+    for ordinal in 0..27_u64 {
+        complete_compaction_source_turn(&store, &manifest, ordinal).await;
+    }
+
+    // Capture an initial request before the queued compaction succeeds. Its
+    // lack of a checkpoint must remain valid if the compaction commits before
+    // the request and user event enter their own storage transaction.
+    let stale_summary = store.session_summary("session-alpha").await.unwrap();
+    let stale_history = store
+        .session_reply_turns_after_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            0,
+            stale_summary.sequence,
+            llm::AGENT_REQUEST_MAX_HISTORY_PAIRS_WITH_CONTEXT,
+        )
+        .await
+        .unwrap();
+    let stale_user_message = "request built before compaction completed";
+    let stale_corpus = CorpusRevisionEnvelope::new(Vec::new()).unwrap();
+    let stale_snapshot = SelectionSnapshotEnvelope::new(
+        select_context(stale_user_message, stale_corpus.entries()).unwrap(),
+    )
+    .unwrap();
+    let mut stale_request =
+        ReplyRequest::from_session_history_for_agent_with_optional_system_prompt_checkpoint_and_context(
+            &stale_history,
+            stale_user_message,
+            None,
+            None,
+            stale_snapshot.snapshot().canonical_context(),
+        )
+        .unwrap();
+    stale_request.tools = manifest
+        .manifest
+        .deployment
+        .spec
+        .tools
+        .iter()
+        .map(|tool| {
+            llm::ReplyToolDefinition::new(&tool.name, tool.input_schema.clone())
+                .with_description(&tool.description)
+        })
+        .collect();
+
+    let observed = store
+        .peek_next_session_compaction()
+        .await
+        .unwrap()
+        .expect("the 27th complete pair queues compaction");
+    assert_eq!(observed.status, SessionCompactionJobStatus::Queued);
+    assert_eq!(observed.generation, 1);
+    assert_eq!(observed.source_start_sequence, 2);
+    assert_eq!(observed.source_end_sequence, 40);
+    let request: ReplyRequest = serde_json::from_value(observed.request_json.clone()).unwrap();
+    assert_eq!(request.messages[0].role, ReplyRole::System);
+    assert_eq!(request.messages[1].content, "compaction user 0");
+    assert_eq!(request.messages[26].content, "compaction assistant 12");
+
+    let SessionCompactionClaimOutcome::Claimed(started) = store
+        .start_observed_session_compaction(&observed.id)
+        .await
+        .unwrap()
+    else {
+        panic!("the observed compaction must start exactly once");
+    };
+    assert_eq!(started.status, SessionCompactionJobStatus::Started);
+    let summary_text = "The first thirteen exchanges established the durable test context.";
+    let response_json = agent_final_response_json(summary_text);
+    let succeeded = store
+        .complete_session_compaction_success(SessionCompactionSuccessCommit {
+            job_id: started.id.clone(),
+            response_json: response_json.clone(),
+            summary_text: summary_text.into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(succeeded.status, SessionCompactionJobStatus::Succeeded);
+    assert_eq!(succeeded.summary_text.as_deref(), Some(summary_text));
+    assert_eq!(
+        store
+            .complete_session_compaction_success(SessionCompactionSuccessCommit {
+                job_id: started.id,
+                response_json,
+                summary_text: summary_text.into(),
+            })
+            .await
+            .unwrap(),
+        succeeded
+    );
+
+    let live = store.session_summary("session-alpha").await.unwrap();
+    let checkpoint = store
+        .session_context_checkpoint_for_actor(&owner_authz(), "session-alpha", live.sequence)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(checkpoint.source_end_sequence, 40);
+    assert_eq!(checkpoint.summary_text, summary_text);
+    let tail = store
+        .session_reply_turns_after_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            checkpoint.source_end_sequence,
+            live.sequence,
+            llm::AGENT_REQUEST_MAX_HISTORY_PAIRS_WITH_CONTEXT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(tail.len(), 14);
+    assert_eq!(tail[0].user_message, "compaction user 13");
+
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-built-before-compaction".into(),
+                user_message: stale_user_message.into(),
+                expected_sequence: stale_summary.sequence,
+            },
+            "start-built-before-compaction",
+            AgentTurnSpec {
+                id: "agent-built-before-compaction".into(),
+                authz: owner_authz(),
+                manifest,
+                environment: "local".into(),
+                provider_name: "test-provider".into(),
+                model_name: Some("test-model".into()),
+                request_json: serde_json::to_value(stale_request).unwrap(),
+                knowledge: AgentKnowledgeContextSpec {
+                    corpus: stale_corpus,
+                    snapshot: stale_snapshot,
+                },
+            },
+        )
+        .await
+        .expect("a request built before compaction must survive the completion race");
+
+    let raw_turn_count: i64 = rusqlite::Connection::open(database.path())
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM session_turns WHERE session_id = 'session-alpha'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(raw_turn_count, 28);
+}
+
+#[tokio::test]
+async fn started_session_compaction_recovers_outcome_unknown_once_without_retry() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    let manifest = test_agent_manifest();
+    for ordinal in 0..27_u64 {
+        complete_compaction_source_turn(&store, &manifest, ordinal).await;
+    }
+    let observed = store
+        .peek_next_session_compaction()
+        .await
+        .unwrap()
+        .expect("the compaction must be queued");
+    let SessionCompactionClaimOutcome::Claimed(started) = store
+        .start_observed_session_compaction(&observed.id)
+        .await
+        .unwrap()
+    else {
+        panic!("the observed compaction must start");
+    };
+    assert_eq!(started.status, SessionCompactionJobStatus::Started);
+    drop(store);
+
+    let reopened = SqliteStore::open(database.path()).await.unwrap();
+    let recovered = reopened
+        .recover_started_session_compactions()
+        .await
+        .unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].id, observed.id);
+    assert_eq!(
+        recovered[0].status,
+        SessionCompactionJobStatus::OutcomeUnknown
+    );
+    assert!(
+        reopened
+            .recover_started_session_compactions()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        reopened
+            .peek_next_session_compaction()
+            .await
+            .unwrap()
+            .is_none()
+    );
+    complete_compaction_source_turn(&reopened, &manifest, 27).await;
+    assert!(
+        reopened
+            .peek_next_session_compaction()
+            .await
+            .unwrap()
+            .is_none(),
+        "an indeterminate source must not be replayed under a fresh job ID"
+    );
+}
+
+#[tokio::test]
+async fn queued_session_compaction_rechecks_actor_before_provider_release() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    let manifest = test_agent_manifest();
+    for ordinal in 0..27_u64 {
+        complete_compaction_source_turn(&store, &manifest, ordinal).await;
+    }
+    let observed = store
+        .peek_next_session_compaction()
+        .await
+        .unwrap()
+        .expect("the compaction must be queued");
+    rusqlite::Connection::open(database.path())
+        .unwrap()
+        .execute(
+            "UPDATE users SET status = 'disabled' WHERE id = 'user-owner'",
+            [],
+        )
+        .unwrap();
+
+    assert_eq!(
+        store
+            .start_observed_session_compaction(&observed.id)
+            .await
+            .unwrap(),
+        SessionCompactionClaimOutcome::NotAvailable
+    );
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let (status, error_json): (String, String) = connection
+        .query_row(
+            "SELECT status, error_json FROM session_compaction_jobs WHERE id = ?1",
+            [&observed.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "failed");
+    assert_eq!(
+        serde_json::from_str::<Value>(&error_json).unwrap()["code"],
+        "authorization_revoked"
+    );
+    assert!(
+        store
+            .peek_next_session_compaction()
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
 async fn created_owned_session_store() -> SqliteStore {
     let store = created_session_store().await;
     bootstrap_test_owner(&store).await;
@@ -19941,6 +20296,14 @@ fn drop_v23_fixture_objects(connection: &rusqlite::Connection) {
 }
 
 fn drop_v24_fixture_objects(connection: &rusqlite::Connection) {
+    let version: i64 = connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    if version >= 25 {
+        drop_v25_fixture_objects(connection);
+    }
     let schema_reject_update = migration_trigger_sql(
         include_str!("../migrations/0020_agent_execution_ledger.sql"),
         "schema_migrations_reject_update",
@@ -19968,6 +20331,34 @@ fn drop_v24_fixture_objects(connection: &rusqlite::Connection) {
                DROP TABLE account_agent_prompt_configs;
                DROP TABLE agent_prompt_revisions;
                DELETE FROM schema_migrations WHERE version = 24;"#,
+        )
+        .unwrap();
+    connection.execute_batch(schema_reject_update).unwrap();
+    connection.execute_batch(schema_reject_delete).unwrap();
+}
+
+fn drop_v25_fixture_objects(connection: &rusqlite::Connection) {
+    let schema_reject_update = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_update",
+    );
+    let schema_reject_delete = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_delete",
+    );
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER schema_migrations_reject_update;
+               DROP TRIGGER schema_migrations_reject_delete;
+               DROP TRIGGER session_compaction_jobs_validate_insert;
+               DROP TRIGGER session_compaction_jobs_reject_identity_update;
+               DROP TRIGGER session_compaction_jobs_enforce_transition;
+               DROP TRIGGER session_compaction_jobs_reject_delete;
+               DROP INDEX session_compaction_jobs_one_active_idx;
+               DROP INDEX session_compaction_jobs_queue_idx;
+               DROP INDEX session_compaction_jobs_latest_success_idx;
+               DROP TABLE session_compaction_jobs;
+               DELETE FROM schema_migrations WHERE version = 25;"#,
         )
         .unwrap();
     connection.execute_batch(schema_reject_update).unwrap();

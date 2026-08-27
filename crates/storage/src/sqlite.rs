@@ -29,6 +29,7 @@ use sha2::{Digest, Sha256};
 
 use crate::cursor;
 mod agent;
+mod compaction;
 mod execution;
 use crate::operation::{OperationClass, OperationLimiter};
 use crate::{
@@ -46,13 +47,15 @@ use crate::{
     ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus,
     ReplyOutcomeUnknownCommit, ReplySuccessCommit, ReviewCommit, ReviewContext, ReviewReceipt,
     RotateMemberSetupTokenCommit, RotateMemberSetupTokenResult, RunSnapshot, RuntimeIdentity,
-    SessionSummaryPage, SqliteOperationLimits, SqlitePhysicalLimits, StorageError, StorageLimits,
-    StoredCredential, StoredMember, StoredMemberPage, StoredMembershipStatus, StoredPreferences,
-    StoredRun, StoredUser, StoredUserRole, StoredUserStatus, TransitionMemberCommit,
+    SessionCompactionClaimOutcome, SessionCompactionFailureCommit, SessionCompactionJob,
+    SessionCompactionSuccessCommit, SessionContextCheckpoint, SessionSummaryPage,
+    SqliteOperationLimits, SqlitePhysicalLimits, StorageError, StorageLimits, StoredCredential,
+    StoredMember, StoredMemberPage, StoredMembershipStatus, StoredPreferences, StoredRun,
+    StoredUser, StoredUserRole, StoredUserStatus, TransitionMemberCommit,
     UpdateAccountAuditPolicyCommit,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 24;
+const CURRENT_SCHEMA_VERSION: i64 = 25;
 const LOCAL_ACCOUNT_ID: &str = "acc_local";
 const EVENT_PAYLOAD_VERSION_V1: i64 = 1;
 const EVENT_PAYLOAD_VERSION_V2: i64 = 2;
@@ -83,6 +86,7 @@ const MIGRATION_0021: &str = include_str!("../migrations/0021_agent_operation_cl
 const MIGRATION_0022: &str = include_str!("../migrations/0022_agent_knowledge_context.sql");
 const MIGRATION_0023: &str = include_str!("../migrations/0023_account_knowledge_catalog.sql");
 const MIGRATION_0024: &str = include_str!("../migrations/0024_account_agent_prompt.sql");
+const MIGRATION_0025: &str = include_str!("../migrations/0025_session_context_compaction.sql");
 const MIGRATION_0022_TRIGGER_NAMES: &[&str] = &[
     "knowledge_corpus_revisions_reject_update",
     "knowledge_corpus_revisions_reject_delete",
@@ -116,6 +120,12 @@ const MIGRATION_0024_TRIGGER_NAMES: &[&str] = &[
     "agent_prompt_config_receipts_require_current_owner",
     "agent_prompt_config_receipts_reject_update",
     "agent_prompt_config_receipts_reject_delete",
+];
+const MIGRATION_0025_TRIGGER_NAMES: &[&str] = &[
+    "session_compaction_jobs_validate_insert",
+    "session_compaction_jobs_reject_identity_update",
+    "session_compaction_jobs_enforce_transition",
+    "session_compaction_jobs_reject_delete",
 ];
 const RECOVERY_BATCH_LIMIT: i64 = 64;
 const AUTH_SESSION_CLEANUP_BATCH_LIMIT: i64 = 64;
@@ -562,6 +572,31 @@ impl SqliteStore {
                 connection,
                 &context,
                 &session_id,
+                through_sequence,
+                limit,
+            )
+        })
+        .await
+    }
+
+    /// Returns only complete turns strictly after a succeeded compaction source
+    /// boundary and at or before the caller's immutable pre-command boundary.
+    pub async fn session_reply_turns_after_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        after_sequence: u64,
+        through_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionTurn>, StorageError> {
+        let context = validated_authz_context(context)?;
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        self.with_connection(move |connection| {
+            query_session_reply_turns_after_for_actor(
+                connection,
+                &context,
+                &session_id,
+                after_sequence,
                 through_sequence,
                 limit,
             )
@@ -1128,6 +1163,73 @@ impl SqliteStore {
         let physical_limits = self.physical_limits.clone();
         self.with_progress_connection(move |connection| {
             recover_started_replies(connection, &physical_limits)
+        })
+        .await
+    }
+
+    /// Observe the stable head of the durable Session-compaction queue.
+    pub async fn peek_next_session_compaction(
+        &self,
+    ) -> Result<Option<SessionCompactionJob>, StorageError> {
+        self.with_progress_connection(|connection| compaction::peek_next(connection))
+            .await
+    }
+
+    /// Commit the exact `started` checkpoint for one observed compaction job.
+    pub async fn start_observed_session_compaction(
+        &self,
+        job_id: &str,
+    ) -> Result<SessionCompactionClaimOutcome, StorageError> {
+        let job_id = normalized_reply_value(job_id, "Session compaction job ID")?.to_owned();
+        self.with_progress_connection(move |connection| {
+            compaction::start_observed(connection, &job_id)
+        })
+        .await
+    }
+
+    /// Persist a validated model summary as the latest immutable checkpoint.
+    pub async fn complete_session_compaction_success(
+        &self,
+        commit: SessionCompactionSuccessCommit,
+    ) -> Result<SessionCompactionJob, StorageError> {
+        self.with_progress_connection(move |connection| {
+            compaction::complete_success(connection, commit)
+        })
+        .await
+    }
+
+    /// Terminalize a known failure or indeterminate post-start provider result.
+    pub async fn complete_session_compaction_failure(
+        &self,
+        commit: SessionCompactionFailureCommit,
+    ) -> Result<SessionCompactionJob, StorageError> {
+        self.with_progress_connection(move |connection| {
+            compaction::complete_failure(connection, commit)
+        })
+        .await
+    }
+
+    /// Convert one bounded batch of process-orphaned started compactions to
+    /// `outcome_unknown`; queued jobs remain safe to execute.
+    pub async fn recover_started_session_compactions(
+        &self,
+    ) -> Result<Vec<SessionCompactionJob>, StorageError> {
+        self.with_progress_connection(compaction::recover_started)
+            .await
+    }
+
+    /// Return the latest succeeded checkpoint visible at an authenticated
+    /// historical Session boundary.
+    pub async fn session_context_checkpoint_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        through_sequence: u64,
+    ) -> Result<Option<SessionContextCheckpoint>, StorageError> {
+        let context = validated_authz_context(context)?;
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        self.with_connection(move |connection| {
+            compaction::checkpoint_for_actor(connection, &context, &session_id, through_sequence)
         })
         .await
     }
@@ -3091,6 +3193,13 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
             params![24, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 25 {
+        transaction.execute_batch(MIGRATION_0025)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![25, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
     // The execution verifier now understands the v22 knowledge binding. Run
     // it only after every missing schema step has been installed so upgrades
     // from v19 and older never query a column that does not exist yet. This
@@ -3754,12 +3863,12 @@ fn readiness(
                'agent_operation_claims', 'knowledge_corpus_revisions',
                'agent_knowledge_contexts', 'agent_knowledge_legacy_boundary',
                'agent_knowledge_legacy_agents', 'account_knowledge_catalogs',
-               'knowledge_catalog_receipts'
+               'knowledge_catalog_receipts', 'session_compaction_jobs'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if table_count != 42 {
+    if table_count != 43 {
         return Err(StorageError::CorruptData(
             "one or more required tables are missing".into(),
         ));
@@ -4243,13 +4352,17 @@ fn readiness(
                'agent_prompt_config_receipts_require_current_owner',
                'agent_prompt_config_receipts_reject_update',
                'agent_prompt_config_receipts_reject_delete',
+               'session_compaction_jobs_validate_insert',
+               'session_compaction_jobs_reject_identity_update',
+               'session_compaction_jobs_enforce_transition',
+               'session_compaction_jobs_reject_delete',
                'schema_migrations_reject_update',
                'schema_migrations_reject_delete'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 143 {
+    if trigger_count != 147 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
         ));
@@ -4257,6 +4370,7 @@ fn readiness(
     verify_migration_trigger_definitions(connection, MIGRATION_0022, MIGRATION_0022_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0023, MIGRATION_0023_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0024, MIGRATION_0024_TRIGGER_NAMES)?;
+    verify_migration_trigger_definitions(connection, MIGRATION_0025, MIGRATION_0025_TRIGGER_NAMES)?;
 
     let agent_pending_call_fk: i64 = connection.query_row(
         r#"SELECT COUNT(*)
@@ -4809,6 +4923,7 @@ fn readiness(
     agent::verify_agent_knowledge_context_integrity(connection)?;
     agent::verify_account_knowledge_catalog_integrity(connection)?;
     agent::verify_account_agent_prompt_integrity(connection)?;
+    compaction::verify_integrity(connection)?;
     execution::verify_agent_execution_integrity(connection)?;
     let (user_count, owner_count): (i64, i64) = connection.query_row(
         r#"SELECT (SELECT COUNT(*) FROM users),
@@ -11943,6 +12058,24 @@ fn query_session_reply_turns_for_actor(
     through_sequence: u64,
     limit: usize,
 ) -> Result<Vec<SessionTurn>, StorageError> {
+    query_session_reply_turns_after_for_actor(
+        connection,
+        context,
+        session_id,
+        0,
+        through_sequence,
+        limit,
+    )
+}
+
+fn query_session_reply_turns_after_for_actor(
+    connection: &mut Connection,
+    context: &AuthzContext,
+    session_id: &str,
+    after_sequence: u64,
+    through_sequence: u64,
+    limit: usize,
+) -> Result<Vec<SessionTurn>, StorageError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
     // Authorization deliberately precedes sequence and limit checks so a
     // foreign Session cannot become a history-boundary oracle.
@@ -11950,17 +12083,24 @@ fn query_session_reply_turns_for_actor(
     let session = query_session_summary(&transaction, session_id)?;
     validate_session_event_tail(&transaction, &session)?;
     validate_active_turn_projection(&transaction, &session)?;
-    if through_sequence > session.sequence {
+    if after_sequence > through_sequence || through_sequence > session.sequence {
         return Err(StorageError::ConcurrentModification);
     }
-    let turns = query_session_reply_turns(&transaction, session_id, through_sequence, limit)?;
+    let turns = query_session_reply_turns_after(
+        &transaction,
+        session_id,
+        after_sequence,
+        through_sequence,
+        limit,
+    )?;
     transaction.commit()?;
     Ok(turns)
 }
 
-fn query_session_reply_turns(
+fn query_session_reply_turns_after(
     connection: &Connection,
     session_id: &str,
+    after_sequence: u64,
     through_sequence: u64,
     limit: usize,
 ) -> Result<Vec<SessionTurn>, StorageError> {
@@ -11971,6 +12111,7 @@ fn query_session_reply_turns(
         });
     }
     let through_sequence = u64_to_i64(through_sequence, "reply context sequence")?;
+    let after_sequence = u64_to_i64(after_sequence, "reply context start sequence")?;
     let limit = capacity_limit(limit)?;
     // The partial index contains only assistant events, so legacy
     // assistant-less flushes never become scan candidates. Joining the
@@ -11992,17 +12133,18 @@ fn query_session_reply_turns(
             AND turn.id = assistant.turn_id
            WHERE assistant.session_id = ?1
              AND assistant.sequence < ?2
+             AND assistant.sequence > ?3
              AND assistant.event_kind = 'assistant_message'
              AND assistant.turn_id IS NOT NULL
              AND flushed.sequence <= ?2
              AND turn.status = 'flushed'
              AND turn.assistant_message IS NOT NULL
            ORDER BY assistant.sequence DESC
-           LIMIT ?3"#,
+           LIMIT ?4"#,
     )?;
     let stored = statement
         .query_map(
-            params![session_id, through_sequence, limit],
+            params![session_id, through_sequence, after_sequence, limit],
             decode_session_turn_row,
         )?
         .collect::<Result<Vec<_>, _>>()?;

@@ -4,7 +4,8 @@
 Event Feed、Point-query Durable Context、Bounded Read Models、SQLite Capacity Slice 2、SQLite
 Physical/Operation Capacity、Bootstrap Audit Retention、schema v13 Account Membership
 Foundation、schema v14 Account-scoped Durable Authorization、schema v15 Member Lifecycle /
-Account Audit、schema v16 Session Reply Context Index 至 schema v24 Account Agent Prompt 已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
+Account Audit、schema v16 Session Reply Context Index 至 schema v25 Durable Session Context
+Compaction 已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
 v11→v12→v13→v14 迁移证据，current-image 证据见本节验收结果，Linux Docker PID/OOM
 authoritative gate 待完成。
 
@@ -205,8 +206,9 @@ POST /sessions/{id}/turns
   user/assistant 对，再追加当前 user message。Session-native Agent request 的第一条且唯一一条
   system message 是当时 active 的 account Agent prompt；其 ID、revision 与域分离 content digest
   绑定在 canonical secret-free deployment manifest，精确内容只随 immutable request 持久化。
-- system prompt、最新至多 26 对历史消息、当前 user message 及其后的 durable `context` message
-  共享 64 KiB 初始 UTF-8 内容预算。初始最多 55 条 message；Agent 全程最多 64 条，为四组 assistant tool call / tool result
+- system prompt、可选 durable `checkpoint`、最新至多 26 对未压缩历史消息、当前 user message
+  及其后的 durable `context` message 共享 64 KiB 初始 UTF-8 内容预算。初始最多 56 条 message；
+  Agent 全程最多 64 条，为四组 assistant tool call / tool result
   预留八条。当前 user message 无法与固定 prompt 一起装入该预算时，在任何 durable write 前
   返回 `413 agent_request_too_large`。interrupted 或尚未 flush 的 turn 不进入模型上下文。
 - admission、model claim、tool continuation 与 deep-integrity 都要求 system message 首位唯一、
@@ -218,6 +220,12 @@ POST /sessions/{id}/turns
   Session 的新状态重建上下文，也不会再次调用 provider。
 - Provider 调用前必须存在同一 prepared claim 对应的 durable `started` checkpoint。
 - `queued` job 可在重启后继续；`started` 且无持久结果的 job 变为 `outcome_unknown`，不得自动重放可能计费的模型请求。
+- 最后一个成功 checkpoint 后出现第 27 个完整 flushed turn 时，schema v25 从最老 13 对中选择
+  provider envelope 可完整容纳的最大 whole-turn 前缀并原子排入 compaction job，不切分消息。
+  原始 Session event/turn 永不删除或改写；成功摘要以独立 durable
+  `checkpoint` role 注入未压缩 tail 之前。compaction 的 `queued` 可恢复，`started` 无结果只变为
+  `outcome_unknown`；failed/unknown generation 阻断自动重排队，不得用新 job ID 重放可能已经
+  计费的摘要请求。
 - Provider 失败必须形成明确的 durable failure/interrupted 状态，不能做空 flush，也不能伪造 assistant 成功。
 - `local-development` 可显式配置 capability-rooted `workspace_list_directory`、
   `workspace_find_paths`、`workspace_search_text`、`workspace_read_file`、`workspace_read_lines`、`workspace_replace_text`、
@@ -315,6 +323,9 @@ POST /sessions/{id}/turns
   content-addressed revision 与 actor-scoped receipt。revision 0 是原内置 prompt 与 manifest
   revision `1`；第一次自定义更新映射到 manifest revision `2`。内容最多 16 KiB，catalog head
   最多推进 256 次，每个 account 最多保留 128 个不同内容和 2 MiB aggregate bytes。
+- `0025_session_context_compaction.sql`：增加不可变 source boundary/digest、上代 checkpoint、模型
+  配置和 exact request 绑定，以及 `queued -> started -> succeeded|failed|outcome_unknown` 单向状态
+  机。成功 summary 最多 16 KiB 且必须严格小于被替换 source；raw Session ledger 保持不变。
 
 schema v24 的 system prompt governance 复用 `0019` 的 prompt binding，并增加 durable
 head/revision/receipt。Owner-only `GET/PUT /api/v1/agent/prompt` 通过 expected-revision CAS 和
@@ -322,6 +333,10 @@ canonical `Idempotency-Key` 更新；普通 member 不能管理，但新 Agent �
 更新不改写既有 Agent；旧 queued governed revision 在 claim 时 fail closed，已经 started 的工作
 继续使用已持久化 request。Owner-only history 列表返回 newest-first bounded metadata，exact point
 route 可读取 revision 0 或任一 committed content；恢复旧内容仍通过 CAS `PUT` 创建新 revision。
+schema v25 的 compaction 与 prompt/knowledge 分离：它只压缩已经完整 flush 且绑定到不可变事件
+边界的历史 turn；后续 Agent request 同时绑定成功 checkpoint 和 checkpoint 之后的原始 tail。
+新回合组装与 compaction 成功并发时，存储层按请求实际携带的 checkpoint（包括没有 checkpoint）
+做精确重建，避免把安全的旧快照误判为损坏。
 Knowledge v1 生成独立、受治理、带完整 digest 的 canonical context
 snapshot，不修改 system prompt。schema v22 已完成数据库绑定、
 Agent request 注入和 exact replay；LLM 协议层使用独立 durable `context` role，并只在

@@ -33,7 +33,8 @@ use llm::{
     LocalFallbackProvider, ProviderError, ReplyKind, ReplyOutput, ReplyProvider, ReplyRequest,
     ReplyToolCall, ReplyToolDefinition, agent_continuation_request, persisted_agent_reply_request,
     validate_agent_reply_request, validate_agent_reply_response_for_request,
-    validate_provider_metadata, validate_reply_request, validate_reply_response_for_request,
+    validate_compaction_response, validate_provider_metadata, validate_reply_request,
+    validate_reply_response_for_request,
 };
 #[cfg(test)]
 use llm::{ReplyMessage, ReplyRole};
@@ -70,9 +71,11 @@ use runtime::{
     AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthzContext, BootstrapOwnerCommit, DemoStore,
     EntryRevision, KnowledgeCatalogRevisionPage, KnowledgeCatalogState,
     KnowledgeCatalogUpdateResult, MemberSetupCommit, PublishedEvent, ReplyClaimOutcome,
-    ReplyFailureCommit, ReplyJob, ReplyOutcomeUnknownCommit, ReplySuccessCommit, StoreError,
-    StoredMember, StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserStatus,
-    TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
+    ReplyFailureCommit, ReplyJob, ReplyOutcomeUnknownCommit, ReplySuccessCommit,
+    SessionCompactionClaimOutcome, SessionCompactionFailureCommit, SessionCompactionJob,
+    SessionCompactionSuccessCommit, StoreError, StoredMember, StoredMembershipStatus,
+    StoredPreferences, StoredUser, StoredUserStatus, TransitionMemberCommit,
+    UpdateAccountAuditPolicyCommit,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -664,6 +667,8 @@ struct ReplyExecutor {
     reply_worker_wake: WorkerWakeState,
     agent_model_drain: Mutex<()>,
     agent_model_worker_wake: WorkerWakeState,
+    compaction_drain: Mutex<()>,
+    compaction_worker_wake: WorkerWakeState,
     agent_tool_drain: Mutex<()>,
     agent_tool_worker_wake: WorkerWakeState,
 }
@@ -676,6 +681,8 @@ impl ReplyExecutor {
             reply_worker_wake: WorkerWakeState::default(),
             agent_model_drain: Mutex::new(()),
             agent_model_worker_wake: WorkerWakeState::default(),
+            compaction_drain: Mutex::new(()),
+            compaction_worker_wake: WorkerWakeState::default(),
             agent_tool_drain: Mutex::new(()),
             agent_tool_worker_wake: WorkerWakeState::default(),
         }
@@ -964,6 +971,7 @@ fn build_authenticated_app(state: ApiState) -> Router {
         .with_state(state.clone());
     kick_reply_worker(&state);
     kick_agent_model_worker(&state);
+    kick_compaction_worker(&state);
     kick_agent_tool_worker(&state);
     router
 }
@@ -2745,6 +2753,173 @@ fn durable_agent_id(session_id: &str, turn_id: &str) -> String {
     format!("{:x}", digest.finalize())
 }
 
+fn kick_compaction_worker(state: &ApiState) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let Some(executor) = &state.reply else {
+        return;
+    };
+    if !executor.compaction_worker_wake.request() {
+        return;
+    }
+    let state = state.clone();
+    runtime.spawn(async move {
+        loop {
+            if let Err(error) =
+                retry_agent_durable_progress("compaction worker", || drain_compaction_jobs(&state))
+                    .await
+            {
+                eprintln!("zeus compaction worker stopped on a permanent queue error: {error}");
+            }
+            let executor = state
+                .reply
+                .as_ref()
+                .expect("a scheduled compaction worker requires a provider");
+            if !executor.compaction_worker_wake.complete_cycle() {
+                return;
+            }
+        }
+    });
+}
+
+async fn drain_compaction_jobs(state: &ApiState) -> Result<(), StoreError> {
+    let executor = state
+        .reply
+        .as_ref()
+        .expect("the compaction worker is only started when a provider exists");
+    let _drain = executor.compaction_drain.lock().await;
+    loop {
+        let job = match state.store.claim_next_session_compaction().await? {
+            SessionCompactionClaimOutcome::Claimed(job) => *job,
+            SessionCompactionClaimOutcome::NotAvailable => return Ok(()),
+        };
+        process_compaction_job(state, job).await?;
+    }
+}
+
+async fn process_compaction_job(
+    state: &ApiState,
+    job: SessionCompactionJob,
+) -> Result<(), StoreError> {
+    let executor = state
+        .reply
+        .as_ref()
+        .expect("a claimed compaction job requires a provider");
+    let metadata = executor.provider.metadata();
+    if validate_provider_metadata(metadata).is_err()
+        || !metadata.is_model_reply()
+        || job.provider_name != metadata.provider_id
+        || metadata.model.as_deref() != Some(job.model_name.as_str())
+    {
+        return settle_compaction_failure(
+            state,
+            &job,
+            "provider_configuration_changed",
+            "The queued compaction no longer matches a model provider",
+            false,
+        )
+        .await;
+    }
+    let request = match serde_json::from_value::<ReplyRequest>(job.request_json.clone()) {
+        Ok(request) if request.tools.is_empty() && validate_reply_request(&request).is_ok() => {
+            request
+        }
+        _ => {
+            return settle_compaction_failure(
+                state,
+                &job,
+                "invalid_persisted_request",
+                "The persisted compaction request could not be decoded safely",
+                false,
+            )
+            .await;
+        }
+    };
+    let provider = Arc::clone(&executor.provider);
+    let response = match tokio::spawn(async move { provider.reply(request).await }).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            let outcome_unknown =
+                matches!(error, ProviderError::Timeout | ProviderError::Transport);
+            return settle_compaction_failure(
+                state,
+                &job,
+                provider_error_code(&error),
+                provider_error_message(&error),
+                outcome_unknown,
+            )
+            .await;
+        }
+        Err(_) => {
+            return settle_compaction_failure(
+                state,
+                &job,
+                "provider_panicked",
+                "The compaction provider stopped after its durable start checkpoint",
+                true,
+            )
+            .await;
+        }
+    };
+    if &response.provider != metadata {
+        return settle_compaction_failure(
+            state,
+            &job,
+            "provider_metadata_mismatch",
+            "The compaction provider returned inconsistent provenance",
+            false,
+        )
+        .await;
+    }
+    let source_bytes = usize::try_from(job.source_content_bytes).map_err(|_| {
+        StoreError::ExecutionInvariant("compaction source bytes are not representable".into())
+    })?;
+    let summary = match validate_compaction_response(&response, source_bytes) {
+        Ok(summary) => summary.to_owned(),
+        Err(error) => {
+            return settle_compaction_failure(
+                state,
+                &job,
+                provider_error_code(&error),
+                provider_error_message(&error),
+                false,
+            )
+            .await;
+        }
+    };
+    let response_json = serde_json::to_value(response).map_err(|_| {
+        StoreError::ExecutionInvariant("compaction response could not be serialized".into())
+    })?;
+    state
+        .store
+        .complete_session_compaction_success(SessionCompactionSuccessCommit {
+            job_id: job.id,
+            response_json,
+            summary_text: summary,
+        })
+        .await?;
+    Ok(())
+}
+
+async fn settle_compaction_failure(
+    state: &ApiState,
+    job: &SessionCompactionJob,
+    code: &str,
+    message: &str,
+    outcome_unknown: bool,
+) -> Result<(), StoreError> {
+    state
+        .store
+        .complete_session_compaction_failure(SessionCompactionFailureCommit {
+            job_id: job.id.clone(),
+            error_json: serde_json::json!({ "code": code, "message": message }),
+            outcome_unknown,
+        })
+        .await?;
+    Ok(())
+}
+
 fn kick_agent_model_worker(state: &ApiState) {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         return;
@@ -3074,7 +3249,8 @@ async fn process_agent_model_job(
                 ));
             }
         },
-        AgentModelCompletion::Final(_) | AgentModelCompletion::Terminal(_) => {}
+        AgentModelCompletion::Final(_) => kick_compaction_worker(state),
+        AgentModelCompletion::Terminal(_) => {}
     }
     Ok(())
 }
@@ -3716,20 +3892,33 @@ async fn start_turn(
         .store
         .session_agent_knowledge_context(&current.principal.authz, &request.user_message)
         .await?;
-    let reply_turns = state
+    let checkpoint = state
         .store
-        .session_reply_turns_for_actor(
+        .session_context_checkpoint_for_actor(
             &current.principal.authz,
             &id,
+            request.expected_sequence,
+        )
+        .await?;
+    let reply_turns = state
+        .store
+        .session_reply_turns_after_for_actor(
+            &current.principal.authz,
+            &id,
+            checkpoint
+                .as_ref()
+                .map_or(0, |checkpoint| checkpoint.source_end_sequence),
             request.expected_sequence,
             AGENT_REQUEST_MAX_HISTORY_PAIRS_WITH_CONTEXT,
         )
         .await?;
-    let mut reply_request =
-        ReplyRequest::from_session_history_for_agent_with_optional_system_prompt_and_context(
+    let mut reply_request = ReplyRequest::from_session_history_for_agent_with_optional_system_prompt_checkpoint_and_context(
             &reply_turns,
             request.user_message.clone(),
             Some(prompt.content.as_str()),
+            checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.summary_text.as_str()),
             knowledge.snapshot.snapshot().canonical_context(),
         )
         .map_err(agent_request_builder_error)?;
@@ -4975,12 +5164,15 @@ impl From<StoreError> for ApiError {
                 "Session command conflicts with current state",
                 "The session state does not allow this command",
             ),
-            StoreError::InvalidAgentTransition(_) => Self::new(
-                StatusCode::CONFLICT,
-                "invalid_agent_transition",
-                "Agent command conflicts with current state",
-                "The Agent state does not allow this command",
-            ),
+            StoreError::InvalidAgentTransition(detail) => {
+                eprintln!("zeus rejected an invalid Agent transition: {detail}");
+                Self::new(
+                    StatusCode::CONFLICT,
+                    "invalid_agent_transition",
+                    "Agent command conflicts with current state",
+                    "The Agent state does not allow this command",
+                )
+            }
             StoreError::ApprovalNotPending {
                 run_id,
                 approval_id,
@@ -7612,6 +7804,131 @@ mod tests {
                 ))
             })
         }
+    }
+
+    #[tokio::test]
+    async fn long_agent_session_compacts_oldest_prefix_and_injects_checkpoint() {
+        let store = DemoStore::seeded().await.unwrap();
+        let owner = provision_test_owner(&store, "user-compaction", "compaction-owner").await;
+        let session_id = "session-agent-compaction";
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: session_id.into(),
+                    title: "Durable context compaction".into(),
+                },
+                "create-agent-compaction",
+            )
+            .await
+            .unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(RecordingProvider::new(Arc::clone(&requests))),
+        )
+        .unwrap();
+        let mut expected_sequence = 1_u64;
+
+        for ordinal in 0..27_u64 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(format!("/api/v1/sessions/{session_id}/turns"))
+                        .header(header::HOST, "zeus.test")
+                        .header(header::ORIGIN, "http://zeus.test")
+                        .header(header::COOKIE, &owner.cookie_header)
+                        .header(CSRF_HEADER, &owner.csrf_token)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header("idempotency-key", format!("compaction-turn-{ordinal}"))
+                        .body(Body::from(
+                            serde_json::json!({
+                                "turn_id": format!("turn-agent-compaction-{ordinal}"),
+                                "user_message": format!("remember durable fact {ordinal}"),
+                                "expected_sequence": expected_sequence,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let ready = wait_for_ready_session(&store, &owner.authz, session_id).await;
+            expected_sequence = ready.session.sequence;
+        }
+
+        let checkpoint = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(checkpoint) = store
+                    .session_context_checkpoint_for_actor(
+                        &owner.authz,
+                        session_id,
+                        expected_sequence,
+                    )
+                    .await
+                    .unwrap()
+                {
+                    break checkpoint;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the compaction worker must persist its checkpoint");
+        assert_eq!(checkpoint.generation, 1);
+        assert_eq!(checkpoint.source_end_sequence, 40);
+        assert_eq!(checkpoint.summary_text, "durable answer 28");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/sessions/{session_id}/turns"))
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "compaction-turn-after-checkpoint")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-agent-after-compaction",
+                            "user_message": "continue from the compacted facts",
+                            "expected_sequence": expected_sequence,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        if response.status() != StatusCode::ACCEPTED {
+            let status = response.status();
+            let body = response_json::<serde_json::Value>(response).await;
+            panic!("post-compaction turn returned {status}: {body}");
+        }
+        let ready = wait_for_ready_session(&store, &owner.authz, session_id).await;
+        assert_eq!(ready.turns.len(), 28);
+
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 29);
+        assert_eq!(recorded[27].messages[0].role, ReplyRole::System);
+        assert!(recorded[27].tools.is_empty());
+        let next_agent = &recorded[28];
+        assert_eq!(next_agent.messages[0].role, ReplyRole::System);
+        assert_eq!(next_agent.messages[1].role, ReplyRole::Checkpoint);
+        assert_eq!(
+            next_agent.messages[1].content,
+            "<compacted-summary>\ndurable answer 28\n</compacted-summary>"
+        );
+        assert_eq!(next_agent.messages[2].content, "remember durable fact 13");
+        assert!(
+            next_agent
+                .messages
+                .iter()
+                .all(|message| message.content != "remember durable fact 0")
+        );
     }
 
     #[tokio::test]

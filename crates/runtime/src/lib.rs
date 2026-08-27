@@ -72,7 +72,9 @@ pub use storage::{
     MemberSetupResult, MemberSetupToken, MemberTransitionResult, MembershipRevision,
     MembershipRole, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit, ReplyJob,
     ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
-    ReplySuccessCommit, RotateMemberSetupTokenResult, SESSION_AGENT_PROMPT_ID, SessionSummaryPage,
+    ReplySuccessCommit, RotateMemberSetupTokenResult, SESSION_AGENT_PROMPT_ID,
+    SessionCompactionClaimOutcome, SessionCompactionFailureCommit, SessionCompactionJob,
+    SessionCompactionSuccessCommit, SessionContextCheckpoint, SessionSummaryPage,
     SqliteOperationLimits, SqliteOperationLimitsError, SqlitePhysicalLimits,
     SqlitePhysicalLimitsError, StorageLimits, StorageLimitsError, StoredCredential, StoredMember,
     StoredMemberPage, StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserRole,
@@ -940,6 +942,7 @@ impl DemoStore {
         // missing result becomes outcome_unknown before generic turn recovery.
         // Queued reply turns are deliberately left open and claimable.
         store.recover_started_reply_jobs().await?;
+        store.recover_started_session_compactions().await?;
         store.recover_started_agent_work().await?;
 
         // Session recovery precedes run-dispatch recovery. Started calls are
@@ -1942,6 +1945,29 @@ impl DemoStore {
             .await?)
     }
 
+    pub async fn session_reply_turns_after_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        after_sequence: u64,
+        through_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionTurn>, StoreError> {
+        validate_durable_reference(session_id, "session ID")?;
+        self.authorize_session_for_actor(context, session_id)
+            .await?;
+        Ok(self
+            .storage
+            .session_reply_turns_after_for_actor(
+                context,
+                session_id,
+                after_sequence,
+                through_sequence,
+                limit,
+            )
+            .await?)
+    }
+
     pub async fn session_events_after_for_actor(
         &self,
         context: &AuthzContext,
@@ -2669,6 +2695,69 @@ impl DemoStore {
         }
     }
 
+    /// Durable Session-compaction claim with exact-start replay across an
+    /// ambiguous SQLite commit acknowledgement.
+    pub async fn claim_next_session_compaction(
+        &self,
+    ) -> Result<SessionCompactionClaimOutcome, StoreError> {
+        let Some(observed) = retry_durable_progress("compaction queue observation", || async {
+            Ok(self.storage.peek_next_session_compaction().await?)
+        })
+        .await?
+        else {
+            return Ok(SessionCompactionClaimOutcome::NotAvailable);
+        };
+        let job_id = observed.id;
+        retry_durable_progress("compaction exact start", || {
+            let job_id = job_id.clone();
+            async move {
+                Ok(self
+                    .storage
+                    .start_observed_session_compaction(&job_id)
+                    .await?)
+            }
+        })
+        .await
+    }
+
+    pub async fn complete_session_compaction_success(
+        &self,
+        commit: SessionCompactionSuccessCommit,
+    ) -> Result<SessionCompactionJob, StoreError> {
+        retry_durable_progress("compaction success", || async {
+            Ok(self
+                .storage
+                .complete_session_compaction_success(commit.clone())
+                .await?)
+        })
+        .await
+    }
+
+    pub async fn complete_session_compaction_failure(
+        &self,
+        commit: SessionCompactionFailureCommit,
+    ) -> Result<SessionCompactionJob, StoreError> {
+        retry_durable_progress("compaction failure", || async {
+            Ok(self
+                .storage
+                .complete_session_compaction_failure(commit.clone())
+                .await?)
+        })
+        .await
+    }
+
+    pub async fn session_context_checkpoint_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        through_sequence: u64,
+    ) -> Result<Option<SessionContextCheckpoint>, StoreError> {
+        Ok(self
+            .storage
+            .session_context_checkpoint_for_actor(context, session_id, through_sequence)
+            .await?)
+    }
+
     /// Account-scoped durable queue inspection for authenticated diagnostics.
     pub async fn reply_job_for_actor(
         &self,
@@ -2978,6 +3067,18 @@ impl DemoStore {
                     }
                     self.publish_session_event(&completion.session.id, event);
                 }
+            }
+        }
+    }
+
+    async fn recover_started_session_compactions(&self) -> Result<(), StoreError> {
+        loop {
+            let recovered = retry_operation_capacity(|| async {
+                Ok(self.storage.recover_started_session_compactions().await?)
+            })
+            .await?;
+            if recovered.is_empty() {
+                return Ok(());
             }
         }
     }

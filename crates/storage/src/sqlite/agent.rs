@@ -959,13 +959,20 @@ fn complete_agent_model_success(
                 &timestamp,
             )?;
             finish_agent_model_job_success(&transaction, &job, &commit.response_json, &timestamp)?;
-            AgentModelCompletion::Final(Box::new(finalize_agent_success(
+            let completion = finalize_agent_success(
                 &transaction,
                 &agent,
                 assistant_message,
                 provenance,
                 &timestamp,
-            )?))
+            )?;
+            super::compaction::maybe_enqueue_after_agent_final(
+                &transaction,
+                &agent,
+                &job,
+                provenance,
+            )?;
+            AgentModelCompletion::Final(Box::new(completion))
         }
         AgentModelResolution::ToolCall { call } => {
             let disposition = proposal_disposition(call.policy_decision.clone(), None)?;
@@ -4395,7 +4402,10 @@ fn validate_request_matches_manifest(
                     "agent model request message {index} role must be a string"
                 ))
             })?;
-            if !matches!(role, "system" | "user" | "context" | "assistant" | "tool") {
+            if !matches!(
+                role,
+                "system" | "user" | "checkpoint" | "context" | "assistant" | "tool"
+            ) {
                 return Err(StorageError::InvalidAgentTransition(format!(
                     "agent model request message {index} has an unsupported role"
                 )));
@@ -5207,30 +5217,68 @@ fn require_initial_agent_request_transcript(
     let history_boundary = user_sequence
         .checked_sub(1)
         .ok_or_else(|| invalid_agent_transcript("the user event has no history boundary"))?;
-    let history = query_session_reply_turns(
-        connection,
-        &agent.session_id,
-        history_boundary,
-        llm::AGENT_REQUEST_MAX_HISTORY_PAIRS_WITH_CONTEXT,
-    )
-    .map_err(agent_transcript_storage_error)?;
-    let mut expected =
-        llm::ReplyRequest::from_session_history_for_agent_with_optional_system_prompt_and_context(
-            &history,
-            query,
-            system_prompt,
-            canonical_context,
+    // Bind reconstruction to the checkpoint actually persisted in this request.
+    // A compaction may complete between the API's read and this write
+    // transaction; an absent or older valid checkpoint must therefore remain
+    // reconstructable instead of turning a safe request into a race-dependent
+    // admission failure.
+    let checkpoint_message = candidate
+        .messages
+        .iter()
+        .find(|message| message.role == llm::ReplyRole::Checkpoint);
+    let checkpoints = match checkpoint_message {
+        Some(message) => {
+            let matches = super::compaction::checkpoints_matching_message(
+                connection,
+                &agent.session_id,
+                history_boundary,
+                &message.content,
+            )
+            .map_err(agent_transcript_storage_error)?;
+            if matches.is_empty() {
+                return Err(invalid_agent_transcript(
+                    "the request checkpoint is not a succeeded durable Session compaction",
+                ));
+            }
+            matches.into_iter().map(Some).collect::<Vec<_>>()
+        }
+        None => vec![None],
+    };
+    for checkpoint in checkpoints {
+        let history = query_session_reply_turns_after(
+            connection,
+            &agent.session_id,
+            checkpoint
+                .as_ref()
+                .map_or(0, |checkpoint| checkpoint.source_end_sequence),
+            history_boundary,
+            llm::AGENT_REQUEST_MAX_HISTORY_PAIRS_WITH_CONTEXT,
         )
-        .map_err(invalid_agent_transcript)?;
-    expected.tools = agent_reply_tools_from_manifest(manifest);
-    let expected =
-        llm::persisted_agent_reply_request(&expected).map_err(invalid_agent_transcript)?;
-    if job.request_json != expected {
-        return Err(invalid_agent_transcript(
-            "the initial request is not the canonical reconstruction of durable history",
-        ));
+        .map_err(agent_transcript_storage_error)?;
+        let Ok(mut expected) =
+            llm::ReplyRequest::from_session_history_for_agent_with_optional_system_prompt_checkpoint_and_context(
+                &history,
+                query,
+                system_prompt,
+                checkpoint
+                    .as_ref()
+                    .map(|checkpoint| checkpoint.summary_text.as_str()),
+                canonical_context,
+            )
+        else {
+            continue;
+        };
+        expected.tools = agent_reply_tools_from_manifest(manifest);
+        let Ok(expected) = llm::persisted_agent_reply_request(&expected) else {
+            continue;
+        };
+        if job.request_json == expected {
+            return Ok(());
+        }
     }
-    Ok(())
+    Err(invalid_agent_transcript(
+        "the initial request is not the canonical reconstruction of durable history",
+    ))
 }
 
 fn require_continuation_agent_request_transcript(

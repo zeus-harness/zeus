@@ -29,7 +29,7 @@ Client / SvelteKit Web
 - `authz`：account capability matrix，以及精确工具名规则、策略 revision、环境和 effect guard；没有命中即拒绝。
 - `tools`：工具描述、注册表、参数验证和 object-safe executor 边界。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
-- `storage`：schema v24 migration、`acc_local` membership 权威、一次性 member setup、用户/偏好、
+- `storage`：schema v25 migration、`acc_local` membership 权威、一次性 member setup、用户/偏好、
   account audit/rollup/policy/archive state、独立 Session/Run ledger、typed event lookup、
   account+actor-scoped 回执、durable Agent/model/tool/dispatch queue、不可变 deployment manifest，
   revisioned account knowledge catalog、owner-governed Agent prompt，以及
@@ -72,6 +72,15 @@ capability 读取当时的 active corpus，随后仍把 exact corpus/snapshot �
 newest-first 有界分页，列表只返回 digest/count/actor/timestamp 摘要，精确 revision 点查才解码并
 校验完整 corpus。revision 0 始终是隐式空基线；恢复历史 corpus 必须通过现有 expected-revision CAS
 写入新 head，不能原地改写旧 revision。
+
+schema v25 增加非破坏性的 Session context compaction。最后一个成功 checkpoint 之后出现第 27
+个完整 flushed turn 时，从最老 13 对中选取 provider envelope 能完整容纳的最大 whole-turn
+前缀，绑定为 immutable compaction request；不切分任何消息，原始
+`session_events` 和 `session_turns` 不删除、不改写。成功摘要以独立 durable `checkpoint` role
+插在 system prompt 之后、未压缩 tail 之前，仅在 OpenAI-compatible wire 边界映射为 `user`。
+compaction job 只允许 `queued -> started -> succeeded|failed|outcome_unknown` 单向迁移；重启可继续
+queued job，但 started 且无 durable 结果的调用只结算为 `outcome_unknown`。failed 或
+outcome_unknown generation 都会阻断自动重排队，不得换一个 job ID 重放同一 source。
 
 ## 事件与状态
 
@@ -145,12 +154,12 @@ Session ledger 记录 `session_created`、`run_attached`、`user_message`、可�
   capability 读取 account active knowledge corpus，再对当前 user message 生成确定性 selection；
   provider request 以命令的
   `expected_sequence` 为快照边界：第一条且唯一一条 system message 是当前 account active
-  prompt 的精确内容，且其 ID/revision/content digest 与 manifest 绑定；随后才是最新完整
-  flushed user/assistant 对和当前 user message。manifest 只保存
+  prompt 的精确内容，且其 ID/revision/content digest 与 manifest 绑定；随后是可选的 durable
+  compaction checkpoint、最新完整 flushed user/assistant tail 和当前 user message。manifest 只保存
   稳定 prompt ID、revision 与域分离 content digest，不保存提示词内容或 secret；精确内容随
   immutable request 持久化；当前 user message 后追加一条 exact durable `context` message。
-  system prompt、最多 26 对历史消息、当前 user message 和 context 共享 64 KiB 初始 UTF-8
-  内容预算；初始最多 55 条 message，为 Agent 全程 64-message 上限预留四组
+  system prompt、checkpoint、最多 26 对未压缩历史消息、当前 user message 和 context 共享
+  64 KiB 初始 UTF-8 内容预算；初始最多 56 条 message，为 Agent 全程 64-message 上限预留四组
   assistant tool call / tool result。interrupted、缺少 assistant 或尚未 flush 的 turn 不进入
   上下文。组装结果持久化在 job 中，迟到的幂等重试复用该 durable request，而不是从更晚的
   Session 状态重新生成。当前 user message 无法与 active prompt 一起装入初始预算时，API 在任何
@@ -209,20 +218,22 @@ connector 在数据库事务和锁之外运行。
 
 API 监听端口之前按固定顺序完成：
 
-1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v24；按当前
+1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v25；按当前
    detailed-row limit 以最多 64 行 batch 压缩 bootstrap terminal audit prefix，再按稳定
    `(priority actor, expires_at, auth-session ID)` 顺序最多清理 64 个过期或绑定
    missing/disabled/suspended/stale-revision authority 的 auth session。
 2. 绑定并核对 runtime identity、primary Session/Run 和 demo attachment。
 3. 以固定 64 行 batch 读取 `started` 且没有持久结果的 legacy reply job，循环排空：结算为
    `outcome_unknown`，追加 `turn_interrupted`，不得重放可能已经计费的 provider 请求。
-4. 先把 Agent 中仅 `prepared` 的 model/tool claim 标为 expired；这些 claim 没有外部 I/O
+4. 以固定 64 行 batch 把 `started` 且没有持久结果的 Session compaction 结算为
+   `outcome_unknown`；`queued` compaction 原样保留，监听启动后由 worker 继续。
+5. 先把 Agent 中仅 `prepared` 的 model/tool claim 标为 expired；这些 claim 没有外部 I/O
    权限，底层 operation 仍为 queued，可由下一 generation 安全继续。再循环处理已 `started`
    的 model/tool operation：两者都结算为 `outcome_unknown`，Agent/Session 进入
    `needs_attention`，且绝不重放可能已计费或已产生副作用的外部调用；waiting-for-approval 原样保留。
-5. 随后以固定 64 行 batch 处理没有 durable terminal 解释的其它 open Session turn：标记
+6. 随后以固定 64 行 batch 处理没有 durable terminal 解释的其它 open Session turn：标记
    `interrupted`、追加 `turn_interrupted`，不生成 flush ack，也不修改 Run ledger。
-6. 以固定 64 行 batch 循环处理 started 且没有 ToolResult 的 Run dispatch：追加 `OutcomeUnknown`，Run 进入
+7. 以固定 64 行 batch 循环处理 started 且没有 ToolResult 的 Run dispatch：追加 `OutcomeUnknown`，Run 进入
    `needs_attention`，不自动重试外部调用。
 7. 只有 queued 且没有 started checkpoint 的工作才可以继续派发；已有终态结果不重新执行。
 8. 恢复和安全派发完成后，进程才绑定监听端口。
@@ -488,8 +499,9 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   都有确定性覆盖。后续 v15 member/audit、v16 context index、v17 Agent loop、v18 exact tool
   completion replay、v19 deployment manifest、v20 RunEpoch/execution fact ledger 与 v21
   prepared operation claim，以及 v22 knowledge context binding 与 domain-separated count+digest
-  legacy-set commitment、v23 owner-governed knowledge catalog head/ingestion receipt，以及 v24
-  owner-governed Agent prompt head/revision/receipt，也覆盖 fresh schema
+  legacy-set commitment、v23 owner-governed knowledge catalog head/ingestion receipt、v24
+  owner-governed Agent prompt head/revision/receipt，以及 v25 non-destructive Session context
+  compaction state machine，也覆盖 fresh schema
   和历史原地迁移；畸形 v21 升级会整体回滚，不留下 v22 版本或表，既有 v22 数据库则原地增加
   空的 revision-0 catalog projection，不改写已经固化的 Agent knowledge context。
 - 重启后用户/偏好、Session/turn/event、Agent/model/tool job、deployment manifest、Run/Event、

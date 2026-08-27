@@ -279,6 +279,40 @@ async fn openai_compatible_maps_durable_context_to_a_separate_user_message() {
     );
 }
 
+#[tokio::test]
+async fn openai_compatible_preserves_compaction_framing_as_separate_user_input() {
+    let response = serde_json::json!({
+        "choices": [{
+            "message": { "role": "assistant", "content": "Checkpoint-bound reply" },
+            "finish_reason": "stop"
+        }]
+    });
+    let mut mock = spawn_mock(
+        "200 OK",
+        &[("Content-Type", "application/json".to_owned())],
+        serde_json::to_vec(&response).unwrap(),
+        Duration::ZERO,
+    )
+    .await;
+    let provider =
+        OpenAiCompatibleProvider::new(&mock.endpoint, "mock-model", "test-api-key").unwrap();
+    let request = ReplyRequest::new([
+        ReplyMessage::new(ReplyRole::System, "Stable instructions"),
+        ReplyMessage::compacted_summary("Older complete turns"),
+        ReplyMessage::new(ReplyRole::User, "Current question"),
+    ]);
+
+    provider.reply(request).await.unwrap();
+    let captured = mock.received.take().unwrap().await.unwrap();
+    let request_json: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
+    assert_eq!(request_json["messages"][1]["role"], "user");
+    assert_eq!(
+        request_json["messages"][1]["content"],
+        "<compacted-summary>\nOlder complete turns\n</compacted-summary>"
+    );
+    assert_eq!(request_json["messages"][2]["content"], "Current question");
+}
+
 fn lookup_tool() -> ReplyToolDefinition {
     ReplyToolDefinition::new(
         "lookup_order",

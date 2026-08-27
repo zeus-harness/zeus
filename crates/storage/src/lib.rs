@@ -488,6 +488,76 @@ pub struct ReplyCompletion {
     pub replayed: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionCompactionJobStatus {
+    Queued,
+    Started,
+    Succeeded,
+    Failed,
+    OutcomeUnknown,
+}
+
+/// Durable at-most-once model work that summarizes one immutable prefix of
+/// complete Session turns without rewriting the raw event ledger.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionCompactionJob {
+    pub id: String,
+    pub account_id: AccountId,
+    pub actor_user_id: String,
+    pub actor_membership_revision: MembershipRevision,
+    pub session_id: String,
+    pub generation: u64,
+    pub previous_job_id: Option<String>,
+    pub provider_name: String,
+    pub model_name: String,
+    pub status: SessionCompactionJobStatus,
+    pub attempt: u32,
+    pub source_start_sequence: u64,
+    pub source_end_sequence: u64,
+    pub source_digest: String,
+    pub source_content_bytes: u64,
+    pub request_json: Value,
+    pub response_json: Option<Value>,
+    pub summary_text: Option<String>,
+    pub summary_digest: Option<String>,
+    pub error_json: Option<Value>,
+    pub queued_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+/// Latest succeeded context checkpoint that may replace only the history at or
+/// before `source_end_sequence` in a later immutable Agent request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionContextCheckpoint {
+    pub job_id: String,
+    pub generation: u64,
+    pub source_end_sequence: u64,
+    pub source_digest: String,
+    pub summary_text: String,
+    pub summary_digest: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SessionCompactionClaimOutcome {
+    Claimed(Box<SessionCompactionJob>),
+    NotAvailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SessionCompactionSuccessCommit {
+    pub job_id: String,
+    pub response_json: Value,
+    pub summary_text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SessionCompactionFailureCommit {
+    pub job_id: String,
+    pub error_json: Value,
+    pub outcome_unknown: bool,
+}
+
 /// Immutable inputs for one durable Session-native agent loop.
 ///
 /// The first provider request is committed atomically with the user turn. The

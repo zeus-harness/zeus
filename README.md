@@ -92,14 +92,16 @@ Partial provider configuration fails startup. The endpoint and key are never
 writable through the browser Settings API.
 
 Each accepted turn builds the initial provider request from exactly one stable
-system message, the newest complete, flushed user/assistant pairs that existed
-at the submitted `expected_sequence`, the new user message, and one final
-durable `context` message. The system
+system message, an optional durable compaction checkpoint, the newest complete,
+flushed user/assistant pairs that existed at the submitted
+`expected_sequence`, the new user message, and one final durable `context`
+message. The system
 prompt identity, revision, and domain-separated content digest are part of the
 canonical secret-free deployment manifest; its exact content is the first
 message in the durable request. The prompt and governed context share the 64 KiB
-initial UTF-8 content budget with at most 26 prior pairs and the current user
-message. That initial shape uses at most 55 of the Agent's 64-message budget,
+initial UTF-8 content budget with at most 26 uncompressed prior pairs, the
+checkpoint, and the current user message. That initial shape uses at most 56 of
+the Agent's 64-message budget,
 reserving eight messages for four sequential assistant tool calls and their
 results. The fixed loop also permits at most eight model steps, one pending
 approval, 16 KiB of arguments per call, 64 KiB per known result, and 128 KiB of
@@ -658,6 +660,16 @@ and bounded memory, CPU, and PID resources.
   manifest revision `1`; the first custom revision binds manifest revision `2`.
   Existing Agents retain their immutable manifest/request. Queued work whose
   governed prompt is no longer active fails closed before provider or tool I/O.
+  Schema v25 adds non-destructive Session context compaction. Once 27 complete
+  pairs exist beyond the last successful checkpoint, the largest whole-turn
+  prefix of the oldest 13 pairs that fits the provider envelope is bound to an
+  immutable model request and durable `queued -> started ->
+  succeeded|failed|outcome_unknown` job. A successful summary is injected as a
+  distinct `checkpoint` role before the uncompressed tail; raw Session events
+  and turns are never rewritten or deleted. Queued work survives restart, while
+  a started call without a durable result becomes `outcome_unknown`. Failed or
+  indeterminate generations block automatic re-enqueue, so the same source is
+  never silently retried under a new job ID.
   Existing Runs and events are decoded, validated, and migrated in place without
   rewriting their payloads. Runtime identity still binds profile, environment,
   primary Session and Run, policy ID, and policy revision; a mismatch fails
@@ -863,7 +875,7 @@ directly.
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Current schema v24 retains durable Run attachment during migration and demo
+Current schema v25 retains durable Run attachment during migration and demo
 seeding, but Alpha+ does not expose a public attach-Run HTTP route.
 
 The application boundary now caps auth JSON at 8 KiB, command JSON at 512 KiB,
@@ -888,7 +900,7 @@ approval, dispatch, reply completion, attachment checks, and startup recovery
 use typed point queries or fixed 64-row batches. Production Session list/detail,
 Run detail, and overview reads now use indexed `LIMIT + 1` keyset pages inside
 actor-authorized SQLite snapshots; no production HTTP read loads a complete
-ledger or collection. Current schema v24 retains bounded Session, open-turn,
+ledger or collection. Current schema v25 retains bounded Session, open-turn,
 active reply/dispatch, auth-session, bootstrap-audit, event-slot, and logical
 event-payload-byte admission. Exact idempotent replay is checked before capacity,
 while accepted work consumes its reserved terminal slots and payload bytes
@@ -970,15 +982,15 @@ schema v15 Member Lifecycle / Account Audit, schema v16 Session Reply Context
 Index, schema v17 Durable Session Agent Loop, schema v18 exact tool-completion
 replay, schema v19 deployment-manifest binding, schema v20 execution-ledger,
 schema v21 prepared claims, schema v22 durable knowledge-context binding, and
-schema v23 account knowledge catalog ingestion, and schema v24 account Agent
-prompt governance:
+schema v23 account knowledge catalog ingestion, schema v24 account Agent prompt
+governance, and schema v25 durable Session context compaction:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 565 tests passed
-  under the existing project counting convention, including 18 connector tests,
-  8 deployment tests, 29 knowledge tests, 248 storage tests, 48 runtime tests,
-  71 API library tests, 6 API main/config
+- `cargo test --workspace --all-targets --locked`: 593 tests passed
+  across the top-level test targets, including 22 connector tests,
+  8 deployment tests, 29 knowledge tests, 29 LLM unit and 13 provider-contract
+  tests, 252 storage tests, 48 runtime tests, 74 API library tests, 6 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,
