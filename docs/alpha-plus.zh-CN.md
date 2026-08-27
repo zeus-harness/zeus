@@ -1,6 +1,6 @@
 # Zeus Harness Alpha+ 设计冻结
 
-状态：主机 Alpha+、Actor Boundary Foundation、API/Terminal Payload Resource Envelope、Bounded Event Feed、Point-query Durable Context、Bounded Read Models、SQLite Capacity Slice 2、SQLite Physical Capacity Slice 与 SQLite Operation Capacity Slice 已实现并通过主机全量验收；current-image Apple 指定压力场景已通过，Linux Docker PID/OOM authoritative gate 待完成
+状态：主机 Alpha+、Actor Boundary Foundation、API/Terminal Payload Resource Envelope、Bounded Event Feed、Point-query Durable Context、Bounded Read Models、SQLite Capacity Slice 2、SQLite Physical/Operation Capacity 与 Bootstrap Audit Retention 已实现并通过主机全量验收；current-image Apple 指定压力场景已通过，v12 current-image restart 与 Linux Docker PID/OOM authoritative gate 待完成
 前置基线：`8117ed6`（SQLite Physical Capacity）
 
 ## 1. 产品术语
@@ -48,8 +48,8 @@ Health 路由保持公开。公开注册、邮件找回、OAuth/SSO、WebAuthn �
 这些边界只是未来 member 能力的安全底座。当前 API 仍拒绝 member 登录；字段、HTTP/SSE
 连接、事件页边界、内部 point/batch read 和 Session/Run 有界 read model 已经落地，但
 即使 SQLite 行数、活跃队列、event-slot 和事件载荷逻辑字节配额已落地，也不得开放 member。
-SQLite 主库/WAL/磁盘 headroom 门禁已经落地，但 member 仍须等待 tenant/account
-membership scope、bootstrap audit 的明确保留期及相应授权/审计语义。
+SQLite 主库/WAL/磁盘 headroom 门禁和 bootstrap audit bounded retention 已经落地，但 member
+仍须等待 tenant/account membership scope、account-scoped authorization 与安全审计生命周期。
 
 Resource Envelope 的固定边界：auth JSON 8 KiB、command JSON 512 KiB；新建 Session/turn
 ID 128 UTF-8 bytes、Session title 256 bytes、user/assistant message 64 KiB、review note 8 KiB；
@@ -80,7 +80,7 @@ SQLite Capacity Slice 2 在每个 `BEGIN IMMEDIATE` admission 事务内执行 ow
 双层限制：Session 1,000/10,000、open turn 32/64、active reply 32/64、active dispatch
 16/32、auth session 每用户/全局 32/256。每个 Session 的 ledger head 加未消费预留槽默认
 最多 10,000，每个 Run 默认 50,000；Session/Run 的 `payload_json` 逻辑 UTF-8 字节默认分别
-限制为 64 MiB/256 MiB，全局合计默认 1 GiB；bootstrap audit 默认最多 1,024 行。配置可调但
+限制为 64 MiB/256 MiB，全局合计默认 1 GiB；bootstrap audit 详细窗口默认最多 1,024 行。配置可调但
 不得为 0、不得让 scope/per-ledger 超过 global，也不得越过编译期 hard ceiling。鉴权和 exact
 receipt replay 先于容量检查，所以 foreign resource 仍是 `404`，已成功命令在满配额时仍能 replay。
 
@@ -91,8 +91,11 @@ Run 槽和 start+terminal 字节。reply claim 必须确认完整预留仍在；
 之前 fail closed 为脱敏 `503`。普通容量拒绝为带 `Cache-Control: no-store` 的 `429`；reply/
 dispatch queue 另带 `Retry-After: 2`。计量只覆盖 `session_events.payload_json` 与
 `run_events.payload_json` 的实际 UTF-8 序列化字节，不宣称 DB file、WAL、索引、page overhead
-或宿主磁盘空间有保证。过期 auth session 只在启动和新建登录会话前按稳定顺序清理最多 64 行；
-ledger、receipt、job、turn 和 bootstrap audit 不做静默删除。
+或宿主磁盘空间有保证。过期 auth session 只在启动和新建登录会话前按稳定顺序清理最多 64 行。
+ledger、receipt、job、turn 和 account audit 不做静默删除；bootstrap token detail 采用明确的
+v12 retention：live 永不压缩，terminal lifecycle 按 sequence 最多 64 行一批链入 singleton
+SHA-256 rollup 后才删除，原因区分 `superseded/consumed/expired/legacy_unknown`。rollup 是数据库内
+历史压缩 commitment，不是外部防篡改锚。
 
 SQLite Physical Capacity Slice 已实现并通过本地主机验证，采用以下默认值与编译期 hard ceiling：
 
@@ -199,6 +202,10 @@ POST /sessions/{id}/turns
 - `0011_event_payload_bytes.sql`：为 Session/Run ledger 与 active finalization reservation
   增加逻辑载荷字节计数和预留，按既有 UTF-8 `payload_json` 的 BLOB byte length 精确回填，
   并由 trigger 在同一事务中记账。
+- `0012_bootstrap_audit_retention.sql`：把旧 `used_at` 保守迁移为 `legacy_unknown`，增加单调
+  sequence 与明确 terminal reason；rotation/open 按当前 detailed-row limit 以最多 64 行批次
+  更新 SHA-256 rollup 并删除已承诺前缀，live token 永不压缩。v11 旧顺序按 `rowid` 保留，
+  wall-clock 回拨不会阻止 compaction；current-v12 因降限需要写入时先通过 Migration physical gate。
 
 迁移必须原地保留 Alpha append-only ledger、事件外键与 runtime identity。任何一步失败都回滚整个 migration transaction。
 
@@ -224,6 +231,9 @@ POST /sessions/{id}/turns
 - v10 到 v11 精确回填 Session/Run event payload bytes 与 active finalization reservation；
   逻辑字节 exact/+1、物理主库边界、Admission/ReservedProgress/Finalization、507/503 合约、
   startup deep check 与显式 `verify_integrity` 都有自动测试。
+- v11 到 v12 保留 token 插入顺序并将旧 terminal reason 标为 `legacy_unknown`；超过 detailed
+  window 的 rotation/open、多批 64 行压缩、canonical digest、时钟回拨、current-v12 降限、
+  低磁盘 pre-write gate、非法 transition/delete/rollup 回退和 deep corruption 都有自动测试。
 - operation gate 的普通 lane fail-fast、单一 deadline、memory progress 优先、等待 future cancel 与
   partial permit 回收、caller abort 后 permit 生命周期、内部 capacity-only retry、worker wake
   合并、最后一个 progress waiter 取消后的主动唤醒、provider/connector panic 的
@@ -237,7 +247,7 @@ POST /sessions/{id}/turns
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 通过 271 个 Rust 测试（storage 121、runtime 28、API library 44、API main/config 4）与
+- host 通过 281 个 Rust 测试（storage 131、runtime 28、API library 44、API main/config 4）与
   25 个 Web Node 测试。
 
 ## 8. 容器与 OOM 验收边界

@@ -24,6 +24,7 @@ use protocol::{
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::cursor;
 use crate::operation::{OperationClass, OperationLimiter};
@@ -38,7 +39,7 @@ use crate::{
     StoredCredential, StoredPreferences, StoredRun, StoredUser, StoredUserRole, StoredUserStatus,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 11;
+const CURRENT_SCHEMA_VERSION: i64 = 12;
 const EVENT_PAYLOAD_VERSION_V1: i64 = 1;
 const EVENT_PAYLOAD_VERSION_V2: i64 = 2;
 const SESSION_EVENT_PAYLOAD_VERSION_V1: i64 = 1;
@@ -54,8 +55,12 @@ const MIGRATION_0008: &str = include_str!("../migrations/0008_actor_boundaries.s
 const MIGRATION_0009: &str = include_str!("../migrations/0009_point_queries.sql");
 const MIGRATION_0010: &str = include_str!("../migrations/0010_capacity.sql");
 const MIGRATION_0011: &str = include_str!("../migrations/0011_event_payload_bytes.sql");
+const MIGRATION_0012: &str = include_str!("../migrations/0012_bootstrap_audit_retention.sql");
 const RECOVERY_BATCH_LIMIT: i64 = 64;
 const AUTH_SESSION_CLEANUP_BATCH_LIMIT: i64 = 64;
+const BOOTSTRAP_AUDIT_ROLLUP_BATCH_LIMIT: i64 = 64;
+const BOOTSTRAP_AUDIT_ZERO_DIGEST: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 const REPLY_JOB_ID_MAX_BYTES: usize = 384;
 const REPLY_REQUEST_JSON_MAX_BYTES: usize = 512 * 1024;
 const REPLY_RESPONSE_JSON_MAX_BYTES: usize = 512 * 1024;
@@ -172,6 +177,7 @@ impl SqliteStore {
         let operation_limiter = Arc::new(OperationLimiter::new(&operation_limits));
         let path = path.as_ref().to_path_buf();
         if path == Path::new(":memory:") {
+            let migration_limits = limits.clone();
             let permits = operation_limiter
                 .acquire(OperationClass::General, true)
                 .await?;
@@ -183,7 +189,7 @@ impl SqliteStore {
                 let result = (|| {
                     let mut connection = Connection::open_in_memory()?;
                     configure_connection(&connection, false, None)?;
-                    migrate(&mut connection)?;
+                    migrate(&mut connection, &migration_limits)?;
                     cleanup_expired_auth_sessions(&mut connection, &now())?;
                     deep_readiness(&mut connection, false, None)?;
                     Ok::<_, StorageError>(connection)
@@ -201,6 +207,7 @@ impl SqliteStore {
             })
         } else {
             let backend_physical_limits = physical_limits.clone();
+            let migration_limits = limits.clone();
             let permits = operation_limiter
                 .acquire(OperationClass::General, false)
                 .await?;
@@ -214,7 +221,12 @@ impl SqliteStore {
                     let lock_file = acquire_database_lock(&path)?;
                     let mut connection = open_file_connection(&path, &backend_physical_limits)?;
                     let schema_version = current_schema_version(&connection)?;
-                    if schema_version < CURRENT_SCHEMA_VERSION {
+                    let bootstrap_audit_compaction_required = schema_version
+                        == CURRENT_SCHEMA_VERSION
+                        && bootstrap_audit_retention_required(&connection, &migration_limits)?;
+                    if schema_version < CURRENT_SCHEMA_VERSION
+                        || bootstrap_audit_compaction_required
+                    {
                         require_physical_capacity(
                             &connection,
                             &path,
@@ -222,7 +234,7 @@ impl SqliteStore {
                             PhysicalCapacityGate::Migration,
                         )?;
                     }
-                    migrate(&mut connection)?;
+                    migrate(&mut connection, &migration_limits)?;
                     require_physical_capacity(
                         &connection,
                         &path,
@@ -2082,7 +2094,7 @@ fn evaluate_physical_capacity(
     Ok(())
 }
 
-fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
+fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), StorageError> {
     connection.execute_batch(
         r#"CREATE TABLE IF NOT EXISTS schema_migrations (
                version INTEGER PRIMARY KEY,
@@ -2225,6 +2237,14 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
             params![11, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 12 {
+        transaction.execute_batch(MIGRATION_0012)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![12, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
+    compact_existing_bootstrap_audit_to_capacity(&transaction, &now(), limits)?;
     transaction.commit()?;
     Ok(())
 }
@@ -2411,12 +2431,13 @@ fn readiness(
                'dispatch_jobs', 'runtime_identity', 'sessions', 'session_runs',
                'session_turns', 'session_events', 'session_command_receipts',
                'users', 'auth_sessions', 'bootstrap_tokens', 'user_preferences',
-               'reply_jobs', 'finalization_reservations', 'event_payload_usage'
+               'reply_jobs', 'finalization_reservations', 'event_payload_usage',
+               'bootstrap_audit_rollup'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if table_count != 19 {
+    if table_count != 20 {
         return Err(StorageError::CorruptData(
             "one or more required tables are missing".into(),
         ));
@@ -2501,12 +2522,14 @@ fn readiness(
                'finalization_reservations_dispatch_idx',
                'finalization_reservations_scope_active_idx',
                'finalization_reservations_kind_active_idx',
-               'auth_sessions_expiry_idx'
+               'auth_sessions_expiry_idx',
+               'bootstrap_tokens_one_live_idx',
+               'bootstrap_tokens_terminal_sequence_idx'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if point_query_indexes != 12 {
+    if point_query_indexes != 14 {
         return Err(StorageError::CorruptData(
             "one or more point-query indexes are missing".into(),
         ));
@@ -2540,8 +2563,11 @@ fn readiness(
                'users_reject_identity_update',
                'users_reject_delete_with_history',
                'auth_sessions_reject_update',
-               'bootstrap_tokens_enforce_single_use',
-               'bootstrap_tokens_reject_delete',
+               'bootstrap_tokens_require_next_sequence',
+               'bootstrap_tokens_enforce_terminal_transition',
+               'bootstrap_tokens_reject_uncommitted_delete',
+               'bootstrap_audit_rollup_enforce_update',
+               'bootstrap_audit_rollup_reject_delete',
                'user_preferences_enforce_revision',
                'sessions_owner_is_write_once',
                'runs_owner_is_write_once',
@@ -2571,11 +2597,13 @@ fn readiness(
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 52 {
+    if trigger_count != 55 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
         ));
     }
+
+    verify_bootstrap_audit_state(connection, deep_invariants)?;
 
     if !deep_invariants {
         let (usage_rows, singleton, used_bytes): (i64, i64, i64) = connection.query_row(
@@ -2816,6 +2844,79 @@ fn readiness(
     Ok(())
 }
 
+fn verify_bootstrap_audit_state(
+    connection: &Connection,
+    deep_invariants: bool,
+) -> Result<(), StorageError> {
+    let rollup_rows: i64 =
+        connection.query_row("SELECT COUNT(*) FROM bootstrap_audit_rollup", [], |row| {
+            row.get(0)
+        })?;
+    if rollup_rows != 1 {
+        return Err(StorageError::CorruptData(
+            "the bootstrap audit rollup singleton is missing or duplicated".into(),
+        ));
+    }
+    let (singleton, through_sequence, digest): (i64, i64, String) = connection.query_row(
+        r#"SELECT singleton, through_sequence, digest
+           FROM bootstrap_audit_rollup"#,
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if singleton != 1
+        || through_sequence < 0
+        || !is_lower_hex_digest(&digest)
+        || (through_sequence == 0 && digest != BOOTSTRAP_AUDIT_ZERO_DIGEST)
+        || (through_sequence > 0 && digest == BOOTSTRAP_AUDIT_ZERO_DIGEST)
+    {
+        return Err(StorageError::CorruptData(
+            "the bootstrap audit rollup is structurally inconsistent".into(),
+        ));
+    }
+
+    let boundary_violation: i64 = connection.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM bootstrap_tokens
+               WHERE sequence <= ?1
+               UNION ALL
+               SELECT 1
+               FROM bootstrap_tokens token
+               WHERE token.terminal_at IS NULL
+                 AND token.sequence <> (SELECT MAX(sequence) FROM bootstrap_tokens)
+           )"#,
+        [through_sequence],
+        |row| row.get(0),
+    )?;
+    if boundary_violation != 0 {
+        return Err(StorageError::CorruptData(
+            "the bootstrap audit detailed window crosses its rollup boundary".into(),
+        ));
+    }
+
+    if deep_invariants {
+        let (count, first, last): (i64, i64, i64) = connection.query_row(
+            r#"SELECT COUNT(*), COALESCE(MIN(sequence), 0), COALESCE(MAX(sequence), 0)
+               FROM bootstrap_tokens"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let expected_first = through_sequence
+            .checked_add(1)
+            .ok_or_else(|| StorageError::CorruptData("bootstrap audit sequence overflow".into()))?;
+        let expected_count = last.checked_sub(through_sequence).ok_or_else(|| {
+            StorageError::CorruptData("bootstrap audit sequence precedes its rollup".into())
+        })?;
+        if (count == 0 && (first != 0 || last != 0))
+            || (count > 0 && (first != expected_first || count != expected_count))
+        {
+            return Err(StorageError::CorruptData(
+                "the bootstrap audit detailed sequence is not contiguous with its rollup".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn deep_readiness(
     connection: &mut Connection,
     expects_wal: bool,
@@ -2916,6 +3017,212 @@ fn require_bootstrap_audit_capacity(
         return Err(StorageError::StorageQuotaExceeded);
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct BootstrapAuditTokenRow {
+    sequence: i64,
+    token_hash: String,
+    created_at: String,
+    expires_at: String,
+    terminal_at: String,
+    terminal_reason: String,
+}
+
+fn compact_bootstrap_audit_to_capacity(
+    connection: &Connection,
+    timestamp: &str,
+    limits: &StorageLimits,
+) -> Result<(), StorageError> {
+    let limit = capacity_limit(limits.bootstrap_audit_rows)?;
+    let target_count = limit.checked_sub(1).ok_or(StorageError::IntegerOutOfRange(
+        "bootstrap audit live reservation",
+    ))?;
+    compact_bootstrap_audit_to_count(connection, timestamp, target_count)
+}
+
+fn compact_existing_bootstrap_audit_to_capacity(
+    connection: &Connection,
+    timestamp: &str,
+    limits: &StorageLimits,
+) -> Result<(), StorageError> {
+    let target_count = capacity_limit(limits.bootstrap_audit_rows)?;
+    compact_bootstrap_audit_to_count(connection, timestamp, target_count)
+}
+
+fn bootstrap_audit_retention_required(
+    connection: &Connection,
+    limits: &StorageLimits,
+) -> Result<bool, StorageError> {
+    let limit = capacity_limit(limits.bootstrap_audit_rows)?;
+    let count: i64 = connection.query_row("SELECT COUNT(*) FROM bootstrap_tokens", [], |row| {
+        row.get(0)
+    })?;
+    Ok(count > limit)
+}
+
+fn compact_bootstrap_audit_to_count(
+    connection: &Connection,
+    timestamp: &str,
+    target_count: i64,
+) -> Result<(), StorageError> {
+    loop {
+        let count: i64 =
+            connection.query_row("SELECT COUNT(*) FROM bootstrap_tokens", [], |row| {
+                row.get(0)
+            })?;
+        if count <= target_count {
+            return Ok(());
+        }
+        let rows_to_remove = count
+            .checked_sub(target_count)
+            .ok_or(StorageError::IntegerOutOfRange(
+                "bootstrap audit compaction batch",
+            ))?
+            .min(BOOTSTRAP_AUDIT_ROLLUP_BATCH_LIMIT);
+        compact_bootstrap_audit_batch(connection, timestamp, rows_to_remove)?;
+    }
+}
+
+fn compact_bootstrap_audit_batch(
+    connection: &Connection,
+    timestamp: &str,
+    batch_limit: i64,
+) -> Result<(), StorageError> {
+    if !(1..=BOOTSTRAP_AUDIT_ROLLUP_BATCH_LIMIT).contains(&batch_limit) {
+        return Err(StorageError::CorruptData(
+            "bootstrap audit compaction batch is outside its supported bound".into(),
+        ));
+    }
+    let (through_sequence, previous_digest): (i64, String) = connection.query_row(
+        r#"SELECT through_sequence, digest
+           FROM bootstrap_audit_rollup WHERE singleton = 1"#,
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if through_sequence < 0 || !is_lower_hex_digest(&previous_digest) {
+        return Err(StorageError::CorruptData(
+            "the bootstrap audit rollup is structurally inconsistent".into(),
+        ));
+    }
+
+    let mut statement = connection.prepare(
+        r#"SELECT sequence, token_hash, created_at, expires_at,
+                  terminal_at, terminal_reason
+           FROM bootstrap_tokens
+           WHERE sequence > ?1
+             AND terminal_at IS NOT NULL
+             AND terminal_reason IS NOT NULL
+           ORDER BY sequence
+           LIMIT ?2"#,
+    )?;
+    let rows = statement
+        .query_map(params![through_sequence, batch_limit], |row| {
+            Ok(BootstrapAuditTokenRow {
+                sequence: row.get(0)?,
+                token_hash: row.get(1)?,
+                created_at: row.get(2)?,
+                expires_at: row.get(3)?,
+                terminal_at: row.get(4)?,
+                terminal_reason: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.is_empty() {
+        return Err(StorageError::StorageQuotaExceeded);
+    }
+    for (index, row) in rows.iter().enumerate() {
+        let expected =
+            through_sequence
+                .checked_add(i64::try_from(index + 1).map_err(|_| {
+                    StorageError::IntegerOutOfRange("bootstrap audit sequence offset")
+                })?)
+                .ok_or(StorageError::IntegerOutOfRange("bootstrap audit sequence"))?;
+        if row.sequence != expected {
+            return Err(StorageError::CorruptData(
+                "the bootstrap audit terminal prefix is not contiguous".into(),
+            ));
+        }
+    }
+    let new_through = rows
+        .last()
+        .expect("a non-empty bootstrap audit compaction batch has a tail")
+        .sequence;
+    let new_digest = bootstrap_audit_rollup_digest(&previous_digest, &rows)?;
+    let changed = connection.execute(
+        r#"UPDATE bootstrap_audit_rollup
+           SET through_sequence = ?1,
+               digest = ?2,
+               updated_at = CASE
+                   WHEN updated_at > ?3 THEN updated_at
+                   ELSE ?3
+               END
+           WHERE singleton = 1 AND through_sequence = ?4 AND digest = ?5"#,
+        params![
+            new_through,
+            new_digest,
+            timestamp,
+            through_sequence,
+            previous_digest
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::CorruptData(
+            "the bootstrap audit rollup changed concurrently".into(),
+        ));
+    }
+    let deleted = connection.execute(
+        r#"DELETE FROM bootstrap_tokens
+           WHERE sequence > ?1 AND sequence <= ?2
+             AND terminal_at IS NOT NULL AND terminal_reason IS NOT NULL"#,
+        params![through_sequence, new_through],
+    )?;
+    if deleted != rows.len() {
+        return Err(StorageError::CorruptData(
+            "the bootstrap audit compacted prefix changed during deletion".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn bootstrap_audit_rollup_digest(
+    previous_digest: &str,
+    rows: &[BootstrapAuditTokenRow],
+) -> Result<String, StorageError> {
+    if !is_lower_hex_digest(previous_digest) {
+        return Err(StorageError::CorruptData(
+            "the bootstrap audit rollup digest is malformed".into(),
+        ));
+    }
+    let mut digest = previous_digest.to_owned();
+    for row in rows {
+        let mut hasher = Sha256::new();
+        hasher.update(b"zeus.bootstrap-audit-rollup.v1\0");
+        hasher.update(digest.as_bytes());
+        hasher.update(row.sequence.to_be_bytes());
+        for field in [
+            row.token_hash.as_bytes(),
+            row.created_at.as_bytes(),
+            row.expires_at.as_bytes(),
+            row.terminal_at.as_bytes(),
+            row.terminal_reason.as_bytes(),
+        ] {
+            let length = u64::try_from(field.len())
+                .map_err(|_| StorageError::IntegerOutOfRange("bootstrap audit digest field"))?;
+            hasher.update(length.to_be_bytes());
+            hasher.update(field);
+        }
+        digest = format!("{:x}", hasher.finalize());
+    }
+    Ok(digest)
+}
+
+fn is_lower_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn require_auth_session_capacity(
@@ -3634,14 +3941,22 @@ fn replace_bootstrap_token(
         physical_limits,
         PhysicalCapacityGate::Admission,
     )?;
-    require_bootstrap_audit_capacity(&transaction, limits)?;
     transaction.execute(
-        "UPDATE bootstrap_tokens SET used_at = ?1 WHERE used_at IS NULL",
+        r#"UPDATE bootstrap_tokens
+           SET terminal_at = ?1,
+               terminal_reason = CASE
+                   WHEN julianday(expires_at) <= julianday(?1) THEN 'expired'
+                   ELSE 'superseded'
+               END
+           WHERE terminal_at IS NULL"#,
         [&timestamp],
     )?;
+    compact_bootstrap_audit_to_capacity(&transaction, &timestamp, limits)?;
+    require_bootstrap_audit_capacity(&transaction, limits)?;
     transaction.execute(
-        r#"INSERT INTO bootstrap_tokens(token_hash, created_at, expires_at, used_at)
-           VALUES (?1, ?2, ?3, NULL)"#,
+        r#"INSERT INTO bootstrap_tokens(
+               token_hash, created_at, expires_at, terminal_at, terminal_reason
+           ) VALUES (?1, ?2, ?3, NULL, NULL)"#,
         params![token_hash, timestamp, expires_at],
     )?;
     transaction.commit()?;
@@ -3679,7 +3994,7 @@ fn bootstrap_owner(
     let bootstrap_expiry = transaction
         .query_row(
             r#"SELECT expires_at FROM bootstrap_tokens
-               WHERE token_hash = ?1 AND used_at IS NULL"#,
+               WHERE token_hash = ?1 AND terminal_at IS NULL"#,
             [bootstrap_token_hash],
             |row| row.get::<_, String>(0),
         )
@@ -3741,8 +4056,9 @@ fn bootstrap_owner(
     )?;
 
     let consumed = transaction.execute(
-        r#"UPDATE bootstrap_tokens SET used_at = ?1
-           WHERE token_hash = ?2 AND used_at IS NULL"#,
+        r#"UPDATE bootstrap_tokens
+           SET terminal_at = ?1, terminal_reason = 'consumed'
+           WHERE token_hash = ?2 AND terminal_at IS NULL"#,
         params![timestamp, bootstrap_token_hash],
     )?;
     if consumed != 1 {

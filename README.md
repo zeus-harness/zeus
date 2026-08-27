@@ -22,6 +22,10 @@ the schema but cannot authenticate through this build; multi-user resource
 isolation is not enabled yet. Keep the service loopback/private-network only,
 and do not expose it as a shared or Internet-facing deployment.
 
+The staged account/membership and audit-retention design is documented in
+[`docs/account-membership-audit-retention.zh-CN.md`](docs/account-membership-audit-retention.zh-CN.md).
+It is an implementation contract, not a claim that member access is enabled.
+
 ## Prerequisites
 
 - Rust `1.97.1`
@@ -107,6 +111,14 @@ cover the UTF-8 byte length of serialized `session_events.payload_json` and
 `run_events.payload_json` plus outstanding finalization reservations. They do
 not cover other rows, indexes, SQLite page overhead, the database file, WAL, or
 free-disk capacity.
+
+`ZEUS_MAX_BOOTSTRAP_AUDIT_ROWS` is the detailed token-lifecycle window, not an
+admission limit that can permanently block owner setup. Schema v12 terminates
+each token as `superseded`, `consumed`, `expired`, or migration-only
+`legacy_unknown`; terminal prefixes are folded in deterministic batches of at
+most 64 into a monotonic SHA-256 rollup before their detail rows are removed.
+The live token is never compacted. The rollup is a database-local history
+commitment, not an external tamper-proof anchor.
 
 The implemented and locally verified SQLite Physical Capacity Slice uses these
 configuration limits:
@@ -428,7 +440,10 @@ and bounded memory, CPU, and PID resources.
   cleanup, and readiness checks for reservation ownership and lifecycle. Schema
   v11 adds exact Session/Run/global logical event-payload byte counters and
   conservative terminal byte reservations, with migration backfill and trigger-
-  enforced accounting over the stored UTF-8 JSON.
+  enforced accounting over the stored UTF-8 JSON. Schema v12 gives bootstrap
+  credentials ordered lifecycle reasons and a bounded detailed audit window;
+  rotation and startup compaction preserve a monotonic digest rollup and no
+  longer brick an unconfigured instance when detailed history reaches its cap.
   Existing Runs and events are decoded, validated, and migrated in place without
   rewriting their payloads. Runtime identity still binds profile, environment,
   primary Session and Run, policy ID, and policy revision; a mismatch fails
@@ -464,9 +479,9 @@ directly.
   state changes additionally require `X-CSRF-Token` to match the login and an
   exact same-origin request. Alpha+ deliberately rejects the schema-reserved
   `member` role. Actor isolation and SQLite physical headroom are now present,
-  but member access remains blocked until a tenant/account membership scope, a
-  bootstrap-audit retention policy, and their authorization/audit semantics
-  land.
+  and bootstrap audit retention is now bounded. Member access remains blocked
+  until the account membership scope, account-scoped authorization, and account
+  security-audit lifecycle land.
 - `GET /api/v1/me/settings` returns the current safe preferences.
   `PATCH /api/v1/me/settings` accepts `theme`, optional allowlisted
   `preferred_model`, and `expected_revision`. Provider endpoints and API keys
@@ -539,7 +554,7 @@ directly.
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Schema v11 retains durable Run attachment during migration and demo seeding,
+Schema v12 retains durable Run attachment during migration and demo seeding,
 but Alpha+ does not expose a public attach-Run HTTP route.
 
 The application boundary now caps auth JSON at 8 KiB and command JSON at
@@ -559,7 +574,7 @@ approval, dispatch, reply completion, attachment checks, and startup recovery
 use typed point queries or fixed 64-row batches. Production Session list/detail,
 Run detail, and overview reads now use indexed `LIMIT + 1` keyset pages inside
 actor-authorized SQLite snapshots; no production HTTP read loads a complete
-ledger or collection. Schema v11 enforces bounded Session, open-turn, active
+ledger or collection. Schema v12 enforces bounded Session, open-turn, active
 reply/dispatch, auth-session, bootstrap-audit, event-slot, and logical event-
 payload-byte admission. Exact idempotent replay is checked before capacity,
 while accepted work consumes its reserved terminal slots and payload bytes
@@ -568,11 +583,12 @@ SQLite triggers from the exact stored UTF-8 `payload_json`; migration backfills
 existing bytes and conservatively reserves active work so historical databases
 can still drain even when they exceed a newly configured limit. Expired auth
 sessions are deleted in deterministic batches of at most 64 on startup and
-before session creation; append-only ledgers, receipts, jobs, turns, and audit
-records are not silently pruned. The locally verified Physical Capacity Slice
+before session creation. Append-only ledgers, receipts, jobs, turns, and account
+audit records are not silently pruned; bootstrap token details alone follow the
+explicit bounded rollup policy above. The locally verified Physical Capacity Slice
 now gates the main DB, active-WAL target, and filesystem headroom, subject to
 the documented WAL and `statvfs` limitations. Bounded SQLite operation
-concurrency is also implemented. A complete audit-retention horizon and
+concurrency is also implemented. Account security-audit retention and the
 tenant/member membership scope remain unresolved; shared-network and
 multi-tenant deployment is therefore still out of scope. The specified
 current-image Apple readiness-pressure scenario has passed; authoritative
@@ -628,11 +644,11 @@ committed data. Use SQLite's backup/checkpoint facilities.
 Current Alpha+ plus Actor Boundary Foundation, API Resource Envelope, Terminal
 Payload Envelope, Bounded Event Feed, Point-query Durable Context, Bounded Read
 Models, SQLite Capacity Slice 2, the SQLite Physical Capacity Slice, and the
-SQLite Operation Capacity Slice host verification:
+SQLite Operation Capacity Slice, and Bootstrap Audit Retention host verification:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --all-targets`: 271 tests passed, including 121
+- `cargo test --workspace --all-targets`: 281 tests passed, including 131
   storage tests, 28 runtime tests, 44 API library tests, and 4 API main/config
   tests, plus the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
@@ -658,6 +674,10 @@ SQLite Operation Capacity Slice host verification:
   worker wake coalescing, progress-waiter cancellation notification,
   provider/connector panic settlement as `outcome_unknown`, progress under
   general saturation, and the stable API `503` mapping contract.
+  Bootstrap-audit coverage includes v11 migration with explicit unknown
+  reasons, canonical digest vectors, multi-batch rotation and startup
+  compaction, current-v12 limit reduction, wall-clock rollback, pre-write
+  physical gating, trigger rollback, and deep-integrity corruption detection.
 - `pnpm --filter web test`: 25 tests passed for CSRF headers, stable command
   identity, deep-page active-Session restore, Session-list cursor encoding and
   deduplication, bounded-tail retry reconciliation and Session-switch race

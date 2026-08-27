@@ -27,7 +27,7 @@ Client / SvelteKit Web
 - `authz`：精确工具名规则、策略 revision、环境和 effect guard；没有命中即拒绝。
 - `tools`：工具描述、注册表、参数验证和 object-safe executor 边界。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
-- `storage`：schema v11 migration、用户/偏好、独立 Session/Run ledger、typed event lookup、
+- `storage`：schema v12 migration、用户/偏好、独立 Session/Run ledger、typed event lookup、
   actor-scoped 回执、durable reply/dispatch queue，以及 logical/physical/operation capacity。
 - `runtime`：Session 命令编排、reply/Run worker、提交后 SSE 提示和启动恢复。
 - `zeus-api`：进程组合、owner 认证、CSRF、provider 配置、REST/SSE 和 readiness。
@@ -142,7 +142,8 @@ connector 在数据库事务和锁之外运行。
 
 API 监听端口之前按固定顺序完成：
 
-1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v11；按
+1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v12；按当前
+   detailed-row limit 以最多 64 行 batch 压缩 bootstrap terminal audit prefix，再按
    `(expires_at, token_hash)` 最多清理 64 个过期 auth session。
 2. 绑定并核对 runtime identity、primary Session/Run 和 demo attachment。
 3. 以固定 64 行 batch 读取 `started` 且没有持久结果的 reply job，循环排空：结算为 `outcome_unknown`，追加
@@ -177,7 +178,7 @@ exactly-once 语义。
   review 和 receipt 已全部 actor-scoped，并有 Alice/Bob 隔离测试；字段、HTTP/SSE 连接和
   event page 边界、内部 point/batch read、有界 list/detail，以及 SQLite 行数、active queue、
   event-slot、事件载荷逻辑字节配额和 DB/WAL/disk headroom 门禁已落地。但 member 仍须等待
-  tenant/account membership scope、bootstrap audit retention 与相应授权/审计语义，不能仅因
+  tenant/account membership scope、account-scoped authorization 与安全审计生命周期，不能仅因
   数据面已隔离就开放。
 - auth JSON 明确限制为 8 KiB、command JSON 为 512 KiB；新建 Session/turn ID、title、
   user/assistant message、review note 与严格幂等键分别按 UTF-8 bytes 设置硬上限。typed
@@ -222,6 +223,11 @@ exactly-once 语义。
   预留，并用 SQLite trigger 按实际存储的 UTF-8 `payload_json` 原子记账。迁移按 BLOB byte
   length 精确回填历史 ledger，为 open turn 与 queued/started dispatch 回填保守终结预算；
   历史用量超过当前配置仍可读取和排空，只阻止新的 admission。
+  v12 为 bootstrap token lifecycle 增加单调 sequence 和
+  `superseded/consumed/expired/legacy_unknown` terminal reason；详细窗口超限时，rotation 与 open
+  在同一事务内按最多 64 行 batch 更新 versioned SHA-256 rollup 后删除 terminal 前缀，live
+  token 永不压缩。旧 v11 行按 `rowid` 保持插入顺序，时钟回拨不阻断压缩；current-v12 因降限
+  需要写入时先通过 Migration physical gate。rollup 只是数据库内 commitment，不是外部可信锚。
   每个 pre-v4 Run 会绑定到生成的 `session-{run_id}`，原 Run/Event 不重写、不丢弃。
 - runtime identity 持久绑定 profile、environment、primary Session/Run、policy ID 和
   revision；不一致时启动失败。Run attachment 当前用于 migration 和 demo seed，Alpha 不公开
@@ -314,7 +320,7 @@ exactly-once 语义。
 
 ## Alpha+ 验收
 
-- schema v1/v3/v7/v8/v9/v10 原地迁移到 v11 后，原 Run/Event payload 保留，primary Session/Run 绑定稳定；迁移时
+- schema v1/v3/v7/v8/v9/v10/v11 原地迁移到 v12 后，原 Run/Event payload 保留，primary Session/Run 绑定稳定；迁移时
   尚未 bootstrap 的 legacy actor 只允许在首次 owner bootstrap 事务中认领一次。
 - 重启后用户/偏好、Session/turn/event、reply job、Run/Event、审批决定、dispatch job 和命令
   回执仍存在。
@@ -331,6 +337,9 @@ exactly-once 语义。
 - reply/dispatch started 后模拟崩溃，均恢复为 `outcome_unknown` 且不发生第二次外部执行。
 - 首次 bootstrap 只能消费一次 token；登录、CSRF、同源、Cookie 属性、设置 revision、退出后
   401 以及退出/失效后 SSE 关闭有自动化或 live 验收。
+- bootstrap audit 的 v11 reason 迁移、canonical digest、64 行多批压缩、rotation/open 降限、
+  wall-clock rollback、低磁盘 pre-write gate、非法 lifecycle/删除/rollup 回退与 deep corruption
+  都有确定性存储测试。
 - 第二个进程不能同时打开同一个持久数据库；profile/policy identity 不匹配时 fail closed。
 - 活跃 Run/Session SSE 不能无限拖住进程退出；SIGINT/SIGTERM 的 graceful drain 最长五秒，
   随后关闭剩余连接并释放 SQLite lease。
@@ -347,13 +356,14 @@ exactly-once 语义。
   `404`。审批、派发、reply completion、attachment 和启动恢复已改为 typed point query 或
   固定 64 行 batch；Session list/detail 与 Run detail/overview 也已改为 indexed bounded read
   model。SQLite row/active/event-slot、逻辑 event-payload byte quota 与 physical capacity gate
-  和 operation capacity gate 已落地；对外或多租户部署前仍必须完成 tenant/account membership
-  scope 与完整 audit retention。current-image Apple 指定 readiness-pressure 已通过；完整低内存/
+  和 operation capacity gate 已落地；bootstrap audit detailed retention 与 rollup 已落地，对外或
+  多租户部署前仍必须完成 tenant/account membership scope 与 account security-audit retention。
+  current-image Apple 指定 readiness-pressure 已通过；完整低内存/
   对抗性压力与 Linux Docker PID/OOM authoritative evidence 仍是 deployment gate。
 - Web 保持紧凑时间线、一个内联审批卡和一个 composer；支持真实 New Session、活动 Session
   刷新恢复、owner 设置/退出和 system/light/dark。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化结果是 271 个 Rust 测试（storage 121、runtime 28、API library 44、API
+- 当前自动化结果是 281 个 Rust 测试（storage 131、runtime 28、API library 44、API
   main/config 4）和 25 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 

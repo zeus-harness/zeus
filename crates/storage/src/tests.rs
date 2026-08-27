@@ -1428,7 +1428,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
     let owner: Option<String> = connection
         .query_row(
             "SELECT owner_user_id FROM runs WHERE id = ?1",
@@ -1556,7 +1556,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
     let approval_plan = explain_query_plan(
         &connection,
         r#"SELECT sequence FROM run_events
@@ -1794,6 +1794,511 @@ async fn owner_bootstrap_claims_legacy_state_and_auth_sessions_are_revocable() {
             })
             .await,
         Err(StorageError::AccountAlreadyConfigured)
+    ));
+}
+
+#[tokio::test]
+async fn bootstrap_audit_capacity_rolls_terminal_prefixes_without_blocking_rotation() {
+    let database = TestDatabase::new();
+    let limits = StorageLimits {
+        bootstrap_audit_rows: 2,
+        ..StorageLimits::default()
+    };
+    let store = SqliteStore::open_with_limits(database.path(), limits)
+        .await
+        .unwrap();
+    let expiry = (chrono::Utc::now() + chrono::Duration::hours(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    for index in 1..=140 {
+        store
+            .replace_bootstrap_token(&bootstrap_token_hash(index), &expiry)
+            .await
+            .unwrap();
+        let detailed_count: i64 = rusqlite::Connection::open(database.path())
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM bootstrap_tokens", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(detailed_count <= 2);
+    }
+
+    let (through_sequence, digest) = bootstrap_audit_rollup(database.path());
+    assert_eq!(through_sequence, 138);
+    assert_ne!(digest, "0".repeat(64));
+    let details = bootstrap_audit_details(database.path());
+    assert_eq!(details.len(), 2);
+    assert_eq!(details[0].0, 139);
+    assert_eq!(details[0].3.as_deref(), Some("superseded"));
+    assert_eq!(details[1].0, 140);
+    assert_eq!(details[1].2, None);
+    assert_eq!(details[1].3, None);
+    store.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn bootstrap_audit_rollup_uses_the_versioned_canonical_sha256_chain() {
+    let database = TestDatabase::new();
+    let limits = StorageLimits {
+        bootstrap_audit_rows: 1,
+        ..StorageLimits::default()
+    };
+    let store = SqliteStore::open_with_limits(database.path(), limits)
+        .await
+        .unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO bootstrap_tokens(
+                   token_hash, created_at, expires_at, terminal_at, terminal_reason
+               ) VALUES (?1, ?2, ?3, NULL, NULL)"#,
+            params![
+                bootstrap_token_hash(1),
+                "2026-08-27T00:00:00.000Z",
+                "2026-08-27T01:00:00.000Z"
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE bootstrap_tokens
+               SET terminal_at = ?1, terminal_reason = 'superseded'
+               WHERE sequence = 1"#,
+            ["2026-08-27T00:30:00.000Z"],
+        )
+        .unwrap();
+    drop(connection);
+
+    store
+        .replace_bootstrap_token(&bootstrap_token_hash(2), "2999-01-01T00:00:00.000Z")
+        .await
+        .unwrap();
+    assert_eq!(
+        bootstrap_audit_rollup(database.path()),
+        (
+            1,
+            "ac5d61b5346605703a1b0c93dc8192d7b8bad2ecb6482dd0eedfe9f29713dd31".into()
+        )
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_audit_rotation_compacts_multiple_sixty_four_row_batches() {
+    let database = TestDatabase::new();
+    let limits = StorageLimits {
+        bootstrap_audit_rows: 1,
+        ..StorageLimits::default()
+    };
+    let store = SqliteStore::open_with_limits(database.path(), limits)
+        .await
+        .unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    for index in 1..=131 {
+        connection
+            .execute(
+                r#"INSERT INTO bootstrap_tokens(
+                       token_hash, created_at, expires_at,
+                       terminal_at, terminal_reason
+                   ) VALUES (?1, ?2, ?3, NULL, NULL)"#,
+                params![
+                    bootstrap_token_hash(index),
+                    "2026-08-26T00:00:00.000Z",
+                    "2999-01-01T00:00:00.000Z"
+                ],
+            )
+            .unwrap();
+        if index <= 130 {
+            connection
+                .execute(
+                    r#"UPDATE bootstrap_tokens
+                       SET terminal_at = ?1, terminal_reason = 'superseded'
+                       WHERE sequence = ?2"#,
+                    params!["2026-08-26T00:30:00.000Z", i64::try_from(index).unwrap()],
+                )
+                .unwrap();
+        }
+    }
+    drop(connection);
+
+    store
+        .replace_bootstrap_token(&bootstrap_token_hash(10_000), "2999-01-01T00:00:00.000Z")
+        .await
+        .unwrap();
+
+    let (through_sequence, digest) = bootstrap_audit_rollup(database.path());
+    assert_eq!(through_sequence, 131);
+    assert_ne!(digest, "0".repeat(64));
+    let details = bootstrap_audit_details(database.path());
+    assert_eq!(details.len(), 1);
+    assert_eq!(details[0].0, 132);
+    assert_eq!(details[0].1, bootstrap_token_hash(10_000));
+    assert_eq!(details[0].2, None);
+    store.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn bootstrap_audit_rotation_survives_wall_clock_rollback() {
+    let database = TestDatabase::new();
+    let limits = StorageLimits {
+        bootstrap_audit_rows: 1,
+        ..StorageLimits::default()
+    };
+    let store = SqliteStore::open_with_limits(database.path(), limits)
+        .await
+        .unwrap();
+    let future = "2999-01-01T00:00:00.000Z";
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO bootstrap_tokens(
+                   token_hash, created_at, expires_at, terminal_at, terminal_reason
+               ) VALUES (?1, ?2, ?3, NULL, NULL)"#,
+            params![bootstrap_token_hash(1), "2026-08-27T00:00:00.000Z", future],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE bootstrap_tokens
+               SET terminal_at = ?1, terminal_reason = 'superseded'
+               WHERE sequence = 1"#,
+            ["2026-08-27T00:30:00.000Z"],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO bootstrap_tokens(
+                   token_hash, created_at, expires_at, terminal_at, terminal_reason
+               ) VALUES (?1, ?2, ?3, NULL, NULL)"#,
+            params![bootstrap_token_hash(2), "2026-08-27T00:31:00.000Z", future],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE bootstrap_audit_rollup
+               SET through_sequence = 1, digest = ?1, updated_at = ?2
+               WHERE singleton = 1"#,
+            params!["a".repeat(64), future],
+        )
+        .unwrap();
+    connection
+        .execute("DELETE FROM bootstrap_tokens WHERE sequence = 1", [])
+        .unwrap();
+    drop(connection);
+
+    store
+        .replace_bootstrap_token(&bootstrap_token_hash(3), future)
+        .await
+        .unwrap();
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let (through_sequence, updated_at): (i64, String) = connection
+        .query_row(
+            r#"SELECT through_sequence, updated_at
+               FROM bootstrap_audit_rollup WHERE singleton = 1"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(through_sequence, 2);
+    assert_eq!(updated_at, future);
+    drop(connection);
+    store.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn v11_bootstrap_audit_migration_preserves_rowid_order_across_clock_rollback() {
+    let database = TestDatabase::new();
+    let initial = SqliteStore::open(database.path()).await.unwrap();
+    drop(initial);
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    downgrade_bootstrap_audit_fixture_to_v11(&connection);
+    connection
+        .execute(
+            r#"INSERT INTO bootstrap_tokens(
+                   token_hash, created_at, expires_at, used_at
+               ) VALUES (?1, ?2, ?3, ?4)"#,
+            params![
+                bootstrap_token_hash(1),
+                "2026-08-27T00:00:00.000Z",
+                "2026-08-27T01:00:00.000Z",
+                "2026-08-27T00:30:00.000Z"
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO bootstrap_tokens(
+                   token_hash, created_at, expires_at, used_at
+               ) VALUES (?1, ?2, ?3, ?4)"#,
+            params![
+                bootstrap_token_hash(2),
+                "2026-08-26T00:00:00.000Z",
+                "2026-08-26T01:00:00.000Z",
+                "2026-08-26T00:30:00.000Z"
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO bootstrap_tokens(
+                   token_hash, created_at, expires_at, used_at
+               ) VALUES (?1, ?2, ?3, NULL)"#,
+            params![
+                bootstrap_token_hash(3),
+                "2026-08-25T00:00:00.000Z",
+                "2999-01-01T00:00:00.000Z"
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    let details = bootstrap_audit_details(database.path());
+    assert_eq!(
+        details.iter().map(|row| row.1.as_str()).collect::<Vec<_>>(),
+        vec![
+            bootstrap_token_hash(1),
+            bootstrap_token_hash(2),
+            bootstrap_token_hash(3)
+        ]
+    );
+    store.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn configured_v11_bootstrap_audit_is_compacted_on_open_and_stays_bounded() {
+    let database = TestDatabase::new();
+    let initial = SqliteStore::open(database.path()).await.unwrap();
+    let future = "2999-01-01T00:00:00.000Z";
+    let owner_token = bootstrap_token_hash(10_000);
+    initial
+        .replace_bootstrap_token(&owner_token, future)
+        .await
+        .unwrap();
+    initial
+        .bootstrap_owner(BootstrapOwnerCommit {
+            bootstrap_token_hash: owner_token,
+            user_id: "user-owner".into(),
+            username: "owner".into(),
+            password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA".into(),
+            session_token_hash: "b".repeat(64),
+            csrf_hash: "c".repeat(64),
+            session_expires_at: future.into(),
+        })
+        .await
+        .unwrap();
+    drop(initial);
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    downgrade_bootstrap_audit_fixture_to_v11(&connection);
+    for index in 1..=130 {
+        connection
+            .execute(
+                r#"INSERT INTO bootstrap_tokens(
+                       token_hash, created_at, expires_at, used_at
+                   ) VALUES (?1, '2026-08-26T00:00:00.000Z',
+                             '2026-08-26T01:00:00.000Z',
+                             '2026-08-26T00:30:00.000Z')"#,
+                [bootstrap_token_hash(index)],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    let limits = StorageLimits {
+        bootstrap_audit_rows: 1,
+        ..StorageLimits::default()
+    };
+    let store = SqliteStore::open_with_limits(database.path(), limits.clone())
+        .await
+        .unwrap();
+    let first_rollup = bootstrap_audit_rollup(database.path());
+    let first_details = bootstrap_audit_details(database.path());
+    assert_eq!(first_rollup.0, 130);
+    assert_ne!(first_rollup.1, "0".repeat(64));
+    assert_eq!(first_details.len(), 1);
+    assert_eq!(first_details[0].0, 131);
+    assert_eq!(first_details[0].1, bootstrap_token_hash(130));
+    store.verify_integrity().await.unwrap();
+    drop(store);
+
+    let reopened = SqliteStore::open_with_limits(database.path(), limits)
+        .await
+        .unwrap();
+    assert_eq!(bootstrap_audit_rollup(database.path()), first_rollup);
+    assert_eq!(bootstrap_audit_details(database.path()), first_details);
+    reopened.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn current_bootstrap_audit_retention_checks_physical_capacity_before_compaction() {
+    let database = TestDatabase::new();
+    let future = "2999-01-01T00:00:00.000Z";
+    {
+        let store = SqliteStore::open(database.path()).await.unwrap();
+        for index in 1..=3 {
+            store
+                .replace_bootstrap_token(&bootstrap_token_hash(index), future)
+                .await
+                .unwrap();
+        }
+    }
+    let before_rollup = bootstrap_audit_rollup(database.path());
+    let before_details = bootstrap_audit_details(database.path());
+    assert_eq!(before_rollup, (0, "0".repeat(64)));
+    assert_eq!(before_details.len(), 3);
+
+    let limits = StorageLimits {
+        bootstrap_audit_rows: 1,
+        ..StorageLimits::default()
+    };
+    let physical_limits = admission_exhausted_physical_limits(database.path());
+    assert!(matches!(
+        SqliteStore::open_with_limits_and_physical(database.path(), limits, physical_limits).await,
+        Err(StorageError::PhysicalStorageExhausted)
+    ));
+    assert_eq!(bootstrap_audit_rollup(database.path()), before_rollup);
+    assert_eq!(bootstrap_audit_details(database.path()), before_details);
+}
+
+#[tokio::test]
+async fn v11_bootstrap_audit_migration_preserves_unknown_and_records_explicit_reasons() {
+    let database = TestDatabase::new();
+    let initial = SqliteStore::open(database.path()).await.unwrap();
+    drop(initial);
+    seed_v11_bootstrap_fixture(database.path(), 1, "2000-01-01T00:00:00.000Z");
+
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    let migrated = bootstrap_audit_details(database.path());
+    assert_eq!(migrated.len(), 2);
+    assert_eq!(migrated[0].3.as_deref(), Some("legacy_unknown"));
+    assert_eq!(migrated[1].3, None);
+
+    let future = "2999-01-01T00:00:00.000Z";
+    store
+        .replace_bootstrap_token(&bootstrap_token_hash(3), future)
+        .await
+        .unwrap();
+    store
+        .replace_bootstrap_token(&bootstrap_token_hash(4), future)
+        .await
+        .unwrap();
+    store
+        .bootstrap_owner(BootstrapOwnerCommit {
+            bootstrap_token_hash: bootstrap_token_hash(4),
+            user_id: "user-owner".into(),
+            username: "owner".into(),
+            password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA".into(),
+            session_token_hash: "b".repeat(64),
+            csrf_hash: "c".repeat(64),
+            session_expires_at: future.into(),
+        })
+        .await
+        .unwrap();
+
+    let reasons = bootstrap_audit_details(database.path())
+        .into_iter()
+        .map(|row| row.3.unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reasons,
+        vec!["legacy_unknown", "expired", "superseded", "consumed"]
+    );
+    store.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn bootstrap_audit_triggers_reject_live_or_uncommitted_delete_and_rollup_rollback() {
+    let database = TestDatabase::new();
+    let limits = StorageLimits {
+        bootstrap_audit_rows: 2,
+        ..StorageLimits::default()
+    };
+    let store = SqliteStore::open_with_limits(database.path(), limits)
+        .await
+        .unwrap();
+    let future = "2999-01-01T00:00:00.000Z";
+    for index in 1..=3 {
+        store
+            .replace_bootstrap_token(&bootstrap_token_hash(index), future)
+            .await
+            .unwrap();
+    }
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    assert!(
+        connection
+            .execute("DELETE FROM bootstrap_tokens WHERE sequence = 2", [])
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute("DELETE FROM bootstrap_tokens WHERE sequence = 3", [])
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute(
+                r#"UPDATE bootstrap_tokens
+                   SET terminal_reason = 'expired'
+                   WHERE sequence = 2"#,
+                [],
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute(
+                r#"INSERT INTO bootstrap_tokens(
+                       token_hash, created_at, expires_at,
+                       terminal_at, terminal_reason
+                   ) VALUES (?1, ?2, ?3, ?2, 'expired')"#,
+                params![bootstrap_token_hash(99), "2026-08-27T00:00:00.000Z", future],
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute(
+                "UPDATE bootstrap_audit_rollup SET through_sequence = 0 WHERE singleton = 1",
+                [],
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute("DELETE FROM bootstrap_audit_rollup", [])
+            .is_err()
+    );
+    drop(connection);
+    store.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn bootstrap_audit_integrity_rejects_a_malformed_rollup_digest() {
+    let database = TestDatabase::new();
+    let limits = StorageLimits {
+        bootstrap_audit_rows: 1,
+        ..StorageLimits::default()
+    };
+    let store = SqliteStore::open_with_limits(database.path(), limits)
+        .await
+        .unwrap();
+    let future = "2999-01-01T00:00:00.000Z";
+    store
+        .replace_bootstrap_token(&bootstrap_token_hash(1), future)
+        .await
+        .unwrap();
+    store
+        .replace_bootstrap_token(&bootstrap_token_hash(2), future)
+        .await
+        .unwrap();
+
+    force_bootstrap_rollup_digest(database.path(), &"g".repeat(64));
+    assert!(matches!(
+        store.verify_integrity().await,
+        Err(StorageError::CorruptData(message))
+            if message.contains("bootstrap audit rollup")
     ));
 }
 
@@ -5871,7 +6376,7 @@ async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempot
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, (1_i64..=11).collect::<Vec<_>>());
+    assert_eq!(versions, (1_i64..=12).collect::<Vec<_>>());
     assert_eq!(
         connection
             .query_row(
@@ -6538,8 +7043,147 @@ fn auth_session_count(path: &Path, active_after: Option<&str>) -> i64 {
     }
 }
 
+fn bootstrap_token_hash(index: usize) -> String {
+    format!("{index:064x}")
+}
+
+fn bootstrap_audit_rollup(path: &Path) -> (i64, String) {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row(
+            r#"SELECT through_sequence, digest
+               FROM bootstrap_audit_rollup WHERE singleton = 1"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+}
+
+fn bootstrap_audit_details(path: &Path) -> Vec<(i64, String, Option<String>, Option<String>)> {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    let mut statement = connection
+        .prepare(
+            r#"SELECT sequence, token_hash, terminal_at, terminal_reason
+               FROM bootstrap_tokens ORDER BY sequence"#,
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn seed_v11_bootstrap_fixture(path: &Path, terminal_count: usize, live_expiry: &str) {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    downgrade_bootstrap_audit_fixture_to_v11(&connection);
+    for index in 1..=terminal_count {
+        connection
+            .execute(
+                r#"INSERT INTO bootstrap_tokens(
+                       token_hash, created_at, expires_at, used_at
+                   ) VALUES (?1, '2026-08-26T00:00:00.000Z',
+                             '2026-08-26T01:00:00.000Z',
+                             '2026-08-26T00:30:00.000Z')"#,
+                [bootstrap_token_hash(index)],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            r#"INSERT INTO bootstrap_tokens(
+                   token_hash, created_at, expires_at, used_at
+               ) VALUES (?1, '2026-08-26T00:59:00.000Z', ?2, NULL)"#,
+            params![bootstrap_token_hash(terminal_count + 1), live_expiry],
+        )
+        .unwrap();
+}
+
+fn force_bootstrap_rollup_digest(path: &Path, digest: &str) {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    let trigger_sql: String = connection
+        .query_row(
+            r#"SELECT sql FROM sqlite_schema
+               WHERE type = 'trigger'
+                 AND name = 'bootstrap_audit_rollup_enforce_update'"#,
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "DROP TRIGGER bootstrap_audit_rollup_enforce_update; PRAGMA ignore_check_constraints = ON;",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE bootstrap_audit_rollup SET digest = ?1 WHERE singleton = 1",
+            [digest],
+        )
+        .unwrap();
+    connection.execute_batch(&trigger_sql).unwrap();
+}
+
+fn downgrade_bootstrap_audit_fixture_to_v11(connection: &rusqlite::Connection) {
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER bootstrap_tokens_require_next_sequence;
+               DROP TRIGGER bootstrap_tokens_enforce_terminal_transition;
+               DROP TRIGGER bootstrap_tokens_reject_uncommitted_delete;
+               DROP TRIGGER bootstrap_audit_rollup_enforce_update;
+               DROP TRIGGER bootstrap_audit_rollup_reject_delete;
+               DROP INDEX bootstrap_tokens_one_live_idx;
+               DROP INDEX bootstrap_tokens_terminal_sequence_idx;
+
+               ALTER TABLE bootstrap_tokens RENAME TO bootstrap_tokens_v12;
+
+               CREATE TABLE bootstrap_tokens (
+                   token_hash TEXT PRIMARY KEY CHECK (length(token_hash) = 64),
+                   created_at TEXT NOT NULL,
+                   expires_at TEXT NOT NULL,
+                   used_at    TEXT
+               ) STRICT;
+
+               INSERT INTO bootstrap_tokens(token_hash, created_at, expires_at, used_at)
+               SELECT token_hash, created_at, expires_at, terminal_at
+               FROM bootstrap_tokens_v12
+               ORDER BY sequence;
+
+               DROP TABLE bootstrap_tokens_v12;
+               DROP TABLE bootstrap_audit_rollup;
+
+               CREATE UNIQUE INDEX bootstrap_tokens_one_live_idx
+                   ON bootstrap_tokens((1)) WHERE used_at IS NULL;
+
+               CREATE TRIGGER bootstrap_tokens_enforce_single_use
+               BEFORE UPDATE ON bootstrap_tokens
+               WHEN NOT (
+                   OLD.used_at IS NULL
+                   AND NEW.used_at IS NOT NULL
+                   AND NEW.token_hash = OLD.token_hash
+                   AND NEW.created_at = OLD.created_at
+                   AND NEW.expires_at = OLD.expires_at
+               )
+               BEGIN
+                   SELECT RAISE(ABORT, 'bootstrap token can only transition to used');
+               END;
+
+               CREATE TRIGGER bootstrap_tokens_reject_delete
+               BEFORE DELETE ON bootstrap_tokens
+               BEGIN
+                   SELECT RAISE(ABORT, 'bootstrap tokens are security audit records');
+               END;
+
+               DELETE FROM schema_migrations WHERE version = 12;"#,
+        )
+        .unwrap();
+}
+
 fn downgrade_capacity_fixture_to_v9(path: &Path) {
     let connection = rusqlite::Connection::open(path).unwrap();
+    downgrade_bootstrap_audit_fixture_to_v11(&connection);
     connection
         .execute_batch(
             r#"DROP TRIGGER session_events_charge_payload_bytes;
@@ -6602,6 +7246,7 @@ fn downgrade_capacity_fixture_to_v9(path: &Path) {
 
 fn downgrade_event_payload_fixture_to_v10(path: &Path) {
     let connection = rusqlite::Connection::open(path).unwrap();
+    downgrade_bootstrap_audit_fixture_to_v11(&connection);
     connection
         .execute_batch(
             r#"DROP TRIGGER session_events_charge_payload_bytes;
