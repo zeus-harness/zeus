@@ -6831,6 +6831,13 @@ mod tests {
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
     }
 
+    struct WorkspaceReadThenFinalProvider {
+        metadata: ProviderMetadata,
+        requests: Arc<StdMutex<Vec<ReplyRequest>>>,
+    }
+
+    const TEST_WORKSPACE_READ_FILE_TOOL_NAME: &str = "workspace_read_file";
+
     struct HistoryThenToolProvider {
         metadata: ProviderMetadata,
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
@@ -6912,6 +6919,61 @@ mod tests {
                         content: "tool completed".into(),
                     },
                     call => panic!("unexpected Agent provider call {call}"),
+                }
+            };
+            let provider = self.metadata.clone();
+            Box::pin(async move {
+                Ok(ReplyResponse {
+                    output,
+                    finish_reason: Some("stop".into()),
+                    provider,
+                })
+            })
+        }
+    }
+
+    impl WorkspaceReadThenFinalProvider {
+        fn new(requests: Arc<StdMutex<Vec<ReplyRequest>>>) -> Self {
+            Self {
+                metadata: ProviderMetadata {
+                    provider_id: "test-workspace-read-provider".into(),
+                    model: Some("test-model".into()),
+                    reply_kind: ReplyKind::Model,
+                },
+                requests,
+            }
+        }
+    }
+
+    impl ReplyProvider for WorkspaceReadThenFinalProvider {
+        fn metadata(&self) -> &ProviderMetadata {
+            &self.metadata
+        }
+
+        fn reply(&self, request: ReplyRequest) -> ReplyFuture<'_> {
+            let output = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(request.clone());
+                match requests.len() {
+                    1 => {
+                        assert!(
+                            request
+                                .tools
+                                .iter()
+                                .any(|tool| tool.name == TEST_WORKSPACE_READ_FILE_TOOL_NAME)
+                        );
+                        ReplyOutput::ToolCall {
+                            call: ReplyToolCall::new(
+                                "provider-call-workspace-read-1",
+                                TEST_WORKSPACE_READ_FILE_TOOL_NAME,
+                                serde_json::json!({ "path": "src/lib.rs" }),
+                            ),
+                        }
+                    }
+                    2 => ReplyOutput::Final {
+                        content: "workspace read completed".into(),
+                    },
+                    call => panic!("unexpected workspace Agent provider call {call}"),
                 }
             };
             let provider = self.metadata.clone();
@@ -7759,6 +7821,117 @@ mod tests {
 
         drop(app);
         drop(store);
+        tokio::task::yield_now().await;
+        cleanup_test_database(&path);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_only_workspace_tool_executes_without_approval_and_is_replayed_to_the_model() {
+        let unique = UserId::generate().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "zeus-api-workspace-read-{}",
+            unique.as_str().replace(':', "-")
+        ));
+        let path = root.join("zeus.db");
+        let marker_root = root.join("markers");
+        let workspace_root = root.join("workspace");
+        std::fs::create_dir_all(workspace_root.join("src")).unwrap();
+        std::fs::write(
+            workspace_root.join("src/lib.rs"),
+            "pub fn governed_workspace() {}\n",
+        )
+        .unwrap();
+        let store = DemoStore::open_local_with_workspace(&path, &marker_root, &workspace_root)
+            .await
+            .unwrap();
+        let owner = provision_test_owner(&store, "user-workspace-read", "workspace-owner").await;
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: "session-workspace-read".into(),
+                    title: "Read workspace".into(),
+                },
+                "create-workspace-read",
+            )
+            .await
+            .unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(WorkspaceReadThenFinalProvider::new(Arc::clone(&requests))),
+        )
+        .unwrap();
+
+        let started = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-workspace-read/turns")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "start-workspace-read")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-workspace-read",
+                            "user_message": "read the governed workspace file",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+
+        let session = wait_for_ready_session(&store, &owner.authz, "session-workspace-read").await;
+        assert_eq!(
+            session.turns[0].assistant_message.as_deref(),
+            Some("workspace read completed")
+        );
+        let agent = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            "session-workspace-read",
+            "turn-workspace-read",
+            protocol::AgentTurnStatus::Succeeded,
+        )
+        .await;
+        assert_eq!(agent.model_steps, 2);
+        assert_eq!(agent.tool_calls, 1);
+        assert_eq!(agent.calls.len(), 1);
+        assert_eq!(agent.calls[0].tool, TEST_WORKSPACE_READ_FILE_TOOL_NAME);
+        assert!(!agent.calls[0].approval_required);
+        assert!(agent.calls[0].review.is_none());
+        assert_eq!(agent.calls[0].status, AgentToolCallStatus::Succeeded);
+        assert_eq!(
+            agent.calls[0].output,
+            Some(serde_json::json!({
+                "path": "src/lib.rs",
+                "content": "pub fn governed_workspace() {}\n",
+                "bytes": 31,
+            }))
+        );
+        assert_eq!(std::fs::read_dir(&marker_root).unwrap().count(), 0);
+
+        let recorded = requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 2);
+        let tool_result = recorded[1].messages.last().unwrap();
+        assert_eq!(tool_result.role, ReplyRole::Tool);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&tool_result.content).unwrap(),
+            agent.calls[0].output.clone().unwrap()
+        );
+
+        drop(app);
+        drop(store);
+        tokio::task::yield_now().await;
+        cleanup_test_database(&path);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

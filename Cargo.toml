@@ -19,6 +19,7 @@ publish = false
 async-stream = "0.3.6"
 axum = { version = "0.8.4", features = ["json", "tokio"] }
 base64 = "0.22.1"
+cap-std = "4.0.3"
 chrono = { version = "0.4.42", default-features = false, features = ["clock", "serde"] }
 fs2 = "0.4.3"
 http-body-util = "0.1.3"

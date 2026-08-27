@@ -219,6 +219,10 @@ POST /sessions/{id}/turns
 - Provider 调用前必须存在同一 prepared claim 对应的 durable `started` checkpoint。
 - `queued` job 可在重启后继续；`started` 且无持久结果的 job 变为 `outcome_unknown`，不得自动重放可能计费的模型请求。
 - Provider 失败必须形成明确的 durable failure/interrupted 状态，不能做空 flush，也不能伪造 assistant 成功。
+- `local-development` 可显式配置 capability-rooted `workspace_read_file`：模型仅能读取根内
+  canonical relative path 对应的 UTF-8 普通文件，最多 8 KiB；穿越、symlink 和越界内容在
+  connector 内 fail closed。它以 read-only policy 自动执行，结果仍按 exact tool completion
+  持久化后再进入下一模型步骤；没有 shell 或隐式写权限。
 - 本地 fallback 只说明“消息已保存但未配置模型”，事件必须标注 `local-fallback/non-model`，不能冒充智能回复。
 - OpenAI-compatible provider 限制连接/总超时、响应体大小，禁止重定向，并对非 2xx、畸形 JSON 和空 choices fail closed。
 

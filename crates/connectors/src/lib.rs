@@ -8,11 +8,15 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    io::{self, Read, Write},
+    path::{Component, Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
+use cap_std::{ambient_authority, fs::Dir};
 use protocol::{SandboxProfile, ToolEffect};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -28,6 +32,10 @@ pub const LOCAL_DEV_ENVIRONMENT: &str = "local-development";
 pub const DEV_MARKER_TOOL_NAME: &str = "dev_marker_write";
 pub const DEV_MARKER_TOOL_VERSION: &str = "1";
 pub const MAX_MARKER_BYTES: usize = 128;
+pub const WORKSPACE_READ_FILE_TOOL_NAME: &str = "workspace_read_file";
+pub const WORKSPACE_READ_FILE_TOOL_VERSION: &str = "1";
+pub const MAX_WORKSPACE_PATH_BYTES: usize = 512;
+pub const MAX_WORKSPACE_FILE_BYTES: usize = 8 * 1024;
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -39,6 +47,10 @@ pub enum ConnectorConfigError {
     InvalidRoot(String),
     #[error("failed to prepare marker root: {0}")]
     RootIo(String),
+    #[error("workspace root must be a directory: {0}")]
+    InvalidWorkspaceRoot(String),
+    #[error("failed to open workspace root: {0}")]
+    WorkspaceRootIo(String),
     #[error(transparent)]
     Registry(#[from] RegistryError),
 }
@@ -64,6 +76,27 @@ pub fn register_local_dev_connectors(
     Ok(canonical_root)
 }
 
+/// Register the bounded read-only workspace connector for local development.
+///
+/// The ambient path is resolved once at startup and converted into a rooted
+/// capability. Model-selected paths are always relative to that capability.
+pub fn register_local_workspace_connector(
+    registry: &mut ToolRegistry,
+    environment: &str,
+    workspace_root: impl AsRef<Path>,
+) -> Result<PathBuf, ConnectorConfigError> {
+    if environment != LOCAL_DEV_ENVIRONMENT {
+        return Err(ConnectorConfigError::EnvironmentDenied(
+            environment.to_owned(),
+        ));
+    }
+
+    let executor = WorkspaceReadFileExecutor::new(workspace_root.as_ref())?;
+    let canonical_root = executor.canonical_root.clone();
+    registry.register(workspace_read_file_descriptor(), executor)?;
+    Ok(canonical_root)
+}
+
 pub fn dev_marker_descriptor() -> ToolDescriptor {
     ToolDescriptor {
         name: DEV_MARKER_TOOL_NAME.into(),
@@ -78,6 +111,237 @@ pub fn dev_marker_descriptor() -> ToolDescriptor {
                 ParameterSpec::required_string(MAX_MARKER_BYTES),
             )]),
         },
+    }
+}
+
+pub fn workspace_read_file_descriptor() -> ToolDescriptor {
+    ToolDescriptor {
+        name: WORKSPACE_READ_FILE_TOOL_NAME.into(),
+        version: WORKSPACE_READ_FILE_TOOL_VERSION.into(),
+        description: format!(
+            "Read one UTF-8 regular file relative to the configured workspace root (maximum {MAX_WORKSPACE_FILE_BYTES} bytes)"
+        ),
+        effect: ToolEffect::ReadOnly,
+        sandbox_profile: SandboxProfile::ReadOnly,
+        input_schema: ObjectSchema {
+            max_serialized_bytes: 4 * 1024,
+            properties: BTreeMap::from([(
+                "path".into(),
+                ParameterSpec::required_string(MAX_WORKSPACE_PATH_BYTES),
+            )]),
+        },
+    }
+}
+
+struct WorkspaceRoots {
+    confined: Dir,
+    inspection: Dir,
+}
+
+#[derive(Clone)]
+struct WorkspaceReadFileExecutor {
+    canonical_root: PathBuf,
+    roots: Arc<WorkspaceRoots>,
+}
+
+impl WorkspaceReadFileExecutor {
+    fn new(root: &Path) -> Result<Self, ConnectorConfigError> {
+        let canonical_root = fs::canonicalize(root)
+            .map_err(|error| ConnectorConfigError::WorkspaceRootIo(error.to_string()))?;
+        let metadata = fs::metadata(&canonical_root)
+            .map_err(|error| ConnectorConfigError::WorkspaceRootIo(error.to_string()))?;
+        if !metadata.is_dir() {
+            return Err(ConnectorConfigError::InvalidWorkspaceRoot(
+                canonical_root.display().to_string(),
+            ));
+        }
+        let confined = Dir::open_ambient_dir(&canonical_root, ambient_authority())
+            .map_err(|error| ConnectorConfigError::WorkspaceRootIo(error.to_string()))?;
+        let inspection = Dir::open_ambient_dir(&canonical_root, ambient_authority())
+            .map_err(|error| ConnectorConfigError::WorkspaceRootIo(error.to_string()))?;
+        Ok(Self {
+            canonical_root,
+            roots: Arc::new(WorkspaceRoots {
+                confined,
+                inspection,
+            }),
+        })
+    }
+}
+
+impl ToolExecutor for WorkspaceReadFileExecutor {
+    fn execute(&self, request: ExecutionRequest) -> ExecutionFuture<'_> {
+        let roots = Arc::clone(&self.roots);
+        Box::pin(async move {
+            if request.environment != LOCAL_DEV_ENVIRONMENT {
+                return Err(workspace_failure(
+                    "environment_denied",
+                    "Workspace reads are restricted to local-development",
+                    false,
+                ));
+            }
+            let arguments: WorkspaceReadArguments =
+                serde_json::from_value(request.call.arguments.clone()).map_err(|_| {
+                    workspace_failure(
+                        "invalid_arguments",
+                        "Workspace read arguments are invalid",
+                        false,
+                    )
+                })?;
+            let path = validate_workspace_path(&arguments.path)?;
+            tokio::task::spawn_blocking(move || {
+                read_workspace_file(&roots, &path, &arguments.path, &request.call.call_id)
+            })
+            .await
+            .map_err(|_| {
+                workspace_failure(
+                    "workspace_reader_join_failed",
+                    "The workspace reader stopped unexpectedly",
+                    false,
+                )
+            })?
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceReadArguments {
+    path: String,
+}
+
+fn validate_workspace_path(path: &str) -> Result<PathBuf, ExecutorError> {
+    if path.is_empty()
+        || path.len() > MAX_WORKSPACE_PATH_BYTES
+        || path.trim() != path
+        || path.contains('\\')
+        || path.chars().any(char::is_control)
+    {
+        return Err(invalid_workspace_path());
+    }
+    let mut parts = Vec::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::Normal(part) => {
+                let part = part.to_str().ok_or_else(invalid_workspace_path)?;
+                parts.push(part);
+            }
+            _ => return Err(invalid_workspace_path()),
+        }
+    }
+    if parts.is_empty() || parts.join("/") != path {
+        return Err(invalid_workspace_path());
+    }
+    Ok(parts.iter().collect())
+}
+
+fn invalid_workspace_path() -> ExecutorError {
+    workspace_failure(
+        "invalid_workspace_path",
+        "Workspace path must be a canonical relative UTF-8 path without traversal",
+        false,
+    )
+}
+
+fn read_workspace_file(
+    roots: &WorkspaceRoots,
+    path: &Path,
+    display_path: &str,
+    call_id: &str,
+) -> Result<ToolOutput, ExecutorError> {
+    reject_workspace_symlinks(&roots.inspection, path)?;
+    let mut file = roots.confined.open(path).map_err(workspace_read_error)?;
+    let metadata = file.metadata().map_err(workspace_read_error)?;
+    if !metadata.is_file() {
+        return Err(workspace_failure(
+            "workspace_not_regular_file",
+            "The requested workspace path is not a regular file",
+            false,
+        ));
+    }
+    if metadata.len() > MAX_WORKSPACE_FILE_BYTES as u64 {
+        return Err(workspace_file_too_large());
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    Read::by_ref(&mut file)
+        .take((MAX_WORKSPACE_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(workspace_read_error)?;
+    if bytes.len() > MAX_WORKSPACE_FILE_BYTES {
+        return Err(workspace_file_too_large());
+    }
+    let content = String::from_utf8(bytes).map_err(|_| {
+        workspace_failure(
+            "workspace_file_not_utf8",
+            "The requested workspace file is not valid UTF-8 text",
+            false,
+        )
+    })?;
+    Ok(ToolOutput {
+        value: json!({
+            "path": display_path,
+            "content": content,
+            "bytes": content.len(),
+        }),
+        replayed: false,
+        provider_request_id: Some(call_id.to_owned()),
+    })
+}
+
+fn reject_workspace_symlinks(root: &Dir, path: &Path) -> Result<(), ExecutorError> {
+    let mut prefix = PathBuf::new();
+    for component in path.components() {
+        let Component::Normal(component) = component else {
+            return Err(invalid_workspace_path());
+        };
+        prefix.push(component);
+        let metadata = root
+            .symlink_metadata(&prefix)
+            .map_err(workspace_read_error)?;
+        if metadata.file_type().is_symlink() {
+            return Err(workspace_failure(
+                "workspace_symlink_denied",
+                "Workspace reads do not follow symbolic links",
+                false,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn workspace_file_too_large() -> ExecutorError {
+    workspace_failure(
+        "workspace_file_too_large",
+        "The requested workspace file exceeds the 8192-byte limit",
+        false,
+    )
+}
+
+fn workspace_read_error(error: io::Error) -> ExecutorError {
+    match error.kind() {
+        io::ErrorKind::NotFound => workspace_failure(
+            "workspace_file_not_found",
+            "The requested workspace file was not found",
+            false,
+        ),
+        io::ErrorKind::PermissionDenied => workspace_failure(
+            "workspace_file_denied",
+            "The requested workspace file is not readable",
+            false,
+        ),
+        _ => workspace_failure(
+            "workspace_read_failed",
+            "The workspace file could not be read",
+            true,
+        ),
+    }
+}
+
+fn workspace_failure(code: &'static str, message: &'static str, retryable: bool) -> ExecutorError {
+    ExecutorError::Failed {
+        code: code.into(),
+        message: message.into(),
+        retryable,
     }
 }
 
@@ -350,6 +614,20 @@ mod tests {
         }
     }
 
+    fn workspace_call(path: &str) -> ToolCall {
+        let arguments = json!({"path": path});
+        ToolCall {
+            call_id: stable_call_id("run-1", 1, 1, WORKSPACE_READ_FILE_TOOL_NAME).unwrap(),
+            tool: WORKSPACE_READ_FILE_TOOL_NAME.into(),
+            tool_version: WORKSPACE_READ_FILE_TOOL_VERSION.into(),
+            arguments_digest: arguments_digest(&arguments),
+            arguments,
+            effect: ToolEffect::ReadOnly,
+            sandbox_profile: SandboxProfile::ReadOnly,
+            executor_status: ToolExecutorStatus::Available,
+        }
+    }
+
     #[test]
     fn non_local_registration_fails_before_touching_the_root() {
         let temp = TestDirectory::new();
@@ -365,6 +643,124 @@ mod tests {
         );
         assert!(!marker_root.exists());
         assert!(registry.descriptor(DEV_MARKER_TOOL_NAME).is_none());
+    }
+
+    #[test]
+    fn non_local_workspace_registration_fails_before_opening_the_root() {
+        let temp = TestDirectory::new();
+        let missing_root = temp.0.join("must-not-exist");
+        let mut registry = ToolRegistry::new();
+
+        let error = register_local_workspace_connector(&mut registry, "production", &missing_root)
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ConnectorConfigError::EnvironmentDenied("production".into())
+        );
+        assert!(registry.descriptor(WORKSPACE_READ_FILE_TOOL_NAME).is_none());
+    }
+
+    #[tokio::test]
+    async fn workspace_read_is_rooted_bounded_and_utf8_only() {
+        let temp = TestDirectory::new();
+        fs::create_dir(temp.0.join("src")).unwrap();
+        fs::write(temp.0.join("src/lib.rs"), "pub fn zeus() {}\n").unwrap();
+        fs::write(
+            temp.0.join("too-large.txt"),
+            vec![b'a'; MAX_WORKSPACE_FILE_BYTES + 1],
+        )
+        .unwrap();
+        fs::write(temp.0.join("binary.dat"), [0xff, 0xfe]).unwrap();
+        let mut registry = ToolRegistry::new();
+        let canonical_root =
+            register_local_workspace_connector(&mut registry, LOCAL_DEV_ENVIRONMENT, &temp.0)
+                .unwrap();
+        assert_eq!(canonical_root, fs::canonicalize(&temp.0).unwrap());
+
+        let output = registry
+            .dispatch(workspace_call("src/lib.rs"), LOCAL_DEV_ENVIRONMENT)
+            .await
+            .unwrap();
+        assert_eq!(output.value["path"], "src/lib.rs");
+        assert_eq!(output.value["content"], "pub fn zeus() {}\n");
+        assert_eq!(output.value["bytes"], 17);
+        assert!(!output.replayed);
+
+        for (path, expected_code) in [
+            ("too-large.txt", "workspace_file_too_large"),
+            ("binary.dat", "workspace_file_not_utf8"),
+            ("missing.txt", "workspace_file_not_found"),
+        ] {
+            let error = registry
+                .dispatch(workspace_call(path), LOCAL_DEV_ENVIRONMENT)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                RegistryError::Executor(ExecutorError::Failed { ref code, .. })
+                    if code == expected_code
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_read_rejects_noncanonical_and_escaping_paths() {
+        let temp = TestDirectory::new();
+        fs::write(temp.0.join("safe.txt"), "safe").unwrap();
+        let mut registry = ToolRegistry::new();
+        register_local_workspace_connector(&mut registry, LOCAL_DEV_ENVIRONMENT, &temp.0).unwrap();
+
+        for path in [
+            "../outside.txt",
+            "/etc/passwd",
+            "./safe.txt",
+            "safe//file.txt",
+            "safe.txt/",
+            "safe\\file.txt",
+        ] {
+            let error = registry
+                .dispatch(workspace_call(path), LOCAL_DEV_ENVIRONMENT)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                RegistryError::Executor(ExecutorError::Failed { ref code, .. })
+                    if code == "invalid_workspace_path"
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_read_never_follows_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TestDirectory::new();
+        let outside = temp.0.parent().unwrap().join(format!(
+            "zeus-connectors-outside-{}-{}",
+            std::process::id(),
+            TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&outside, "outside secret").unwrap();
+        fs::create_dir(temp.0.join("nested")).unwrap();
+        symlink(&outside, temp.0.join("linked-file")).unwrap();
+        symlink(temp.0.parent().unwrap(), temp.0.join("nested/linked-dir")).unwrap();
+        let mut registry = ToolRegistry::new();
+        register_local_workspace_connector(&mut registry, LOCAL_DEV_ENVIRONMENT, &temp.0).unwrap();
+
+        for path in ["linked-file", "nested/linked-dir/outside.txt"] {
+            let error = registry
+                .dispatch(workspace_call(path), LOCAL_DEV_ENVIRONMENT)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                RegistryError::Executor(ExecutorError::Failed { ref code, .. })
+                    if code == "workspace_symlink_denied"
+            ));
+        }
+        fs::remove_file(outside).unwrap();
     }
 
     #[tokio::test]

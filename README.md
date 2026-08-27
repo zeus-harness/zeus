@@ -13,8 +13,9 @@ DeepSeek Harness rather than a dense operations dashboard.
 An approval records authorization only. The default `production-guarded`
 profile has no RDS executor: approving the illustrated change is durably
 recorded, then settles as `not_dispatched / executor_unavailable` without a
-production side effect. An explicit `local-development` profile provides one
-real, path-constrained marker executor for testing the complete loop. Restate,
+production side effect. An explicit `local-development` profile provides a
+path-constrained marker executor and can additionally register one rooted,
+read-only workspace file tool for testing a useful complete Agent loop. Restate,
 MinIO, the networkless tool sandbox, and optional PostgreSQL are development
 topology for later milestones; they are not application state authorities.
 
@@ -231,15 +232,18 @@ provider/connector result until its idempotent finalization commits. Repeated
 worker wakeups are coalesced into at most one running worker and one pending
 drain cycle instead of spawning mutex waiters without a bound.
 
-To exercise the only executable Alpha connector, use a separate database and
-an explicit fixed root. The caller supplies marker text only; it cannot choose
-a path or invoke a host command:
+To exercise the local connectors, use a separate database and explicit fixed
+roots. The marker caller cannot choose a path; `workspace_read_file` accepts
+only a canonical relative path below the configured workspace, rejects
+symlinks/non-UTF-8/non-regular files, and reads at most 8 KiB. Neither connector
+can invoke a host command:
 
 ```sh
 ZEUS_DATABASE_PATH=.zeus/local-development.db \
 ZEUS_LISTEN_ADDR=127.0.0.1:8081 \
 ZEUS_DEMO_PROFILE=local-development \
 ZEUS_LOCAL_MARKER_ROOT=.zeus/local-markers \
+ZEUS_LOCAL_WORKSPACE_ROOT=. \
 cargo run -p zeus-api
 ```
 
@@ -918,9 +922,10 @@ prompt governance:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 547 tests passed
-  under the existing project counting convention, including 8 deployment tests,
-  29 knowledge tests, 248 storage tests, 48 runtime tests, 66 API library tests, 6 API main/config
+- `cargo test --workspace --all-targets --locked`: 552 tests passed
+  under the existing project counting convention, including 9 connector tests,
+  8 deployment tests, 29 knowledge tests, 248 storage tests, 48 runtime tests,
+  67 API library tests, 6 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,
@@ -967,7 +972,10 @@ prompt governance:
   provider-visible tools, completion replay binding, and fail-closed
   provider/tool/policy/profile drift, prepared-claim exact recovery and expiry,
   one RunEpoch per external start, no replay of started work, and exact replay
-  or conflict detection for a committed dispatch terminal acknowledgement.
+  or conflict detection for a committed dispatch terminal acknowledgement. The
+  rooted workspace connector additionally covers traversal, symlink, UTF-8,
+  regular-file and 8 KiB rejection plus one automatic read-only tool-to-model
+  continuation through the real Agent worker chain.
 - `pnpm --filter web test`: 28 tests passed for CSRF headers, stable command
   identity, deep-page active-Session restore, Session-list cursor encoding and
   deduplication, bounded-tail retry reconciliation and Session-switch race

@@ -30,14 +30,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "local-development" => {
             let marker_root = std::env::var("ZEUS_LOCAL_MARKER_ROOT")
                 .unwrap_or_else(|_| ".zeus/local-markers".into());
-            DemoStore::open_local_with_limits_and_physical_and_operations(
-                &database_path,
-                marker_root,
-                storage_limits,
-                physical_limits,
-                operation_limits,
-            )
-            .await?
+            match optional_environment("ZEUS_LOCAL_WORKSPACE_ROOT")? {
+                Some(workspace_root) => {
+                    DemoStore::open_local_with_workspace_and_limits_and_physical_and_operations(
+                        &database_path,
+                        marker_root,
+                        workspace_root,
+                        storage_limits,
+                        physical_limits,
+                        operation_limits,
+                    )
+                    .await?
+                }
+                None => {
+                    DemoStore::open_local_with_limits_and_physical_and_operations(
+                        &database_path,
+                        marker_root,
+                        storage_limits,
+                        physical_limits,
+                        operation_limits,
+                    )
+                    .await?
+                }
+            }
         }
         other => {
             return Err(io::Error::new(

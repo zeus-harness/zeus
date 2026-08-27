@@ -388,8 +388,13 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
 - `production-guarded` profile 即使 owner 已认证，仍因真实生产 connector 缺失而保持执行禁用。
 - `dev_marker_write` 仅在 `local-development` profile 注册，只能在服务端固定目录写服务器生成的
   marker 文件；参数不能提供路径。
+- `workspace_read_file` 仅在显式配置 `ZEUS_LOCAL_WORKSPACE_ROOT` 的 `local-development`
+  profile 注册。服务启动时把该目录转换为 capability root；模型只能提交 canonical relative
+  UTF-8 path，路径穿越、符号链接、非普通文件、非 UTF-8 内容和超过 8 KiB 的文件都 fail closed。
+  该工具是 `read_only + read_only sandbox`，策略自动允许，不经过写操作审批。
 - `ZEUS_DEMO_PROFILE=production-guarded` 是默认值；切到 `local-development` 时必须使用独立
-  SQLite 数据库，并由 `ZEUS_LOCAL_MARKER_ROOT` 固定写入根目录。
+  SQLite 数据库，并由 `ZEUS_LOCAL_MARKER_ROOT` 固定写入根目录。只有显式设置
+  `ZEUS_LOCAL_WORKSPACE_ROOT` 时才注册只读 workspace 工具；未设置时保留原 marker-only 行为。
 
 ## 容器边界
 
@@ -489,6 +494,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
 - 活跃 Run/Session SSE 不能无限拖住进程退出；SIGINT/SIGTERM 的 graceful drain 最长五秒，
   随后关闭剩余连接并释放 SQLite lease。
 - local-development marker：批准前不存在、拒绝后不存在、allow-once 后只生成一个稳定文件。
+- read-only workspace：真实 Agent tool loop 覆盖免审批执行、root confinement、canonical path、
+  symlink/UTF-8/8 KiB 边界，以及 exact tool result 回灌下一模型步骤。
 - 生产 RDS 路径只能得到 executor unavailable，不能得到伪造成功。
 - Session/Run SSE 重连都严格从各自大于 cursor 的 sequence 补齐事件。请求同时携带 query
   cursor 和 `Last-Event-ID` 时，后者优先。

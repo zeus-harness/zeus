@@ -19,7 +19,10 @@ use std::{
 
 use authz::{PolicyBuildError, PolicyContext, PolicyEngine, PolicyEvaluation, PolicyRule};
 use chrono::{SecondsFormat, Utc};
-use connectors::{ConnectorConfigError, LOCAL_DEV_ENVIRONMENT, register_local_dev_connectors};
+use connectors::{
+    ConnectorConfigError, LOCAL_DEV_ENVIRONMENT, register_local_dev_connectors,
+    register_local_workspace_connector, workspace_read_file_descriptor,
+};
 pub use deployment::ManifestEnvelope;
 use deployment::{
     AgentDeployment, AgentSpec, ManifestPolicy, ManifestPromptBinding, ManifestProvider,
@@ -222,7 +225,10 @@ where
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DemoProfile {
     ProductionGuarded,
-    LocalDevelopment { marker_root: PathBuf },
+    LocalDevelopment {
+        marker_root: PathBuf,
+        workspace_root: Option<PathBuf>,
+    },
 }
 
 #[derive(Clone)]
@@ -615,6 +621,22 @@ impl DemoStore {
             path,
             DemoProfile::LocalDevelopment {
                 marker_root: marker_root.into(),
+                workspace_root: None,
+            },
+        )
+        .await
+    }
+
+    pub async fn open_local_with_workspace(
+        path: impl AsRef<Path>,
+        marker_root: impl Into<PathBuf>,
+        workspace_root: impl Into<PathBuf>,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_profile(
+            path,
+            DemoProfile::LocalDevelopment {
+                marker_root: marker_root.into(),
+                workspace_root: Some(workspace_root.into()),
             },
         )
         .await
@@ -629,6 +651,7 @@ impl DemoStore {
             path,
             DemoProfile::LocalDevelopment {
                 marker_root: marker_root.into(),
+                workspace_root: None,
             },
             limits,
         )
@@ -662,6 +685,30 @@ impl DemoStore {
             path,
             DemoProfile::LocalDevelopment {
                 marker_root: marker_root.into(),
+                workspace_root: None,
+            },
+            limits,
+            physical_limits,
+            operation_limits,
+        )
+        .await
+    }
+
+    /// Opens local development with the bounded marker writer plus a rooted,
+    /// read-only workspace file capability exposed to the Agent.
+    pub async fn open_local_with_workspace_and_limits_and_physical_and_operations(
+        path: impl AsRef<Path>,
+        marker_root: impl Into<PathBuf>,
+        workspace_root: impl Into<PathBuf>,
+        limits: StorageLimits,
+        physical_limits: SqlitePhysicalLimits,
+        operation_limits: SqliteOperationLimits,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_profile_and_limits_and_physical_and_operations(
+            path,
+            DemoProfile::LocalDevelopment {
+                marker_root: marker_root.into(),
+                workspace_root: Some(workspace_root.into()),
             },
             limits,
             physical_limits,
@@ -3138,7 +3185,10 @@ impl RuntimeComponents {
                     policy_revision: PRODUCTION_POLICY_REVISION,
                 })
             }
-            DemoProfile::LocalDevelopment { marker_root } => {
+            DemoProfile::LocalDevelopment {
+                marker_root,
+                workspace_root,
+            } => {
                 let scenario = DemoScenario::local_marker();
                 if scenario.run.environment != LOCAL_DEV_ENVIRONMENT {
                     return Err(StoreError::ExecutionInvariant(
@@ -3146,20 +3196,37 @@ impl RuntimeComponents {
                     ));
                 }
                 let call = requested_call(&scenario.events)?;
-                let policy = PolicyEngine::new(vec![PolicyRule {
+                let mut policy_rules = vec![PolicyRule {
                     revision: LOCAL_POLICY_REVISION.into(),
                     tool: call.tool,
                     environment: scenario.run.environment.clone(),
                     effect: call.effect,
                     sandbox_profile: call.sandbox_profile,
                     decision: PolicyDecision::RequireApproval,
-                }])?;
+                }];
                 let mut registry = ToolRegistry::new();
                 register_local_dev_connectors(
                     &mut registry,
                     &scenario.run.environment,
                     marker_root,
                 )?;
+                if let Some(workspace_root) = workspace_root {
+                    let descriptor = workspace_read_file_descriptor();
+                    policy_rules.push(PolicyRule {
+                        revision: LOCAL_POLICY_REVISION.into(),
+                        tool: descriptor.name.clone(),
+                        environment: scenario.run.environment.clone(),
+                        effect: descriptor.effect.clone(),
+                        sandbox_profile: descriptor.sandbox_profile.clone(),
+                        decision: PolicyDecision::Allow,
+                    });
+                    register_local_workspace_connector(
+                        &mut registry,
+                        &scenario.run.environment,
+                        workspace_root,
+                    )?;
+                }
+                let policy = PolicyEngine::new(policy_rules)?;
                 Ok(Self {
                     scenario,
                     policy,
@@ -6406,6 +6473,7 @@ mod tests {
             storage,
             DemoProfile::LocalDevelopment {
                 marker_root: paths.marker_root.clone(),
+                workspace_root: None,
             },
             false,
         )
@@ -6683,6 +6751,7 @@ mod tests {
             SqliteStore::open(&paths.database).await.unwrap(),
             DemoProfile::LocalDevelopment {
                 marker_root: paths.marker_root.clone(),
+                workspace_root: None,
             },
             auto_dispatch,
         )
