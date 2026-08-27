@@ -6883,6 +6883,9 @@ mod tests {
             session_id: String,
             request: TerminalSendRequest,
         },
+        Close {
+            session_id: String,
+        },
     }
 
     struct RecordingTerminalBackend {
@@ -6961,6 +6964,12 @@ mod tests {
         }
 
         fn close(&self) -> TerminalFuture<'_, ()> {
+            self.actions
+                .lock()
+                .unwrap()
+                .push(RecordedTerminalAction::Close {
+                    session_id: self.session_id.clone(),
+                });
             Box::pin(async { Ok(()) })
         }
     }
@@ -8528,7 +8537,7 @@ mod tests {
             }))
         );
         let actions = backend_actions.lock().unwrap().clone();
-        assert_eq!(actions.len(), 2);
+        assert_eq!(actions.len(), 3);
         assert_eq!(
             actions[1],
             RecordedTerminalAction::Send {
@@ -8537,6 +8546,12 @@ mod tests {
                     text: "echo zeus".into(),
                     submit: true,
                 },
+            }
+        );
+        assert_eq!(
+            actions[2],
+            RecordedTerminalAction::Close {
+                session_id: "pty-1".into(),
             }
         );
 
@@ -8692,10 +8707,10 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("executor_outcome_unknown")
         );
-        assert_eq!(backend_actions.lock().unwrap().len(), 2);
+        assert_eq!(backend_actions.lock().unwrap().len(), 3);
         assert_eq!(requests.lock().unwrap().len(), 2);
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(backend_actions.lock().unwrap().len(), 2);
+        assert_eq!(backend_actions.lock().unwrap().len(), 3);
         assert_eq!(requests.lock().unwrap().len(), 2);
 
         drop(app);

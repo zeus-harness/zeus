@@ -274,8 +274,12 @@ such a backend and never falls back to a host shell. Terminal ownership is the
 complete server-derived account/actor/Session/turn/Agent scope; foreign session
 IDs are concealed as unknown. Open/send/signal/close require exact-call owner
 approval, while bounded read/list are read-only. Mutation receipts use the same
-scope plus call ID. An indeterminate backend result after the durable start
-checkpoint settles as `outcome_unknown` and is never retried automatically.
+scope plus call ID. Each owner is limited to four sessions and the service has
+a 128-session global hard limit. After any durable Agent terminal state, Zeus
+removes and best-effort closes every terminal in that exact scope; backend close
+failures are reported but cannot retain internal capacity or reopen the Agent.
+An indeterminate backend result after the durable start checkpoint settles as
+`outcome_unknown` and is never retried automatically.
 
 The rooted workspace connectors can be exercised with:
 

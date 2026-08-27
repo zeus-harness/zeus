@@ -421,7 +421,10 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   启动路径不注入 backend，因此 manifest 中不存在这些工具，也不存在 host-shell fallback。
   每个 terminal session 精确绑定服务端从 durable Agent work 还原的
   account/actor/Session/turn/Agent scope；其它 scope 查询同一 ID 只得到 unknown。每个 owner 最多
-  4 个 session，send 输入、read 行数和返回字节均有硬上限，同一 session 不允许并发 send。
+  4 个 session，整个 service 最多 128 个 live/pending session；send 输入、read 行数和返回字节均有
+  硬上限，同一 session 不允许并发 send。任何 Agent durable terminal state 提交后，runtime 按 exact
+  scope 移除并 best-effort close 全部 terminal；backend close 失败会记录，但不能占住 Zeus 内部容量，
+  也不能重开已终止的 Agent。
   open/send/signal/close 为 approval-gated mutation，read/list 为 read-only allow；mutation receipt
   同时绑定 scope、call ID、tool 和 arguments digest。durable started 之后 backend 报告不确定结果
   时结算 `outcome_unknown` 并中断 Agent turn，禁止自动重试可能已产生的副作用。
@@ -541,7 +544,9 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   冲突、symlink 与 12 KiB 边界均 fail closed。
 - isolated terminal：显式注入 fake isolated backend 的真实 Agent loop 覆盖 open 与 send 两次
   exact-call approval、完整 server-owned execution scope、精确 tool-result 回灌，以及 backend
-  send 结果不确定时 durable `outcome_unknown`、Session `needs_attention` 且不重试外部操作。
+  send 结果不确定时 durable `outcome_unknown`、Session `needs_attention` 且不重试外部操作；成功与
+  outcome-unknown 终态都会自动 close exact-scope terminal。单元测试另覆盖 4/128 容量、owner 隔离、
+  幂等 cleanup 与 backend close 失败时释放内部容量。
 - 生产 RDS 路径只能得到 executor unavailable，不能得到伪造成功。
 - Session/Run SSE 重连都严格从各自大于 cursor 的 sequence 补齐事件。请求同时携带 query
   cursor 和 `Last-Event-ID` 时，后者优先。

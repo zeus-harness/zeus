@@ -1516,6 +1516,10 @@ fn terminal_executor_error(error: TerminalError, indeterminate: bool) -> Executo
             "terminal_session_limit",
             "The initiating Agent already owns the maximum number of terminal sessions",
         ),
+        TerminalError::ServiceSessionLimit => terminal_failed(
+            "terminal_service_capacity",
+            "The isolated terminal service has reached its global session limit",
+        ),
         TerminalError::DuplicateName => terminal_failed(
             "terminal_name_conflict",
             "The initiating Agent already owns a terminal with this name",

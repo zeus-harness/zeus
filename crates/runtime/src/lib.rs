@@ -245,6 +245,7 @@ pub struct DemoStore {
     session_publisher: broadcast::Sender<PublishedSessionEvent>,
     policy: Arc<PolicyEngine>,
     registry: Arc<ToolRegistry>,
+    terminal_service: Option<Arc<TerminalService>>,
     profile_id: Arc<str>,
     environment: Arc<str>,
     policy_id: Arc<str>,
@@ -873,6 +874,7 @@ impl DemoStore {
         auto_dispatch: bool,
         terminal_service: Option<Arc<TerminalService>>,
     ) -> Result<Self, StoreError> {
+        let terminal_service_for_cleanup = terminal_service.clone();
         let components = RuntimeComponents::build(profile, terminal_service)?;
         let profile_id = components.profile_id;
         let primary_session_id = components.primary_session_id;
@@ -922,6 +924,7 @@ impl DemoStore {
             session_publisher,
             policy: Arc::new(components.policy),
             registry: Arc::new(components.registry),
+            terminal_service: terminal_service_for_cleanup,
             profile_id: Arc::from(profile_id),
             environment: Arc::from(environment),
             policy_id: Arc::from(components.policy_id),
@@ -1318,6 +1321,37 @@ impl DemoStore {
             work.call.agent_id.as_str(),
         )?;
         Ok(ScopedSessionAgentTool { resolved, scope })
+    }
+
+    /// Release non-durable executor resources only after storage has committed
+    /// a terminal Agent state. Cleanup never changes or reopens that outcome.
+    async fn cleanup_agent_terminal_resources(&self, agent: &AgentTurn) {
+        let Some(service) = &self.terminal_service else {
+            return;
+        };
+        let scope = match ExecutionScope::new(
+            agent.account_id.as_str(),
+            agent.actor_user_id.as_str(),
+            agent.session_id.as_str(),
+            agent.turn_id.as_str(),
+            agent.id.as_str(),
+        ) {
+            Ok(scope) => scope,
+            Err(error) => {
+                eprintln!("zeus could not derive terminal cleanup scope: {error}");
+                return;
+            }
+        };
+        match service.close_owner(&scope).await {
+            Ok(report) if report.close_failed > 0 => eprintln!(
+                "zeus terminal cleanup removed {} records but {} backend closes failed",
+                report.removed, report.close_failed
+            ),
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("zeus terminal cleanup could not access service state: {error}")
+            }
+        }
     }
 
     /// Re-evaluate policy and the complete registry contract immediately before
@@ -2195,6 +2229,8 @@ impl DemoStore {
                             completion.event.clone(),
                         );
                     }
+                    self.cleanup_agent_terminal_resources(&completion.agent)
+                        .await;
                 }
                 outcome => return Ok(outcome),
             }
@@ -2221,10 +2257,12 @@ impl DemoStore {
                 .await?)
         })
         .await?;
-        if let AgentModelStartOutcome::Rejected(completion) = &outcome
-            && !completion.replayed
-        {
-            self.publish_session_event(&completion.session.id, completion.event.clone());
+        if let AgentModelStartOutcome::Rejected(completion) = &outcome {
+            if !completion.replayed {
+                self.publish_session_event(&completion.session.id, completion.event.clone());
+            }
+            self.cleanup_agent_terminal_resources(&completion.agent)
+                .await;
         }
         Ok(outcome)
     }
@@ -2276,11 +2314,14 @@ impl DemoStore {
                         self.publish_session_event(&finalized.session.id, event.clone());
                     }
                 }
+                self.cleanup_agent_terminal_resources(&finalized.agent)
+                    .await;
             }
             AgentModelCompletion::Terminal(terminal) => {
                 if !terminal.replayed {
                     self.publish_session_event(&terminal.session.id, terminal.event.clone());
                 }
+                self.cleanup_agent_terminal_resources(&terminal.agent).await;
             }
             AgentModelCompletion::ToolCall { .. } => {}
         }
@@ -2302,6 +2343,8 @@ impl DemoStore {
         if !completion.replayed {
             self.publish_session_event(&completion.session.id, completion.event.clone());
         }
+        self.cleanup_agent_terminal_resources(&completion.agent)
+            .await;
         Ok(completion)
     }
 
@@ -2334,6 +2377,8 @@ impl DemoStore {
                             completion.event.clone(),
                         );
                     }
+                    self.cleanup_agent_terminal_resources(&completion.agent)
+                        .await;
                 }
                 outcome => return Ok(outcome),
             }
@@ -2360,10 +2405,12 @@ impl DemoStore {
                 .await?)
         })
         .await?;
-        if let AgentToolStartOutcome::Rejected(completion) = &outcome
-            && !completion.replayed
-        {
-            self.publish_session_event(&completion.session.id, completion.event.clone());
+        if let AgentToolStartOutcome::Rejected(completion) = &outcome {
+            if !completion.replayed {
+                self.publish_session_event(&completion.session.id, completion.event.clone());
+            }
+            self.cleanup_agent_terminal_resources(&completion.agent)
+                .await;
         }
         Ok(outcome)
     }
@@ -2377,10 +2424,11 @@ impl DemoStore {
             Ok(self.storage.complete_agent_tool(commit.clone()).await?)
         })
         .await?;
-        if let AgentToolCompletion::Terminal(terminal) = &completion
-            && !terminal.replayed
-        {
-            self.publish_session_event(&terminal.session.id, terminal.event.clone());
+        if let AgentToolCompletion::Terminal(terminal) = &completion {
+            if !terminal.replayed {
+                self.publish_session_event(&terminal.session.id, terminal.event.clone());
+            }
+            self.cleanup_agent_terminal_resources(&terminal.agent).await;
         }
         Ok(completion)
     }
@@ -2400,6 +2448,8 @@ impl DemoStore {
         if !completion.replayed {
             self.publish_session_event(&completion.session.id, completion.event.clone());
         }
+        self.cleanup_agent_terminal_resources(&completion.agent)
+            .await;
         Ok(completion)
     }
 
@@ -2573,10 +2623,12 @@ impl DemoStore {
             .storage
             .review_agent_tool_for_actor(context, session_id, turn_id, commit)
             .await?;
-        if let Some(completion) = &result.terminal_completion
-            && !completion.replayed
-        {
-            self.publish_session_event(&completion.session.id, completion.event.clone());
+        if let Some(completion) = &result.terminal_completion {
+            if !completion.replayed {
+                self.publish_session_event(&completion.session.id, completion.event.clone());
+            }
+            self.cleanup_agent_terminal_resources(&completion.agent)
+                .await;
         }
         Ok(result)
     }

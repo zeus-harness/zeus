@@ -28,6 +28,7 @@ pub const MAX_TERMINAL_INPUT_BYTES: usize = 16 * 1024;
 pub const MAX_TERMINAL_RESULT_BYTES: usize = 48 * 1024;
 pub const MAX_TERMINAL_READ_LINES: usize = 500;
 pub const MAX_TERMINAL_SESSIONS_PER_OWNER: usize = 4;
+pub const MAX_TERMINAL_SESSIONS: usize = 128;
 pub const MAX_TERMINAL_BACKENDS: usize = 8;
 
 pub type TerminalFuture<'a, T> =
@@ -75,6 +76,18 @@ pub struct TerminalReadResult {
     pub line_begin: usize,
     pub line_end: usize,
     pub truncated: bool,
+}
+
+/// Best-effort backend cleanup after Zeus has already committed an Agent
+/// terminal state. Records are always removed from the service capacity;
+/// failures report possible backend-side leakage without reopening the Agent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TerminalCleanupReport {
+    pub removed: usize,
+    pub pending_cancelled: usize,
+    pub close_attempted: usize,
+    pub close_succeeded: usize,
+    pub close_failed: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,6 +140,8 @@ pub enum TerminalError {
     BackendUnavailable,
     #[error("terminal owner session limit reached")]
     OwnerSessionLimit,
+    #[error("terminal service session limit reached")]
+    ServiceSessionLimit,
     #[error("terminal name is already in use by this owner")]
     DuplicateName,
     #[error("terminal session is unknown to this owner")]
@@ -174,6 +189,8 @@ struct TerminalState {
     sessions: BTreeMap<String, Arc<TerminalRecord>>,
     pending_names: BTreeSet<(ExecutionScope, String)>,
     pending_by_owner: BTreeMap<ExecutionScope, usize>,
+    closing_owners: BTreeSet<ExecutionScope>,
+    pending_total: usize,
 }
 
 pub struct TerminalService {
@@ -259,7 +276,9 @@ impl TerminalService {
             closing: AtomicBool::new(false),
         });
         if let Err(error) = reservation.publish(Arc::clone(&record)) {
-            let _ = record.session.close().await;
+            if record.session.close().await.is_err() {
+                return Err(TerminalError::BackendFailed);
+            }
             return Err(error);
         }
         Ok(snapshot_for(&session_id, &record, status))
@@ -390,6 +409,60 @@ impl TerminalService {
         Ok(true)
     }
 
+    /// Remove and best-effort close every terminal owned by one exact Agent
+    /// execution scope. This is idempotent and does not expose foreign records.
+    pub async fn close_owner(
+        &self,
+        owner: &ExecutionScope,
+    ) -> Result<TerminalCleanupReport, TerminalError> {
+        let records = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| TerminalError::StateUnavailable)?;
+            let pending_cancelled = state.pending_by_owner.get(owner).copied().unwrap_or(0);
+            if pending_cancelled > 0 {
+                state.closing_owners.insert(owner.clone());
+            }
+            let session_ids = state
+                .sessions
+                .iter()
+                .filter(|(_, record)| record.owner == *owner)
+                .map(|(session_id, _)| session_id.clone())
+                .collect::<Vec<_>>();
+            let records = session_ids
+                .into_iter()
+                .filter_map(|session_id| {
+                    state
+                        .sessions
+                        .remove(&session_id)
+                        .map(|record| (session_id, record))
+                })
+                .collect::<Vec<_>>();
+            (records, pending_cancelled)
+        };
+        let mut report = TerminalCleanupReport {
+            removed: records.0.len(),
+            pending_cancelled: records.1,
+            ..TerminalCleanupReport::default()
+        };
+        for (_, record) in records.0 {
+            if record
+                .closing
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            report.close_attempted += 1;
+            match record.session.close().await {
+                Ok(()) => report.close_succeeded += 1,
+                Err(_) => report.close_failed += 1,
+            }
+        }
+        Ok(report)
+    }
+
     fn owned_record(
         &self,
         owner: &ExecutionScope,
@@ -428,12 +501,18 @@ impl SpawnReservation {
             let next_session = sequence
                 .checked_add(1)
                 .ok_or(TerminalError::StateUnavailable)?;
+            if current.closing_owners.contains(&owner) {
+                return Err(TerminalError::SessionClosing);
+            }
             let existing = current
                 .sessions
                 .values()
                 .filter(|record| record.owner == owner)
                 .count();
             let pending = current.pending_by_owner.get(&owner).copied().unwrap_or(0);
+            if current.sessions.len() + current.pending_total >= MAX_TERMINAL_SESSIONS {
+                return Err(TerminalError::ServiceSessionLimit);
+            }
             if existing + pending >= MAX_TERMINAL_SESSIONS_PER_OWNER {
                 return Err(TerminalError::OwnerSessionLimit);
             }
@@ -446,6 +525,7 @@ impl SpawnReservation {
                 }
             }
             *current.pending_by_owner.entry(owner.clone()).or_default() += 1;
+            current.pending_total += 1;
             current.next_session = next_session;
             format!("pty-{sequence}")
         };
@@ -463,6 +543,9 @@ impl SpawnReservation {
             .state
             .lock()
             .map_err(|_| TerminalError::StateUnavailable)?;
+        if state.closing_owners.contains(&self.owner) {
+            return Err(TerminalError::SessionClosing);
+        }
         if state.sessions.contains_key(&self.session_id) {
             return Err(TerminalError::StateUnavailable);
         }
@@ -514,7 +597,9 @@ fn release_pending(state: &mut TerminalState, owner: &ExecutionScope, name: Opti
     };
     if remove_owner {
         state.pending_by_owner.remove(owner);
+        state.closing_owners.remove(owner);
     }
+    state.pending_total = state.pending_total.saturating_sub(1);
 }
 
 fn snapshot_for(
@@ -628,18 +713,58 @@ fn validate_read_result(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
 
     struct StubBackend {
         sessions: Arc<Mutex<Vec<Arc<StubSession>>>>,
+        fail_close: bool,
     }
 
     struct StubSession {
         sends: AtomicUsize,
         signals: AtomicUsize,
         closes: AtomicUsize,
+        fail_close: bool,
+    }
+
+    struct BlockingSpawnBackend {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        block_first: AtomicBool,
+        sessions: Arc<Mutex<Vec<Arc<StubSession>>>>,
+    }
+
+    impl TerminalBackend for BlockingSpawnBackend {
+        fn backend_type(&self) -> &str {
+            "blocking"
+        }
+
+        fn spawn(
+            &self,
+            _request: BackendSpawnRequest,
+        ) -> TerminalFuture<'_, Arc<dyn TerminalBackendSession>> {
+            let entered = Arc::clone(&self.entered);
+            let release = Arc::clone(&self.release);
+            let should_block = self.block_first.swap(false, Ordering::AcqRel);
+            let sessions = Arc::clone(&self.sessions);
+            Box::pin(async move {
+                if should_block {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                let session = Arc::new(StubSession {
+                    sends: AtomicUsize::new(0),
+                    signals: AtomicUsize::new(0),
+                    closes: AtomicUsize::new(0),
+                    fail_close: false,
+                });
+                sessions.lock().unwrap().push(Arc::clone(&session));
+                let session: Arc<dyn TerminalBackendSession> = session;
+                Ok(session)
+            })
+        }
     }
 
     impl TerminalBackend for StubBackend {
@@ -655,6 +780,7 @@ mod tests {
                 sends: AtomicUsize::new(0),
                 signals: AtomicUsize::new(0),
                 closes: AtomicUsize::new(0),
+                fail_close: self.fail_close,
             });
             self.sessions.lock().unwrap().push(Arc::clone(&session));
             let backend_session: Arc<dyn TerminalBackendSession> = session;
@@ -698,7 +824,14 @@ mod tests {
 
         fn close(&self) -> TerminalFuture<'_, ()> {
             self.closes.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async { Ok(()) })
+            let fail_close = self.fail_close;
+            Box::pin(async move {
+                if fail_close {
+                    Err(TerminalError::BackendFailed)
+                } else {
+                    Ok(())
+                }
+            })
         }
     }
 
@@ -710,6 +843,7 @@ mod tests {
         let sessions = Arc::new(Mutex::new(Vec::new()));
         let backend: Arc<dyn TerminalBackend> = Arc::new(StubBackend {
             sessions: Arc::clone(&sessions),
+            fail_close: false,
         });
         (TerminalService::new([backend]).unwrap(), sessions)
     }
@@ -864,6 +998,187 @@ mod tests {
                 .await,
             Err(TerminalError::InvalidRequest("terminal input is too large"))
         );
+    }
+
+    #[tokio::test]
+    async fn global_capacity_and_owner_cleanup_are_bounded_and_isolated() {
+        let (service, sessions) = service();
+        for index in 0..MAX_TERMINAL_SESSIONS {
+            service
+                .spawn(
+                    owner(&format!("user-{index}")),
+                    TerminalSpawnRequest {
+                        backend_type: "stub".into(),
+                        name: None,
+                        cwd: ".".into(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(sessions.lock().unwrap().len(), MAX_TERMINAL_SESSIONS);
+        assert_eq!(
+            service
+                .spawn(
+                    owner("overflow"),
+                    TerminalSpawnRequest {
+                        backend_type: "stub".into(),
+                        name: None,
+                        cwd: ".".into(),
+                    },
+                )
+                .await,
+            Err(TerminalError::ServiceSessionLimit)
+        );
+
+        let first_owner = owner("user-0");
+        let report = service.close_owner(&first_owner).await.unwrap();
+        assert_eq!(
+            report,
+            TerminalCleanupReport {
+                removed: 1,
+                pending_cancelled: 0,
+                close_attempted: 1,
+                close_succeeded: 1,
+                close_failed: 0,
+            }
+        );
+        assert!(service.list(&first_owner).await.unwrap().is_empty());
+        assert_eq!(service.list(&owner("user-1")).await.unwrap().len(), 1);
+        assert_eq!(
+            service.close_owner(&first_owner).await.unwrap(),
+            TerminalCleanupReport::default()
+        );
+
+        service
+            .spawn(
+                owner("replacement"),
+                TerminalSpawnRequest {
+                    backend_type: "stub".into(),
+                    name: None,
+                    cwd: ".".into(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn owner_cleanup_releases_service_capacity_when_backend_close_fails() {
+        let sessions = Arc::new(Mutex::new(Vec::new()));
+        let backend: Arc<dyn TerminalBackend> = Arc::new(StubBackend {
+            sessions: Arc::clone(&sessions),
+            fail_close: true,
+        });
+        let service = TerminalService::new([backend]).unwrap();
+        let owner = owner("close-failure");
+        service
+            .spawn(
+                owner.clone(),
+                TerminalSpawnRequest {
+                    backend_type: "stub".into(),
+                    name: None,
+                    cwd: ".".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            service.close_owner(&owner).await.unwrap(),
+            TerminalCleanupReport {
+                removed: 1,
+                pending_cancelled: 0,
+                close_attempted: 1,
+                close_succeeded: 0,
+                close_failed: 1,
+            }
+        );
+        assert!(service.list(&owner).await.unwrap().is_empty());
+        assert_eq!(
+            sessions.lock().unwrap()[0].closes.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_cleanup_cancels_an_in_flight_spawn_before_publication() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let sessions = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(BlockingSpawnBackend {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            block_first: AtomicBool::new(true),
+            sessions: Arc::clone(&sessions),
+        });
+        let service = Arc::new(
+            TerminalService::new([Arc::clone(&backend) as Arc<dyn TerminalBackend>]).unwrap(),
+        );
+        let owner = owner("spawn-cleanup");
+        let entered_wait = entered.notified();
+        let spawn = {
+            let service = Arc::clone(&service);
+            let owner = owner.clone();
+            tokio::spawn(async move {
+                service
+                    .spawn(
+                        owner,
+                        TerminalSpawnRequest {
+                            backend_type: "blocking".into(),
+                            name: Some("main".into()),
+                            cwd: ".".into(),
+                        },
+                    )
+                    .await
+            })
+        };
+        entered_wait.await;
+
+        assert_eq!(
+            service.close_owner(&owner).await.unwrap(),
+            TerminalCleanupReport {
+                removed: 0,
+                pending_cancelled: 1,
+                close_attempted: 0,
+                close_succeeded: 0,
+                close_failed: 0,
+            }
+        );
+        assert_eq!(
+            service
+                .spawn(
+                    owner.clone(),
+                    TerminalSpawnRequest {
+                        backend_type: "blocking".into(),
+                        name: Some("replacement".into()),
+                        cwd: ".".into(),
+                    },
+                )
+                .await,
+            Err(TerminalError::SessionClosing)
+        );
+
+        release.notify_one();
+        assert_eq!(spawn.await.unwrap(), Err(TerminalError::SessionClosing));
+        assert_eq!(
+            sessions.lock().unwrap()[0].closes.load(Ordering::Relaxed),
+            1
+        );
+        assert!(service.list(&owner).await.unwrap().is_empty());
+
+        service
+            .spawn(
+                owner.clone(),
+                TerminalSpawnRequest {
+                    backend_type: "blocking".into(),
+                    name: Some("replacement".into()),
+                    cwd: ".".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(service.list(&owner).await.unwrap().len(), 1);
     }
 
     #[test]

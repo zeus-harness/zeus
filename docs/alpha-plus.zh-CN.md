@@ -239,7 +239,9 @@ POST /sessions/{id}/turns
 - persistent terminal 只在 embedding runtime 显式注入 isolated backend 时进入 Agent manifest；
   Zeus 核心自身不启动 host process，也不提供 host-shell fallback。session owner 使用 durable work
   中服务端校验的 account/actor/Session/turn/Agent scope，foreign scope 只能得到 unknown；每 owner
-  最多 4 个 session，输入、输出和 read 行数均有硬上限。open/send/signal/close 必须逐次 owner
+  最多 4 个 session，service 全局最多 128 个 live/pending session，输入、输出和 read 行数均有硬上限。
+  Agent durable terminal state 提交后必须按 exact scope 移除并 best-effort close 全部 session；close
+  失败只记录 backend 泄漏风险，不能保留内部容量或重开 Agent。open/send/signal/close 必须逐次 owner
   approval，read/list 为 read-only allow；mutation receipt 绑定 scope、call ID、tool 与 arguments
   digest。started checkpoint 后无法确认副作用结果时必须 durable settle 为 `outcome_unknown`，终止
   当前 Agent turn 且不得自动重试。
