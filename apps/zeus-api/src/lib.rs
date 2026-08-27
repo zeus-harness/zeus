@@ -6836,6 +6836,11 @@ mod tests {
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
     }
 
+    struct WorkspaceFindThenFinalProvider {
+        metadata: ProviderMetadata,
+        requests: Arc<StdMutex<Vec<ReplyRequest>>>,
+    }
+
     struct WorkspaceReplaceThenFinalProvider {
         metadata: ProviderMetadata,
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
@@ -6854,10 +6859,13 @@ mod tests {
     const TEST_WORKSPACE_READ_FILE_TOOL_NAME: &str = "workspace_read_file";
     const TEST_WORKSPACE_READ_LINES_TOOL_NAME: &str = "workspace_read_lines";
     const TEST_WORKSPACE_LIST_DIRECTORY_TOOL_NAME: &str = "workspace_list_directory";
+    const TEST_WORKSPACE_FIND_PATHS_TOOL_NAME: &str = "workspace_find_paths";
     const TEST_WORKSPACE_SEARCH_TEXT_TOOL_NAME: &str = "workspace_search_text";
     const TEST_WORKSPACE_REPLACE_TEXT_TOOL_NAME: &str = "workspace_replace_text";
     const TEST_WORKSPACE_CREATE_FILE_TOOL_NAME: &str = "workspace_create_file";
     const TEST_WORKSPACE_INSERT_TEXT_TOOL_NAME: &str = "workspace_insert_text";
+    static WORKSPACE_DISCOVERY_AGENT_TEST_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
 
     struct HistoryThenToolProvider {
         metadata: ProviderMetadata,
@@ -6963,6 +6971,75 @@ mod tests {
                 },
                 requests,
             }
+        }
+    }
+
+    impl WorkspaceFindThenFinalProvider {
+        fn new(requests: Arc<StdMutex<Vec<ReplyRequest>>>) -> Self {
+            Self {
+                metadata: ProviderMetadata {
+                    provider_id: "test-workspace-find-provider".into(),
+                    model: Some("test-model".into()),
+                    reply_kind: ReplyKind::Model,
+                },
+                requests,
+            }
+        }
+    }
+
+    impl ReplyProvider for WorkspaceFindThenFinalProvider {
+        fn metadata(&self) -> &ProviderMetadata {
+            &self.metadata
+        }
+
+        fn reply(&self, request: ReplyRequest) -> ReplyFuture<'_> {
+            let output = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(request.clone());
+                match requests.len() {
+                    1 => {
+                        assert!(
+                            request
+                                .tools
+                                .iter()
+                                .any(|tool| tool.name == TEST_WORKSPACE_FIND_PATHS_TOOL_NAME)
+                        );
+                        ReplyOutput::ToolCall {
+                            call: ReplyToolCall::new(
+                                "provider-call-workspace-find-1",
+                                TEST_WORKSPACE_FIND_PATHS_TOOL_NAME,
+                                serde_json::json!({
+                                    "path": ".",
+                                    "pattern": "**/*.rs",
+                                }),
+                            ),
+                        }
+                    }
+                    2 => ReplyOutput::ToolCall {
+                        call: ReplyToolCall::new(
+                            "provider-call-workspace-find-lines-2",
+                            TEST_WORKSPACE_READ_LINES_TOOL_NAME,
+                            serde_json::json!({
+                                "path": "src/lib.rs",
+                                "start_line": 1,
+                                "end_line": 1,
+                            }),
+                        ),
+                    },
+                    3 => ReplyOutput::Final {
+                        content: "workspace path discovery completed".into(),
+                    },
+                    call => panic!("unexpected workspace path discovery provider call {call}"),
+                }
+            };
+            let provider = self.metadata.clone();
+            Box::pin(async move {
+                Ok(ReplyResponse {
+                    output,
+                    finish_reason: Some("stop".into()),
+                    provider,
+                })
+            })
         }
     }
 
@@ -8058,6 +8135,7 @@ mod tests {
     #[tokio::test]
     async fn read_only_workspace_search_and_line_read_execute_without_approval_and_replay_exactly()
     {
+        let _workspace_test_guard = WORKSPACE_DISCOVERY_AGENT_TEST_LOCK.lock().await;
         let unique = UserId::generate().unwrap();
         let root = std::env::temp_dir().join(format!(
             "zeus-api-workspace-read-{}",
@@ -8186,6 +8264,134 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&line_result.content).unwrap(),
             agent.calls[1].output.clone().unwrap()
         );
+
+        drop(app);
+        drop(store);
+        tokio::task::yield_now().await;
+        cleanup_test_database(&path);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_only_workspace_find_and_line_read_execute_without_approval_and_replay_exactly() {
+        let _workspace_test_guard = WORKSPACE_DISCOVERY_AGENT_TEST_LOCK.lock().await;
+        let unique = UserId::generate().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "zeus-api-workspace-find-{}",
+            unique.as_str().replace(':', "-")
+        ));
+        let path = root.join("zeus.db");
+        let marker_root = root.join("markers");
+        let workspace_root = root.join("workspace");
+        std::fs::create_dir_all(workspace_root.join("src")).unwrap();
+        std::fs::write(workspace_root.join("src/lib.rs"), "pub fn zeus() {}\n").unwrap();
+        let store = DemoStore::open_local_with_workspace(&path, &marker_root, &workspace_root)
+            .await
+            .unwrap();
+        let owner =
+            provision_test_owner(&store, "user-workspace-find", "workspace-find-owner").await;
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: "session-workspace-find".into(),
+                    title: "Find workspace path".into(),
+                },
+                "create-workspace-find",
+            )
+            .await
+            .unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(WorkspaceFindThenFinalProvider::new(Arc::clone(&requests))),
+        )
+        .unwrap();
+
+        let started = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-workspace-find/turns")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "start-workspace-find")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-workspace-find",
+                            "user_message": "find a Rust source file and read its first line",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+
+        let session = wait_for_ready_session(&store, &owner.authz, "session-workspace-find").await;
+        assert_eq!(
+            session.turns[0].assistant_message.as_deref(),
+            Some("workspace path discovery completed")
+        );
+        let agent = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            "session-workspace-find",
+            "turn-workspace-find",
+            protocol::AgentTurnStatus::Succeeded,
+        )
+        .await;
+        assert_eq!(agent.model_steps, 3);
+        assert_eq!(agent.tool_calls, 2);
+        assert_eq!(agent.calls.len(), 2);
+        assert_eq!(agent.calls[0].tool, TEST_WORKSPACE_FIND_PATHS_TOOL_NAME);
+        assert_eq!(
+            agent.calls[0].output,
+            Some(serde_json::json!({
+                "path": ".",
+                "pattern": "**/*.rs",
+                "matches": ["src/lib.rs"],
+                "truncated": false,
+                "scanned_directories": 2,
+                "scanned_files": 1,
+                "scanned_entries": 2,
+                "skipped_entries": 0,
+            }))
+        );
+        assert_eq!(agent.calls[1].tool, TEST_WORKSPACE_READ_LINES_TOOL_NAME);
+        assert_eq!(
+            agent.calls[1].output,
+            Some(serde_json::json!({
+                "path": "src/lib.rs",
+                "start_line": 1,
+                "end_line": 1,
+                "total_lines": 2,
+                "content": "pub fn zeus() {}\n",
+                "bytes": 17,
+            }))
+        );
+        for call in &agent.calls {
+            assert!(!call.approval_required);
+            assert!(call.review.is_none());
+            assert_eq!(call.status, AgentToolCallStatus::Succeeded);
+        }
+        assert_eq!(std::fs::read_dir(&marker_root).unwrap().count(), 0);
+
+        let recorded = requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 3);
+        for (request_index, call_index) in [(1, 0), (2, 1)] {
+            let tool_result = recorded[request_index].messages.last().unwrap();
+            assert_eq!(tool_result.role, ReplyRole::Tool);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&tool_result.content).unwrap(),
+                agent.calls[call_index].output.clone().unwrap()
+            );
+        }
 
         drop(app);
         drop(store);

@@ -11,6 +11,7 @@ publish.workspace = true
 
 [dependencies]
 cap-std.workspace = true
+globset.workspace = true
 protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true

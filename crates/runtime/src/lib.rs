@@ -22,9 +22,10 @@ use chrono::{SecondsFormat, Utc};
 use connectors::{
     ConnectorConfigError, LOCAL_DEV_ENVIRONMENT, register_local_dev_connectors,
     register_local_workspace_connectors, workspace_create_file_descriptor,
-    workspace_insert_text_descriptor, workspace_list_directory_descriptor,
-    workspace_read_file_descriptor, workspace_read_lines_descriptor,
-    workspace_replace_text_descriptor, workspace_search_text_descriptor,
+    workspace_find_paths_descriptor, workspace_insert_text_descriptor,
+    workspace_list_directory_descriptor, workspace_read_file_descriptor,
+    workspace_read_lines_descriptor, workspace_replace_text_descriptor,
+    workspace_search_text_descriptor,
 };
 pub use deployment::ManifestEnvelope;
 use deployment::{
@@ -3216,6 +3217,7 @@ impl RuntimeComponents {
                 if let Some(workspace_root) = workspace_root {
                     for descriptor in [
                         workspace_list_directory_descriptor(),
+                        workspace_find_paths_descriptor(),
                         workspace_read_file_descriptor(),
                         workspace_read_lines_descriptor(),
                         workspace_search_text_descriptor(),

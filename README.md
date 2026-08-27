@@ -237,6 +237,10 @@ drain cycle instead of spawning mutex waiters without a bound.
 To exercise the local connectors, use a separate database and explicit fixed
 roots. The marker caller cannot choose a path. `workspace_list_directory`
 lists at most 64 sorted entries from one canonical relative directory.
+`workspace_find_paths` finds at most 32 regular files using a relative glob;
+`*`, `?`, and character classes stay within one path component while `**`
+matches complete path components. Its deterministic traversal is bounded by
+directory, file, entry, depth, and result limits.
 `workspace_search_text` searches literal text deterministically below one such
 directory, retaining at most 32 matches while bounding directories, files,
 depth, per-file bytes, and total bytes; it skips `.git`, `.svelte-kit`, `.zeus`,
@@ -944,10 +948,10 @@ prompt governance:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 563 tests passed
-  under the existing project counting convention, including 17 connector tests,
+- `cargo test --workspace --all-targets --locked`: 565 tests passed
+  under the existing project counting convention, including 18 connector tests,
   8 deployment tests, 29 knowledge tests, 248 storage tests, 48 runtime tests,
-  70 API library tests, 6 API main/config
+  71 API library tests, 6 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,
@@ -997,8 +1001,9 @@ prompt governance:
   or conflict detection for a committed dispatch terminal acknowledgement. The
   rooted workspace connectors additionally cover traversal, symlink, UTF-8,
   regular-file, 8 KiB file and 64-entry directory rejection, deterministic
-  directory ordering, bounded literal search, plus an automatic search-to-read
-  to-model continuation through the real Agent worker chain. The exact text
+  directory ordering, bounded path-glob and literal search, plus automatic
+  find-to-read and search-to-read-to-model continuations through the real Agent
+  worker chain. The exact text
   replacement path covers unique-match enforcement, atomic permission-preserving
   publication, bounded idempotent replay/conflict, deletion, size rejection,
   owner approval before the first byte changes, and exact result continuation.

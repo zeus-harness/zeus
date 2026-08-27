@@ -20,6 +20,7 @@ use cap_std::{
     ambient_authority,
     fs::{Dir, OpenOptions as CapOpenOptions},
 };
+use globset::{GlobBuilder, GlobMatcher};
 use protocol::{SandboxProfile, ToolCall, ToolEffect};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -41,6 +42,8 @@ pub const WORKSPACE_READ_LINES_TOOL_NAME: &str = "workspace_read_lines";
 pub const WORKSPACE_READ_LINES_TOOL_VERSION: &str = "1";
 pub const WORKSPACE_LIST_DIRECTORY_TOOL_NAME: &str = "workspace_list_directory";
 pub const WORKSPACE_LIST_DIRECTORY_TOOL_VERSION: &str = "1";
+pub const WORKSPACE_FIND_PATHS_TOOL_NAME: &str = "workspace_find_paths";
+pub const WORKSPACE_FIND_PATHS_TOOL_VERSION: &str = "1";
 pub const WORKSPACE_SEARCH_TEXT_TOOL_NAME: &str = "workspace_search_text";
 pub const WORKSPACE_SEARCH_TEXT_TOOL_VERSION: &str = "1";
 pub const WORKSPACE_REPLACE_TEXT_TOOL_NAME: &str = "workspace_replace_text";
@@ -55,6 +58,12 @@ pub const MAX_WORKSPACE_RANGE_FILE_BYTES: usize = 64 * 1024;
 pub const MAX_WORKSPACE_RANGE_OUTPUT_BYTES: usize = 8 * 1024;
 pub const MAX_WORKSPACE_RANGE_LINES: usize = 200;
 pub const MAX_WORKSPACE_DIRECTORY_ENTRIES: usize = 64;
+pub const MAX_WORKSPACE_FIND_PATTERN_BYTES: usize = 256;
+pub const MAX_WORKSPACE_FIND_MATCHES: usize = 32;
+pub const MAX_WORKSPACE_FIND_FILES: usize = 256;
+pub const MAX_WORKSPACE_FIND_DIRECTORIES: usize = 64;
+pub const MAX_WORKSPACE_FIND_ENTRIES: usize = 1024;
+pub const MAX_WORKSPACE_FIND_DEPTH: usize = 12;
 pub const MAX_WORKSPACE_SEARCH_QUERY_BYTES: usize = 256;
 pub const MAX_WORKSPACE_SEARCH_MATCHES: usize = 32;
 pub const MAX_WORKSPACE_SEARCH_FILES: usize = 256;
@@ -69,7 +78,7 @@ pub const MAX_WORKSPACE_INSERT_TEXT_BYTES: usize = 4 * 1024;
 pub const MAX_WORKSPACE_CREATE_CONTENT_BYTES: usize = 12 * 1024;
 pub const MAX_WORKSPACE_MUTATION_RECEIPTS: usize = 1024;
 
-const WORKSPACE_SEARCH_IGNORED_DIRECTORIES: [&str; 6] = [
+const WORKSPACE_IGNORED_DIRECTORIES: [&str; 6] = [
     ".git",
     ".svelte-kit",
     ".zeus",
@@ -143,6 +152,9 @@ pub fn register_local_workspace_connectors(
     let search_executor = WorkspaceSearchTextExecutor {
         roots: Arc::clone(&executor.roots),
     };
+    let find_executor = WorkspaceFindPathsExecutor {
+        roots: Arc::clone(&executor.roots),
+    };
     let replace_executor = WorkspaceReplaceTextExecutor {
         roots: Arc::clone(&executor.roots),
     };
@@ -155,6 +167,7 @@ pub fn register_local_workspace_connectors(
     registry.register(workspace_read_file_descriptor(), executor)?;
     registry.register(workspace_read_lines_descriptor(), lines_executor)?;
     registry.register(workspace_list_directory_descriptor(), list_executor)?;
+    registry.register(workspace_find_paths_descriptor(), find_executor)?;
     registry.register(workspace_search_text_descriptor(), search_executor)?;
     registry.register(workspace_replace_text_descriptor(), replace_executor)?;
     registry.register(workspace_insert_text_descriptor(), insert_executor)?;
@@ -252,6 +265,31 @@ pub fn workspace_list_directory_descriptor() -> ToolDescriptor {
                 "path".into(),
                 ParameterSpec::required_string(MAX_WORKSPACE_PATH_BYTES),
             )]),
+        },
+    }
+}
+
+pub fn workspace_find_paths_descriptor() -> ToolDescriptor {
+    ToolDescriptor {
+        name: WORKSPACE_FIND_PATHS_TOOL_NAME.into(),
+        version: WORKSPACE_FIND_PATHS_TOOL_VERSION.into(),
+        description: format!(
+            "Find regular workspace files below one relative directory using a path glob with *, ?, [], and whole-component ** syntax (maximum {MAX_WORKSPACE_FIND_MATCHES} matches; patterns are relative to path; use . for the workspace root)"
+        ),
+        effect: ToolEffect::ReadOnly,
+        sandbox_profile: SandboxProfile::ReadOnly,
+        input_schema: ObjectSchema {
+            max_serialized_bytes: 4 * 1024,
+            properties: BTreeMap::from([
+                (
+                    "path".into(),
+                    ParameterSpec::required_string(MAX_WORKSPACE_PATH_BYTES),
+                ),
+                (
+                    "pattern".into(),
+                    ParameterSpec::required_string(MAX_WORKSPACE_FIND_PATTERN_BYTES),
+                ),
+            ]),
         },
     }
 }
@@ -559,6 +597,54 @@ struct WorkspaceSearchTextExecutor {
     roots: Arc<WorkspaceRoots>,
 }
 
+#[derive(Clone)]
+struct WorkspaceFindPathsExecutor {
+    roots: Arc<WorkspaceRoots>,
+}
+
+impl ToolExecutor for WorkspaceFindPathsExecutor {
+    fn execute(&self, request: ExecutionRequest) -> ExecutionFuture<'_> {
+        let roots = Arc::clone(&self.roots);
+        Box::pin(async move {
+            if request.environment != LOCAL_DEV_ENVIRONMENT {
+                return Err(workspace_failure(
+                    "environment_denied",
+                    "Workspace path discovery is restricted to local-development",
+                    false,
+                ));
+            }
+            let arguments: WorkspaceFindPathsArguments =
+                serde_json::from_value(request.call.arguments.clone()).map_err(|_| {
+                    workspace_failure(
+                        "invalid_arguments",
+                        "Workspace path discovery arguments are invalid",
+                        false,
+                    )
+                })?;
+            let path = validate_workspace_directory_path(&arguments.path)?;
+            let matcher = compile_workspace_find_pattern(&arguments.pattern)?;
+            tokio::task::spawn_blocking(move || {
+                find_workspace_paths(
+                    &roots,
+                    &path,
+                    &arguments.path,
+                    &arguments.pattern,
+                    &matcher,
+                    &request.call.call_id,
+                )
+            })
+            .await
+            .map_err(|_| {
+                workspace_failure(
+                    "workspace_path_finder_join_failed",
+                    "The workspace path finder stopped unexpectedly",
+                    false,
+                )
+            })?
+        })
+    }
+}
+
 impl ToolExecutor for WorkspaceSearchTextExecutor {
     fn execute(&self, request: ExecutionRequest) -> ExecutionFuture<'_> {
         let roots = Arc::clone(&self.roots);
@@ -781,6 +867,13 @@ struct WorkspaceSearchTextArguments {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct WorkspaceFindPathsArguments {
+    path: String,
+    pattern: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WorkspaceReplaceTextArguments {
     path: String,
     old_text: String,
@@ -854,6 +947,37 @@ fn validate_workspace_search_query(query: &str) -> Result<(), ExecutorError> {
         ));
     }
     Ok(())
+}
+
+fn compile_workspace_find_pattern(pattern: &str) -> Result<GlobMatcher, ExecutorError> {
+    if pattern.is_empty()
+        || pattern.len() > MAX_WORKSPACE_FIND_PATTERN_BYTES
+        || pattern.trim() != pattern
+        || pattern.starts_with('/')
+        || pattern.ends_with('/')
+        || pattern.contains('\\')
+        || pattern.chars().any(char::is_control)
+        || pattern
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return Err(invalid_workspace_find_pattern());
+    }
+
+    let mut builder = GlobBuilder::new(pattern);
+    builder.literal_separator(true).backslash_escape(false);
+    builder
+        .build()
+        .map(|glob| glob.compile_matcher())
+        .map_err(|_| invalid_workspace_find_pattern())
+}
+
+fn invalid_workspace_find_pattern() -> ExecutorError {
+    workspace_failure(
+        "invalid_workspace_find_pattern",
+        "Workspace find pattern must be a valid relative UTF-8 glob within 256 bytes without traversal",
+        false,
+    )
 }
 
 fn validate_workspace_line_range(
@@ -1103,6 +1227,152 @@ enum WorkspaceSearchEntryKind {
     Other,
 }
 
+fn find_workspace_paths(
+    roots: &WorkspaceRoots,
+    path: &Path,
+    display_path: &str,
+    pattern: &str,
+    matcher: &GlobMatcher,
+    call_id: &str,
+) -> Result<ToolOutput, ExecutorError> {
+    if path != Path::new(".") {
+        reject_workspace_symlinks(&roots.inspection, path)?;
+    }
+
+    let mut pending = VecDeque::from([(path.to_path_buf(), String::new(), 0_usize)]);
+    let mut matches = Vec::new();
+    let mut scanned_directories = 0_usize;
+    let mut scanned_files = 0_usize;
+    let mut scanned_entries = 0_usize;
+    let mut skipped_entries = 0_usize;
+    let mut truncated = false;
+
+    'find: while let Some((directory_path, relative_directory, depth)) = pending.pop_front() {
+        if scanned_directories == MAX_WORKSPACE_FIND_DIRECTORIES {
+            truncated = true;
+            break;
+        }
+        if directory_path != Path::new(".") {
+            reject_workspace_symlinks(&roots.inspection, &directory_path)?;
+        }
+        scanned_directories += 1;
+        let directory = roots
+            .confined
+            .read_dir(&directory_path)
+            .map_err(workspace_directory_error)?;
+        let mut entries = Vec::new();
+        for entry in directory {
+            let entry = entry.map_err(workspace_directory_error)?;
+            let name = entry.file_name().into_string().map_err(|_| {
+                workspace_failure(
+                    "workspace_entry_not_utf8",
+                    "The searched workspace contains a non-UTF-8 entry",
+                    false,
+                )
+            })?;
+            if name.is_empty()
+                || name.len() > MAX_WORKSPACE_PATH_BYTES
+                || name.chars().any(char::is_control)
+            {
+                return Err(workspace_failure(
+                    "workspace_entry_invalid",
+                    "The searched workspace contains an invalid entry name",
+                    false,
+                ));
+            }
+            if is_workspace_internal_entry(&name) {
+                continue;
+            }
+            if entries.len() == MAX_WORKSPACE_DIRECTORY_ENTRIES {
+                return Err(workspace_failure(
+                    "workspace_find_directory_too_large",
+                    "A searched workspace directory exceeds the 64-entry limit",
+                    false,
+                ));
+            }
+            let file_type = entry.file_type().map_err(workspace_directory_error)?;
+            let kind = if file_type.is_file() {
+                WorkspaceSearchEntryKind::File
+            } else if file_type.is_dir() {
+                WorkspaceSearchEntryKind::Directory
+            } else if file_type.is_symlink() {
+                WorkspaceSearchEntryKind::Symlink
+            } else {
+                WorkspaceSearchEntryKind::Other
+            };
+            entries.push(WorkspaceSearchEntry { name, kind });
+        }
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+
+        for entry in entries {
+            if scanned_entries == MAX_WORKSPACE_FIND_ENTRIES {
+                truncated = true;
+                break 'find;
+            }
+            scanned_entries += 1;
+            let entry_path = join_workspace_path(&directory_path, &entry.name);
+            let entry_display_path = workspace_display_path(&entry_path)?;
+            if entry_display_path.len() > MAX_WORKSPACE_PATH_BYTES {
+                skipped_entries += 1;
+                truncated = true;
+                continue;
+            }
+            let relative_entry_path = if relative_directory.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{relative_directory}/{}", entry.name)
+            };
+            match entry.kind {
+                WorkspaceSearchEntryKind::Directory => {
+                    if WORKSPACE_IGNORED_DIRECTORIES.contains(&entry.name.as_str()) {
+                        skipped_entries += 1;
+                    } else if depth == MAX_WORKSPACE_FIND_DEPTH {
+                        skipped_entries += 1;
+                        truncated = true;
+                    } else {
+                        pending.push_back((entry_path, relative_entry_path, depth + 1));
+                    }
+                }
+                WorkspaceSearchEntryKind::File => {
+                    if scanned_files == MAX_WORKSPACE_FIND_FILES {
+                        truncated = true;
+                        break 'find;
+                    }
+                    scanned_files += 1;
+                    if !matcher.is_match(&relative_entry_path) {
+                        continue;
+                    }
+                    reject_workspace_symlinks(&roots.inspection, &entry_path)?;
+                    if matches.len() == MAX_WORKSPACE_FIND_MATCHES {
+                        truncated = true;
+                        break 'find;
+                    }
+                    matches.push(entry_display_path);
+                }
+                WorkspaceSearchEntryKind::Symlink | WorkspaceSearchEntryKind::Other => {
+                    skipped_entries += 1;
+                }
+            }
+        }
+    }
+
+    matches.sort();
+    Ok(ToolOutput {
+        value: json!({
+            "path": display_path,
+            "pattern": pattern,
+            "matches": matches,
+            "truncated": truncated,
+            "scanned_directories": scanned_directories,
+            "scanned_files": scanned_files,
+            "scanned_entries": scanned_entries,
+            "skipped_entries": skipped_entries,
+        }),
+        replayed: false,
+        provider_request_id: Some(call_id.to_owned()),
+    })
+}
+
 fn search_workspace_text(
     roots: &WorkspaceRoots,
     path: &Path,
@@ -1189,7 +1459,7 @@ fn search_workspace_text(
             }
             match entry.kind {
                 WorkspaceSearchEntryKind::Directory => {
-                    if WORKSPACE_SEARCH_IGNORED_DIRECTORIES.contains(&entry.name.as_str()) {
+                    if WORKSPACE_IGNORED_DIRECTORIES.contains(&entry.name.as_str()) {
                         skipped_entries += 1;
                     } else if depth == MAX_WORKSPACE_SEARCH_DEPTH {
                         skipped_entries += 1;
@@ -2311,6 +2581,20 @@ mod tests {
         }
     }
 
+    fn workspace_find_call(path: &str, pattern: &str) -> ToolCall {
+        let arguments = json!({"path": path, "pattern": pattern});
+        ToolCall {
+            call_id: stable_call_id("run-1", 1, 1, WORKSPACE_FIND_PATHS_TOOL_NAME).unwrap(),
+            tool: WORKSPACE_FIND_PATHS_TOOL_NAME.into(),
+            tool_version: WORKSPACE_FIND_PATHS_TOOL_VERSION.into(),
+            arguments_digest: arguments_digest(&arguments),
+            arguments,
+            effect: ToolEffect::ReadOnly,
+            sandbox_profile: SandboxProfile::ReadOnly,
+            executor_status: ToolExecutorStatus::Available,
+        }
+    }
+
     fn workspace_replace_call(step: u32, path: &str, old_text: &str, new_text: &str) -> ToolCall {
         let arguments = json!({
             "path": path,
@@ -2454,6 +2738,11 @@ mod tests {
         assert!(
             registry
                 .descriptor(WORKSPACE_INSERT_TEXT_TOOL_NAME)
+                .is_none()
+        );
+        assert!(
+            registry
+                .descriptor(WORKSPACE_FIND_PATHS_TOOL_NAME)
                 .is_none()
         );
     }
@@ -2691,6 +2980,15 @@ mod tests {
             RegistryError::Executor(ExecutorError::Failed { ref code, .. })
                 if code == "workspace_search_directory_too_large"
         ));
+        let find_error = registry
+            .dispatch(workspace_find_call("too-many", "*"), LOCAL_DEV_ENVIRONMENT)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            find_error,
+            RegistryError::Executor(ExecutorError::Failed { ref code, .. })
+                if code == "workspace_find_directory_too_large"
+        ));
 
         let traversal = registry
             .dispatch(workspace_list_call("../outside"), LOCAL_DEV_ENVIRONMENT)
@@ -2782,6 +3080,140 @@ mod tests {
                 RegistryError::Executor(ExecutorError::Failed { ref code, .. })
                     if code == expected_code
             ));
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_find_paths_is_globbed_deterministic_and_bounded() {
+        let temp = TestDirectory::new();
+        fs::create_dir_all(temp.0.join("src/nested")).unwrap();
+        fs::create_dir(temp.0.join("tests")).unwrap();
+        fs::create_dir(temp.0.join("target")).unwrap();
+        fs::create_dir(temp.0.join("many")).unwrap();
+        fs::write(temp.0.join("src/lib.rs"), []).unwrap();
+        fs::write(temp.0.join("src/main.ts"), []).unwrap();
+        fs::write(temp.0.join("src/nested/tool.rs"), []).unwrap();
+        fs::write(temp.0.join("tests/api.rs"), []).unwrap();
+        fs::write(temp.0.join("target/ignored.rs"), []).unwrap();
+        for index in 0..=MAX_WORKSPACE_FIND_MATCHES {
+            fs::write(temp.0.join("many").join(format!("file-{index:03}.rs")), []).unwrap();
+        }
+        let mut registry = ToolRegistry::new();
+        register_local_workspace_connectors(&mut registry, LOCAL_DEV_ENVIRONMENT, &temp.0).unwrap();
+
+        let output = registry
+            .dispatch(workspace_find_call(".", "**/*.rs"), LOCAL_DEV_ENVIRONMENT)
+            .await
+            .unwrap();
+        assert_eq!(output.value["path"], ".");
+        assert_eq!(output.value["pattern"], "**/*.rs");
+        assert_eq!(
+            output.value["matches"],
+            serde_json::json!([
+                "many/file-000.rs",
+                "many/file-001.rs",
+                "many/file-002.rs",
+                "many/file-003.rs",
+                "many/file-004.rs",
+                "many/file-005.rs",
+                "many/file-006.rs",
+                "many/file-007.rs",
+                "many/file-008.rs",
+                "many/file-009.rs",
+                "many/file-010.rs",
+                "many/file-011.rs",
+                "many/file-012.rs",
+                "many/file-013.rs",
+                "many/file-014.rs",
+                "many/file-015.rs",
+                "many/file-016.rs",
+                "many/file-017.rs",
+                "many/file-018.rs",
+                "many/file-019.rs",
+                "many/file-020.rs",
+                "many/file-021.rs",
+                "many/file-022.rs",
+                "many/file-023.rs",
+                "many/file-024.rs",
+                "many/file-025.rs",
+                "many/file-026.rs",
+                "many/file-027.rs",
+                "many/file-028.rs",
+                "many/file-029.rs",
+                "many/file-030.rs",
+                "many/file-031.rs",
+            ])
+        );
+        assert_eq!(output.value["truncated"], true);
+        assert_eq!(
+            output.value["matches"].as_array().unwrap().len(),
+            MAX_WORKSPACE_FIND_MATCHES
+        );
+
+        let direct = registry
+            .dispatch(workspace_find_call("src", "*.rs"), LOCAL_DEV_ENVIRONMENT)
+            .await
+            .unwrap();
+        assert_eq!(direct.value["matches"], serde_json::json!(["src/lib.rs"]));
+        assert_eq!(direct.value["truncated"], false);
+
+        let recursive = registry
+            .dispatch(workspace_find_call("src", "**/*.rs"), LOCAL_DEV_ENVIRONMENT)
+            .await
+            .unwrap();
+        assert_eq!(
+            recursive.value["matches"],
+            serde_json::json!(["src/lib.rs", "src/nested/tool.rs"])
+        );
+        assert_eq!(recursive.value["scanned_directories"], 2);
+        assert_eq!(recursive.value["scanned_files"], 3);
+        assert_eq!(recursive.value["scanned_entries"], 4);
+        assert_eq!(recursive.value["skipped_entries"], 0);
+
+        let explicitly_selected_ignored_directory = registry
+            .dispatch(
+                workspace_find_call("target", "**/*.rs"),
+                LOCAL_DEV_ENVIRONMENT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            explicitly_selected_ignored_directory.value["matches"],
+            serde_json::json!(["target/ignored.rs"])
+        );
+        let ignored_below_root = registry
+            .dispatch(
+                workspace_find_call(".", "target/**/*.rs"),
+                LOCAL_DEV_ENVIRONMENT,
+            )
+            .await
+            .unwrap();
+        assert!(
+            ignored_below_root.value["matches"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            ignored_below_root.value["skipped_entries"]
+                .as_u64()
+                .unwrap()
+                >= 1
+        );
+
+        for pattern in [" ../*", "../*.rs", "/etc/*", "src\\*.rs", "a//*.rs", "["] {
+            let error = registry
+                .dispatch(workspace_find_call(".", pattern), LOCAL_DEV_ENVIRONMENT)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    RegistryError::Executor(ExecutorError::Failed { ref code, .. })
+                        if code == "invalid_workspace_find_pattern"
+                ),
+                "unexpected error for pattern {pattern:?}: {error:?}"
+            );
         }
     }
 
