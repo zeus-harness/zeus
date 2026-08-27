@@ -334,7 +334,7 @@ request 注入仍是下一阶段，当前不能从 live knowledge 重建 queued 
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 按项目既有统计口径通过 509 个 Rust 测试（knowledge 20、storage 232、runtime 48、API library 64、API
+- host 按项目既有统计口径通过 513 个 Rust 测试（knowledge 24、storage 232、runtime 48、API library 64、API
   main/config 6）与 28 个 Web Node 测试。
 - `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 

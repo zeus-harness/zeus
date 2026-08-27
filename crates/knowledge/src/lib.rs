@@ -24,6 +24,7 @@ type TermFrequencies = BTreeMap<String, u32>;
 
 pub const SELECTION_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
 pub const SELECTION_SNAPSHOT_ENVELOPE_SCHEMA_VERSION: u16 = 1;
+pub const CORPUS_REVISION_ENVELOPE_SCHEMA_VERSION: u16 = 1;
 pub const TOKENIZER_REVISION: &str = "zeus.lexical-tokenizer.v1";
 pub const SCORING_REVISION: &str = "zeus.integer-lexical.v1";
 pub const CONTEXT_RENDERER_REVISION: &str = "zeus.canonical-knowledge-context.v1";
@@ -40,11 +41,13 @@ pub const MAX_ENTRY_UNIQUE_TERMS: usize = 256;
 pub const MAX_SELECTION_HITS: usize = 6;
 pub const MAX_CANONICAL_CONTEXT_BYTES: usize = 16 * 1024;
 pub const MAX_SELECTION_SNAPSHOT_BYTES: usize = 256 * 1024;
+pub const MAX_CORPUS_REVISION_ENVELOPE_BYTES: usize = 2 * 1024 * 1024;
 
 pub const TITLE_TOKEN_WEIGHT: u64 = 8;
 pub const CONTENT_TOKEN_WEIGHT: u64 = 2;
 
 const QUERY_DIGEST_DOMAIN: &[u8] = b"zeus.knowledge-query.sha256.v1";
+const CORPUS_DIGEST_DOMAIN: &[u8] = b"zeus.knowledge-corpus.sha256.v1";
 const ENTRY_CONTENT_DIGEST_DOMAIN: &[u8] = b"zeus.knowledge-entry-content.sha256.v1";
 const CONTEXT_DIGEST_DOMAIN: &[u8] = b"zeus.knowledge-context.sha256.v1";
 const SELECTION_SNAPSHOT_DIGEST_DOMAIN: &[u8] = b"zeus.knowledge-selection.sha256.v1";
@@ -188,6 +191,119 @@ impl<'de> Deserialize<'de> for EntryRevision {
         let wire = EntryRevisionWire::deserialize(deserializer)?;
         Self::new(wire.entry_id, wire.revision, wire.title, wire.content)
             .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Canonical, digest-bearing representation of one exact immutable corpus.
+///
+/// Construction sorts revisions by identity, so callers cannot create two
+/// durable encodings for the same set. The digest remains account-neutral;
+/// storage must bind it to an account before admitting an Agent turn.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CorpusRevisionEnvelope {
+    schema_version: u16,
+    digest: Sha256Digest,
+    entries: Vec<EntryRevision>,
+}
+
+impl CorpusRevisionEnvelope {
+    pub fn new(mut entries: Vec<EntryRevision>) -> Result<Self, KnowledgeError> {
+        validate_entry_revisions(&entries)?;
+        entries.sort_by(compare_entry_identity);
+        let digest = corpus_digest_unchecked(&entries);
+        let envelope = Self {
+            schema_version: CORPUS_REVISION_ENVELOPE_SCHEMA_VERSION,
+            digest,
+            entries,
+        };
+        let _ = envelope.canonical_json()?;
+        Ok(envelope)
+    }
+
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    pub const fn digest(&self) -> Sha256Digest {
+        self.digest
+    }
+
+    pub fn entries(&self) -> &[EntryRevision] {
+        &self.entries
+    }
+
+    pub fn validate(&self) -> Result<(), KnowledgeError> {
+        if self.schema_version != CORPUS_REVISION_ENVELOPE_SCHEMA_VERSION {
+            return Err(invalid_snapshot(
+                "unsupported corpus revision envelope schema version",
+            ));
+        }
+        validate_entry_revisions(&self.entries)?;
+        if self
+            .entries
+            .windows(2)
+            .any(|pair| compare_entry_identity(&pair[0], &pair[1]) != Ordering::Less)
+        {
+            return Err(invalid_snapshot(
+                "corpus entry revisions must be uniquely sorted by identity",
+            ));
+        }
+        if self.digest != corpus_digest_unchecked(&self.entries) {
+            return Err(invalid_snapshot(
+                "corpus revision digest disagrees with its canonical entries",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn canonical_json(&self) -> Result<String, KnowledgeError> {
+        self.validate()?;
+        let encoded = serde_json::to_string(self)
+            .map_err(|error| KnowledgeError::Serialization(error.to_string()))?;
+        if encoded.len() > MAX_CORPUS_REVISION_ENVELOPE_BYTES {
+            return Err(KnowledgeError::CorpusRevisionEnvelopeTooLarge {
+                max_bytes: MAX_CORPUS_REVISION_ENVELOPE_BYTES,
+                actual_bytes: encoded.len(),
+            });
+        }
+        Ok(encoded)
+    }
+
+    pub fn from_canonical_json(value: &str) -> Result<Self, KnowledgeError> {
+        if value.is_empty() || value.len() > MAX_CORPUS_REVISION_ENVELOPE_BYTES {
+            return Err(KnowledgeError::CorpusRevisionEnvelopeTooLarge {
+                max_bytes: MAX_CORPUS_REVISION_ENVELOPE_BYTES,
+                actual_bytes: value.len(),
+            });
+        }
+        let envelope = serde_json::from_str::<CorpusRevisionEnvelopeWire>(value)
+            .map_err(|error| KnowledgeError::Serialization(error.to_string()))?
+            .into_envelope()?;
+        let canonical = envelope.canonical_json()?;
+        if canonical != value {
+            return Err(KnowledgeError::NonCanonicalEnvelope);
+        }
+        Ok(envelope)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CorpusRevisionEnvelopeWire {
+    schema_version: u16,
+    digest: Sha256Digest,
+    entries: Vec<EntryRevision>,
+}
+
+impl CorpusRevisionEnvelopeWire {
+    fn into_envelope(self) -> Result<CorpusRevisionEnvelope, KnowledgeError> {
+        let envelope = CorpusRevisionEnvelope {
+            schema_version: self.schema_version,
+            digest: self.digest,
+            entries: self.entries,
+        };
+        envelope.validate()?;
+        Ok(envelope)
     }
 }
 
@@ -420,6 +536,7 @@ pub struct SelectionSnapshot {
     scoring_revision: String,
     renderer_revision: String,
     query_digest: Sha256Digest,
+    corpus_digest: Sha256Digest,
     context_digest: Sha256Digest,
     context_bytes: u32,
     canonical_context: String,
@@ -446,6 +563,10 @@ impl SelectionSnapshot {
 
     pub const fn query_digest(&self) -> Sha256Digest {
         self.query_digest
+    }
+
+    pub const fn corpus_digest(&self) -> Sha256Digest {
+        self.corpus_digest
     }
 
     pub const fn context_digest(&self) -> Sha256Digest {
@@ -514,6 +635,11 @@ impl SelectionSnapshot {
         entries: &[EntryRevision],
     ) -> Result<(), KnowledgeError> {
         self.validate_for_query(query)?;
+        if self.corpus_digest != corpus_digest(entries)? {
+            return Err(invalid_snapshot(
+                "selection disagrees with the exact immutable corpus revision",
+            ));
+        }
         let expected = select(query, entries)?;
         if self != &expected {
             return Err(invalid_snapshot(
@@ -558,8 +684,9 @@ impl SelectionSnapshot {
                 actual_bytes: value.len(),
             });
         }
-        let snapshot = serde_json::from_str::<Self>(value)
-            .map_err(|error| KnowledgeError::Serialization(error.to_string()))?;
+        let snapshot = serde_json::from_str::<SelectionSnapshotWire>(value)
+            .map_err(|error| KnowledgeError::Serialization(error.to_string()))?
+            .into_snapshot()?;
         let canonical = snapshot.canonical_payload_json()?;
         if canonical != value {
             return Err(KnowledgeError::NonCanonicalEnvelope);
@@ -635,6 +762,7 @@ struct SelectionSnapshotWire {
     scoring_revision: String,
     renderer_revision: String,
     query_digest: Sha256Digest,
+    corpus_digest: Sha256Digest,
     context_digest: Sha256Digest,
     context_bytes: u32,
     canonical_context: String,
@@ -642,25 +770,22 @@ struct SelectionSnapshotWire {
     evidence: SelectionEvidence,
 }
 
-impl<'de> Deserialize<'de> for SelectionSnapshot {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = SelectionSnapshotWire::deserialize(deserializer)?;
-        let snapshot = Self {
-            schema_version: wire.schema_version,
-            tokenizer_revision: wire.tokenizer_revision,
-            scoring_revision: wire.scoring_revision,
-            renderer_revision: wire.renderer_revision,
-            query_digest: wire.query_digest,
-            context_digest: wire.context_digest,
-            context_bytes: wire.context_bytes,
-            canonical_context: wire.canonical_context,
-            hits: wire.hits,
-            evidence: wire.evidence,
+impl SelectionSnapshotWire {
+    fn into_snapshot(self) -> Result<SelectionSnapshot, KnowledgeError> {
+        let snapshot = SelectionSnapshot {
+            schema_version: self.schema_version,
+            tokenizer_revision: self.tokenizer_revision,
+            scoring_revision: self.scoring_revision,
+            renderer_revision: self.renderer_revision,
+            query_digest: self.query_digest,
+            corpus_digest: self.corpus_digest,
+            context_digest: self.context_digest,
+            context_bytes: self.context_bytes,
+            canonical_context: self.canonical_context,
+            hits: self.hits,
+            evidence: self.evidence,
         };
-        snapshot.validate().map_err(serde::de::Error::custom)?;
+        snapshot.validate()?;
         Ok(snapshot)
     }
 }
@@ -745,8 +870,9 @@ impl SelectionSnapshotEnvelope {
                 actual_bytes: value.len(),
             });
         }
-        let envelope = serde_json::from_str::<Self>(value)
-            .map_err(|error| KnowledgeError::Serialization(error.to_string()))?;
+        let envelope = serde_json::from_str::<SelectionSnapshotEnvelopeWire>(value)
+            .map_err(|error| KnowledgeError::Serialization(error.to_string()))?
+            .into_envelope()?;
         let canonical = envelope.canonical_json()?;
         if canonical != value {
             return Err(KnowledgeError::NonCanonicalEnvelope);
@@ -760,21 +886,17 @@ impl SelectionSnapshotEnvelope {
 struct SelectionSnapshotEnvelopeWire {
     schema_version: u16,
     digest: Sha256Digest,
-    snapshot: SelectionSnapshot,
+    snapshot: SelectionSnapshotWire,
 }
 
-impl<'de> Deserialize<'de> for SelectionSnapshotEnvelope {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = SelectionSnapshotEnvelopeWire::deserialize(deserializer)?;
-        let envelope = Self {
-            schema_version: wire.schema_version,
-            digest: wire.digest,
-            snapshot: wire.snapshot,
+impl SelectionSnapshotEnvelopeWire {
+    fn into_envelope(self) -> Result<SelectionSnapshotEnvelope, KnowledgeError> {
+        let envelope = SelectionSnapshotEnvelope {
+            schema_version: self.schema_version,
+            digest: self.digest,
+            snapshot: self.snapshot.into_snapshot()?,
         };
-        envelope.validate().map_err(serde::de::Error::custom)?;
+        envelope.validate()?;
         Ok(envelope)
     }
 }
@@ -813,6 +935,10 @@ pub enum KnowledgeError {
         actual_bytes: usize,
     },
     SelectionSnapshotTooLarge {
+        max_bytes: usize,
+        actual_bytes: usize,
+    },
+    CorpusRevisionEnvelopeTooLarge {
         max_bytes: usize,
         actual_bytes: usize,
     },
@@ -873,20 +999,27 @@ impl fmt::Display for KnowledgeError {
                 formatter,
                 "knowledge selection snapshot uses {actual_bytes} bytes; maximum is {max_bytes}"
             ),
+            Self::CorpusRevisionEnvelopeTooLarge {
+                max_bytes,
+                actual_bytes,
+            } => write!(
+                formatter,
+                "knowledge corpus revision envelope uses {actual_bytes} bytes; maximum is {max_bytes}"
+            ),
             Self::NonCanonicalEnvelope => {
-                formatter.write_str("knowledge selection snapshot JSON is not canonical")
+                formatter.write_str("knowledge durable artifact JSON is not canonical")
             }
             Self::Serialization(reason) => {
                 write!(
                     formatter,
-                    "knowledge snapshot serialization failed: {reason}"
+                    "knowledge durable artifact serialization failed: {reason}"
                 )
             }
             Self::ArithmeticOverflow => {
                 formatter.write_str("knowledge selection arithmetic overflowed")
             }
             Self::InvalidSnapshot(reason) => {
-                write!(formatter, "invalid selection snapshot: {reason}")
+                write!(formatter, "invalid knowledge durable artifact: {reason}")
             }
         }
     }
@@ -928,6 +1061,16 @@ pub fn query_digest(query: &str) -> Result<Sha256Digest, KnowledgeError> {
     Ok(domain_digest(QUERY_DIGEST_DOMAIN, query.as_bytes()))
 }
 
+/// Digest the exact immutable corpus revision independent of caller order.
+///
+/// Every identity, title, and content byte is length-delimited in the digest
+/// material. Replacing even an unmatched entry therefore changes the corpus
+/// binding carried by a selection snapshot.
+pub fn corpus_digest(entries: &[EntryRevision]) -> Result<Sha256Digest, KnowledgeError> {
+    validate_entry_revisions(entries)?;
+    Ok(corpus_digest_unchecked(entries))
+}
+
 /// Digest exact immutable entry content bytes.
 pub fn content_digest(content: &str) -> Sha256Digest {
     domain_digest(ENTRY_CONTENT_DIGEST_DOMAIN, content.as_bytes())
@@ -941,43 +1084,8 @@ pub fn canonical_context_digest(context: &str) -> Sha256Digest {
 /// Select a deterministic, bounded knowledge context from immutable revisions.
 pub fn select(query: &str, entries: &[EntryRevision]) -> Result<SelectionSnapshot, KnowledgeError> {
     let query_frequencies = validated_query_frequencies(query)?;
-    if entries.len() > MAX_ENTRY_REVISIONS {
-        return Err(KnowledgeError::TooManyEntryRevisions {
-            max: MAX_ENTRY_REVISIONS,
-            actual: entries.len(),
-        });
-    }
-
-    let mut aggregate_bytes = 0_usize;
-    let mut identities = BTreeMap::<(&str, &str), ()>::new();
-    for entry in entries {
-        entry.validate()?;
-        let entry_bytes = entry
-            .entry_id
-            .len()
-            .checked_add(entry.revision.len())
-            .and_then(|value| value.checked_add(entry.title.len()))
-            .and_then(|value| value.checked_add(entry.content.len()))
-            .ok_or(KnowledgeError::ArithmeticOverflow)?;
-        aggregate_bytes = aggregate_bytes
-            .checked_add(entry_bytes)
-            .ok_or(KnowledgeError::ArithmeticOverflow)?;
-        if identities
-            .insert((&entry.entry_id, &entry.revision), ())
-            .is_some()
-        {
-            return Err(KnowledgeError::DuplicateEntryRevision {
-                entry_id: entry.entry_id.clone(),
-                revision: entry.revision.clone(),
-            });
-        }
-    }
-    if aggregate_bytes > MAX_AGGREGATE_ENTRY_BYTES {
-        return Err(KnowledgeError::AggregateEntriesTooLarge {
-            max_bytes: MAX_AGGREGATE_ENTRY_BYTES,
-            actual_bytes: aggregate_bytes,
-        });
-    }
+    validate_entry_revisions(entries)?;
+    let corpus_digest = corpus_digest_unchecked(entries);
 
     let mut candidates = Vec::new();
     for entry in entries {
@@ -1040,6 +1148,7 @@ pub fn select(query: &str, entries: &[EntryRevision]) -> Result<SelectionSnapsho
         scoring_revision: SCORING_REVISION.into(),
         renderer_revision: CONTEXT_RENDERER_REVISION.into(),
         query_digest: domain_digest(QUERY_DIGEST_DOMAIN, query.as_bytes()),
+        corpus_digest,
         context_digest: canonical_context_digest(&canonical_context),
         context_bytes,
         canonical_context,
@@ -1389,6 +1498,78 @@ fn validated_query_frequencies(query: &str) -> Result<TermFrequencies, Knowledge
         });
     }
     Ok(frequencies)
+}
+
+fn validate_entry_revisions(entries: &[EntryRevision]) -> Result<(), KnowledgeError> {
+    if entries.len() > MAX_ENTRY_REVISIONS {
+        return Err(KnowledgeError::TooManyEntryRevisions {
+            max: MAX_ENTRY_REVISIONS,
+            actual: entries.len(),
+        });
+    }
+
+    let mut aggregate_bytes = 0_usize;
+    let mut identities = BTreeSet::<(&str, &str)>::new();
+    for entry in entries {
+        entry.validate()?;
+        let entry_bytes = entry
+            .entry_id
+            .len()
+            .checked_add(entry.revision.len())
+            .and_then(|value| value.checked_add(entry.title.len()))
+            .and_then(|value| value.checked_add(entry.content.len()))
+            .ok_or(KnowledgeError::ArithmeticOverflow)?;
+        aggregate_bytes = aggregate_bytes
+            .checked_add(entry_bytes)
+            .ok_or(KnowledgeError::ArithmeticOverflow)?;
+        if !identities.insert((&entry.entry_id, &entry.revision)) {
+            return Err(KnowledgeError::DuplicateEntryRevision {
+                entry_id: entry.entry_id.clone(),
+                revision: entry.revision.clone(),
+            });
+        }
+    }
+    if aggregate_bytes > MAX_AGGREGATE_ENTRY_BYTES {
+        return Err(KnowledgeError::AggregateEntriesTooLarge {
+            max_bytes: MAX_AGGREGATE_ENTRY_BYTES,
+            actual_bytes: aggregate_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn corpus_digest_unchecked(entries: &[EntryRevision]) -> Sha256Digest {
+    let mut sorted = entries.iter().collect::<Vec<_>>();
+    sorted.sort_by(|left, right| compare_entry_identity(left, right));
+
+    let mut material = Vec::new();
+    material.extend_from_slice(
+        &u64::try_from(sorted.len())
+            .expect("bounded corpus length fits in u64")
+            .to_be_bytes(),
+    );
+    for entry in sorted {
+        for field in [
+            entry.entry_id.as_bytes(),
+            entry.revision.as_bytes(),
+            entry.title.as_bytes(),
+            entry.content.as_bytes(),
+        ] {
+            material.extend_from_slice(
+                &u64::try_from(field.len())
+                    .expect("bounded entry field length fits in u64")
+                    .to_be_bytes(),
+            );
+            material.extend_from_slice(field);
+        }
+    }
+    domain_digest(CORPUS_DIGEST_DOMAIN, &material)
+}
+
+fn compare_entry_identity(left: &EntryRevision, right: &EntryRevision) -> Ordering {
+    left.entry_id
+        .cmp(&right.entry_id)
+        .then_with(|| left.revision.cmp(&right.revision))
 }
 
 fn validate_identifier(
@@ -1761,11 +1942,31 @@ mod tests {
     #[test]
     fn digests_are_exact_and_domain_separated() {
         let query = query_digest("same").unwrap();
+        assert_eq!(
+            query.to_hex(),
+            "36298a2c512aab218df23b8af06852b6b0bc92915d3921a72f4f268cd031d232"
+        );
+        assert_eq!(
+            content_digest("same").to_hex(),
+            "386b9b194dfabe75c577d27e657cafac4264ba2735df5ea582929ddd1d6b99d3"
+        );
+        assert_eq!(
+            canonical_context_digest("same").to_hex(),
+            "bd60d3c04db216dbb3342c9f9105c22d7951ae8fc464c9e5deb277797372fa4c"
+        );
         assert_eq!(query, query_digest("same").unwrap());
         assert_ne!(query, query_digest("Same").unwrap());
         assert_ne!(query, content_digest("same"));
         assert_ne!(content_digest("same"), canonical_context_digest("same"));
         let snapshot = select("same", &[entry("entry", "Same", "same")]).unwrap();
+        assert_eq!(
+            snapshot.corpus_digest().to_hex(),
+            "9451260434304c1497636983fd82bf675ab163be5e483f29167837ed1a4c465d"
+        );
+        assert_eq!(
+            snapshot.snapshot_digest().unwrap().to_hex(),
+            "6c0ccc05915a5f22de7dff32340109749fe8397e4b5df50b88df13af171c7d4d"
+        );
         assert!(snapshot.matches_query("same").unwrap());
         assert!(!snapshot.matches_query("Same").unwrap());
         assert_ne!(
@@ -1884,7 +2085,7 @@ mod tests {
             SelectionSnapshot::from_canonical_payload_json(
                 &serde_json::to_string(&tampered).unwrap()
             ),
-            Err(KnowledgeError::Serialization(_))
+            Err(KnowledgeError::InvalidSnapshot(_))
         ));
     }
 
@@ -1899,6 +2100,12 @@ mod tests {
             .unwrap();
 
         let encoded = envelope.canonical_json().unwrap();
+        let mut encoded_digest = Sha256::new();
+        encoded_digest.update(encoded.as_bytes());
+        assert_eq!(
+            Sha256Digest(encoded_digest.finalize().into()).to_hex(),
+            "bdc93bbd87c3b84db41643bf48b9364163976e74cfdfd289628cc6b1cd342806"
+        );
         assert_eq!(
             SelectionSnapshotEnvelope::from_canonical_json(&encoded).unwrap(),
             envelope
@@ -1928,7 +2135,139 @@ mod tests {
             SelectionSnapshotEnvelope::from_canonical_json(
                 &serde_json::to_string(&tampered).unwrap()
             ),
+            Err(KnowledgeError::InvalidSnapshot(_))
+        ));
+    }
+
+    #[test]
+    fn corpus_revision_envelope_is_sorted_canonical_and_tamper_evident() {
+        let alpha = entry("alpha", "Alpha", "alpha body");
+        let beta = entry("beta", "Beta", "beta body");
+        let envelope = CorpusRevisionEnvelope::new(vec![beta, alpha]).unwrap();
+        assert_eq!(
+            envelope
+                .entries()
+                .iter()
+                .map(EntryRevision::entry_id)
+                .collect::<Vec<_>>(),
+            ["alpha", "beta"]
+        );
+        assert_eq!(
+            envelope.digest(),
+            corpus_digest(envelope.entries()).unwrap()
+        );
+
+        let encoded = envelope.canonical_json().unwrap();
+        let mut encoded_digest = Sha256::new();
+        encoded_digest.update(encoded.as_bytes());
+        assert_eq!(
+            Sha256Digest(encoded_digest.finalize().into()).to_hex(),
+            "c0cacc10f8b700a78ede41ba23a10d4d3e2a2de199a5dac0d5091de8946e3e9e"
+        );
+        assert_eq!(
+            CorpusRevisionEnvelope::from_canonical_json(&encoded).unwrap(),
+            envelope
+        );
+
+        let mut tampered: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        tampered["entries"][0]["content"] = serde_json::Value::String("changed".into());
+        assert!(matches!(
+            CorpusRevisionEnvelope::from_canonical_json(&serde_json::to_string(&tampered).unwrap()),
+            Err(KnowledgeError::InvalidSnapshot(_))
+        ));
+
+        let mut reordered: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        reordered["entries"].as_array_mut().unwrap().swap(0, 1);
+        assert!(matches!(
+            CorpusRevisionEnvelope::from_canonical_json(
+                &serde_json::to_string(&reordered).unwrap()
+            ),
+            Err(KnowledgeError::InvalidSnapshot(_))
+        ));
+
+        let mut unknown: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown".into(), serde_json::Value::Bool(true));
+        assert!(matches!(
+            CorpusRevisionEnvelope::from_canonical_json(&serde_json::to_string(&unknown).unwrap()),
             Err(KnowledgeError::Serialization(_))
+        ));
+    }
+
+    #[test]
+    fn corpus_digest_binds_every_revision_even_when_it_does_not_match() {
+        let included = entry("included", "Match", "match");
+        let unmatched_a = entry("unmatched-a", "Alpha", "alpha");
+        let unmatched_b = entry("unmatched-b", "Beta", "beta");
+
+        let first_entries = [included.clone(), unmatched_a];
+        let reordered_entries = [first_entries[1].clone(), included.clone()];
+        let changed_entries = [included, unmatched_b];
+        let snapshot = select("match", &first_entries).unwrap();
+
+        assert_eq!(
+            snapshot.corpus_digest(),
+            corpus_digest(&reordered_entries).unwrap()
+        );
+        snapshot
+            .validate_for_selection("match", &reordered_entries)
+            .unwrap();
+        assert_ne!(
+            snapshot.corpus_digest(),
+            corpus_digest(&changed_entries).unwrap()
+        );
+        assert!(matches!(
+            snapshot.validate_for_selection("match", &changed_entries),
+            Err(KnowledgeError::InvalidSnapshot(_))
+        ));
+    }
+
+    #[test]
+    fn canonical_decoders_enforce_the_snapshot_byte_boundary_before_parsing() {
+        let exact = " ".repeat(MAX_SELECTION_SNAPSHOT_BYTES);
+        assert!(matches!(
+            SelectionSnapshot::from_canonical_payload_json(&exact),
+            Err(KnowledgeError::Serialization(_))
+        ));
+        assert!(matches!(
+            SelectionSnapshotEnvelope::from_canonical_json(&exact),
+            Err(KnowledgeError::Serialization(_))
+        ));
+
+        let oversized = " ".repeat(MAX_SELECTION_SNAPSHOT_BYTES + 1);
+        assert!(matches!(
+            SelectionSnapshot::from_canonical_payload_json(&oversized),
+            Err(KnowledgeError::SelectionSnapshotTooLarge {
+                max_bytes: MAX_SELECTION_SNAPSHOT_BYTES,
+                actual_bytes,
+            }) if actual_bytes == MAX_SELECTION_SNAPSHOT_BYTES + 1
+        ));
+        assert!(matches!(
+            SelectionSnapshotEnvelope::from_canonical_json(&oversized),
+            Err(KnowledgeError::SelectionSnapshotTooLarge {
+                max_bytes: MAX_SELECTION_SNAPSHOT_BYTES,
+                actual_bytes,
+            }) if actual_bytes == MAX_SELECTION_SNAPSHOT_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn canonical_corpus_decoder_enforces_its_byte_boundary_before_parsing() {
+        let exact = " ".repeat(MAX_CORPUS_REVISION_ENVELOPE_BYTES);
+        assert!(matches!(
+            CorpusRevisionEnvelope::from_canonical_json(&exact),
+            Err(KnowledgeError::Serialization(_))
+        ));
+
+        let oversized = " ".repeat(MAX_CORPUS_REVISION_ENVELOPE_BYTES + 1);
+        assert!(matches!(
+            CorpusRevisionEnvelope::from_canonical_json(&oversized),
+            Err(KnowledgeError::CorpusRevisionEnvelopeTooLarge {
+                max_bytes: MAX_CORPUS_REVISION_ENVELOPE_BYTES,
+                actual_bytes,
+            }) if actual_bytes == MAX_CORPUS_REVISION_ENVELOPE_BYTES + 1
         ));
     }
 

@@ -862,9 +862,9 @@ and schema v21 prepared-claim host verification:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --locked`: 509 tests passed
+- `cargo test --workspace --locked`: 513 tests passed
   under the existing project counting convention, including 8 deployment tests,
-  20 knowledge tests, 232 storage tests, 48 runtime tests, 64 API library tests, 6 API main/config
+  24 knowledge tests, 232 storage tests, 48 runtime tests, 64 API library tests, 6 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,

@@ -474,7 +474,7 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   刷新恢复、owner/member setup/登录、owner 成员与 audit 管理、设置/退出和
   system/light/dark。member 的审批卡只读。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化按项目既有统计口径是 509 个 Rust 测试（其中 deployment 8、knowledge 20、storage 232、
+- 当前自动化按项目既有统计口径是 513 个 Rust 测试（其中 deployment 8、knowledge 24、storage 232、
   runtime 48、API library 64、API main/config 6）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
