@@ -50,24 +50,24 @@ pub use storage::{
     AgentModelClaimOutcome, AgentModelCompletion, AgentModelFailureCommit, AgentModelJob,
     AgentModelJobStatus, AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit,
     AgentOperationClaim, AgentOperationKind, AgentPreparedModel, AgentPreparedTool,
-    AgentPromptCommit, AgentPromptState, AgentPromptUpdateResult, AgentReviewCommit,
-    AgentReviewContext, AgentReviewResult, AgentTerminalCompletion, AgentToolCall,
-    AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
-    AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurn,
-    AgentTurnEnqueueResponse, AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal,
-    AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, CreateMemberResult,
-    DEFAULT_SESSION_AGENT_PROMPT_REVISION, DEFAULT_SESSION_AGENT_SYSTEM_PROMPT,
-    InFlightWorkSummary, KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage,
-    KnowledgeCatalogRevisionSummary, KnowledgeCatalogState, KnowledgeCatalogUpdateResult,
-    MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit, MemberSetupResult, MemberSetupToken,
-    MemberTransitionResult, MembershipRevision, MembershipRole, ReplyClaimOutcome, ReplyCompletion,
-    ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus,
-    ReplyOutcomeUnknownCommit, ReplySuccessCommit, RotateMemberSetupTokenResult,
-    SESSION_AGENT_PROMPT_ID, SessionSummaryPage, SqliteOperationLimits, SqliteOperationLimitsError,
-    SqlitePhysicalLimits, SqlitePhysicalLimitsError, StorageLimits, StorageLimitsError,
-    StoredCredential, StoredMember, StoredMemberPage, StoredMembershipStatus, StoredPreferences,
-    StoredUser, StoredUserRole, StoredUserStatus, TransitionMemberCommit,
-    UpdateAccountAuditPolicyCommit,
+    AgentPromptCommit, AgentPromptRevisionPage, AgentPromptRevisionSummary, AgentPromptState,
+    AgentPromptUpdateResult, AgentReviewCommit, AgentReviewContext, AgentReviewResult,
+    AgentTerminalCompletion, AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome,
+    AgentToolCompletion, AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit,
+    AgentToolStartOutcome, AgentToolWork, AgentTurn, AgentTurnEnqueueResponse,
+    AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthSessionId,
+    AuthzContext, BootstrapOwnerCommit, CreateMemberResult, DEFAULT_SESSION_AGENT_PROMPT_REVISION,
+    DEFAULT_SESSION_AGENT_SYSTEM_PROMPT, InFlightWorkSummary, KnowledgeCatalogCommit,
+    KnowledgeCatalogRevisionPage, KnowledgeCatalogRevisionSummary, KnowledgeCatalogState,
+    KnowledgeCatalogUpdateResult, MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit,
+    MemberSetupResult, MemberSetupToken, MemberTransitionResult, MembershipRevision,
+    MembershipRole, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit, ReplyJob,
+    ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
+    ReplySuccessCommit, RotateMemberSetupTokenResult, SESSION_AGENT_PROMPT_ID, SessionSummaryPage,
+    SqliteOperationLimits, SqliteOperationLimitsError, SqlitePhysicalLimits,
+    SqlitePhysicalLimitsError, StorageLimits, StorageLimitsError, StoredCredential, StoredMember,
+    StoredMemberPage, StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserRole,
+    StoredUserStatus, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
 use storage::{
     ClaimOutcome, CommitOutcome, CreateMemberCommit, DispatchCompleteCommit, DispatchContext,
@@ -396,6 +396,8 @@ pub enum StoreError {
     InvalidKnowledgeCatalog(String),
     #[error("the account Agent prompt revision changed concurrently")]
     AgentPromptRevisionConflict,
+    #[error("account Agent prompt revision {0} was not found")]
+    AgentPromptRevisionNotFound(u64),
     #[error("invalid account Agent prompt: {0}")]
     InvalidAgentPrompt(String),
     #[error("the durable storage quota is exhausted")]
@@ -501,6 +503,9 @@ impl From<StorageError> for StoreError {
             }
             StorageError::InvalidKnowledgeCatalog(detail) => Self::InvalidKnowledgeCatalog(detail),
             StorageError::AgentPromptRevisionConflict => Self::AgentPromptRevisionConflict,
+            StorageError::AgentPromptRevisionNotFound(revision) => {
+                Self::AgentPromptRevisionNotFound(revision)
+            }
             StorageError::InvalidAgentPrompt(detail) => Self::InvalidAgentPrompt(detail),
             StorageError::StorageQuotaExceeded => Self::StorageQuotaExceeded,
             StorageError::PhysicalStorageExhausted => Self::PhysicalStorageExhausted,
@@ -1318,6 +1323,29 @@ impl DemoStore {
         context: &AuthzContext,
     ) -> Result<AgentPromptState, StoreError> {
         Ok(self.storage.agent_prompt_for_admin(context).await?)
+    }
+
+    pub async fn agent_prompt_revision_for_admin(
+        &self,
+        context: &AuthzContext,
+        revision: u64,
+    ) -> Result<AgentPromptState, StoreError> {
+        Ok(self
+            .storage
+            .agent_prompt_revision_for_admin(context, revision)
+            .await?)
+    }
+
+    pub async fn agent_prompt_revisions_for_admin(
+        &self,
+        context: &AuthzContext,
+        before_revision: Option<u64>,
+        limit: usize,
+    ) -> Result<AgentPromptRevisionPage, StoreError> {
+        Ok(self
+            .storage
+            .agent_prompt_revisions_for_admin(context, before_revision, limit)
+            .await?)
     }
 
     pub async fn replace_agent_prompt(

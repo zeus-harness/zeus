@@ -648,6 +648,26 @@ pub struct AgentPromptUpdateResult {
     pub replayed: bool,
 }
 
+/// Bounded owner-facing metadata for one immutable Agent prompt revision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AgentPromptRevisionSummary {
+    pub revision: u64,
+    pub binding_revision: String,
+    pub content_digest: String,
+    pub content_bytes: u64,
+    pub updated_by_user_id: String,
+    pub updated_by_membership_revision: MembershipRevision,
+    pub updated_at: String,
+}
+
+/// Newest-first page of committed Agent prompt revisions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AgentPromptRevisionPage {
+    pub current_revision: u64,
+    pub items: Vec<AgentPromptRevisionSummary>,
+    pub next_before_revision: Option<u64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentModelJobStatus {
     Queued,

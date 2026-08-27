@@ -291,7 +291,9 @@ schema v24 的 system prompt governance 复用 `0019` 的 prompt binding，并�
 head/revision/receipt。Owner-only `GET/PUT /api/v1/agent/prompt` 通过 expected-revision CAS 和
 canonical `Idempotency-Key` 更新；普通 member 不能管理，但新 Agent 使用当时 active revision。
 更新不改写既有 Agent；旧 queued governed revision 在 claim 时 fail closed，已经 started 的工作
-继续使用已持久化 request。Knowledge v1 生成独立、受治理、带完整 digest 的 canonical context
+继续使用已持久化 request。Owner-only history 列表返回 newest-first bounded metadata，exact point
+route 可读取 revision 0 或任一 committed content；恢复旧内容仍通过 CAS `PUT` 创建新 revision。
+Knowledge v1 生成独立、受治理、带完整 digest 的 canonical context
 snapshot，不修改 system prompt。schema v22 已完成数据库绑定、
 Agent request 注入和 exact replay；LLM 协议层使用独立 durable `context` role，并只在
 OpenAI-compatible provider wire 上映射为另一条 `user` message。schema v23 已完成 owner-only

@@ -700,6 +700,11 @@ directly.
   16 KiB. Stale CAS returns `409 agent_prompt_revision_conflict`. Responses use
   `Cache-Control: no-store`; ordinary members cannot administer the prompt, but
   their new Agents use the current owner-governed revision.
+- Owner-only `GET /api/v1/agent/prompt/revisions` returns newest-first bounded
+  revision metadata, and `GET /api/v1/agent/prompt/revisions/{revision}` returns
+  the exact content, including built-in revision `0`. Recovery reads the desired
+  historical content and submits it through the existing CAS `PUT`, creating a
+  new head instead of rewriting immutable history.
 - `GET /api/v1/me/settings` returns the current safe preferences.
   `PATCH /api/v1/me/settings` accepts `theme`, optional allowlisted
   `preferred_model`, and `expected_revision`. Provider endpoints and API keys

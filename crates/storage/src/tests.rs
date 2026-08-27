@@ -5160,6 +5160,16 @@ async fn agent_prompt_is_owner_governed_idempotent_and_active_for_members() {
         store.agent_prompt_for_admin(&member).await,
         Err(StorageError::PermissionDenied)
     ));
+    assert!(matches!(
+        store
+            .agent_prompt_revisions_for_admin(&member, None, 1)
+            .await,
+        Err(StorageError::PermissionDenied)
+    ));
+    assert!(matches!(
+        store.agent_prompt_revision_for_admin(&member, 0).await,
+        Err(StorageError::PermissionDenied)
+    ));
     assert_eq!(
         store.active_agent_prompt_for_actor(&member).await.unwrap(),
         default_prompt
@@ -5252,6 +5262,86 @@ async fn agent_prompt_is_owner_governed_idempotent_and_active_for_members() {
             .await,
         Err(StorageError::InvalidAgentPrompt(_))
     ));
+
+    let second = store
+        .replace_agent_prompt(
+            &owner_authz(),
+            AgentPromptCommit {
+                expected_revision: 1,
+                content: "You are the second account-governed Zeus test agent.".into(),
+                idempotency_key: "agent-prompt-second".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let newest = store
+        .agent_prompt_revisions_for_admin(&owner_authz(), None, 1)
+        .await
+        .unwrap();
+    assert_eq!(newest.current_revision, 2);
+    assert_eq!(newest.items.len(), 1);
+    assert_eq!(newest.items[0].revision, 2);
+    assert_eq!(newest.items[0].binding_revision, "3");
+    assert_eq!(
+        newest.items[0].content_bytes,
+        u64::try_from(second.prompt.content.len()).unwrap()
+    );
+    assert_eq!(newest.next_before_revision, Some(2));
+
+    let older = store
+        .agent_prompt_revisions_for_admin(&owner_authz(), Some(2), 1)
+        .await
+        .unwrap();
+    assert_eq!(older.items.len(), 1);
+    assert_eq!(older.items[0].revision, 1);
+    assert_eq!(older.next_before_revision, None);
+    assert_eq!(
+        store
+            .agent_prompt_revision_for_admin(&owner_authz(), 1)
+            .await
+            .unwrap(),
+        first.prompt
+    );
+    assert_eq!(
+        store
+            .agent_prompt_revision_for_admin(&owner_authz(), 0)
+            .await
+            .unwrap(),
+        default_prompt
+    );
+    assert!(matches!(
+        store
+            .agent_prompt_revision_for_admin(&owner_authz(), 3)
+            .await,
+        Err(StorageError::AgentPromptRevisionNotFound(3))
+    ));
+    assert!(matches!(
+        store
+            .agent_prompt_revisions_for_admin(&owner_authz(), Some(0), 1)
+            .await,
+        Err(StorageError::InvalidPageCursor)
+    ));
+    assert!(matches!(
+        store
+            .agent_prompt_revisions_for_admin(&owner_authz(), Some(4), 1)
+            .await,
+        Err(StorageError::PageCursorBeyondHead { head: 2 })
+    ));
+
+    let restored = store
+        .replace_agent_prompt(
+            &owner_authz(),
+            AgentPromptCommit {
+                expected_revision: 2,
+                content: first.prompt.content.clone(),
+                idempotency_key: "agent-prompt-restore-first".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(restored.prompt.revision, 3);
+    assert_eq!(restored.prompt.binding_revision, "4");
+    assert_eq!(restored.prompt.content_digest, first.prompt.content_digest);
     store.verify_integrity().await.unwrap();
 }
 

@@ -72,6 +72,8 @@ pub enum StorageError {
     InvalidKnowledgeCatalog(String),
     #[error("the account Agent prompt changed concurrently")]
     AgentPromptRevisionConflict,
+    #[error("account Agent prompt revision {0} was not found")]
+    AgentPromptRevisionNotFound(u64),
     #[error("invalid account Agent prompt: {0}")]
     InvalidAgentPrompt(String),
     #[error(

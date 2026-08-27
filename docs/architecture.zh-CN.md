@@ -52,7 +52,9 @@ manifest revision `1`；第一次自定义更新产生 prompt config revision 1 
 与 account audit 单事务提交；内容非空、control-safe 且最多 16 KiB。新 Agent 只把 prompt
 ID/revision/content digest 写入 secret-free manifest，并把 exact 内容写入 immutable model request。
 更新不会改写既有 Agent；仍 queued 且绑定旧 governed prompt 的工作会在 provider/tool I/O 前以
-deployment drift fail closed。动态 knowledge 不拼入系统提示词。Knowledge v1 已实现 immutable entry
+deployment drift fail closed。Owner-only prompt history 提供 newest-first 有界摘要和 exact revision
+点查；revision 0 是内置基线，恢复旧内容必须通过现有 CAS `PUT` 创建新 head。动态 knowledge
+不拼入系统提示词。Knowledge v1 已实现 immutable entry
 revision 校验、固定 tokenizer/整数排序、整条 entry 丢弃、16 KiB canonical context 与完整
 selection snapshot digest。schema v22 把 exact corpus、snapshot、canonical context、Agent、
 initial model job 和 execution admission digest 绑定后持久化，重放不从 live state 重新检索。
@@ -473,7 +475,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   只会创建新的恢复 revision。
 - Account Agent prompt 的 revision-0 兼容、owner/member capability、16 KiB envelope、revision
   CAS、相同 key 精确重放、异输入冲突、v23→v24 migration、HTTP 入库后真实 provider request 与
-  manifest 绑定，以及 prompt 更新后旧 queued Agent 在 provider I/O 前拒绝都有自动化覆盖。
+  manifest 绑定，以及 prompt 更新后旧 queued Agent 在 provider I/O 前拒绝都有自动化覆盖。历史
+  列表/点查还覆盖 newest-first 分页、revision 0、缺失 revision 和用旧内容创建新恢复 revision。
 - 首次 bootstrap 只能消费一次 token；登录、CSRF、同源、Cookie 属性、设置 revision、退出后
   401 以及退出/失效后 SSE 关闭有自动化或 live 验收。
 - bootstrap audit 的 v11 reason 迁移、canonical digest、64 行多批压缩、rotation/open 降限、

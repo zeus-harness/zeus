@@ -34,8 +34,8 @@ use crate::operation::{OperationClass, OperationLimiter};
 use crate::{
     AccountAuditArchiveState, AccountAuditCheckpointCommit, AccountAuditEvent, AccountAuditPage,
     AccountAuditPolicy, AccountAuditRollup, AccountAuditState, AccountId, AgentModelJob,
-    AgentPromptCommit, AgentPromptState, AgentPromptUpdateResult, AgentTurn,
-    AgentTurnEnqueueResponse, AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal,
+    AgentPromptCommit, AgentPromptRevisionPage, AgentPromptState, AgentPromptUpdateResult,
+    AgentTurn, AgentTurnEnqueueResponse, AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal,
     AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, BoundedRunRead,
     ClaimOutcome, CommitOutcome, CreateMemberCommit, CreateMemberResult, DispatchCompleteCommit,
     DispatchContext, DispatchJob, DispatchJobSpec, DispatchRecoveryCommit, DispatchRejection,
@@ -1471,6 +1471,36 @@ impl SqliteStore {
         let context = validated_authz_context(context)?;
         self.with_connection(move |connection| {
             agent::query_account_agent_prompt_for_admin(connection, &context)
+        })
+        .await
+    }
+
+    pub async fn agent_prompt_revision_for_admin(
+        &self,
+        context: &AuthzContext,
+        revision: u64,
+    ) -> Result<AgentPromptState, StorageError> {
+        let context = validated_authz_context(context)?;
+        self.with_connection(move |connection| {
+            agent::query_account_agent_prompt_revision_for_admin(connection, &context, revision)
+        })
+        .await
+    }
+
+    pub async fn agent_prompt_revisions_for_admin(
+        &self,
+        context: &AuthzContext,
+        before_revision: Option<u64>,
+        limit: usize,
+    ) -> Result<AgentPromptRevisionPage, StorageError> {
+        let context = validated_authz_context(context)?;
+        self.with_connection(move |connection| {
+            agent::query_account_agent_prompt_revisions_for_admin(
+                connection,
+                &context,
+                before_revision,
+                limit,
+            )
         })
         .await
     }

@@ -63,8 +63,8 @@ use runtime::{
     AccountAuditPolicy as StoredAccountAuditPolicy, AccountAuditRollup as StoredAccountAuditRollup,
     AccountAuditState as StoredAccountAuditState, AgentKnowledgeContextExplain,
     AgentModelClaimOutcome, AgentModelCompletion, AgentModelFailureCommit, AgentModelJob,
-    AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit, AgentPromptState,
-    AgentPromptUpdateResult, AgentReviewCommit, AgentToolCall, AgentToolCallSpec,
+    AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit, AgentPromptRevisionPage,
+    AgentPromptState, AgentPromptUpdateResult, AgentReviewCommit, AgentToolCall, AgentToolCallSpec,
     AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
     AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe,
     AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthzContext, BootstrapOwnerCommit, DemoStore,
@@ -738,6 +738,13 @@ struct ReplaceAgentPromptRequest {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct AgentPromptRevisionListQuery {
+    before_revision: Option<u64>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct KnowledgeCatalogRevisionListQuery {
     before_revision: Option<u64>,
     limit: Option<usize>,
@@ -925,6 +932,14 @@ fn build_authenticated_app(state: ApiState) -> Router {
         .route(
             "/api/v1/agent/prompt",
             get(get_agent_prompt).put(replace_agent_prompt),
+        )
+        .route(
+            "/api/v1/agent/prompt/revisions",
+            get(list_agent_prompt_revisions),
+        )
+        .route(
+            "/api/v1/agent/prompt/revisions/{revision}",
+            get(get_agent_prompt_revision),
         )
         .route_layer(middleware::from_fn(require_account_owner))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
@@ -1507,6 +1522,45 @@ async fn replace_agent_prompt(
         )
         .await?;
     json_no_store(result)
+}
+
+async fn list_agent_prompt_revisions(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    query: Result<Query<AgentPromptRevisionListQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let Query(query) = query.map_err(ApiError::invalid_query)?;
+    let page: AgentPromptRevisionPage = state
+        .store
+        .agent_prompt_revisions_for_admin(
+            &current.principal.authz,
+            query.before_revision,
+            query.limit.unwrap_or(COLLECTION_PAGE_DEFAULT_LIMIT),
+        )
+        .await?;
+    json_no_store(page)
+}
+
+async fn get_agent_prompt_revision(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    Path(revision): Path<String>,
+) -> Result<Response, ApiError> {
+    let parsed_revision = revision.parse::<u64>().ok();
+    let revision = parsed_revision
+        .filter(|parsed| parsed.to_string() == revision)
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "invalid_agent_prompt_revision",
+                "Agent prompt revision must be a canonical unsigned integer",
+            )
+            .with_no_store()
+        })?;
+    let prompt: AgentPromptState = state
+        .store
+        .agent_prompt_revision_for_admin(&current.principal.authz, revision)
+        .await?;
+    json_no_store(prompt)
 }
 
 async fn list_knowledge_catalog_revisions(
@@ -4863,6 +4917,13 @@ impl From<StoreError> for ApiError {
                 "agent_prompt_revision_conflict",
                 "Agent prompt revision conflict",
                 "The account Agent prompt changed; refresh it and retry",
+            )
+            .with_no_store(),
+            StoreError::AgentPromptRevisionNotFound(revision) => Self::new(
+                StatusCode::NOT_FOUND,
+                "agent_prompt_revision_not_found",
+                "Agent prompt revision not found",
+                format!("Agent prompt revision {revision} does not exist"),
             )
             .with_no_store(),
             StoreError::InvalidAgentPrompt(reason) => {
@@ -8609,6 +8670,92 @@ mod tests {
         let replay: serde_json::Value = response_json(replay).await;
         assert_eq!(replay["prompt"], update["prompt"]);
         assert_eq!(replay["replayed"], true);
+
+        let history = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/agent/prompt/revisions?limit=1")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(history.status(), StatusCode::OK);
+        assert_eq!(history.headers()[header::CACHE_CONTROL], "no-store");
+        let history: serde_json::Value = response_json(history).await;
+        assert_eq!(history["current_revision"], 1);
+        assert_eq!(history["items"][0]["revision"], 1);
+        assert_eq!(history["items"][0]["binding_revision"], "2");
+        assert_eq!(history["next_before_revision"], serde_json::Value::Null);
+
+        let exact = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/agent/prompt/revisions/1")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact.status(), StatusCode::OK);
+        let exact: serde_json::Value = response_json(exact).await;
+        assert_eq!(exact, update["prompt"]);
+
+        let baseline = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/agent/prompt/revisions/0")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(baseline.status(), StatusCode::OK);
+        let baseline: serde_json::Value = response_json(baseline).await;
+        assert_eq!(baseline["revision"], 0);
+        assert_eq!(baseline["content"], initial["content"]);
+
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/agent/prompt/revisions/2")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            missing,
+            StatusCode::NOT_FOUND,
+            "agent_prompt_revision_not_found",
+        )
+        .await;
+
+        let noncanonical = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/agent/prompt/revisions/01")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            noncanonical,
+            StatusCode::BAD_REQUEST,
+            "invalid_agent_prompt_revision",
+        )
+        .await;
 
         let conflict = app
             .clone()
