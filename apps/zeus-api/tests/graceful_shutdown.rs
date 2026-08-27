@@ -11,7 +11,10 @@ use std::{
 };
 
 use runtime::{BootstrapOwnerCommit, DemoStore};
-use tenancy::{BootstrapToken, CsrfToken, Password, SessionToken, UserId, Username, hash_password};
+use tenancy::{
+    AuthSessionId, BootstrapToken, CsrfToken, Password, SessionToken, UserId, Username,
+    hash_password,
+};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(8);
@@ -91,6 +94,7 @@ fn seed_authenticated_owner(database: &Path) -> SessionToken {
         store
             .bootstrap_owner(BootstrapOwnerCommit {
                 bootstrap_token_hash: bootstrap_token.digest().to_persistence(),
+                auth_session_id: AuthSessionId::generate().unwrap(),
                 user_id: user_id.to_string(),
                 username: username.to_string(),
                 password_hash: password_hash.as_phc().to_owned(),

@@ -1,24 +1,24 @@
 # Account Membership 与审计保留设计
 
-状态：v12 Bootstrap Audit Retention 与 schema v13 Account Membership Foundation 均已实现。
-主机 Rust/Web 全量门禁通过；Apple `zeus-operation-acceptance` 先保留历史 v11→v12 证据，随后又在
-同一 named volume 上完成 v12→v13 原地迁移及保留卷重启验证。v14-v15 仍待实施。本文不表示
-member 已可登录，也不授权共享网络部署。
+状态：v12 Bootstrap Audit Retention、schema v13 Account Membership Foundation 与 schema v14
+Account-scoped Durable Authorization 均已实现。Apple `zeus-operation-acceptance` 保留了历史
+v11→v12→v13 迁移链；v14 current-image 证据见本文验收状态。v15 仍待实施。本文不表示 member
+已可登录，也不授权共享网络部署。
 
-当前实现基线是 schema v13。产品仍是单实例、单 owner；所有业务 HTTP/SSE 都拒绝 `member`。
+当前实现基线是 schema v14。产品仍是单实例、单 owner；所有业务 HTTP/SSE 都拒绝 `member`。
 
 ## 1. 为什么不能直接开放 member
 
-当前 `owner_user_id` 同时承担三种不同职责：
+v13 以前的 `owner_user_id` 同时承担三种不同职责：
 
 1. Session/Run 的资源所属作用域；
 2. 发起命令、reply 或 approval 的 actor 身份；
 3. receipt、队列和容量限制的 scope key。
 
-这三种职责在单 owner 模式下恰好相同，在 account 内协作时不再相同。现有实现还存在有意的
-角色差异：Session/reply storage 接受 active `member`，Run review/dispatch 只接受 active
-`owner`，而 API 在最外层拒绝所有 member。仅删除 API 的 owner 检查会得到一个半授权系统：
-member 可以创建 Session 和触发 provider，却不能稳定读取或审批相连的 Run。
+这三种职责在单 owner 模式下恰好相同，在 account 内协作时不再相同。v14 已把资源 account、
+命令 actor、receipt/capacity scope 分列，并用 capability 区分 Session/reply 与 approval/dispatch；
+API 仍在最外层拒绝所有 member。仅删除 API 的 owner 检查仍会绕过 v15 所需的 member setup、
+disable、audit 与产品验收，因此 gate 不能提前移除。
 
 因此实施必须遵守：
 
@@ -77,8 +77,8 @@ membership identity 和权限 revision 由 schema trigger 强制：`account_id`�
 - `reply_jobs`、`dispatch_jobs`；
 - Session/Run receipts 与 `finalization_reservations`。
 
-当前 v13 的 `owner_user_id` 仍是访问控制权威。只有 v14 完成授权切换后，它才不再参与访问控制，
-并只作为 legacy creator 来源，最终明确命名为 `created_by_user_id`。历史事件 payload 不重写。
+v14 中 `owner_user_id` 已退出访问控制，只作为 legacy creator metadata；后续可明确命名为
+`created_by_user_id`。历史事件 payload 不重写。
 
 v11 允许通过 storage 构造 member-owned Session，因此 configured migration 不能无条件把所有
 数据并入 `acc_local`。v13 迁移在写入任何 account 字段前证明：所有 Session/Run owner 都等于
@@ -89,7 +89,7 @@ membership，也不扩大旧 owner 的可见范围。无法证明归属的旧 me
 
 ## 3. 统一授权上下文
 
-本节描述待实施的 v14 授权目标，不是当前 v13 已开放的 API/storage 行为。
+本节描述已经落地的 v14 授权边界；产品级 member 登录仍由 v15 gate 阻止。
 
 HTTP、runtime 和 storage 的业务入口使用一个显式上下文，不能继续只传裸 `actor_user_id`：
 
@@ -105,20 +105,20 @@ struct AuthzContext {
 
 登录 session 绑定 `account_id` 与签发时的 `membership_revision`。每次认证都 JOIN active User、
 active Account 和 active Membership；revision、角色或状态发生变化后，旧 session 立即失效。
-当前 v13 及 v14-v15 设计只支持一个 `acc_local`，不提供 account picker 或多 account runtime。
+当前 v14-v15 设计只支持一个 `acc_local`，不提供 account picker 或多 account runtime。
 未来若增加 account 切换，一个登录 session 仍只能绑定一个 account，切换必须轮换 session
 token，避免请求头临时选 tenant 带来的 confused-deputy 风险。
 
 首版权限矩阵：
 
-| Capability | owner | member |
-| --- | :---: | :---: |
-| Account 内 Session/Run 读取 | ✓ | ✓ |
-| 创建 Session、发送 turn、resume | ✓ | ✓ |
-| 调用 reply provider | ✓ | ✓ |
-| approval、connector dispatch | ✓ | — |
-| 成员管理、Account/provider 设置 | ✓ | — |
-| 安全审计读取与导出 | ✓ | — |
+| Capability                      | owner | member |
+| ------------------------------- | :---: | :----: |
+| Account 内 Session/Run 读取     |   ✓   |   ✓    |
+| 创建 Session、发送 turn、resume |   ✓   |   ✓    |
+| 调用 reply provider             |   ✓   |   ✓    |
+| approval、connector dispatch    |   ✓   |   —    |
+| 成员管理、Account/provider 设置 |   ✓   |   —    |
+| 安全审计读取与导出              |   ✓   |   —    |
 
 member 发起的 reply job 固化 `account_id + actor_user_id + membership_revision`。由 member
 发起、owner 批准的 dispatch 同时固化 `initiating_actor_user_id + initiating_revision` 和
@@ -142,16 +142,14 @@ Run projection、not-dispatched evidence 与 reservation settlement，SSE 必须
 面向业务的新 handler 只能调用带 `AuthzContext` 的方法。现有无 actor 方法应降为
 crate-private、seed/recovery 专用或删除，避免未来 handler 误用。
 
-当前 v13 过渡期仍保留 `users.role`，并要求全局唯一旧 owner 与 `acc_local` owner membership 完全
-一致；API member gate 继续读取旧边界。v14 必须把 membership role 变成 account capability 的
-唯一权威，删除或停止使用 `users.role`、`users_single_owner_idx` 和所有 `StoredUserRole`
-授权分支。`AuthPrincipal`、API 返回 role、Run/reply/dispatch 检查全部改读当前 membership；
-旧授权点归零前不能开放 member。
+v14 仍保留 `users.role` 作为 creator metadata，但已删除 `users_single_owner_idx`，所有认证、API
+返回 role、Run/reply/dispatch 授权均读取 `account_memberships`。Storage 每次在事务内从 durable
+membership 取得 role/capability，不信任调用方携带的 legacy role；API member gate 也读取
+membership role。v15 完成前仍不能开放 member。
 
 ## 4. 数据与幂等作用域
 
-以下 account-scoped receipt、capacity 与 cursor 也是 v14 目标；当前 v13 仍使用既有 owner/actor
-scope，不得据此开放 member。
+以下 account-scoped receipt、capacity 与 cursor 已在 v14 落地，但不得据此提前开放 member。
 
 - 资源查询以 `account_id` 隔离，actor capability 决定动作；不再要求 actor 直接“拥有”资源。
 - receipt identity 为
@@ -180,8 +178,8 @@ NULL、孤儿或跨 account 关系，并为 `(account_id, id/order key)` 建索�
 
 ## 5. HTTP 错误契约
 
-以下新增错误是 v14-v15 目标。当前 v13 的 member 登录仍保持通用 `401 invalid_credentials`，
-没有 account picker 或成员管理 HTTP API。
+v14 已实现 authentication/authorization/resource 错误边界；成员管理专用冲突仍属于 v15。
+member 登录保持通用 `401 invalid_credentials`，没有 account picker 或成员管理 HTTP API。
 
 - `401 authentication_required`：没有 session，或身份/session 已失效。
 - `401 invalid_credentials`：登录失败；用户名不存在、密码错误、User disabled 必须不可区分。
@@ -210,7 +208,7 @@ v12 先独立修复这个 system-scope 问题，不改任何 Session/Run ledger 
 - rotation 在同一事务中终止旧 token，按 sequence 每批最多 64 行压缩最老 terminal 前缀，
   再签发新 token；任一步失败全部回滚；
 - 被移除的 canonical rows 链入 singleton rollup：`through_sequence + SHA-256 digest +
-  updated_at`。rollup 永久保留且只能单调前进；详细窗口因此有界，同时新启动不会因历史行数
+updated_at`。rollup 永久保留且只能单调前进；详细窗口因此有界，同时新启动不会因历史行数
   达上限而锁死。
 
 该 digest 是数据库内的历史压缩 commitment，不是外部可信锚。它能约束正常实现的前缀压缩，
@@ -274,11 +272,11 @@ Session/Run ledger、receipt、turn、reply/dispatch job 不在本阶段做 rete
 - 新增 account 一致性 FK/trigger、revision/identity trigger、点查询与 deep-integrity 校验；
 - API 仍拒绝 member。
 
-v13 已采用双轨过渡：只新增/回填 immutable account scope，现有 `owner_user_id` 授权和 trigger
-继续工作。v14 先重建 account-scoped receipt/job/reservation 与一致性 trigger，通过 deep
-integrity 后切换代码，最后删除旧 owner 授权 trigger/index 并把 creator 列明确改名。
+v13 采用双轨过渡，只新增/回填 immutable account scope；v14 随后重建 account-scoped
+auth/receipt/job/reservation 与一致性 trigger，通过 migration postflight 与 deep integrity 后切换
+代码，并删除旧 owner 授权 trigger/index。creator 列的物理改名仍可在后续兼容迁移中完成。
 
-### v14：Account-scoped Durable Authorization（待实施）
+### v14：Account-scoped Durable Authorization（已实现）
 
 - 引入 `AuthzContext`；
 - membership role 取代 `users.role` 成为唯一 capability 权威；
@@ -299,31 +297,37 @@ integrity 后切换代码，最后删除旧 owner 授权 trigger/index 并把 cr
 
 ## 9. 验收状态与后续门槛
 
-schema v13 已完成的证据：
+schema v14 已完成的证据：
 
-- `cargo test --workspace --all-targets` 共 289 个测试通过，其中 storage 139、runtime 28、API
-  library 44、API main/config 4，其余 crates 与 graceful-shutdown 合约也通过；
-- `cargo fmt --all -- --check` 与 workspace all-target clippy 通过；
+- `cargo test --workspace --all-targets` 按项目既有统计口径共 312 个测试通过，其中 storage
+  153、runtime 31、API library 46、API main/config 6，其余 crates、子进程数据库锁与
+  graceful-shutdown 合约也通过；
+- `cargo fmt --all -- --check` 与 workspace all-target/all-features clippy 通过；
 - fresh 及既有 v1/v5/v8/v12 数据迁移覆盖 account 回填，member-owned history、外键破坏或无法
   证明的 owner/actor/scope 会使 v12→v13 整体回滚，不留下部分 account schema；
 - `acc_local`、唯一旧 owner membership、bootstrap 原子建 membership、account/revision/last-owner
   trigger、root scope immutability 与 deep-integrity corruption 都有确定性 storage 测试；
+- configured/unconfigured v13→v14 会原地保留 auth session、receipt、reply/dispatch job 与
+  reservation；额外 account、disabled legacy owner 或无法证明的 actor state 会在 version 14 写入前
+  整体回滚，schema version 保持 13；
+- Account A/B 的 REST/SSE/cursor/receipt 隔离、membership revision 撤权、stale session 清理后
+  重新登录、同 Account actor 幂等隔离、member read/reply 与 approval 403、双主体 dispatch claim，
+  以及 actor/account/global 三层容量都有确定性回归；
 - Bootstrap Audit Retention 的 v11→v12 reason 迁移、rotation/open 多批压缩、摘要连续性与非法
   删除测试继续通过，未因 v13 改写 ledger 或 receipt；
 - Web 25 个 Node 测试及 check、lint、production build 全部通过；
-- Apple current-image `zeus-operation-acceptance` 保留 schema v12 named volume，原地迁移到 v13，
-  `restart-verify` 后仍通过；入口为 `127.0.0.1:18089`，API 限制为 2 CPU/1 GiB，采集到的
-  `memory.events` 为 `oom=0`、`oom_kill=0`。
+- Apple current-image `zeus-operation-acceptance` 保留历史 v11→v12→v13 named volume，原地迁移到
+  v14，`verify` 与保留卷 `restart-verify` 后仍通过；入口为 `127.0.0.1:18089`，API 限制为
+  2 CPU/1 GiB。重启后 `memory.current=79,466,496`、`memory.peak=98,201,600`、Zeus RSS
+  9,824 KiB、`pids.current=6`，`oom=0`、`oom_kill=0`；Apple 仍是 `pids.max=max`。
 
-v14-v15 仍须完成并重新验收：
+v15 仍须完成并重新验收：
 
-- Account A 的 actor 对 Account B 的 REST、SSE、cursor、receipt 一律得到 `404`；
-- membership revision 变化后旧 cookie、SSE 与在变更后 claim 的 job 全部失效；
 - member 能调用配置好的 reply provider 完成 Session 对话；provider 配置、tool policy、approval
   与 connector dispatch 保持 owner-only；
-- 同 account 两个 actor 的同名 idempotency key 互不 replay；
 - account audit、member setup/disable、legal hold、归档与 retention failure injection 达到本文约束；
-- 全部门禁通过后才移除 member 登录/API gate。当前 v13 不得描述为多租户授权已经完成。
+- 全部门禁通过后才移除 member 登录/API gate。当前 v14 不得描述为 member 产品能力或共享多租户
+  部署已经完成。
 
 共享网络部署还必须另行完成 TLS/canonical origin、trusted proxy、Secure cookie、per-account
 provider secret/计费隔离与 Linux Docker PID/OOM gate；membership 完成本身不等于可以暴露到

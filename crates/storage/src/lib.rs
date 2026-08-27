@@ -25,6 +25,7 @@ use protocol::{
 use serde::Serialize;
 use serde_json::Value;
 pub use sqlite::SqliteStore;
+pub use tenancy::{AccountId, AuthSessionId, AuthzContext, MembershipRevision, MembershipRole};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoredUserRole {
@@ -51,6 +52,9 @@ pub struct StoredUser {
 #[derive(Clone, PartialEq, Eq)]
 pub struct StoredCredential {
     pub user: StoredUser,
+    pub account_id: AccountId,
+    pub membership_role: MembershipRole,
+    pub membership_revision: MembershipRevision,
     pub password_hash: String,
 }
 
@@ -59,6 +63,9 @@ impl fmt::Debug for StoredCredential {
         formatter
             .debug_struct("StoredCredential")
             .field("user", &self.user)
+            .field("account_id", &self.account_id)
+            .field("membership_role", &self.membership_role)
+            .field("membership_revision", &self.membership_revision)
             .field("password_hash", &"[REDACTED]")
             .finish()
     }
@@ -76,6 +83,7 @@ pub struct StoredPreferences {
 #[derive(Clone, PartialEq, Eq)]
 pub struct AuthPrincipal {
     pub user: StoredUser,
+    pub authz: AuthzContext,
     pub csrf_hash: String,
     pub expires_at: String,
 }
@@ -85,6 +93,7 @@ impl fmt::Debug for AuthPrincipal {
         formatter
             .debug_struct("AuthPrincipal")
             .field("user", &self.user)
+            .field("authz", &self.authz)
             .field("csrf_hash", &"[REDACTED]")
             .field("expires_at", &self.expires_at)
             .finish()
@@ -97,6 +106,7 @@ pub struct BootstrapOwnerCommit {
     pub user_id: String,
     pub username: String,
     pub password_hash: String,
+    pub auth_session_id: AuthSessionId,
     pub session_token_hash: String,
     pub csrf_hash: String,
     pub session_expires_at: String,
@@ -110,6 +120,7 @@ impl fmt::Debug for BootstrapOwnerCommit {
             .field("user_id", &self.user_id)
             .field("username", &self.username)
             .field("password_hash", &"[REDACTED]")
+            .field("auth_session_id", &self.auth_session_id)
             .field("session_token_hash", &"[REDACTED]")
             .field("csrf_hash", &"[REDACTED]")
             .field("session_expires_at", &self.session_expires_at)
@@ -119,7 +130,7 @@ impl fmt::Debug for BootstrapOwnerCommit {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct AuthSessionCommit {
-    pub user_id: String,
+    pub authz: AuthzContext,
     pub session_token_hash: String,
     pub csrf_hash: String,
     pub expires_at: String,
@@ -129,7 +140,7 @@ impl fmt::Debug for AuthSessionCommit {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AuthSessionCommit")
-            .field("user_id", &self.user_id)
+            .field("authz", &self.authz)
             .field("session_token_hash", &"[REDACTED]")
             .field("csrf_hash", &"[REDACTED]")
             .field("expires_at", &self.expires_at)
@@ -145,7 +156,7 @@ impl fmt::Debug for AuthSessionCommit {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ReplyJobSpec {
     pub id: String,
-    pub actor_user_id: String,
+    pub authz: AuthzContext,
     pub provider_name: String,
     pub model_name: Option<String>,
     pub request_json: Value,
@@ -164,7 +175,9 @@ pub enum ReplyJobStatus {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReplyJob {
     pub id: String,
+    pub account_id: AccountId,
     pub actor_user_id: String,
+    pub actor_membership_revision: MembershipRevision,
     pub session_id: String,
     pub turn_id: String,
     pub provider_name: String,
@@ -345,8 +358,10 @@ pub enum CommitOutcome {
 pub struct DispatchJobSpec {
     pub call_id: String,
     pub approval_id: String,
+    /// The actor whose request initiated this immutable dispatch.
+    pub initiating_authz: AuthzContext,
     /// The owner whose approval authorized this immutable dispatch.
-    pub approving_actor_user_id: String,
+    pub approving_authz: AuthzContext,
     pub tool_name: String,
     pub tool_version: String,
     pub effect: ToolEffect,
@@ -369,10 +384,14 @@ pub enum DispatchStatus {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DispatchJob {
     pub call_id: String,
+    pub account_id: AccountId,
     pub run_id: String,
     pub approval_id: String,
     pub approval_event_sequence: u64,
+    pub initiating_actor_user_id: Option<String>,
+    pub initiating_membership_revision: Option<MembershipRevision>,
     pub approving_actor_user_id: Option<String>,
+    pub approving_membership_revision: Option<MembershipRevision>,
     pub tool_name: String,
     pub tool_version: String,
     pub effect: ToolEffect,

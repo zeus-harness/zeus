@@ -38,15 +38,16 @@ use protocol::{
     StartTurnRequest, ThemePreference, UpdatePreferencesRequest, UserPreferences,
 };
 use runtime::{
-    AuthPrincipal, AuthSessionCommit, BootstrapOwnerCommit, DemoStore, PublishedEvent,
-    ReplyClaimOutcome, ReplyFailureCommit, ReplyJob, ReplyJobSpec, ReplyOutcomeUnknownCommit,
-    ReplySuccessCommit, StoreError, StoredPreferences, StoredUser, StoredUserRole,
+    AuthPrincipal, AuthSessionCommit, AuthzContext, BootstrapOwnerCommit, DemoStore,
+    PublishedEvent, ReplyClaimOutcome, ReplyFailureCommit, ReplyJob, ReplyJobSpec,
+    ReplyOutcomeUnknownCommit, ReplySuccessCommit, StoreError, StoredPreferences, StoredUser,
     StoredUserStatus,
 };
 use serde::Deserialize;
 use tenancy::{
-    BootstrapTokenDigest, CsrfToken, CsrfTokenDigest, Password, PasswordAuthenticator,
-    PasswordHashRecord, SessionToken, SessionTokenDigest, UserId, Username, hash_password,
+    AccountId, AuthSessionId, BootstrapTokenDigest, CsrfToken, CsrfTokenDigest, MembershipRole,
+    Password, PasswordAuthenticator, PasswordHashRecord, SessionToken, SessionTokenDigest, UserId,
+    Username, hash_password,
 };
 use tokio::{
     sync::{Mutex, OwnedSemaphorePermit, Semaphore, broadcast},
@@ -445,13 +446,19 @@ struct SseCapacity {
 
 struct SseCapacityInner {
     global: Arc<Semaphore>,
-    actor_counts: StdMutex<HashMap<String, usize>>,
+    actor_counts: StdMutex<HashMap<SseActorKey, usize>>,
     per_actor_limit: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SseActorKey {
+    account_id: AccountId,
+    user_id: String,
 }
 
 struct SseLease {
     capacity: SseCapacity,
-    actor_user_id: String,
+    actor_key: SseActorKey,
     _global_permit: OwnedSemaphorePermit,
 }
 
@@ -478,7 +485,7 @@ impl SseCapacity {
         Self::new(SSE_GLOBAL_CONNECTION_LIMIT, SSE_ACTOR_CONNECTION_LIMIT)
     }
 
-    fn try_acquire(&self, actor_user_id: &str) -> Result<SseLease, RateLimitError> {
+    fn try_acquire(&self, context: &AuthzContext) -> Result<SseLease, RateLimitError> {
         let global_permit = Arc::clone(&self.inner.global)
             .try_acquire_owned()
             .map_err(|_| RateLimitError::Limited(SSE_CAPACITY_RETRY_AFTER))?;
@@ -487,7 +494,11 @@ impl SseCapacity {
             .actor_counts
             .lock()
             .map_err(|_| RateLimitError::Unavailable)?;
-        let actor_count = actor_counts.entry(actor_user_id.to_owned()).or_default();
+        let actor_key = SseActorKey {
+            account_id: context.account_id.clone(),
+            user_id: context.user_id.clone(),
+        };
+        let actor_count = actor_counts.entry(actor_key.clone()).or_default();
         if *actor_count >= self.inner.per_actor_limit {
             return Err(RateLimitError::Limited(SSE_CAPACITY_RETRY_AFTER));
         }
@@ -495,7 +506,7 @@ impl SseCapacity {
         drop(actor_counts);
         Ok(SseLease {
             capacity: self.clone(),
-            actor_user_id: actor_user_id.to_owned(),
+            actor_key,
             _global_permit: global_permit,
         })
     }
@@ -509,10 +520,10 @@ impl Drop for SseLease {
             .actor_counts
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(actor_count) = actor_counts.get_mut(&self.actor_user_id) {
+        if let Some(actor_count) = actor_counts.get_mut(&self.actor_key) {
             *actor_count = actor_count.saturating_sub(1);
             if *actor_count == 0 {
-                actor_counts.remove(&self.actor_user_id);
+                actor_counts.remove(&self.actor_key);
             }
         }
     }
@@ -533,7 +544,7 @@ struct CurrentAuth {
 #[cfg(test)]
 #[derive(Clone)]
 struct TestRequestAuth {
-    user_id: String,
+    authz: AuthzContext,
     cookie_header: HeaderValue,
     csrf_token: HeaderValue,
 }
@@ -659,7 +670,12 @@ fn build_authenticated_app(state: ApiState) -> Router {
 
 #[cfg(test)]
 async fn app(store: DemoStore) -> Router {
-    app_with_event_feed_options(store, DURABLE_LEDGER_POLL_INTERVAL, true).await
+    app_with_auth(store).await.0
+}
+
+#[cfg(test)]
+async fn app_with_auth(store: DemoStore) -> (Router, TestRequestAuth) {
+    app_with_event_feed_options_and_auth(store, DURABLE_LEDGER_POLL_INTERVAL, true).await
 }
 
 #[cfg(test)]
@@ -668,6 +684,21 @@ async fn app_with_event_feed_options(
     durable_ledger_poll_interval: Duration,
     broadcast_hints_enabled: bool,
 ) -> Router {
+    app_with_event_feed_options_and_auth(
+        store,
+        durable_ledger_poll_interval,
+        broadcast_hints_enabled,
+    )
+    .await
+    .0
+}
+
+#[cfg(test)]
+async fn app_with_event_feed_options_and_auth(
+    store: DemoStore,
+    durable_ledger_poll_interval: Duration,
+    broadcast_hints_enabled: bool,
+) -> (Router, TestRequestAuth) {
     assert!(
         !durable_ledger_poll_interval.is_zero(),
         "the durable ledger poll interval must be positive"
@@ -682,7 +713,7 @@ async fn app_with_event_feed_options(
         reply: None,
         sse_capacity: SseCapacity::production(),
     };
-    build_test_app(state, request_auth)
+    (build_test_app(state, request_auth.clone()), request_auth)
 }
 
 #[cfg(test)]
@@ -723,6 +754,7 @@ fn build_test_app(state: ApiState, request_auth: TestRequestAuth) -> Router {
 #[cfg(test)]
 async fn configure_test_actor(store: &DemoStore) -> TestRequestAuth {
     let bootstrap_token_hash = "a".repeat(64);
+    let auth_session_id = AuthSessionId::generate().unwrap();
     let session_token = SessionToken::generate().unwrap();
     let csrf_token = CsrfToken::generate().unwrap();
     let expires_at = (chrono::Utc::now() + chrono::Duration::hours(1))
@@ -737,6 +769,7 @@ async fn configure_test_actor(store: &DemoStore) -> TestRequestAuth {
             user_id: "user-test-owner".into(),
             username: "test-owner".into(),
             password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA".into(),
+            auth_session_id: auth_session_id.clone(),
             session_token_hash: session_token.digest().to_persistence(),
             csrf_hash: csrf_token.digest().to_persistence(),
             session_expires_at: expires_at,
@@ -744,7 +777,13 @@ async fn configure_test_actor(store: &DemoStore) -> TestRequestAuth {
         .await
         .expect("the test owner should claim the seeded resources");
     TestRequestAuth {
-        user_id: "user-test-owner".into(),
+        authz: AuthzContext {
+            account_id: AccountId::local(),
+            user_id: "user-test-owner".into(),
+            membership_role: MembershipRole::Owner,
+            membership_revision: tenancy::MembershipRevision::new(1).unwrap(),
+            auth_session_id,
+        },
         cookie_header: HeaderValue::from_str(&format!(
             "{SESSION_COOKIE}={}; {CSRF_COOKIE}={}",
             session_token.expose_secret(),
@@ -802,9 +841,12 @@ async fn auth_status(
         None
     };
     let (user, preferences) = if let Some(principal) = principal {
-        let preferences = state.store.preferences(&principal.user.id).await?;
+        let preferences = state.store.preferences(&principal.authz).await?;
         (
-            Some(account_user(&principal.user)),
+            Some(account_user(
+                &principal.user,
+                principal.authz.membership_role,
+            )),
             Some(user_preferences(&preferences)?),
         )
     } else {
@@ -872,7 +914,7 @@ async fn bootstrap(
     .map_err(|error| ApiError::auth_unavailable(&error))?;
 
     let user_id = UserId::generate().map_err(|error| ApiError::auth_unavailable(&error))?;
-    let (session_token, csrf_token, expires_at) = fresh_auth_tokens()?;
+    let (auth_session_id, session_token, csrf_token, expires_at) = fresh_auth_tokens()?;
     let (user, preferences) = state
         .store
         .bootstrap_owner(BootstrapOwnerCommit {
@@ -880,6 +922,7 @@ async fn bootstrap(
             user_id: user_id.as_str().to_owned(),
             username: username.as_str().to_owned(),
             password_hash: password_hash.as_phc().to_owned(),
+            auth_session_id,
             session_token_hash: session_token.digest().to_persistence(),
             csrf_hash: csrf_token.digest().to_persistence(),
             session_expires_at: expires_at.clone(),
@@ -896,6 +939,7 @@ async fn bootstrap(
         &csrf_token,
         &expires_at,
         user,
+        MembershipRole::Owner,
         preferences,
     )
 }
@@ -959,29 +1003,45 @@ async fn login(
     let credential = credential.filter(|credential| {
         verified
             && credential.user.status == StoredUserStatus::Active
-            && credential.user.role == StoredUserRole::Owner
+            && credential.account_id == AccountId::local()
+            && credential.membership_role == MembershipRole::Owner
     });
     let Some(credential) = credential else {
         return Err(ApiError::invalid_login());
     };
 
-    let (session_token, csrf_token, expires_at) = fresh_auth_tokens()?;
+    let (auth_session_id, session_token, csrf_token, expires_at) = fresh_auth_tokens()?;
+    let context = AuthzContext {
+        account_id: credential.account_id.clone(),
+        user_id: credential.user.id.clone(),
+        membership_role: credential.membership_role,
+        membership_revision: credential.membership_revision,
+        auth_session_id,
+    };
     state
         .store
         .create_auth_session(AuthSessionCommit {
-            user_id: credential.user.id.clone(),
+            authz: context.clone(),
             session_token_hash: session_token.digest().to_persistence(),
             csrf_hash: csrf_token.digest().to_persistence(),
             expires_at: expires_at.clone(),
         })
-        .await?;
-    let preferences = state.store.preferences(&credential.user.id).await?;
+        .await
+        .map_err(|error| match error {
+            StoreError::UserNotFound(_)
+            | StoreError::UserDisabled(_)
+            | StoreError::AuthSessionNotFound
+            | StoreError::PermissionDenied => ApiError::invalid_login(),
+            other => other.into(),
+        })?;
+    let preferences = state.store.preferences(&context).await?;
     authentication_response(
         &state,
         &session_token,
         &csrf_token,
         &expires_at,
         credential.user,
+        context.membership_role,
         preferences,
     )
 }
@@ -992,7 +1052,7 @@ async fn logout(
 ) -> Result<Response, ApiError> {
     state
         .store
-        .revoke_auth_session(&current.session_token_hash)
+        .revoke_auth_session(&current.principal.authz, &current.session_token_hash)
         .await?;
     let mut response = Json(LogoutResponse {
         status: "signed_out".into(),
@@ -1007,7 +1067,7 @@ async fn get_preferences(
     State(state): State<ApiState>,
     Extension(current): Extension<CurrentAuth>,
 ) -> Result<Json<UserPreferences>, ApiError> {
-    let preferences = state.store.preferences(&current.principal.user.id).await?;
+    let preferences = state.store.preferences(&current.principal.authz).await?;
     Ok(Json(user_preferences(&preferences)?))
 }
 
@@ -1039,7 +1099,7 @@ async fn patch_preferences(
     let preferences = state
         .store
         .update_preferences(
-            &current.principal.user.id,
+            &current.principal.authz,
             request.expected_revision,
             theme,
             preferred_model,
@@ -1060,7 +1120,7 @@ async fn require_auth(State(state): State<ApiState>, mut request: Request, next:
             .authenticate(&digest)
             .await?
             .ok_or_else(ApiError::unauthorized)?;
-        if principal.user.role != StoredUserRole::Owner {
+        if principal.authz.membership_role != MembershipRole::Owner {
             return Err(ApiError::unauthorized());
         }
 
@@ -1117,8 +1177,8 @@ fn charge_auth_rate_limit(
     }
 }
 
-fn acquire_sse_lease(capacity: &SseCapacity, actor_user_id: &str) -> Result<SseLease, ApiError> {
-    match capacity.try_acquire(actor_user_id) {
+fn acquire_sse_lease(capacity: &SseCapacity, context: &AuthzContext) -> Result<SseLease, ApiError> {
+    match capacity.try_acquire(context) {
         Ok(lease) => Ok(lease),
         Err(RateLimitError::Limited(retry_after)) => {
             Err(ApiError::sse_capacity_exceeded(retry_after))
@@ -1129,12 +1189,14 @@ fn acquire_sse_lease(capacity: &SseCapacity, actor_user_id: &str) -> Result<SseL
     }
 }
 
-fn fresh_auth_tokens() -> Result<(SessionToken, CsrfToken, String), ApiError> {
+fn fresh_auth_tokens() -> Result<(AuthSessionId, SessionToken, CsrfToken, String), ApiError> {
+    let auth_session_id =
+        AuthSessionId::generate().map_err(|error| ApiError::auth_unavailable(&error))?;
     let session = SessionToken::generate().map_err(|error| ApiError::auth_unavailable(&error))?;
     let csrf = CsrfToken::generate().map_err(|error| ApiError::auth_unavailable(&error))?;
     let expires_at = (chrono::Utc::now() + chrono::Duration::seconds(AUTH_SESSION_SECONDS))
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    Ok((session, csrf, expires_at))
+    Ok((auth_session_id, session, csrf, expires_at))
 }
 
 fn authentication_response(
@@ -1143,10 +1205,11 @@ fn authentication_response(
     csrf_token: &CsrfToken,
     expires_at: &str,
     user: StoredUser,
+    membership_role: MembershipRole,
     preferences: StoredPreferences,
 ) -> Result<Response, ApiError> {
     let mut response = Json(AuthenticationResponse {
-        user: account_user(&user),
+        user: account_user(&user, membership_role),
         preferences: user_preferences(&preferences)?,
         csrf_token: csrf_token.expose_secret().to_owned(),
         expires_at: expires_at.to_owned(),
@@ -1176,16 +1239,16 @@ async fn authenticate_headers(
         .store
         .authenticate(&digest.to_persistence())
         .await?
-        .filter(|principal| principal.user.role == StoredUserRole::Owner))
+        .filter(|principal| principal.authz.membership_role == MembershipRole::Owner))
 }
 
-fn account_user(user: &StoredUser) -> AccountUser {
+fn account_user(user: &StoredUser, membership_role: MembershipRole) -> AccountUser {
     AccountUser {
         id: user.id.clone(),
         username: user.username.clone(),
-        role: match user.role {
-            StoredUserRole::Owner => AccountRole::Owner,
-            StoredUserRole::Member => AccountRole::Member,
+        role: match membership_role {
+            MembershipRole::Owner => AccountRole::Owner,
+            MembershipRole::Member => AccountRole::Member,
         },
         status: match user.status {
             StoredUserStatus::Active => AccountStatus::Active,
@@ -1595,7 +1658,7 @@ async fn overview(
     Ok(Json(
         state
             .store
-            .overview_for_actor(&current.principal.user.id)
+            .overview_for_actor(&current.principal.authz)
             .await?,
     ))
 }
@@ -1609,7 +1672,7 @@ async fn list_sessions(
     let page = state
         .store
         .list_sessions_for_actor(
-            &current.principal.user.id,
+            &current.principal.authz,
             query.cursor.as_deref(),
             query.limit.unwrap_or(COLLECTION_PAGE_DEFAULT_LIMIT),
         )
@@ -1634,7 +1697,7 @@ async fn create_session(
     let idempotency_key = required_idempotency_key(&headers)?;
     let response = state
         .store
-        .create_session_for_actor(&current.principal.user.id, request, &idempotency_key)
+        .create_session_for_actor(&current.principal.authz, request, &idempotency_key)
         .await?;
     Ok((StatusCode::CREATED, Json(response)))
 }
@@ -1645,12 +1708,16 @@ async fn session_detail(
     Path(id): Path<String>,
     query: Result<Query<SessionDetailQuery>, QueryRejection>,
 ) -> Result<Json<SessionDetail>, ApiError> {
+    state
+        .store
+        .authorize_session_for_actor(&current.principal.authz, &id)
+        .await?;
     let Query(query) = query.map_err(ApiError::invalid_query)?;
     Ok(Json(
         state
             .store
             .get_session_for_actor(
-                &current.principal.user.id,
+                &current.principal.authz,
                 &id,
                 query.run_ids_before.as_deref(),
                 query.run_ids_limit.unwrap_or(COLLECTION_PAGE_DEFAULT_LIMIT),
@@ -1668,10 +1735,14 @@ async fn session_turn(
     Extension(current): Extension<CurrentAuth>,
     Path((id, turn_id)): Path<(String, String)>,
 ) -> Result<Json<SessionTurn>, ApiError> {
+    state
+        .store
+        .authorize_session_for_actor(&current.principal.authz, &id)
+        .await?;
     Ok(Json(
         state
             .store
-            .session_turn_for_actor(&current.principal.user.id, &id, &turn_id)
+            .session_turn_for_actor(&current.principal.authz, &id, &turn_id)
             .await?,
     ))
 }
@@ -1683,12 +1754,16 @@ async fn resume_session(
     headers: HeaderMap,
     payload: Result<Json<ResumeSessionRequest>, JsonRejection>,
 ) -> Result<Json<ResumeSessionResponse>, ApiError> {
+    state
+        .store
+        .authorize_session_for_actor(&current.principal.authz, &id)
+        .await?;
     let Json(request) = payload.map_err(ApiError::invalid_json)?;
     let idempotency_key = required_idempotency_key(&headers)?;
     Ok(Json(
         state
             .store
-            .resume_session_for_actor(&current.principal.user.id, &id, request, &idempotency_key)
+            .resume_session_for_actor(&current.principal.authz, &id, request, &idempotency_key)
             .await?,
     ))
 }
@@ -1700,6 +1775,10 @@ async fn start_turn(
     headers: HeaderMap,
     payload: Result<Json<StartTurnRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
+    state
+        .store
+        .authorize_session_for_actor(&current.principal.authz, &id)
+        .await?;
     let Json(request) = payload.map_err(ApiError::invalid_json)?;
     let idempotency_key = required_idempotency_key(&headers)?;
     validate_start_turn_envelope(&request)?;
@@ -1712,7 +1791,7 @@ async fn start_turn(
     )]);
     let job = ReplyJobSpec {
         id: format!("reply:{id}:{}", request.turn_id),
-        actor_user_id: current.principal.user.id.clone(),
+        authz: current.principal.authz.clone(),
         provider_name: metadata.provider_id.clone(),
         model_name: metadata.model.clone(),
         request_json: serde_json::to_value(reply_request)
@@ -1721,7 +1800,7 @@ async fn start_turn(
     let response = state
         .store
         .start_turn_and_enqueue_reply_for_actor(
-            &current.principal.user.id,
+            &current.principal.authz,
             &id,
             request,
             &idempotency_key,
@@ -1740,12 +1819,16 @@ async fn test_start_turn(
     headers: HeaderMap,
     payload: Result<Json<StartTurnRequest>, JsonRejection>,
 ) -> Result<Json<protocol::StartTurnResponse>, ApiError> {
+    state
+        .store
+        .authorize_session_for_actor(&current.principal.authz, &id)
+        .await?;
     let Json(request) = payload.map_err(ApiError::invalid_json)?;
     let idempotency_key = required_idempotency_key(&headers)?;
     Ok(Json(
         state
             .store
-            .start_turn_for_actor(&current.principal.user.id, &id, request, &idempotency_key)
+            .start_turn_for_actor(&current.principal.authz, &id, request, &idempotency_key)
             .await?,
     ))
 }
@@ -1758,6 +1841,10 @@ async fn test_flush_turn(
     headers: HeaderMap,
     payload: Result<Json<protocol::FlushSessionRequest>, JsonRejection>,
 ) -> Result<Json<protocol::FlushSessionResponse>, ApiError> {
+    state
+        .store
+        .authorize_session_for_actor(&current.principal.authz, &id)
+        .await?;
     let Json(request) = payload.map_err(ApiError::invalid_json)?;
     let idempotency_key = required_idempotency_key(&headers)?;
     if turn_id != request.turn_id {
@@ -1769,7 +1856,7 @@ async fn test_flush_turn(
     Ok(Json(
         state
             .store
-            .flush_turn_for_actor(&current.principal.user.id, &id, request, &idempotency_key)
+            .flush_turn_for_actor(&current.principal.authz, &id, request, &idempotency_key)
             .await?,
     ))
 }
@@ -1780,12 +1867,16 @@ async fn run_detail(
     Path(id): Path<String>,
     query: Result<Query<RunDetailQuery>, QueryRejection>,
 ) -> Result<Json<RunDetail>, ApiError> {
+    state
+        .store
+        .authorize_run_for_actor(&current.principal.authz, &id)
+        .await?;
     let Query(query) = query.map_err(ApiError::invalid_query)?;
     Ok(Json(
         state
             .store
             .run_detail_for_actor(
-                &current.principal.user.id,
+                &current.principal.authz,
                 &id,
                 query.events_before.as_deref(),
                 query.events_limit.unwrap_or(EVENT_PAGE_DEFAULT_LIMIT),
@@ -1801,6 +1892,10 @@ async fn review_decision(
     headers: HeaderMap,
     payload: Result<Json<ReviewRequest>, JsonRejection>,
 ) -> Result<Json<ReviewResponse>, ApiError> {
+    state
+        .store
+        .authorize_run_for_actor(&current.principal.authz, &id)
+        .await?;
     let Json(request) = payload.map_err(ApiError::invalid_json)?;
     let header_key = required_idempotency_key(&headers)?;
 
@@ -1817,7 +1912,7 @@ async fn review_decision(
         state
             .store
             .review_for_actor(
-                &current.principal.user.id,
+                &current.principal.authz,
                 &id,
                 &approval_id,
                 request,
@@ -1878,21 +1973,20 @@ async fn session_events(
     headers: HeaderMap,
     query: Result<Query<EventsQuery>, QueryRejection>,
 ) -> Result<Response, ApiError> {
+    state
+        .store
+        .authorize_session_for_actor(&current.principal.authz, &id)
+        .await?;
     let Query(query) = query.map_err(ApiError::invalid_query)?;
     let after = event_cursor(&headers, query)?;
     if !sse_auth_is_current(&state.store, &current).await {
         return Err(ApiError::unauthorized());
     }
-    let actor_user_id = current.principal.user.id.clone();
-    let sse_lease = acquire_sse_lease(&state.sse_capacity, &actor_user_id)?;
+    let authz = current.principal.authz.clone();
+    let sse_lease = acquire_sse_lease(&state.sse_capacity, &authz)?;
     let mut feed = state
         .store
-        .session_event_page_feed_for_actor(
-            &actor_user_id,
-            &id,
-            after,
-            protocol::EVENT_PAGE_DEFAULT_LIMIT,
-        )
+        .session_event_page_feed_for_actor(&authz, &id, after, protocol::EVENT_PAGE_DEFAULT_LIMIT)
         .await?;
     let store = state.store.clone();
     let durable_ledger_poll_interval = state.durable_ledger_poll_interval;
@@ -1928,7 +2022,7 @@ async fn session_events(
                 }
                 match store
                     .session_event_page_for_actor(
-                        &actor_user_id,
+                        &authz,
                         &session_id,
                         cursor,
                         protocol::EVENT_PAGE_DEFAULT_LIMIT,
@@ -1969,7 +2063,7 @@ async fn session_events(
                             // cannot make an earlier event permanently vanish.
                             match store
                                 .session_event_page_for_actor(
-                                    &actor_user_id,
+                                    &authz,
                                     &session_id,
                                     cursor,
                                     protocol::EVENT_PAGE_DEFAULT_LIMIT,
@@ -1995,7 +2089,7 @@ async fn session_events(
                         }
                         match store
                             .session_event_page_for_actor(
-                                &actor_user_id,
+                                &authz,
                                 &session_id,
                                 cursor,
                                 protocol::EVENT_PAGE_DEFAULT_LIMIT,
@@ -2022,7 +2116,7 @@ async fn session_events(
                     }
                     match store
                         .session_event_page_for_actor(
-                            &actor_user_id,
+                            &authz,
                             &session_id,
                             cursor,
                             protocol::EVENT_PAGE_DEFAULT_LIMIT,
@@ -2059,21 +2153,20 @@ async fn run_events(
     headers: HeaderMap,
     query: Result<Query<EventsQuery>, QueryRejection>,
 ) -> Result<Response, ApiError> {
+    state
+        .store
+        .authorize_run_for_actor(&current.principal.authz, &id)
+        .await?;
     let Query(query) = query.map_err(ApiError::invalid_query)?;
     let after = event_cursor(&headers, query)?;
     if !sse_auth_is_current(&state.store, &current).await {
         return Err(ApiError::unauthorized());
     }
-    let actor_user_id = current.principal.user.id.clone();
-    let sse_lease = acquire_sse_lease(&state.sse_capacity, &actor_user_id)?;
+    let authz = current.principal.authz.clone();
+    let sse_lease = acquire_sse_lease(&state.sse_capacity, &authz)?;
     let mut feed = state
         .store
-        .event_page_feed_for_actor(
-            &actor_user_id,
-            &id,
-            after,
-            protocol::EVENT_PAGE_DEFAULT_LIMIT,
-        )
+        .event_page_feed_for_actor(&authz, &id, after, protocol::EVENT_PAGE_DEFAULT_LIMIT)
         .await?;
     let store = state.store.clone();
     let durable_ledger_poll_interval = state.durable_ledger_poll_interval;
@@ -2112,7 +2205,7 @@ async fn run_events(
                 }
                 match store
                     .run_event_page_for_actor(
-                        &actor_user_id,
+                        &authz,
                         &run_id,
                         cursor,
                         protocol::EVENT_PAGE_DEFAULT_LIMIT,
@@ -2155,7 +2248,7 @@ async fn run_events(
                         // durable event.
                         match run_events_for_hint(
                             &store,
-                            &actor_user_id,
+                            &authz,
                             &run_id,
                             cursor,
                             &published,
@@ -2183,7 +2276,7 @@ async fn run_events(
                         // instead of silently skipping events.
                         match store
                             .run_event_page_for_actor(
-                                &actor_user_id,
+                                &authz,
                                 &run_id,
                                 cursor,
                                 protocol::EVENT_PAGE_DEFAULT_LIMIT,
@@ -2210,7 +2303,7 @@ async fn run_events(
                     }
                     match store
                         .run_event_page_for_actor(
-                            &actor_user_id,
+                            &authz,
                             &run_id,
                             cursor,
                             protocol::EVENT_PAGE_DEFAULT_LIMIT,
@@ -2246,15 +2339,14 @@ async fn sse_auth_is_current(store: &DemoStore, current: &CurrentAuth) -> bool {
     matches!(
         store.authenticate(&current.session_token_hash).await,
         Ok(Some(principal))
-            if principal.user.id == current.principal.user.id
-                && principal.user.role == StoredUserRole::Owner
-                && principal.user.status == StoredUserStatus::Active
+            if principal.authz == current.principal.authz
+                && principal.authz.membership_role == MembershipRole::Owner
     )
 }
 
 async fn run_events_for_hint(
     store: &DemoStore,
-    actor_user_id: &str,
+    context: &AuthzContext,
     run_id: &str,
     cursor: u64,
     published: &PublishedEvent,
@@ -2263,12 +2355,7 @@ async fn run_events_for_hint(
         return Ok(None);
     }
     store
-        .run_event_page_for_actor(
-            actor_user_id,
-            run_id,
-            cursor,
-            protocol::EVENT_PAGE_DEFAULT_LIMIT,
-        )
+        .run_event_page_for_actor(context, run_id, cursor, protocol::EVENT_PAGE_DEFAULT_LIMIT)
         .await
         .map(Some)
 }
@@ -2389,6 +2476,7 @@ impl ApiError {
             "Authentication required",
             "Sign in to access this Zeus resource",
         )
+        .with_no_store()
     }
 
     fn invalid_login() -> Self {
@@ -2630,6 +2718,14 @@ impl From<StoreError> for ApiError {
             ),
             StoreError::InvalidBootstrapToken => Self::invalid_bootstrap(),
             StoreError::UserNotFound(_) | StoreError::UserDisabled(_) => Self::invalid_login(),
+            StoreError::AuthSessionNotFound => Self::unauthorized(),
+            StoreError::PermissionDenied => Self::new(
+                StatusCode::FORBIDDEN,
+                "permission_denied",
+                "Permission denied",
+                "The current account membership cannot perform this operation",
+            )
+            .with_no_store(),
             StoreError::StorageQuotaExceeded => Self::storage_quota_exceeded(),
             StoreError::PhysicalStorageExhausted => Self::physical_storage_exhausted(),
             StoreError::OperationCapacityExceeded => Self::sqlite_operation_capacity_exceeded(),
@@ -2923,22 +3019,36 @@ mod tests {
 
     #[test]
     fn sse_capacity_enforces_global_and_actor_limits_until_lease_drop() {
-        let capacity = SseCapacity::new(2, 2);
-        let alice_one = capacity.try_acquire("alice").unwrap();
-        let alice_two = capacity.try_acquire("alice").unwrap();
+        let capacity = SseCapacity::new(3, 1);
+        let alice = test_authz_context("acc-local", "alice", "session-alice");
+        let alice_other_account =
+            test_authz_context("acc-other", "alice", "session-alice-other-account");
+        let bob = test_authz_context("acc-local", "bob", "session-bob");
+        let alice_one = capacity.try_acquire(&alice).unwrap();
         assert!(matches!(
-            capacity.try_acquire("bob"),
+            capacity.try_acquire(&alice),
+            Err(RateLimitError::Limited(retry_after)) if retry_after == SSE_CAPACITY_RETRY_AFTER
+        ));
+        let alice_other_account_lease = capacity.try_acquire(&alice_other_account).unwrap();
+        let bob_lease = capacity.try_acquire(&bob).unwrap();
+        assert!(matches!(
+            capacity.try_acquire(&test_authz_context("acc-local", "carol", "session-carol")),
             Err(RateLimitError::Limited(retry_after)) if retry_after == SSE_CAPACITY_RETRY_AFTER
         ));
         drop(alice_one);
-        let bob = capacity.try_acquire("bob").unwrap();
-        assert!(matches!(
-            capacity.try_acquire("alice"),
-            Err(RateLimitError::Limited(retry_after)) if retry_after == SSE_CAPACITY_RETRY_AFTER
-        ));
-        drop(alice_two);
-        drop(bob);
-        assert!(capacity.try_acquire("alice").is_ok());
+        assert!(capacity.try_acquire(&alice).is_ok());
+        drop(alice_other_account_lease);
+        drop(bob_lease);
+    }
+
+    fn test_authz_context(account_id: &str, user_id: &str, auth_session_id: &str) -> AuthzContext {
+        AuthzContext {
+            account_id: AccountId::from_persistence(account_id).unwrap(),
+            user_id: user_id.into(),
+            membership_role: MembershipRole::Owner,
+            membership_revision: tenancy::MembershipRevision::new(1).unwrap(),
+            auth_session_id: AuthSessionId::from_persistence(auth_session_id).unwrap(),
+        }
     }
 
     #[tokio::test]
@@ -3208,7 +3318,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_wrong_disabled_and_member_login_failures_are_indistinguishable() {
+    async fn invalid_member_disabled_and_non_local_login_failures_are_indistinguishable() {
         let fixture = configured_auth_test_app("login-equivalence", LOGIN_RATE_POLICY).await;
         let mut failures = Vec::new();
 
@@ -3229,16 +3339,37 @@ mod tests {
                 .unwrap(),
         );
 
-        update_test_user_access(&fixture.path, "member", "active");
+        insert_test_member(&fixture.path, "user-login-member", "member");
+        copy_test_password(&fixture.path, "owner", "member");
         failures.push(
             fixture
                 .app
                 .clone()
-                .oneshot(login_request("owner", TEST_OWNER_PASSWORD))
+                .oneshot(login_request("member", TEST_OWNER_PASSWORD))
                 .await
                 .unwrap(),
         );
-        update_test_user_access(&fixture.path, "owner", "disabled");
+        insert_test_non_local_owner(&fixture.path);
+        copy_test_password(&fixture.path, "owner", "other-owner");
+        failures.push(
+            fixture
+                .app
+                .clone()
+                .oneshot(login_request("other-owner", TEST_OWNER_PASSWORD))
+                .await
+                .unwrap(),
+        );
+        insert_test_disabled_local_owner(&fixture.path);
+        copy_test_password(&fixture.path, "owner", "disabled-owner");
+        failures.push(
+            fixture
+                .app
+                .clone()
+                .oneshot(login_request("disabled-owner", TEST_OWNER_PASSWORD))
+                .await
+                .unwrap(),
+        );
+        update_test_user_status(&fixture.path, "disabled");
         failures.push(
             fixture
                 .app
@@ -3248,10 +3379,16 @@ mod tests {
                 .unwrap(),
         );
 
+        let mut expected_headers = None;
         let mut expected_problem = None;
         for response in failures {
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
             assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            if let Some(expected) = &expected_headers {
+                assert_eq!(response.headers(), expected);
+            } else {
+                expected_headers = Some(response.headers().clone());
+            }
             let problem: ProblemDetails = response_json(response).await;
             assert_eq!(problem.code, "invalid_credentials");
             if let Some(expected) = &expected_problem {
@@ -3261,7 +3398,7 @@ mod tests {
             }
         }
 
-        update_test_user_access(&fixture.path, "owner", "active");
+        update_test_user_status(&fixture.path, "active");
         let success = fixture
             .app
             .clone()
@@ -3468,7 +3605,7 @@ mod tests {
             loop {
                 let detail = store
                     .get_session_for_actor(
-                        &owner.user_id,
+                        &owner.authz,
                         &session_id,
                         None,
                         protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
@@ -3510,7 +3647,7 @@ mod tests {
         let job_id = "reply-legacy-oversized-reply";
         store
             .create_session_for_actor(
-                &identity.user_id,
+                &identity.authz,
                 CreateSessionRequest {
                     id: session_id.into(),
                     title: "Legacy oversized reply".into(),
@@ -3526,7 +3663,7 @@ mod tests {
         let metadata = provider.metadata().clone();
         store
             .start_turn_and_enqueue_reply_for_actor(
-                &identity.user_id,
+                &identity.authz,
                 session_id,
                 StartTurnRequest {
                     turn_id: turn_id.into(),
@@ -3536,7 +3673,7 @@ mod tests {
                 "start-legacy-oversized-reply",
                 ReplyJobSpec {
                     id: job_id.into(),
-                    actor_user_id: identity.user_id.clone(),
+                    authz: identity.authz.clone(),
                     provider_name: metadata.provider_id,
                     model_name: metadata.model,
                     request_json: serde_json::to_value(ReplyRequest::new([ReplyMessage::new(
@@ -3572,13 +3709,29 @@ mod tests {
         process_reply_job(&state, *job).await.unwrap();
 
         assert_eq!(provider_calls.load(Ordering::Relaxed), 0);
-        let stored = store.reply_job(job_id).await.unwrap().unwrap();
+        let stored = store
+            .reply_job_for_actor(&identity.authz, job_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.status, runtime::ReplyJobStatus::Failed);
         assert_eq!(
             stored.error_json.unwrap()["code"],
             "persisted_request_exceeds_resource_envelope"
         );
-        let detail = store.get_session(session_id).await.unwrap();
+        let detail = store
+            .get_session_for_actor(
+                &identity.authz,
+                session_id,
+                None,
+                protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                None,
+                protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                None,
+                protocol::EVENT_PAGE_DEFAULT_LIMIT,
+            )
+            .await
+            .unwrap();
         assert_eq!(detail.session.status, SessionStatus::NeedsAttention);
         assert!(matches!(
             &detail.events.last().unwrap().data,
@@ -3596,7 +3749,7 @@ mod tests {
         let job_id = "reply-oversized-provider-reply";
         store
             .create_session_for_actor(
-                &identity.user_id,
+                &identity.authz,
                 CreateSessionRequest {
                     id: session_id.into(),
                     title: "Oversized provider reply".into(),
@@ -3612,7 +3765,7 @@ mod tests {
         let metadata = provider.metadata().clone();
         store
             .start_turn_and_enqueue_reply_for_actor(
-                &identity.user_id,
+                &identity.authz,
                 session_id,
                 StartTurnRequest {
                     turn_id: turn_id.into(),
@@ -3622,7 +3775,7 @@ mod tests {
                 "start-oversized-provider-reply",
                 ReplyJobSpec {
                     id: job_id.into(),
-                    actor_user_id: identity.user_id.clone(),
+                    authz: identity.authz.clone(),
                     provider_name: metadata.provider_id,
                     model_name: metadata.model,
                     request_json: serde_json::to_value(ReplyRequest::new([ReplyMessage::new(
@@ -3653,14 +3806,30 @@ mod tests {
         process_reply_job(&state, *job).await.unwrap();
 
         assert_eq!(calls.load(Ordering::Relaxed), 1);
-        let stored = store.reply_job(job_id).await.unwrap().unwrap();
+        let stored = store
+            .reply_job_for_actor(&identity.authz, job_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.status, runtime::ReplyJobStatus::Failed);
         let error = stored.error_json.unwrap();
         assert_eq!(error["code"], "provider_reply_too_large");
         assert!(
             error["message"].as_str().unwrap().len() <= protocol::REPLY_ERROR_MESSAGE_MAX_BYTES
         );
-        let detail = store.get_session(session_id).await.unwrap();
+        let detail = store
+            .get_session_for_actor(
+                &identity.authz,
+                session_id,
+                None,
+                protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                None,
+                protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                None,
+                protocol::EVENT_PAGE_DEFAULT_LIMIT,
+            )
+            .await
+            .unwrap();
         assert_eq!(detail.session.status, SessionStatus::NeedsAttention);
         assert!(detail.turns[0].assistant_message.is_none());
         assert!(detail.events.iter().all(|event| !matches!(
@@ -3687,6 +3856,7 @@ mod tests {
         ] {
             let store = DemoStore::seeded().await.unwrap();
             let bootstrap_hash = "d".repeat(64);
+            let auth_session_id = AuthSessionId::generate().unwrap();
             let expires_at = (chrono::Utc::now() + chrono::Duration::hours(1))
                 .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
             store
@@ -3699,18 +3869,26 @@ mod tests {
                     user_id: "user-owner".into(),
                     username: "owner".into(),
                     password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA".into(),
+                    auth_session_id: auth_session_id.clone(),
                     session_token_hash: "e".repeat(64),
                     csrf_hash: "f".repeat(64),
                     session_expires_at: expires_at,
                 })
                 .await
                 .unwrap();
+            let authz = AuthzContext {
+                account_id: AccountId::local(),
+                user_id: "user-owner".into(),
+                membership_role: MembershipRole::Owner,
+                membership_revision: tenancy::MembershipRevision::new(1).unwrap(),
+                auth_session_id,
+            };
             let session_id = format!("session-{suffix}");
             let turn_id = format!("turn-{suffix}");
             let job_id = format!("reply-{suffix}");
             store
                 .create_session_for_actor(
-                    "user-owner",
+                    &authz,
                     CreateSessionRequest {
                         id: session_id.clone(),
                         title: format!("Indeterminate {suffix}"),
@@ -3723,7 +3901,7 @@ mod tests {
             let metadata = provider.metadata();
             store
                 .start_turn_and_enqueue_reply_for_actor(
-                    "user-owner",
+                    &authz,
                     &session_id,
                     StartTurnRequest {
                         turn_id: turn_id.clone(),
@@ -3733,7 +3911,7 @@ mod tests {
                     &format!("start-{suffix}"),
                     ReplyJobSpec {
                         id: job_id.clone(),
-                        actor_user_id: "user-owner".into(),
+                        authz: authz.clone(),
                         provider_name: metadata.provider_id.clone(),
                         model_name: metadata.model.clone(),
                         request_json: serde_json::to_value(ReplyRequest::new([ReplyMessage::new(
@@ -3763,10 +3941,26 @@ mod tests {
 
             process_reply_job(&state, *job).await.unwrap();
 
-            let stored = store.reply_job(&job_id).await.unwrap().unwrap();
+            let stored = store
+                .reply_job_for_actor(&authz, &job_id)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(stored.status, runtime::ReplyJobStatus::OutcomeUnknown);
             assert_eq!(stored.error_json.unwrap()["code"], expected_code);
-            let detail = store.get_session(&session_id).await.unwrap();
+            let detail = store
+                .get_session_for_actor(
+                    &authz,
+                    &session_id,
+                    None,
+                    protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                    None,
+                    protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                    None,
+                    protocol::EVENT_PAGE_DEFAULT_LIMIT,
+                )
+                .await
+                .unwrap();
             assert_eq!(detail.session.status, SessionStatus::NeedsAttention);
             assert!(matches!(
                 &detail.events.last().unwrap().data,
@@ -4127,10 +4321,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            revoked.headers()[header::CACHE_CONTROL],
+            HeaderValue::from_static("no-store")
+        );
     }
 
     #[tokio::test]
-    async fn cross_actor_rest_and_sse_are_not_found_and_live_sse_closes_on_owner_change() {
+    async fn cross_account_rest_and_sse_are_not_found_and_live_sse_closes_on_account_change() {
         let (app, store, alice, path) = authenticated_file_app("cross-actor").await;
         let bob = insert_test_member(&path, "user-bob", "bob");
         let session_id = "session-cross-actor";
@@ -4181,9 +4379,9 @@ mod tests {
                 .contains("stream-open")
         );
 
-        // Production ownership is immutable. This test-only database mutation
-        // simulates a future administrative transfer and proves the stream
-        // does not keep relying on the authorization snapshot from open time.
+        // Production account ownership is immutable. This test-only database
+        // mutation simulates a future administrative transfer and proves the
+        // stream does not keep relying on its open-time authorization snapshot.
         transfer_test_session(&path, session_id, &bob.user_id);
         let ended = tokio::time::timeout(Duration::from_secs(3), sse_body.frame())
             .await
@@ -4226,6 +4424,25 @@ mod tests {
         )
         .await;
 
+        let malformed_foreign_limit = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/sessions/{session_id}?events_limit=not-a-number"
+                ))
+                .header(header::COOKIE, &alice.cookie_header)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            malformed_foreign_limit,
+            StatusCode::NOT_FOUND,
+            "session_not_found",
+        )
+        .await;
+
         let malformed_foreign_turn = app
             .clone()
             .oneshot(
@@ -4254,8 +4471,7 @@ mod tests {
                     .header(header::COOKIE, &alice.cookie_header)
                     .header(CSRF_HEADER, &alice.csrf_token)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header("idempotency-key", "resume-cross-actor")
-                    .body(Body::from(r#"{"expected_sequence":1}"#))
+                    .body(Body::from("not-json"))
                     .unwrap(),
             )
             .await
@@ -4293,6 +4509,25 @@ mod tests {
             .unwrap();
         assert_eq!(cross_actor_sse.status(), StatusCode::NOT_FOUND);
 
+        let malformed_foreign_sse = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/sessions/{session_id}/events?after=not-a-number"
+                ))
+                .header(header::COOKIE, &alice.cookie_header)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            malformed_foreign_sse,
+            StatusCode::NOT_FOUND,
+            "session_not_found",
+        )
+        .await;
+
         let sessions = app
             .clone()
             .oneshot(
@@ -4325,7 +4560,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_actor_run_rest_review_and_sse_are_not_found_and_live_sse_closes() {
+    async fn cross_account_run_rest_review_and_sse_are_not_found_and_live_sse_closes() {
         let (app, store, alice, path) = authenticated_file_app("cross-run").await;
         let bob = insert_test_member(&path, "user-bob-run", "bob-run");
 
@@ -4394,6 +4629,25 @@ mod tests {
         )
         .await;
 
+        let malformed_foreign_limit = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/runs/{DEMO_RUN_ID}?events_limit=not-a-number"
+                ))
+                .header(header::COOKIE, &alice.cookie_header)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            malformed_foreign_limit,
+            StatusCode::NOT_FOUND,
+            "run_not_found",
+        )
+        .await;
+
         let review = app
             .clone()
             .oneshot(
@@ -4405,8 +4659,7 @@ mod tests {
                 .header(header::COOKIE, &alice.cookie_header)
                 .header(CSRF_HEADER, &alice.csrf_token)
                 .header(header::CONTENT_TYPE, "application/json")
-                .header("idempotency-key", "review-cross-actor")
-                .body(Body::from(r#"{"decision":"reject"}"#))
+                .body(Body::from("not-json"))
                 .unwrap(),
             )
             .await
@@ -4424,6 +4677,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cross_actor_sse.status(), StatusCode::NOT_FOUND);
+
+        let malformed_foreign_sse = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/runs/{DEMO_RUN_ID}/events?after=not-a-number"
+                ))
+                .header(header::COOKIE, &alice.cookie_header)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            malformed_foreign_sse,
+            StatusCode::NOT_FOUND,
+            "run_not_found",
+        )
+        .await;
 
         let overview = app
             .clone()
@@ -4443,7 +4715,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sse_closes_when_the_authenticated_actor_role_changes() {
+    async fn legacy_user_role_mutation_does_not_change_authority_but_membership_revision_does() {
         let (app, store, alice, path) = authenticated_file_app("role-change").await;
         let sse = app
             .clone()
@@ -4469,10 +4741,46 @@ mod tests {
         );
 
         change_test_user_role(&path, &alice.user_id, "member");
+        let accepted = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/overview")
+                    .header(header::COOKIE, &alice.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let status = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/auth/status")
+                    .header(header::COOKIE, &alice.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let status: AuthStatusResponse = response_json(status).await;
+        assert_eq!(status.user.unwrap().role, AccountRole::Owner);
+
+        let legacy_role_did_not_close =
+            tokio::time::timeout(Duration::from_secs(3), body.frame()).await;
+        assert!(
+            legacy_role_did_not_close.is_err(),
+            "legacy users.role unexpectedly changed the live SSE authority"
+        );
+
+        bump_test_membership_revision(&path, &alice.user_id);
         let ended = tokio::time::timeout(Duration::from_secs(3), body.frame())
             .await
-            .expect("role-changed SSE should close by the next durable poll");
-        assert!(ended.is_none(), "role-changed SSE emitted another frame");
+            .expect("membership revision change should close SSE by the next durable poll");
+        assert!(
+            ended.is_none(),
+            "membership-revision-changed SSE emitted another frame"
+        );
 
         let rejected = app
             .clone()
@@ -4486,9 +4794,66 @@ mod tests {
             .unwrap();
         assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
 
+        drop(body);
         drop(app);
         drop(store);
         cleanup_test_database(&path);
+    }
+
+    #[tokio::test]
+    async fn membership_account_and_user_status_changes_revoke_cookie_and_live_sse() {
+        for authority in ["membership", "account", "user"] {
+            let (app, store, owner, path) =
+                authenticated_file_app(&format!("{authority}-status-revocation")).await;
+            let sse = app
+                .clone()
+                .oneshot(
+                    Request::get("/api/v1/sessions/session-ZR-1842/events?after=2")
+                        .header(header::COOKIE, &owner.cookie_header)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(sse.status(), StatusCode::OK);
+            let mut body = sse.into_body();
+            let opened = tokio::time::timeout(Duration::from_secs(1), body.frame())
+                .await
+                .expect("owner SSE should open immediately")
+                .expect("owner SSE should produce an opening frame")
+                .expect("owner SSE opening frame should be valid");
+            assert!(
+                String::from_utf8(opened.into_data().unwrap().to_vec())
+                    .unwrap()
+                    .contains("stream-open")
+            );
+
+            invalidate_test_authority(&path, &owner.user_id, authority);
+            let ended = tokio::time::timeout(Duration::from_secs(3), body.frame())
+                .await
+                .unwrap_or_else(|_| panic!("{authority} status change did not revalidate SSE"));
+            assert!(
+                ended.is_none(),
+                "{authority} status change emitted another SSE frame"
+            );
+
+            let rejected = app
+                .clone()
+                .oneshot(
+                    Request::get("/api/v1/overview")
+                        .header(header::COOKIE, &owner.cookie_header)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+            drop(body);
+            drop(app);
+            drop(store);
+            cleanup_test_database(&path);
+        }
     }
 
     #[tokio::test]
@@ -4594,11 +4959,11 @@ mod tests {
     #[tokio::test]
     async fn session_list_is_a_bare_bounded_array_and_cursor_walks_101_rows() {
         let store = DemoStore::seeded().await.unwrap();
-        let app = app(store.clone()).await;
+        let (app, current) = app_with_auth(store.clone()).await;
         for index in 0..100 {
             store
                 .create_session_for_actor(
-                    "user-test-owner",
+                    &current.authz,
                     CreateSessionRequest {
                         id: format!("session-page-{index:03}"),
                         title: format!("Pagination fixture {index:03}"),
@@ -4757,16 +5122,14 @@ mod tests {
     #[tokio::test]
     async fn session_turn_point_read_reaches_beyond_tail_and_masks_unknown_turns() {
         const SESSION_ID: &str = "session-ZR-1842";
-        const ACTOR_ID: &str = "user-test-owner";
-
         let store = DemoStore::seeded().await.unwrap();
-        let app = app(store.clone()).await;
+        let (app, current) = app_with_auth(store.clone()).await;
         let mut sequence = 2;
         for ordinal in 1..=51 {
             let turn_id = format!("turn-point-{ordinal:03}");
             let started = store
                 .start_turn_for_actor(
-                    ACTOR_ID,
+                    &current.authz,
                     SESSION_ID,
                     StartTurnRequest {
                         turn_id: turn_id.clone(),
@@ -4779,7 +5142,7 @@ mod tests {
                 .unwrap();
             let flushed = store
                 .flush_turn_for_actor(
-                    ACTOR_ID,
+                    &current.authz,
                     SESSION_ID,
                     protocol::FlushSessionRequest {
                         turn_id,
@@ -5396,8 +5759,10 @@ mod tests {
     #[tokio::test]
     async fn sse_polls_the_ledger_without_local_broadcast_hints() {
         let store = DemoStore::seeded().await.unwrap();
-        let response = app_with_event_feed_options(store.clone(), Duration::from_millis(10), false)
-            .await
+        let (app, current) =
+            app_with_event_feed_options_and_auth(store.clone(), Duration::from_millis(10), false)
+                .await;
+        let response = app
             .oneshot(
                 Request::get(format!("/api/v1/runs/{DEMO_RUN_ID}/events?after=8"))
                     .body(Body::empty())
@@ -5430,7 +5795,7 @@ mod tests {
 
         let reviewed = store
             .review_for_actor(
-                "user-test-owner",
+                &current.authz,
                 DEMO_RUN_ID,
                 "APR-901",
                 ReviewRequest {
@@ -5457,7 +5822,7 @@ mod tests {
         let current = configure_test_actor(&store).await;
         let reviewed = store
             .review_for_actor(
-                &current.user_id,
+                &current.authz,
                 DEMO_RUN_ID,
                 "APR-901",
                 ReviewRequest {
@@ -5473,7 +5838,15 @@ mod tests {
 
         let detail = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let detail = store.run_detail(DEMO_RUN_ID).await.unwrap();
+                let detail = store
+                    .run_detail_for_actor(
+                        &current.authz,
+                        DEMO_RUN_ID,
+                        None,
+                        protocol::EVENT_PAGE_DEFAULT_LIMIT,
+                    )
+                    .await
+                    .unwrap();
                 if detail.run.sequence >= 11 {
                     break detail;
                 }
@@ -5487,7 +5860,7 @@ mod tests {
 
         let replay = run_events_for_hint(
             &store,
-            &current.user_id,
+            &current.authz,
             DEMO_RUN_ID,
             8,
             &PublishedEvent {
@@ -5570,6 +5943,28 @@ mod tests {
                     .and_then(|value| value.to_str().ok()),
                 retry_after
             );
+            let problem: ProblemDetails = response_json(response).await;
+            assert_eq!(problem.code, code);
+        }
+    }
+
+    #[tokio::test]
+    async fn authorization_errors_use_stable_no_store_contracts() {
+        for (error, status, code) in [
+            (
+                StoreError::AuthSessionNotFound,
+                StatusCode::UNAUTHORIZED,
+                "authentication_required",
+            ),
+            (
+                StoreError::PermissionDenied,
+                StatusCode::FORBIDDEN,
+                "permission_denied",
+            ),
+        ] {
+            let response = ApiError::from(error).into_response();
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
             let problem: ProblemDetails = response_json(response).await;
             assert_eq!(problem.code, code);
         }
@@ -5788,15 +6183,14 @@ mod tests {
             .unwrap()
     }
 
-    fn update_test_user_access(path: &Path, role: &str, status: &str) {
+    fn update_test_user_status(path: &Path, status: &str) {
         let connection = Connection::open(path).unwrap();
         connection.busy_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(
             connection
                 .execute(
-                    "UPDATE users SET role = ?1, status = ?2, updated_at = ?3 WHERE username = 'owner'",
+                    "UPDATE users SET status = ?1, updated_at = ?2 WHERE username = 'owner'",
                     params![
-                        role,
                         status,
                         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                     ],
@@ -5804,6 +6198,96 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    fn copy_test_password(path: &Path, source_username: &str, target_username: &str) {
+        let connection = Connection::open(path).unwrap();
+        connection.busy_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            connection
+                .execute(
+                    r#"UPDATE users
+                       SET password_hash = (
+                               SELECT password_hash FROM users WHERE username = ?1
+                           ),
+                           updated_at = ?3
+                       WHERE username = ?2"#,
+                    params![
+                        source_username,
+                        target_username,
+                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    ],
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    fn insert_test_non_local_owner(path: &Path) {
+        let connection = Connection::open(path).unwrap();
+        connection.busy_timeout(Duration::from_secs(1)).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        connection
+            .execute(
+                r#"INSERT INTO accounts(id, name, status, created_at, updated_at)
+                   VALUES ('acc_other', 'Other', 'active', ?1, ?1)"#,
+                [&timestamp],
+            )
+            .unwrap();
+        connection
+            .execute(
+                r#"INSERT INTO users(
+                       id, username, role, status, password_hash, created_at, updated_at
+                   ) VALUES (
+                       'user-other-owner', 'other-owner', 'owner', 'active',
+                       '$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA', ?1, ?1
+                   )"#,
+                [&timestamp],
+            )
+            .unwrap();
+        connection
+            .execute(
+                r#"INSERT INTO account_memberships(
+                       account_id, user_id, role, status, revision, created_at, updated_at
+                   ) VALUES (
+                       'acc_other', 'user-other-owner', 'owner', 'active', 1, ?1, ?1
+                   )"#,
+                [&timestamp],
+            )
+            .unwrap();
+    }
+
+    fn insert_test_disabled_local_owner(path: &Path) {
+        let connection = Connection::open(path).unwrap();
+        connection.busy_timeout(Duration::from_secs(1)).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        connection
+            .execute(
+                r#"INSERT INTO users(
+                       id, username, role, status, password_hash, created_at, updated_at
+                   ) VALUES (
+                       'user-disabled-owner', 'disabled-owner', 'owner', 'active',
+                       '$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA', ?1, ?1
+                   )"#,
+                [&timestamp],
+            )
+            .unwrap();
+        connection
+            .execute(
+                r#"INSERT INTO account_memberships(
+                       account_id, user_id, role, status, revision, created_at, updated_at
+                   ) VALUES (
+                       'acc_local', 'user-disabled-owner', 'owner', 'disabled', 1, ?1, ?1
+                   )"#,
+                [&timestamp],
+            )
+            .unwrap();
     }
 
     async fn assert_problem(response: Response, status: StatusCode, code: &str) {
@@ -5823,6 +6307,7 @@ mod tests {
 
     struct TestIdentity {
         user_id: String,
+        authz: AuthzContext,
         cookie_header: String,
         csrf_token: String,
     }
@@ -5897,6 +6382,7 @@ mod tests {
         username: &str,
     ) -> TestIdentity {
         let bootstrap_hash = "1".repeat(64);
+        let auth_session_id = AuthSessionId::generate().unwrap();
         let session_token = SessionToken::generate().unwrap();
         let csrf_token = CsrfToken::generate().unwrap();
         let expires_at = (chrono::Utc::now() + chrono::Duration::hours(1))
@@ -5911,6 +6397,7 @@ mod tests {
                 user_id: user_id.into(),
                 username: username.into(),
                 password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA".into(),
+                auth_session_id: auth_session_id.clone(),
                 session_token_hash: session_token.digest().to_persistence(),
                 csrf_hash: csrf_token.digest().to_persistence(),
                 session_expires_at: expires_at,
@@ -5919,6 +6406,13 @@ mod tests {
             .unwrap();
         TestIdentity {
             user_id: user_id.into(),
+            authz: AuthzContext {
+                account_id: AccountId::local(),
+                user_id: user_id.into(),
+                membership_role: MembershipRole::Owner,
+                membership_revision: tenancy::MembershipRevision::new(1).unwrap(),
+                auth_session_id,
+            },
             cookie_header: format!(
                 "{SESSION_COOKIE}={}; {CSRF_COOKIE}={}",
                 session_token.expose_secret(),
@@ -5929,6 +6423,7 @@ mod tests {
     }
 
     fn insert_test_member(path: &Path, user_id: &str, username: &str) -> TestIdentity {
+        let auth_session_id = AuthSessionId::generate().unwrap();
         let session_token = SessionToken::generate().unwrap();
         let csrf_token = CsrfToken::generate().unwrap();
         let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -5962,10 +6457,20 @@ mod tests {
             .unwrap();
         connection
             .execute(
+                r#"INSERT INTO account_memberships(
+                       account_id, user_id, role, status, revision, created_at, updated_at
+                   ) VALUES ('acc_local', ?1, 'member', 'active', 1, ?2, ?2)"#,
+                params![user_id, timestamp],
+            )
+            .unwrap();
+        connection
+            .execute(
                 r#"INSERT INTO auth_sessions(
-                       token_hash, user_id, csrf_hash, created_at, expires_at, last_seen_at
-                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?4)"#,
+                       id, token_hash, account_id, user_id, membership_revision,
+                       csrf_hash, created_at, expires_at, last_seen_at
+                   ) VALUES (?1, ?2, 'acc_local', ?3, 1, ?4, ?5, ?6, ?5)"#,
                 params![
+                    auth_session_id.as_str(),
                     session_token.digest().to_persistence(),
                     user_id,
                     csrf_token.digest().to_persistence(),
@@ -5976,6 +6481,13 @@ mod tests {
             .unwrap();
         TestIdentity {
             user_id: user_id.into(),
+            authz: AuthzContext {
+                account_id: AccountId::local(),
+                user_id: user_id.into(),
+                membership_role: MembershipRole::Member,
+                membership_revision: tenancy::MembershipRevision::new(1).unwrap(),
+                auth_session_id,
+            },
             cookie_header: format!(
                 "{SESSION_COOKIE}={}; {CSRF_COOKIE}={}",
                 session_token.expose_secret(),
@@ -5991,13 +6503,19 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .unwrap();
+        insert_test_foreign_account_owner(&connection, new_owner_user_id);
         connection
-            .execute_batch("DROP TRIGGER sessions_owner_is_write_once")
+            .execute_batch(
+                "DROP TRIGGER sessions_owner_is_write_once;
+                 DROP TRIGGER sessions_account_is_immutable;",
+            )
             .unwrap();
         assert_eq!(
             connection
                 .execute(
-                    "UPDATE sessions SET owner_user_id = ?1 WHERE id = ?2",
+                    r#"UPDATE sessions
+                       SET owner_user_id = ?1, account_id = 'acc_other'
+                       WHERE id = ?2"#,
                     params![new_owner_user_id, session_id],
                 )
                 .unwrap(),
@@ -6011,13 +6529,19 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .unwrap();
+        insert_test_foreign_account_owner(&connection, new_owner_user_id);
         connection
-            .execute_batch("DROP TRIGGER runs_owner_is_write_once")
+            .execute_batch(
+                "DROP TRIGGER runs_owner_is_write_once;
+                 DROP TRIGGER runs_account_is_immutable;",
+            )
             .unwrap();
         assert_eq!(
             connection
                 .execute(
-                    "UPDATE runs SET owner_user_id = ?1 WHERE id = ?2",
+                    r#"UPDATE runs
+                       SET owner_user_id = ?1, account_id = 'acc_other'
+                       WHERE id = ?2"#,
                     params![new_owner_user_id, run_id],
                 )
                 .unwrap(),
@@ -6041,6 +6565,100 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    fn bump_test_membership_revision(path: &Path, user_id: &str) {
+        let connection = Connection::open(path).unwrap();
+        connection.busy_timeout(Duration::from_secs(1)).unwrap();
+        let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        insert_test_backup_owner(&connection, &timestamp);
+        assert_eq!(
+            connection
+                .execute(
+                    r#"UPDATE account_memberships
+                       SET role = 'member', revision = revision + 1, updated_at = ?1
+                       WHERE account_id = 'acc_local' AND user_id = ?2"#,
+                    params![timestamp, user_id],
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    fn invalidate_test_authority(path: &Path, user_id: &str, authority: &str) {
+        let connection = Connection::open(path).unwrap();
+        connection.busy_timeout(Duration::from_secs(1)).unwrap();
+        let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let changed = match authority {
+            "membership" => {
+                insert_test_backup_owner(&connection, &timestamp);
+                connection
+                    .execute(
+                        r#"UPDATE account_memberships
+                           SET status = 'disabled', revision = revision + 1, updated_at = ?1
+                           WHERE account_id = 'acc_local' AND user_id = ?2"#,
+                        params![timestamp, user_id],
+                    )
+                    .unwrap()
+            }
+            "account" => connection
+                .execute(
+                    "UPDATE accounts SET status = 'suspended', updated_at = ?1 WHERE id = 'acc_local'",
+                    [&timestamp],
+                )
+                .unwrap(),
+            "user" => connection
+                .execute(
+                    "UPDATE users SET status = 'disabled', updated_at = ?1 WHERE id = ?2",
+                    params![timestamp, user_id],
+                )
+                .unwrap(),
+            _ => panic!("unknown authority fixture {authority}"),
+        };
+        assert_eq!(changed, 1);
+    }
+
+    fn insert_test_foreign_account_owner(connection: &Connection, user_id: &str) {
+        let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        connection
+            .execute(
+                r#"INSERT INTO accounts(id, name, status, created_at, updated_at)
+                   VALUES ('acc_other', 'Other', 'active', ?1, ?1)"#,
+                [&timestamp],
+            )
+            .unwrap();
+        connection
+            .execute(
+                r#"INSERT INTO account_memberships(
+                       account_id, user_id, role, status, revision, created_at, updated_at
+                   ) VALUES ('acc_other', ?1, 'owner', 'active', 1, ?2, ?2)"#,
+                params![user_id, timestamp],
+            )
+            .unwrap();
+    }
+
+    fn insert_test_backup_owner(connection: &Connection, timestamp: &str) {
+        connection
+            .execute(
+                r#"INSERT INTO users(
+                       id, username, role, status, password_hash, created_at, updated_at
+                   ) VALUES (
+                       'user-backup-owner', 'backup-owner', 'owner', 'active',
+                       '$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA', ?1, ?1
+                   )"#,
+                [timestamp],
+            )
+            .unwrap();
+        connection
+            .execute(
+                r#"INSERT INTO account_memberships(
+                       account_id, user_id, role, status, revision, created_at, updated_at
+                   ) VALUES (
+                       'acc_local', 'user-backup-owner', 'owner', 'active', 1, ?1, ?1
+                   )"#,
+                [timestamp],
+            )
+            .unwrap();
     }
 
     fn cleanup_test_database(path: &Path) {

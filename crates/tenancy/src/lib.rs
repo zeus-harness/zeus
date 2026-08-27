@@ -15,6 +15,7 @@ use argon2::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand_core::{OsRng, RngCore};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -26,6 +27,7 @@ pub const PASSWORD_MIN_CHARS: usize = 12;
 pub const PASSWORD_MAX_BYTES: usize = 1024;
 
 const USER_ID_RANDOM_BYTES: usize = 16;
+const AUTH_SESSION_ID_RANDOM_BYTES: usize = 16;
 const TOKEN_RANDOM_BYTES: usize = 32;
 const ARGON2_MEMORY_KIB: u32 = 19 * 1024;
 const ARGON2_ITERATIONS: u32 = 2;
@@ -90,6 +92,82 @@ impl FromStr for UserId {
 pub enum UserIdError {
     #[error("user ID must use the canonical server-generated representation")]
     InvalidFormat,
+}
+
+/// Durable account identifier carried by every authorized operation.
+///
+/// Persistence accepts bounded legacy-compatible values because existing Zeus
+/// databases predate the canonical local account. New local deployments use
+/// the deterministic `acc_local` identifier.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+pub struct AccountId(String);
+
+impl AccountId {
+    pub fn local() -> Self {
+        Self("acc_local".into())
+    }
+
+    pub fn from_persistence(value: impl Into<String>) -> Result<Self, AuthorityIdError> {
+        Ok(Self(validate_authority_id(value.into(), "account ID")?))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AccountId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Stable, non-secret identity for one login session.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+pub struct AuthSessionId(String);
+
+impl AuthSessionId {
+    pub fn generate() -> Result<Self, RandomnessError> {
+        let mut bytes = [0_u8; AUTH_SESSION_ID_RANDOM_BYTES];
+        OsRng
+            .try_fill_bytes(&mut bytes)
+            .map_err(|_| RandomnessError::Unavailable)?;
+        Ok(Self(format!("asi_{}", URL_SAFE_NO_PAD.encode(bytes))))
+    }
+
+    pub fn from_persistence(value: impl Into<String>) -> Result<Self, AuthorityIdError> {
+        Ok(Self(validate_authority_id(
+            value.into(),
+            "authentication session ID",
+        )?))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AuthSessionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+fn validate_authority_id(value: String, field: &'static str) -> Result<String, AuthorityIdError> {
+    if value.is_empty()
+        || value.len() > 128
+        || value.trim() != value
+        || value.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(AuthorityIdError::Invalid { field });
+    }
+    Ok(value)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum AuthorityIdError {
+    #[error("{field} must be non-empty, trimmed, bounded, and contain no control characters")]
+    Invalid { field: &'static str },
 }
 
 /// Case-insensitive ASCII username stored in lowercase canonical form.
@@ -158,13 +236,14 @@ pub enum UsernameError {
     InvalidCharacter { index: usize, character: char },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Role {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MembershipRole {
     Owner,
     Member,
 }
 
-impl Role {
+impl MembershipRole {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Owner => "owner",
@@ -173,28 +252,61 @@ impl Role {
     }
 }
 
-impl fmt::Display for Role {
+impl fmt::Display for MembershipRole {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
 }
 
-impl FromStr for Role {
-    type Err = RoleError;
+impl FromStr for MembershipRole {
+    type Err = MembershipRoleError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "owner" => Ok(Self::Owner),
             "member" => Ok(Self::Member),
-            _ => Err(RoleError::Unsupported(value.to_owned())),
+            _ => Err(MembershipRoleError::Unsupported(value.to_owned())),
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
-pub enum RoleError {
-    #[error("unsupported local user role `{0}`")]
+pub enum MembershipRoleError {
+    #[error("unsupported account membership role `{0}`")]
     Unsupported(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+pub struct MembershipRevision(u64);
+
+impl MembershipRevision {
+    pub fn new(value: u64) -> Result<Self, MembershipRevisionError> {
+        if value == 0 {
+            return Err(MembershipRevisionError::Zero);
+        }
+        Ok(Self(value))
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum MembershipRevisionError {
+    #[error("membership revision must be positive")]
+    Zero,
+}
+
+/// Authenticated account authority. Callers carry this value, while storage
+/// re-reads the durable membership at every mutation linearization point.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AuthzContext {
+    pub account_id: AccountId,
+    pub user_id: String,
+    pub membership_role: MembershipRole,
+    pub membership_revision: MembershipRevision,
+    pub auth_session_id: AuthSessionId,
 }
 
 /// A policy-validated password whose allocation is zeroized on drop.
@@ -605,10 +717,30 @@ mod tests {
     }
 
     #[test]
-    fn roles_have_a_strict_persistence_representation() {
-        assert_eq!(Role::Owner.to_string(), "owner");
-        assert_eq!(Role::from_str("member").unwrap(), Role::Member);
-        assert!(Role::from_str("admin").is_err());
+    fn authority_context_primitives_are_strict_and_legacy_compatible() {
+        assert_eq!(MembershipRole::Owner.to_string(), "owner");
+        assert_eq!(
+            MembershipRole::from_str("member").unwrap(),
+            MembershipRole::Member
+        );
+        assert!(MembershipRole::from_str("admin").is_err());
+        assert_eq!(
+            serde_json::to_string(&MembershipRole::Owner).unwrap(),
+            "\"owner\""
+        );
+        assert_eq!(AccountId::local().as_str(), "acc_local");
+        assert!(AccountId::from_persistence(" legacy").is_err());
+        assert_eq!(MembershipRevision::new(1).unwrap().get(), 1);
+        assert!(MembershipRevision::new(0).is_err());
+
+        let auth_session_id = AuthSessionId::generate().unwrap();
+        assert!(auth_session_id.as_str().starts_with("asi_"));
+        assert_eq!(
+            AuthSessionId::from_persistence("legacy-auth-session")
+                .unwrap()
+                .as_str(),
+            "legacy-auth-session"
+        );
     }
 
     #[test]

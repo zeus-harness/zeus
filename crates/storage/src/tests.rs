@@ -23,9 +23,10 @@ use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
 use crate::{
-    AuthSessionCommit, BootstrapOwnerCommit, ClaimOutcome, CommitOutcome, DispatchCompleteCommit,
-    DispatchJobSpec, DispatchRecoveryCommit, DispatchStartCommit, DispatchStatus,
-    ReplyClaimOutcome, ReplyFailureCommit, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
+    AccountId, AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, ClaimOutcome,
+    CommitOutcome, DispatchCompleteCommit, DispatchJobSpec, DispatchRecoveryCommit,
+    DispatchStartCommit, DispatchStatus, MembershipRevision, MembershipRole, ReplyClaimOutcome,
+    ReplyFailureCommit, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
     ReplySuccessCommit, ReviewCommit, RunSnapshot, RuntimeIdentity, SqliteOperationLimits,
     SqlitePhysicalLimits, SqliteStore, StorageError, StorageLimits, StoredUserRole,
     StoredUserStatus,
@@ -36,6 +37,46 @@ const RUN_ID: &str = "ZR-1842";
 const LOCK_HELPER_DATABASE: &str = "ZEUS_STORAGE_LOCK_HELPER_DATABASE";
 const LOCK_HELPER_READY: &str = "ZEUS_STORAGE_LOCK_HELPER_READY";
 const LOCK_HELPER_RELEASE: &str = "ZEUS_STORAGE_LOCK_HELPER_RELEASE";
+const TEST_OWNER_AUTH_SESSION_ID: &str = "asi_test_owner";
+const TEST_FOREIGN_AUTH_SESSION_ID: &str = "asi_test_foreign";
+
+fn test_owner_auth_session_id() -> AuthSessionId {
+    AuthSessionId::from_persistence(TEST_OWNER_AUTH_SESSION_ID).unwrap()
+}
+
+fn owner_authz() -> AuthzContext {
+    owner_authz_with_session(TEST_OWNER_AUTH_SESSION_ID)
+}
+
+fn owner_authz_with_session(auth_session_id: &str) -> AuthzContext {
+    AuthzContext {
+        account_id: AccountId::local(),
+        user_id: "user-owner".into(),
+        membership_role: MembershipRole::Owner,
+        membership_revision: MembershipRevision::new(1).unwrap(),
+        auth_session_id: AuthSessionId::from_persistence(auth_session_id).unwrap(),
+    }
+}
+
+fn foreign_authz() -> AuthzContext {
+    AuthzContext {
+        account_id: AccountId::local(),
+        user_id: "foreign-user".into(),
+        membership_role: MembershipRole::Member,
+        membership_revision: MembershipRevision::new(1).unwrap(),
+        auth_session_id: AuthSessionId::from_persistence(TEST_FOREIGN_AUTH_SESSION_ID).unwrap(),
+    }
+}
+
+fn member_authz() -> AuthzContext {
+    AuthzContext {
+        account_id: AccountId::local(),
+        user_id: "user-member".into(),
+        membership_role: MembershipRole::Member,
+        membership_revision: MembershipRevision::new(1).unwrap(),
+        auth_session_id: AuthSessionId::from_persistence("asi_test_member").unwrap(),
+    }
+}
 
 struct TestDatabase {
     path: PathBuf,
@@ -581,7 +622,7 @@ async fn reserved_reply_progress_and_finalization_survive_admission_exhaustion()
         let store = created_owned_file_session_store(database.path()).await;
         store
             .start_turn_and_enqueue_reply_for_actor(
-                "user-owner",
+                &owner_authz(),
                 "session-alpha",
                 StartTurnRequest {
                     turn_id: "turn-physical-finalization".into(),
@@ -770,7 +811,10 @@ async fn legacy_runtime_state_is_adopted_only_when_run_and_policy_match() {
         .unwrap();
     bootstrap_test_owner(&mismatched).await;
     mismatched
-        .commit_review(approved_dispatch_commit(&snapshot, "legacy-policy"))
+        .commit_review_for_actor(
+            &owner_authz(),
+            approved_dispatch_commit(&snapshot, "legacy-policy"),
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -842,7 +886,7 @@ async fn point_contexts_match_full_ledger_and_mask_foreign_actors() {
 
     let full = store.load_run(RUN_ID).await.unwrap();
     let review = store
-        .review_context_for_actor("user-owner", RUN_ID, "APR-901")
+        .review_context_for_actor(&owner_authz(), RUN_ID, "APR-901")
         .await
         .unwrap();
     assert_eq!(review.snapshot, full.snapshot);
@@ -852,18 +896,18 @@ async fn point_contexts_match_full_ledger_and_mask_foreign_actors() {
     assert_eq!(review.requested_call_event_sequence, Some(4));
     assert!(matches!(
         store
-            .review_context_for_actor("foreign-user", RUN_ID, "missing-approval")
+            .review_context_for_actor(&foreign_authz(), RUN_ID, "missing-approval")
             .await,
-        Err(StorageError::RunNotFound(id)) if id == RUN_ID
+        Err(StorageError::AuthSessionNotFound)
     ));
 
     let commit = approved_dispatch_commit(&snapshot, "point-context-review");
     store
-        .commit_review_for_actor("user-owner", commit.clone())
+        .commit_review_for_actor(&owner_authz(), commit.clone())
         .await
         .unwrap();
     let settled_review = store
-        .review_context_for_actor("user-owner", RUN_ID, "APR-901")
+        .review_context_for_actor(&owner_authz(), RUN_ID, "APR-901")
         .await
         .unwrap();
     assert!(settled_review.approval.is_none());
@@ -878,7 +922,7 @@ async fn point_contexts_match_full_ledger_and_mask_foreign_actors() {
 
     store
         .create_session_for_actor(
-            "user-owner",
+            &owner_authz(),
             CreateSessionRequest {
                 id: "session-ZR-1842".into(),
                 title: "Checkout API latency".into(),
@@ -889,7 +933,7 @@ async fn point_contexts_match_full_ledger_and_mask_foreign_actors() {
         .unwrap();
     store
         .attach_run_for_actor(
-            "user-owner",
+            &owner_authz(),
             "session-ZR-1842",
             AttachRunRequest {
                 run_id: RUN_ID.into(),
@@ -940,13 +984,13 @@ async fn point_contexts_fail_closed_on_duplicate_or_mismatched_lookup_rows() {
     );
     assert!(matches!(
         duplicate_store
-            .review_context_for_actor("foreign-user", RUN_ID, "APR-901")
+            .review_context_for_actor(&foreign_authz(), RUN_ID, "APR-901")
             .await,
-        Err(StorageError::RunNotFound(id)) if id == RUN_ID
+        Err(StorageError::AuthSessionNotFound)
     ));
     assert!(matches!(
         duplicate_store
-            .review_context_for_actor("user-owner", RUN_ID, "APR-901")
+            .review_context_for_actor(&owner_authz(), RUN_ID, "APR-901")
             .await,
         Err(StorageError::CorruptData(message))
             if message.contains("multiple request events")
@@ -1155,12 +1199,14 @@ async fn review_note_envelope_rejects_before_receipt_or_ledger_side_effects() {
     }))
     .unwrap();
     assert!(matches!(
-        store.commit_review_for_actor("user-owner", oversized).await,
+        store
+            .commit_review_for_actor(&owner_authz(), oversized)
+            .await,
         Err(StorageError::InvalidResourceEnvelope(_))
     ));
     assert!(
         store
-            .review_receipt_for_actor("user-owner", RUN_ID, "oversized-review-note")
+            .review_receipt_for_actor(&owner_authz(), RUN_ID, "oversized-review-note")
             .await
             .unwrap()
             .is_none()
@@ -1182,7 +1228,7 @@ async fn review_note_envelope_rejects_before_receipt_or_ledger_side_effects() {
     .unwrap();
     assert_eq!(
         store
-            .commit_review_for_actor("user-owner", boundary)
+            .commit_review_for_actor(&owner_authz(), boundary)
             .await
             .unwrap(),
         CommitOutcome::Committed
@@ -1207,7 +1253,7 @@ async fn legacy_oversized_run_and_review_identifiers_remain_usable_after_reopen(
     let reopened = SqliteStore::open(database.path()).await.unwrap();
     assert_eq!(
         reopened
-            .load_run_for_actor("user-owner", &long_run_id)
+            .load_run_for_actor(&owner_authz(), &long_run_id)
             .await
             .unwrap()
             .snapshot
@@ -1217,14 +1263,14 @@ async fn legacy_oversized_run_and_review_identifiers_remain_usable_after_reopen(
     );
     assert_eq!(
         reopened
-            .events_after_for_actor("user-owner", &long_run_id, 0)
+            .events_after_for_actor(&owner_authz(), &long_run_id, 0)
             .await
             .unwrap()
             .len(),
         6
     );
     let legacy_page = reopened
-        .run_event_page_for_actor("user-owner", &long_run_id, 0, 3)
+        .run_event_page_for_actor(&owner_authz(), &long_run_id, 0, 3)
         .await
         .unwrap();
     assert_eq!(legacy_page.items.len(), 3);
@@ -1245,14 +1291,14 @@ async fn legacy_oversized_run_and_review_identifiers_remain_usable_after_reopen(
     .unwrap();
     assert_eq!(
         reopened
-            .commit_review_for_actor("user-owner", commit.clone())
+            .commit_review_for_actor(&owner_authz(), commit.clone())
             .await
             .unwrap(),
         CommitOutcome::Committed
     );
     let receipt = reopened
         .review_receipt_for_actor(
-            "user-owner",
+            &owner_authz(),
             &commit.snapshot.run.id,
             "legacy-long-run-review",
         )
@@ -1276,10 +1322,10 @@ async fn legacy_oversized_run_and_review_identifiers_remain_usable_after_reopen(
     connection
         .execute(
             r#"INSERT INTO idempotency_receipts(
-                   actor_scope, idempotency_key, operation, request_fingerprint,
+                   account_id, actor_user_id, idempotency_key, operation, request_fingerprint,
                    response_json, run_id, event_sequence, created_at
                ) VALUES (
-                   'user-owner', 'legacy-long-note-receipt', 'review', ?1,
+                   'acc_local', 'user-owner', 'legacy-long-note-receipt', 'review', ?1,
                    ?2, ?3, 7, '2026-08-27T00:00:00.000Z'
                )"#,
             params![
@@ -1293,7 +1339,7 @@ async fn legacy_oversized_run_and_review_identifiers_remain_usable_after_reopen(
     assert!(
         reopened
             .review_receipt_for_actor(
-                "user-owner",
+                &owner_authz(),
                 &commit.snapshot.run.id,
                 "legacy-long-note-receipt",
             )
@@ -1377,7 +1423,9 @@ async fn failure_after_event_insert_rolls_back_projection_event_and_receipt() {
     let commit = approved_dispatch_commit(&snapshot, "atomic-review");
 
     assert!(matches!(
-        store.commit_review_with_failure(commit.clone()).await,
+        store
+            .commit_review_with_failure(&owner_authz(), commit.clone())
+            .await,
         Err(StorageError::InjectedFailure)
     ));
     let unchanged = store.load_run(RUN_ID).await.unwrap();
@@ -1399,7 +1447,10 @@ async fn failure_after_event_insert_rolls_back_projection_event_and_receipt() {
     );
 
     assert_eq!(
-        store.commit_review(commit).await.unwrap(),
+        store
+            .commit_review_for_actor(&owner_authz(), commit)
+            .await
+            .unwrap(),
         CommitOutcome::Committed
     );
 }
@@ -1428,7 +1479,10 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+    assert_eq!(
+        versions,
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+    );
     let owner: Option<String> = connection
         .query_row(
             "SELECT owner_user_id FROM runs WHERE id = ?1",
@@ -1568,7 +1622,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
     assert_eq!(
         run_event_payloads(database.path(), &long_run_id),
         payloads_before,
-        "v9-v13 migrations must not rewrite immutable event payloads"
+        "v9-v14 migrations must not rewrite immutable event payloads"
     );
     let connection = rusqlite::Connection::open(database.path()).unwrap();
     let version: i64 = connection
@@ -1576,7 +1630,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
     let configured_account: (String, String, String, i64) = connection
         .query_row(
             r#"SELECT
@@ -1699,9 +1753,10 @@ async fn v12_member_owned_history_aborts_v13_without_partial_account_schema() {
     let store = SqliteStore::open(database.path()).await.unwrap();
     bootstrap_test_owner(&store).await;
     insert_test_member(database.path(), "user-member", "member");
+    activate_test_member_auth(database.path(), "user-member", "asi_test_member");
     store
         .create_session_for_actor(
-            "user-member",
+            &member_authz(),
             CreateSessionRequest {
                 id: "session-member-history".into(),
                 title: "Member-owned legacy history".into(),
@@ -1857,6 +1912,7 @@ async fn owner_bootstrap_claims_legacy_state_and_auth_sessions_are_revocable() {
     let (owner, preferences) = store
         .bootstrap_owner(BootstrapOwnerCommit {
             bootstrap_token_hash: bootstrap_hash.clone(),
+            auth_session_id: test_owner_auth_session_id(),
             user_id: "user-owner".into(),
             username: "owner".into(),
             password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA".into(),
@@ -1885,14 +1941,14 @@ async fn owner_bootstrap_claims_legacy_state_and_auth_sessions_are_revocable() {
     assert_eq!(principal.csrf_hash, csrf_hash);
 
     let updated = store
-        .update_preferences("user-owner", 1, "dark", Some("local-fallback"))
+        .update_preferences(&owner_authz(), 1, "dark", Some("local-fallback"))
         .await
         .unwrap();
     assert_eq!(updated.theme, "dark");
     assert_eq!(updated.revision, 2);
     assert!(matches!(
         store
-            .update_preferences("user-owner", 1, "light", None)
+            .update_preferences(&owner_authz(), 1, "light", None)
             .await,
         Err(StorageError::ConcurrentModification)
     ));
@@ -1915,7 +1971,12 @@ async fn owner_bootstrap_claims_legacy_state_and_auth_sessions_are_revocable() {
     assert_eq!(run_owner, "user-owner");
     assert_eq!(session_owner, "user-owner");
 
-    assert!(store.revoke_auth_session(&session_hash).await.unwrap());
+    assert!(
+        store
+            .revoke_auth_session(&owner_authz(), &session_hash)
+            .await
+            .unwrap()
+    );
     assert!(store.authenticate(&session_hash).await.unwrap().is_none());
     assert!(matches!(
         store
@@ -1927,6 +1988,7 @@ async fn owner_bootstrap_claims_legacy_state_and_auth_sessions_are_revocable() {
         store
             .bootstrap_owner(BootstrapOwnerCommit {
                 bootstrap_token_hash: bootstrap_hash,
+                auth_session_id: test_owner_auth_session_id(),
                 user_id: "other-owner".into(),
                 username: "other".into(),
                 password_hash: "$argon2id$unused".into(),
@@ -2094,7 +2156,7 @@ async fn v12_identity_and_run_crash_prefix_migrates_then_recovers_the_primary_se
     assert_eq!(
         recovered,
         (
-            13,
+            14,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into()
@@ -2120,6 +2182,7 @@ async fn bootstrap_owner_rolls_back_membership_claims_and_token_on_late_failure(
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let commit = BootstrapOwnerCommit {
         bootstrap_token_hash: "a".repeat(64),
+        auth_session_id: test_owner_auth_session_id(),
         user_id: "user-owner".into(),
         username: "owner".into(),
         password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA".into(),
@@ -2176,7 +2239,7 @@ async fn bootstrap_owner_rolls_back_membership_claims_and_token_on_late_failure(
     assert_eq!(
         connection
             .query_row(
-                "SELECT COUNT(*) FROM session_command_receipts WHERE actor_scope = '__legacy__'",
+                "SELECT COUNT(*) FROM session_command_receipts WHERE actor_user_id IS NULL",
                 [],
                 |row| row.get::<_, i64>(0),
             )
@@ -2643,6 +2706,7 @@ async fn configured_v11_bootstrap_audit_is_compacted_on_open_and_stays_bounded()
     initial
         .bootstrap_owner(BootstrapOwnerCommit {
             bootstrap_token_hash: owner_token,
+            auth_session_id: test_owner_auth_session_id(),
             user_id: "user-owner".into(),
             username: "owner".into(),
             password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA".into(),
@@ -2751,6 +2815,7 @@ async fn v11_bootstrap_audit_migration_preserves_unknown_and_records_explicit_re
     store
         .bootstrap_owner(BootstrapOwnerCommit {
             bootstrap_token_hash: bootstrap_token_hash(4),
+            auth_session_id: test_owner_auth_session_id(),
             user_id: "user-owner".into(),
             username: "owner".into(),
             password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA".into(),
@@ -2874,7 +2939,11 @@ async fn auth_session_creation_rejects_unknown_users() {
     assert!(matches!(
         store
             .create_auth_session(AuthSessionCommit {
-                user_id: "missing-user".into(),
+                authz: AuthzContext {
+                    user_id: "missing-user".into(),
+                    auth_session_id: AuthSessionId::from_persistence("asi_missing_user").unwrap(),
+                    ..owner_authz()
+                },
                 session_token_hash: "a".repeat(64),
                 csrf_hash: "b".repeat(64),
                 expires_at: expiry,
@@ -2942,13 +3011,410 @@ async fn v5_configured_database_migrates_to_the_local_owner_membership() {
     assert_eq!(
         migrated,
         (
-            13,
+            14,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into(),
             "owner".into(),
             1
         )
+    );
+}
+
+#[tokio::test]
+async fn v13_configured_active_work_migrates_with_account_authority_and_exact_volume() {
+    let database = TestDatabase::new();
+    let store = seeded_file_store(database.path()).await;
+    bootstrap_test_owner(&store).await;
+    store
+        .create_session_for_actor(
+            &owner_authz(),
+            CreateSessionRequest {
+                id: "session-v13-active".into(),
+                title: "Active v13 work".into(),
+            },
+            "create-v13-active",
+        )
+        .await
+        .unwrap();
+    store
+        .start_turn_and_enqueue_reply_for_actor(
+            &owner_authz(),
+            "session-v13-active",
+            StartTurnRequest {
+                turn_id: "turn-v13-active".into(),
+                user_message: "Preserve this queued reply".into(),
+                expected_sequence: 1,
+            },
+            "start-v13-active",
+            reply_job_spec("reply-v13-active", "turn-v13-active"),
+        )
+        .await
+        .unwrap();
+    let (snapshot, _) = seed_fixture();
+    store
+        .commit_review_for_actor(
+            &owner_authz(),
+            approved_dispatch_commit(&snapshot, "dispatch-v13-active"),
+        )
+        .await
+        .unwrap();
+    drop(store);
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    downgrade_durable_authorization_fixture_to_v13(&connection);
+    let v13_counts: (i64, i64, i64, i64) = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT COUNT(*) FROM auth_sessions),
+                   (SELECT COUNT(*) FROM reply_jobs),
+                   (SELECT COUNT(*) FROM dispatch_jobs),
+                   (SELECT COUNT(*) FROM finalization_reservations)"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(v13_counts, (1, 1, 1, 2));
+    drop(connection);
+
+    let migrated = SqliteStore::open(database.path()).await.unwrap();
+    migrated.verify_integrity().await.unwrap();
+    let principal = migrated
+        .authenticate(&"b".repeat(64))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(principal.authz.account_id, AccountId::local());
+    assert_eq!(principal.authz.user_id, "user-owner");
+    assert_eq!(principal.authz.membership_role, MembershipRole::Owner);
+    assert_eq!(principal.authz.membership_revision.get(), 1);
+    assert_eq!(
+        migrated
+            .reply_job("reply-v13-active")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        ReplyJobStatus::Queued
+    );
+    assert_eq!(
+        migrated
+            .dispatch_job("call-local-001")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        DispatchStatus::Queued
+    );
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let migrated_counts: (i64, i64, i64, i64, i64) = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT MAX(version) FROM schema_migrations),
+                   (SELECT COUNT(*) FROM reply_jobs
+                    WHERE account_id = 'acc_local'
+                      AND actor_user_id = 'user-owner'
+                      AND actor_membership_revision = 1),
+                   (SELECT COUNT(*) FROM dispatch_jobs
+                    WHERE account_id = 'acc_local'
+                      AND initiating_actor_user_id = 'user-owner'
+                      AND initiating_membership_revision = 1
+                      AND approving_actor_user_id = 'user-owner'
+                      AND approving_membership_revision = 1),
+                   (SELECT COUNT(*) FROM finalization_reservations
+                    WHERE account_id = 'acc_local'
+                      AND actor_user_id = 'user-owner'),
+                   (SELECT COUNT(*) FROM auth_sessions)"#,
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(migrated_counts, (14, 1, 1, 2, 1));
+}
+
+#[tokio::test]
+async fn v13_unconfigured_null_authority_migrates_and_only_bootstrap_owner_claims_once() {
+    let database = TestDatabase::new();
+    create_v7_database_with_legacy_dispatch(database.path());
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    store
+        .create_session(
+            CreateSessionRequest {
+                id: "session-v13-unconfigured".into(),
+                title: "Unconfigured v13 work".into(),
+            },
+            "create-v13-unconfigured",
+        )
+        .await
+        .unwrap();
+    store
+        .start_turn(
+            "session-v13-unconfigured",
+            StartTurnRequest {
+                turn_id: "turn-v13-unconfigured".into(),
+                user_message: "Preserve prebootstrap capacity".into(),
+                expected_sequence: 1,
+            },
+            "start-v13-unconfigured",
+        )
+        .await
+        .unwrap();
+    drop(store);
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    downgrade_durable_authorization_fixture_to_v13(&connection);
+    assert_eq!(
+        connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        13
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM finalization_reservations WHERE scope_id = '__legacy__'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        2
+    );
+    drop(connection);
+
+    let migrated = SqliteStore::open(database.path()).await.unwrap();
+    migrated.verify_integrity().await.unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let unclaimed: (i64, i64, i64, i64) = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT COUNT(*) FROM session_command_receipts
+                    WHERE actor_user_id IS NULL),
+                   (SELECT COUNT(*) FROM dispatch_jobs
+                    WHERE initiating_actor_user_id IS NULL
+                      AND initiating_membership_revision IS NULL
+                      AND approving_actor_user_id IS NULL
+                      AND approving_membership_revision IS NULL),
+                   (SELECT COUNT(*) FROM finalization_reservations
+                    WHERE actor_user_id IS NULL),
+                   (SELECT COUNT(*) FROM auth_sessions)"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(unclaimed, (2, 1, 2, 0));
+    drop(connection);
+
+    bootstrap_test_owner(&migrated).await;
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let claimed: (i64, i64, i64) = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT COUNT(*) FROM session_command_receipts
+                    WHERE actor_user_id = 'user-owner'),
+                   (SELECT COUNT(*) FROM dispatch_jobs
+                    WHERE initiating_actor_user_id = 'user-owner'
+                      AND initiating_membership_revision = 1
+                      AND approving_actor_user_id = 'user-owner'
+                      AND approving_membership_revision = 1),
+                   (SELECT COUNT(*) FROM finalization_reservations
+                    WHERE actor_user_id = 'user-owner')"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(claimed, (2, 1, 2));
+    assert!(
+        connection
+            .execute(
+                "UPDATE session_command_receipts SET actor_user_id = NULL",
+                [],
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute(
+                "UPDATE dispatch_jobs SET approving_actor_user_id = NULL",
+                [],
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute(
+                "UPDATE finalization_reservations SET actor_user_id = NULL",
+                [],
+            )
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn v13_auth_migration_retains_only_the_active_local_owner_session() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    bootstrap_test_owner(&store).await;
+    insert_test_member(database.path(), "user-member", "member");
+    activate_test_member_auth(database.path(), "user-member", "asi_test_member");
+    drop(store);
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    downgrade_durable_authorization_fixture_to_v13(&connection);
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM auth_sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        2
+    );
+    drop(connection);
+
+    let migrated = SqliteStore::open(database.path()).await.unwrap();
+    assert!(
+        migrated
+            .authenticate(&"b".repeat(64))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        migrated
+            .authenticate(&"e".repeat(64))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                r#"SELECT COUNT(*) FROM auth_sessions session
+                   JOIN account_memberships membership
+                     ON membership.account_id = session.account_id
+                    AND membership.user_id = session.user_id
+                   WHERE session.account_id = 'acc_local'
+                     AND session.membership_revision = membership.revision
+                     AND membership.role = 'owner'
+                     AND membership.status = 'active'"#,
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn v14_preflight_failure_rolls_back_to_an_intact_v13_schema() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    bootstrap_test_owner(&store).await;
+    drop(store);
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    downgrade_durable_authorization_fixture_to_v13(&connection);
+    connection
+        .execute(
+            r#"INSERT INTO accounts(id, name, status, created_at, updated_at)
+               VALUES (
+                   'acc_unexpected', 'Unexpected', 'active',
+                   '2026-08-27T00:00:00.000Z', '2026-08-27T00:00:00.000Z'
+               )"#,
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO account_memberships(
+                   account_id, user_id, role, status, revision,
+                   created_at, updated_at
+               ) VALUES (
+                   'acc_unexpected', 'user-owner', 'owner', 'active', 1,
+                   '2026-08-27T00:00:00.000Z', '2026-08-27T00:00:00.000Z'
+               )"#,
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(SqliteStore::open(database.path()).await.is_err());
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let rollback_state: (i64, i64, i64, i64) = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT MAX(version) FROM schema_migrations),
+                   (SELECT COUNT(*) FROM pragma_table_info('auth_sessions')
+                    WHERE name IN ('id', 'account_id', 'membership_revision')),
+                   (SELECT COUNT(*) FROM sqlite_schema
+                    WHERE name LIKE '%_v13' OR name LIKE '%_v14'),
+                   (SELECT COUNT(*) FROM sqlite_schema
+                    WHERE type = 'trigger'
+                      AND name = 'auth_sessions_require_current_membership')"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(rollback_state, (13, 0, 0, 0));
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM auth_sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn v14_rejects_a_disabled_legacy_owner_before_committing_any_schema_change() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    bootstrap_test_owner(&store).await;
+    drop(store);
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    downgrade_durable_authorization_fixture_to_v13(&connection);
+    connection
+        .execute(
+            r#"UPDATE users
+               SET status = 'disabled', updated_at = '2999-01-01T00:00:00.000Z'
+               WHERE id = 'user-owner'"#,
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(SqliteStore::open(database.path()).await.is_err());
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let rollback_state: (i64, i64, i64) = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT MAX(version) FROM schema_migrations),
+                   (SELECT COUNT(*) FROM pragma_table_info('auth_sessions')
+                    WHERE name IN ('id', 'account_id', 'membership_revision')),
+                   (SELECT COUNT(*) FROM sqlite_schema
+                    WHERE name LIKE '%_v13' OR name LIKE '%_v14')"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(rollback_state, (13, 0, 0));
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM auth_sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
     );
 }
 
@@ -3575,9 +4041,11 @@ async fn open_turn_and_started_reply_recovery_use_fixed_sixty_four_row_batches()
     const TOTAL: usize = 65;
 
     let limits = StorageLimits {
-        open_turns_per_scope: TOTAL,
+        open_turns_per_actor: TOTAL,
+        open_turns_per_account: TOTAL,
         open_turns_global: TOTAL,
-        active_reply_jobs_per_scope: TOTAL,
+        active_reply_jobs_per_actor: TOTAL,
+        active_reply_jobs_per_account: TOTAL,
         active_reply_jobs_global: TOTAL,
         ..StorageLimits::default()
     };
@@ -3624,7 +4092,7 @@ async fn open_turn_and_started_reply_recovery_use_fixed_sixty_four_row_batches()
         let turn_id = format!("turn-reply-batch-{index:03}");
         reply_store
             .create_session_for_actor(
-                "user-owner",
+                &owner_authz(),
                 CreateSessionRequest {
                     id: session_id.clone(),
                     title: format!("Reply recovery batch {index}"),
@@ -3635,7 +4103,7 @@ async fn open_turn_and_started_reply_recovery_use_fixed_sixty_four_row_batches()
             .unwrap();
         reply_store
             .start_turn_and_enqueue_reply_for_actor(
-                "user-owner",
+                &owner_authz(),
                 &session_id,
                 StartTurnRequest {
                     turn_id: turn_id.clone(),
@@ -3802,7 +4270,8 @@ async fn reply_start_is_atomic_actor_scoped_and_success_is_idempotent() {
     assert!(unchanged.turns.is_empty());
 
     let enqueued = store
-        .start_turn_and_enqueue_reply(
+        .start_turn_and_enqueue_reply_for_actor(
+            &owner_authz(),
             "session-alpha",
             request.clone(),
             "reply-start-atomic",
@@ -3813,23 +4282,43 @@ async fn reply_start_is_atomic_actor_scoped_and_success_is_idempotent() {
     assert!(!enqueued.start.replayed);
     assert_eq!(enqueued.start.session.sequence, 2);
     assert_eq!(enqueued.job.status, ReplyJobStatus::Queued);
+    let rotated_authz = owner_authz_with_session("asi_rotated_owner");
+    let expiry = (chrono::Utc::now() + chrono::Duration::hours(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    store
+        .create_auth_session(AuthSessionCommit {
+            authz: rotated_authz.clone(),
+            session_token_hash: "9".repeat(64),
+            csrf_hash: "8".repeat(64),
+            expires_at: expiry,
+        })
+        .await
+        .unwrap();
+    let mut rotated_spec = spec.clone();
+    rotated_spec.authz = rotated_authz.clone();
     let replay = store
-        .start_turn_and_enqueue_reply("session-alpha", request, "reply-start-atomic", spec.clone())
+        .start_turn_and_enqueue_reply_for_actor(
+            &rotated_authz,
+            "session-alpha",
+            request,
+            "reply-start-atomic",
+            rotated_spec,
+        )
         .await
         .unwrap();
     assert!(replay.start.replayed);
     assert_eq!(replay.job, enqueued.job);
 
     let connection = rusqlite::Connection::open(database.path()).unwrap();
-    let actor_scope: String = connection
+    let actor_user_id: String = connection
         .query_row(
-            r#"SELECT actor_scope FROM session_command_receipts
+            r#"SELECT actor_user_id FROM session_command_receipts
                WHERE operation = 'start_turn' AND idempotency_key = 'reply-start-atomic'"#,
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(actor_scope, "user-owner");
+    assert_eq!(actor_user_id, "user-owner");
     drop(connection);
 
     let ReplyClaimOutcome::Claimed(claimed) = store.claim_next_reply().await.unwrap() else {
@@ -3910,18 +4399,82 @@ async fn reply_start_is_atomic_actor_scoped_and_success_is_idempotent() {
 }
 
 #[tokio::test]
+async fn reply_start_replays_across_membership_revision_without_reauthorizing_queued_work() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    let request = StartTurnRequest {
+        turn_id: "turn-revision-replay".into(),
+        user_message: "Replay this accepted request after an authority change".into(),
+        expected_sequence: 1,
+    };
+    let original_spec = reply_job_spec("reply-revision-replay", "turn-revision-replay");
+    let admitted = store
+        .start_turn_and_enqueue_reply_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            request.clone(),
+            "reply-revision-replay",
+            original_spec,
+        )
+        .await
+        .unwrap();
+    assert_eq!(admitted.job.actor_membership_revision.get(), 1);
+
+    bump_test_membership_revision(database.path(), "user-owner");
+    let revised_authz = AuthzContext {
+        account_id: AccountId::local(),
+        user_id: "user-owner".into(),
+        membership_role: MembershipRole::Member,
+        membership_revision: MembershipRevision::new(2).unwrap(),
+        auth_session_id: AuthSessionId::from_persistence("asi_revised_member").unwrap(),
+    };
+    let expiry = (chrono::Utc::now() + chrono::Duration::hours(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    store
+        .create_auth_session(AuthSessionCommit {
+            authz: revised_authz.clone(),
+            session_token_hash: "7".repeat(64),
+            csrf_hash: "6".repeat(64),
+            expires_at: expiry,
+        })
+        .await
+        .unwrap();
+    let replayed = store
+        .start_turn_and_enqueue_reply_for_actor(
+            &revised_authz,
+            "session-alpha",
+            request,
+            "reply-revision-replay",
+            ReplyJobSpec {
+                authz: revised_authz.clone(),
+                ..reply_job_spec("reply-revision-replay", "turn-revision-replay")
+            },
+        )
+        .await
+        .unwrap();
+    assert!(replayed.start.replayed);
+    assert_eq!(replayed.job, admitted.job);
+
+    let ReplyClaimOutcome::Rejected(rejected) = store.claim_next_reply().await.unwrap() else {
+        panic!("the stale persisted revision must be settled without provider execution");
+    };
+    assert_eq!(rejected.job.status, ReplyJobStatus::Failed);
+    assert_eq!(rejected.job.actor_membership_revision.get(), 1);
+}
+
+#[tokio::test]
 async fn actor_scoped_session_creation_sets_owner_required_by_reply_enqueue() {
     let store = SqliteStore::open(":memory:").await.unwrap();
     bootstrap_test_owner(&store).await;
     let request = alpha_session_request();
     let created = store
-        .create_session_for_actor("user-owner", request.clone(), "actor-create-session")
+        .create_session_for_actor(&owner_authz(), request.clone(), "actor-create-session")
         .await
         .unwrap();
     assert!(!created.replayed);
     assert!(
         store
-            .create_session_for_actor("user-owner", request, "actor-create-session")
+            .create_session_for_actor(&owner_authz(), request, "actor-create-session")
             .await
             .unwrap()
             .replayed
@@ -3945,24 +4498,11 @@ async fn actor_scoped_session_creation_sets_owner_required_by_reply_enqueue() {
         id: "session-unowned".into(),
         title: "Unowned after bootstrap".into(),
     };
-    store
-        .create_session(legacy_request, "legacy-create-after-bootstrap")
-        .await
-        .unwrap();
     assert!(matches!(
         store
-            .start_turn_and_enqueue_reply(
-                "session-unowned",
-                StartTurnRequest {
-                    turn_id: "turn-unowned".into(),
-                    user_message: "Must fail closed".into(),
-                    expected_sequence: 1,
-                },
-                "start-unowned",
-                reply_job_spec("reply-unowned", "turn-unowned"),
-            )
+            .create_session(legacy_request, "legacy-create-after-bootstrap")
             .await,
-        Err(StorageError::SessionNotFound(_))
+        Err(StorageError::Sqlite(_))
     ));
 }
 
@@ -3990,7 +4530,7 @@ async fn legacy_oversized_session_and_reply_settle_after_file_database_reopen() 
     reopened.readiness().await.unwrap();
     reopened
         .create_session_for_actor(
-            "user-owner",
+            &owner_authz(),
             CreateSessionRequest {
                 id: "zz-normal-session".into(),
                 title: "Normal Session".into(),
@@ -4009,26 +4549,26 @@ async fn legacy_oversized_session_and_reply_settle_after_file_database_reopen() 
     drop(connection);
 
     let first_page = reopened
-        .session_summary_page_for_actor("user-owner", None, 1)
+        .session_summary_page_for_actor(&owner_authz(), None, 1)
         .await
         .unwrap();
     assert_eq!(first_page.items[0].id, session_id);
     let second_page = reopened
-        .session_summary_page_for_actor("user-owner", first_page.next_cursor.as_deref(), 1)
+        .session_summary_page_for_actor(&owner_authz(), first_page.next_cursor.as_deref(), 1)
         .await
         .unwrap();
     assert_eq!(second_page.items[0].id, "zz-normal-session");
     assert!(second_page.next_cursor.is_none());
     assert!(
         reopened
-            .list_sessions_for_actor("user-owner")
+            .list_sessions_for_actor(&owner_authz())
             .await
             .unwrap()
             .iter()
             .any(|session| session.id == session_id)
     );
     let detail = reopened
-        .get_session_for_actor("user-owner", &session_id)
+        .get_session_for_actor(&owner_authz(), &session_id)
         .await
         .unwrap();
     assert_eq!(detail.session.sequence, 2);
@@ -4036,7 +4576,7 @@ async fn legacy_oversized_session_and_reply_settle_after_file_database_reopen() 
     assert_eq!(detail.turns[0].user_message, user_message);
     assert_eq!(
         reopened
-            .session_turn_for_actor("user-owner", &session_id, &turn_id)
+            .session_turn_for_actor(&owner_authz(), &session_id, &turn_id)
             .await
             .unwrap(),
         detail.turns[0]
@@ -4049,13 +4589,13 @@ async fn legacy_oversized_session_and_reply_settle_after_file_database_reopen() 
     );
     assert_eq!(
         reopened
-            .session_events_after_for_actor("user-owner", &session_id, 0)
+            .session_events_after_for_actor(&owner_authz(), &session_id, 0)
             .await
             .unwrap(),
         detail.events
     );
     let legacy_page = reopened
-        .session_event_page_for_actor("user-owner", &session_id, 0, 2)
+        .session_event_page_for_actor(&owner_authz(), &session_id, 0, 2)
         .await
         .unwrap();
     assert_eq!(legacy_page.items, detail.events);
@@ -4098,7 +4638,7 @@ async fn legacy_oversized_session_and_reply_settle_after_file_database_reopen() 
 }
 
 #[tokio::test]
-async fn actor_scoped_session_and_run_reads_hide_foreign_or_disabled_resources() {
+async fn account_scoped_session_and_run_reads_allow_members_and_reject_stale_sessions() {
     let database = TestDatabase::new();
     let store = seeded_file_store(database.path()).await;
     store
@@ -4106,62 +4646,86 @@ async fn actor_scoped_session_and_run_reads_hide_foreign_or_disabled_resources()
         .await
         .unwrap();
     bootstrap_test_owner(&store).await;
+    insert_test_member(database.path(), "foreign-user", "foreign");
+    activate_test_member_auth(
+        database.path(),
+        "foreign-user",
+        TEST_FOREIGN_AUTH_SESSION_ID,
+    );
 
-    let sessions = store.list_sessions_for_actor("user-owner").await.unwrap();
+    let sessions = store.list_sessions_for_actor(&owner_authz()).await.unwrap();
     assert_eq!(sessions.len(), 1);
     let session_id = &sessions[0].id;
     assert_eq!(
         store
-            .get_session_for_actor("user-owner", session_id)
+            .get_session_for_actor(&owner_authz(), session_id)
             .await
             .unwrap()
             .run_ids,
         vec![RUN_ID]
     );
-    assert!(matches!(
-        store
-            .get_session_for_actor("foreign-user", session_id)
-            .await,
-        Err(StorageError::SessionNotFound(id)) if id == *session_id
-    ));
-    assert!(matches!(
-        store
-            .session_events_after_for_actor("foreign-user", session_id, 0)
-            .await,
-        Err(StorageError::SessionNotFound(id)) if id == *session_id
-    ));
     assert_eq!(
         store
-            .snapshot_for_actor("user-owner", RUN_ID)
+            .get_session_for_actor(&foreign_authz(), session_id)
+            .await
+            .unwrap()
+            .session
+            .id,
+        *session_id
+    );
+    assert!(
+        !store
+            .session_events_after_for_actor(&foreign_authz(), session_id, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .snapshot_for_actor(&owner_authz(), RUN_ID)
             .await
             .unwrap()
             .run
             .id,
         RUN_ID
     );
-    assert!(matches!(
-        store.snapshot_for_actor("foreign-user", RUN_ID).await,
-        Err(StorageError::RunNotFound(id)) if id == RUN_ID
-    ));
-    assert!(matches!(
-        store.load_run_for_actor("foreign-user", RUN_ID).await,
-        Err(StorageError::RunNotFound(id)) if id == RUN_ID
-    ));
-    assert!(matches!(
+    assert_eq!(
         store
-            .events_after_for_actor("foreign-user", RUN_ID, 0)
-            .await,
-        Err(StorageError::RunNotFound(id)) if id == RUN_ID
-    ));
+            .snapshot_for_actor(&foreign_authz(), RUN_ID)
+            .await
+            .unwrap()
+            .run
+            .id,
+        RUN_ID
+    );
+    assert_eq!(
+        store
+            .load_run_for_actor(&foreign_authz(), RUN_ID)
+            .await
+            .unwrap()
+            .snapshot
+            .run
+            .id,
+        RUN_ID
+    );
+    assert!(
+        !store
+            .events_after_for_actor(&foreign_authz(), RUN_ID, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     set_test_user_status(database.path(), "user-owner", "disabled");
     assert!(matches!(
-        store.get_session_for_actor("user-owner", session_id).await,
-        Err(StorageError::SessionNotFound(_))
+        store
+            .get_session_for_actor(&owner_authz(), session_id)
+            .await,
+        Err(StorageError::AuthSessionNotFound)
     ));
     assert!(matches!(
-        store.snapshot_for_actor("user-owner", RUN_ID).await,
-        Err(StorageError::RunNotFound(_))
+        store.snapshot_for_actor(&owner_authz(), RUN_ID).await,
+        Err(StorageError::AuthSessionNotFound)
     ));
 }
 
@@ -4175,7 +4739,7 @@ async fn actor_session_summary_pages_are_stable_bounded_and_indexed() {
         let id = format!("session-page-{index:03}");
         store
             .create_session_for_actor(
-                "user-owner",
+                &owner_authz(),
                 CreateSessionRequest {
                     id: id.clone(),
                     title: format!("Page fixture {index:03}"),
@@ -4217,7 +4781,7 @@ async fn actor_session_summary_pages_are_stable_bounded_and_indexed() {
     let mut ids = Vec::new();
     for (page_index, expected_len) in [50, 50, 1].into_iter().enumerate() {
         let page = store
-            .session_summary_page_for_actor("user-owner", cursor.as_deref(), 50)
+            .session_summary_page_for_actor(&owner_authz(), cursor.as_deref(), 50)
             .await
             .unwrap();
         assert_eq!(page.items.len(), expected_len);
@@ -4242,7 +4806,7 @@ async fn actor_session_summary_pages_are_stable_bounded_and_indexed() {
     for invalid_limit in [0, protocol::COLLECTION_PAGE_MAX_LIMIT + 1] {
         assert!(matches!(
             store
-                .session_summary_page_for_actor("user-owner", None, invalid_limit)
+                .session_summary_page_for_actor(&owner_authz(), None, invalid_limit)
                 .await,
             Err(StorageError::InvalidPageLimit { limit, max })
                 if limit == invalid_limit && max == protocol::COLLECTION_PAGE_MAX_LIMIT
@@ -4250,32 +4814,37 @@ async fn actor_session_summary_pages_are_stable_bounded_and_indexed() {
     }
     assert!(matches!(
         store
-            .session_summary_page_for_actor("user-owner", Some("not-a-cursor"), 50)
+            .session_summary_page_for_actor(&owner_authz(), Some("not-a-cursor"), 50)
             .await,
         Err(StorageError::InvalidPageCursor)
     ));
 
     insert_test_member(database.path(), "foreign-user", "foreign");
+    activate_test_member_auth(
+        database.path(),
+        "foreign-user",
+        TEST_FOREIGN_AUTH_SESSION_ID,
+    );
     assert!(matches!(
         store
-            .session_summary_page_for_actor("foreign-user", first_owner_cursor.as_deref(), 50,)
+            .session_summary_page_for_actor(&foreign_authz(), first_owner_cursor.as_deref(), 50,)
             .await,
         Err(StorageError::InvalidPageCursor)
     ));
     assert!(matches!(
         store
             .session_detail_page_for_actor(
-                "foreign-user",
+                &foreign_authz(),
                 "session-page-000",
                 Some("not-a-cursor"),
-                0,
+                1,
                 Some("not-a-cursor"),
-                0,
+                1,
                 Some("not-a-cursor"),
-                0,
+                1,
             )
             .await,
-        Err(StorageError::SessionNotFound(id)) if id == "session-page-000"
+        Err(StorageError::InvalidPageCursor)
     ));
 }
 
@@ -4299,7 +4868,7 @@ async fn actor_session_detail_tails_are_independent_scoped_and_contiguous() {
     for id in ["session-tail", "session-other"] {
         store
             .create_session_for_actor(
-                "user-owner",
+                &owner_authz(),
                 CreateSessionRequest {
                     id: id.into(),
                     title: format!("Tail fixture {id}"),
@@ -4314,7 +4883,7 @@ async fn actor_session_detail_tails_are_independent_scoped_and_contiguous() {
     for (index, run_id) in [RUN_ID, "ZR-SECOND"].into_iter().enumerate() {
         let attached = store
             .attach_run_for_actor(
-                "user-owner",
+                &owner_authz(),
                 "session-tail",
                 AttachRunRequest {
                     run_id: run_id.into(),
@@ -4330,7 +4899,7 @@ async fn actor_session_detail_tails_are_independent_scoped_and_contiguous() {
         let turn_id = format!("turn-{ordinal}");
         let started = store
             .start_turn_for_actor(
-                "user-owner",
+                &owner_authz(),
                 "session-tail",
                 StartTurnRequest {
                     turn_id: turn_id.clone(),
@@ -4344,7 +4913,7 @@ async fn actor_session_detail_tails_are_independent_scoped_and_contiguous() {
         sequence = started.session.sequence;
         let flushed = store
             .flush_turn_for_actor(
-                "user-owner",
+                &owner_authz(),
                 "session-tail",
                 FlushSessionRequest {
                     turn_id,
@@ -4360,7 +4929,7 @@ async fn actor_session_detail_tails_are_independent_scoped_and_contiguous() {
     assert_eq!(sequence, 12);
 
     let first = store
-        .session_detail_page_for_actor("user-owner", "session-tail", None, 1, None, 2, None, 2)
+        .session_detail_page_for_actor(&owner_authz(), "session-tail", None, 1, None, 2, None, 2)
         .await
         .unwrap();
     assert_eq!(first.session.sequence, 12);
@@ -4389,7 +4958,7 @@ async fn actor_session_detail_tails_are_independent_scoped_and_contiguous() {
     let run_ids_before = first_pagination.run_ids.next_before.clone().unwrap();
     let older_run_ids = store
         .session_detail_page_for_actor(
-            "user-owner",
+            &owner_authz(),
             "session-tail",
             Some(&run_ids_before),
             1,
@@ -4407,7 +4976,7 @@ async fn actor_session_detail_tails_are_independent_scoped_and_contiguous() {
     assert!(matches!(
         store
             .session_detail_page_for_actor(
-                "user-owner",
+                &owner_authz(),
                 "session-other",
                 Some(&run_ids_before),
                 1,
@@ -4423,7 +4992,7 @@ async fn actor_session_detail_tails_are_independent_scoped_and_contiguous() {
     let turns_before = first_pagination.turns.next_before.clone().unwrap();
     let older_turns = store
         .session_detail_page_for_actor(
-            "user-owner",
+            &owner_authz(),
             "session-tail",
             None,
             1,
@@ -4448,7 +5017,7 @@ async fn actor_session_detail_tails_are_independent_scoped_and_contiguous() {
     while let Some(before) = events_before {
         let page = store
             .session_detail_page_for_actor(
-                "user-owner",
+                &owner_authz(),
                 "session-tail",
                 None,
                 1,
@@ -4473,7 +5042,7 @@ async fn actor_session_detail_tails_are_independent_scoped_and_contiguous() {
     assert!(matches!(
         store
             .session_detail_page_for_actor(
-                "user-owner",
+                &owner_authz(),
                 "session-other",
                 None,
                 1,
@@ -4488,7 +5057,7 @@ async fn actor_session_detail_tails_are_independent_scoped_and_contiguous() {
     assert!(matches!(
         store
             .session_detail_page_for_actor(
-                "user-owner",
+                &owner_authz(),
                 "session-tail",
                 None,
                 1,
@@ -4518,7 +5087,7 @@ async fn actor_session_detail_tails_are_independent_scoped_and_contiguous() {
         assert!(matches!(
             store
                 .session_detail_page_for_actor(
-                    "user-owner",
+                    &owner_authz(),
                     "session-tail",
                     None,
                     run_ids_limit,
@@ -4531,11 +5100,17 @@ async fn actor_session_detail_tails_are_independent_scoped_and_contiguous() {
             Err(StorageError::InvalidPageLimit { max, .. }) if max == expected_max
         ));
     }
-    let future = crate::cursor::encode_session_events("session-tail", sequence + 1).unwrap();
+    let future = crate::cursor::encode_session_events(
+        "acc_local",
+        "user-owner",
+        "session-tail",
+        sequence + 1,
+    )
+    .unwrap();
     assert!(matches!(
         store
             .session_detail_page_for_actor(
-                "user-owner",
+                &owner_authz(),
                 "session-tail",
                 None,
                 1,
@@ -4549,20 +5124,25 @@ async fn actor_session_detail_tails_are_independent_scoped_and_contiguous() {
     ));
 
     insert_test_member(database.path(), "foreign-user", "foreign");
+    activate_test_member_auth(
+        database.path(),
+        "foreign-user",
+        TEST_FOREIGN_AUTH_SESSION_ID,
+    );
     assert!(matches!(
         store
             .session_detail_page_for_actor(
-                "foreign-user",
+                &foreign_authz(),
                 "session-tail",
                 Some("not-a-cursor"),
-                0,
+                1,
                 Some("not-a-cursor"),
-                0,
+                1,
                 Some("not-a-cursor"),
-                0,
+                1,
             )
             .await,
-        Err(StorageError::SessionNotFound(id)) if id == "session-tail"
+        Err(StorageError::InvalidPageCursor)
     ));
 
     let connection = rusqlite::Connection::open(database.path()).unwrap();
@@ -4596,7 +5176,7 @@ async fn actor_bounded_run_reads_latest_tail_with_scoped_cursor_and_one_head() {
     let store = bounded_event_store(total).await;
 
     let first = store
-        .bounded_run_for_actor("user-owner", RUN_ID, None, 128)
+        .bounded_run_for_actor(&owner_authz(), RUN_ID, None, 128)
         .await
         .unwrap();
     assert_eq!(first.snapshot.run.sequence, total as u64);
@@ -4607,7 +5187,7 @@ async fn actor_bounded_run_reads_latest_tail_with_scoped_cursor_and_one_head() {
     let first_before = first.events_page.next_before.unwrap();
 
     let second = store
-        .bounded_run_for_actor("user-owner", RUN_ID, Some(&first_before), 128)
+        .bounded_run_for_actor(&owner_authz(), RUN_ID, Some(&first_before), 128)
         .await
         .unwrap();
     assert_eq!(second.snapshot.run.sequence, total as u64);
@@ -4617,7 +5197,7 @@ async fn actor_bounded_run_reads_latest_tail_with_scoped_cursor_and_one_head() {
     let second_before = second.events_page.next_before.unwrap();
 
     let third = store
-        .bounded_run_for_actor("user-owner", RUN_ID, Some(&second_before), 128)
+        .bounded_run_for_actor(&owner_authz(), RUN_ID, Some(&second_before), 128)
         .await
         .unwrap();
     assert_eq!(
@@ -4634,7 +5214,7 @@ async fn actor_bounded_run_reads_latest_tail_with_scoped_cursor_and_one_head() {
     for invalid_limit in [0, protocol::EVENT_PAGE_MAX_LIMIT + 1] {
         assert!(matches!(
             store
-                .bounded_run_for_actor("user-owner", RUN_ID, None, invalid_limit)
+                .bounded_run_for_actor(&owner_authz(), RUN_ID, None, invalid_limit)
                 .await,
             Err(StorageError::InvalidPageLimit { limit, max })
                 if limit == invalid_limit && max == protocol::EVENT_PAGE_MAX_LIMIT
@@ -4642,35 +5222,43 @@ async fn actor_bounded_run_reads_latest_tail_with_scoped_cursor_and_one_head() {
     }
     assert!(matches!(
         store
-            .bounded_run_for_actor("user-owner", RUN_ID, Some("not-a-cursor"), 2)
+            .bounded_run_for_actor(&owner_authz(), RUN_ID, Some("not-a-cursor"), 2)
             .await,
         Err(StorageError::InvalidPageCursor)
     ));
     assert!(matches!(
         store
-            .bounded_run_for_actor("user-owner", RUN_ID, Some(&(first_before.clone() + "=")), 2,)
+            .bounded_run_for_actor(
+                &owner_authz(),
+                RUN_ID,
+                Some(&(first_before.clone() + "=")),
+                2,
+            )
             .await,
         Err(StorageError::InvalidPageCursor)
     ));
-    let wrong_kind = crate::cursor::encode_session_events("session-tail", 2).unwrap();
+    let wrong_kind =
+        crate::cursor::encode_session_events("acc_local", "user-owner", "session-tail", 2).unwrap();
     assert!(matches!(
         store
-            .bounded_run_for_actor("user-owner", RUN_ID, Some(&wrong_kind), 2)
+            .bounded_run_for_actor(&owner_authz(), RUN_ID, Some(&wrong_kind), 2)
             .await,
         Err(StorageError::InvalidPageCursor)
     ));
-    let future = crate::cursor::encode_run_events(RUN_ID, total as u64 + 1).unwrap();
+    let future =
+        crate::cursor::encode_run_events("acc_local", "user-owner", RUN_ID, total as u64 + 1)
+            .unwrap();
     assert!(matches!(
         store
-            .bounded_run_for_actor("user-owner", RUN_ID, Some(&future), 2)
+            .bounded_run_for_actor(&owner_authz(), RUN_ID, Some(&future), 2)
             .await,
         Err(StorageError::PageCursorBeyondHead { head }) if head == total as u64
     ));
     assert!(matches!(
         store
-            .bounded_run_for_actor("foreign-user", RUN_ID, Some("not-a-cursor"), 0)
+            .bounded_run_for_actor(&foreign_authz(), RUN_ID, Some("not-a-cursor"), 0)
             .await,
-        Err(StorageError::RunNotFound(id)) if id == RUN_ID
+        Err(StorageError::AuthSessionNotFound)
     ));
 }
 
@@ -4680,7 +5268,7 @@ async fn actor_scoped_run_event_pages_are_bounded_contiguous_and_cursor_safe() {
     let store = bounded_event_store(total).await;
 
     let first = store
-        .run_event_page_for_actor("user-owner", RUN_ID, 0, protocol::EVENT_PAGE_MAX_LIMIT)
+        .run_event_page_for_actor(&owner_authz(), RUN_ID, 0, protocol::EVENT_PAGE_MAX_LIMIT)
         .await
         .unwrap();
     assert_eq!(first.items.len(), protocol::EVENT_PAGE_MAX_LIMIT);
@@ -4692,7 +5280,7 @@ async fn actor_scoped_run_event_pages_are_bounded_contiguous_and_cursor_safe() {
 
     let second = store
         .run_event_page_for_actor(
-            "user-owner",
+            &owner_authz(),
             RUN_ID,
             first.next_after.unwrap(),
             protocol::EVENT_PAGE_MAX_LIMIT,
@@ -4713,7 +5301,7 @@ async fn actor_scoped_run_event_pages_are_bounded_contiguous_and_cursor_safe() {
 
     let empty = store
         .run_event_page_for_actor(
-            "user-owner",
+            &owner_authz(),
             RUN_ID,
             total as u64,
             protocol::EVENT_PAGE_DEFAULT_LIMIT,
@@ -4727,7 +5315,7 @@ async fn actor_scoped_run_event_pages_are_bounded_contiguous_and_cursor_safe() {
 
     assert!(matches!(
         store
-            .run_event_page_for_actor("user-owner", RUN_ID, total as u64 + 1, 1)
+            .run_event_page_for_actor(&owner_authz(), RUN_ID, total as u64 + 1, 1)
             .await,
         Err(StorageError::EventCursorBeyondHead {
             after,
@@ -4736,14 +5324,14 @@ async fn actor_scoped_run_event_pages_are_bounded_contiguous_and_cursor_safe() {
     ));
     assert!(matches!(
         store
-            .run_event_page_for_actor("user-owner", RUN_ID, u64::MAX, 1)
+            .run_event_page_for_actor(&owner_authz(), RUN_ID, u64::MAX, 1)
             .await,
         Err(StorageError::EventCursorOutOfRange { after }) if after == u64::MAX
     ));
     for invalid_limit in [0, protocol::EVENT_PAGE_MAX_LIMIT + 1] {
         assert!(matches!(
             store
-                .run_event_page_for_actor("user-owner", RUN_ID, 0, invalid_limit)
+                .run_event_page_for_actor(&owner_authz(), RUN_ID, 0, invalid_limit)
                 .await,
             Err(StorageError::InvalidEventPageLimit { limit, max })
                 if limit == invalid_limit && max == protocol::EVENT_PAGE_MAX_LIMIT
@@ -4752,15 +5340,15 @@ async fn actor_scoped_run_event_pages_are_bounded_contiguous_and_cursor_safe() {
 
     assert!(matches!(
         store
-            .run_event_page_for_actor("foreign-user", RUN_ID, total as u64 + 1, 1)
+            .run_event_page_for_actor(&foreign_authz(), RUN_ID, total as u64 + 1, 1)
             .await,
-        Err(StorageError::RunNotFound(id)) if id == RUN_ID
+        Err(StorageError::AuthSessionNotFound)
     ));
     assert!(matches!(
         store
-            .run_event_page_for_actor("foreign-user", RUN_ID, 0, 0)
+            .run_event_page_for_actor(&foreign_authz(), RUN_ID, 0, 0)
             .await,
-        Err(StorageError::RunNotFound(id)) if id == RUN_ID
+        Err(StorageError::AuthSessionNotFound)
     ));
 }
 
@@ -4795,7 +5383,7 @@ async fn actor_scoped_session_event_pages_authorize_before_page_validation() {
     bootstrap_test_owner(&store).await;
 
     let first = store
-        .session_event_page_for_actor("user-owner", "session-ZR-1842", 0, 1)
+        .session_event_page_for_actor(&owner_authz(), "session-ZR-1842", 0, 1)
         .await
         .unwrap();
     assert_eq!(first.items.len(), 1);
@@ -4805,7 +5393,7 @@ async fn actor_scoped_session_event_pages_authorize_before_page_validation() {
     assert!(first.has_more);
 
     let last = store
-        .session_event_page_for_actor("user-owner", "session-ZR-1842", 1, 1)
+        .session_event_page_for_actor(&owner_authz(), "session-ZR-1842", 1, 1)
         .await
         .unwrap();
     assert_eq!(last.items.len(), 1);
@@ -4816,7 +5404,7 @@ async fn actor_scoped_session_event_pages_authorize_before_page_validation() {
 
     assert!(matches!(
         store
-            .session_event_page_for_actor("user-owner", "session-ZR-1842", 3, 1)
+            .session_event_page_for_actor(&owner_authz(), "session-ZR-1842", 3, 1)
             .await,
         Err(StorageError::EventCursorBeyondHead {
             after: 3,
@@ -4825,9 +5413,9 @@ async fn actor_scoped_session_event_pages_authorize_before_page_validation() {
     ));
     assert!(matches!(
         store
-            .session_event_page_for_actor("foreign-user", "session-ZR-1842", 3, 0)
+            .session_event_page_for_actor(&foreign_authz(), "session-ZR-1842", 3, 0)
             .await,
-        Err(StorageError::SessionNotFound(id)) if id == "session-ZR-1842"
+        Err(StorageError::AuthSessionNotFound)
     ));
 }
 
@@ -4876,10 +5464,11 @@ async fn active_owner_and_member_have_independent_session_receipt_namespaces() {
     let store = SqliteStore::open(database.path()).await.unwrap();
     bootstrap_test_owner(&store).await;
     insert_test_member(database.path(), "user-member", "member");
+    activate_test_member_auth(database.path(), "user-member", "asi_test_member");
 
     let owner = store
         .create_session_for_actor(
-            "user-owner",
+            &owner_authz(),
             CreateSessionRequest {
                 id: "session-owner-scope".into(),
                 title: "Owner scope".into(),
@@ -4890,7 +5479,7 @@ async fn active_owner_and_member_have_independent_session_receipt_namespaces() {
         .unwrap();
     let member = store
         .create_session_for_actor(
-            "user-member",
+            &member_authz(),
             CreateSessionRequest {
                 id: "session-member-scope".into(),
                 title: "Member scope".into(),
@@ -4904,7 +5493,7 @@ async fn active_owner_and_member_have_independent_session_receipt_namespaces() {
 
     let owner_turn = store
         .start_turn_for_actor(
-            "user-owner",
+            &owner_authz(),
             "session-owner-scope",
             StartTurnRequest {
                 turn_id: "turn-owner-scope".into(),
@@ -4917,7 +5506,7 @@ async fn active_owner_and_member_have_independent_session_receipt_namespaces() {
         .unwrap();
     let member_turn = store
         .start_turn_for_actor(
-            "user-member",
+            &member_authz(),
             "session-member-scope",
             StartTurnRequest {
                 turn_id: "turn-member-scope".into(),
@@ -4932,7 +5521,7 @@ async fn active_owner_and_member_have_independent_session_receipt_namespaces() {
     assert_eq!(member_turn.turn.id, "turn-member-scope");
     assert_eq!(
         store
-            .session_turn_for_actor("user-owner", "session-owner-scope", "turn-owner-scope",)
+            .session_turn_for_actor(&owner_authz(), "session-owner-scope", "turn-owner-scope",)
             .await
             .unwrap(),
         owner_turn.turn
@@ -4940,29 +5529,32 @@ async fn active_owner_and_member_have_independent_session_receipt_namespaces() {
     assert!(matches!(
         store
             .session_turn_for_actor(
-                "user-member",
+                &member_authz(),
                 "session-owner-scope",
-                " malformed-turn ",
+                "unknown-member-turn",
             )
             .await,
-        Err(StorageError::SessionNotFound(id)) if id == "session-owner-scope"
+        Err(StorageError::SessionTurnNotFound(id)) if id == "unknown-member-turn"
     ));
     assert!(matches!(
         store
             .session_turn_for_actor(
-                "user-owner",
+                &owner_authz(),
                 "session-owner-scope",
                 "unknown-turn",
             )
             .await,
         Err(StorageError::SessionTurnNotFound(id)) if id == "unknown-turn"
     ));
-    assert!(matches!(
+    assert_eq!(
         store
-            .get_session_for_actor("user-member", "session-owner-scope")
-            .await,
-        Err(StorageError::SessionNotFound(_))
-    ));
+            .get_session_for_actor(&member_authz(), "session-owner-scope")
+            .await
+            .unwrap()
+            .session
+            .id,
+        "session-owner-scope"
+    );
     store.readiness().await.unwrap();
 }
 
@@ -4971,7 +5563,7 @@ async fn actor_scoped_resume_authorizes_before_receipt_replay() {
     let store = created_owned_session_store().await;
     store
         .start_turn_for_actor(
-            "user-owner",
+            &owner_authz(),
             "session-alpha",
             StartTurnRequest {
                 turn_id: "turn-resume-actor".into(),
@@ -4990,17 +5582,17 @@ async fn actor_scoped_resume_authorizes_before_receipt_replay() {
     assert!(matches!(
         store
             .resume_session_for_actor(
-                "foreign-user",
+                &foreign_authz(),
                 "session-alpha",
                 request.clone(),
                 "resume-shared-key",
             )
             .await,
-        Err(StorageError::SessionNotFound(_))
+        Err(StorageError::AuthSessionNotFound)
     ));
     let resumed = store
         .resume_session_for_actor(
-            "user-owner",
+            &owner_authz(),
             "session-alpha",
             request.clone(),
             "resume-shared-key",
@@ -5010,7 +5602,12 @@ async fn actor_scoped_resume_authorizes_before_receipt_replay() {
     assert!(!resumed.replayed);
     assert!(
         store
-            .resume_session_for_actor("user-owner", "session-alpha", request, "resume-shared-key",)
+            .resume_session_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                request,
+                "resume-shared-key",
+            )
             .await
             .unwrap()
             .replayed
@@ -5022,34 +5619,54 @@ async fn review_receipts_are_actor_scoped_and_authorization_precedes_replay() {
     let database = TestDatabase::new();
     let store = seeded_file_store(database.path()).await;
     bootstrap_test_owner(&store).await;
+    insert_test_member(database.path(), "user-member", "member");
+    activate_test_member_auth(database.path(), "user-member", "asi_test_member");
     let (snapshot, _) = seed_fixture();
     let commit = approved_commit(&snapshot, "actor-review");
 
     assert_eq!(
         store
-            .commit_review_for_actor("user-owner", commit.clone())
+            .commit_review_for_actor(&owner_authz(), commit.clone())
             .await
             .unwrap(),
         CommitOutcome::Committed
     );
     assert!(
         store
-            .review_receipt_for_actor("user-owner", RUN_ID, "actor-review")
+            .review_receipt_for_actor(&owner_authz(), RUN_ID, "actor-review")
             .await
             .unwrap()
             .is_some()
     );
     assert!(matches!(
         store
-            .review_receipt_for_actor("foreign-user", RUN_ID, "actor-review")
+            .commit_review_for_actor(&member_authz(), commit.clone())
             .await,
-        Err(StorageError::RunNotFound(_))
+        Err(StorageError::PermissionDenied)
+    ));
+    assert!(matches!(
+        store
+            .review_receipt_for_actor(&member_authz(), RUN_ID, "actor-review")
+            .await,
+        Err(StorageError::PermissionDenied)
+    ));
+    assert!(matches!(
+        store
+            .review_receipt_for_actor(&member_authz(), "missing-run", "actor-review")
+            .await,
+        Err(StorageError::RunNotFound(id)) if id == "missing-run"
+    ));
+    assert!(matches!(
+        store
+            .review_receipt_for_actor(&foreign_authz(), RUN_ID, "actor-review")
+            .await,
+        Err(StorageError::AuthSessionNotFound)
     ));
 
     set_test_user_status(database.path(), "user-owner", "disabled");
     assert!(matches!(
-        store.commit_review_for_actor("user-owner", commit).await,
-        Err(StorageError::RunNotFound(_))
+        store.commit_review_for_actor(&owner_authz(), commit).await,
+        Err(StorageError::AuthSessionNotFound)
     ));
     assert_eq!(store.load_run(RUN_ID).await.unwrap().events.len(), 7);
 }
@@ -5060,7 +5677,7 @@ async fn reply_claim_rechecks_actor_and_interrupts_without_provider_execution() 
     let store = created_owned_file_session_store(database.path()).await;
     store
         .start_turn_and_enqueue_reply_for_actor(
-            "user-owner",
+            &owner_authz(),
             "session-alpha",
             StartTurnRequest {
                 turn_id: "turn-revoked-reply".into(),
@@ -5099,11 +5716,12 @@ async fn dispatch_claim_rechecks_owner_and_records_not_dispatched_evidence() {
     bootstrap_test_owner(&store).await;
     let (snapshot, _) = seed_fixture();
     let review = approved_dispatch_commit(&snapshot, "revoked-dispatch");
+    set_test_user_role(database.path(), "user-owner", "member");
     store
-        .commit_review_for_actor("user-owner", review.clone())
+        .commit_review_for_actor(&owner_authz(), review.clone())
         .await
         .unwrap();
-    set_test_user_role(database.path(), "user-owner", "member");
+    bump_test_membership_revision(database.path(), "user-owner");
 
     let ClaimOutcome::Rejected(rejection) = store
         .claim_next_dispatch(start_commit(&review.snapshot))
@@ -5118,7 +5736,7 @@ async fn dispatch_claim_rechecks_owner_and_records_not_dispatched_evidence() {
     assert_eq!(rejection.job.result_event_sequence, Some(8));
     assert_eq!(
         rejection.job.authorization_error_json.as_ref().unwrap()["reason"],
-        "approving_actor_role_changed"
+        "initiating_authority_revoked"
     );
     assert_eq!(rejection.event.metadata["executor_invoked"], false);
     assert!(matches!(
@@ -5144,11 +5762,7 @@ async fn dispatch_claim_rechecks_owner_and_records_not_dispatched_evidence() {
             .unwrap(),
         ClaimOutcome::NotAvailable
     );
-    assert!(matches!(
-        store.verify_integrity().await,
-        Err(StorageError::CorruptData(message))
-            if message.contains("account boundary")
-    ));
+    store.verify_integrity().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5660,7 +6274,10 @@ async fn approval_projection_receipt_and_dispatch_enqueue_commit_atomically() {
     let commit = approved_dispatch_commit(&snapshot, "approve-enqueue");
 
     assert_eq!(
-        store.commit_review(commit.clone()).await.unwrap(),
+        store
+            .commit_review_for_actor(&owner_authz(), commit.clone())
+            .await
+            .unwrap(),
         CommitOutcome::Committed
     );
     let loaded = store.load_run(RUN_ID).await.unwrap();
@@ -5677,7 +6294,10 @@ async fn approval_projection_receipt_and_dispatch_enqueue_commit_atomically() {
     assert_eq!(store.peek_next_dispatch().await.unwrap().unwrap(), queued);
 
     assert!(matches!(
-        store.commit_review(commit).await.unwrap(),
+        store
+            .commit_review_for_actor(&owner_authz(), commit)
+            .await
+            .unwrap(),
         CommitOutcome::Replayed(_)
     ));
     assert_eq!(store.load_run(RUN_ID).await.unwrap().events.len(), 7);
@@ -5783,7 +6403,7 @@ async fn dispatch_admission_rejects_unclaimable_jobs_without_any_durable_side_ef
         let call_id = commit.dispatch.as_ref().unwrap().call_id.clone();
         assert!(
             matches!(
-                store.commit_review(commit).await,
+                store.commit_review_for_actor(&owner_authz(), commit).await,
                 Err(StorageError::InvalidDispatchTransition(_))
             ),
             "{label} must fail before admission"
@@ -5805,7 +6425,10 @@ async fn dispatch_admission_rejects_unclaimable_jobs_without_any_durable_side_ef
     }
 
     assert_eq!(
-        store.commit_review(valid.clone()).await.unwrap(),
+        store
+            .commit_review_for_actor(&owner_authz(), valid.clone())
+            .await
+            .unwrap(),
         CommitOutcome::Committed
     );
     assert!(matches!(
@@ -5824,7 +6447,10 @@ async fn database_rejects_dispatch_input_mutation_deletion_and_state_skips() {
     bootstrap_test_owner(&store).await;
     let (snapshot, _) = seed_fixture();
     store
-        .commit_review(approved_dispatch_commit(&snapshot, "immutable-job"))
+        .commit_review_for_actor(
+            &owner_authz(),
+            approved_dispatch_commit(&snapshot, "immutable-job"),
+        )
         .await
         .unwrap();
 
@@ -5870,7 +6496,10 @@ async fn claim_is_queue_ordered_and_atomically_appends_the_start_event() {
     bootstrap_test_owner(&store).await;
     let (snapshot, _) = seed_fixture();
     let review = approved_dispatch_commit(&snapshot, "claim-review");
-    store.commit_review(review.clone()).await.unwrap();
+    store
+        .commit_review_for_actor(&owner_authz(), review.clone())
+        .await
+        .unwrap();
     let start = start_commit(&review.snapshot);
 
     let ClaimOutcome::Claimed(claimed) = store.claim_next_dispatch(start.clone()).await.unwrap()
@@ -5899,7 +6528,10 @@ async fn claim_failure_rolls_back_job_projection_and_v2_event() {
     bootstrap_test_owner(&store).await;
     let (snapshot, _) = seed_fixture();
     let review = approved_dispatch_commit(&snapshot, "claim-rollback-review");
-    store.commit_review(review.clone()).await.unwrap();
+    store
+        .commit_review_for_actor(&owner_authz(), review.clone())
+        .await
+        .unwrap();
     let start = start_commit(&review.snapshot);
 
     assert!(matches!(
@@ -5925,7 +6557,10 @@ async fn complete_is_atomic_and_persists_the_typed_result() {
     bootstrap_test_owner(&store).await;
     let (snapshot, _) = seed_fixture();
     let review = approved_dispatch_commit(&snapshot, "complete-review");
-    store.commit_review(review.clone()).await.unwrap();
+    store
+        .commit_review_for_actor(&owner_authz(), review.clone())
+        .await
+        .unwrap();
     let start = start_commit(&review.snapshot);
     store.claim_next_dispatch(start.clone()).await.unwrap();
     let completion = completion_commit(&start.snapshot);
@@ -5957,7 +6592,10 @@ async fn dispatch_storage_rejects_noncanonical_event_and_projection_without_part
     bootstrap_test_owner(&store).await;
     let (snapshot, _) = seed_fixture();
     let review = approved_dispatch_commit(&snapshot, "canonical-dispatch-review");
-    store.commit_review(review.clone()).await.unwrap();
+    store
+        .commit_review_for_actor(&owner_authz(), review.clone())
+        .await
+        .unwrap();
 
     let start = start_commit(&review.snapshot);
     let mut injected_start = start.clone();
@@ -6000,7 +6638,7 @@ async fn queued_job_survives_restart_and_remains_dispatchable() {
         store.seed_if_empty(snapshot, events).await.unwrap();
         bootstrap_test_owner(&store).await;
         store
-            .commit_review_for_actor("user-owner", review.clone())
+            .commit_review_for_actor(&owner_authz(), review.clone())
             .await
             .unwrap();
     }
@@ -6029,7 +6667,7 @@ async fn started_job_restart_recovery_records_outcome_unknown_without_requeue() 
         store.seed_if_empty(snapshot, events).await.unwrap();
         bootstrap_test_owner(&store).await;
         store
-            .commit_review_for_actor("user-owner", review)
+            .commit_review_for_actor(&owner_authz(), review)
             .await
             .unwrap();
         store.claim_next_dispatch(start.clone()).await.unwrap();
@@ -6067,7 +6705,8 @@ async fn started_job_restart_recovery_records_outcome_unknown_without_requeue() 
 #[tokio::test]
 async fn session_quota_rejects_a_new_key_but_replays_an_admitted_create() {
     let limits = StorageLimits {
-        sessions_per_scope: 1,
+        sessions_per_actor: 1,
+        sessions_per_account: 1,
         sessions_global: 1,
         ..StorageLimits::default()
     };
@@ -6082,7 +6721,7 @@ async fn session_quota_rejects_a_new_key_but_replays_an_admitted_create() {
     };
     let created = store
         .create_session_for_actor(
-            "user-owner",
+            &owner_authz(),
             admitted.clone(),
             "create-session-quota-admitted",
         )
@@ -6093,7 +6732,7 @@ async fn session_quota_rejects_a_new_key_but_replays_an_admitted_create() {
     assert!(matches!(
         store
             .create_session_for_actor(
-                "user-owner",
+                &owner_authz(),
                 CreateSessionRequest {
                     id: "session-quota-rejected".into(),
                     title: "One Session beyond the limit".into(),
@@ -6105,15 +6744,157 @@ async fn session_quota_rejects_a_new_key_but_replays_an_admitted_create() {
     ));
 
     let replayed = store
-        .create_session_for_actor("user-owner", admitted, "create-session-quota-admitted")
+        .create_session_for_actor(&owner_authz(), admitted, "create-session-quota-admitted")
         .await
         .unwrap();
     assert!(replayed.replayed);
     assert_eq!(replayed.session, created.session);
     assert_eq!(
-        store.list_sessions_for_actor("user-owner").await.unwrap(),
+        store.list_sessions_for_actor(&owner_authz()).await.unwrap(),
         vec![created.session]
     );
+}
+
+#[tokio::test]
+async fn session_capacity_enforces_actor_then_account_then_global_boundaries() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open_with_limits(
+        database.path(),
+        StorageLimits {
+            sessions_per_actor: 1,
+            sessions_per_account: 2,
+            sessions_global: 3,
+            ..StorageLimits::default()
+        },
+    )
+    .await
+    .unwrap();
+    bootstrap_test_owner(&store).await;
+    let local_member = activate_test_account_actor(
+        database.path(),
+        &TestAccountActor {
+            account_id: "acc_local",
+            user_id: "user-capacity-member",
+            auth_session_id: "asi_capacity_member",
+            token_byte: '2',
+        },
+    );
+    let local_third = activate_test_account_actor(
+        database.path(),
+        &TestAccountActor {
+            account_id: "acc_local",
+            user_id: "user-capacity-third",
+            auth_session_id: "asi_capacity_third",
+            token_byte: '3',
+        },
+    );
+    let second_account = activate_test_account_actor(
+        database.path(),
+        &TestAccountActor {
+            account_id: "acc_capacity_two",
+            user_id: "user-capacity-two",
+            auth_session_id: "asi_capacity_two",
+            token_byte: '4',
+        },
+    );
+    let third_account = activate_test_account_actor(
+        database.path(),
+        &TestAccountActor {
+            account_id: "acc_capacity_three",
+            user_id: "user-capacity-three",
+            auth_session_id: "asi_capacity_three",
+            token_byte: '5',
+        },
+    );
+
+    store
+        .create_session_for_actor(
+            &owner_authz(),
+            CreateSessionRequest {
+                id: "session-capacity-owner".into(),
+                title: "Owner actor boundary".into(),
+            },
+            "session-capacity-owner",
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .create_session_for_actor(
+                &owner_authz(),
+                CreateSessionRequest {
+                    id: "session-capacity-owner-plus-one".into(),
+                    title: "Owner actor plus one".into(),
+                },
+                "session-capacity-owner-plus-one",
+            )
+            .await,
+        Err(StorageError::StorageQuotaExceeded)
+    ));
+    store
+        .create_session_for_actor(
+            &local_member,
+            CreateSessionRequest {
+                id: "session-capacity-local-member".into(),
+                title: "Local account boundary".into(),
+            },
+            "session-capacity-local-member",
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .create_session_for_actor(
+                &local_third,
+                CreateSessionRequest {
+                    id: "session-capacity-local-plus-one".into(),
+                    title: "Local account plus one".into(),
+                },
+                "session-capacity-local-plus-one",
+            )
+            .await,
+        Err(StorageError::StorageQuotaExceeded)
+    ));
+    store
+        .create_session_for_actor(
+            &second_account,
+            CreateSessionRequest {
+                id: "session-capacity-second-account".into(),
+                title: "Global exact boundary".into(),
+            },
+            "session-capacity-second-account",
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .create_session_for_actor(
+                &third_account,
+                CreateSessionRequest {
+                    id: "session-capacity-global-plus-one".into(),
+                    title: "Global plus one".into(),
+                },
+                "session-capacity-global-plus-one",
+            )
+            .await,
+        Err(StorageError::StorageQuotaExceeded)
+    ));
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let counts: (i64, i64, i64) = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT COUNT(*) FROM sessions
+                    WHERE account_id = 'acc_local'
+                      AND owner_user_id = 'user-owner'),
+                   (SELECT COUNT(*) FROM sessions
+                    WHERE account_id = 'acc_local'),
+                   (SELECT COUNT(*) FROM sessions)"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(counts, (1, 2, 3));
 }
 
 #[tokio::test]
@@ -6429,9 +7210,11 @@ async fn run_event_payload_byte_limit_admits_exact_and_rejects_plus_one_atomical
 #[tokio::test]
 async fn open_turn_quota_admits_the_exact_limit_and_rejects_plus_one_atomically() {
     let limits = StorageLimits {
-        sessions_per_scope: 3,
+        sessions_per_actor: 3,
+        sessions_per_account: 3,
         sessions_global: 3,
-        open_turns_per_scope: 2,
+        open_turns_per_actor: 2,
+        open_turns_per_account: 2,
         open_turns_global: 2,
         ..StorageLimits::default()
     };
@@ -6448,7 +7231,7 @@ async fn open_turn_quota_admits_the_exact_limit_and_rejects_plus_one_atomically(
     for index in 1..=2 {
         let response = store
             .start_turn_for_actor(
-                "user-owner",
+                &owner_authz(),
                 &format!("session-open-{index}"),
                 StartTurnRequest {
                     turn_id: format!("turn-open-{index}"),
@@ -6465,7 +7248,7 @@ async fn open_turn_quota_admits_the_exact_limit_and_rejects_plus_one_atomically(
     assert!(matches!(
         store
             .start_turn_for_actor(
-                "user-owner",
+                &owner_authz(),
                 "session-open-3",
                 StartTurnRequest {
                     turn_id: "turn-open-3".into(),
@@ -6486,11 +7269,14 @@ async fn open_turn_quota_admits_the_exact_limit_and_rejects_plus_one_atomically(
 #[tokio::test]
 async fn reply_queue_quota_admits_the_exact_limit_and_rejects_plus_one_atomically() {
     let limits = StorageLimits {
-        sessions_per_scope: 3,
+        sessions_per_actor: 3,
+        sessions_per_account: 3,
         sessions_global: 3,
-        open_turns_per_scope: 3,
+        open_turns_per_actor: 3,
+        open_turns_per_account: 3,
         open_turns_global: 3,
-        active_reply_jobs_per_scope: 2,
+        active_reply_jobs_per_actor: 2,
+        active_reply_jobs_per_account: 2,
         active_reply_jobs_global: 2,
         ..StorageLimits::default()
     };
@@ -6509,7 +7295,7 @@ async fn reply_queue_quota_admits_the_exact_limit_and_rejects_plus_one_atomicall
         let turn_id = format!("turn-reply-{index}");
         let enqueued = store
             .start_turn_and_enqueue_reply_for_actor(
-                "user-owner",
+                &owner_authz(),
                 &session_id,
                 StartTurnRequest {
                     turn_id: turn_id.clone(),
@@ -6527,7 +7313,7 @@ async fn reply_queue_quota_admits_the_exact_limit_and_rejects_plus_one_atomicall
     assert!(matches!(
         store
             .start_turn_and_enqueue_reply_for_actor(
-                "user-owner",
+                &owner_authz(),
                 "session-reply-3",
                 StartTurnRequest {
                     turn_id: "turn-reply-3".into(),
@@ -6555,7 +7341,7 @@ async fn reply_reservations_cover_success_failure_and_missing_claim_fail_closed(
 
     store
         .start_turn_and_enqueue_reply_for_actor(
-            "user-owner",
+            &owner_authz(),
             "session-alpha",
             StartTurnRequest {
                 turn_id: "turn-reserved-success".into(),
@@ -6612,7 +7398,7 @@ async fn reply_reservations_cover_success_failure_and_missing_claim_fail_closed(
 
     store
         .start_turn_and_enqueue_reply_for_actor(
-            "user-owner",
+            &owner_authz(),
             "session-reply-failure",
             StartTurnRequest {
                 turn_id: "turn-reserved-failure".into(),
@@ -6658,7 +7444,7 @@ async fn reply_reservations_cover_success_failure_and_missing_claim_fail_closed(
 
     store
         .start_turn_and_enqueue_reply_for_actor(
-            "user-owner",
+            &owner_authz(),
             "session-reply-missing",
             StartTurnRequest {
                 turn_id: "turn-reservation-missing".into(),
@@ -6695,7 +7481,10 @@ async fn dispatch_reservation_rolls_back_then_transitions_two_to_one_to_deleted(
     bootstrap_test_owner(&store).await;
     let (snapshot, _) = seed_fixture();
     let review = approved_dispatch_commit(&snapshot, "dispatch-reservation-lifecycle");
-    store.commit_review(review.clone()).await.unwrap();
+    store
+        .commit_review_for_actor(&owner_authz(), review.clone())
+        .await
+        .unwrap();
     assert_eq!(
         dispatch_finalization_slots(database.path(), RUN_ID, "call-local-001"),
         Some(2)
@@ -6752,6 +7541,112 @@ async fn dispatch_reservation_rolls_back_then_transitions_two_to_one_to_deleted(
 }
 
 #[tokio::test]
+async fn distinct_dispatch_initiator_owns_capacity_and_finalization_reservation() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open_with_limits(
+        database.path(),
+        StorageLimits {
+            active_dispatch_jobs_per_actor: 1,
+            active_dispatch_jobs_per_account: 3,
+            active_dispatch_jobs_global: 3,
+            ..StorageLimits::default()
+        },
+    )
+    .await
+    .unwrap();
+    let (snapshot, events) = seed_fixture();
+    assert!(store.seed_if_empty(snapshot.clone(), events).await.unwrap());
+    bootstrap_test_owner(&store).await;
+    insert_test_member(database.path(), "user-member", "member");
+    activate_test_member_auth(database.path(), "user-member", "asi_test_member");
+
+    // Fill the approving owner's actor quota. A distinct initiating member
+    // must still be admitted and charged to its own actor bucket.
+    insert_active_dispatch_capacity_fixture(
+        database.path(),
+        "user-owner",
+        "call-owner-capacity",
+        "APR-OWNER-CAPACITY",
+    );
+    let mut review = approved_dispatch_commit(&snapshot, "distinct-dispatch-actors");
+    review.dispatch.as_mut().unwrap().initiating_authz = member_authz();
+    assert_eq!(
+        store
+            .commit_review_for_actor(&owner_authz(), review)
+            .await
+            .unwrap(),
+        CommitOutcome::Committed
+    );
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let authority: (String, String, String) = connection
+        .query_row(
+            r#"SELECT job.initiating_actor_user_id,
+                      job.approving_actor_user_id,
+                      reservation.actor_user_id
+               FROM dispatch_jobs job
+               JOIN finalization_reservations reservation
+                 ON reservation.kind = 'dispatch'
+                AND reservation.run_id = job.run_id
+                AND reservation.call_id = job.call_id
+               WHERE job.call_id = 'call-local-001'"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        authority,
+        (
+            "user-member".into(),
+            "user-owner".into(),
+            "user-member".into()
+        )
+    );
+}
+
+#[tokio::test]
+async fn distinct_dispatch_rejects_when_the_initiator_actor_quota_is_full() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open_with_limits(
+        database.path(),
+        StorageLimits {
+            active_dispatch_jobs_per_actor: 1,
+            active_dispatch_jobs_per_account: 3,
+            active_dispatch_jobs_global: 3,
+            ..StorageLimits::default()
+        },
+    )
+    .await
+    .unwrap();
+    let (snapshot, events) = seed_fixture();
+    assert!(store.seed_if_empty(snapshot.clone(), events).await.unwrap());
+    bootstrap_test_owner(&store).await;
+    insert_test_member(database.path(), "user-member", "member");
+    activate_test_member_auth(database.path(), "user-member", "asi_test_member");
+
+    insert_active_dispatch_capacity_fixture(
+        database.path(),
+        "user-member",
+        "call-member-capacity",
+        "APR-MEMBER-CAPACITY",
+    );
+    let mut review = approved_dispatch_commit(&snapshot, "full-initiator-dispatch-capacity");
+    review.dispatch.as_mut().unwrap().initiating_authz = member_authz();
+    assert!(matches!(
+        store.commit_review_for_actor(&owner_authz(), review).await,
+        Err(StorageError::DispatchQueueCapacityExceeded)
+    ));
+    assert!(
+        store
+            .dispatch_job("call-local-001")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(store.load_run(RUN_ID).await.unwrap().events.len(), 6);
+}
+
+#[tokio::test]
 async fn auth_session_capacity_counts_only_active_rows_and_cleans_expired_rows() {
     const FAR_PAST: &str = "2000-01-01T00:00:00.000Z";
     const FAR_FUTURE: &str = "2999-01-01T00:00:00.000Z";
@@ -6772,6 +7667,7 @@ async fn auth_session_capacity_counts_only_active_rows_and_cleans_expired_rows()
     store
         .bootstrap_owner(BootstrapOwnerCommit {
             bootstrap_token_hash: "a".repeat(64),
+            auth_session_id: test_owner_auth_session_id(),
             user_id: "user-owner".into(),
             username: "owner".into(),
             password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA".into(),
@@ -6783,7 +7679,7 @@ async fn auth_session_capacity_counts_only_active_rows_and_cleans_expired_rows()
         .unwrap();
     store
         .create_auth_session(AuthSessionCommit {
-            user_id: "user-owner".into(),
+            authz: owner_authz_with_session("asi_capacity_1"),
             session_token_hash: "d".repeat(64),
             csrf_hash: "e".repeat(64),
             expires_at: FAR_FUTURE.into(),
@@ -6796,8 +7692,12 @@ async fn auth_session_capacity_counts_only_active_rows_and_cleans_expired_rows()
     connection
         .execute(
             r#"INSERT INTO auth_sessions(
-                   token_hash, user_id, csrf_hash, created_at, expires_at, last_seen_at
-               ) VALUES (?1, 'user-owner', ?2, ?3, ?3, ?3)"#,
+                   id, token_hash, account_id, user_id, membership_revision,
+                   csrf_hash, created_at, expires_at, last_seen_at
+               ) VALUES (
+                   'asi_expired_capacity', ?1, 'acc_local', 'user-owner', 1,
+                   ?2, ?3, ?3, ?3
+               )"#,
             params![expired_token, "2".repeat(64), FAR_PAST],
         )
         .unwrap();
@@ -6806,7 +7706,7 @@ async fn auth_session_capacity_counts_only_active_rows_and_cleans_expired_rows()
 
     store
         .create_auth_session(AuthSessionCommit {
-            user_id: "user-owner".into(),
+            authz: owner_authz_with_session("asi_capacity_2"),
             session_token_hash: "3".repeat(64),
             csrf_hash: "4".repeat(64),
             expires_at: FAR_FUTURE.into(),
@@ -6819,7 +7719,7 @@ async fn auth_session_capacity_counts_only_active_rows_and_cleans_expired_rows()
     assert!(matches!(
         store
             .create_auth_session(AuthSessionCommit {
-                user_id: "user-owner".into(),
+                authz: owner_authz_with_session("asi_capacity_3"),
                 session_token_hash: "5".repeat(64),
                 csrf_hash: "6".repeat(64),
                 expires_at: FAR_FUTURE.into(),
@@ -6828,6 +7728,89 @@ async fn auth_session_capacity_counts_only_active_rows_and_cleans_expired_rows()
         Err(StorageError::AuthSessionCapacityExceeded)
     ));
     assert_eq!(auth_session_count(database.path(), Some(FAR_PAST)), 3);
+}
+
+#[tokio::test]
+async fn stale_membership_sessions_are_revoked_and_do_not_block_new_revision_login() {
+    const FAR_FUTURE: &str = "2999-01-01T00:00:00.000Z";
+
+    let database = TestDatabase::new();
+    let store = SqliteStore::open_with_limits(
+        database.path(),
+        StorageLimits {
+            auth_sessions_per_user: 2,
+            auth_sessions_global: 2,
+            ..StorageLimits::default()
+        },
+    )
+    .await
+    .unwrap();
+    store
+        .replace_bootstrap_token(&"a".repeat(64), FAR_FUTURE)
+        .await
+        .unwrap();
+    store
+        .bootstrap_owner(BootstrapOwnerCommit {
+            bootstrap_token_hash: "a".repeat(64),
+            auth_session_id: test_owner_auth_session_id(),
+            user_id: "user-owner".into(),
+            username: "owner".into(),
+            password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA".into(),
+            session_token_hash: "b".repeat(64),
+            csrf_hash: "c".repeat(64),
+            session_expires_at: FAR_FUTURE.into(),
+        })
+        .await
+        .unwrap();
+    store
+        .create_auth_session(AuthSessionCommit {
+            authz: owner_authz_with_session("asi_stale_capacity"),
+            session_token_hash: "d".repeat(64),
+            csrf_hash: "e".repeat(64),
+            expires_at: FAR_FUTURE.into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(auth_session_count(database.path(), None), 2);
+
+    bump_test_membership_revision(database.path(), "user-owner");
+    assert!(store.authenticate(&"b".repeat(64)).await.unwrap().is_none());
+    assert!(store.authenticate(&"d".repeat(64)).await.unwrap().is_none());
+    let revised_authz = AuthzContext {
+        account_id: AccountId::local(),
+        user_id: "user-owner".into(),
+        membership_role: MembershipRole::Member,
+        membership_revision: MembershipRevision::new(2).unwrap(),
+        auth_session_id: AuthSessionId::from_persistence("asi_current_capacity").unwrap(),
+    };
+    store
+        .create_auth_session(AuthSessionCommit {
+            authz: revised_authz.clone(),
+            session_token_hash: "f".repeat(64),
+            csrf_hash: "1".repeat(64),
+            expires_at: FAR_FUTURE.into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .authenticate(&"f".repeat(64))
+            .await
+            .unwrap()
+            .unwrap()
+            .authz,
+        revised_authz
+    );
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let retained: (i64, i64) = connection
+        .query_row(
+            r#"SELECT COUNT(*), MIN(membership_revision)
+               FROM auth_sessions WHERE user_id = 'user-owner'"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(retained, (1, 2));
 }
 
 #[tokio::test]
@@ -6985,7 +7968,7 @@ async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempot
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, (1_i64..=13).collect::<Vec<_>>());
+    assert_eq!(versions, (1_i64..=14).collect::<Vec<_>>());
     assert_eq!(
         connection
             .query_row(
@@ -7063,7 +8046,7 @@ async fn integrity_verification_rejects_parent_global_and_reservation_payload_co
     let reservation_store = created_owned_file_session_store(reservation_database.path()).await;
     reservation_store
         .start_turn_for_actor(
-            "user-owner",
+            &owner_authz(),
             "session-alpha",
             StartTurnRequest {
                 turn_id: "turn-reservation-counter-tamper".into(),
@@ -7205,7 +8188,7 @@ async fn reply_job_insert_requires_provider_model_payload_reservation() {
     let turn_id = "turn-provider-budget-hardening";
     store
         .start_turn_for_actor(
-            "user-owner",
+            &owner_authz(),
             "session-alpha",
             StartTurnRequest {
                 turn_id: turn_id.into(),
@@ -7261,7 +8244,7 @@ async fn claims_fail_closed_on_insufficient_payload_reservations_before_state_tr
     let reply_store = created_owned_file_session_store(reply_database.path()).await;
     reply_store
         .start_turn_and_enqueue_reply_for_actor(
-            "user-owner",
+            &owner_authz(),
             "session-alpha",
             StartTurnRequest {
                 turn_id: "turn-insufficient-payload-reservation".into(),
@@ -7315,7 +8298,10 @@ async fn claims_fail_closed_on_insufficient_payload_reservations_before_state_tr
     bootstrap_test_owner(&dispatch_store).await;
     let (snapshot, _) = seed_fixture();
     let review = approved_dispatch_commit(&snapshot, "dispatch-insufficient-payload-reservation");
-    dispatch_store.commit_review(review.clone()).await.unwrap();
+    dispatch_store
+        .commit_review_for_actor(&owner_authz(), review.clone())
+        .await
+        .unwrap();
     assert_eq!(
         force_finalization_reservation_update(
             dispatch_database.path(),
@@ -7385,9 +8371,11 @@ async fn v9_database_over_new_limits_still_opens_reads_and_recovers() {
     downgrade_capacity_fixture_to_v9(database.path());
 
     let limits = StorageLimits {
-        sessions_per_scope: 1,
+        sessions_per_actor: 1,
+        sessions_per_account: 1,
         sessions_global: 1,
-        open_turns_per_scope: 1,
+        open_turns_per_actor: 1,
+        open_turns_per_account: 1,
         open_turns_global: 1,
         session_event_payload_bytes_per_session: 1,
         run_event_payload_bytes_per_run: 1,
@@ -7475,7 +8463,8 @@ async fn startup_seeds_enforce_capacity_before_inserting_and_replay_existing_sta
         );
     }
     let below_existing_state = StorageLimits {
-        sessions_per_scope: 1,
+        sessions_per_actor: 1,
+        sessions_per_account: 1,
         sessions_global: 1,
         session_event_slots_per_session: 1,
         run_event_slots_per_run: 1,
@@ -7516,7 +8505,7 @@ async fn create_owned_test_sessions<const N: usize>(store: &SqliteStore, session
     for session_id in session_ids {
         store
             .create_session_for_actor(
-                "user-owner",
+                &owner_authz(),
                 CreateSessionRequest {
                     id: session_id.into(),
                     title: format!("Capacity fixture {session_id}"),
@@ -7586,6 +8575,45 @@ fn dispatch_finalization_capacity(path: &Path, run_id: &str, call_id: &str) -> O
         )
         .optional()
         .unwrap()
+}
+
+fn insert_active_dispatch_capacity_fixture(
+    path: &Path,
+    initiating_actor_user_id: &str,
+    call_id: &str,
+    approval_id: &str,
+) {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO dispatch_jobs(
+                   call_id, account_id, run_id, approval_id,
+                   approval_event_sequence, initiating_actor_user_id,
+                   initiating_membership_revision, approving_actor_user_id,
+                   approving_membership_revision, tool_name, tool_version,
+                   effect, args_json, args_digest, policy_id, policy_revision,
+                   sandbox_profile, status, attempt, result_json,
+                   authorization_error_json, queued_at, started_at, finished_at,
+                   start_event_sequence, result_event_sequence
+               ) VALUES (
+                   ?1, 'acc_local', ?2, ?3, 6, ?4, 1, 'user-owner', 1,
+                   'local.capacity', '1.0.0', 'local_write', '{}', ?5,
+                   'local-alpha', 'rev-capacity', 'workspace_write',
+                   'queued', 0, NULL, NULL, ?6, NULL, NULL, NULL, NULL
+               )"#,
+            params![
+                call_id,
+                RUN_ID,
+                approval_id,
+                initiating_actor_user_id,
+                format!("sha256:{}", "9".repeat(64)),
+                "2026-08-27T00:00:00.000Z",
+            ],
+        )
+        .unwrap();
 }
 
 fn force_finalization_reservation_update(
@@ -7744,6 +8772,9 @@ fn downgrade_account_foundation_fixture_to_v12(connection: &rusqlite::Connection
     if version < 13 {
         return;
     }
+    if version >= 14 {
+        downgrade_durable_authorization_fixture_to_v13(connection);
+    }
     connection
         .execute_batch(
             r#"DROP TRIGGER accounts_reject_duplicate_insert;
@@ -7780,6 +8811,282 @@ fn downgrade_account_foundation_fixture_to_v12(connection: &rusqlite::Connection
                DROP TABLE account_memberships;
                DROP TABLE accounts;
                DELETE FROM schema_migrations WHERE version = 13;"#,
+        )
+        .unwrap();
+}
+
+fn downgrade_durable_authorization_fixture_to_v13(connection: &rusqlite::Connection) {
+    let template = rusqlite::Connection::open_in_memory().unwrap();
+    template
+        .execute_batch(include_str!("../migrations/0001_init.sql"))
+        .unwrap();
+    template
+        .execute_batch(include_str!("../migrations/0002_tool_execution.sql"))
+        .unwrap();
+    template
+        .execute_batch(include_str!("../migrations/0003_runtime_identity.sql"))
+        .unwrap();
+    template
+        .execute_batch(include_str!("../migrations/0004_sessions.sql"))
+        .unwrap();
+    template
+        .execute_batch(include_str!("../migrations/0005_accounts.sql"))
+        .unwrap();
+    template
+        .execute_batch(include_str!("../migrations/0006_actor_receipts.sql"))
+        .unwrap();
+    template
+        .execute_batch(include_str!("../migrations/0007_reply_jobs.sql"))
+        .unwrap();
+    template
+        .execute_batch(include_str!("../migrations/0008_actor_boundaries.sql"))
+        .unwrap();
+    template
+        .execute_batch("DROP TRIGGER run_events_reject_update;")
+        .unwrap();
+    template
+        .execute_batch(include_str!("../migrations/0009_point_queries.sql"))
+        .unwrap();
+    template
+        .execute_batch(
+            r#"CREATE INDEX run_events_approval_lookup_idx
+                   ON run_events(run_id, approval_id, sequence DESC, approval_status)
+                   WHERE approval_id IS NOT NULL;
+               CREATE INDEX run_events_tool_call_lookup_idx
+                   ON run_events(run_id, data_kind, call_id, sequence)
+                   WHERE data_kind = 'tool_call_requested' AND call_id IS NOT NULL;
+               CREATE INDEX run_events_policy_revision_idx
+                   ON run_events(run_id, policy_revision)
+                   WHERE policy_revision IS NOT NULL;
+               CREATE INDEX session_runs_session_attached_idx
+                   ON session_runs(session_id, attached_at, run_id);
+               CREATE INDEX reply_jobs_started_idx
+                   ON reply_jobs(status, started_at, id);
+               CREATE INDEX dispatch_jobs_started_idx
+                   ON dispatch_jobs(status, started_at, call_id);
+               CREATE INDEX session_turns_open_recovery_idx
+                   ON session_turns(status, session_id, ordinal, id);
+
+               CREATE TRIGGER run_events_reject_update
+               BEFORE UPDATE ON run_events
+               BEGIN
+                   SELECT RAISE(ABORT, 'run_events are append-only');
+               END;
+
+               CREATE TRIGGER run_events_require_next_sequence
+               BEFORE INSERT ON run_events
+               WHEN NEW.sequence <> COALESCE((
+                   SELECT MAX(sequence) + 1
+                   FROM run_events
+                   WHERE run_id = NEW.run_id
+               ), 1)
+               BEGIN
+                   SELECT RAISE(ABORT, 'run event sequence must be contiguous');
+               END;"#,
+        )
+        .unwrap();
+    template
+        .execute_batch(include_str!("../migrations/0010_capacity.sql"))
+        .unwrap();
+    template
+        .execute_batch(include_str!("../migrations/0011_event_payload_bytes.sql"))
+        .unwrap();
+    template
+        .execute_batch(include_str!(
+            "../migrations/0012_bootstrap_audit_retention.sql"
+        ))
+        .unwrap();
+    template
+        .execute_batch(include_str!(
+            "../migrations/0013_account_membership_foundation.sql"
+        ))
+        .unwrap();
+
+    let table_names = [
+        "auth_sessions",
+        "session_command_receipts",
+        "idempotency_receipts",
+        "reply_jobs",
+        "dispatch_jobs",
+        "finalization_reservations",
+    ];
+    let v13_tables = table_names
+        .iter()
+        .map(|name| {
+            template
+                .query_row(
+                    "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+                    [name],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut statement = template
+        .prepare(
+            r#"SELECT sql
+               FROM sqlite_schema
+               WHERE sql IS NOT NULL
+                 AND (
+                     (type IN ('index', 'trigger')
+                      AND tbl_name IN (
+                          'auth_sessions', 'session_command_receipts',
+                          'idempotency_receipts', 'reply_jobs', 'dispatch_jobs',
+                          'finalization_reservations'
+                      ))
+                     OR name IN (
+                         'users_single_owner_idx',
+                         'session_runs_require_same_owner'
+                     )
+                 )
+               ORDER BY CASE type WHEN 'index' THEN 0 ELSE 1 END, name"#,
+        )
+        .unwrap();
+    let v13_objects = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON; BEGIN IMMEDIATE;",
+        )
+        .unwrap();
+
+    let current_objects = {
+        let mut statement = connection
+            .prepare(
+                r#"SELECT type, name
+                   FROM sqlite_schema
+                   WHERE sql IS NOT NULL
+                     AND type IN ('index', 'trigger')
+                     AND tbl_name IN (
+                         'auth_sessions', 'session_command_receipts',
+                         'idempotency_receipts', 'reply_jobs', 'dispatch_jobs',
+                         'finalization_reservations'
+                     )
+                   ORDER BY CASE type WHEN 'trigger' THEN 0 ELSE 1 END, name"#,
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    for (object_type, name) in current_objects {
+        connection
+            .execute_batch(&format!("DROP {object_type} \"{name}\";"))
+            .unwrap();
+    }
+
+    connection
+        .execute_batch(
+            r#"ALTER TABLE finalization_reservations
+                   RENAME TO finalization_reservations_v14;
+               ALTER TABLE reply_jobs RENAME TO reply_jobs_v14;
+               ALTER TABLE dispatch_jobs RENAME TO dispatch_jobs_v14;
+               ALTER TABLE auth_sessions RENAME TO auth_sessions_v14;
+               ALTER TABLE session_command_receipts
+                   RENAME TO session_command_receipts_v14;
+               ALTER TABLE idempotency_receipts
+                   RENAME TO idempotency_receipts_v14;"#,
+        )
+        .unwrap();
+    for table_sql in v13_tables {
+        connection.execute_batch(&table_sql).unwrap();
+    }
+    connection
+        .execute_batch(
+            r#"INSERT INTO auth_sessions(
+                   token_hash, user_id, csrf_hash, created_at, expires_at,
+                   last_seen_at
+               )
+               SELECT token_hash, user_id, csrf_hash, created_at, expires_at,
+                      last_seen_at
+               FROM auth_sessions_v14;
+
+               INSERT INTO session_command_receipts(
+                   actor_scope, idempotency_key, operation,
+                   request_fingerprint, response_json, session_id,
+                   event_sequence, created_at
+               )
+               SELECT COALESCE(actor_user_id, '__legacy__'), idempotency_key,
+                      operation, request_fingerprint, response_json, session_id,
+                      event_sequence, created_at
+               FROM session_command_receipts_v14;
+
+               INSERT INTO idempotency_receipts(
+                   actor_scope, idempotency_key, operation,
+                   request_fingerprint, response_json, run_id,
+                   event_sequence, created_at
+               )
+               SELECT COALESCE(actor_user_id, '__legacy__'), idempotency_key,
+                      operation, request_fingerprint, response_json, run_id,
+                      event_sequence, created_at
+               FROM idempotency_receipts_v14;
+
+               INSERT INTO reply_jobs(
+                   id, actor_user_id, session_id, turn_id, provider_name,
+                   model_name, status, attempt, request_json, response_json,
+                   error_json, completion_fingerprint,
+                   assistant_event_sequence, terminal_event_sequence,
+                   queued_at, started_at, finished_at
+               )
+               SELECT id, actor_user_id, session_id, turn_id, provider_name,
+                      model_name, status, attempt, request_json, response_json,
+                      error_json, completion_fingerprint,
+                      assistant_event_sequence, terminal_event_sequence,
+                      queued_at, started_at, finished_at
+               FROM reply_jobs_v14;
+
+               INSERT INTO dispatch_jobs(
+                   call_id, run_id, approval_id, approval_event_sequence,
+                   approving_actor_user_id, tool_name, tool_version, effect,
+                   args_json, args_digest, policy_id, policy_revision,
+                   sandbox_profile, status, attempt, result_json,
+                   authorization_error_json, queued_at, started_at,
+                   finished_at, start_event_sequence, result_event_sequence
+               )
+               SELECT call_id, run_id, approval_id, approval_event_sequence,
+                      approving_actor_user_id, tool_name, tool_version, effect,
+                      args_json, args_digest, policy_id, policy_revision,
+                      sandbox_profile, status, attempt, result_json,
+                      authorization_error_json, queued_at, started_at,
+                      finished_at, start_event_sequence, result_event_sequence
+               FROM dispatch_jobs_v14;
+
+               INSERT INTO finalization_reservations(
+                   kind, scope_id, session_id, turn_id, run_id, call_id,
+                   remaining_event_slots, reserved_bytes, created_at,
+                   remaining_event_payload_bytes
+               )
+               SELECT kind, COALESCE(actor_user_id, '__legacy__'), session_id,
+                      turn_id, run_id, call_id, remaining_event_slots,
+                      reserved_bytes, created_at,
+                      remaining_event_payload_bytes
+               FROM finalization_reservations_v14;
+
+               DROP TABLE finalization_reservations_v14;
+               DROP TABLE reply_jobs_v14;
+               DROP TABLE dispatch_jobs_v14;
+               DROP TABLE auth_sessions_v14;
+               DROP TABLE session_command_receipts_v14;
+               DROP TABLE idempotency_receipts_v14;"#,
+        )
+        .unwrap();
+    for object_sql in v13_objects {
+        connection.execute_batch(&object_sql).unwrap();
+    }
+    connection
+        .execute_batch(
+            r#"DELETE FROM schema_migrations WHERE version = 14;
+               COMMIT;
+               PRAGMA legacy_alter_table = OFF;
+               PRAGMA foreign_keys = ON;"#,
         )
         .unwrap();
 }
@@ -8041,6 +9348,7 @@ async fn bootstrap_test_owner(store: &SqliteStore) {
     store
         .bootstrap_owner(BootstrapOwnerCommit {
             bootstrap_token_hash: "a".repeat(64),
+            auth_session_id: test_owner_auth_session_id(),
             user_id: "user-owner".into(),
             username: "owner".into(),
             password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA".into(),
@@ -8072,6 +9380,42 @@ fn set_test_user_role(path: &Path, user_id: &str, role: &str) {
         .unwrap();
 }
 
+fn bump_test_membership_revision(path: &Path, user_id: &str) {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO users(
+                   id, username, role, status, password_hash, created_at, updated_at
+               ) VALUES (
+                   'user-backup-owner', 'backup-owner', 'owner', 'active', ?1, ?2, ?2
+               )"#,
+            params![
+                "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA",
+                "2026-08-27T00:00:00.000Z"
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO account_memberships(
+                   account_id, user_id, role, status, revision, created_at, updated_at
+               ) VALUES (
+                   'acc_local', 'user-backup-owner', 'owner', 'active', 1, ?1, ?1
+               )"#,
+            ["2026-08-27T00:00:00.000Z"],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE account_memberships
+               SET role = 'member', revision = revision + 1,
+                   updated_at = '9999-12-31T23:59:59.999Z'
+               WHERE account_id = 'acc_local' AND user_id = ?1"#,
+            [user_id],
+        )
+        .unwrap();
+}
+
 fn insert_test_member(path: &Path, user_id: &str, username: &str) {
     let connection = rusqlite::Connection::open(path).unwrap();
     connection
@@ -8090,6 +9434,109 @@ fn insert_test_member(path: &Path, user_id: &str, username: &str) {
             ],
         )
         .unwrap();
+}
+
+fn activate_test_member_auth(path: &Path, user_id: &str, auth_session_id: &str) {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO account_memberships(
+                   account_id, user_id, role, status, revision, created_at, updated_at
+               ) VALUES (
+                   'acc_local', ?1, 'member', 'active', 1,
+                   '2026-08-27T00:00:00.000Z', '2026-08-27T00:00:00.000Z'
+               )"#,
+            [user_id],
+        )
+        .unwrap();
+    let token_hash = if user_id == "foreign-user" {
+        "f".repeat(64)
+    } else {
+        "e".repeat(64)
+    };
+    connection
+        .execute(
+            r#"INSERT INTO auth_sessions(
+                   id, token_hash, account_id, user_id, membership_revision,
+                   csrf_hash, created_at, expires_at, last_seen_at
+               ) VALUES (
+                   ?1, ?2, 'acc_local', ?3, 1, ?4,
+                   '2026-08-27T00:00:00.000Z', '2999-01-01T00:00:00.000Z',
+                   '2026-08-27T00:00:00.000Z'
+               )"#,
+            params![auth_session_id, token_hash, user_id, "d".repeat(64)],
+        )
+        .unwrap();
+}
+
+struct TestAccountActor<'a> {
+    account_id: &'a str,
+    user_id: &'a str,
+    auth_session_id: &'a str,
+    token_byte: char,
+}
+
+fn activate_test_account_actor(path: &Path, actor: &TestAccountActor<'_>) -> AuthzContext {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .unwrap();
+    if actor.account_id != "acc_local" {
+        connection
+            .execute(
+                r#"INSERT INTO accounts(id, name, status, created_at, updated_at)
+                   VALUES (?1, ?1, 'active', ?2, ?2)"#,
+                params![actor.account_id, "2026-08-27T00:00:00.000Z"],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            r#"INSERT INTO users(
+                   id, username, role, status, password_hash, created_at, updated_at
+               ) VALUES (?1, ?1, 'member', 'active', ?2, ?3, ?3)"#,
+            params![
+                actor.user_id,
+                "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA",
+                "2026-08-27T00:00:00.000Z",
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO account_memberships(
+                   account_id, user_id, role, status, revision, created_at, updated_at
+               ) VALUES (?1, ?2, 'member', 'active', 1, ?3, ?3)"#,
+            params![actor.account_id, actor.user_id, "2026-08-27T00:00:00.000Z"],
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"INSERT INTO auth_sessions(
+                   id, token_hash, account_id, user_id, membership_revision,
+                   csrf_hash, created_at, expires_at, last_seen_at
+               ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?6)"#,
+            params![
+                actor.auth_session_id,
+                actor.token_byte.to_string().repeat(64),
+                actor.account_id,
+                actor.user_id,
+                "a".repeat(64),
+                "2026-08-27T00:00:00.000Z",
+                "2999-01-01T00:00:00.000Z",
+            ],
+        )
+        .unwrap();
+    AuthzContext {
+        account_id: AccountId::from_persistence(actor.account_id).unwrap(),
+        user_id: actor.user_id.into(),
+        membership_role: MembershipRole::Member,
+        membership_revision: MembershipRevision::new(1).unwrap(),
+        auth_session_id: AuthSessionId::from_persistence(actor.auth_session_id).unwrap(),
+    }
 }
 
 fn insert_legacy_oversized_reply_fixture(
@@ -8197,11 +9644,11 @@ fn insert_legacy_oversized_reply_fixture(
     connection
         .execute(
             r#"INSERT INTO finalization_reservations(
-                   kind, scope_id, session_id, turn_id, run_id, call_id,
+                   kind, account_id, actor_user_id, session_id, turn_id, run_id, call_id,
                    remaining_event_slots, remaining_event_payload_bytes,
                    reserved_bytes, created_at
                ) VALUES (
-                   'session_turn', 'user-owner', ?1, ?2, NULL, NULL,
+                   'session_turn', 'acc_local', 'user-owner', ?1, ?2, NULL, NULL,
                    2, ?3, NULL, ?4
                )"#,
             params![session_id, turn_id, finalization_payload_bytes, timestamp],
@@ -8210,12 +9657,13 @@ fn insert_legacy_oversized_reply_fixture(
     connection
         .execute(
             r#"INSERT INTO reply_jobs(
-                   id, actor_user_id, session_id, turn_id, provider_name, model_name,
+                   id, account_id, actor_user_id, actor_membership_revision,
+                   session_id, turn_id, provider_name, model_name,
                    status, attempt, request_json, response_json, error_json,
                    completion_fingerprint, assistant_event_sequence,
                    terminal_event_sequence, queued_at, started_at, finished_at
                ) VALUES (
-                   ?1, 'user-owner', ?2, ?3, 'test-provider', 'test-model',
+                   ?1, 'acc_local', 'user-owner', 1, ?2, ?3, 'test-provider', 'test-model',
                    'queued', 0, ?4, NULL, NULL, NULL, NULL, NULL, ?5, NULL, NULL
                )"#,
             params![
@@ -8251,7 +9699,7 @@ async fn created_owned_file_session_store(path: &Path) -> SqliteStore {
 fn reply_job_spec(id: &str, turn_id: &str) -> ReplyJobSpec {
     ReplyJobSpec {
         id: id.into(),
-        actor_user_id: "user-owner".into(),
+        authz: owner_authz(),
         provider_name: "test-provider".into(),
         model_name: Some("test-model".into()),
         request_json: json!({
@@ -8525,7 +9973,8 @@ fn approved_dispatch_commit(seed: &RunSnapshot, key: &str) -> ReviewCommit {
     let dispatch = DispatchJobSpec {
         call_id: "call-local-001".into(),
         approval_id: "APR-901".into(),
-        approving_actor_user_id: "user-owner".into(),
+        initiating_authz: owner_authz(),
+        approving_authz: owner_authz(),
         tool_name: "local.echo".into(),
         tool_version: "1.0.0".into(),
         effect: ToolEffect::LocalWrite,

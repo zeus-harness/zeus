@@ -21,15 +21,15 @@ Client / SvelteKit Web
 ```
 
 - `protocol`：认证、设置、Session/Run HTTP、SSE、turn 与可版本化事件合约。
-- `tenancy`：本地 owner 身份、Argon2id 密码、opaque token、CSRF 与域分离 digest。
+- `tenancy`：本地身份、account/membership 授权上下文、Argon2id 密码、opaque token、CSRF 与域分离 digest。
 - `llm`：object-safe reply provider、本地非模型 fallback 和有界 OpenAI-compatible 客户端。
 - `kernel`：纯状态转换，不读数据库、不执行外部工具。
-- `authz`：精确工具名规则、策略 revision、环境和 effect guard；没有命中即拒绝。
+- `authz`：account capability matrix，以及精确工具名规则、策略 revision、环境和 effect guard；没有命中即拒绝。
 - `tools`：工具描述、注册表、参数验证和 object-safe executor 边界。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
-- `storage`：schema v13 migration、`acc_local`/owner membership foundation、用户/偏好、独立
-  Session/Run ledger、typed event lookup、actor-scoped 回执、durable reply/dispatch queue，
-  以及 logical/physical/operation capacity。
+- `storage`：schema v14 migration、`acc_local` membership 权威、用户/偏好、独立 Session/Run
+  ledger、typed event lookup、account+actor-scoped 回执、durable reply/dispatch queue，以及
+  actor/account/global logical capacity、physical capacity 和 operation capacity。
 - `runtime`：Session 命令编排、reply/Run worker、提交后 SSE 提示和启动恢复。
 - `zeus-api`：进程组合、owner 认证、CSRF、provider 配置、REST/SSE 和 readiness。
 
@@ -119,7 +119,8 @@ job；reply job 与 Run dispatch job 是两条独立队列。
 
 审批命令也在一个 `BEGIN IMMEDIATE` 事务内完成：
 
-1. 重新校验 active owner 与 Run ownership，再读取 actor-scoped 持久幂等回执。
+1. 在同一 SQLite snapshot 重新校验 auth session、membership revision/capability 与 Run account，
+   再读取 `(account, actor, operation, key)` 持久幂等回执。
 2. 对 Run head sequence 做 CAS。
 3. 追加 `ApprovalDecided` 事件并更新 Run 投影。
 4. Approve 时插入唯一的 queued dispatch job。
@@ -129,9 +130,11 @@ job；reply job 与 Run dispatch job 是两条独立队列。
 Session 和 Run 的进程内 broadcast 都只负责低延迟提示，不是事件事实源。两种 SSE 都从各自
 的 sequence cursor 每 2 秒补读一次持久 ledger；即使提示丢失，也不会永久漏掉已提交事件。
 
-worker 在调用 connector 之前，必须先在另一个事务中复验 dispatch job 绑定的批准 actor 仍是
-active owner 且仍拥有 Run，再把 job 从 queued CAS 为 started、追加 `ToolDispatchStarted` 并推进
-Run sequence。授权已撤销时，该事务直接把 job 置为 rejected、Run 置为 `needs_attention`，追加
+worker 在调用 connector 之前，必须先在另一个事务中复验 dispatch job 固化的 initiating actor
+仍有 SessionWrite capability、approving actor 仍有 ApproveDispatch capability，且两者的
+account/membership revision、User、Account 都仍有效，再把 job 从 queued CAS 为 started、追加
+`ToolDispatchStarted` 并推进 Run sequence。授权已撤销时，该事务直接把 job 置为 rejected、Run
+置为 `needs_attention`，追加
 `ToolResult::NotDispatched(reason=authorization_revoked)`；不会生成假的 started checkpoint，也不会
 调用 connector。该事务失败时 executor 调用次数同样必须为零。
 connector 在数据库事务和锁之外运行。
@@ -143,9 +146,10 @@ connector 在数据库事务和锁之外运行。
 
 API 监听端口之前按固定顺序完成：
 
-1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v13；按当前
-   detailed-row limit 以最多 64 行 batch 压缩 bootstrap terminal audit prefix，再按
-   `(expires_at, token_hash)` 最多清理 64 个过期 auth session。
+1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v14；按当前
+   detailed-row limit 以最多 64 行 batch 压缩 bootstrap terminal audit prefix，再按稳定
+   `(priority actor, expires_at, auth-session ID)` 顺序最多清理 64 个过期或绑定
+   missing/disabled/suspended/stale-revision authority 的 auth session。
 2. 绑定并核对 runtime identity、primary Session/Run 和 demo attachment。
 3. 以固定 64 行 batch 读取 `started` 且没有持久结果的 reply job，循环排空：结算为 `outcome_unknown`，追加
    `turn_interrupted`，不得重放可能已经计费的 provider 请求。queued reply 原样保留并可安全领取。
@@ -175,13 +179,13 @@ exactly-once 语义。
   owner。bootstrap/login 必须 exact same-origin；写请求还要求与登录会话绑定的 CSRF token。
   session cookie 为 opaque、`HttpOnly; SameSite=Strict`；HTTPS 部署必须显式设置
   `ZEUS_COOKIE_SECURE=true` 才附加 `Secure`。
-- Alpha+ 明确拒绝 schema 预留的 `member` 登录。正式 Run/Session 查询、SSE、resume、turn、
-  review 和 receipt 已全部 actor-scoped，并有 Alice/Bob 隔离测试；字段、HTTP/SSE 连接和
+- Alpha+ 仍明确拒绝 schema 预留的 `member` 登录。正式 Run/Session 查询、SSE、resume、turn、
+  review 和 receipt 已全部 account+actor-scoped，并有跨 account/actor 隔离测试；字段、HTTP/SSE 连接和
   event page 边界、内部 point/batch read、有界 list/detail，以及 SQLite 行数、active queue、
-  event-slot、事件载荷逻辑字节配额和 DB/WAL/disk headroom 门禁已落地。v13 还建立了唯一
-  `acc_local`、旧 owner membership 与四个 root 的 immutable account scope；但 member 仍须等待
-  v14 account-scoped durable authorization 与 v15 member lifecycle/account security audit，
-  不能仅因 foundation 已落地就开放。
+  event-slot、事件载荷逻辑字节配额和 DB/WAL/disk headroom 门禁已落地。v14 已把唯一
+  `acc_local` membership 切为 capability 权威，并为 auth session、receipt、reply/dispatch、
+  reservation、cursor 和 capacity 建立 account/actor 边界；member 仍须等待 v15 lifecycle 与
+  account security audit，不能仅因底层 capability 已落地就开放。
 - auth JSON 明确限制为 8 KiB、command JSON 为 512 KiB；新建 Session/turn ID、title、
   user/assistant message、review note 与严格幂等键分别按 UTF-8 bytes 设置硬上限。typed
   reply response 为 512 KiB，compact tool output 与 dispatch arguments JSON 为 64 KiB，
@@ -195,10 +199,12 @@ exactly-once 语义。
   stream，只有 body drop 或流结束才释放。initial replay、hint reconciliation、Lagged recovery
   和 durable poll 都使用 SQL `LIMIT + 1` page，默认 128、硬上限 256；`has_more` 通过页间
   `yield_now` cooperative continuation 补齐，cursor 只随实际发送的 sequence 前进。
-- Session summary list 使用 `(owner, updated_at DESC, id ASC)` indexed keyset，默认 50、最大
-  100，并以响应头续页。Session detail 的 attachment/turn/event tail 和 Run detail/overview 的
-  event tail 都使用 `LIMIT + 1`，collection 上限 100、event 上限 256；opaque cursor 绑定 kind
-  与 actor/resource scope。actor 鉴权先于 cursor/limit 语义，projection、tail 和各独立 page 在同一
+- Session summary list 使用 account scope 内 `(updated_at DESC, id ASC)` indexed keyset，默认
+  50、最大 100，并以响应头续页；cursor 另绑定当前 actor。Session detail 的
+  attachment/turn/event tail 和 Run detail/overview 的
+  event tail 都使用 `LIMIT + 1`，collection 上限 100、event 上限 256；opaque cursor v2 绑定
+  `(account, actor, kind, parent resource)`，不绑定 auth-session ID 或 membership revision，因此
+  同一 actor 重新登录仍可续页。鉴权先于 cursor/limit 语义，projection、tail 和各独立 page 在同一
   SQLite read transaction 中校验，页内再恢复为原始升序。
 - Session turn 提供 actor-scoped `(session_id, turn_id)` point GET。Web 的 durable retry 不会因
   turn 离开默认 50 条 tail 就清除原 command identity；回执重放后会再次读取权威 turn 终态。
@@ -233,15 +239,19 @@ exactly-once 语义。
   v13 创建唯一 `acc_local` 和 `account_memberships`，只为既有唯一 active owner 建 revision 1
   membership，并给 Incident/Session/Run/runtime identity 回填 immutable `account_id`。迁移在任何
   account 写入前验证 legacy owner、actor、receipt、job、reservation、runtime binding 与外键；
-  member-owned/cross-owner/损坏关系使 v12→v13 整体回滚。v13 保留 `users.role` 与 owner-based
-  API/storage 授权，member gate 不变；account-scoped receipt/job/auth/capacity 属于 v14。
+  member-owned/cross-owner/损坏关系使 v12→v13 整体回滚。v14 重建 auth session、command
+  receipt、reply/dispatch job 与 finalization reservation，固化 account、actor 和 membership
+  revision；`account_memberships` 成为唯一 capability 权威，`users.role`/`owner_user_id` 只保留
+  creator metadata。迁移前后在同一事务核对 row/FK/index/trigger/actor state，无法证明的旧
+  authority 整体回滚；member 产品 gate 保持关闭。
   每个 pre-v4 Run 会绑定到生成的 `session-{run_id}`，原 Run/Event 不重写、不丢弃。
 - runtime identity 持久绑定 profile、environment、primary Session/Run、policy ID 和
   revision；不一致时启动失败。Run attachment 当前用于 migration 和 demo seed，Alpha 不公开
   attach-Run HTTP route。
-- queue claim 与 started recovery 在任何外部调用前再次核对 actor 状态、role、resource owner、
-  job 的 run、policy ID 和 revision。
-- Session/Run command 在鉴权与 exact receipt replay 之后、状态写入之前检查 logical capacity。
+- queue claim 在任何外部调用前再次核对固化 account、User、membership role/status/revision、
+  capability、job 的 Run、policy ID 和 revision；已经 claim 的 completion 不因后续撤权重放外部调用。
+- Session/Run command 在鉴权与 exact receipt replay 之后、状态写入之前检查 actor/account/global
+  三层 logical capacity；每个窄层配置都必须小于等于下一层。
   turn admission 预留两个 Session event slots 与完整终结载荷预算；dispatch admission 预留两个
   Run slots 与 start+terminal 载荷预算。reply claim 必须仍持有完整预留；dispatch started 将
   2→1 并把字节预算收敛为 terminal 上界；success/failure/rejection/recovery 在终态事务降到
@@ -252,7 +262,7 @@ exactly-once 语义。
 - SQLite Physical Capacity Slice 已实现并通过本地主机验证：主库 4 GiB（hard ceiling 32 GiB）、WAL
   target 16 MiB（hard ceiling 256 MiB）、最小可用空间 256 MiB（hard ceiling 8 GiB）、
   admission headroom watermark 512 MiB（hard ceiling 8 GiB）。配置必须满足 `WAL target < admission
-  reserve < max main`，并用 checked addition 保证 `min free + admission reserve` 不溢出。
+reserve < max main`，并用 checked addition 保证 `min free + admission reserve` 不溢出。
   `max_page_count` 是主库 page 上限；WAL target 只用于 autocheckpoint/journal reset，不是
   active WAL 的绝对硬上限。`statvfs` 可用空间检查存在 TOCTOU，只能降低风险，不能提供磁盘
   预留保证；该 headroom 是单一 admission watermark，不按请求或 active job 累加，逻辑
@@ -330,7 +340,9 @@ exactly-once 语义。
 - schema v1/v3/v5/v7/v8/v9/v10/v11 原地迁移到 v12 的历史证据继续保留；v12→v13 又原地建立
   `acc_local`、owner membership 与 root account scope。原 Run/Event payload、receipt 与 primary
   Session/Run 绑定稳定；迁移时尚未 bootstrap 的 legacy actor 只允许在首次 owner bootstrap
-  事务中认领一次。
+  事务中认领一次。v13→v14 再原地重建 auth session、receipt、reply/dispatch job 与 reservation；
+  configured/unconfigured active work、窄化 NULL claim、owner-only auth 保留和 version-13 原子回滚
+  都有确定性覆盖。
 - 重启后用户/偏好、Session/turn/event、reply job、Run/Event、审批决定、dispatch job 和命令
   回执仍存在。
 - Session start 与 reply enqueue 同事务；reply success 把 assistant provenance、连续事件、turn
@@ -368,17 +380,17 @@ exactly-once 语义。
   `404`。审批、派发、reply completion、attachment 和启动恢复已改为 typed point query 或
   固定 64 行 batch；Session list/detail 与 Run detail/overview 也已改为 indexed bounded read
   model。SQLite row/active/event-slot、逻辑 event-payload byte quota 与 physical capacity gate
-  和 operation capacity gate 已落地；bootstrap audit detailed retention/rollup 与 v13 account
-  membership foundation 已落地。对外或多租户部署前仍必须完成 v14 account-scoped durable
-  authorization、v15 member lifecycle/account security audit，以及共享部署门禁。
-  此前 Operation Capacity Apple 指定 readiness-pressure 与当前 v13 migration/restart 已分别
-  通过；v13 本轮没有重跑该压力。完整低内存/对抗性压力与 Linux Docker PID/OOM authoritative
+  和 operation capacity gate 已落地；bootstrap audit detailed retention/rollup、v13 account
+  membership foundation 与 v14 account-scoped durable authorization 已落地。对外或多租户部署前
+  仍必须完成 v15 member lifecycle/account security audit，以及共享部署门禁。
+  此前 Operation Capacity Apple 指定 readiness-pressure 与当前 v14 migration/restart 已分别
+  通过；v14 本轮没有重跑该压力。完整低内存/对抗性压力与 Linux Docker PID/OOM authoritative
   evidence 仍是 deployment gate。
 - Web 保持紧凑时间线、一个内联审批卡和一个 composer；支持真实 New Session、活动 Session
   刷新恢复、owner 设置/退出和 system/light/dark。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化结果是 289 个 Rust 测试（storage 139、runtime 28、API library 44、API
-  main/config 4）和 25 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化按项目既有统计口径是 312 个 Rust 测试（storage 153、runtime 31、API library 46、
+  API main/config 6）和 25 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
 提交 `af29089` 曾构建并运行在独立 `zeus-operation-acceptance` project（端口 `18089`）；既有
@@ -387,16 +399,19 @@ exactly-once 语义。
 volume；首次启动完成 v11→v12 migration，保留 volume 的第二次 `restart-verify` 也通过。API、
 Web、gateway、认证状态、匿名保护边界均通过，且 `configured=false` 未配置状态在重启前后一致；
 该历史 v12 readiness 的 exact-schema 检查覆盖迁移后的再次打开。
-当前 schema v13 镜像又在同一 `zeus-operation-acceptance` project 上保留上述现为 v12 的 named
-volume，原地完成 v12→v13 migration；保留卷 `restart-verify` 通过，验收栈继续运行在
-`127.0.0.1:18089`。API effective limit 为 2 CPU/1 GiB，当前资源快照的 `memory.events` 为
-`oom=0`、`oom_kill=0`；member 登录/API gate 仍关闭。
+schema v13 镜像又在同一 `zeus-operation-acceptance` project 上保留上述现为 v12 的 named
+volume，原地完成 v12→v13 migration；保留卷 `restart-verify` 通过。
+当前 schema v14 镜像继续保留上述现为 v13 的 named volume，原地完成 v13→v14 migration；
+`verify` 与保留卷 `restart-verify` 均通过，验收栈继续运行在 `127.0.0.1:18089`。API effective
+limit 为 2 CPU/1 GiB；重启后 `memory.current=79,466,496`、`memory.peak=98,201,600`、Zeus
+RSS 9,824 KiB、`pids.current=6`，`memory.events` 为 `oom=0`、`oom_kill=0`；member 登录/API
+gate 仍关闭，Apple `pids.max=max`。
 此前 Operation Capacity 指定压力中，API 限制核对为 2 CPU/1 GiB；30,000 次 readiness、并发
 128 的压力结果为 2,670 个 `200`、
 27,330 个预期 operation-capacity `503`、transport error 0、约 6,677 req/s。第二轮 10,000 次、
 并发 64 的 9,586 个 `503` 全部携带 `sqlite_operation_capacity_exceeded`。该历史压力期间及之后
 `memory.peak=97,595,392` bytes、Zeus RSS 约 23 MiB、`oom=0`、`oom_kill=0`，且 CPU quota
 发生 throttling。Apple VM 无 Swap，1.0 无 per-container PID limit 且 `pids.max=max`；因此这只
-证明当时 Operation Capacity 镜像在该 Apple readiness-pressure 场景下保持有界；v13 本轮没有
+证明当时 Operation Capacity 镜像在该 Apple readiness-pressure 场景下保持有界；v14 本轮没有
 重跑该压力，也不替代 Linux Docker PID/OOM authoritative acceptance 或更低内存/对抗性压力。
 Docker Compose 当前只有静态配置检查；本机缺少 Docker CLI 时不声明 Compose build/up 已通过。

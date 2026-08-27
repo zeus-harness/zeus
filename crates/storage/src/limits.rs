@@ -11,13 +11,17 @@
 
 use thiserror::Error;
 
-pub const DEFAULT_SESSIONS_PER_SCOPE: usize = 1_000;
+pub const DEFAULT_SESSIONS_PER_ACTOR: usize = 1_000;
+pub const DEFAULT_SESSIONS_PER_ACCOUNT: usize = 10_000;
 pub const DEFAULT_SESSIONS_GLOBAL: usize = 10_000;
-pub const DEFAULT_OPEN_TURNS_PER_SCOPE: usize = 32;
+pub const DEFAULT_OPEN_TURNS_PER_ACTOR: usize = 32;
+pub const DEFAULT_OPEN_TURNS_PER_ACCOUNT: usize = 64;
 pub const DEFAULT_OPEN_TURNS_GLOBAL: usize = 64;
-pub const DEFAULT_ACTIVE_REPLY_JOBS_PER_SCOPE: usize = 32;
+pub const DEFAULT_ACTIVE_REPLY_JOBS_PER_ACTOR: usize = 32;
+pub const DEFAULT_ACTIVE_REPLY_JOBS_PER_ACCOUNT: usize = 64;
 pub const DEFAULT_ACTIVE_REPLY_JOBS_GLOBAL: usize = 64;
-pub const DEFAULT_ACTIVE_DISPATCH_JOBS_PER_SCOPE: usize = 16;
+pub const DEFAULT_ACTIVE_DISPATCH_JOBS_PER_ACTOR: usize = 16;
+pub const DEFAULT_ACTIVE_DISPATCH_JOBS_PER_ACCOUNT: usize = 32;
 pub const DEFAULT_ACTIVE_DISPATCH_JOBS_GLOBAL: usize = 32;
 pub const DEFAULT_AUTH_SESSIONS_PER_USER: usize = 32;
 pub const DEFAULT_AUTH_SESSIONS_GLOBAL: usize = 256;
@@ -28,13 +32,17 @@ pub const DEFAULT_RUN_EVENT_PAYLOAD_BYTES_PER_RUN: usize = 256 * 1024 * 1024;
 pub const DEFAULT_EVENT_PAYLOAD_BYTES_GLOBAL: usize = 1024 * 1024 * 1024;
 pub const DEFAULT_BOOTSTRAP_AUDIT_ROWS: usize = 1_024;
 
-pub const HARD_MAX_SESSIONS_PER_SCOPE: usize = 10_000;
+pub const HARD_MAX_SESSIONS_PER_ACTOR: usize = 10_000;
+pub const HARD_MAX_SESSIONS_PER_ACCOUNT: usize = 100_000;
 pub const HARD_MAX_SESSIONS_GLOBAL: usize = 100_000;
-pub const HARD_MAX_OPEN_TURNS_PER_SCOPE: usize = 128;
+pub const HARD_MAX_OPEN_TURNS_PER_ACTOR: usize = 128;
+pub const HARD_MAX_OPEN_TURNS_PER_ACCOUNT: usize = 512;
 pub const HARD_MAX_OPEN_TURNS_GLOBAL: usize = 512;
-pub const HARD_MAX_ACTIVE_REPLY_JOBS_PER_SCOPE: usize = 128;
+pub const HARD_MAX_ACTIVE_REPLY_JOBS_PER_ACTOR: usize = 128;
+pub const HARD_MAX_ACTIVE_REPLY_JOBS_PER_ACCOUNT: usize = 512;
 pub const HARD_MAX_ACTIVE_REPLY_JOBS_GLOBAL: usize = 512;
-pub const HARD_MAX_ACTIVE_DISPATCH_JOBS_PER_SCOPE: usize = 64;
+pub const HARD_MAX_ACTIVE_DISPATCH_JOBS_PER_ACTOR: usize = 64;
+pub const HARD_MAX_ACTIVE_DISPATCH_JOBS_PER_ACCOUNT: usize = 256;
 pub const HARD_MAX_ACTIVE_DISPATCH_JOBS_GLOBAL: usize = 256;
 pub const HARD_MAX_AUTH_SESSIONS_PER_USER: usize = 128;
 pub const HARD_MAX_AUTH_SESSIONS_GLOBAL: usize = 4_096;
@@ -47,18 +55,22 @@ pub const HARD_MAX_BOOTSTRAP_AUDIT_ROWS: usize = 65_536;
 
 /// Logical capacity limits enforced by the SQLite storage transaction layer.
 ///
-/// A "scope" is the durable resource owner. Alpha currently stores a user ID;
-/// the neutral name leaves room for a future tenant/account scope without
-/// weakening the existing owner boundary.
+/// Actor limits prevent one member from monopolizing an account; account
+/// limits bound aggregate tenant usage; global limits protect the SQLite
+/// process. Each narrower tier must fit within the next broader tier.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StorageLimits {
-    pub sessions_per_scope: usize,
+    pub sessions_per_actor: usize,
+    pub sessions_per_account: usize,
     pub sessions_global: usize,
-    pub open_turns_per_scope: usize,
+    pub open_turns_per_actor: usize,
+    pub open_turns_per_account: usize,
     pub open_turns_global: usize,
-    pub active_reply_jobs_per_scope: usize,
+    pub active_reply_jobs_per_actor: usize,
+    pub active_reply_jobs_per_account: usize,
     pub active_reply_jobs_global: usize,
-    pub active_dispatch_jobs_per_scope: usize,
+    pub active_dispatch_jobs_per_actor: usize,
+    pub active_dispatch_jobs_per_account: usize,
     pub active_dispatch_jobs_global: usize,
     pub auth_sessions_per_user: usize,
     pub auth_sessions_global: usize,
@@ -78,13 +90,17 @@ pub struct StorageLimits {
 impl StorageLimits {
     /// The supported Alpha defaults.
     pub const ALPHA_DEFAULT: Self = Self {
-        sessions_per_scope: DEFAULT_SESSIONS_PER_SCOPE,
+        sessions_per_actor: DEFAULT_SESSIONS_PER_ACTOR,
+        sessions_per_account: DEFAULT_SESSIONS_PER_ACCOUNT,
         sessions_global: DEFAULT_SESSIONS_GLOBAL,
-        open_turns_per_scope: DEFAULT_OPEN_TURNS_PER_SCOPE,
+        open_turns_per_actor: DEFAULT_OPEN_TURNS_PER_ACTOR,
+        open_turns_per_account: DEFAULT_OPEN_TURNS_PER_ACCOUNT,
         open_turns_global: DEFAULT_OPEN_TURNS_GLOBAL,
-        active_reply_jobs_per_scope: DEFAULT_ACTIVE_REPLY_JOBS_PER_SCOPE,
+        active_reply_jobs_per_actor: DEFAULT_ACTIVE_REPLY_JOBS_PER_ACTOR,
+        active_reply_jobs_per_account: DEFAULT_ACTIVE_REPLY_JOBS_PER_ACCOUNT,
         active_reply_jobs_global: DEFAULT_ACTIVE_REPLY_JOBS_GLOBAL,
-        active_dispatch_jobs_per_scope: DEFAULT_ACTIVE_DISPATCH_JOBS_PER_SCOPE,
+        active_dispatch_jobs_per_actor: DEFAULT_ACTIVE_DISPATCH_JOBS_PER_ACTOR,
+        active_dispatch_jobs_per_account: DEFAULT_ACTIVE_DISPATCH_JOBS_PER_ACCOUNT,
         active_dispatch_jobs_global: DEFAULT_ACTIVE_DISPATCH_JOBS_GLOBAL,
         auth_sessions_per_user: DEFAULT_AUTH_SESSIONS_PER_USER,
         auth_sessions_global: DEFAULT_AUTH_SESSIONS_GLOBAL,
@@ -101,13 +117,17 @@ impl StorageLimits {
     /// This value is useful to configuration adapters that want to expose the
     /// supported range without duplicating storage policy.
     pub const HARD_CEILINGS: Self = Self {
-        sessions_per_scope: HARD_MAX_SESSIONS_PER_SCOPE,
+        sessions_per_actor: HARD_MAX_SESSIONS_PER_ACTOR,
+        sessions_per_account: HARD_MAX_SESSIONS_PER_ACCOUNT,
         sessions_global: HARD_MAX_SESSIONS_GLOBAL,
-        open_turns_per_scope: HARD_MAX_OPEN_TURNS_PER_SCOPE,
+        open_turns_per_actor: HARD_MAX_OPEN_TURNS_PER_ACTOR,
+        open_turns_per_account: HARD_MAX_OPEN_TURNS_PER_ACCOUNT,
         open_turns_global: HARD_MAX_OPEN_TURNS_GLOBAL,
-        active_reply_jobs_per_scope: HARD_MAX_ACTIVE_REPLY_JOBS_PER_SCOPE,
+        active_reply_jobs_per_actor: HARD_MAX_ACTIVE_REPLY_JOBS_PER_ACTOR,
+        active_reply_jobs_per_account: HARD_MAX_ACTIVE_REPLY_JOBS_PER_ACCOUNT,
         active_reply_jobs_global: HARD_MAX_ACTIVE_REPLY_JOBS_GLOBAL,
-        active_dispatch_jobs_per_scope: HARD_MAX_ACTIVE_DISPATCH_JOBS_PER_SCOPE,
+        active_dispatch_jobs_per_actor: HARD_MAX_ACTIVE_DISPATCH_JOBS_PER_ACTOR,
+        active_dispatch_jobs_per_account: HARD_MAX_ACTIVE_DISPATCH_JOBS_PER_ACCOUNT,
         active_dispatch_jobs_global: HARD_MAX_ACTIVE_DISPATCH_JOBS_GLOBAL,
         auth_sessions_per_user: HARD_MAX_AUTH_SESSIONS_PER_USER,
         auth_sessions_global: HARD_MAX_AUTH_SESSIONS_GLOBAL,
@@ -123,9 +143,14 @@ impl StorageLimits {
     pub fn validate(&self) -> Result<(), StorageLimitsError> {
         for (field, value, hard_ceiling) in [
             (
-                "sessions_per_scope",
-                self.sessions_per_scope,
-                HARD_MAX_SESSIONS_PER_SCOPE,
+                "sessions_per_actor",
+                self.sessions_per_actor,
+                HARD_MAX_SESSIONS_PER_ACTOR,
+            ),
+            (
+                "sessions_per_account",
+                self.sessions_per_account,
+                HARD_MAX_SESSIONS_PER_ACCOUNT,
             ),
             (
                 "sessions_global",
@@ -133,9 +158,14 @@ impl StorageLimits {
                 HARD_MAX_SESSIONS_GLOBAL,
             ),
             (
-                "open_turns_per_scope",
-                self.open_turns_per_scope,
-                HARD_MAX_OPEN_TURNS_PER_SCOPE,
+                "open_turns_per_actor",
+                self.open_turns_per_actor,
+                HARD_MAX_OPEN_TURNS_PER_ACTOR,
+            ),
+            (
+                "open_turns_per_account",
+                self.open_turns_per_account,
+                HARD_MAX_OPEN_TURNS_PER_ACCOUNT,
             ),
             (
                 "open_turns_global",
@@ -143,9 +173,14 @@ impl StorageLimits {
                 HARD_MAX_OPEN_TURNS_GLOBAL,
             ),
             (
-                "active_reply_jobs_per_scope",
-                self.active_reply_jobs_per_scope,
-                HARD_MAX_ACTIVE_REPLY_JOBS_PER_SCOPE,
+                "active_reply_jobs_per_actor",
+                self.active_reply_jobs_per_actor,
+                HARD_MAX_ACTIVE_REPLY_JOBS_PER_ACTOR,
+            ),
+            (
+                "active_reply_jobs_per_account",
+                self.active_reply_jobs_per_account,
+                HARD_MAX_ACTIVE_REPLY_JOBS_PER_ACCOUNT,
             ),
             (
                 "active_reply_jobs_global",
@@ -153,9 +188,14 @@ impl StorageLimits {
                 HARD_MAX_ACTIVE_REPLY_JOBS_GLOBAL,
             ),
             (
-                "active_dispatch_jobs_per_scope",
-                self.active_dispatch_jobs_per_scope,
-                HARD_MAX_ACTIVE_DISPATCH_JOBS_PER_SCOPE,
+                "active_dispatch_jobs_per_actor",
+                self.active_dispatch_jobs_per_actor,
+                HARD_MAX_ACTIVE_DISPATCH_JOBS_PER_ACTOR,
+            ),
+            (
+                "active_dispatch_jobs_per_account",
+                self.active_dispatch_jobs_per_account,
+                HARD_MAX_ACTIVE_DISPATCH_JOBS_PER_ACCOUNT,
             ),
             (
                 "active_dispatch_jobs_global",
@@ -207,26 +247,50 @@ impl StorageLimits {
         }
 
         validate_scope_pair(
-            "sessions_per_scope",
-            self.sessions_per_scope,
+            "sessions_per_actor",
+            self.sessions_per_actor,
+            "sessions_per_account",
+            self.sessions_per_account,
+        )?;
+        validate_scope_pair(
+            "sessions_per_account",
+            self.sessions_per_account,
             "sessions_global",
             self.sessions_global,
         )?;
         validate_scope_pair(
-            "open_turns_per_scope",
-            self.open_turns_per_scope,
+            "open_turns_per_actor",
+            self.open_turns_per_actor,
+            "open_turns_per_account",
+            self.open_turns_per_account,
+        )?;
+        validate_scope_pair(
+            "open_turns_per_account",
+            self.open_turns_per_account,
             "open_turns_global",
             self.open_turns_global,
         )?;
         validate_scope_pair(
-            "active_reply_jobs_per_scope",
-            self.active_reply_jobs_per_scope,
+            "active_reply_jobs_per_actor",
+            self.active_reply_jobs_per_actor,
+            "active_reply_jobs_per_account",
+            self.active_reply_jobs_per_account,
+        )?;
+        validate_scope_pair(
+            "active_reply_jobs_per_account",
+            self.active_reply_jobs_per_account,
             "active_reply_jobs_global",
             self.active_reply_jobs_global,
         )?;
         validate_scope_pair(
-            "active_dispatch_jobs_per_scope",
-            self.active_dispatch_jobs_per_scope,
+            "active_dispatch_jobs_per_actor",
+            self.active_dispatch_jobs_per_actor,
+            "active_dispatch_jobs_per_account",
+            self.active_dispatch_jobs_per_account,
+        )?;
+        validate_scope_pair(
+            "active_dispatch_jobs_per_account",
+            self.active_dispatch_jobs_per_account,
             "active_dispatch_jobs_global",
             self.active_dispatch_jobs_global,
         )?;
@@ -341,32 +405,48 @@ mod tests {
 
         for (value, hard_ceiling) in [
             (
-                defaults.sessions_per_scope,
-                StorageLimits::HARD_CEILINGS.sessions_per_scope,
+                defaults.sessions_per_actor,
+                StorageLimits::HARD_CEILINGS.sessions_per_actor,
+            ),
+            (
+                defaults.sessions_per_account,
+                StorageLimits::HARD_CEILINGS.sessions_per_account,
             ),
             (
                 defaults.sessions_global,
                 StorageLimits::HARD_CEILINGS.sessions_global,
             ),
             (
-                defaults.open_turns_per_scope,
-                StorageLimits::HARD_CEILINGS.open_turns_per_scope,
+                defaults.open_turns_per_actor,
+                StorageLimits::HARD_CEILINGS.open_turns_per_actor,
+            ),
+            (
+                defaults.open_turns_per_account,
+                StorageLimits::HARD_CEILINGS.open_turns_per_account,
             ),
             (
                 defaults.open_turns_global,
                 StorageLimits::HARD_CEILINGS.open_turns_global,
             ),
             (
-                defaults.active_reply_jobs_per_scope,
-                StorageLimits::HARD_CEILINGS.active_reply_jobs_per_scope,
+                defaults.active_reply_jobs_per_actor,
+                StorageLimits::HARD_CEILINGS.active_reply_jobs_per_actor,
+            ),
+            (
+                defaults.active_reply_jobs_per_account,
+                StorageLimits::HARD_CEILINGS.active_reply_jobs_per_account,
             ),
             (
                 defaults.active_reply_jobs_global,
                 StorageLimits::HARD_CEILINGS.active_reply_jobs_global,
             ),
             (
-                defaults.active_dispatch_jobs_per_scope,
-                StorageLimits::HARD_CEILINGS.active_dispatch_jobs_per_scope,
+                defaults.active_dispatch_jobs_per_actor,
+                StorageLimits::HARD_CEILINGS.active_dispatch_jobs_per_actor,
+            ),
+            (
+                defaults.active_dispatch_jobs_per_account,
+                StorageLimits::HARD_CEILINGS.active_dispatch_jobs_per_account,
             ),
             (
                 defaults.active_dispatch_jobs_global,
@@ -428,21 +508,33 @@ mod tests {
 
     #[test]
     fn every_zero_field_is_rejected_with_its_name() {
-        let mutations: [LimitMutation; 16] = [
-            ("sessions_per_scope", |limits| limits.sessions_per_scope = 0),
+        let mutations: [LimitMutation; 20] = [
+            ("sessions_per_actor", |limits| limits.sessions_per_actor = 0),
+            ("sessions_per_account", |limits| {
+                limits.sessions_per_account = 0
+            }),
             ("sessions_global", |limits| limits.sessions_global = 0),
-            ("open_turns_per_scope", |limits| {
-                limits.open_turns_per_scope = 0
+            ("open_turns_per_actor", |limits| {
+                limits.open_turns_per_actor = 0
+            }),
+            ("open_turns_per_account", |limits| {
+                limits.open_turns_per_account = 0
             }),
             ("open_turns_global", |limits| limits.open_turns_global = 0),
-            ("active_reply_jobs_per_scope", |limits| {
-                limits.active_reply_jobs_per_scope = 0
+            ("active_reply_jobs_per_actor", |limits| {
+                limits.active_reply_jobs_per_actor = 0
+            }),
+            ("active_reply_jobs_per_account", |limits| {
+                limits.active_reply_jobs_per_account = 0
             }),
             ("active_reply_jobs_global", |limits| {
                 limits.active_reply_jobs_global = 0
             }),
-            ("active_dispatch_jobs_per_scope", |limits| {
-                limits.active_dispatch_jobs_per_scope = 0
+            ("active_dispatch_jobs_per_actor", |limits| {
+                limits.active_dispatch_jobs_per_actor = 0
+            }),
+            ("active_dispatch_jobs_per_account", |limits| {
+                limits.active_dispatch_jobs_per_account = 0
             }),
             ("active_dispatch_jobs_global", |limits| {
                 limits.active_dispatch_jobs_global = 0
@@ -487,28 +579,46 @@ mod tests {
 
     #[test]
     fn every_value_above_its_hard_ceiling_is_rejected() {
-        let mutations: [CeilingMutation; 16] = [
+        let mutations: [CeilingMutation; 20] = [
             (
-                "sessions_per_scope",
-                HARD_MAX_SESSIONS_PER_SCOPE,
-                |limits| limits.sessions_per_scope = HARD_MAX_SESSIONS_PER_SCOPE + 1,
+                "sessions_per_actor",
+                HARD_MAX_SESSIONS_PER_ACTOR,
+                |limits| limits.sessions_per_actor = HARD_MAX_SESSIONS_PER_ACTOR + 1,
+            ),
+            (
+                "sessions_per_account",
+                HARD_MAX_SESSIONS_PER_ACCOUNT,
+                |limits| limits.sessions_per_account = HARD_MAX_SESSIONS_PER_ACCOUNT + 1,
             ),
             ("sessions_global", HARD_MAX_SESSIONS_GLOBAL, |limits| {
                 limits.sessions_global = HARD_MAX_SESSIONS_GLOBAL + 1
             }),
             (
-                "open_turns_per_scope",
-                HARD_MAX_OPEN_TURNS_PER_SCOPE,
-                |limits| limits.open_turns_per_scope = HARD_MAX_OPEN_TURNS_PER_SCOPE + 1,
+                "open_turns_per_actor",
+                HARD_MAX_OPEN_TURNS_PER_ACTOR,
+                |limits| limits.open_turns_per_actor = HARD_MAX_OPEN_TURNS_PER_ACTOR + 1,
+            ),
+            (
+                "open_turns_per_account",
+                HARD_MAX_OPEN_TURNS_PER_ACCOUNT,
+                |limits| limits.open_turns_per_account = HARD_MAX_OPEN_TURNS_PER_ACCOUNT + 1,
             ),
             ("open_turns_global", HARD_MAX_OPEN_TURNS_GLOBAL, |limits| {
                 limits.open_turns_global = HARD_MAX_OPEN_TURNS_GLOBAL + 1
             }),
             (
-                "active_reply_jobs_per_scope",
-                HARD_MAX_ACTIVE_REPLY_JOBS_PER_SCOPE,
+                "active_reply_jobs_per_actor",
+                HARD_MAX_ACTIVE_REPLY_JOBS_PER_ACTOR,
                 |limits| {
-                    limits.active_reply_jobs_per_scope = HARD_MAX_ACTIVE_REPLY_JOBS_PER_SCOPE + 1
+                    limits.active_reply_jobs_per_actor = HARD_MAX_ACTIVE_REPLY_JOBS_PER_ACTOR + 1
+                },
+            ),
+            (
+                "active_reply_jobs_per_account",
+                HARD_MAX_ACTIVE_REPLY_JOBS_PER_ACCOUNT,
+                |limits| {
+                    limits.active_reply_jobs_per_account =
+                        HARD_MAX_ACTIVE_REPLY_JOBS_PER_ACCOUNT + 1
                 },
             ),
             (
@@ -517,11 +627,19 @@ mod tests {
                 |limits| limits.active_reply_jobs_global = HARD_MAX_ACTIVE_REPLY_JOBS_GLOBAL + 1,
             ),
             (
-                "active_dispatch_jobs_per_scope",
-                HARD_MAX_ACTIVE_DISPATCH_JOBS_PER_SCOPE,
+                "active_dispatch_jobs_per_actor",
+                HARD_MAX_ACTIVE_DISPATCH_JOBS_PER_ACTOR,
                 |limits| {
-                    limits.active_dispatch_jobs_per_scope =
-                        HARD_MAX_ACTIVE_DISPATCH_JOBS_PER_SCOPE + 1
+                    limits.active_dispatch_jobs_per_actor =
+                        HARD_MAX_ACTIVE_DISPATCH_JOBS_PER_ACTOR + 1
+                },
+            ),
+            (
+                "active_dispatch_jobs_per_account",
+                HARD_MAX_ACTIVE_DISPATCH_JOBS_PER_ACCOUNT,
+                |limits| {
+                    limits.active_dispatch_jobs_per_account =
+                        HARD_MAX_ACTIVE_DISPATCH_JOBS_PER_ACCOUNT + 1
                 },
             ),
             (
@@ -599,29 +717,57 @@ mod tests {
     }
 
     #[test]
-    fn scoped_limits_must_not_exceed_their_global_limit() {
-        let cases: [ScopePairMutation; 7] = [
-            ("sessions_per_scope", "sessions_global", |limits| {
-                limits.sessions_per_scope = 2;
+    fn actor_account_and_global_limit_order_is_enforced() {
+        let cases: [ScopePairMutation; 11] = [
+            ("sessions_per_actor", "sessions_per_account", |limits| {
+                limits.sessions_per_actor = 2;
+                limits.sessions_per_account = 1;
+            }),
+            ("sessions_per_account", "sessions_global", |limits| {
+                limits.sessions_per_actor = 1;
+                limits.sessions_per_account = 2;
                 limits.sessions_global = 1;
             }),
-            ("open_turns_per_scope", "open_turns_global", |limits| {
-                limits.open_turns_per_scope = 2;
+            ("open_turns_per_actor", "open_turns_per_account", |limits| {
+                limits.open_turns_per_actor = 2;
+                limits.open_turns_per_account = 1;
+            }),
+            ("open_turns_per_account", "open_turns_global", |limits| {
+                limits.open_turns_per_actor = 1;
+                limits.open_turns_per_account = 2;
                 limits.open_turns_global = 1;
             }),
             (
-                "active_reply_jobs_per_scope",
+                "active_reply_jobs_per_actor",
+                "active_reply_jobs_per_account",
+                |limits| {
+                    limits.active_reply_jobs_per_actor = 2;
+                    limits.active_reply_jobs_per_account = 1;
+                },
+            ),
+            (
+                "active_reply_jobs_per_account",
                 "active_reply_jobs_global",
                 |limits| {
-                    limits.active_reply_jobs_per_scope = 2;
+                    limits.active_reply_jobs_per_actor = 1;
+                    limits.active_reply_jobs_per_account = 2;
                     limits.active_reply_jobs_global = 1;
                 },
             ),
             (
-                "active_dispatch_jobs_per_scope",
+                "active_dispatch_jobs_per_actor",
+                "active_dispatch_jobs_per_account",
+                |limits| {
+                    limits.active_dispatch_jobs_per_actor = 2;
+                    limits.active_dispatch_jobs_per_account = 1;
+                },
+            ),
+            (
+                "active_dispatch_jobs_per_account",
                 "active_dispatch_jobs_global",
                 |limits| {
-                    limits.active_dispatch_jobs_per_scope = 2;
+                    limits.active_dispatch_jobs_per_actor = 1;
+                    limits.active_dispatch_jobs_per_account = 2;
                     limits.active_dispatch_jobs_global = 1;
                 },
             ),
@@ -666,7 +812,8 @@ mod tests {
     #[test]
     fn validated_preserves_a_valid_configuration() {
         let limits = StorageLimits {
-            sessions_per_scope: 7,
+            sessions_per_actor: 7,
+            sessions_per_account: 9,
             sessions_global: 11,
             ..StorageLimits::default()
         };

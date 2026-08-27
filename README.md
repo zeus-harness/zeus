@@ -17,17 +17,19 @@ real, path-constrained marker executor for testing the complete loop. Restate,
 MinIO, the networkless tool sandbox, and optional PostgreSQL are development
 topology for later milestones; they are not application state authorities.
 
-Alpha+ supports exactly one local owner. Schema v13 now creates the single
-`acc_local` account, its owner membership, and immutable account scope on four
-durable roots. The `member` role still cannot authenticate through this
-build: account-scoped durable authorization, member lifecycle, and account
-security audit remain v14-v15 work. Keep the service loopback/private-network
-only, and do not expose it as a shared or Internet-facing deployment.
+Alpha+ supports exactly one local owner. Schema v14 keeps the single
+`acc_local` account and makes its durable membership the sole capability
+authority for authentication, REST/SSE access, receipts, reply/dispatch work,
+and worker claim. The `member` role still cannot authenticate through this
+build: member lifecycle and account security audit remain v15 work. Keep the
+service loopback/private-network only, and do not expose it as a shared or
+Internet-facing deployment.
 
 The staged account/membership and audit-retention design is documented in
 [`docs/account-membership-audit-retention.zh-CN.md`](docs/account-membership-audit-retention.zh-CN.md).
-Its v12-v13 foundation slices are implemented; the v14-v15 sections remain an
-implementation contract, not a claim that member access is enabled.
+Its v12-v14 foundation and durable-authorization slices are implemented; the
+v15 section remains an implementation contract, not a claim that member access
+is enabled.
 
 ## Prerequisites
 
@@ -85,28 +87,39 @@ writable through the browser Settings API.
 
 SQLite logical-capacity defaults can be reduced for local tests or raised only
 up to the compiled hard ceiling. Explicit values must be non-empty unsigned
-decimal integers; zero, non-UTF-8, per-scope values above their global value,
+decimal integers; zero, non-UTF-8, actor values above their account value,
+account values above their global value,
 per-ledger event-payload byte limits above the global byte limit, and values
 above the hard ceiling fail startup.
 
-| Environment variable | Default | Hard ceiling |
-| --- | ---: | ---: |
-| `ZEUS_MAX_SESSIONS_PER_SCOPE` | 1,000 | 10,000 |
-| `ZEUS_MAX_SESSIONS_GLOBAL` | 10,000 | 100,000 |
-| `ZEUS_MAX_OPEN_TURNS_PER_SCOPE` | 32 | 128 |
-| `ZEUS_MAX_OPEN_TURNS_GLOBAL` | 64 | 512 |
-| `ZEUS_MAX_ACTIVE_REPLY_JOBS_PER_SCOPE` | 32 | 128 |
-| `ZEUS_MAX_ACTIVE_REPLY_JOBS_GLOBAL` | 64 | 512 |
-| `ZEUS_MAX_ACTIVE_DISPATCH_JOBS_PER_SCOPE` | 16 | 64 |
-| `ZEUS_MAX_ACTIVE_DISPATCH_JOBS_GLOBAL` | 32 | 256 |
-| `ZEUS_MAX_AUTH_SESSIONS_PER_USER` | 32 | 128 |
-| `ZEUS_MAX_AUTH_SESSIONS_GLOBAL` | 256 | 4,096 |
-| `ZEUS_MAX_SESSION_EVENT_SLOTS_PER_SESSION` | 10,000 | 100,000 |
-| `ZEUS_MAX_RUN_EVENT_SLOTS_PER_RUN` | 50,000 | 500,000 |
-| `ZEUS_MAX_SESSION_EVENT_PAYLOAD_BYTES_PER_SESSION` | 64 MiB (67,108,864) | 256 MiB (268,435,456) |
-| `ZEUS_MAX_RUN_EVENT_PAYLOAD_BYTES_PER_RUN` | 256 MiB (268,435,456) | 1 GiB (1,073,741,824) |
-| `ZEUS_MAX_EVENT_PAYLOAD_BYTES_GLOBAL` | 1 GiB (1,073,741,824) | 2 GiB (2,147,483,648) |
-| `ZEUS_MAX_BOOTSTRAP_AUDIT_ROWS` | 1,024 | 65,536 |
+| Environment variable                               |               Default |          Hard ceiling |
+| -------------------------------------------------- | --------------------: | --------------------: |
+| `ZEUS_MAX_SESSIONS_PER_ACTOR`                      |                 1,000 |                10,000 |
+| `ZEUS_MAX_SESSIONS_PER_ACCOUNT`                    |                10,000 |               100,000 |
+| `ZEUS_MAX_SESSIONS_GLOBAL`                         |                10,000 |               100,000 |
+| `ZEUS_MAX_OPEN_TURNS_PER_ACTOR`                    |                    32 |                   128 |
+| `ZEUS_MAX_OPEN_TURNS_PER_ACCOUNT`                  |                    64 |                   512 |
+| `ZEUS_MAX_OPEN_TURNS_GLOBAL`                       |                    64 |                   512 |
+| `ZEUS_MAX_ACTIVE_REPLY_JOBS_PER_ACTOR`             |                    32 |                   128 |
+| `ZEUS_MAX_ACTIVE_REPLY_JOBS_PER_ACCOUNT`           |                    64 |                   512 |
+| `ZEUS_MAX_ACTIVE_REPLY_JOBS_GLOBAL`                |                    64 |                   512 |
+| `ZEUS_MAX_ACTIVE_DISPATCH_JOBS_PER_ACTOR`          |                    16 |                    64 |
+| `ZEUS_MAX_ACTIVE_DISPATCH_JOBS_PER_ACCOUNT`        |                    32 |                   256 |
+| `ZEUS_MAX_ACTIVE_DISPATCH_JOBS_GLOBAL`             |                    32 |                   256 |
+| `ZEUS_MAX_AUTH_SESSIONS_PER_USER`                  |                    32 |                   128 |
+| `ZEUS_MAX_AUTH_SESSIONS_GLOBAL`                    |                   256 |                 4,096 |
+| `ZEUS_MAX_SESSION_EVENT_SLOTS_PER_SESSION`         |                10,000 |               100,000 |
+| `ZEUS_MAX_RUN_EVENT_SLOTS_PER_RUN`                 |                50,000 |               500,000 |
+| `ZEUS_MAX_SESSION_EVENT_PAYLOAD_BYTES_PER_SESSION` |   64 MiB (67,108,864) | 256 MiB (268,435,456) |
+| `ZEUS_MAX_RUN_EVENT_PAYLOAD_BYTES_PER_RUN`         | 256 MiB (268,435,456) | 1 GiB (1,073,741,824) |
+| `ZEUS_MAX_EVENT_PAYLOAD_BYTES_GLOBAL`              | 1 GiB (1,073,741,824) | 2 GiB (2,147,483,648) |
+| `ZEUS_MAX_BOOTSTRAP_AUDIT_ROWS`                    |                 1,024 |                65,536 |
+
+The legacy `*_PER_SCOPE` names are accepted only when their corresponding
+`*_PER_ACTOR` name is absent. Setting both names fails startup. If a
+`*_PER_ACCOUNT` value is absent it inherits the effective configured global
+value, so reducing a global limit cannot accidentally leave an invalid account
+default above it.
 
 Event-slot limits cover the current durable ledger head plus slots reserved for
 accepted work to reach a terminal state. Event-payload byte limits similarly
@@ -126,12 +139,12 @@ commitment, not an external tamper-proof anchor.
 The implemented and locally verified SQLite Physical Capacity Slice uses these
 configuration limits:
 
-| Environment variable | Default | Hard ceiling | Purpose |
-| --- | ---: | ---: | --- |
-| `ZEUS_SQLITE_MAX_MAIN_BYTES` | 4 GiB (4,294,967,296) | 32 GiB | Main database page budget |
-| `ZEUS_SQLITE_WAL_TARGET_BYTES` | 16 MiB (16,777,216) | 256 MiB | WAL autocheckpoint/reset target |
-| `ZEUS_SQLITE_MIN_FREE_BYTES` | 256 MiB (268,435,456) | 8 GiB | Minimum filesystem headroom |
-| `ZEUS_SQLITE_ADMISSION_RESERVE_BYTES` | 512 MiB (536,870,912) | 8 GiB | Admission filesystem headroom watermark |
+| Environment variable                  |               Default | Hard ceiling | Purpose                                 |
+| ------------------------------------- | --------------------: | -----------: | --------------------------------------- |
+| `ZEUS_SQLITE_MAX_MAIN_BYTES`          | 4 GiB (4,294,967,296) |       32 GiB | Main database page budget               |
+| `ZEUS_SQLITE_WAL_TARGET_BYTES`        |   16 MiB (16,777,216) |      256 MiB | WAL autocheckpoint/reset target         |
+| `ZEUS_SQLITE_MIN_FREE_BYTES`          | 256 MiB (268,435,456) |        8 GiB | Minimum filesystem headroom             |
+| `ZEUS_SQLITE_ADMISSION_RESERVE_BYTES` | 512 MiB (536,870,912) |        8 GiB | Admission filesystem headroom watermark |
 
 Startup rejects invalid configuration unless
 `WAL target < admission reserve < max main`; it must also use checked arithmetic
@@ -166,11 +179,11 @@ check, without the startup checkpoint, explicitly through
 
 SQLite blocking work also has a bounded operation gate:
 
-| Environment variable | Default | Hard ceiling |
-| --- | ---: | ---: |
-| `ZEUS_SQLITE_MAX_CONCURRENT_OPERATIONS` | 8 | 32 |
-| `ZEUS_SQLITE_RESERVED_PROGRESS_OPERATIONS` | 1 | 8 |
-| `ZEUS_SQLITE_OPERATION_ACQUIRE_TIMEOUT_MS` | 1,000 ms | 5,000 ms |
+| Environment variable                       |  Default | Hard ceiling |
+| ------------------------------------------ | -------: | -----------: |
+| `ZEUS_SQLITE_MAX_CONCURRENT_OPERATIONS`    |        8 |           32 |
+| `ZEUS_SQLITE_RESERVED_PROGRESS_OPERATIONS` |        1 |            8 |
+| `ZEUS_SQLITE_OPERATION_ACQUIRE_TIMEOUT_MS` | 1,000 ms |     5,000 ms |
 
 With the defaults, ordinary reads and admission commands share seven general
 slots. Their general-lane acquisition uses `try_acquire`, so saturation fails
@@ -451,8 +464,12 @@ and bounded memory, CPU, and PID resources.
   existing active owner as revision-1 membership, and backfills immutable
   account scope onto Incident, Session, Run, and runtime identity. Ambiguous
   legacy owner/actor/scope or broken foreign-key state aborts v12-to-v13
-  migration before partial account state can commit. Existing owner-based
-  authorization remains authoritative and the member gate stays closed.
+  migration before partial account state can commit. Schema v14 rebuilds login
+  sessions, receipts, reply/dispatch jobs, and finalization reservations around
+  `(account, actor, membership revision)` authority. It removes legacy owner
+  checks from authorization, scopes cursors and active-work capacity by account
+  and actor, and revalidates both dispatch subjects before worker claim. The
+  product-level member login gate stays closed until v15.
   Existing Runs and events are decoded, validated, and migrated in place without
   rewriting their payloads. Runtime identity still binds profile, environment,
   primary Session and Run, policy ID, and policy revision; a mismatch fails
@@ -488,9 +505,9 @@ directly.
   state changes additionally require `X-CSRF-Token` to match the login and an
   exact same-origin request. Alpha+ deliberately rejects the schema-reserved
   `member` role. Actor isolation, SQLite physical headroom, bounded bootstrap
-  audit retention, and the schema-v13 account/membership foundation are now
-  present. Member access remains blocked until v14 account-scoped durable
-  authorization and v15 member lifecycle/account security audit land.
+  audit retention, the account/membership foundation, and schema-v14 durable
+  authorization are now present. Member access remains blocked until v15
+  member lifecycle/account security audit lands.
 - `GET /api/v1/me/settings` returns the current safe preferences.
   `PATCH /api/v1/me/settings` accepts `theme`, optional allowlisted
   `preferred_model`, and `expected_revision`. Provider endpoints and API keys
@@ -563,7 +580,7 @@ directly.
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Current schema v13 retains durable Run attachment during migration and demo
+Current schema v14 retains durable Run attachment during migration and demo
 seeding, but Alpha+ does not expose a public attach-Run HTTP route.
 
 The application boundary now caps auth JSON at 8 KiB and command JSON at
@@ -583,7 +600,7 @@ approval, dispatch, reply completion, attachment checks, and startup recovery
 use typed point queries or fixed 64-row batches. Production Session list/detail,
 Run detail, and overview reads now use indexed `LIMIT + 1` keyset pages inside
 actor-authorized SQLite snapshots; no production HTTP read loads a complete
-ledger or collection. Current schema v13 retains bounded Session, open-turn,
+ledger or collection. Current schema v14 retains bounded Session, open-turn,
 active reply/dispatch, auth-session, bootstrap-audit, event-slot, and logical
 event-payload-byte admission. Exact idempotent replay is checked before capacity,
 while accepted work consumes its reserved terminal slots and payload bytes
@@ -591,19 +608,21 @@ without ordinary admission. Parent-ledger and global counters are charged by
 SQLite triggers from the exact stored UTF-8 `payload_json`; migration backfills
 existing bytes and conservatively reserves active work so historical databases
 can still drain even when they exceed a newly configured limit. Expired auth
-sessions are deleted in deterministic batches of at most 64 on startup and
+sessions and sessions bound to missing, disabled, suspended, or stale-revision
+authority are deleted in deterministic batches of at most 64 on startup and
 before session creation. Append-only ledgers, receipts, jobs, turns, and account
 audit records are not silently pruned; bootstrap token details alone follow the
 explicit bounded rollup policy above. The locally verified Physical Capacity Slice
 now gates the main DB, active-WAL target, and filesystem headroom, subject to
 the documented WAL and `statvfs` limitations. Bounded SQLite operation
-concurrency is also implemented. The v13 account/membership foundation is
-implemented, but account-scoped receipt/job/auth/capacity authorization,
-member lifecycle, and account security-audit retention remain unresolved;
-shared-network and multi-tenant deployment is therefore still out of scope.
+concurrency is also implemented. Schema v14 now provides account-scoped
+receipt/job/auth/cursor/capacity authorization and durable membership-revision
+checks. Member lifecycle and account security-audit retention remain
+unresolved; shared-network and multi-tenant deployment is therefore still out
+of scope.
 The earlier Operation Capacity Apple readiness-pressure scenario and current
-schema-v13 retained-volume migration/restart have passed as separate gates;
-the v13 image did not rerun that pressure workload. Authoritative Linux Docker
+schema-v14 retained-volume migration/restart have passed as separate gates;
+the v14 image did not rerun that pressure workload. Authoritative Linux Docker
 PID/OOM and adversarial low-memory acceptance remain separate deployment gates.
 
 ## Container images
@@ -655,14 +674,15 @@ committed data. Use SQLite's backup/checkpoint facilities.
 Current Alpha+ plus Actor Boundary Foundation, API Resource Envelope, Terminal
 Payload Envelope, Bounded Event Feed, Point-query Durable Context, Bounded Read
 Models, SQLite Capacity Slice 2, the SQLite Physical Capacity Slice, and the
-SQLite Operation Capacity Slice, Bootstrap Audit Retention, and schema v13
-Account Membership Foundation host verification:
+SQLite Operation Capacity Slice, Bootstrap Audit Retention, schema v13 Account
+Membership Foundation, and schema v14 Account-scoped Durable Authorization host
+verification:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --all-targets`: 289 tests passed, including 139
-  storage tests, 28 runtime tests, 44 API library tests, and 4 API main/config
-  tests, plus the real
+- `cargo test --workspace --all-targets`: 312 tests passed under the existing
+  project counting convention, including 153 storage tests, 31 runtime tests,
+  46 API library tests, 6 API main/config tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,
   body/field/idempotency boundaries, atomic login limits, SSE lease capacity,
@@ -675,8 +695,8 @@ Account Membership Foundation host verification:
   and limit-plus-one admission, terminal event-slot and logical payload-byte
   reservation lifecycles, UTF-8 migration backfill, counter-integrity and
   `INSERT OR REPLACE` hardening, startup seed idempotency, over-limit legacy
-  migration/recovery, bounded
-  expired-auth cleanup, fail-closed environment parsing, typed reply/tool
+  migration/recovery, bounded unusable-auth cleanup, fail-closed environment
+  parsing, typed reply/tool
   payload envelopes, canonical dispatch admission, and one-shot oversized
   provider/executor settlement without persisting the rejected payload.
   Operation-capacity coverage proves the seven-slot ordinary lane, fail-fast
@@ -690,11 +710,13 @@ Account Membership Foundation host verification:
   reasons, canonical digest vectors, multi-batch rotation and startup
   compaction, current-v12 limit reduction, wall-clock rollback, pre-write
   physical gating, trigger rollback, and deep-integrity corruption detection.
-  Account-foundation coverage includes fresh/v1/v5/v8/v12 migration, the
+  Account-foundation and durable-authorization coverage includes
+  fresh/v1/v5/v8/v12/v13 migration, the
   deterministic local account and owner membership, bootstrap atomicity,
   revision/identity/last-owner triggers, immutable root scope, deep-integrity
-  corruption, and fail-closed rollback for member-owned history or broken
-  foreign keys without partial v13 schema.
+  corruption, account/actor cursor and receipt isolation, three-tier capacity,
+  stale-session relogin, dual-subject dispatch, worker claim revocation, and
+  fail-closed rollback without a partial v13 or v14 schema.
 - `pnpm --filter web test`: 25 tests passed for CSRF headers, stable command
   identity, deep-page active-Session restore, Session-list cursor encoding and
   deduplication, bounded-tail retry reconciliation and Session-switch race
@@ -746,14 +768,20 @@ state-consistency checks across the retained-volume restart. Historical
 schema-v12 readiness required the exact schema, so this also verified reopening
 the v11-to-v12 migrated volume.
 
-The current schema-v13 image was subsequently rebuilt in the same
+The schema-v13 image was subsequently rebuilt in the same
 `zeus-operation-acceptance` project while retaining that now-v12 named volume.
 It completed the in-place v12-to-v13 migration, and volume-retaining
-`restart-verify` passed again. The stack remains available at
-`http://127.0.0.1:18089`; the API effective limit is 2 CPUs/1 GiB and the
-current resource snapshot reports `memory.events` `oom=0` and `oom_kill=0`.
-This verifies migration/reopen and the still-closed anonymous/member product
-boundary, not v14-v15 authorization.
+`restart-verify` passed again.
+
+The current schema-v14 image was then built from this worktree on the same
+isolated project while retaining the now-v13 volume. `up` completed the
+v13-to-v14 migration; `verify` and volume-retaining `restart-verify` passed API,
+Web, gateway, auth-status, anonymous-boundary, and `configured=false` state
+consistency checks. The stack remains available at `http://127.0.0.1:18089`.
+The API effective limit is 2 CPUs/1 GiB; the post-restart snapshot reports
+`memory.current=79,466,496`, `memory.peak=98,201,600`, Zeus RSS 9,824 KiB,
+`pids.current=6`, and `memory.events` `oom=0`/`oom_kill=0`. Apple `container`
+still reports `pids.max=max`, so this is not a PID-limit guarantee.
 
 The earlier Operation Capacity readiness-pressure image was verified at 2
 CPUs/1 GiB. A 30,000-request `/health/ready` run at concurrency 128 completed
@@ -767,7 +795,7 @@ and `memory.events` reported zero `oom`/`oom_kill`. CPU throttling confirmed the
 2-CPU quota was active. Apple `container` 1.0 still exposes no per-container
 PID limit (`pids.max=max`), and the VM had no swap. This is historical Apple
 acceptance for the stated Operation Capacity readiness-pressure scenario, not
-evidence that the v13 image reran it, and not authoritative Linux Docker
+evidence that the v14 image reran it, and not authoritative Linux Docker
 PID/OOM or adversarial low-memory acceptance.
 
 Docker Compose configuration remains available for environments with Docker

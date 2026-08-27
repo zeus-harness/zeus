@@ -33,12 +33,12 @@ use protocol::{
     StartTurnRequest, StartTurnResponse, ToolCall, ToolExecutorStatus, ToolOutcome,
 };
 pub use storage::{
-    AuthPrincipal, AuthSessionCommit, BootstrapOwnerCommit, ReplyClaimOutcome, ReplyCompletion,
-    ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus,
-    ReplyOutcomeUnknownCommit, ReplySuccessCommit, SessionSummaryPage, SqliteOperationLimits,
-    SqliteOperationLimitsError, SqlitePhysicalLimits, SqlitePhysicalLimitsError, StorageLimits,
-    StorageLimitsError, StoredCredential, StoredPreferences, StoredUser, StoredUserRole,
-    StoredUserStatus,
+    AccountId, AuthPrincipal, AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit,
+    MembershipRevision, MembershipRole, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit,
+    ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
+    ReplySuccessCommit, SessionSummaryPage, SqliteOperationLimits, SqliteOperationLimitsError,
+    SqlitePhysicalLimits, SqlitePhysicalLimitsError, StorageLimits, StorageLimitsError,
+    StoredCredential, StoredPreferences, StoredUser, StoredUserRole, StoredUserStatus,
 };
 use storage::{
     ClaimOutcome, CommitOutcome, DispatchCompleteCommit, DispatchContext, DispatchJob,
@@ -227,6 +227,10 @@ pub enum StoreError {
     UserNotFound(String),
     #[error("user {0} is disabled")]
     UserDisabled(String),
+    #[error("the authentication session was not found or has expired")]
+    AuthSessionNotFound,
+    #[error("the current account membership lacks the required capability")]
+    PermissionDenied,
     #[error("the durable storage quota is exhausted")]
     StorageQuotaExceeded,
     #[error("SQLite physical storage cannot safely accept this operation")]
@@ -300,6 +304,8 @@ impl From<StorageError> for StoreError {
             StorageError::InvalidBootstrapToken => Self::InvalidBootstrapToken,
             StorageError::UserNotFound(id) => Self::UserNotFound(id),
             StorageError::UserDisabled(id) => Self::UserDisabled(id),
+            StorageError::AuthSessionNotFound => Self::AuthSessionNotFound,
+            StorageError::PermissionDenied => Self::PermissionDenied,
             StorageError::StorageQuotaExceeded => Self::StorageQuotaExceeded,
             StorageError::PhysicalStorageExhausted => Self::PhysicalStorageExhausted,
             StorageError::OperationCapacityExceeded => Self::OperationCapacityExceeded,
@@ -628,53 +634,49 @@ impl DemoStore {
         Ok(self.storage.authenticate(session_token_hash).await?)
     }
 
-    pub async fn revoke_auth_session(&self, session_token_hash: &str) -> Result<bool, StoreError> {
-        Ok(self.storage.revoke_auth_session(session_token_hash).await?)
+    pub async fn revoke_auth_session(
+        &self,
+        context: &AuthzContext,
+        session_token_hash: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .storage
+            .revoke_auth_session(context, session_token_hash)
+            .await?)
     }
 
-    pub async fn preferences(&self, user_id: &str) -> Result<StoredPreferences, StoreError> {
-        Ok(self.storage.preferences(user_id).await?)
+    pub async fn preferences(
+        &self,
+        context: &AuthzContext,
+    ) -> Result<StoredPreferences, StoreError> {
+        Ok(self.storage.preferences(context).await?)
     }
 
     pub async fn update_preferences(
         &self,
-        user_id: &str,
+        context: &AuthzContext,
         expected_revision: u64,
         theme: &str,
         preferred_model: Option<&str>,
     ) -> Result<StoredPreferences, StoreError> {
         Ok(self
             .storage
-            .update_preferences(user_id, expected_revision, theme, preferred_model)
+            .update_preferences(context, expected_revision, theme, preferred_model)
             .await?)
     }
 
-    pub async fn overview(&self) -> Result<OverviewResponse, StoreError> {
-        let stored = self.storage.load_run(&self.primary_run_id).await?;
-        Ok(OverviewResponse {
-            primary_session_id: self.primary_session_id.to_string(),
-            incident: stored.snapshot.incident,
-            run: stored.snapshot.run,
-            metrics: stored.snapshot.metrics,
-            recent_events: stored.events,
-            evidence: stored.snapshot.evidence,
-            tool_policy: stored.snapshot.tool_policy,
-            recent_events_page: None,
-        })
-    }
-
-    /// Returns the primary workspace only when the actor is still an active
-    /// owner of its primary Run. The storage predicate intentionally maps a
-    /// missing, unowned, disabled, or non-owner actor to the same not-found
-    /// result.
+    /// Returns the primary workspace only when the complete authority context
+    /// still has read capability for the account that owns its primary Run.
+    /// Storage intentionally maps missing, cross-account, disabled, stale, or
+    /// insufficient authority to the same not-found result.
     pub async fn overview_for_actor(
         &self,
-        actor_user_id: &str,
+        context: &AuthzContext,
     ) -> Result<OverviewResponse, StoreError> {
         let stored = self
             .storage
             .bounded_run_for_actor(
-                actor_user_id,
+                context,
                 &self.primary_run_id,
                 None,
                 EVENT_PAGE_DEFAULT_LIMIT,
@@ -692,7 +694,8 @@ impl DemoStore {
         })
     }
 
-    pub async fn run_detail(&self, run_id: &str) -> Result<RunDetail, StoreError> {
+    #[cfg(test)]
+    async fn run_detail(&self, run_id: &str) -> Result<RunDetail, StoreError> {
         validate_durable_reference(run_id, "run ID")?;
         let stored = self.storage.load_run(run_id).await?;
         Ok(RunDetail {
@@ -705,15 +708,16 @@ impl DemoStore {
 
     pub async fn run_detail_for_actor(
         &self,
-        actor_user_id: &str,
+        context: &AuthzContext,
         run_id: &str,
         events_before: Option<&str>,
         events_limit: usize,
     ) -> Result<RunDetail, StoreError> {
         validate_durable_reference(run_id, "run ID")?;
+        self.authorize_run_for_actor(context, run_id).await?;
         let stored = self
             .storage
-            .bounded_run_for_actor(actor_user_id, run_id, events_before, events_limit)
+            .bounded_run_for_actor(context, run_id, events_before, events_limit)
             .await?;
         Ok(RunDetail {
             incident: stored.snapshot.incident,
@@ -725,72 +729,59 @@ impl DemoStore {
         })
     }
 
-    pub async fn events_after(
+    /// Performs the narrow account-scoped point authorization used by API
+    /// handlers before parsing resource-specific cursors or request bodies.
+    pub async fn authorize_run_for_actor(
         &self,
+        context: &AuthzContext,
         run_id: &str,
-        after: u64,
-    ) -> Result<Vec<RunEvent>, StoreError> {
+    ) -> Result<(), StoreError> {
         validate_durable_reference(run_id, "run ID")?;
-        Ok(self.storage.events_after(run_id, after).await?)
+        self.storage
+            .consistent_snapshot_for_actor(context, run_id)
+            .await?;
+        Ok(())
     }
 
     pub async fn events_after_for_actor(
         &self,
-        actor_user_id: &str,
+        context: &AuthzContext,
         run_id: &str,
         after: u64,
     ) -> Result<Vec<RunEvent>, StoreError> {
         validate_durable_reference(run_id, "run ID")?;
+        self.authorize_run_for_actor(context, run_id).await?;
         Ok(self
             .storage
-            .events_after_for_actor(actor_user_id, run_id, after)
+            .events_after_for_actor(context, run_id, after)
             .await?)
-    }
-
-    pub async fn run_event_page(
-        &self,
-        run_id: &str,
-        after: u64,
-        limit: usize,
-    ) -> Result<RunEventPage, StoreError> {
-        validate_durable_reference(run_id, "run ID")?;
-        Ok(self.storage.run_event_page(run_id, after, limit).await?)
     }
 
     pub async fn run_event_page_for_actor(
         &self,
-        actor_user_id: &str,
+        context: &AuthzContext,
         run_id: &str,
         after: u64,
         limit: usize,
     ) -> Result<RunEventPage, StoreError> {
         validate_durable_reference(run_id, "run ID")?;
+        self.authorize_run_for_actor(context, run_id).await?;
         Ok(self
             .storage
-            .run_event_page_for_actor(actor_user_id, run_id, after, limit)
+            .run_event_page_for_actor(context, run_id, after, limit)
             .await?)
-    }
-
-    /// Subscribes before taking the durable replay snapshot. Consumers discard
-    /// broadcasts at or below their cursor, avoiding both gaps and duplicates.
-    pub async fn event_feed(&self, run_id: &str, after: u64) -> Result<EventFeed, StoreError> {
-        let receiver = self.publisher.subscribe();
-        let replay = self.events_after(run_id, after).await?;
-        Ok(EventFeed { replay, receiver })
     }
 
     /// Subscribes before the actor-scoped durable snapshot so a commit cannot
     /// fall between authorization/replay and the live wake channel.
     pub async fn event_feed_for_actor(
         &self,
-        actor_user_id: &str,
+        context: &AuthzContext,
         run_id: &str,
         after: u64,
     ) -> Result<EventFeed, StoreError> {
         let receiver = self.publisher.subscribe();
-        let replay = self
-            .events_after_for_actor(actor_user_id, run_id, after)
-            .await?;
+        let replay = self.events_after_for_actor(context, run_id, after).await?;
         Ok(EventFeed { replay, receiver })
     }
 
@@ -798,44 +789,51 @@ impl DemoStore {
     /// miss a commit between the replay snapshot and the live wake channel.
     pub async fn event_page_feed_for_actor(
         &self,
-        actor_user_id: &str,
+        context: &AuthzContext,
         run_id: &str,
         after: u64,
         limit: usize,
     ) -> Result<EventPageFeed, StoreError> {
         let receiver = self.publisher.subscribe();
         let replay = self
-            .run_event_page_for_actor(actor_user_id, run_id, after, limit)
+            .run_event_page_for_actor(context, run_id, after, limit)
             .await?;
         Ok(EventPageFeed { replay, receiver })
     }
 
-    pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, StoreError> {
-        Ok(self.storage.list_sessions().await?)
-    }
-
     pub async fn list_sessions_for_actor(
         &self,
-        actor_user_id: &str,
+        context: &AuthzContext,
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<SessionSummaryPage, StoreError> {
         Ok(self
             .storage
-            .session_summary_page_for_actor(actor_user_id, cursor, limit)
+            .session_summary_page_for_actor(context, cursor, limit)
             .await?)
     }
 
-    pub async fn get_session(&self, session_id: &str) -> Result<SessionDetail, StoreError> {
+    #[cfg(test)]
+    async fn get_session(&self, session_id: &str) -> Result<SessionDetail, StoreError> {
         validate_durable_reference(session_id, "session ID")?;
         Ok(self.storage.get_session(session_id).await?)
     }
 
-    pub async fn session_summary(&self, session_id: &str) -> Result<SessionSummary, StoreError> {
+    /// Performs the narrow account-scoped point authorization used by API
+    /// handlers before parsing resource-specific cursors or request bodies.
+    pub async fn authorize_session_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+    ) -> Result<(), StoreError> {
         validate_durable_reference(session_id, "session ID")?;
-        Ok(self.storage.session_summary(session_id).await?)
+        self.storage
+            .session_summary_for_actor(context, session_id)
+            .await?;
+        Ok(())
     }
 
+    /// Durable worker-only point read using the reserved progress lane.
     pub async fn session_summary_for_progress(
         &self,
         session_id: &str,
@@ -853,7 +851,7 @@ impl DemoStore {
     #[allow(clippy::too_many_arguments)]
     pub async fn get_session_for_actor(
         &self,
-        actor_user_id: &str,
+        context: &AuthzContext,
         session_id: &str,
         run_ids_before: Option<&str>,
         run_ids_limit: usize,
@@ -863,10 +861,12 @@ impl DemoStore {
         events_limit: usize,
     ) -> Result<SessionDetail, StoreError> {
         validate_durable_reference(session_id, "session ID")?;
+        self.authorize_session_for_actor(context, session_id)
+            .await?;
         Ok(self
             .storage
             .session_detail_page_for_actor(
-                actor_user_id,
+                context,
                 session_id,
                 run_ids_before,
                 run_ids_limit,
@@ -880,98 +880,64 @@ impl DemoStore {
 
     pub async fn session_turn_for_actor(
         &self,
-        actor_user_id: &str,
+        context: &AuthzContext,
         session_id: &str,
         turn_id: &str,
     ) -> Result<SessionTurn, StoreError> {
         validate_durable_reference(session_id, "session ID")?;
+        self.authorize_session_for_actor(context, session_id)
+            .await?;
         Ok(self
             .storage
-            .session_turn_for_actor(actor_user_id, session_id, turn_id)
+            .session_turn_for_actor(context, session_id, turn_id)
             .await?)
-    }
-
-    pub async fn session_events_after(
-        &self,
-        session_id: &str,
-        after: u64,
-    ) -> Result<Vec<SessionEvent>, StoreError> {
-        validate_durable_reference(session_id, "session ID")?;
-        validate_session_sequence(after, "session event cursor")?;
-        Ok(self.storage.session_events_after(session_id, after).await?)
     }
 
     pub async fn session_events_after_for_actor(
         &self,
-        actor_user_id: &str,
+        context: &AuthzContext,
         session_id: &str,
         after: u64,
     ) -> Result<Vec<SessionEvent>, StoreError> {
         validate_durable_reference(session_id, "session ID")?;
+        self.authorize_session_for_actor(context, session_id)
+            .await?;
         validate_session_sequence(after, "session event cursor")?;
         Ok(self
             .storage
-            .session_events_after_for_actor(actor_user_id, session_id, after)
-            .await?)
-    }
-
-    pub async fn session_event_page(
-        &self,
-        session_id: &str,
-        after: u64,
-        limit: usize,
-    ) -> Result<SessionEventPage, StoreError> {
-        validate_durable_reference(session_id, "session ID")?;
-        Ok(self
-            .storage
-            .session_event_page(session_id, after, limit)
+            .session_events_after_for_actor(context, session_id, after)
             .await?)
     }
 
     pub async fn session_event_page_for_actor(
         &self,
-        actor_user_id: &str,
+        context: &AuthzContext,
         session_id: &str,
         after: u64,
         limit: usize,
     ) -> Result<SessionEventPage, StoreError> {
         validate_durable_reference(session_id, "session ID")?;
+        self.authorize_session_for_actor(context, session_id)
+            .await?;
         Ok(self
             .storage
-            .session_event_page_for_actor(actor_user_id, session_id, after, limit)
+            .session_event_page_for_actor(context, session_id, after, limit)
             .await?)
     }
 
-    /// Subscribes to the session channel before loading the durable replay.
-    /// The session channel is intentionally independent from run dispatch and
-    /// its event ledger. Receiver items are post-commit wake hints, not an
-    /// ordered source of truth: concurrent publishers may send out of order,
-    /// so consumers must reconcile from `session_events_after` before moving
-    /// their durable cursor.
-    pub async fn session_event_feed(
-        &self,
-        session_id: &str,
-        after: u64,
-    ) -> Result<SessionEventFeed, StoreError> {
-        validate_durable_reference(session_id, "session ID")?;
-        let receiver = self.session_publisher.subscribe();
-        let replay = self.session_events_after(session_id, after).await?;
-        Ok(SessionEventFeed { replay, receiver })
-    }
-
     /// Actor-scoped counterpart used by authenticated SSE. Subscription still
-    /// precedes the durable query, while storage performs the owner check in
-    /// the same read transaction that builds the replay.
+    /// precedes the durable query, while storage revalidates account authority
+    /// in the same read transaction that builds the replay.
     pub async fn session_event_feed_for_actor(
         &self,
-        actor_user_id: &str,
+        context: &AuthzContext,
         session_id: &str,
         after: u64,
     ) -> Result<SessionEventFeed, StoreError> {
         validate_durable_reference(session_id, "session ID")?;
         let receiver = self.session_publisher.subscribe();
         let replay = self
-            .session_events_after_for_actor(actor_user_id, session_id, after)
+            .session_events_after_for_actor(context, session_id, after)
             .await?;
         Ok(SessionEventFeed { replay, receiver })
     }
@@ -980,39 +946,21 @@ impl DemoStore {
     /// precedes the storage transaction that authorizes and builds the page.
     pub async fn session_event_page_feed_for_actor(
         &self,
-        actor_user_id: &str,
+        context: &AuthzContext,
         session_id: &str,
         after: u64,
         limit: usize,
     ) -> Result<SessionEventPageFeed, StoreError> {
         let receiver = self.session_publisher.subscribe();
         let replay = self
-            .session_event_page_for_actor(actor_user_id, session_id, after, limit)
+            .session_event_page_for_actor(context, session_id, after, limit)
             .await?;
         Ok(SessionEventPageFeed { replay, receiver })
     }
 
-    pub async fn create_session(
-        &self,
-        request: CreateSessionRequest,
-        idempotency_key: &str,
-    ) -> Result<CreateSessionResponse, StoreError> {
-        validate_new_session_id(&request.id, "session ID")?;
-        validate_new_session_title(&request.title, "session title")?;
-        let idempotency_key = normalized_idempotency_key(idempotency_key)?;
-        let response = self
-            .storage
-            .create_session(request, idempotency_key)
-            .await?;
-        if !response.replayed {
-            self.publish_session_event(&response.session.id, response.event.clone());
-        }
-        Ok(response)
-    }
-
     pub async fn create_session_for_actor(
         &self,
-        actor_user_id: &str,
+        context: &AuthzContext,
         request: CreateSessionRequest,
         idempotency_key: &str,
     ) -> Result<CreateSessionResponse, StoreError> {
@@ -1021,7 +969,7 @@ impl DemoStore {
         let idempotency_key = normalized_idempotency_key(idempotency_key)?;
         let response = self
             .storage
-            .create_session_for_actor(actor_user_id, request, idempotency_key)
+            .create_session_for_actor(context, request, idempotency_key)
             .await?;
         if !response.replayed {
             self.publish_session_event(&response.session.id, response.event.clone());
@@ -1031,37 +979,22 @@ impl DemoStore {
 
     pub async fn attach_run_for_actor(
         &self,
-        actor_user_id: &str,
+        context: &AuthzContext,
         session_id: &str,
         request: AttachRunRequest,
         idempotency_key: &str,
     ) -> Result<AttachRunResponse, StoreError> {
         validate_durable_reference(session_id, "session ID")?;
         validate_durable_reference(&request.run_id, "run ID")?;
-        validate_session_sequence(request.expected_sequence, "expected session sequence")?;
-        let idempotency_key = normalized_idempotency_key(idempotency_key)?;
-        let response = self
-            .storage
-            .attach_run_for_actor(actor_user_id, session_id, request, idempotency_key)
+        self.authorize_session_for_actor(context, session_id)
             .await?;
-        if !response.replayed {
-            self.publish_session_event(session_id, response.event.clone());
-        }
-        Ok(response)
-    }
-
-    pub async fn resume_session(
-        &self,
-        session_id: &str,
-        request: ResumeSessionRequest,
-        idempotency_key: &str,
-    ) -> Result<ResumeSessionResponse, StoreError> {
-        validate_durable_reference(session_id, "session ID")?;
+        self.authorize_run_for_actor(context, &request.run_id)
+            .await?;
         validate_session_sequence(request.expected_sequence, "expected session sequence")?;
         let idempotency_key = normalized_idempotency_key(idempotency_key)?;
         let response = self
             .storage
-            .resume_session(session_id, request, idempotency_key)
+            .attach_run_for_actor(context, session_id, request, idempotency_key)
             .await?;
         if !response.replayed {
             self.publish_session_event(session_id, response.event.clone());
@@ -1071,38 +1004,19 @@ impl DemoStore {
 
     pub async fn resume_session_for_actor(
         &self,
-        actor_user_id: &str,
+        context: &AuthzContext,
         session_id: &str,
         request: ResumeSessionRequest,
         idempotency_key: &str,
     ) -> Result<ResumeSessionResponse, StoreError> {
         validate_durable_reference(session_id, "session ID")?;
-        validate_session_sequence(request.expected_sequence, "expected session sequence")?;
-        let idempotency_key = normalized_idempotency_key(idempotency_key)?;
-        let response = self
-            .storage
-            .resume_session_for_actor(actor_user_id, session_id, request, idempotency_key)
+        self.authorize_session_for_actor(context, session_id)
             .await?;
-        if !response.replayed {
-            self.publish_session_event(session_id, response.event.clone());
-        }
-        Ok(response)
-    }
-
-    pub async fn start_turn(
-        &self,
-        session_id: &str,
-        request: StartTurnRequest,
-        idempotency_key: &str,
-    ) -> Result<StartTurnResponse, StoreError> {
-        validate_durable_reference(session_id, "session ID")?;
-        validate_new_turn_id(&request.turn_id, "turn ID")?;
-        validate_user_message_value(&request.user_message, "user message")?;
         validate_session_sequence(request.expected_sequence, "expected session sequence")?;
         let idempotency_key = normalized_idempotency_key(idempotency_key)?;
         let response = self
             .storage
-            .start_turn(session_id, request, idempotency_key)
+            .resume_session_for_actor(context, session_id, request, idempotency_key)
             .await?;
         if !response.replayed {
             self.publish_session_event(session_id, response.event.clone());
@@ -1112,19 +1026,21 @@ impl DemoStore {
 
     pub async fn start_turn_for_actor(
         &self,
-        actor_user_id: &str,
+        context: &AuthzContext,
         session_id: &str,
         request: StartTurnRequest,
         idempotency_key: &str,
     ) -> Result<StartTurnResponse, StoreError> {
         validate_durable_reference(session_id, "session ID")?;
         validate_new_turn_id(&request.turn_id, "turn ID")?;
+        self.authorize_session_for_actor(context, session_id)
+            .await?;
         validate_user_message_value(&request.user_message, "user message")?;
         validate_session_sequence(request.expected_sequence, "expected session sequence")?;
         let idempotency_key = normalized_idempotency_key(idempotency_key)?;
         let response = self
             .storage
-            .start_turn_for_actor(actor_user_id, session_id, request, idempotency_key)
+            .start_turn_for_actor(context, session_id, request, idempotency_key)
             .await?;
         if !response.replayed {
             self.publish_session_event(session_id, response.event.clone());
@@ -1132,31 +1048,9 @@ impl DemoStore {
         Ok(response)
     }
 
-    pub async fn start_turn_and_enqueue_reply(
-        &self,
-        session_id: &str,
-        request: StartTurnRequest,
-        idempotency_key: &str,
-        job: ReplyJobSpec,
-    ) -> Result<ReplyJobEnqueueResponse, StoreError> {
-        validate_durable_reference(session_id, "session ID")?;
-        validate_new_turn_id(&request.turn_id, "turn ID")?;
-        validate_user_message_value(&request.user_message, "user message")?;
-        validate_session_sequence(request.expected_sequence, "expected session sequence")?;
-        let idempotency_key = normalized_idempotency_key(idempotency_key)?;
-        let response = self
-            .storage
-            .start_turn_and_enqueue_reply(session_id, request, idempotency_key, job)
-            .await?;
-        if !response.start.replayed {
-            self.publish_session_event(session_id, response.start.event.clone());
-        }
-        Ok(response)
-    }
-
     pub async fn start_turn_and_enqueue_reply_for_actor(
         &self,
-        actor_user_id: &str,
+        context: &AuthzContext,
         session_id: &str,
         request: StartTurnRequest,
         idempotency_key: &str,
@@ -1164,13 +1058,15 @@ impl DemoStore {
     ) -> Result<ReplyJobEnqueueResponse, StoreError> {
         validate_durable_reference(session_id, "session ID")?;
         validate_new_turn_id(&request.turn_id, "turn ID")?;
+        self.authorize_session_for_actor(context, session_id)
+            .await?;
         validate_user_message_value(&request.user_message, "user message")?;
         validate_session_sequence(request.expected_sequence, "expected session sequence")?;
         let idempotency_key = normalized_idempotency_key(idempotency_key)?;
         let response = self
             .storage
             .start_turn_and_enqueue_reply_for_actor(
-                actor_user_id,
+                context,
                 session_id,
                 request,
                 idempotency_key,
@@ -1183,6 +1079,8 @@ impl DemoStore {
         Ok(response)
     }
 
+    /// Durable reply-worker claim façade. No handler authority is accepted;
+    /// storage revalidates the persisted initiating authority atomically.
     pub async fn claim_next_reply(&self) -> Result<ReplyClaimOutcome, StoreError> {
         loop {
             match retry_operation_capacity(|| async { Ok(self.storage.claim_next_reply().await?) })
@@ -1202,10 +1100,26 @@ impl DemoStore {
         }
     }
 
-    pub async fn reply_job(&self, job_id: &str) -> Result<Option<ReplyJob>, StoreError> {
+    /// Account-scoped durable queue inspection for authenticated diagnostics.
+    pub async fn reply_job_for_actor(
+        &self,
+        context: &AuthzContext,
+        job_id: &str,
+    ) -> Result<Option<ReplyJob>, StoreError> {
+        self.storage.preferences(context).await?;
+        Ok(self
+            .storage
+            .reply_job(job_id)
+            .await?
+            .filter(|job| job.account_id == context.account_id))
+    }
+
+    #[cfg(test)]
+    async fn reply_job(&self, job_id: &str) -> Result<Option<ReplyJob>, StoreError> {
         Ok(self.storage.reply_job(job_id).await?)
     }
 
+    /// Durable worker-only completion after a successful claimed provider call.
     pub async fn complete_reply_success(
         &self,
         commit: ReplySuccessCommit,
@@ -1222,6 +1136,7 @@ impl DemoStore {
         Ok(completion)
     }
 
+    /// Durable worker-only completion after a failed claimed provider call.
     pub async fn complete_reply_failure(
         &self,
         commit: ReplyFailureCommit,
@@ -1238,6 +1153,7 @@ impl DemoStore {
         Ok(completion)
     }
 
+    /// Durable worker-only completion for an indeterminate claimed provider call.
     pub async fn complete_reply_outcome_unknown(
         &self,
         commit: ReplyOutcomeUnknownCommit,
@@ -1257,40 +1173,17 @@ impl DemoStore {
         Ok(completion)
     }
 
-    pub async fn flush_turn(
-        &self,
-        session_id: &str,
-        request: FlushSessionRequest,
-        idempotency_key: &str,
-    ) -> Result<FlushSessionResponse, StoreError> {
-        validate_durable_reference(session_id, "session ID")?;
-        validate_durable_reference(&request.turn_id, "turn ID")?;
-        if let Some(message) = &request.assistant_message {
-            validate_session_message(message, "assistant message")?;
-        }
-        validate_session_sequence(request.expected_sequence, "expected session sequence")?;
-        let idempotency_key = normalized_idempotency_key(idempotency_key)?;
-        let response = self
-            .storage
-            .flush_turn(session_id, request, idempotency_key)
-            .await?;
-        if !response.replayed {
-            for event in &response.events {
-                self.publish_session_event(session_id, event.clone());
-            }
-        }
-        Ok(response)
-    }
-
     pub async fn flush_turn_for_actor(
         &self,
-        actor_user_id: &str,
+        context: &AuthzContext,
         session_id: &str,
         request: FlushSessionRequest,
         idempotency_key: &str,
     ) -> Result<FlushSessionResponse, StoreError> {
         validate_durable_reference(session_id, "session ID")?;
         validate_durable_reference(&request.turn_id, "turn ID")?;
+        self.authorize_session_for_actor(context, session_id)
+            .await?;
         if let Some(message) = &request.assistant_message {
             validate_session_message(message, "assistant message")?;
         }
@@ -1298,7 +1191,7 @@ impl DemoStore {
         let idempotency_key = normalized_idempotency_key(idempotency_key)?;
         let response = self
             .storage
-            .flush_turn_for_actor(actor_user_id, session_id, request, idempotency_key)
+            .flush_turn_for_actor(context, session_id, request, idempotency_key)
             .await?;
         if !response.replayed {
             for event in &response.events {
@@ -1306,19 +1199,6 @@ impl DemoStore {
             }
         }
         Ok(response)
-    }
-
-    /// Records one call-bound approval decision. Approving only queues the
-    /// exact call; it does not claim that execution has started.
-    pub async fn review(
-        &self,
-        run_id: &str,
-        approval_id: &str,
-        request: ReviewRequest,
-        idempotency_key: &str,
-    ) -> Result<ReviewResponse, StoreError> {
-        self.review_inner(None, run_id, approval_id, request, idempotency_key)
-            .await
     }
 
     /// Actor-scoped approval boundary used by the authenticated server.
@@ -1328,25 +1208,19 @@ impl DemoStore {
     /// response nor turn an ownership miss into an idempotency conflict.
     pub async fn review_for_actor(
         &self,
-        actor_user_id: &str,
+        context: &AuthzContext,
         run_id: &str,
         approval_id: &str,
         request: ReviewRequest,
         idempotency_key: &str,
     ) -> Result<ReviewResponse, StoreError> {
-        self.review_inner(
-            Some(actor_user_id),
-            run_id,
-            approval_id,
-            request,
-            idempotency_key,
-        )
-        .await
+        self.review_inner(Some(context), run_id, approval_id, request, idempotency_key)
+            .await
     }
 
     async fn review_inner(
         &self,
-        actor_user_id: Option<&str>,
+        context: Option<&AuthzContext>,
         run_id: &str,
         approval_id: &str,
         request: ReviewRequest,
@@ -1354,27 +1228,27 @@ impl DemoStore {
     ) -> Result<ReviewResponse, StoreError> {
         validate_durable_reference(run_id, "run ID")?;
         validate_durable_reference(approval_id, "approval ID")?;
-        let idempotency_key = normalized_idempotency_key(idempotency_key)?;
 
         // Read the execution context before payload fingerprinting and receipt
         // lookup. Besides preserving the resource-not-found mask, this keeps a
         // pending approval visible across a same-key commit race; the final
         // write transaction can then replay the winning receipt instead of
         // incorrectly reporting that the approval is no longer pending.
-        let context = if let Some(actor_user_id) = actor_user_id {
+        let review_context = if let Some(context) = context {
             self.storage
-                .review_context_for_actor(actor_user_id, run_id, approval_id)
+                .review_context_for_actor(context, run_id, approval_id)
                 .await?
         } else {
             self.storage.review_context(run_id, approval_id).await?
         };
+        let idempotency_key = normalized_idempotency_key(idempotency_key)?;
         validate_review_request_value(&request)?;
         let fingerprint = review_fingerprint(run_id, approval_id, &request)?;
 
-        if let Some(actor_user_id) = actor_user_id {
+        if let Some(context) = context {
             if let Some(receipt) = self
                 .storage
-                .review_receipt_for_actor(actor_user_id, run_id, idempotency_key)
+                .review_receipt_for_actor(context, run_id, idempotency_key)
                 .await?
             {
                 let response = replay_receipt(receipt, &fingerprint)?;
@@ -1386,15 +1260,15 @@ impl DemoStore {
             self.kick_dispatcher();
             return Ok(response);
         }
-        let (pending, call) = pending_approval_and_call(&context, approval_id)?;
+        let (pending, call) = pending_approval_and_call(&review_context, approval_id)?;
         let approving = request.decision == ReviewDecision::Approve;
         if approving {
-            self.validate_pending_policy(&context.snapshot.run, &pending, &call)?;
+            self.validate_pending_policy(&review_context.snapshot.run, &pending, &call)?;
         }
 
-        let expected_sequence = context.snapshot.run.sequence;
+        let expected_sequence = review_context.snapshot.run.sequence;
         let transition = apply_review(
-            &context.snapshot.run,
+            &review_context.snapshot.run,
             &pending,
             request.decision.clone(),
             request.note.as_deref(),
@@ -1403,7 +1277,7 @@ impl DemoStore {
         )?;
 
         let dispatch = if approving {
-            let approving_actor_user_id = actor_user_id.ok_or_else(|| {
+            let approving_context = context.ok_or_else(|| {
                 StoreError::ExecutionInvariant(
                     "approval execution requires an authenticated owner actor".into(),
                 )
@@ -1414,7 +1288,7 @@ impl DemoStore {
                 )
             })?;
             let evaluation = self.policy.guard_dispatch(
-                &context.snapshot.run.environment,
+                &review_context.snapshot.run.environment,
                 &call,
                 Some(approved),
             );
@@ -1424,6 +1298,14 @@ impl DemoStore {
             Some(DispatchJobSpec {
                 call_id: call.call_id.clone(),
                 approval_id: approved.id.clone(),
+                // v14 keeps the authenticated API owner gate closed and the
+                // historical ToolCallRequested payload has no initiator
+                // authority. Persist two independent subjects now, using the
+                // current owner for both. A future member-capable request path
+                // must supply traceable initiator provenance rather than infer
+                // it from the approver.
+                initiating_authz: approving_context.clone(),
+                approving_authz: approving_context.clone(),
                 tool_name: call.tool.clone(),
                 tool_version: call.tool_version.clone(),
                 effect: call.effect.clone(),
@@ -1432,13 +1314,12 @@ impl DemoStore {
                 policy_id: self.policy_id.to_string(),
                 policy_revision: evaluation.policy_revision,
                 sandbox_profile: call.sandbox_profile.clone(),
-                approving_actor_user_id: approving_actor_user_id.to_owned(),
             })
         } else {
             None
         };
 
-        let mut snapshot = context.snapshot;
+        let mut snapshot = review_context.snapshot;
         snapshot.run = transition.run.clone();
         clear_pending_approval_metric(&mut snapshot);
         let response = ReviewResponse {
@@ -1459,9 +1340,9 @@ impl DemoStore {
             response: response.clone(),
             dispatch,
         };
-        let outcome = if let Some(actor_user_id) = actor_user_id {
+        let outcome = if let Some(context) = context {
             self.storage
-                .commit_review_for_actor(actor_user_id, commit)
+                .commit_review_for_actor(context, commit)
                 .await?
         } else {
             self.storage.commit_review(commit).await?
@@ -1483,6 +1364,9 @@ impl DemoStore {
         }
     }
 
+    /// Durable dispatch-worker façade. No handler authority is accepted;
+    /// storage revalidates both persisted subjects at the claim boundary.
+    ///
     /// Drains durable queued work. A Tokio mutex prevents duplicate workers in
     /// one process; SQLite's queue-head transaction arbitrates across racers.
     pub async fn dispatch_pending(&self) -> Result<(), StoreError> {
@@ -1494,17 +1378,18 @@ impl DemoStore {
         Ok(())
     }
 
-    pub async fn current_run(&self) -> Result<RunSummary, StoreError> {
+    #[cfg(test)]
+    async fn current_run(&self) -> Result<RunSummary, StoreError> {
         Ok(self.storage.snapshot(&self.primary_run_id).await?.run)
     }
 
     pub async fn current_run_for_actor(
         &self,
-        actor_user_id: &str,
+        context: &AuthzContext,
     ) -> Result<RunSummary, StoreError> {
         Ok(self
             .storage
-            .snapshot_for_actor(actor_user_id, &self.primary_run_id)
+            .snapshot_for_actor(context, &self.primary_run_id)
             .await?
             .run)
     }
@@ -1814,12 +1699,13 @@ impl DemoStore {
     }
 
     fn validate_dispatch_job_identity(&self, job: &DispatchJob) -> Result<(), StoreError> {
-        if job.run_id != self.primary_run_id.as_ref()
+        if job.account_id != AccountId::local()
+            || job.run_id != self.primary_run_id.as_ref()
             || job.policy_id != self.policy_id.as_ref()
             || job.policy_revision != self.policy_revision.as_ref()
         {
             return Err(StoreError::ExecutionInvariant(format!(
-                "dispatch job {} is not bound to this runtime's run and policy identity",
+                "dispatch job {} is not bound to this runtime's account, run, and policy identity",
                 job.call_id
             )));
         }
@@ -2217,6 +2103,87 @@ mod tests {
     static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
     const TEST_OWNER_ID: &str = "user-runtime-owner";
 
+    fn test_authz(user_id: &str) -> AuthzContext {
+        AuthzContext {
+            account_id: AccountId::local(),
+            user_id: user_id.into(),
+            membership_role: MembershipRole::Owner,
+            membership_revision: MembershipRevision::new(1).unwrap(),
+            auth_session_id: AuthSessionId::from_persistence(format!("runtime-test-{user_id}"))
+                .unwrap(),
+        }
+    }
+
+    fn install_foreign_owner_authz(path: &Path) -> AuthzContext {
+        const ACCOUNT_ID: &str = "acc_runtime_foreign";
+        const USER_ID: &str = "user-runtime-foreign-owner";
+        const AUTH_SESSION_ID: &str = "runtime-test-foreign-owner";
+
+        let mut connection = Connection::open(path).unwrap();
+        connection
+            .busy_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+        let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        transaction
+            .execute(
+                r#"INSERT INTO accounts(id, name, status, created_at, updated_at)
+                   VALUES (?1, 'Runtime foreign account', 'active', ?2, ?2)"#,
+                params![ACCOUNT_ID, timestamp],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                r#"INSERT INTO users(
+                       id, username, role, status, password_hash,
+                       created_at, updated_at
+                   ) VALUES (?1, ?2, 'member', 'active', ?3, ?4, ?4)"#,
+                params![
+                    USER_ID,
+                    "runtime-foreign-owner",
+                    "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA",
+                    timestamp
+                ],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                r#"INSERT INTO account_memberships(
+                       account_id, user_id, role, status, revision,
+                       created_at, updated_at
+                   ) VALUES (?1, ?2, 'owner', 'active', 1, ?3, ?3)"#,
+                params![ACCOUNT_ID, USER_ID, timestamp],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                r#"INSERT INTO auth_sessions(
+                       id, token_hash, account_id, user_id,
+                       membership_revision, csrf_hash, created_at,
+                       expires_at, last_seen_at
+                   ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?6)"#,
+                params![
+                    AUTH_SESSION_ID,
+                    "d".repeat(64),
+                    ACCOUNT_ID,
+                    USER_ID,
+                    "e".repeat(64),
+                    timestamp,
+                    "2999-01-01T00:00:00.000Z"
+                ],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+
+        AuthzContext {
+            account_id: AccountId::from_persistence(ACCOUNT_ID).unwrap(),
+            user_id: USER_ID.into(),
+            membership_role: MembershipRole::Owner,
+            membership_revision: MembershipRevision::new(1).unwrap(),
+            auth_session_id: AuthSessionId::from_persistence(AUTH_SESSION_ID).unwrap(),
+        }
+    }
+
     struct PanickingExecutor;
 
     impl ToolExecutor for PanickingExecutor {
@@ -2282,7 +2249,7 @@ mod tests {
     async fn replay_is_strictly_after_the_cursor() {
         let store = production_store(false).await;
         let replay = store
-            .events_after_for_actor(TEST_OWNER_ID, protocol::DEMO_RUN_ID, 4)
+            .events_after_for_actor(&test_authz(TEST_OWNER_ID), protocol::DEMO_RUN_ID, 4)
             .await
             .unwrap();
 
@@ -2300,7 +2267,7 @@ mod tests {
         let store = production_store(false).await;
 
         let first = store
-            .event_page_feed_for_actor(TEST_OWNER_ID, DEMO_RUN_ID, 0, 3)
+            .event_page_feed_for_actor(&test_authz(TEST_OWNER_ID), DEMO_RUN_ID, 0, 3)
             .await
             .unwrap();
         assert_eq!(
@@ -2317,7 +2284,7 @@ mod tests {
         assert!(first.replay.has_more);
 
         let last = store
-            .run_event_page_for_actor(TEST_OWNER_ID, DEMO_RUN_ID, 3, 5)
+            .run_event_page_for_actor(&test_authz(TEST_OWNER_ID), DEMO_RUN_ID, 3, 5)
             .await
             .unwrap();
         assert_eq!(
@@ -2333,7 +2300,7 @@ mod tests {
 
         assert!(matches!(
             store
-                .run_event_page_for_actor(TEST_OWNER_ID, DEMO_RUN_ID, 9, 1)
+                .run_event_page_for_actor(&test_authz(TEST_OWNER_ID), DEMO_RUN_ID, 9, 1)
                 .await,
             Err(StoreError::EventCursorBeyondHead {
                 after: 9,
@@ -2342,13 +2309,13 @@ mod tests {
         ));
         assert!(matches!(
             store
-                .run_event_page_for_actor(TEST_OWNER_ID, DEMO_RUN_ID, u64::MAX, 1)
+                .run_event_page_for_actor(&test_authz(TEST_OWNER_ID), DEMO_RUN_ID, u64::MAX, 1)
                 .await,
             Err(StoreError::EventCursorOutOfRange { after }) if after == u64::MAX
         ));
         assert!(matches!(
             store
-                .run_event_page_for_actor(TEST_OWNER_ID, DEMO_RUN_ID, 0, 0)
+                .run_event_page_for_actor(&test_authz(TEST_OWNER_ID), DEMO_RUN_ID, 0, 0)
                 .await,
             Err(StoreError::Storage(StorageError::InvalidEventPageLimit {
                 limit: 0,
@@ -2357,13 +2324,13 @@ mod tests {
         ));
         assert!(matches!(
             store
-                .run_event_page_for_actor("foreign-user", DEMO_RUN_ID, 9, 0)
+                .run_event_page_for_actor(&test_authz("foreign-user"), DEMO_RUN_ID, 9, 0)
                 .await,
-            Err(StoreError::RunNotFound(id)) if id == DEMO_RUN_ID
+            Err(StoreError::AuthSessionNotFound)
         ));
 
         let mut session_feed = store
-            .session_event_page_feed_for_actor(TEST_OWNER_ID, DEMO_SESSION_ID, 2, 1)
+            .session_event_page_feed_for_actor(&test_authz(TEST_OWNER_ID), DEMO_SESSION_ID, 2, 1)
             .await
             .unwrap();
         assert!(session_feed.replay.items.is_empty());
@@ -2373,7 +2340,7 @@ mod tests {
 
         let started = store
             .start_turn_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 DEMO_SESSION_ID,
                 StartTurnRequest {
                     turn_id: "turn-paged-feed".into(),
@@ -2408,7 +2375,7 @@ mod tests {
         store.auto_dispatch = true;
         let run_before = store
             .run_detail_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 DEMO_RUN_ID,
                 None,
                 protocol::EVENT_PAGE_DEFAULT_LIMIT,
@@ -2416,11 +2383,15 @@ mod tests {
             .await
             .unwrap();
         let mut session_feed = store
-            .session_event_feed_for_actor(TEST_OWNER_ID, DEMO_SESSION_ID, 2)
+            .session_event_feed_for_actor(&test_authz(TEST_OWNER_ID), DEMO_SESSION_ID, 2)
             .await
             .unwrap();
         let mut run_feed = store
-            .event_feed_for_actor(TEST_OWNER_ID, DEMO_RUN_ID, run_before.run.sequence)
+            .event_feed_for_actor(
+                &test_authz(TEST_OWNER_ID),
+                DEMO_RUN_ID,
+                run_before.run.sequence,
+            )
             .await
             .unwrap();
         assert!(session_feed.replay.is_empty());
@@ -2428,7 +2399,7 @@ mod tests {
 
         let started = store
             .start_turn_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 DEMO_SESSION_ID,
                 StartTurnRequest {
                     turn_id: "turn-runtime-isolation".into(),
@@ -2456,7 +2427,7 @@ mod tests {
         };
         let flushed = store
             .flush_turn_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 DEMO_SESSION_ID,
                 flush_request.clone(),
                 "runtime-flush-isolation",
@@ -2477,7 +2448,7 @@ mod tests {
 
         let replayed = store
             .flush_turn_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 DEMO_SESSION_ID,
                 flush_request,
                 "runtime-flush-isolation",
@@ -2497,7 +2468,7 @@ mod tests {
         assert_eq!(
             store
                 .run_detail_for_actor(
-                    TEST_OWNER_ID,
+                    &test_authz(TEST_OWNER_ID),
                     DEMO_RUN_ID,
                     None,
                     protocol::EVENT_PAGE_DEFAULT_LIMIT,
@@ -2533,7 +2504,7 @@ mod tests {
         bootstrap_test_owner(&store).await;
         let run_before = store
             .run_detail_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 DEMO_RUN_ID,
                 None,
                 protocol::EVENT_PAGE_DEFAULT_LIMIT,
@@ -2542,7 +2513,7 @@ mod tests {
             .unwrap();
         store
             .start_turn_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 DEMO_SESSION_ID,
                 StartTurnRequest {
                     turn_id: "turn-restart-recovery".into(),
@@ -2564,7 +2535,7 @@ mod tests {
         .unwrap();
         let detail = reopened
             .get_session_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 DEMO_SESSION_ID,
                 None,
                 protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
@@ -2592,7 +2563,7 @@ mod tests {
         assert_eq!(
             reopened
                 .run_detail_for_actor(
-                    TEST_OWNER_ID,
+                    &test_authz(TEST_OWNER_ID),
                     DEMO_RUN_ID,
                     None,
                     protocol::EVENT_PAGE_DEFAULT_LIMIT,
@@ -2607,7 +2578,7 @@ mod tests {
         };
         let resumed = reopened
             .resume_session_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 DEMO_SESSION_ID,
                 resume_request.clone(),
                 "runtime-resume-recovery",
@@ -2618,7 +2589,7 @@ mod tests {
         assert_eq!(resumed.session.sequence, 5);
         let replayed = reopened
             .resume_session_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 DEMO_SESSION_ID,
                 resume_request,
                 "runtime-resume-recovery",
@@ -2629,7 +2600,7 @@ mod tests {
         assert_eq!(
             reopened
                 .get_session_for_actor(
-                    TEST_OWNER_ID,
+                    &test_authz(TEST_OWNER_ID),
                     DEMO_SESSION_ID,
                     None,
                     protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
@@ -2647,7 +2618,7 @@ mod tests {
         assert_eq!(
             reopened
                 .run_detail_for_actor(
-                    TEST_OWNER_ID,
+                    &test_authz(TEST_OWNER_ID),
                     DEMO_RUN_ID,
                     None,
                     protocol::EVENT_PAGE_DEFAULT_LIMIT,
@@ -2661,7 +2632,10 @@ mod tests {
     #[tokio::test]
     async fn overview_and_session_queries_expose_the_stable_primary_session() {
         let store = production_store(false).await;
-        let overview = store.overview_for_actor(TEST_OWNER_ID).await.unwrap();
+        let overview = store
+            .overview_for_actor(&test_authz(TEST_OWNER_ID))
+            .await
+            .unwrap();
         assert_eq!(overview.primary_session_id, DEMO_SESSION_ID);
         assert_eq!(overview.recent_events.len(), 8);
         assert_eq!(
@@ -2672,7 +2646,7 @@ mod tests {
             })
         );
         let latest_run = store
-            .run_detail_for_actor(TEST_OWNER_ID, DEMO_RUN_ID, None, 3)
+            .run_detail_for_actor(&test_authz(TEST_OWNER_ID), DEMO_RUN_ID, None, 3)
             .await
             .unwrap();
         assert_eq!(
@@ -2687,7 +2661,7 @@ mod tests {
         assert!(run_page.has_more);
         let older_run = store
             .run_detail_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 DEMO_RUN_ID,
                 run_page.next_before.as_deref(),
                 3,
@@ -2703,7 +2677,11 @@ mod tests {
             vec![3, 4, 5]
         );
         let sessions = store
-            .list_sessions_for_actor(TEST_OWNER_ID, None, protocol::COLLECTION_PAGE_DEFAULT_LIMIT)
+            .list_sessions_for_actor(
+                &test_authz(TEST_OWNER_ID),
+                None,
+                protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+            )
             .await
             .unwrap();
         assert_eq!(sessions.items.len(), 1);
@@ -2711,7 +2689,7 @@ mod tests {
         assert!(sessions.next_cursor.is_none());
         let detail = store
             .get_session_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 DEMO_SESSION_ID,
                 None,
                 protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
@@ -2731,59 +2709,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_scoped_queries_and_commands_hide_another_owners_resources() {
+    async fn actor_scoped_queries_and_commands_require_a_current_authenticated_context() {
         const OTHER_ACTOR: &str = "user-other-owner";
 
         let store = production_store(false).await;
         assert_eq!(
-            store.current_run_for_actor(TEST_OWNER_ID).await.unwrap().id,
+            store
+                .current_run_for_actor(&test_authz(TEST_OWNER_ID))
+                .await
+                .unwrap()
+                .id,
             DEMO_RUN_ID
         );
+        let mut wrong_account = test_authz(TEST_OWNER_ID);
+        wrong_account.account_id = AccountId::from_persistence("acc_foreign").unwrap();
+        let mut stale_revision = test_authz(TEST_OWNER_ID);
+        stale_revision.membership_revision = MembershipRevision::new(2).unwrap();
+        let mut wrong_role = test_authz(TEST_OWNER_ID);
+        wrong_role.membership_role = MembershipRole::Member;
+        let mut wrong_session = test_authz(TEST_OWNER_ID);
+        wrong_session.auth_session_id =
+            AuthSessionId::from_persistence("runtime-test-foreign-session").unwrap();
+        for invalid_context in [wrong_account, stale_revision, wrong_role, wrong_session] {
+            assert!(
+                matches!(
+                    store.overview_for_actor(&invalid_context).await,
+                    Err(StoreError::AuthSessionNotFound)
+                ),
+                "every component of the authorization context must be isolated"
+            );
+        }
         assert!(
             matches!(
-                store.overview_for_actor(OTHER_ACTOR).await,
-                Err(StoreError::RunNotFound(id)) if id == DEMO_RUN_ID
+                store.overview_for_actor(&test_authz(OTHER_ACTOR)).await,
+                Err(StoreError::AuthSessionNotFound)
             ),
-            "overview must conceal another owner's run"
+            "overview must reject an authority without a durable login session"
         );
         assert!(
             matches!(
                 store
                     .run_detail_for_actor(
-                        OTHER_ACTOR,
+                        &test_authz(OTHER_ACTOR),
                         DEMO_RUN_ID,
                         None,
                         protocol::EVENT_PAGE_DEFAULT_LIMIT,
                     )
                     .await,
-                Err(StoreError::RunNotFound(id)) if id == DEMO_RUN_ID
+                Err(StoreError::AuthSessionNotFound)
             ),
-            "run detail must conceal another owner's run"
+            "run detail must reject an authority without a durable login session"
         );
         assert!(
             matches!(
-                store.events_after_for_actor(OTHER_ACTOR, DEMO_RUN_ID, 0).await,
-                Err(StoreError::RunNotFound(id)) if id == DEMO_RUN_ID
+                store
+                    .events_after_for_actor(&test_authz(OTHER_ACTOR), DEMO_RUN_ID, 0)
+                    .await,
+                Err(StoreError::AuthSessionNotFound)
             ),
-            "run replay must conceal another owner's run"
+            "run replay must reject an authority without a durable login session"
         );
         let run_feed_error = match store
-            .event_feed_for_actor(OTHER_ACTOR, DEMO_RUN_ID, 0)
+            .event_feed_for_actor(&test_authz(OTHER_ACTOR), DEMO_RUN_ID, 0)
             .await
         {
             Ok(_) => panic!("run feed must conceal another owner's run"),
             Err(error) => error,
         };
-        assert!(matches!(
-            run_feed_error,
-            StoreError::RunNotFound(id) if id == DEMO_RUN_ID
-        ));
+        assert!(matches!(run_feed_error, StoreError::AuthSessionNotFound));
 
         assert!(
             matches!(
                 store
                     .get_session_for_actor(
-                        OTHER_ACTOR,
+                        &test_authz(OTHER_ACTOR),
                         DEMO_SESSION_ID,
                         None,
                         protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
@@ -2793,21 +2792,21 @@ mod tests {
                         protocol::EVENT_PAGE_DEFAULT_LIMIT,
                     )
                     .await,
-                Err(StoreError::SessionNotFound(id)) if id == DEMO_SESSION_ID
+                Err(StoreError::AuthSessionNotFound)
             ),
-            "session detail must conceal another owner's session"
+            "session detail must reject an authority without a durable login session"
         );
         assert!(
             matches!(
                 store
-                    .session_events_after_for_actor(OTHER_ACTOR, DEMO_SESSION_ID, 0)
+                    .session_events_after_for_actor(&test_authz(OTHER_ACTOR), DEMO_SESSION_ID, 0)
                     .await,
-                Err(StoreError::SessionNotFound(id)) if id == DEMO_SESSION_ID
+                Err(StoreError::AuthSessionNotFound)
             ),
-            "session replay must conceal another owner's session"
+            "session replay must reject an authority without a durable login session"
         );
         let session_feed_error = match store
-            .session_event_feed_for_actor(OTHER_ACTOR, DEMO_SESSION_ID, 0)
+            .session_event_feed_for_actor(&test_authz(OTHER_ACTOR), DEMO_SESSION_ID, 0)
             .await
         {
             Ok(_) => panic!("session feed must conceal another owner's session"),
@@ -2815,13 +2814,13 @@ mod tests {
         };
         assert!(matches!(
             session_feed_error,
-            StoreError::SessionNotFound(id) if id == DEMO_SESSION_ID
+            StoreError::AuthSessionNotFound
         ));
         assert!(
             matches!(
                 store
                     .start_turn_for_actor(
-                        OTHER_ACTOR,
+                        &test_authz(OTHER_ACTOR),
                         DEMO_SESSION_ID,
                         StartTurnRequest {
                             turn_id: "turn-other-owner".into(),
@@ -2831,7 +2830,7 @@ mod tests {
                         "runtime-other-owner-start",
                     )
                     .await,
-                Err(StoreError::SessionNotFound(id)) if id == DEMO_SESSION_ID
+                Err(StoreError::AuthSessionNotFound)
             ),
             "session commands must authorize the resource before transition validation"
         );
@@ -2839,7 +2838,7 @@ mod tests {
             matches!(
                 store
                     .attach_run_for_actor(
-                        OTHER_ACTOR,
+                        &test_authz(OTHER_ACTOR),
                         DEMO_SESSION_ID,
                         AttachRunRequest {
                             run_id: DEMO_RUN_ID.into(),
@@ -2848,7 +2847,7 @@ mod tests {
                         "runtime-other-owner-attach",
                     )
                     .await,
-                Err(StoreError::SessionNotFound(id)) if id == DEMO_SESSION_ID
+                Err(StoreError::AuthSessionNotFound)
             ),
             "run attachment must authorize the session before checking attachment state"
         );
@@ -2856,7 +2855,7 @@ mod tests {
             matches!(
                 store
                     .resume_session_for_actor(
-                        OTHER_ACTOR,
+                        &test_authz(OTHER_ACTOR),
                         DEMO_SESSION_ID,
                         ResumeSessionRequest {
                             expected_sequence: 2,
@@ -2864,14 +2863,14 @@ mod tests {
                         "runtime-other-owner-resume",
                     )
                     .await,
-                Err(StoreError::SessionNotFound(id)) if id == DEMO_SESSION_ID
+                Err(StoreError::AuthSessionNotFound)
             ),
             "resume must authorize the session before checking its state"
         );
         assert_eq!(
             store
                 .get_session_for_actor(
-                    TEST_OWNER_ID,
+                    &test_authz(TEST_OWNER_ID),
                     DEMO_SESSION_ID,
                     None,
                     protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
@@ -2889,6 +2888,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resource_bound_actor_facades_conceal_foreign_resources_before_business_errors() {
+        let paths = TestPaths::new("foreign-resource-error-order");
+        let store = local_store(&paths, false).await;
+        let foreign = install_foreign_owner_authz(&paths.database);
+
+        assert!(matches!(
+            store
+                .run_detail_for_actor(&foreign, LOCAL_DEMO_RUN_ID, Some("not-a-cursor"), 0)
+                .await,
+            Err(StoreError::RunNotFound(run_id)) if run_id == LOCAL_DEMO_RUN_ID
+        ));
+        assert!(matches!(
+            store
+                .get_session_for_actor(
+                    &foreign,
+                    LOCAL_DEMO_SESSION_ID,
+                    Some("not-a-cursor"),
+                    0,
+                    Some("not-a-cursor"),
+                    0,
+                    Some("not-a-cursor"),
+                    0,
+                )
+                .await,
+            Err(StoreError::SessionNotFound(session_id))
+                if session_id == LOCAL_DEMO_SESSION_ID
+        ));
+        assert!(matches!(
+            store
+                .resume_session_for_actor(
+                    &foreign,
+                    LOCAL_DEMO_SESSION_ID,
+                    ResumeSessionRequest {
+                        expected_sequence: u64::MAX,
+                    },
+                    "",
+                )
+                .await,
+            Err(StoreError::SessionNotFound(session_id))
+                if session_id == LOCAL_DEMO_SESSION_ID
+        ));
+        assert!(matches!(
+            store
+                .start_turn_for_actor(
+                    &foreign,
+                    LOCAL_DEMO_SESSION_ID,
+                    StartTurnRequest {
+                        turn_id: "turn-foreign-error-order".into(),
+                        user_message: "".into(),
+                        expected_sequence: u64::MAX,
+                    },
+                    "",
+                )
+                .await,
+            Err(StoreError::SessionNotFound(session_id))
+                if session_id == LOCAL_DEMO_SESSION_ID
+        ));
+        assert!(matches!(
+            store
+                .flush_turn_for_actor(
+                    &foreign,
+                    LOCAL_DEMO_SESSION_ID,
+                    FlushSessionRequest {
+                        turn_id: "turn-foreign-error-order".into(),
+                        assistant_message: Some("".into()),
+                        expected_sequence: u64::MAX,
+                    },
+                    "",
+                )
+                .await,
+            Err(StoreError::SessionNotFound(session_id))
+                if session_id == LOCAL_DEMO_SESSION_ID
+        ));
+        assert!(matches!(
+            store
+                .review_for_actor(
+                    &foreign,
+                    LOCAL_DEMO_RUN_ID,
+                    "APR-DEV-1",
+                    approval_request(ReviewDecision::Reject),
+                    "",
+                )
+                .await,
+            Err(StoreError::RunNotFound(run_id)) if run_id == LOCAL_DEMO_RUN_ID
+        ));
+    }
+
+    #[tokio::test]
     async fn actor_review_authorizes_the_run_before_receipt_replay() {
         const OTHER_ACTOR: &str = "user-other-owner";
 
@@ -2896,7 +2983,7 @@ mod tests {
         let request = approval_request(ReviewDecision::Reject);
         let first = store
             .review_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 DEMO_RUN_ID,
                 "APR-901",
                 request.clone(),
@@ -2909,7 +2996,7 @@ mod tests {
 
         let replay = store
             .review_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 DEMO_RUN_ID,
                 "APR-901",
                 request.clone(),
@@ -2924,14 +3011,14 @@ mod tests {
             matches!(
                 store
                     .review_for_actor(
-                        OTHER_ACTOR,
+                        &test_authz(OTHER_ACTOR),
                         DEMO_RUN_ID,
                         "APR-901",
                         request,
                         "actor-review-replay",
                     )
                     .await,
-                Err(StoreError::RunNotFound(id)) if id == DEMO_RUN_ID
+                Err(StoreError::AuthSessionNotFound)
             ),
             "receipt possession must not bypass run authorization"
         );
@@ -2969,7 +3056,7 @@ mod tests {
                 barrier.wait().await;
                 store
                     .review_for_actor(
-                        TEST_OWNER_ID,
+                        &test_authz(TEST_OWNER_ID),
                         DEMO_RUN_ID,
                         "APR-901",
                         approval_request(ReviewDecision::Reject),
@@ -3006,7 +3093,7 @@ mod tests {
         let store = production_store(false).await;
         let before = store
             .get_session_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 DEMO_SESSION_ID,
                 None,
                 protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
@@ -3021,7 +3108,7 @@ mod tests {
         assert!(matches!(
             store
                 .start_turn_for_actor(
-                    TEST_OWNER_ID,
+                    &test_authz(TEST_OWNER_ID),
                     DEMO_SESSION_ID,
                     StartTurnRequest {
                         turn_id: "turn-runtime-over-message".into(),
@@ -3036,7 +3123,7 @@ mod tests {
         assert!(matches!(
             store
                 .start_turn_for_actor(
-                    TEST_OWNER_ID,
+                    &test_authz(TEST_OWNER_ID),
                     DEMO_SESSION_ID,
                     StartTurnRequest {
                         turn_id: "turn-runtime-key".into(),
@@ -3051,7 +3138,7 @@ mod tests {
 
         let unchanged = store
             .get_session_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 DEMO_SESSION_ID,
                 None,
                 protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
@@ -3065,7 +3152,7 @@ mod tests {
         assert_eq!(unchanged, before);
         let started = store
             .start_turn_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 DEMO_SESSION_ID,
                 StartTurnRequest {
                     turn_id: "turn-runtime-key".into(),
@@ -3084,7 +3171,7 @@ mod tests {
         let store = production_store(false).await;
         let before = store
             .run_detail_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 DEMO_RUN_ID,
                 None,
                 protocol::EVENT_PAGE_DEFAULT_LIMIT,
@@ -3094,7 +3181,7 @@ mod tests {
         assert!(matches!(
             store
                 .review_for_actor(
-                    TEST_OWNER_ID,
+                    &test_authz(TEST_OWNER_ID),
                     DEMO_RUN_ID,
                     "APR-901",
                     ReviewRequest {
@@ -3110,7 +3197,7 @@ mod tests {
         assert!(matches!(
             store
                 .review_for_actor(
-                    TEST_OWNER_ID,
+                    &test_authz(TEST_OWNER_ID),
                     DEMO_RUN_ID,
                     "APR-901",
                     ReviewRequest {
@@ -3126,7 +3213,11 @@ mod tests {
         assert!(
             store
                 .storage
-                .review_receipt_for_actor(TEST_OWNER_ID, DEMO_RUN_ID, "runtime-review-envelope",)
+                .review_receipt_for_actor(
+                    &test_authz(TEST_OWNER_ID),
+                    DEMO_RUN_ID,
+                    "runtime-review-envelope",
+                )
                 .await
                 .unwrap()
                 .is_none()
@@ -3134,7 +3225,11 @@ mod tests {
         assert!(
             store
                 .storage
-                .review_receipt_for_actor(TEST_OWNER_ID, DEMO_RUN_ID, "runtime-body-key-envelope",)
+                .review_receipt_for_actor(
+                    &test_authz(TEST_OWNER_ID),
+                    DEMO_RUN_ID,
+                    "runtime-body-key-envelope",
+                )
                 .await
                 .unwrap()
                 .is_none()
@@ -3142,7 +3237,7 @@ mod tests {
         assert_eq!(
             store
                 .run_detail_for_actor(
-                    TEST_OWNER_ID,
+                    &test_authz(TEST_OWNER_ID),
                     DEMO_RUN_ID,
                     None,
                     protocol::EVENT_PAGE_DEFAULT_LIMIT,
@@ -3166,14 +3261,14 @@ mod tests {
         assert!(matches!(
             store
                 .review_for_actor(
-                    TEST_OWNER_ID,
+                    &test_authz(TEST_OWNER_ID),
                     DEMO_RUN_ID,
                     "APR-901",
                     approval_request(ReviewDecision::Reject),
                     "unbootstrapped-review",
                 )
                 .await,
-            Err(StoreError::RunNotFound(id)) if id == DEMO_RUN_ID
+            Err(StoreError::AuthSessionNotFound)
         ));
     }
 
@@ -3182,7 +3277,7 @@ mod tests {
         let store = production_store(false).await;
         let response = store
             .review_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 protocol::DEMO_RUN_ID,
                 "APR-901",
                 approval_request(ReviewDecision::Approve),
@@ -3212,7 +3307,19 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(job.account_id, AccountId::local());
+        assert_eq!(job.initiating_actor_user_id.as_deref(), Some(TEST_OWNER_ID));
         assert_eq!(job.approving_actor_user_id.as_deref(), Some(TEST_OWNER_ID));
+        assert_eq!(
+            job.initiating_membership_revision
+                .map(|revision| revision.get()),
+            Some(1)
+        );
+        assert_eq!(
+            job.approving_membership_revision
+                .map(|revision| revision.get()),
+            Some(1)
+        );
         assert_eq!(job.status, DispatchStatus::Finished);
         assert_eq!(job.attempt, 1);
     }
@@ -3224,7 +3331,7 @@ mod tests {
         let request = approval_request(ReviewDecision::Approve);
         let first = store
             .review_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 LOCAL_DEMO_RUN_ID,
                 "APR-DEV-1",
                 request.clone(),
@@ -3243,7 +3350,7 @@ mod tests {
 
         let replay = store
             .review_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 LOCAL_DEMO_RUN_ID,
                 "APR-DEV-1",
                 request,
@@ -3286,7 +3393,7 @@ mod tests {
 
         let approved = store
             .review_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 LOCAL_DEMO_RUN_ID,
                 "APR-DEV-1",
                 approval_request(ReviewDecision::Approve),
@@ -3353,7 +3460,7 @@ mod tests {
 
         let approved = store
             .review_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 LOCAL_DEMO_RUN_ID,
                 "APR-DEV-1",
                 approval_request(ReviewDecision::Approve),
@@ -3381,7 +3488,7 @@ mod tests {
         let store = local_store(&paths, false).await;
         let response = store
             .review_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 LOCAL_DEMO_RUN_ID,
                 "APR-DEV-1",
                 approval_request(ReviewDecision::Reject),
@@ -3405,13 +3512,13 @@ mod tests {
 
     #[tokio::test]
     async fn revoked_owner_dispatch_is_rejected_before_the_connector_runs() {
-        for revocation in [ActorRevocation::Member, ActorRevocation::Disabled] {
+        for revocation in [ActorRevocation::Revision, ActorRevocation::Disabled] {
             let label = format!("dispatch-revoked-{}", revocation.label());
             let paths = TestPaths::new(&label);
             let store = local_store(&paths, false).await;
             let approved = store
                 .review_for_actor(
-                    TEST_OWNER_ID,
+                    &test_authz(TEST_OWNER_ID),
                     LOCAL_DEMO_RUN_ID,
                     "APR-DEV-1",
                     approval_request(ReviewDecision::Approve),
@@ -3421,7 +3528,11 @@ mod tests {
                 .unwrap();
             assert_eq!(approved.run.status, RunStatus::Queued);
             let mut feed = store
-                .event_feed_for_actor(TEST_OWNER_ID, LOCAL_DEMO_RUN_ID, approved.event.sequence)
+                .event_feed_for_actor(
+                    &test_authz(TEST_OWNER_ID),
+                    LOCAL_DEMO_RUN_ID,
+                    approved.event.sequence,
+                )
                 .await
                 .unwrap();
 
@@ -3485,13 +3596,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claimed_dispatch_completes_after_a_later_membership_revision() {
+        let paths = TestPaths::new("dispatch-revision-after-claim");
+        let store = local_store(&paths, false).await;
+        store
+            .review_for_actor(
+                &test_authz(TEST_OWNER_ID),
+                LOCAL_DEMO_RUN_ID,
+                "APR-DEV-1",
+                approval_request(ReviewDecision::Approve),
+                "approve-dispatch-revision-after-claim",
+            )
+            .await
+            .unwrap();
+        let claimed = store.claim_next_dispatch().await.unwrap().unwrap();
+        assert_eq!(claimed.job.status, DispatchStatus::Started);
+        assert_eq!(directory_entries(&paths.marker_root), 0);
+
+        // The claim is the last authorization boundary before external I/O.
+        // Revocation after that checkpoint cannot safely cancel an operation
+        // that may already have happened, and must not block its completion.
+        revoke_test_actor(&paths.database, ActorRevocation::Revision);
+        let outcome = store.dispatch_outcome(&claimed).await;
+        assert!(matches!(outcome, ToolOutcome::Succeeded { .. }));
+        assert_eq!(directory_entries(&paths.marker_root), 1);
+        store.complete_dispatch(claimed, outcome).await.unwrap();
+
+        let job = store
+            .storage
+            .dispatch_job(LOCAL_MARKER_CALL_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, DispatchStatus::Finished);
+        assert_eq!(job.attempt, 1);
+    }
+
+    #[tokio::test]
     async fn disabled_reply_actor_is_interrupted_without_exposing_a_claimed_job() {
         let paths = TestPaths::new("reply-actor-disabled");
         let store = local_store(&paths, false).await;
         let job_id = "reply-runtime-authorization-revoked";
         let enqueued = store
             .start_turn_and_enqueue_reply_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 LOCAL_DEMO_SESSION_ID,
                 StartTurnRequest {
                     turn_id: "turn-runtime-authorization-revoked".into(),
@@ -3501,7 +3649,7 @@ mod tests {
                 "enqueue-runtime-authorization-revoked",
                 ReplyJobSpec {
                     id: job_id.into(),
-                    actor_user_id: TEST_OWNER_ID.into(),
+                    authz: test_authz(TEST_OWNER_ID),
                     provider_name: "provider-must-not-run".into(),
                     model_name: Some("model-must-not-run".into()),
                     request_json: serde_json::json!({"prompt": "must remain durable only"}),
@@ -3512,7 +3660,7 @@ mod tests {
         assert_eq!(enqueued.job.status, ReplyJobStatus::Queued);
         let mut feed = store
             .session_event_feed_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 LOCAL_DEMO_SESSION_ID,
                 enqueued.start.event.sequence,
             )
@@ -3557,12 +3705,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claimed_reply_completion_survives_a_later_membership_revision() {
+        let paths = TestPaths::new("reply-revision-after-claim");
+        let store = local_store(&paths, false).await;
+        let job_id = "reply-runtime-revision-after-claim";
+        store
+            .start_turn_and_enqueue_reply_for_actor(
+                &test_authz(TEST_OWNER_ID),
+                LOCAL_DEMO_SESSION_ID,
+                StartTurnRequest {
+                    turn_id: "turn-runtime-revision-after-claim".into(),
+                    user_message: "A claimed provider call must still settle durably.".into(),
+                    expected_sequence: 2,
+                },
+                "enqueue-runtime-revision-after-claim",
+                ReplyJobSpec {
+                    id: job_id.into(),
+                    authz: test_authz(TEST_OWNER_ID),
+                    provider_name: "test-provider".into(),
+                    model_name: Some("test-model".into()),
+                    request_json: serde_json::json!({"prompt": "settle after claim"}),
+                },
+            )
+            .await
+            .unwrap();
+        let ReplyClaimOutcome::Claimed(claimed) = store.claim_next_reply().await.unwrap() else {
+            panic!("the active authority must be claimable before revision changes");
+        };
+        assert_eq!(claimed.status, ReplyJobStatus::Started);
+
+        revoke_test_actor(&paths.database, ActorRevocation::Revision);
+        let expected_sequence = store
+            .session_summary_for_progress(LOCAL_DEMO_SESSION_ID)
+            .await
+            .unwrap()
+            .sequence;
+        let completion = store
+            .complete_reply_success(ReplySuccessCommit {
+                job_id: job_id.into(),
+                expected_sequence,
+                assistant_message: "The already-started provider call settled once.".into(),
+                provenance: protocol::AssistantReplyProvenance {
+                    provider_id: "test-provider".into(),
+                    model: Some("test-model".into()),
+                    reply_kind: protocol::AssistantReplyKind::Model,
+                },
+                response_json: serde_json::json!({
+                    "content": "The already-started provider call settled once.",
+                    "finish_reason": "stop",
+                    "provider": {
+                        "provider_id": "test-provider",
+                        "model": "test-model",
+                        "reply_kind": "model"
+                    }
+                }),
+            })
+            .await
+            .unwrap();
+        assert_eq!(completion.job.status, ReplyJobStatus::Succeeded);
+        assert_eq!(completion.session.status, SessionStatus::Ready);
+        assert_eq!(completion.events.len(), 2);
+    }
+
+    #[tokio::test]
     async fn started_call_becomes_outcome_unknown_after_restart_and_is_not_retried() {
         let paths = TestPaths::new("recovery");
         let store = local_store(&paths, false).await;
         store
             .review_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 LOCAL_DEMO_RUN_ID,
                 "APR-DEV-1",
                 approval_request(ReviewDecision::Approve),
@@ -3573,6 +3784,10 @@ mod tests {
         let claimed = store.claim_next_dispatch().await.unwrap().unwrap();
         assert_eq!(claimed.job.status, DispatchStatus::Started);
         assert_eq!(directory_entries(&paths.marker_root), 0);
+        // Authorization is consumed by the durable started checkpoint. A
+        // later membership revision must not turn recovery into a retry or
+        // prevent the outcome_unknown terminal record.
+        revoke_test_actor(&paths.database, ActorRevocation::Revision);
         drop(store);
 
         let storage = SqliteStore::open(&paths.database).await.unwrap();
@@ -3622,7 +3837,7 @@ mod tests {
 
         store
             .review_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 LOCAL_DEMO_RUN_ID,
                 "APR-DEV-1",
                 approval_request(ReviewDecision::Approve),
@@ -3650,7 +3865,7 @@ mod tests {
         let store = production_store(false).await;
         store
             .review_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 protocol::DEMO_RUN_ID,
                 "APR-901",
                 approval_request(ReviewDecision::Approve),
@@ -3660,7 +3875,7 @@ mod tests {
             .unwrap();
         let error = store
             .review_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 protocol::DEMO_RUN_ID,
                 "APR-901",
                 approval_request(ReviewDecision::Reject),
@@ -3806,7 +4021,7 @@ mod tests {
         let outcome = store
             .storage
             .commit_review_for_actor(
-                TEST_OWNER_ID,
+                &test_authz(TEST_OWNER_ID),
                 ReviewCommit {
                     expected_sequence,
                     snapshot,
@@ -3817,7 +4032,8 @@ mod tests {
                     dispatch: Some(DispatchJobSpec {
                         call_id: call.call_id.clone(),
                         approval_id: pending.id,
-                        approving_actor_user_id: TEST_OWNER_ID.into(),
+                        initiating_authz: test_authz(TEST_OWNER_ID),
+                        approving_authz: test_authz(TEST_OWNER_ID),
                         tool_name: call.tool,
                         tool_version: call.tool_version,
                         effect: call.effect,
@@ -3877,6 +4093,7 @@ mod tests {
                 user_id: TEST_OWNER_ID.into(),
                 username: "runtime-owner".into(),
                 password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA".into(),
+                auth_session_id: test_authz(TEST_OWNER_ID).auth_session_id,
                 session_token_hash: "b".repeat(64),
                 csrf_hash: "c".repeat(64),
                 session_expires_at: expiry.into(),
@@ -3888,14 +4105,14 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum ActorRevocation {
-        Member,
+        Revision,
         Disabled,
     }
 
     impl ActorRevocation {
         fn label(self) -> &'static str {
             match self {
-                Self::Member => "member",
+                Self::Revision => "revision",
                 Self::Disabled => "disabled",
             }
         }
@@ -3908,10 +4125,44 @@ mod tests {
             .unwrap();
         let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         let changed = match revocation {
-            ActorRevocation::Member => connection.execute(
-                "UPDATE users SET role = 'member', updated_at = ?1 WHERE id = ?2",
-                params![timestamp, TEST_OWNER_ID],
-            ),
+            ActorRevocation::Revision => {
+                // Membership revisions may only advance alongside a real
+                // authority change, and an account must retain an active
+                // owner. Install a backup owner membership before downgrading
+                // the test actor so this exercises the production invariant
+                // instead of bypassing its triggers.
+                connection
+                    .execute(
+                        r#"INSERT INTO users(
+                               id, username, role, status, password_hash,
+                               created_at, updated_at
+                           ) VALUES (?1, ?2, 'member', 'active', ?3, ?4, ?4)"#,
+                        params![
+                            "user-runtime-backup-owner",
+                            "runtime-backup-owner",
+                            "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnaWVzdA",
+                            timestamp
+                        ],
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        r#"INSERT INTO account_memberships(
+                               account_id, user_id, role, status, revision,
+                               created_at, updated_at
+                           ) VALUES (
+                               'acc_local', ?1, 'owner', 'active', 1, ?2, ?2
+                           )"#,
+                        params!["user-runtime-backup-owner", timestamp],
+                    )
+                    .unwrap();
+                connection.execute(
+                    r#"UPDATE account_memberships
+                       SET role = 'member', revision = revision + 1, updated_at = ?1
+                       WHERE account_id = 'acc_local' AND user_id = ?2"#,
+                    params![timestamp, TEST_OWNER_ID],
+                )
+            }
             ActorRevocation::Disabled => connection.execute(
                 "UPDATE users SET status = 'disabled', updated_at = ?1 WHERE id = ?2",
                 params![timestamp, TEST_OWNER_ID],

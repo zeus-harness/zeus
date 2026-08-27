@@ -8,9 +8,32 @@ use protocol::{
     Approval, ApprovalScope, ApprovalStatus, PolicyDecision, SandboxProfile, ToolCall, ToolEffect,
 };
 use serde::{Deserialize, Serialize};
+use tenancy::MembershipRole;
 use thiserror::Error;
 
 pub const DEFAULT_DENY_REVISION: &str = "zeus-default-deny-v1";
+
+/// Account-level capabilities are deliberately separate from tool policy.
+/// Storage re-reads the durable membership before evaluating this matrix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AccountCapability {
+    Read,
+    SessionWrite,
+    Reply,
+    ApproveDispatch,
+    AccountAdmin,
+    AuditRead,
+}
+
+pub const fn membership_allows(role: MembershipRole, capability: AccountCapability) -> bool {
+    match role {
+        MembershipRole::Owner => true,
+        MembershipRole::Member => matches!(
+            capability,
+            AccountCapability::Read | AccountCapability::SessionWrite | AccountCapability::Reply
+        ),
+    }
+}
 
 /// One exact-match policy rule. Wildcards are intentionally unsupported.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,6 +304,44 @@ mod tests {
         let evaluation = engine.evaluate(&PolicyContext::for_call("local-development", &call()));
         assert_eq!(evaluation.decision, PolicyDecision::Deny);
         assert_eq!(evaluation.policy_revision, DEFAULT_DENY_REVISION);
+    }
+
+    #[test]
+    fn account_capabilities_are_default_deny_for_member_authority() {
+        assert!(membership_allows(
+            MembershipRole::Member,
+            AccountCapability::Read
+        ));
+        assert!(membership_allows(
+            MembershipRole::Member,
+            AccountCapability::SessionWrite
+        ));
+        assert!(membership_allows(
+            MembershipRole::Member,
+            AccountCapability::Reply
+        ));
+        assert!(!membership_allows(
+            MembershipRole::Member,
+            AccountCapability::ApproveDispatch
+        ));
+        assert!(!membership_allows(
+            MembershipRole::Member,
+            AccountCapability::AccountAdmin
+        ));
+        assert!(!membership_allows(
+            MembershipRole::Member,
+            AccountCapability::AuditRead
+        ));
+        for capability in [
+            AccountCapability::Read,
+            AccountCapability::SessionWrite,
+            AccountCapability::Reply,
+            AccountCapability::ApproveDispatch,
+            AccountCapability::AccountAdmin,
+            AccountCapability::AuditRead,
+        ] {
+            assert!(membership_allows(MembershipRole::Owner, capability));
+        }
     }
 
     #[test]

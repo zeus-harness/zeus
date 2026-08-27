@@ -2,10 +2,10 @@
 
 状态：主机 Alpha+、Actor Boundary Foundation、API/Terminal Payload Resource Envelope、Bounded
 Event Feed、Point-query Durable Context、Bounded Read Models、SQLite Capacity Slice 2、SQLite
-Physical/Operation Capacity、Bootstrap Audit Retention 与 schema v13 Account Membership
-Foundation 已实现并通过主机全量验收；Apple 保留此前 Operation Capacity 指定压力证据与历史
-v11→v12 迁移证据，current-image 又完成 v12→v13 保留数据卷迁移/重启，Linux Docker PID/OOM
-authoritative gate 待完成。
+Physical/Operation Capacity、Bootstrap Audit Retention、schema v13 Account Membership
+Foundation 与 schema v14 Account-scoped Durable Authorization 已实现；Apple 保留此前 Operation
+Capacity 指定压力证据与历史 v11→v12→v13 迁移证据，v14 current-image 证据见本节验收结果，
+Linux Docker PID/OOM authoritative gate 待完成。
 
 历史前置基线：`8117ed6`（SQLite Physical Capacity）
 
@@ -39,24 +39,27 @@ Health 路由保持公开。公开注册、邮件找回、OAuth/SSO、WebAuthn �
 ## 3. 所有权与幂等
 
 - `sessions.owner_user_id` 与 `runs.owner_user_id` 在首次 bootstrap 前允许为 `NULL`；业务路由在 bootstrap 前不可访问。
-- bootstrap 事务把所有遗留空 owner 行认领给首位 owner，此后 ownership trigger 禁止再次修改。
+- bootstrap 事务把所有遗留空 creator 行认领给首位 owner；v14 后这些列是 write-once metadata，
+  授权只读取 `account_memberships`。
 - 正式 REST/SSE 的 Session/Run 读取、事件回放、resume、turn、review 和
-  receipt 全部传入当前 actor，并在同一 SQLite 查询或事务中重新校验账号状态、
-  role 与资源 owner。不存在、不拥有或不具备 Run owner 权限统一映射为 `404`。
+  receipt 全部传入完整 `AuthzContext`，并在同一 SQLite 查询或事务中重新校验 auth session、
+  User/Account、membership role/status/revision 与资源 account。不存在或跨 account 统一映射为
+  `404`；同 account 但缺 capability 映射为 `403 permission_denied`。
 - 所有 Session/Run command receipt 的身份为
-  `(actor_scope, operation, idempotency_key)`；资源授权发生在 receipt replay 之前，
+  `(account_id, actor_user_id, operation, idempotency_key)`；资源授权发生在 receipt replay 之前，
   猜中其他 actor 的 key 不能重放响应或改变错误类型。
-- 既有 Alpha receipt 在迁移后使用 `__legacy__` scope，并在 owner bootstrap 时一并认领。
-- reply claim 会重新校验 active Session owner；dispatch job 永久绑定批准它的 active
-  owner。授权在排队后被撤销时，任务在一个事务中进入 durable 拒绝终态并追加
+- v14 把未配置实例的 legacy receipt/dispatch/reservation scope 迁移为窄化 `NULL` 状态，只允许
+  revision-1 bootstrap owner 在同一事务中认领一次；配置后的新写入必须有 account+actor。
+- reply claim 会重新校验固化的 actor membership revision/capability；dispatch job 永久绑定
+  initiating 与 approving 两个主体并在 claim 同时复核。授权在排队后被撤销时，任务在一个事务中进入 durable 拒绝终态并追加
   `authorization_revoked` 证据，provider/connector 调用次数必须为零。
 
 这些边界只是未来 member 能力的安全底座。当前 API 仍拒绝 member 登录；字段、HTTP/SSE
 连接、事件页边界、内部 point/batch read 和 Session/Run 有界 read model 已经落地，但
 即使 SQLite 行数、活跃队列、event-slot 和事件载荷逻辑字节配额已落地，也不得开放 member。
-SQLite 主库/WAL/磁盘 headroom 门禁、bootstrap audit bounded retention，以及 v13 的单一
-`acc_local`/owner membership foundation 已经落地；member 仍须等待 v14 account-scoped durable
-authorization 与 v15 member lifecycle/account security audit，不能因 foundation 表已存在就开放。
+SQLite 主库/WAL/磁盘 headroom 门禁、bootstrap audit bounded retention，以及 v14 的单一
+`acc_local` membership durable authorization 已经落地；member 仍须等待 v15 lifecycle/account
+security audit，不能因底层 capability 已存在就开放。
 
 Resource Envelope 的固定边界：auth JSON 8 KiB、command JSON 512 KiB；新建 Session/turn
 ID 128 UTF-8 bytes、Session title 256 bytes、user/assistant message 64 KiB、review note 8 KiB；
@@ -77,18 +80,19 @@ tool/version/effect、arguments/digest 和 sandbox；错误任务不能占住 qu
 保持裸数组响应并通过 `X-Zeus-Next-Cursor` 返回续页 cursor；Session detail 的 Run ID/turn
 分别默认 50、最大 100，Session event 默认 128、最大 256；Run detail 与 overview 的 Run
 event 默认 128、最大 256。详情 collection 以 `pagination.*.{next_before,has_more}` 返回独立、
-actor/resource scope 绑定的 opaque cursor，页内仍按原顺序升序输出。鉴权、projection/tail 校验和各页
+`(account, actor, kind, resource)` scope 绑定的 opaque cursor，页内仍按原顺序升序输出。鉴权、projection/tail 校验和各页
 读取位于同一 SQLite snapshot；foreign resource 在 limit/cursor 语义检查前统一得到 `404`。
 不在 bounded turn tail 中的 durable retry identity 通过 actor-scoped turn point GET 确认；无法
 确认时保留原 idempotency key，不把旧消息改成新命令重发。异步点查返回前若用户切换 Session
 或 attempt identity 已改变，selection epoch/session/turn/key guard 会丢弃旧结果。
 
-SQLite Capacity Slice 2 在每个 `BEGIN IMMEDIATE` admission 事务内执行 owner scope 与 global
-双层限制：Session 1,000/10,000、open turn 32/64、active reply 32/64、active dispatch
-16/32、auth session 每用户/全局 32/256。每个 Session 的 ledger head 加未消费预留槽默认
+SQLite Capacity Slice 2 在每个 `BEGIN IMMEDIATE` admission 事务内执行 actor/account/global
+三层限制：Session 1,000/10,000/10,000、open turn 32/64/64、active reply 32/64/64、active
+dispatch 16/32/32；auth session 仍为每用户/全局 32/256。每个 Session 的 ledger head 加未消费预留槽默认
 最多 10,000，每个 Run 默认 50,000；Session/Run 的 `payload_json` 逻辑 UTF-8 字节默认分别
 限制为 64 MiB/256 MiB，全局合计默认 1 GiB；bootstrap audit 详细窗口默认最多 1,024 行。配置可调但
-不得为 0、不得让 scope/per-ledger 超过 global，也不得越过编译期 hard ceiling。鉴权和 exact
+不得为 0、不得让 actor 超过 account、account 超过 global、per-ledger 超过 global，也不得越过
+编译期 hard ceiling。鉴权和 exact
 receipt replay 先于容量检查，所以 foreign resource 仍是 `404`，已成功命令在满配额时仍能 replay。
 
 接受 turn 时同时预留两个 Session 终结事件槽和保守载荷字节；接受 dispatch 时同时预留两个
@@ -98,7 +102,8 @@ Run 槽和 start+terminal 字节。reply claim 必须确认完整预留仍在；
 之前 fail closed 为脱敏 `503`。普通容量拒绝为带 `Cache-Control: no-store` 的 `429`；reply/
 dispatch queue 另带 `Retry-After: 2`。计量只覆盖 `session_events.payload_json` 与
 `run_events.payload_json` 的实际 UTF-8 序列化字节，不宣称 DB file、WAL、索引、page overhead
-或宿主磁盘空间有保证。过期 auth session 只在启动和新建登录会话前按稳定顺序清理最多 64 行。
+或宿主磁盘空间有保证。过期，以及绑定 missing/disabled/suspended/stale-revision authority 的 auth
+session，只在启动和新建登录会话前按稳定顺序清理最多 64 行。
 ledger、receipt、job、turn 和 account audit 不做静默删除；bootstrap token detail 采用明确的
 v12 retention：live 永不压缩，terminal lifecycle 按 sequence 最多 64 行一批链入 singleton
 SHA-256 rollup 后才删除，原因区分 `superseded/consumed/expired/legacy_unknown`。rollup 是数据库内
@@ -106,12 +111,12 @@ SHA-256 rollup 后才删除，原因区分 `superseded/consumed/expired/legacy_u
 
 SQLite Physical Capacity Slice 已实现并通过本地主机验证，采用以下默认值与编译期 hard ceiling：
 
-| 配置 | 默认值 | hard ceiling | 含义 |
-| --- | ---: | ---: | --- |
-| `ZEUS_SQLITE_MAX_MAIN_BYTES` | 4 GiB（4,294,967,296） | 32 GiB | 主库 page 预算 |
-| `ZEUS_SQLITE_WAL_TARGET_BYTES` | 16 MiB（16,777,216） | 256 MiB | WAL autocheckpoint/reset 目标 |
-| `ZEUS_SQLITE_MIN_FREE_BYTES` | 256 MiB（268,435,456） | 8 GiB | 文件系统最小剩余空间 |
-| `ZEUS_SQLITE_ADMISSION_RESERVE_BYTES` | 512 MiB（536,870,912） | 8 GiB | admission 文件系统 headroom watermark |
+| 配置                                  |                 默认值 | hard ceiling | 含义                                  |
+| ------------------------------------- | ---------------------: | -----------: | ------------------------------------- |
+| `ZEUS_SQLITE_MAX_MAIN_BYTES`          | 4 GiB（4,294,967,296） |       32 GiB | 主库 page 预算                        |
+| `ZEUS_SQLITE_WAL_TARGET_BYTES`        |   16 MiB（16,777,216） |      256 MiB | WAL autocheckpoint/reset 目标         |
+| `ZEUS_SQLITE_MIN_FREE_BYTES`          | 256 MiB（268,435,456） |        8 GiB | 文件系统最小剩余空间                  |
+| `ZEUS_SQLITE_ADMISSION_RESERVE_BYTES` | 512 MiB（536,870,912） |        8 GiB | admission 文件系统 headroom watermark |
 
 启动必须校验 `WAL target < admission reserve < max main`，并以 checked addition
 保证 `min free + admission reserve` 不溢出。`max_page_count` 只限制 SQLite 主库页数；WAL
@@ -134,11 +139,11 @@ SQLite integrity 检查和 truncating WAL checkpoint。运维或测试可显式�
 
 SQLite blocking operation 也有独立的并发边界：
 
-| 配置 | 默认值 | hard ceiling | 含义 |
-| --- | ---: | ---: | --- |
-| `ZEUS_SQLITE_MAX_CONCURRENT_OPERATIONS` | 8 | 32 | file/memory SQLite operation 总槽位 |
-| `ZEUS_SQLITE_RESERVED_PROGRESS_OPERATIONS` | 1 | 8 | 为 durable progress 留出的槽位 |
-| `ZEUS_SQLITE_OPERATION_ACQUIRE_TIMEOUT_MS` | 1,000 ms | 5,000 ms | 已进入等待路径后的最长等待时间 |
+| 配置                                       |   默认值 | hard ceiling | 含义                                |
+| ------------------------------------------ | -------: | -----------: | ----------------------------------- |
+| `ZEUS_SQLITE_MAX_CONCURRENT_OPERATIONS`    |        8 |           32 | file/memory SQLite operation 总槽位 |
+| `ZEUS_SQLITE_RESERVED_PROGRESS_OPERATIONS` |        1 |            8 | 为 durable progress 留出的槽位      |
+| `ZEUS_SQLITE_OPERATION_ACQUIRE_TIMEOUT_MS` | 1,000 ms |     5,000 ms | 已进入等待路径后的最长等待时间      |
 
 默认普通 lane 只有 7 个槽位。普通 read/admission 先 `try_acquire` general permit，饱和即
 fail fast，不形成无界等待者；progress lane 可使用全部 8 个 total permit，但也只等待配置的
@@ -219,6 +224,11 @@ POST /sessions/{id}/turns
   与 readiness/deep-integrity 检查。迁移先证明旧 owner、actor、receipt、job、reservation 和
   runtime boundary；member-owned、跨 owner 或外键损坏的 v12 数据整体回滚。v13 不切换现有
   owner-based API 授权，也不开放 member。
+- `0014_account_scoped_durable_authorization.sql`：把 auth session、Session/Run receipt、reply/
+  dispatch job 与 finalization reservation 重建为 account+actor scope，固化 membership revision
+  与 dispatch 双主体；删除旧 owner 授权 trigger/index，安装 v2 cursor、actor/account/global
+  capacity 与 durable capability 校验。迁移在同一 transaction 内执行 preflight、row/FK/schema/
+  actor-state postflight，无法证明的 authority 回滚并保留 schema v13；API member gate不变。
 
 迁移必须原地保留 Alpha append-only ledger、事件外键与 runtime identity。任何一步失败都回滚整个 migration transaction。
 
@@ -250,6 +260,9 @@ POST /sessions/{id}/turns
 - v12 到 v13 对 fresh/未配置与既有 owner 数据原地建立 `acc_local`；v1/v5/v8/v12 fixture 的
   account 回填、bootstrap 同事务建 membership、revision/identity/last-owner trigger、root scope
   immutability、deep integrity，以及 member-owned history/外键破坏时无部分写入回滚都有自动测试。
+- v13 到 v14 原地重建 account-scoped auth session、receipt、reply/dispatch job 与 reservation；
+  configured/unconfigured active work、窄化 NULL bootstrap claim、owner-only auth session 保留、
+  disabled owner/额外 account preflight 与 version-13 原子回滚都有自动测试。
 - operation gate 的普通 lane fail-fast、单一 deadline、memory progress 优先、等待 future cancel 与
   partial permit 回收、caller abort 后 permit 生命周期、内部 capacity-only retry、worker wake
   合并、最后一个 progress waiter 取消后的主动唤醒、provider/connector panic 的
@@ -263,7 +276,8 @@ POST /sessions/{id}/turns
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 通过 289 个 Rust 测试（storage 139、runtime 28、API library 44、API main/config 4）与
+- host 按项目既有统计口径通过 312 个 Rust 测试（storage 153、runtime 31、API library 46、API
+  main/config 6）与
   25 个 Web Node 测试。
 - `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 
@@ -284,11 +298,14 @@ POST /sessions/{id}/turns
   保留该 volume，API/Web/gateway、认证状态、匿名保护边界与 `configured=false` 未配置状态在重启
   前后保持一致的检查全部通过。当时 v12 readiness 的 exact-schema 检查还覆盖了迁移后的再次
   打开。
-- current-image schema v13 又在同一个 `zeus-operation-acceptance` project 上保留上述现为 v12 的
-  named volume，原地完成 v12→v13 migration；保留 volume 的 `restart-verify` 通过，栈继续运行于
-  `127.0.0.1:18089`。API effective limit 核对为 2 CPU/1 GiB，当前资源快照的
-  `memory.events` 为 `oom=0`、`oom_kill=0`。该验证证明 migration/reopen 与匿名产品 gate，
-  不表示 v14-v15 或 member 授权已经完成。
+- schema v13 镜像随后在同一个 `zeus-operation-acceptance` project 上保留上述现为 v12 的 named
+  volume，原地完成 v12→v13 migration；保留 volume 的 `restart-verify` 通过。
+- current-image schema v14 又保留上述现为 v13 的 named volume，原地完成 v13→v14 migration；
+  `verify` 与保留 volume 的 `restart-verify` 都通过，栈继续运行于 `127.0.0.1:18089`。API
+  effective limit 核对为 2 CPU/1 GiB；重启后 `memory.current=79,466,496`、
+  `memory.peak=98,201,600`、Zeus RSS 9,824 KiB、`pids.current=6`，`memory.events` 为
+  `oom=0`、`oom_kill=0`。该验证证明 migration/reopen 与仍关闭的 member 产品 gate；Apple
+  `pids.max=max`，不是 PID-limit 保证。
 - 此前 Operation Capacity 指定压力场景中，API 实际限制为 2 CPU/1 GiB。`/health/ready` 的 30,000
   请求、并发 128 压力在 4.493 秒内
   完成：2,670 个 `200`、27,330 个 fail-fast `503`、transport error 0。第二轮 10,000 请求、
@@ -297,5 +314,5 @@ POST /sessions/{id}/turns
 - 该历史压力期间及之后 cgroup `memory.peak=97,595,392` bytes（约 93 MiB），Zeus RSS 约 23 MiB，
   `oom=0`、`oom_kill=0`；CPU throttling 证明 2 CPU quota 生效。VM 无 Swap，Apple 1.0 仍没有
   per-container PID limit，`pids.max=max`。因此只声明此前 Operation Capacity Apple
-  readiness-pressure 与当前 v13 migration/restart 各自通过；v13 本轮没有重跑该压力。Linux
+  readiness-pressure 与当前 v14 migration/restart 各自通过；v14 本轮没有重跑该压力。Linux
   Docker PID/OOM authoritative evidence 与更低内存/对抗性压力仍是 deployment gate。

@@ -38,6 +38,8 @@ pub enum StorageError {
     UserDisabled(String),
     #[error("the authentication session was not found or has expired")]
     AuthSessionNotFound,
+    #[error("the current account membership lacks the required capability")]
+    PermissionDenied,
     #[error("the durable storage quota is exhausted")]
     StorageQuotaExceeded,
     #[error("SQLite physical storage cannot safely accept this operation")]
