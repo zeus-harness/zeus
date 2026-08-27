@@ -7,23 +7,26 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    fs::{self, File, OpenOptions},
+    fs::{self, File, OpenOptions as StdOpenOptions},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
 
-use cap_std::{ambient_authority, fs::Dir};
-use protocol::{SandboxProfile, ToolEffect};
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, OpenOptions as CapOpenOptions},
+};
+use protocol::{SandboxProfile, ToolCall, ToolEffect};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
 use tools::{
-    ExecutionFuture, ExecutionRequest, ExecutorError, ObjectSchema, ParameterSpec, RegistryError,
-    ToolDescriptor, ToolExecutor, ToolOutput, ToolRegistry,
+    ExecutionFuture, ExecutionRequest, ExecutorError, ObjectSchema, ParameterSpec, ParameterType,
+    RegistryError, ToolDescriptor, ToolExecutor, ToolOutput, ToolRegistry,
 };
 
 pub const LOCAL_DEV_ENVIRONMENT: &str = "local-development";
@@ -38,6 +41,8 @@ pub const WORKSPACE_LIST_DIRECTORY_TOOL_NAME: &str = "workspace_list_directory";
 pub const WORKSPACE_LIST_DIRECTORY_TOOL_VERSION: &str = "1";
 pub const WORKSPACE_SEARCH_TEXT_TOOL_NAME: &str = "workspace_search_text";
 pub const WORKSPACE_SEARCH_TEXT_TOOL_VERSION: &str = "1";
+pub const WORKSPACE_REPLACE_TEXT_TOOL_NAME: &str = "workspace_replace_text";
+pub const WORKSPACE_REPLACE_TEXT_TOOL_VERSION: &str = "1";
 pub const MAX_WORKSPACE_PATH_BYTES: usize = 512;
 pub const MAX_WORKSPACE_FILE_BYTES: usize = 8 * 1024;
 pub const MAX_WORKSPACE_DIRECTORY_ENTRIES: usize = 64;
@@ -49,6 +54,9 @@ pub const MAX_WORKSPACE_SEARCH_TOTAL_BYTES: usize = 1024 * 1024;
 pub const MAX_WORKSPACE_SEARCH_FILE_BYTES: usize = 64 * 1024;
 pub const MAX_WORKSPACE_SEARCH_DEPTH: usize = 12;
 pub const MAX_WORKSPACE_SEARCH_PREVIEW_BYTES: usize = 256;
+pub const MAX_WORKSPACE_EDIT_TEXT_BYTES: usize = 4 * 1024;
+pub const MAX_WORKSPACE_EDIT_FILE_BYTES: usize = 64 * 1024;
+pub const MAX_WORKSPACE_EDIT_RECEIPTS: usize = 1024;
 
 const WORKSPACE_SEARCH_IGNORED_DIRECTORIES: [&str; 6] = [
     ".git",
@@ -121,9 +129,13 @@ pub fn register_local_workspace_connectors(
     let search_executor = WorkspaceSearchTextExecutor {
         roots: Arc::clone(&executor.roots),
     };
+    let replace_executor = WorkspaceReplaceTextExecutor {
+        roots: Arc::clone(&executor.roots),
+    };
     registry.register(workspace_read_file_descriptor(), executor)?;
     registry.register(workspace_list_directory_descriptor(), list_executor)?;
     registry.register(workspace_search_text_descriptor(), search_executor)?;
+    registry.register(workspace_replace_text_descriptor(), replace_executor)?;
     Ok(canonical_root)
 }
 
@@ -207,9 +219,56 @@ pub fn workspace_search_text_descriptor() -> ToolDescriptor {
     }
 }
 
+pub fn workspace_replace_text_descriptor() -> ToolDescriptor {
+    ToolDescriptor {
+        name: WORKSPACE_REPLACE_TEXT_TOOL_NAME.into(),
+        version: WORKSPACE_REPLACE_TEXT_TOOL_VERSION.into(),
+        description: format!(
+            "Replace one unique exact text occurrence in an existing UTF-8 workspace file (maximum {MAX_WORKSPACE_EDIT_FILE_BYTES} file bytes)"
+        ),
+        effect: ToolEffect::LocalWrite,
+        sandbox_profile: SandboxProfile::WorkspaceWrite,
+        input_schema: ObjectSchema {
+            max_serialized_bytes: 12 * 1024,
+            properties: BTreeMap::from([
+                (
+                    "new_text".into(),
+                    ParameterSpec {
+                        parameter_type: ParameterType::String,
+                        required: true,
+                        min_length: Some(0),
+                        max_length: Some(MAX_WORKSPACE_EDIT_TEXT_BYTES),
+                    },
+                ),
+                (
+                    "old_text".into(),
+                    ParameterSpec::required_string(MAX_WORKSPACE_EDIT_TEXT_BYTES),
+                ),
+                (
+                    "path".into(),
+                    ParameterSpec::required_string(MAX_WORKSPACE_PATH_BYTES),
+                ),
+            ]),
+        },
+    }
+}
+
 struct WorkspaceRoots {
     confined: Dir,
     inspection: Dir,
+    edit_state: Mutex<WorkspaceEditState>,
+}
+
+#[derive(Default)]
+struct WorkspaceEditState {
+    receipts: BTreeMap<String, WorkspaceEditReceipt>,
+    receipt_order: VecDeque<String>,
+}
+
+#[derive(Clone)]
+struct WorkspaceEditReceipt {
+    arguments_digest: String,
+    output: ToolOutput,
 }
 
 #[derive(Clone)]
@@ -238,6 +297,7 @@ impl WorkspaceReadFileExecutor {
             roots: Arc::new(WorkspaceRoots {
                 confined,
                 inspection,
+                edit_state: Mutex::new(WorkspaceEditState::default()),
             }),
         })
     }
@@ -365,6 +425,55 @@ impl ToolExecutor for WorkspaceSearchTextExecutor {
     }
 }
 
+#[derive(Clone)]
+struct WorkspaceReplaceTextExecutor {
+    roots: Arc<WorkspaceRoots>,
+}
+
+impl ToolExecutor for WorkspaceReplaceTextExecutor {
+    fn execute(&self, request: ExecutionRequest) -> ExecutionFuture<'_> {
+        let roots = Arc::clone(&self.roots);
+        Box::pin(async move {
+            if request.environment != LOCAL_DEV_ENVIRONMENT {
+                return Err(workspace_failure(
+                    "environment_denied",
+                    "Workspace edits are restricted to local-development",
+                    false,
+                ));
+            }
+            let arguments: WorkspaceReplaceTextArguments =
+                serde_json::from_value(request.call.arguments.clone()).map_err(|_| {
+                    workspace_failure(
+                        "invalid_arguments",
+                        "Workspace edit arguments are invalid",
+                        false,
+                    )
+                })?;
+            let path = validate_workspace_path(&arguments.path)?;
+            validate_workspace_edit_text(&arguments.old_text, false)?;
+            validate_workspace_edit_text(&arguments.new_text, true)?;
+            if arguments.old_text == arguments.new_text {
+                return Err(workspace_failure(
+                    "workspace_edit_no_change",
+                    "Workspace edit old_text and new_text must differ",
+                    false,
+                ));
+            }
+            tokio::task::spawn_blocking(move || {
+                replace_workspace_text(&roots, &path, &arguments, &request.call)
+            })
+            .await
+            .map_err(|_| {
+                workspace_failure(
+                    "workspace_editor_join_failed",
+                    "The workspace editor stopped unexpectedly",
+                    false,
+                )
+            })?
+        })
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkspaceReadArguments {
@@ -376,6 +485,14 @@ struct WorkspaceReadArguments {
 struct WorkspaceSearchTextArguments {
     path: String,
     query: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceReplaceTextArguments {
+    path: String,
+    old_text: String,
+    new_text: String,
 }
 
 fn validate_workspace_path(path: &str) -> Result<PathBuf, ExecutorError> {
@@ -392,6 +509,9 @@ fn validate_workspace_path(path: &str) -> Result<PathBuf, ExecutorError> {
         match component {
             Component::Normal(part) => {
                 let part = part.to_str().ok_or_else(invalid_workspace_path)?;
+                if is_workspace_internal_entry(part) {
+                    return Err(invalid_workspace_path());
+                }
                 parts.push(part);
             }
             _ => return Err(invalid_workspace_path()),
@@ -401,6 +521,10 @@ fn validate_workspace_path(path: &str) -> Result<PathBuf, ExecutorError> {
         return Err(invalid_workspace_path());
     }
     Ok(parts.iter().collect())
+}
+
+fn is_workspace_internal_entry(name: &str) -> bool {
+    name.starts_with(".zeus-replace-")
 }
 
 fn validate_workspace_directory_path(path: &str) -> Result<PathBuf, ExecutorError> {
@@ -419,6 +543,17 @@ fn validate_workspace_search_query(query: &str) -> Result<(), ExecutorError> {
         return Err(workspace_failure(
             "invalid_workspace_search_query",
             "Workspace search query must be non-blank single-line UTF-8 text within 256 bytes",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_workspace_edit_text(text: &str, allow_empty: bool) -> Result<(), ExecutorError> {
+    if (!allow_empty && text.is_empty()) || text.len() > MAX_WORKSPACE_EDIT_TEXT_BYTES {
+        return Err(workspace_failure(
+            "invalid_workspace_edit_text",
+            "Workspace edit text exceeds its UTF-8 byte limit or old_text is empty",
             false,
         ));
     }
@@ -493,13 +628,6 @@ fn list_workspace_directory(
         .map_err(workspace_directory_error)?;
     let mut entries = Vec::new();
     for entry in directory {
-        if entries.len() == MAX_WORKSPACE_DIRECTORY_ENTRIES {
-            return Err(workspace_failure(
-                "workspace_directory_too_large",
-                "The requested workspace directory exceeds the 64-entry limit",
-                false,
-            ));
-        }
         let entry = entry.map_err(workspace_directory_error)?;
         let name = entry.file_name().into_string().map_err(|_| {
             workspace_failure(
@@ -515,6 +643,16 @@ fn list_workspace_directory(
             return Err(workspace_failure(
                 "workspace_entry_invalid",
                 "The requested workspace directory contains an invalid entry name",
+                false,
+            ));
+        }
+        if is_workspace_internal_entry(&name) {
+            continue;
+        }
+        if entries.len() == MAX_WORKSPACE_DIRECTORY_ENTRIES {
+            return Err(workspace_failure(
+                "workspace_directory_too_large",
+                "The requested workspace directory exceeds the 64-entry limit",
                 false,
             ));
         }
@@ -589,13 +727,6 @@ fn search_workspace_text(
             .map_err(workspace_directory_error)?;
         let mut entries = Vec::new();
         for entry in directory {
-            if entries.len() == MAX_WORKSPACE_DIRECTORY_ENTRIES {
-                return Err(workspace_failure(
-                    "workspace_search_directory_too_large",
-                    "A searched workspace directory exceeds the 64-entry limit",
-                    false,
-                ));
-            }
             let entry = entry.map_err(workspace_directory_error)?;
             let name = entry.file_name().into_string().map_err(|_| {
                 workspace_failure(
@@ -611,6 +742,16 @@ fn search_workspace_text(
                 return Err(workspace_failure(
                     "workspace_entry_invalid",
                     "The searched workspace contains an invalid entry name",
+                    false,
+                ));
+            }
+            if is_workspace_internal_entry(&name) {
+                continue;
+            }
+            if entries.len() == MAX_WORKSPACE_DIRECTORY_ENTRIES {
+                return Err(workspace_failure(
+                    "workspace_search_directory_too_large",
+                    "A searched workspace directory exceeds the 64-entry limit",
                     false,
                 ));
             }
@@ -812,6 +953,231 @@ fn workspace_search_preview(line: &str, query: &str) -> String {
     preview
 }
 
+fn replace_workspace_text(
+    roots: &WorkspaceRoots,
+    path: &Path,
+    arguments: &WorkspaceReplaceTextArguments,
+    call: &ToolCall,
+) -> Result<ToolOutput, ExecutorError> {
+    let mut edit_state = roots.edit_state.lock().map_err(|_| {
+        workspace_failure(
+            "workspace_editor_poisoned",
+            "The workspace editor state is unavailable",
+            false,
+        )
+    })?;
+    if let Some(receipt) = edit_state.receipts.get(&call.call_id) {
+        if receipt.arguments_digest != call.arguments_digest {
+            return Err(workspace_failure(
+                "workspace_edit_idempotency_conflict",
+                "The workspace edit call id is already bound to different arguments",
+                false,
+            ));
+        }
+        let mut output = receipt.output.clone();
+        output.replayed = true;
+        return Ok(output);
+    }
+
+    reject_workspace_symlinks(&roots.inspection, path)?;
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().ok_or_else(invalid_workspace_path)?;
+    let parent = roots
+        .confined
+        .open_dir(parent_path)
+        .map_err(workspace_directory_error)?;
+    let (original_bytes, permissions) = read_workspace_edit_file(&parent, file_name)?;
+    let original = String::from_utf8(original_bytes.clone()).map_err(|_| {
+        workspace_failure(
+            "workspace_edit_file_not_utf8",
+            "The workspace edit target is not valid UTF-8 text",
+            false,
+        )
+    })?;
+    let mut occurrences = original.match_indices(&arguments.old_text);
+    let Some((match_offset, _)) = occurrences.next() else {
+        return Err(workspace_failure(
+            "workspace_edit_text_not_found",
+            "Workspace edit old_text was not found",
+            false,
+        ));
+    };
+    if occurrences.next().is_some() {
+        return Err(workspace_failure(
+            "workspace_edit_text_not_unique",
+            "Workspace edit old_text must occur exactly once",
+            false,
+        ));
+    }
+    let updated_len = original
+        .len()
+        .checked_sub(arguments.old_text.len())
+        .and_then(|length| length.checked_add(arguments.new_text.len()))
+        .ok_or_else(workspace_edit_file_too_large)?;
+    if updated_len > MAX_WORKSPACE_EDIT_FILE_BYTES {
+        return Err(workspace_edit_file_too_large());
+    }
+    let mut updated = String::with_capacity(updated_len);
+    updated.push_str(&original[..match_offset]);
+    updated.push_str(&arguments.new_text);
+    updated.push_str(&original[match_offset + arguments.old_text.len()..]);
+
+    let temp_sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp_name = format!(
+        ".zeus-replace-{}-{}-{temp_sequence}.tmp",
+        call.call_id,
+        std::process::id()
+    );
+    let write_result = (|| -> Result<(), ExecutorError> {
+        let mut options = CapOpenOptions::new();
+        options.write(true).create_new(true);
+        let mut temp = parent
+            .open_with(&temp_name, &options)
+            .map_err(workspace_edit_io)?;
+        temp.write_all(updated.as_bytes())
+            .map_err(workspace_edit_io)?;
+        temp.set_permissions(permissions)
+            .map_err(workspace_edit_io)?;
+        temp.sync_all().map_err(workspace_edit_io)?;
+
+        let (current_bytes, _) = read_workspace_edit_file(&parent, file_name)?;
+        if current_bytes != original_bytes {
+            return Err(workspace_failure(
+                "workspace_edit_conflict",
+                "The workspace edit target changed before atomic replacement",
+                false,
+            ));
+        }
+        parent
+            .rename(&temp_name, &parent, file_name)
+            .map_err(workspace_edit_io)?;
+        sync_cap_directory(&parent)
+    })();
+    if let Err(error) = write_result {
+        let _ = parent.remove_file(&temp_name);
+        return Err(error);
+    }
+
+    let output = ToolOutput {
+        value: json!({
+            "path": arguments.path,
+            "replacements": 1,
+            "bytes_before": original.len(),
+            "bytes_after": updated.len(),
+        }),
+        replayed: false,
+        provider_request_id: Some(call.call_id.clone()),
+    };
+    remember_workspace_edit_receipt(
+        &mut edit_state,
+        call.call_id.clone(),
+        WorkspaceEditReceipt {
+            arguments_digest: call.arguments_digest.clone(),
+            output: output.clone(),
+        },
+    );
+    Ok(output)
+}
+
+fn remember_workspace_edit_receipt(
+    edit_state: &mut WorkspaceEditState,
+    call_id: String,
+    receipt: WorkspaceEditReceipt,
+) {
+    if edit_state.receipts.len() == MAX_WORKSPACE_EDIT_RECEIPTS
+        && let Some(expired_call_id) = edit_state.receipt_order.pop_front()
+    {
+        edit_state.receipts.remove(&expired_call_id);
+    }
+    edit_state.receipt_order.push_back(call_id.clone());
+    edit_state.receipts.insert(call_id, receipt);
+}
+
+fn read_workspace_edit_file(
+    parent: &Dir,
+    file_name: &std::ffi::OsStr,
+) -> Result<(Vec<u8>, cap_std::fs::Permissions), ExecutorError> {
+    let target_metadata = parent
+        .symlink_metadata(file_name)
+        .map_err(workspace_read_error)?;
+    if target_metadata.file_type().is_symlink() {
+        return Err(workspace_failure(
+            "workspace_symlink_denied",
+            "Workspace edits do not follow symbolic links",
+            false,
+        ));
+    }
+    let mut file = parent.open(file_name).map_err(workspace_read_error)?;
+    let metadata = file.metadata().map_err(workspace_read_error)?;
+    if !metadata.is_file() {
+        return Err(workspace_failure(
+            "workspace_edit_not_regular_file",
+            "The workspace edit target is not a regular file",
+            false,
+        ));
+    }
+    if metadata.len() > MAX_WORKSPACE_EDIT_FILE_BYTES as u64 {
+        return Err(workspace_edit_file_too_large());
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    Read::by_ref(&mut file)
+        .take((MAX_WORKSPACE_EDIT_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(workspace_read_error)?;
+    if bytes.len() > MAX_WORKSPACE_EDIT_FILE_BYTES {
+        return Err(workspace_edit_file_too_large());
+    }
+    Ok((bytes, metadata.permissions()))
+}
+
+fn workspace_edit_file_too_large() -> ExecutorError {
+    workspace_failure(
+        "workspace_edit_file_too_large",
+        "The workspace edit target or result exceeds the 65536-byte limit",
+        false,
+    )
+}
+
+fn workspace_edit_io(error: io::Error) -> ExecutorError {
+    match error.kind() {
+        io::ErrorKind::NotFound => workspace_failure(
+            "workspace_edit_target_not_found",
+            "The workspace edit target was not found",
+            false,
+        ),
+        io::ErrorKind::PermissionDenied => workspace_failure(
+            "workspace_edit_denied",
+            "The workspace edit target is not writable",
+            false,
+        ),
+        io::ErrorKind::AlreadyExists => workspace_failure(
+            "workspace_edit_temp_conflict",
+            "The workspace edit temporary file already exists",
+            true,
+        ),
+        _ => workspace_failure(
+            "workspace_edit_failed",
+            "The workspace edit could not be committed atomically",
+            true,
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn sync_cap_directory(directory: &Dir) -> Result<(), ExecutorError> {
+    Dir::reopen_dir(directory)
+        .and_then(|directory| directory.into_std_file().sync_all())
+        .map_err(workspace_edit_io)
+}
+
+#[cfg(not(unix))]
+fn sync_cap_directory(_directory: &Dir) -> Result<(), ExecutorError> {
+    Ok(())
+}
+
 fn reject_workspace_symlinks(root: &Dir, path: &Path) -> Result<(), ExecutorError> {
     let mut prefix = PathBuf::new();
     for component in path.components() {
@@ -1008,7 +1374,7 @@ fn write_marker(
     );
     let temp = root.join(temp_name);
     let publish_result = (|| -> io::Result<()> {
-        let mut file = OpenOptions::new()
+        let mut file = StdOpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temp)?;
@@ -1200,6 +1566,24 @@ mod tests {
         }
     }
 
+    fn workspace_replace_call(step: u32, path: &str, old_text: &str, new_text: &str) -> ToolCall {
+        let arguments = json!({
+            "path": path,
+            "old_text": old_text,
+            "new_text": new_text,
+        });
+        ToolCall {
+            call_id: stable_call_id("run-1", 1, step, WORKSPACE_REPLACE_TEXT_TOOL_NAME).unwrap(),
+            tool: WORKSPACE_REPLACE_TEXT_TOOL_NAME.into(),
+            tool_version: WORKSPACE_REPLACE_TEXT_TOOL_VERSION.into(),
+            arguments_digest: arguments_digest(&arguments),
+            arguments,
+            effect: ToolEffect::LocalWrite,
+            sandbox_profile: SandboxProfile::WorkspaceWrite,
+            executor_status: ToolExecutorStatus::Available,
+        }
+    }
+
     #[test]
     fn workspace_search_preview_keeps_a_late_utf8_match_within_the_byte_limit() {
         let line = format!("{}目标needle{}", "前".repeat(120), "后".repeat(120));
@@ -1209,6 +1593,35 @@ mod tests {
         assert!(preview.contains("目标needle"));
         assert!(preview.starts_with("..."));
         assert!(preview.ends_with("..."));
+    }
+
+    #[test]
+    fn workspace_edit_receipts_evict_in_insertion_order_at_the_hard_limit() {
+        let mut state = WorkspaceEditState::default();
+        for index in 0..=MAX_WORKSPACE_EDIT_RECEIPTS {
+            remember_workspace_edit_receipt(
+                &mut state,
+                format!("call-{index}"),
+                WorkspaceEditReceipt {
+                    arguments_digest: format!("digest-{index}"),
+                    output: ToolOutput {
+                        value: json!({"index": index}),
+                        replayed: false,
+                        provider_request_id: None,
+                    },
+                },
+            );
+        }
+
+        assert_eq!(state.receipts.len(), MAX_WORKSPACE_EDIT_RECEIPTS);
+        assert_eq!(state.receipt_order.len(), MAX_WORKSPACE_EDIT_RECEIPTS);
+        assert!(!state.receipts.contains_key("call-0"));
+        assert_eq!(state.receipt_order.front().unwrap(), "call-1");
+        assert!(
+            state
+                .receipts
+                .contains_key(&format!("call-{MAX_WORKSPACE_EDIT_RECEIPTS}"))
+        );
     }
 
     #[test]
@@ -1242,6 +1655,11 @@ mod tests {
             ConnectorConfigError::EnvironmentDenied("production".into())
         );
         assert!(registry.descriptor(WORKSPACE_READ_FILE_TOOL_NAME).is_none());
+        assert!(
+            registry
+                .descriptor(WORKSPACE_REPLACE_TEXT_TOOL_NAME)
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1301,6 +1719,7 @@ mod tests {
             "safe//file.txt",
             "safe.txt/",
             "safe\\file.txt",
+            ".zeus-replace-hidden.tmp",
         ] {
             let error = registry
                 .dispatch(workspace_call(path), LOCAL_DEV_ENVIRONMENT)
@@ -1320,6 +1739,7 @@ mod tests {
         fs::create_dir(temp.0.join("src")).unwrap();
         fs::write(temp.0.join("z.txt"), "z").unwrap();
         fs::write(temp.0.join("a.txt"), "a").unwrap();
+        fs::write(temp.0.join(".zeus-replace-hidden.tmp"), "hidden").unwrap();
         fs::create_dir(temp.0.join("too-many")).unwrap();
         for index in 0..=MAX_WORKSPACE_DIRECTORY_ENTRIES {
             fs::write(
@@ -1461,6 +1881,137 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn workspace_replace_is_atomic_unique_and_idempotent() {
+        let temp = TestDirectory::new();
+        fs::create_dir(temp.0.join("src")).unwrap();
+        fs::write(temp.0.join("src/lib.rs"), "alpha target omega\n").unwrap();
+        fs::write(temp.0.join("ambiguous.txt"), "same same\n").unwrap();
+        fs::write(temp.0.join("delete.txt"), "prefix remove suffix\n").unwrap();
+        fs::write(
+            temp.0.join("too-large.txt"),
+            vec![b'a'; MAX_WORKSPACE_EDIT_FILE_BYTES + 1],
+        )
+        .unwrap();
+        let mut registry = ToolRegistry::new();
+        register_local_workspace_connectors(&mut registry, LOCAL_DEV_ENVIRONMENT, &temp.0).unwrap();
+
+        let call = workspace_replace_call(1, "src/lib.rs", "target", "replacement");
+        let first = registry
+            .dispatch(call.clone(), LOCAL_DEV_ENVIRONMENT)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.value,
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "replacements": 1,
+                "bytes_before": 19,
+                "bytes_after": 24,
+            })
+        );
+        assert!(!first.replayed);
+        assert_eq!(
+            fs::read_to_string(temp.0.join("src/lib.rs")).unwrap(),
+            "alpha replacement omega\n"
+        );
+
+        let replay = registry
+            .dispatch(call, LOCAL_DEV_ENVIRONMENT)
+            .await
+            .unwrap();
+        assert_eq!(replay.value, first.value);
+        assert!(replay.replayed);
+
+        let conflict = registry
+            .dispatch(
+                workspace_replace_call(1, "src/lib.rs", "replacement", "other"),
+                LOCAL_DEV_ENVIRONMENT,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            conflict,
+            RegistryError::Executor(ExecutorError::Failed { ref code, .. })
+                if code == "workspace_edit_idempotency_conflict"
+        ));
+
+        for (step, path, old_text, new_text, expected_code) in [
+            (
+                2,
+                "ambiguous.txt",
+                "same",
+                "different",
+                "workspace_edit_text_not_unique",
+            ),
+            (
+                3,
+                "src/lib.rs",
+                "missing",
+                "different",
+                "workspace_edit_text_not_found",
+            ),
+            (
+                4,
+                "src/lib.rs",
+                "replacement",
+                "replacement",
+                "workspace_edit_no_change",
+            ),
+            (
+                5,
+                "too-large.txt",
+                "a",
+                "b",
+                "workspace_edit_file_too_large",
+            ),
+            (
+                6,
+                "../outside.txt",
+                "outside",
+                "inside",
+                "invalid_workspace_path",
+            ),
+        ] {
+            let error = registry
+                .dispatch(
+                    workspace_replace_call(step, path, old_text, new_text),
+                    LOCAL_DEV_ENVIRONMENT,
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                RegistryError::Executor(ExecutorError::Failed { ref code, .. })
+                    if code == expected_code
+            ));
+        }
+        assert_eq!(
+            fs::read_to_string(temp.0.join("ambiguous.txt")).unwrap(),
+            "same same\n"
+        );
+
+        let deleted = registry
+            .dispatch(
+                workspace_replace_call(7, "delete.txt", "remove", ""),
+                LOCAL_DEV_ENVIRONMENT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.value["replacements"], 1);
+        assert_eq!(
+            fs::read_to_string(temp.0.join("delete.txt")).unwrap(),
+            "prefix  suffix\n"
+        );
+        assert!(fs::read_dir(temp.0.join("src")).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".zeus-replace-")
+        }));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn workspace_read_never_follows_symlinks() {
@@ -1498,6 +2049,19 @@ mod tests {
             .await
             .unwrap();
         assert!(search.value["matches"].as_array().unwrap().is_empty());
+        let edit = registry
+            .dispatch(
+                workspace_replace_call(8, "linked-file", "outside", "inside"),
+                LOCAL_DEV_ENVIRONMENT,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            edit,
+            RegistryError::Executor(ExecutorError::Failed { ref code, .. })
+                if code == "workspace_symlink_denied"
+        ));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside secret");
 
         for path in ["linked-file", "nested/linked-dir/outside.txt"] {
             let error = registry

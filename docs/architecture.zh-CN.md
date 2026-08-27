@@ -388,14 +388,19 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
 - `production-guarded` profile 即使 owner 已认证，仍因真实生产 connector 缺失而保持执行禁用。
 - `dev_marker_write` 仅在 `local-development` profile 注册，只能在服务端固定目录写服务器生成的
   marker 文件；参数不能提供路径。
-- `workspace_list_directory`、`workspace_search_text` 与 `workspace_read_file` 仅在显式配置
+- `workspace_list_directory`、`workspace_search_text`、`workspace_read_file` 与
+  `workspace_replace_text` 仅在显式配置
   `ZEUS_LOCAL_WORKSPACE_ROOT` 的 `local-development` profile 注册。服务启动时把该目录转换为
   capability root；模型只能提交 canonical relative UTF-8 path。目录发现最多返回 64 个按名称
   排序的直接子项并标注 file/directory/symlink/other。字面量文本搜索按稳定路径与行号返回最多
   32 个匹配，并固定限制目录数、文件数、深度、单文件 64 KiB 与总扫描 1 MiB；它跳过
   `.git`、`.svelte-kit`、`.zeus`、`node_modules`、`target` 与 `dist`。文件读取拒绝路径穿越、
-  符号链接、非普通文件、非 UTF-8 内容和超过 8 KiB 的文件。三个工具均不跟随符号链接，均为
-  `read_only + read_only sandbox`，策略自动允许，不经过写操作审批，也没有 shell 或写权限。
+  符号链接、非普通文件、非 UTF-8 内容和超过 8 KiB 的文件。前三个工具均不跟随符号链接，均为
+  `read_only + read_only sandbox`，策略自动允许。文本替换只处理现有、至多 64 KiB 的 UTF-8
+  普通文件，要求 `old_text` 唯一出现，使用同目录临时文件、权限复制、file sync、原文复验、
+  atomic rename 与 directory sync；相同 call ID 的近期同参重试返回有界内存 receipt，异参重用、
+  目标变化、穿越或 symlink 均 fail closed。该工具固定为 `local_write + workspace_write sandbox`
+  并要求 owner 对 exact persisted call 批准。所有 workspace 工具都没有 shell 权限。
 - `ZEUS_DEMO_PROFILE=production-guarded` 是默认值；切到 `local-development` 时必须使用独立
   SQLite 数据库，并由 `ZEUS_LOCAL_MARKER_ROOT` 固定写入根目录。只有显式设置
   `ZEUS_LOCAL_WORKSPACE_ROOT` 时才注册只读 workspace 工具；未设置时保留原 marker-only 行为。
@@ -500,6 +505,9 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
 - local-development marker：批准前不存在、拒绝后不存在、allow-once 后只生成一个稳定文件。
 - read-only workspace：真实 Agent tool loop 覆盖免审批执行、root confinement、canonical path、
   symlink/UTF-8/8 KiB 边界、有界字面量搜索，以及 search → read 的 exact tool result 逐步回灌。
+- workspace exact edit：真实 Agent 在 owner 批准前不改文件，批准后只执行一次 unique text
+  replacement，结果持久化并回灌下一模型步骤；拒绝、同参重放、异参 call-ID 冲突、目标变化、
+  symlink、UTF-8 与 64 KiB 边界均 fail closed。
 - 生产 RDS 路径只能得到 executor unavailable，不能得到伪造成功。
 - Session/Run SSE 重连都严格从各自大于 cursor 的 sequence 补齐事件。请求同时携带 query
   cursor 和 `Last-Event-ID` 时，后者优先。

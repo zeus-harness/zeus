@@ -6836,9 +6836,15 @@ mod tests {
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
     }
 
+    struct WorkspaceReplaceThenFinalProvider {
+        metadata: ProviderMetadata,
+        requests: Arc<StdMutex<Vec<ReplyRequest>>>,
+    }
+
     const TEST_WORKSPACE_READ_FILE_TOOL_NAME: &str = "workspace_read_file";
     const TEST_WORKSPACE_LIST_DIRECTORY_TOOL_NAME: &str = "workspace_list_directory";
     const TEST_WORKSPACE_SEARCH_TEXT_TOOL_NAME: &str = "workspace_search_text";
+    const TEST_WORKSPACE_REPLACE_TEXT_TOOL_NAME: &str = "workspace_replace_text";
 
     struct HistoryThenToolProvider {
         metadata: ProviderMetadata,
@@ -6998,6 +7004,65 @@ mod tests {
                         content: "workspace read completed".into(),
                     },
                     call => panic!("unexpected workspace Agent provider call {call}"),
+                }
+            };
+            let provider = self.metadata.clone();
+            Box::pin(async move {
+                Ok(ReplyResponse {
+                    output,
+                    finish_reason: Some("stop".into()),
+                    provider,
+                })
+            })
+        }
+    }
+
+    impl WorkspaceReplaceThenFinalProvider {
+        fn new(requests: Arc<StdMutex<Vec<ReplyRequest>>>) -> Self {
+            Self {
+                metadata: ProviderMetadata {
+                    provider_id: "test-workspace-replace-provider".into(),
+                    model: Some("test-model".into()),
+                    reply_kind: ReplyKind::Model,
+                },
+                requests,
+            }
+        }
+    }
+
+    impl ReplyProvider for WorkspaceReplaceThenFinalProvider {
+        fn metadata(&self) -> &ProviderMetadata {
+            &self.metadata
+        }
+
+        fn reply(&self, request: ReplyRequest) -> ReplyFuture<'_> {
+            let output = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(request.clone());
+                match requests.len() {
+                    1 => {
+                        assert!(
+                            request
+                                .tools
+                                .iter()
+                                .any(|tool| tool.name == TEST_WORKSPACE_REPLACE_TEXT_TOOL_NAME)
+                        );
+                        ReplyOutput::ToolCall {
+                            call: ReplyToolCall::new(
+                                "provider-call-workspace-replace-1",
+                                TEST_WORKSPACE_REPLACE_TEXT_TOOL_NAME,
+                                serde_json::json!({
+                                    "path": "src/lib.rs",
+                                    "old_text": "before",
+                                    "new_text": "after",
+                                }),
+                            ),
+                        }
+                    }
+                    2 => ReplyOutput::Final {
+                        content: "workspace edit completed".into(),
+                    },
+                    call => panic!("unexpected workspace edit provider call {call}"),
                 }
             };
             let provider = self.metadata.clone();
@@ -7976,6 +8041,165 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&read_result.content).unwrap(),
             agent.calls[1].output.clone().unwrap()
+        );
+
+        drop(app);
+        drop(store);
+        tokio::task::yield_now().await;
+        cleanup_test_database(&path);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_replace_waits_for_owner_approval_then_replays_the_exact_result() {
+        let unique = UserId::generate().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "zeus-api-workspace-replace-{}",
+            unique.as_str().replace(':', "-")
+        ));
+        let path = root.join("zeus.db");
+        let marker_root = root.join("markers");
+        let workspace_root = root.join("workspace");
+        let target = workspace_root.join("src/lib.rs");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "pub fn before() {}\n").unwrap();
+        let store = DemoStore::open_local_with_workspace(&path, &marker_root, &workspace_root)
+            .await
+            .unwrap();
+        let owner =
+            provision_test_owner(&store, "user-workspace-replace", "workspace-replace-owner").await;
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: "session-workspace-replace".into(),
+                    title: "Edit workspace".into(),
+                },
+                "create-workspace-replace",
+            )
+            .await
+            .unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(WorkspaceReplaceThenFinalProvider::new(Arc::clone(
+                &requests,
+            ))),
+        )
+        .unwrap();
+
+        let started = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-workspace-replace/turns")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "start-workspace-replace")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-workspace-replace",
+                            "user_message": "rename the function from before to after",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+
+        let waiting = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            "session-workspace-replace",
+            "turn-workspace-replace",
+            protocol::AgentTurnStatus::WaitingApproval,
+        )
+        .await;
+        let call_id = waiting.pending_call_id.clone().unwrap();
+        assert_eq!(waiting.calls.len(), 1);
+        assert_eq!(waiting.calls[0].tool, TEST_WORKSPACE_REPLACE_TEXT_TOOL_NAME);
+        assert!(waiting.calls[0].approval_required);
+        assert_eq!(
+            waiting.calls[0].status,
+            AgentToolCallStatus::WaitingApproval
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "pub fn before() {}\n"
+        );
+
+        let approved = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/v1/sessions/session-workspace-replace/turns/turn-workspace-replace/approvals/{call_id}/decision"
+                ))
+                .header(header::HOST, "zeus.test")
+                .header(header::ORIGIN, "http://zeus.test")
+                .header(header::COOKIE, &owner.cookie_header)
+                .header(CSRF_HEADER, &owner.csrf_token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("idempotency-key", "approve-workspace-replace")
+                .body(Body::from(
+                    serde_json::json!({
+                        "decision": "approve",
+                        "note": "apply the exact unique replacement",
+                        "idempotency_key": "approve-workspace-replace",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(approved.status(), StatusCode::OK);
+
+        let session =
+            wait_for_ready_session(&store, &owner.authz, "session-workspace-replace").await;
+        assert_eq!(
+            session.turns[0].assistant_message.as_deref(),
+            Some("workspace edit completed")
+        );
+        let agent = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            "session-workspace-replace",
+            "turn-workspace-replace",
+            protocol::AgentTurnStatus::Succeeded,
+        )
+        .await;
+        assert_eq!(agent.model_steps, 2);
+        assert_eq!(agent.tool_calls, 1);
+        assert_eq!(agent.calls.len(), 1);
+        assert_eq!(agent.calls[0].status, AgentToolCallStatus::Succeeded);
+        assert_eq!(
+            agent.calls[0].output,
+            Some(serde_json::json!({
+                "path": "src/lib.rs",
+                "replacements": 1,
+                "bytes_before": 19,
+                "bytes_after": 18,
+            }))
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "pub fn after() {}\n"
+        );
+        assert_eq!(std::fs::read_dir(&marker_root).unwrap().count(), 0);
+
+        let recorded = requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 2);
+        let tool_result = recorded[1].messages.last().unwrap();
+        assert_eq!(tool_result.role, ReplyRole::Tool);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&tool_result.content).unwrap(),
+            agent.calls[0].output.clone().unwrap()
         );
 
         drop(app);
