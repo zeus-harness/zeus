@@ -530,6 +530,23 @@ pub struct AgentKnowledgeContextSpec {
     pub snapshot: SelectionSnapshotEnvelope,
 }
 
+/// Auditable projection of the immutable knowledge selection bound to one
+/// Agent turn. It exposes the selected snapshot and binding digests without
+/// returning every unselected entry in the account corpus.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AgentKnowledgeContextExplain {
+    pub binding_schema_version: u16,
+    pub binding_digest: String,
+    pub initial_model_job_id: String,
+    pub corpus_digest: String,
+    pub snapshot_digest: String,
+    pub query_digest: String,
+    pub context_digest: String,
+    pub context_bytes: u32,
+    pub snapshot: SelectionSnapshotEnvelope,
+    pub created_at: String,
+}
+
 /// Current account-scoped knowledge catalog projection.
 ///
 /// Revision zero is the implicit, unconfigured empty corpus. Once configured,

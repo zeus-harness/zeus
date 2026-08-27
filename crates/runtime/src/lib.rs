@@ -46,12 +46,12 @@ use serde_json::Value;
 pub use storage::{
     AccountAuditArchiveState, AccountAuditCheckpointCommit, AccountAuditEvent, AccountAuditPage,
     AccountAuditPolicy, AccountAuditRollup, AccountAuditState, AccountId, AgentFinalCompletion,
-    AgentKnowledgeContextSpec, AgentModelClaimOutcome, AgentModelCompletion,
-    AgentModelFailureCommit, AgentModelJob, AgentModelJobStatus, AgentModelResolution,
-    AgentModelStartOutcome, AgentModelSuccessCommit, AgentOperationClaim, AgentOperationKind,
-    AgentPreparedModel, AgentPreparedTool, AgentReviewCommit, AgentReviewContext,
-    AgentReviewResult, AgentTerminalCompletion, AgentToolCall, AgentToolCallSpec,
-    AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
+    AgentKnowledgeContextExplain, AgentKnowledgeContextSpec, AgentModelClaimOutcome,
+    AgentModelCompletion, AgentModelFailureCommit, AgentModelJob, AgentModelJobStatus,
+    AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit, AgentOperationClaim,
+    AgentOperationKind, AgentPreparedModel, AgentPreparedTool, AgentReviewCommit,
+    AgentReviewContext, AgentReviewResult, AgentTerminalCompletion, AgentToolCall,
+    AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
     AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurn,
     AgentTurnEnqueueResponse, AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal,
     AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, CreateMemberResult,
@@ -2097,6 +2097,25 @@ impl DemoStore {
             .storage
             .agent_turn_detail_for_actor(context, session_id, turn_id)
             .await?)
+    }
+
+    /// Return the exact immutable knowledge selection bound to an
+    /// authenticated Session Agent turn. Frozen pre-v22 turns return `None`.
+    pub async fn agent_knowledge_context_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<AgentKnowledgeContextExplain>, StoreError> {
+        validate_durable_reference(session_id, "session ID")?;
+        validate_durable_reference(turn_id, "turn ID")?;
+        self.storage
+            .agent_knowledge_context_for_actor(context, session_id, turn_id)
+            .await
+            .map_err(|error| match error {
+                StorageError::CorruptData(detail) => StoreError::ExecutionInvariant(detail),
+                other => StoreError::from(other),
+            })
     }
 
     /// Return the immutable deployment manifest bound to an authenticated

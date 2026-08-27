@@ -61,16 +61,17 @@ use runtime::ReplyJobSpec;
 use runtime::{
     AccountAuditCheckpointCommit, AccountAuditEvent as StoredAccountAuditEvent,
     AccountAuditPolicy as StoredAccountAuditPolicy, AccountAuditRollup as StoredAccountAuditRollup,
-    AccountAuditState as StoredAccountAuditState, AgentModelClaimOutcome, AgentModelCompletion,
-    AgentModelFailureCommit, AgentModelJob, AgentModelResolution, AgentModelStartOutcome,
-    AgentModelSuccessCommit, AgentReviewCommit, AgentToolCall, AgentToolCallSpec,
-    AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
-    AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe,
-    AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthzContext, BootstrapOwnerCommit, DemoStore,
-    EntryRevision, KnowledgeCatalogState, KnowledgeCatalogUpdateResult, MemberSetupCommit,
-    PublishedEvent, ReplyClaimOutcome, ReplyFailureCommit, ReplyJob, ReplyOutcomeUnknownCommit,
-    ReplySuccessCommit, StoreError, StoredMember, StoredMembershipStatus, StoredPreferences,
-    StoredUser, StoredUserStatus, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
+    AccountAuditState as StoredAccountAuditState, AgentKnowledgeContextExplain,
+    AgentModelClaimOutcome, AgentModelCompletion, AgentModelFailureCommit, AgentModelJob,
+    AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit, AgentReviewCommit,
+    AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion,
+    AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork,
+    AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthzContext,
+    BootstrapOwnerCommit, DemoStore, EntryRevision, KnowledgeCatalogState,
+    KnowledgeCatalogUpdateResult, MemberSetupCommit, PublishedEvent, ReplyClaimOutcome,
+    ReplyFailureCommit, ReplyJob, ReplyOutcomeUnknownCommit, ReplySuccessCommit, StoreError,
+    StoredMember, StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserStatus,
+    TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -744,6 +745,14 @@ struct AgentDeploymentExplainResponse {
     diff: Option<ManifestDiff>,
 }
 
+#[derive(Debug, Serialize)]
+struct AgentKnowledgeExplainResponse {
+    agent: AgentTurnDetail,
+    legacy_unbound: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<AgentKnowledgeContextExplain>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RunDetailQuery {
@@ -820,6 +829,10 @@ fn build_authenticated_app(state: ApiState) -> Router {
         .route(
             "/api/v1/sessions/{id}/turns/{turn_id}/agent/execution/explain",
             get(agent_execution_explain),
+        )
+        .route(
+            "/api/v1/sessions/{id}/turns/{turn_id}/agent/knowledge/explain",
+            get(agent_knowledge_explain),
         )
         .route(
             "/api/v1/sessions/{id}/turns/{turn_id}/agent/execution/epochs/{step}",
@@ -3388,6 +3401,30 @@ async fn agent_execution_explain(
         .map_err(ApiError::from)
         .map_err(ApiError::with_no_store)?;
     json_no_store(explanation)
+}
+
+async fn agent_knowledge_explain(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    Path((id, turn_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let agent = state
+        .store
+        .agent_turn_detail_for_actor(&current.principal.authz, &id, &turn_id)
+        .await
+        .map_err(ApiError::from)
+        .map_err(ApiError::with_no_store)?;
+    let context = state
+        .store
+        .agent_knowledge_context_for_actor(&current.principal.authz, &id, &turn_id)
+        .await
+        .map_err(ApiError::from)
+        .map_err(ApiError::with_no_store)?;
+    json_no_store(AgentKnowledgeExplainResponse {
+        agent,
+        legacy_unbound: context.is_none(),
+        context,
+    })
 }
 
 async fn agent_run_epoch_explain(
@@ -8344,6 +8381,17 @@ mod tests {
         let app = authenticated_app(store.clone(), false)
             .unwrap()
             .layer(MockConnectInfo(test_peer()));
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: "session-knowledge-explain".into(),
+                    title: "Knowledge explainability".into(),
+                },
+                "create-session-knowledge-explain",
+            )
+            .await
+            .unwrap();
 
         let initial = app
             .clone()
@@ -8392,6 +8440,57 @@ mod tests {
         let update: serde_json::Value = response_json(update).await;
         assert_eq!(update["catalog"]["revision"], 1);
         assert_eq!(update["replayed"], false);
+
+        let started = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-knowledge-explain/turns")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "knowledge-explain-turn")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-knowledge-explain",
+                            "user_message": "explain the immutable execution epoch",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+
+        let explained = app
+            .clone()
+            .oneshot(
+                Request::get(
+                    "/api/v1/sessions/session-knowledge-explain/turns/turn-knowledge-explain/agent/knowledge/explain",
+                )
+                .header(header::HOST, "zeus.test")
+                .header(header::COOKIE, &owner.cookie_header)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(explained.status(), StatusCode::OK);
+        assert_eq!(explained.headers()[header::CACHE_CONTROL], "no-store");
+        let explained: serde_json::Value = response_json(explained).await;
+        assert_eq!(explained["legacy_unbound"], false);
+        assert_eq!(
+            explained["context"]["corpus_digest"],
+            update["catalog"]["corpus"]["digest"]
+        );
+        assert_eq!(
+            explained["context"]["snapshot"]["snapshot"]["hits"][0]["entry"]["entry_id"],
+            "execution-epochs"
+        );
+        assert!(explained["context"].get("corpus").is_none());
 
         let replay = app
             .clone()

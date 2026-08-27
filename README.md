@@ -716,6 +716,11 @@ directly.
   actor-scoped persisted and current secret-free manifests plus a deterministic
   JSON-pointer diff. It explicitly marks pre-v19 unbound history and whether
   the current runtime can execute the exact persisted deployment.
+- `GET /api/v1/sessions/{session_id}/turns/{turn_id}/agent/knowledge/explain`
+  returns the exact persisted selection snapshot and its binding, corpus,
+  query, snapshot, and context digests with `Cache-Control: no-store`. It does
+  not return unselected account-corpus entries; frozen pre-v22 history is
+  reported as `legacy_unbound` with no fabricated context.
 - `POST /api/v1/sessions/{session_id}/turns/{turn_id}/approvals/{call_id}/decision`
   lets an owner approve the exact persisted call or reject it as a structured
   model-visible result. The decision is idempotent and never accepts a

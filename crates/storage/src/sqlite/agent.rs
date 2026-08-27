@@ -6,14 +6,14 @@
 
 use super::*;
 use crate::{
-    AgentFinalCompletion, AgentModelClaimOutcome, AgentModelCompletion, AgentModelFailureCommit,
-    AgentModelJobStatus, AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit,
-    AgentOperationClaim, AgentOperationKind, AgentPreparedModel, AgentPreparedTool,
-    AgentReviewCommit, AgentReviewContext, AgentReviewResult, AgentTerminalCompletion,
-    AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion,
-    AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork,
-    AgentTurnReceiptProbe, KnowledgeCatalogCommit, KnowledgeCatalogState,
-    KnowledgeCatalogUpdateResult,
+    AgentFinalCompletion, AgentKnowledgeContextExplain, AgentModelClaimOutcome,
+    AgentModelCompletion, AgentModelFailureCommit, AgentModelJobStatus, AgentModelResolution,
+    AgentModelStartOutcome, AgentModelSuccessCommit, AgentOperationClaim, AgentOperationKind,
+    AgentPreparedModel, AgentPreparedTool, AgentReviewCommit, AgentReviewContext,
+    AgentReviewResult, AgentTerminalCompletion, AgentToolCall, AgentToolCallSpec,
+    AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
+    AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe,
+    KnowledgeCatalogCommit, KnowledgeCatalogState, KnowledgeCatalogUpdateResult,
 };
 use ::execution::{DigestDomain, FactSource, OperationRef, Sha256Digest};
 use deployment::ManifestEnvelope;
@@ -323,6 +323,24 @@ impl SqliteStore {
         let turn_id = validated_durable_reference(turn_id, "turn ID")?.to_owned();
         self.with_connection(move |connection| {
             query_agent_turn_detail_for_actor(connection, &context, &session_id, &turn_id)
+        })
+        .await
+    }
+
+    /// Returns the exact immutable knowledge selection bound to an Agent turn.
+    /// Authorization and account isolation are checked before selected content
+    /// is exposed. Frozen pre-v22 legacy turns return `None`.
+    pub async fn agent_knowledge_context_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<AgentKnowledgeContextExplain>, StorageError> {
+        let context = validated_authz_context(context)?;
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        let turn_id = validated_durable_reference(turn_id, "turn ID")?.to_owned();
+        self.with_connection(move |connection| {
+            query_agent_knowledge_context_for_actor(connection, &context, &session_id, &turn_id)
         })
         .await
     }
@@ -3151,6 +3169,47 @@ fn query_agent_turn_detail_for_actor(
     let detail = agent_turn_detail(&transaction, &agent)?;
     transaction.commit()?;
     Ok(detail)
+}
+
+fn query_agent_knowledge_context_for_actor(
+    connection: &mut Connection,
+    context: &AuthzContext,
+    session_id: &str,
+    turn_id: &str,
+) -> Result<Option<AgentKnowledgeContextExplain>, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    require_active_session_actor(&transaction, session_id, context)?;
+    let agent = query_agent_turn_for_session_turn(&transaction, session_id, turn_id)?;
+    if agent.account_id != context.account_id {
+        return Err(StorageError::AgentTurnNotFound(turn_id.to_owned()));
+    }
+    if agent.knowledge_context_digest.is_none() {
+        let initial_job = query_agent_model_job(&transaction, &agent.id, 1)?;
+        if agent_has_frozen_legacy_knowledge_boundary(&transaction, &agent, &initial_job)? {
+            transaction.commit()?;
+            return Ok(None);
+        }
+    }
+    let (stored, _, _) = load_and_validate_agent_knowledge_context(&transaction, &agent)?;
+    let snapshot =
+        knowledge::SelectionSnapshotEnvelope::from_canonical_json(&stored.snapshot_envelope_json)
+            .map_err(corrupt_knowledge_context)?;
+    let explanation = AgentKnowledgeContextExplain {
+        binding_schema_version: u16::try_from(stored.schema_version)
+            .map_err(|_| StorageError::IntegerOutOfRange("Agent knowledge binding schema"))?,
+        binding_digest: stored.digest,
+        initial_model_job_id: stored.initial_model_job_id,
+        corpus_digest: stored.corpus_digest,
+        snapshot_digest: stored.snapshot_digest,
+        query_digest: stored.query_digest,
+        context_digest: stored.context_digest,
+        context_bytes: u32::try_from(stored.context_bytes)
+            .map_err(|_| StorageError::IntegerOutOfRange("Agent knowledge context bytes"))?,
+        snapshot,
+        created_at: stored.created_at,
+    };
+    transaction.commit()?;
+    Ok(Some(explanation))
 }
 
 fn query_agent_deployment_manifest_for_actor(

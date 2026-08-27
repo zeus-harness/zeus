@@ -60,7 +60,9 @@ capability 读取当时的 active corpus，随后仍把 exact corpus/snapshot �
 更新不会改写既有 turn。Catalog revision 最多 256，单 account 最多保留 128 个不同 corpus revision
 与 64 MiB canonical envelope；超过边界 fail closed。SQLite 内 trigger/deep readiness 可检测缺失、
 不连续或投影不一致，但与其它本地 commitment 一样，不是防止拥有任意数据库写权限者同时替换数据
-和校验逻辑的外部信任锚。
+和校验逻辑的外部信任锚。Actor-scoped `agent/knowledge/explain` 返回已经固化的 selection snapshot
+与 binding/corpus/query/context digest，但不返回未命中的完整 account corpus；pre-v22 history 明确
+标记为 `legacy_unbound`，不伪造空 selection。
 
 ## 事件与状态
 
