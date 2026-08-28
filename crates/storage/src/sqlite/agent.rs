@@ -12,13 +12,13 @@ use crate::{
     AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit, AgentOperationClaim,
     AgentOperationKind, AgentPreparedModel, AgentPreparedTool, AgentPromptCommit,
     AgentPromptRevisionPage, AgentPromptRevisionSummary, AgentPromptState, AgentPromptUpdateResult,
-    AgentReviewCommit, AgentReviewContext, AgentReviewResult, AgentTerminalCompletion,
-    AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion,
-    AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork,
-    AgentTurnReceiptProbe, DEFAULT_SESSION_AGENT_PROMPT_REVISION,
-    DEFAULT_SESSION_AGENT_SYSTEM_PROMPT, KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage,
-    KnowledgeCatalogRevisionSummary, KnowledgeCatalogState, KnowledgeCatalogUpdateResult,
-    SESSION_AGENT_PROMPT_ID,
+    AgentReviewCommit, AgentReviewContext, AgentReviewResult, AgentSubagentSpawnCandidate,
+    AgentSubagentSpawnCommit, AgentTerminalCompletion, AgentToolCall, AgentToolCallSpec,
+    AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
+    AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe,
+    DEFAULT_SESSION_AGENT_PROMPT_REVISION, DEFAULT_SESSION_AGENT_SYSTEM_PROMPT,
+    KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage, KnowledgeCatalogRevisionSummary,
+    KnowledgeCatalogState, KnowledgeCatalogUpdateResult, SESSION_AGENT_PROMPT_ID,
 };
 use ::execution::{DigestDomain, FactSource, OperationRef, Sha256Digest};
 use deployment::{ManifestEnvelope, prompt_content_digest};
@@ -432,7 +432,28 @@ impl SqliteStore {
     ) -> Result<AgentToolCompletion, StorageError> {
         let physical_limits = self.physical_limits.clone();
         self.with_progress_connection(move |connection| {
-            complete_agent_tool(connection, commit, &physical_limits)
+            complete_agent_tool(connection, commit, None, &physical_limits)
+        })
+        .await
+    }
+
+    /// Commits one successful `spawn_agent` result together with the child
+    /// Session fork, initial turn, Agent/model job, and parent continuation.
+    /// No child row is visible unless the parent result commits too.
+    pub async fn complete_agent_tool_with_subagent(
+        &self,
+        commit: AgentToolCompletionCommit,
+        spawn: AgentSubagentSpawnCommit,
+    ) -> Result<AgentToolCompletion, StorageError> {
+        let physical_limits = self.physical_limits.clone();
+        let limits = self.limits.clone();
+        self.with_progress_connection(move |connection| {
+            complete_agent_tool(
+                connection,
+                commit,
+                Some((&spawn, &limits)),
+                &physical_limits,
+            )
         })
         .await
     }
@@ -484,6 +505,22 @@ impl SqliteStore {
                 cursor.as_deref(),
                 limit,
             )
+        })
+        .await
+    }
+
+    /// Resolves the immutable parent history boundary, current durable
+    /// authority, and exact parent deployment for one started `spawn_agent`
+    /// call. The model supplies none of these identities.
+    pub async fn subagent_spawn_candidate_for_started_tool(
+        &self,
+        scope: &ExecutionScope,
+        call_id: &str,
+    ) -> Result<AgentSubagentSpawnCandidate, StorageError> {
+        let scope = scope.clone();
+        let call_id = validated_durable_reference(call_id, "Agent tool call ID")?.to_owned();
+        self.with_connection(move |connection| {
+            query_subagent_spawn_candidate_for_started_tool(connection, &scope, &call_id)
         })
         .await
     }
@@ -2431,6 +2468,7 @@ fn start_prepared_agent_tool(
 fn complete_agent_tool(
     connection: &mut Connection,
     commit: AgentToolCompletionCommit,
+    subagent_spawn: Option<(&AgentSubagentSpawnCommit, &StorageLimits)>,
     physical_limits: &SqlitePhysicalLimits,
 ) -> Result<AgentToolCompletion, StorageError> {
     normalized_identifier(&commit.call_id, "agent call ID")?;
@@ -2465,11 +2503,14 @@ fn complete_agent_tool(
         &commit,
         call.status != AgentToolCallStatus::Running,
     )?;
+    let prepared_subagent =
+        prepare_agent_subagent_completion(&call, &commit, subagent_spawn.map(|(spawn, _)| spawn))?;
     let mut agent = query_agent_turn(&transaction, &call.agent_id)?;
     if call.status != AgentToolCallStatus::Running {
         let replay = replay_agent_tool_completion(&transaction, &call, &agent, &commit)?;
         verify_replayed_agent_todo_completion(&transaction, &call, prepared_todo.as_ref())?;
         verify_replayed_agent_goal_completion(&transaction, &call, prepared_goal.as_ref())?;
+        verify_replayed_agent_subagent_completion(&transaction, &call, prepared_subagent.as_ref())?;
         transaction.commit()?;
         return Ok(replay);
     }
@@ -2511,6 +2552,22 @@ fn complete_agent_tool(
     }
     if let Some(snapshot) = prepared_goal.as_ref() {
         insert_agent_goal_snapshot(&transaction, &call, snapshot, &timestamp)?;
+    }
+    if let Some(spawn) = prepared_subagent.as_ref() {
+        let limits = subagent_spawn.map(|(_, limits)| limits).ok_or_else(|| {
+            StorageError::InvalidAgentTransition(
+                "prepared subagent spawn lost its storage limits".into(),
+            )
+        })?;
+        insert_agent_subagent_spawn(
+            &transaction,
+            &call,
+            &agent,
+            spawn,
+            limits,
+            physical_limits,
+            &timestamp,
+        )?;
     }
     let terminal_error =
         (settled.status() == WorkflowStatus::Failed).then(|| workflow_terminal_error(&settled));
@@ -4402,7 +4459,7 @@ fn query_session_fork_page_for_started_agent_tool(
     if authorized == 0 {
         return Err(StorageError::AgentToolCallNotFound(call_id.to_owned()));
     }
-    let page = super::query_session_fork_page(
+    let page = query_agent_subagent_page(
         &transaction,
         scope.account_id.as_str(),
         scope.actor_id.as_str(),
@@ -4412,6 +4469,238 @@ fn query_session_fork_page_for_started_agent_tool(
     )?;
     transaction.commit()?;
     Ok(page)
+}
+
+fn query_agent_subagent_page(
+    connection: &Connection,
+    account_id: &str,
+    actor_user_id: &str,
+    parent_session_id: &str,
+    page_cursor: Option<&str>,
+    limit: usize,
+) -> Result<SessionForkPage, StorageError> {
+    let fetch_limit = validated_read_page_limit(limit, COLLECTION_PAGE_MAX_LIMIT)?;
+    let page_cursor = page_cursor
+        .map(|value| {
+            cursor::decode_agent_subagents(value, account_id, actor_user_id, parent_session_id)
+        })
+        .transpose()?;
+    let query_rows = |statement: &mut rusqlite::Statement<'_>,
+                      parameters: &[&dyn rusqlite::ToSql]| {
+        statement
+            .query_map(parameters, |row| {
+                Ok((
+                    decode_session_summary_row(row)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, String>(11)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let rows = if let Some(page_cursor) = page_cursor {
+        let mut statement = connection.prepare(
+            r#"SELECT child.id, child.title, child.status, child.created_at,
+                      child.updated_at, child.sequence, child.projection_sequence,
+                      child.active_turn_id, fork.parent_session_id,
+                      fork.parent_sequence, fork.inherited_turn_count, spawn.created_at
+               FROM agent_subagent_spawns spawn
+               JOIN session_forks fork ON fork.child_session_id = spawn.child_session_id
+               JOIN sessions child ON child.id = spawn.child_session_id
+               WHERE spawn.account_id = ?1
+                 AND spawn.actor_user_id = ?2
+                 AND spawn.parent_session_id = ?3
+                 AND (spawn.created_at < ?4
+                      OR (spawn.created_at = ?4 AND spawn.child_session_id > ?5))
+               ORDER BY spawn.created_at DESC, spawn.child_session_id ASC
+               LIMIT ?6"#,
+        )?;
+        query_rows(
+            &mut statement,
+            &[
+                &account_id,
+                &actor_user_id,
+                &parent_session_id,
+                &page_cursor.first,
+                &page_cursor.second,
+                &fetch_limit,
+            ],
+        )?
+    } else {
+        let mut statement = connection.prepare(
+            r#"SELECT child.id, child.title, child.status, child.created_at,
+                      child.updated_at, child.sequence, child.projection_sequence,
+                      child.active_turn_id, fork.parent_session_id,
+                      fork.parent_sequence, fork.inherited_turn_count, spawn.created_at
+               FROM agent_subagent_spawns spawn
+               JOIN session_forks fork ON fork.child_session_id = spawn.child_session_id
+               JOIN sessions child ON child.id = spawn.child_session_id
+               WHERE spawn.account_id = ?1
+                 AND spawn.actor_user_id = ?2
+                 AND spawn.parent_session_id = ?3
+               ORDER BY spawn.created_at DESC, spawn.child_session_id ASC
+               LIMIT ?4"#,
+        )?;
+        query_rows(
+            &mut statement,
+            &[
+                &account_id,
+                &actor_user_id,
+                &parent_session_id,
+                &fetch_limit,
+            ],
+        )?
+    };
+    let has_more = rows.len() > limit;
+    let mut items = Vec::with_capacity(rows.len().min(limit));
+    for (stored_child, stored_parent_id, parent_sequence, inherited_turns, created_at) in
+        rows.into_iter().take(limit)
+    {
+        let child = stored_child.decode()?;
+        validate_session_event_tail(connection, &child)?;
+        items.push(SessionForkSummary {
+            session: child,
+            fork: SessionFork {
+                parent_session_id: stored_parent_id,
+                parent_sequence: i64_to_u64(parent_sequence, "subagent parent sequence")?,
+                inherited_turns: i64_to_u64(inherited_turns, "subagent inherited turn count")?,
+                created_at,
+            },
+        });
+    }
+    let next_cursor = if has_more {
+        let last = items.last().ok_or_else(|| {
+            StorageError::CorruptData("subagent page sentinel has no returned item".into())
+        })?;
+        Some(cursor::encode_agent_subagents(
+            account_id,
+            actor_user_id,
+            parent_session_id,
+            &last.fork.created_at,
+            &last.session.id,
+        )?)
+    } else {
+        None
+    };
+    Ok(SessionForkPage { items, next_cursor })
+}
+
+fn query_subagent_spawn_candidate_for_started_tool(
+    connection: &mut Connection,
+    scope: &ExecutionScope,
+    call_id: &str,
+) -> Result<AgentSubagentSpawnCandidate, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let call = query_agent_tool_call(&transaction, call_id)?;
+    let agent = query_agent_turn(&transaction, &call.agent_id)?;
+    if call.status != AgentToolCallStatus::Running
+        || call.tool_name != subagents::SPAWN_AGENT_TOOL_NAME
+        || call.tool_version != subagents::SPAWN_AGENT_TOOL_VERSION
+        || call.account_id.as_str() != scope.account_id
+        || call.session_id != scope.session_id
+        || call.turn_id != scope.turn_id
+        || call.agent_id != scope.agent_id
+        || agent.account_id.as_str() != scope.account_id
+        || agent.actor_user_id != scope.actor_id
+        || agent.session_id != scope.session_id
+        || agent.turn_id != scope.turn_id
+    {
+        return Err(StorageError::AgentToolCallNotFound(call_id.to_owned()));
+    }
+    let role = transaction
+        .query_row(
+            r#"SELECT membership.role
+               FROM accounts account
+               JOIN account_memberships membership
+                 ON membership.account_id = account.id
+               JOIN users user ON user.id = membership.user_id
+               JOIN sessions session ON session.account_id = account.id
+               WHERE account.id = ?1
+                 AND account.status = 'active'
+                 AND membership.user_id = ?2
+                 AND membership.status = 'active'
+                 AND membership.revision = ?3
+                 AND user.status = 'active'
+                 AND session.id = ?4"#,
+            params![
+                agent.account_id.as_str(),
+                agent.actor_user_id,
+                u64_to_i64(
+                    agent.actor_membership_revision.get(),
+                    "subagent spawn membership revision"
+                )?,
+                agent.session_id,
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|role| decode_membership_role(&role))
+        .transpose()?
+        .filter(|role| membership_allows(*role, AccountCapability::Reply))
+        .ok_or(StorageError::PermissionDenied)?;
+    let parent_session = query_session_summary(&transaction, &agent.session_id)?;
+    if parent_session.status != SessionStatus::Running
+        || parent_session.active_turn_id.as_deref() != Some(agent.turn_id.as_str())
+    {
+        return Err(StorageError::InvalidAgentTransition(
+            "spawn_agent parent is not the active running Session turn".into(),
+        ));
+    }
+    let (user_sequence, _) =
+        query_session_user_message_event(&transaction, &agent.session_id, &agent.turn_id)?;
+    let parent_sequence = user_sequence.checked_sub(1).ok_or_else(|| {
+        StorageError::CorruptData("spawn_agent parent user event has no history boundary".into())
+    })?;
+    let inherited_turns: i64 = transaction.query_row(
+        r#"SELECT COUNT(*)
+           FROM session_events flushed
+           JOIN session_events assistant
+             ON assistant.session_id = flushed.session_id
+            AND assistant.turn_id = flushed.turn_id
+            AND assistant.sequence + 1 = flushed.sequence
+            AND assistant.event_kind = 'assistant_message'
+           JOIN session_turns turn
+             ON turn.session_id = flushed.session_id
+            AND turn.id = flushed.turn_id
+           WHERE flushed.session_id = ?1
+             AND flushed.event_kind = 'turn_flushed'
+             AND flushed.sequence <= ?2
+             AND turn.status = 'flushed'
+             AND turn.assistant_message IS NOT NULL"#,
+        params![
+            agent.session_id,
+            u64_to_i64(parent_sequence, "subagent parent sequence")?
+        ],
+        |row| row.get(0),
+    )?;
+    let manifest_digest = agent.deployment_manifest_digest.as_deref().ok_or_else(|| {
+        StorageError::InvalidAgentTransition(
+            "spawn_agent requires a deployment-bound parent Agent".into(),
+        )
+    })?;
+    let manifest = query_agent_deployment_manifest(&transaction, manifest_digest)?;
+    let auth_session_id =
+        AuthSessionId::from_persistence("subagent-spawn-driver-v1").map_err(|error| {
+            StorageError::CorruptData(format!(
+                "invalid internal subagent spawn authority ID: {error}"
+            ))
+        })?;
+    let candidate = AgentSubagentSpawnCandidate {
+        authz: AuthzContext {
+            account_id: agent.account_id,
+            user_id: agent.actor_user_id,
+            membership_role: role,
+            membership_revision: agent.actor_membership_revision,
+            auth_session_id,
+        },
+        parent_session,
+        parent_sequence,
+        inherited_turns: i64_to_u64(inherited_turns, "subagent inherited turn count")?,
+        manifest,
+    };
+    transaction.commit()?;
+    Ok(candidate)
 }
 
 fn query_agent_todo_snapshot_for_call(
@@ -6857,6 +7146,242 @@ pub(super) fn verify_agent_model_output_integrity(
                     "Agent model output `{job_id}` does not match its terminal response"
                 )));
             }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn verify_agent_subagent_spawn_integrity(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    let invalid_completion = connection
+        .query_row(
+            r#"SELECT call.call_id
+               FROM agent_tool_calls call
+               LEFT JOIN agent_subagent_spawns spawn ON spawn.call_id = call.call_id
+               WHERE call.tool_name = ?1 AND call.tool_version = ?2
+                 AND ((call.status = 'succeeded' AND spawn.call_id IS NULL)
+                      OR (call.status <> 'succeeded' AND spawn.call_id IS NOT NULL))
+               LIMIT 1"#,
+            params![
+                subagents::SPAWN_AGENT_TOOL_NAME,
+                subagents::SPAWN_AGENT_TOOL_VERSION,
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(call_id) = invalid_completion {
+        return Err(StorageError::CorruptData(format!(
+            "spawn_agent call `{call_id}` is not bound to exactly one successful child admission"
+        )));
+    }
+
+    let over_direct_limit = connection
+        .query_row(
+            r#"SELECT parent_session_id
+               FROM agent_subagent_spawns
+               GROUP BY account_id, parent_session_id
+               HAVING COUNT(*) > ?1
+               LIMIT 1"#,
+            [i64::try_from(subagents::SPAWN_AGENT_MAX_DIRECT_CHILDREN)
+                .map_err(|_| StorageError::IntegerOutOfRange("subagent direct-child limit"))?],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(parent_session_id) = over_direct_limit {
+        return Err(StorageError::CorruptData(format!(
+            "subagent parent `{parent_session_id}` exceeds the durable direct-child limit"
+        )));
+    }
+    let over_depth_limit = connection
+        .query_row(
+            r#"WITH RECURSIVE ancestry(origin, session_id, depth) AS (
+                   SELECT child_session_id, parent_session_id, 1
+                   FROM agent_subagent_spawns
+                   UNION ALL
+                   SELECT ancestry.origin, spawn.parent_session_id, ancestry.depth + 1
+                   FROM ancestry
+                   JOIN agent_subagent_spawns spawn
+                     ON spawn.child_session_id = ancestry.session_id
+                   WHERE ancestry.depth <= ?1
+               )
+               SELECT origin FROM ancestry WHERE depth > ?1 LIMIT 1"#,
+            [i64::try_from(subagents::SPAWN_AGENT_MAX_DEPTH)
+                .map_err(|_| StorageError::IntegerOutOfRange("subagent depth limit"))?],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(child_session_id) = over_depth_limit {
+        return Err(StorageError::CorruptData(format!(
+            "subagent child `{child_session_id}` exceeds the durable ancestry depth limit"
+        )));
+    }
+
+    let mut statement = connection.prepare(
+        r#"SELECT call_id, account_id, actor_user_id, parent_session_id,
+                  parent_turn_id, parent_agent_id, parent_sequence,
+                  child_session_id, child_turn_id, child_agent_id,
+                  description, prompt_digest, created_at
+           FROM agent_subagent_spawns
+           ORDER BY call_id"#,
+    )?;
+    let spawns = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, String>(12)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    for (
+        call_id,
+        account_id,
+        actor_user_id,
+        parent_session_id,
+        parent_turn_id,
+        parent_agent_id,
+        parent_sequence,
+        child_session_id,
+        child_turn_id,
+        child_agent_id,
+        description,
+        prompt_digest,
+        created_at,
+    ) in spawns
+    {
+        let call = query_agent_tool_call(connection, &call_id)?;
+        let parent_agent = query_agent_turn(connection, &parent_agent_id)?;
+        let child_agent = query_agent_turn(connection, &child_agent_id)?;
+        let child_turn = query_session_turn(connection, &child_session_id, &child_turn_id)?;
+        let child_session = query_session_summary(connection, &child_session_id)?;
+        let request = subagents::prepare_spawn_agent(&call.arguments_json).map_err(|error| {
+            StorageError::CorruptData(format!(
+                "spawn_agent call `{call_id}` has invalid durable arguments: {error}"
+            ))
+        })?;
+        let result: subagents::SpawnAgentResult =
+            serde_json::from_value(call.result_json.clone().ok_or_else(|| {
+                StorageError::CorruptData(format!(
+                    "spawn_agent call `{call_id}` has no successful durable result"
+                ))
+            })?)
+            .map_err(|error| {
+                StorageError::CorruptData(format!(
+                    "spawn_agent call `{call_id}` has an invalid durable result: {error}"
+                ))
+            })?;
+        let identity =
+            subagents::spawn_agent_identity(&parent_session_id, &call_id).map_err(|error| {
+                StorageError::CorruptData(format!(
+                    "spawn_agent call `{call_id}` has invalid identity material: {error}"
+                ))
+            })?;
+        let expected_prompt_digest =
+            subagents::spawn_prompt_digest(request.prompt()).map_err(|error| {
+                StorageError::CorruptData(format!(
+                    "spawn_agent call `{call_id}` has invalid prompt material: {error}"
+                ))
+            })?;
+        let (
+            fork_account_id,
+            fork_parent_session_id,
+            fork_parent_sequence,
+            inherited_turns,
+            fork_actor_user_id,
+            fork_membership_revision,
+            fork_created_at,
+        ) = connection.query_row(
+            r#"SELECT account_id, parent_session_id, parent_sequence,
+                      inherited_turn_count, created_by_user_id,
+                      created_by_membership_revision, created_at
+               FROM session_forks WHERE child_session_id = ?1"#,
+            [&child_session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )?;
+        let parent_sequence = i64_to_u64(parent_sequence, "subagent parent sequence")?;
+        let inherited_turns = i64_to_u64(inherited_turns, "subagent inherited turn count")?;
+        let (parent_user_sequence, _) =
+            query_session_user_message_event(connection, &parent_session_id, &parent_turn_id)?;
+        let (child_user_sequence, _) =
+            query_session_user_message_event(connection, &child_session_id, &child_turn_id)?;
+        let expected_child_user_sequence = inherited_turns
+            .checked_mul(3)
+            .and_then(|value| value.checked_add(2))
+            .ok_or(StorageError::IntegerOutOfRange(
+                "subagent child user sequence",
+            ))?;
+        let fork_membership_revision = i64_to_u64(
+            fork_membership_revision,
+            "subagent fork membership revision",
+        )?;
+        let expected_parent_sequence = parent_user_sequence.checked_sub(1).ok_or_else(|| {
+            StorageError::CorruptData(format!(
+                "spawn_agent call `{call_id}` has no parent history boundary"
+            ))
+        })?;
+        if call.status != AgentToolCallStatus::Succeeded
+            || call.account_id.as_str() != account_id
+            || call.session_id != parent_session_id
+            || call.turn_id != parent_turn_id
+            || call.agent_id != parent_agent_id
+            || parent_agent.actor_user_id != actor_user_id
+            || parent_agent.account_id.as_str() != account_id
+            || parent_sequence != expected_parent_sequence
+            || result.subagent_id != identity.session_id
+            || child_session_id != identity.session_id
+            || child_turn_id != identity.turn_id
+            || child_agent_id != identity.agent_id
+            || description != request.description()
+            || child_session.title != description
+            || child_turn.user_message != request.prompt()
+            || prompt_digest != expected_prompt_digest
+            || fork_account_id != account_id
+            || fork_parent_session_id != parent_session_id
+            || i64_to_u64(fork_parent_sequence, "subagent fork parent sequence")? != parent_sequence
+            || fork_actor_user_id != actor_user_id
+            || fork_membership_revision != parent_agent.actor_membership_revision.get()
+            || fork_created_at != created_at
+            || child_session.created_at != created_at
+            || child_turn.started_at != created_at
+            || child_agent.created_at != created_at
+            || child_agent.account_id.as_str() != account_id
+            || child_agent.actor_user_id != actor_user_id
+            || child_agent.actor_membership_revision != parent_agent.actor_membership_revision
+            || child_agent.session_id != child_session_id
+            || child_agent.turn_id != child_turn_id
+            || child_turn.ordinal != inherited_turns + 1
+            || child_user_sequence != expected_child_user_sequence
+            || child_agent.deployment_manifest_digest != parent_agent.deployment_manifest_digest
+            || child_agent.environment != parent_agent.environment
+            || child_agent.provider_name != parent_agent.provider_name
+            || child_agent.model_name != parent_agent.model_name
+        {
+            return Err(StorageError::CorruptData(format!(
+                "spawn_agent call `{call_id}` has inconsistent durable child evidence"
+            )));
         }
     }
     Ok(())
@@ -10154,6 +10679,272 @@ fn replay_agent_tool_completion(
         Err(StorageError::CorruptData(
             "terminal agent tool result has no continuation model job".into(),
         ))
+    }
+}
+
+fn prepare_agent_subagent_completion(
+    call: &AgentToolCall,
+    commit: &AgentToolCompletionCommit,
+    spawn: Option<&AgentSubagentSpawnCommit>,
+) -> Result<Option<AgentSubagentSpawnCommit>, StorageError> {
+    let is_spawn = call.tool_name == subagents::SPAWN_AGENT_TOOL_NAME
+        && call.tool_version == subagents::SPAWN_AGENT_TOOL_VERSION;
+    if !is_spawn {
+        if spawn.is_some() {
+            return Err(StorageError::InvalidAgentTransition(
+                "a non-spawn tool cannot carry a subagent admission".into(),
+            ));
+        }
+        return Ok(None);
+    }
+    if commit.status != AgentToolCallStatus::Succeeded {
+        if spawn.is_some() {
+            return Err(StorageError::InvalidAgentTransition(
+                "a failed spawn_agent result cannot create a child Agent".into(),
+            ));
+        }
+        return Ok(None);
+    }
+    let spawn = spawn.ok_or_else(|| {
+        StorageError::InvalidAgentTransition(
+            "a successful spawn_agent result requires one atomic child admission".into(),
+        )
+    })?;
+    let request = subagents::prepare_spawn_agent(&call.arguments_json).map_err(|error| {
+        StorageError::InvalidAgentTransition(format!(
+            "spawn_agent arguments are not canonical: {error}"
+        ))
+    })?;
+    let result: subagents::SpawnAgentResult = serde_json::from_value(commit.result_json.clone())
+        .map_err(|error| {
+            StorageError::InvalidAgentTransition(format!(
+                "spawn_agent result is not canonical: {error}"
+            ))
+        })?;
+    let identity = subagents::spawn_agent_identity(&call.session_id, &call.call_id)
+        .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+    if result.subagent_id != identity.session_id
+        || spawn.fork.id != identity.session_id
+        || spawn.fork.title != request.description()
+        || spawn.fork.through_sequence != spawn.parent_sequence
+        || spawn.start.turn_id != identity.turn_id
+        || spawn.start.user_message != request.prompt()
+        || spawn.start.expected_sequence == 0
+        || spawn.agent.id != identity.agent_id
+        || spawn.agent.authz.account_id != call.account_id
+        || spawn.agent.authz.user_id.is_empty()
+        || spawn.agent.environment.is_empty()
+    {
+        return Err(StorageError::InvalidAgentTransition(
+            "spawn_agent admission does not match its exact persisted call".into(),
+        ));
+    }
+    Ok(Some(spawn.clone()))
+}
+
+fn verify_replayed_agent_subagent_completion(
+    connection: &Connection,
+    call: &AgentToolCall,
+    prepared: Option<&AgentSubagentSpawnCommit>,
+) -> Result<(), StorageError> {
+    let stored = connection
+        .query_row(
+            r#"SELECT account_id, actor_user_id, parent_session_id,
+                      parent_turn_id, parent_agent_id, parent_sequence,
+                      child_session_id, child_turn_id, child_agent_id,
+                      description, prompt_digest
+               FROM agent_subagent_spawns WHERE call_id = ?1"#,
+            [&call.call_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                ))
+            },
+        )
+        .optional()?;
+    match (prepared, stored) {
+        (None, None) => Ok(()),
+        (Some(prepared), Some(stored)) => {
+            let prompt_digest = subagents::spawn_prompt_digest(&prepared.start.user_message)
+                .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+            if stored.0 == call.account_id.as_str()
+                && stored.1 == prepared.agent.authz.user_id
+                && stored.2 == call.session_id
+                && stored.3 == call.turn_id
+                && stored.4 == call.agent_id
+                && stored.5 == u64_to_i64(prepared.parent_sequence, "subagent parent sequence")?
+                && stored.6 == prepared.fork.id
+                && stored.7 == prepared.start.turn_id
+                && stored.8 == prepared.agent.id
+                && stored.9 == prepared.fork.title
+                && stored.10 == prompt_digest
+            {
+                Ok(())
+            } else {
+                Err(StorageError::InvalidAgentTransition(
+                    "spawn_agent replay conflicts with its durable child admission".into(),
+                ))
+            }
+        }
+        _ => Err(StorageError::InvalidAgentTransition(
+            "spawn_agent replay disagrees with its durable child admission".into(),
+        )),
+    }
+}
+
+fn require_agent_subagent_capacity(
+    connection: &Connection,
+    call: &AgentToolCall,
+) -> Result<(), StorageError> {
+    let direct_limit = i64::try_from(subagents::SPAWN_AGENT_MAX_DIRECT_CHILDREN)
+        .map_err(|_| StorageError::IntegerOutOfRange("subagent direct-child limit"))?;
+    let direct_count: i64 = connection.query_row(
+        r#"SELECT COUNT(*) FROM (
+               SELECT 1 FROM agent_subagent_spawns
+               WHERE account_id = ?1 AND parent_session_id = ?2
+               LIMIT ?3
+           )"#,
+        params![call.account_id.as_str(), call.session_id, direct_limit],
+        |row| row.get(0),
+    )?;
+    if direct_count >= direct_limit {
+        return Err(StorageError::SubagentAdmissionRejected);
+    }
+    let max_depth = i64::try_from(subagents::SPAWN_AGENT_MAX_DEPTH)
+        .map_err(|_| StorageError::IntegerOutOfRange("subagent depth limit"))?;
+    let parent_depth: i64 = connection.query_row(
+        r#"WITH RECURSIVE ancestry(session_id, depth) AS (
+               SELECT ?1, 0
+               UNION ALL
+               SELECT spawn.parent_session_id, ancestry.depth + 1
+               FROM ancestry
+               JOIN agent_subagent_spawns spawn
+                 ON spawn.child_session_id = ancestry.session_id
+               WHERE ancestry.depth < ?2
+           )
+           SELECT COALESCE(MAX(depth), 0) FROM ancestry"#,
+        params![call.session_id, max_depth],
+        |row| row.get(0),
+    )?;
+    if parent_depth >= max_depth {
+        return Err(StorageError::SubagentAdmissionRejected);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_agent_subagent_spawn(
+    connection: &Connection,
+    call: &AgentToolCall,
+    parent_agent: &AgentTurn,
+    spawn: &AgentSubagentSpawnCommit,
+    limits: &StorageLimits,
+    physical_limits: &SqlitePhysicalLimits,
+    timestamp: &str,
+) -> Result<(), StorageError> {
+    if !agent_actor_is_authorized(connection, parent_agent)? {
+        return Err(StorageError::PermissionDenied);
+    }
+    let (user_sequence, _) =
+        query_session_user_message_event(connection, &call.session_id, &call.turn_id)?;
+    let parent_sequence = user_sequence.checked_sub(1).ok_or_else(|| {
+        StorageError::CorruptData("spawn_agent parent user event has no history boundary".into())
+    })?;
+    if spawn.parent_sequence != parent_sequence
+        || spawn.agent.authz.account_id != parent_agent.account_id
+        || spawn.agent.authz.user_id != parent_agent.actor_user_id
+        || spawn.agent.authz.membership_revision != parent_agent.actor_membership_revision
+        || spawn.agent.manifest.digest
+            != parent_agent
+                .deployment_manifest_digest
+                .clone()
+                .unwrap_or_default()
+        || spawn.agent.environment != parent_agent.environment
+        || spawn.agent.provider_name != parent_agent.provider_name
+        || spawn.agent.model_name != parent_agent.model_name
+    {
+        return Err(StorageError::InvalidAgentTransition(
+            "spawn_agent child authority or deployment differs from its parent".into(),
+        ));
+    }
+    require_agent_subagent_capacity(connection, call)?;
+    let fork = super::fork_session(
+        connection,
+        &spawn.agent.authz,
+        &call.session_id,
+        spawn.fork.clone(),
+        &call.call_id,
+        limits,
+        physical_limits,
+        true,
+        Some(timestamp),
+    )
+    .map_err(subagent_admission_error)?;
+    if fork.replayed
+        || fork.session.sequence != spawn.start.expected_sequence
+        || fork.fork.parent_sequence != spawn.parent_sequence
+    {
+        return Err(StorageError::InvalidAgentTransition(
+            "spawn_agent fork admission changed before completion".into(),
+        ));
+    }
+    let (child_agent, _) = super::insert_subagent_initial_turn(
+        connection,
+        &spawn.fork.id,
+        &spawn.start,
+        &spawn.agent,
+        limits,
+        physical_limits,
+        timestamp,
+    )
+    .map_err(subagent_admission_error)?;
+    let prompt_digest = subagents::spawn_prompt_digest(&spawn.start.user_message)
+        .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+    connection.execute(
+        r#"INSERT INTO agent_subagent_spawns(
+               call_id, account_id, actor_user_id, parent_session_id,
+               parent_turn_id, parent_agent_id, parent_sequence,
+               child_session_id, child_turn_id, child_agent_id,
+               description, prompt_digest, created_at
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
+        params![
+            call.call_id,
+            call.account_id.as_str(),
+            parent_agent.actor_user_id,
+            call.session_id,
+            call.turn_id,
+            call.agent_id,
+            u64_to_i64(spawn.parent_sequence, "subagent parent sequence")?,
+            spawn.fork.id,
+            spawn.start.turn_id,
+            child_agent.id,
+            spawn.fork.title,
+            prompt_digest,
+            timestamp,
+        ],
+    )?;
+    Ok(())
+}
+
+fn subagent_admission_error(error: StorageError) -> StorageError {
+    match error {
+        StorageError::StorageQuotaExceeded
+        | StorageError::PhysicalStorageExhausted
+        | StorageError::ReplyQueueCapacityExceeded
+        | StorageError::FinalizationReservationUnavailable => {
+            StorageError::SubagentAdmissionRejected
+        }
+        other => other,
     }
 }
 

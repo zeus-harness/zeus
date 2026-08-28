@@ -9,6 +9,7 @@ const CURSOR_MAX_BYTES: usize = 64 * 1024;
 
 const SESSION_LIST_KIND: &str = "session_list";
 const SESSION_FORKS_KIND: &str = "session_forks";
+const AGENT_SUBAGENTS_KIND: &str = "agent_subagents";
 const SESSION_RUN_IDS_KIND: &str = "session_run_ids";
 const SESSION_TURNS_KIND: &str = "session_turns";
 const SESSION_EVENTS_KIND: &str = "session_events";
@@ -93,6 +94,38 @@ pub(crate) fn decode_session_forks(
     decode_text_key(
         value,
         SESSION_FORKS_KIND,
+        account_id,
+        actor_user_id,
+        parent_session_id,
+    )
+}
+
+pub(crate) fn encode_agent_subagents(
+    account_id: &str,
+    actor_user_id: &str,
+    parent_session_id: &str,
+    created_at: &str,
+    child_session_id: &str,
+) -> Result<String, StorageError> {
+    encode_scoped_text_key(
+        AGENT_SUBAGENTS_KIND,
+        account_id,
+        actor_user_id,
+        parent_session_id,
+        created_at,
+        child_session_id,
+    )
+}
+
+pub(crate) fn decode_agent_subagents(
+    value: &str,
+    account_id: &str,
+    actor_user_id: &str,
+    parent_session_id: &str,
+) -> Result<TextKeyCursor, StorageError> {
+    decode_text_key(
+        value,
+        AGENT_SUBAGENTS_KIND,
         account_id,
         actor_user_id,
         parent_session_id,
@@ -495,6 +528,23 @@ mod tests {
         assert!(decode_session_forks(&forks, "acc-a", "actor-b", "session-a").is_err());
         assert!(decode_session_forks(&forks, "acc-a", "actor-a", "session-b").is_err());
         assert!(decode_session_list(&forks, "acc-a", "actor-a").is_err());
+
+        let subagents = encode_agent_subagents(
+            "acc-a",
+            "actor-a",
+            "session-a",
+            "2026-01-01T00:00:00Z",
+            "session-child",
+        )
+        .unwrap();
+        assert_eq!(
+            decode_agent_subagents(&subagents, "acc-a", "actor-a", "session-a").unwrap(),
+            TextKeyCursor {
+                first: "2026-01-01T00:00:00Z".into(),
+                second: "session-child".into(),
+            }
+        );
+        assert!(decode_session_forks(&subagents, "acc-a", "actor-a", "session-a").is_err());
     }
 
     #[test]

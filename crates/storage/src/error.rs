@@ -96,6 +96,8 @@ pub enum StorageError {
     OperationCapacityExceeded,
     #[error("the durable reply queue is at capacity")]
     ReplyQueueCapacityExceeded,
+    #[error("the durable subagent admission is at capacity")]
+    SubagentAdmissionRejected,
     #[error("the durable dispatch queue is at capacity")]
     DispatchQueueCapacityExceeded,
     #[error("the authentication session store is at capacity")]

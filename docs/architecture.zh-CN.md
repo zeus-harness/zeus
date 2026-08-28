@@ -34,10 +34,11 @@ Client / SvelteKit Web
   生命周期与 revision CAS；它只准备有界规范状态，持久化权威仍由 SQLite 掌握。
 - `skills`：启动时一次性加载的 strict version 1 Skill Catalog、确定性 digest，以及只读
   `skill_list` / `skill_load` executor；Skill body 只有通过普通工具结果才对模型可见。
-- `subagents`：只读 `list_agents` 工具契约、严格参数边界与有界结果；durable scope 和分页读取
-  由 runtime/storage 掌握，不由通用 executor 接受调用方自报身份。
+- `subagents`：`spawn_agent` / `list_agents` 工具契约、严格参数边界、确定性 child identity 与
+  有界结果；durable scope、原子 admission 和分页读取由 runtime/storage 掌握，不由通用 executor
+  接受调用方自报身份。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
-- `storage`：schema v35 migration、有界 account/membership 权威、一次性 member setup、用户/偏好、
+- `storage`：schema v36 migration、有界 account/membership 权威、一次性 member setup、用户/偏好、
   account audit/rollup/policy/archive state、独立 Session/Run ledger、typed event lookup、
   account+actor-scoped 回执、durable Agent/model/tool/dispatch queue、不可变 model output、
   不可变 deployment manifest，
@@ -134,11 +135,17 @@ schema v35 增加 durable direct-child fork catalog。读取先复验 parent 的
 lineage 扫描或临时排序。Catalog 只返回直接 child 的 Session summary 与 immutable fork metadata，
 递归分支遍历由调用方逐层完成。
 
-Agent-facing `list_agents@1-direct-session-forks` 复用 schema v35 的 durable catalog，但收紧为默认
-16、最多 32 条。Runtime 只在 exact Agent tool call 已落盘为 `started` 后分派，storage 在同一只读
-事务中复验 account/actor/Session/turn/Agent/call ID、工具名与版本，再从 server-derived parent
-Session 读取直接 child；伪造 call scope 在 cursor 解析前失败。该阶段只提供发现能力，不包含
-model-facing spawn、send、interrupt 或递归全图加载。
+schema v36 增加 Agent-native durable child admission。`spawn_agent@1-durable-session-fork`
+在 exact parent tool 已 durable started 后生成确定性 child Session/turn/Agent ID；known-success
+completion 与 fork、首个 user turn、deployment-bound Agent/model job、parent call binding 在同一
+SQLite transaction 提交。Child 只继承 parent 当前 user event 之前已经完整 flush 的历史；直属 child
+上限 8、ancestry 上限 3，容量失败全量回滚并作为 known failure 回灌 parent。
+
+Agent-facing `list_agents@1-direct-session-forks` 只读取 `agent_subagent_spawns` 绑定的直接 child，
+不会把普通 Session fork 冒充 Agent。Runtime 只在 exact Agent tool call 已落盘为 `started` 后分派，
+storage 在同一只读事务中复验 account/actor/Session/turn/Agent/call ID、工具名与版本；cursor 另用
+独立 kind 并绑定 account/actor/parent。当前阶段可后台启动与发现 child，但不提供 send、interrupt
+或递归全图加载。
 
 schema v28 增加 Agent turn 自有的 durable plan。`todo_write@1-single-active` 每次提交完整列表，
 最多 24 项、每项 256 UTF-8 bytes、至多一个 `in_progress`；首写 `expected_revision=0`，之后严格
@@ -363,7 +370,7 @@ connector 在数据库事务和锁之外运行。
 
 API 监听端口之前按固定顺序完成：
 
-1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v35；按当前
+1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v36；按当前
    detailed-row limit 以最多 64 行 batch 压缩 bootstrap terminal audit prefix，再按稳定
    `(priority actor, expires_at, auth-session ID)` 顺序最多清理 64 个过期或绑定
    missing/disabled/suspended/stale-revision authority 的 auth session。

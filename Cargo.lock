@@ -1487,6 +1487,7 @@ dependencies = [
  "protocol",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tools",
 ]

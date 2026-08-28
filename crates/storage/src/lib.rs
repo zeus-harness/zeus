@@ -664,6 +664,19 @@ pub struct AgentGoalRoundCandidate {
     pub goal: goals::GoalSnapshot,
 }
 
+/// Runtime-only inputs needed to build a child Agent request for one exact
+/// durably started `spawn_agent` call. The synthetic auth-session ID is never
+/// accepted by public routes; the completion transaction rechecks the stored
+/// membership revision and direct-parent call binding.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentSubagentSpawnCandidate {
+    pub authz: AuthzContext,
+    pub parent_session: SessionSummary,
+    pub parent_sequence: u64,
+    pub inherited_turns: u64,
+    pub manifest: ManifestEnvelope,
+}
+
 /// Read-only scheduling candidate for the first queued follow-up of one Ready
 /// Session. The synthetic auth-session ID is internal; durable admission
 /// rechecks the captured membership revision without trusting a browser login.
@@ -1241,6 +1254,17 @@ pub struct AgentToolCompletionCommit {
     pub result_json: Value,
     pub provider_request_id: Option<String>,
     pub next_request_json: Option<Value>,
+}
+
+/// Atomic child admission attached to one successful parent `spawn_agent`
+/// completion. Every identifier and immutable request is server-derived;
+/// storage binds it back to the exact started call before inserting anything.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentSubagentSpawnCommit {
+    pub parent_sequence: u64,
+    pub fork: protocol::ForkSessionRequest,
+    pub start: protocol::StartTurnRequest,
+    pub agent: AgentTurnSpec,
 }
 
 #[derive(Clone, Debug, PartialEq)]

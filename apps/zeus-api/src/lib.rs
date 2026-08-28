@@ -31,16 +31,16 @@ use axum::{
 use deployment::{ManifestDiff, ManifestEnvelope};
 use execution::{AgentExecutionExplain, AgentRunEpochExplain};
 use futures_util::StreamExt;
+#[cfg(test)]
+use llm::ReplyMessage;
 use llm::{
     AGENT_REQUEST_INITIAL_CONTENT_MAX_BYTES, AGENT_REQUEST_MAX_HISTORY_PAIRS_WITH_CONTEXT,
     LocalFallbackProvider, ProviderError, ReplyKind, ReplyOutput, ReplyProvider, ReplyRequest,
-    ReplyResponse, ReplyStreamEvent, ReplyToolCall, ReplyToolDefinition,
+    ReplyResponse, ReplyRole, ReplyStreamEvent, ReplyToolCall, ReplyToolDefinition,
     agent_continuation_request, persisted_agent_reply_request, validate_agent_reply_request,
     validate_agent_reply_response_for_request, validate_compaction_response,
     validate_provider_metadata, validate_reply_request, validate_reply_response_for_request,
 };
-#[cfg(test)]
-use llm::{ReplyMessage, ReplyRole};
 use protocol::{
     ACCOUNT_AUDIT_EVENT_SCHEMA, ACCOUNT_AUDIT_EXPORT_MANIFEST_KIND,
     ACCOUNT_AUDIT_EXPORT_SCHEMA_VERSION,
@@ -76,13 +76,13 @@ use runtime::{
     AgentModelCancellationGuard, AgentModelClaimOutcome, AgentModelCompletion,
     AgentModelFailureCommit, AgentModelJob, AgentModelResolution, AgentModelStartOutcome,
     AgentModelSuccessCommit, AgentPromptRevisionPage, AgentPromptState, AgentPromptUpdateResult,
-    AgentReviewCommit, AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome,
-    AgentToolCompletion, AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit,
-    AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal,
-    AuthSessionCommit, AuthzContext, BootstrapOwnerCommit, CreateAccountCommit, DemoStore,
-    EntryRevision, KnowledgeCatalogRevisionPage, KnowledgeCatalogState,
-    KnowledgeCatalogUpdateResult, MemberSetupCommit, PublishedEvent, ReplyClaimOutcome,
-    ReplyFailureCommit, ReplyJob, ReplyOutcomeUnknownCommit, ReplySuccessCommit,
+    AgentReviewCommit, AgentSubagentSpawnCommit, AgentToolCall, AgentToolCallSpec,
+    AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
+    AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe,
+    AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthzContext, BootstrapOwnerCommit,
+    CreateAccountCommit, DemoStore, EntryRevision, ExecutionScope, KnowledgeCatalogRevisionPage,
+    KnowledgeCatalogState, KnowledgeCatalogUpdateResult, MemberSetupCommit, PublishedEvent,
+    ReplyClaimOutcome, ReplyFailureCommit, ReplyJob, ReplyOutcomeUnknownCommit, ReplySuccessCommit,
     SessionCompactionClaimOutcome, SessionCompactionFailureCommit, SessionCompactionJob,
     SessionCompactionSuccessCommit, StoreError, StoredAccount, StoredAccountStatus, StoredMember,
     StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserStatus,
@@ -3660,6 +3660,130 @@ async fn current_agent_manifest(
     )
 }
 
+async fn prepare_agent_subagent_spawn(
+    state: &ApiState,
+    work: &AgentToolWork,
+) -> Result<AgentSubagentSpawnCommit, StoreError> {
+    let request = subagents::prepare_spawn_agent(&work.call.arguments_json)
+        .map_err(|error| StoreError::InvalidAgentTransition(error.to_string()))?;
+    let scope = ExecutionScope::new(
+        work.call.account_id.as_str(),
+        work.model_job.actor_user_id.as_str(),
+        work.call.session_id.as_str(),
+        work.call.turn_id.as_str(),
+        work.call.agent_id.as_str(),
+    )
+    .map_err(|error| StoreError::InvalidAgentTransition(error.to_string()))?;
+    let candidate = state
+        .store
+        .subagent_spawn_candidate_for_started_tool(&scope, &work.call.call_id)
+        .await?;
+    let identity = subagents::spawn_agent_identity(&work.call.session_id, &work.call.call_id)
+        .map_err(|error| StoreError::InvalidAgentTransition(error.to_string()))?;
+    let parent_request: ReplyRequest = serde_json::from_value(work.model_job.request_json.clone())
+        .map_err(|error| {
+            StoreError::InvalidAgentTransition(format!(
+                "spawn_agent parent request is not typed: {error}"
+            ))
+        })?;
+    let system_prompt = parent_request
+        .messages
+        .iter()
+        .find(|message| message.role == ReplyRole::System)
+        .map(|message| message.content.as_str())
+        .ok_or_else(|| {
+            StoreError::InvalidAgentTransition(
+                "spawn_agent requires the exact parent system prompt".into(),
+            )
+        })?;
+    validate_agent_initial_content_budget(system_prompt, request.prompt()).map_err(|_| {
+        StoreError::InvalidAgentTransition(
+            "spawn_agent prompt exceeds the initial model content budget".into(),
+        )
+    })?;
+    let knowledge = state
+        .store
+        .current_session_agent_knowledge_context_for_account(
+            &candidate.authz.account_id,
+            request.prompt(),
+        )
+        .await?;
+    let checkpoint = state
+        .store
+        .session_context_checkpoint_for_account(
+            &candidate.authz.account_id,
+            &candidate.parent_session.id,
+            candidate.parent_sequence,
+        )
+        .await?;
+    let reply_turns = state
+        .store
+        .session_reply_turns_after_for_account(
+            &candidate.authz.account_id,
+            &candidate.parent_session.id,
+            checkpoint
+                .as_ref()
+                .map_or(0, |checkpoint| checkpoint.source_end_sequence),
+            candidate.parent_sequence,
+            AGENT_REQUEST_MAX_HISTORY_PAIRS_WITH_CONTEXT,
+        )
+        .await?;
+    let mut child_request =
+        ReplyRequest::from_session_history_for_agent_with_optional_system_prompt_checkpoint_and_context(
+            &reply_turns,
+            request.prompt().to_owned(),
+            Some(system_prompt),
+            checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.summary_text.as_str()),
+            knowledge.snapshot.snapshot().canonical_context(),
+        )
+        .map_err(|error| StoreError::InvalidAgentTransition(error.to_string()))?;
+    child_request.tools = agent_tools_from_manifest(&candidate.manifest);
+    let request_json = persisted_agent_reply_request(&child_request)
+        .map_err(|error| StoreError::InvalidAgentTransition(error.to_string()))?;
+    let inherited_events = candidate
+        .inherited_turns
+        .checked_mul(3)
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| {
+            StoreError::InvalidAgentTransition(
+                "spawn_agent inherited Session sequence overflowed".into(),
+            )
+        })?;
+    let provider = &candidate.manifest.manifest.deployment.spec.provider;
+    if provider.provider_id != work.model_job.provider_name
+        || provider.model != work.model_job.model_name
+    {
+        return Err(StoreError::InvalidAgentTransition(
+            "spawn_agent parent provider differs from its deployment manifest".into(),
+        ));
+    }
+    Ok(AgentSubagentSpawnCommit {
+        parent_sequence: candidate.parent_sequence,
+        fork: ForkSessionRequest {
+            id: identity.session_id,
+            title: request.description().to_owned(),
+            through_sequence: candidate.parent_sequence,
+        },
+        start: StartTurnRequest {
+            turn_id: identity.turn_id,
+            user_message: request.prompt().to_owned(),
+            expected_sequence: inherited_events,
+        },
+        agent: AgentTurnSpec {
+            id: identity.agent_id,
+            authz: candidate.authz,
+            manifest: candidate.manifest,
+            environment: state.store.session_agent_environment().to_owned(),
+            provider_name: work.model_job.provider_name.clone(),
+            model_name: work.model_job.model_name.clone(),
+            request_json,
+            knowledge,
+        },
+    })
+}
+
 fn agent_tools_from_manifest(manifest: &ManifestEnvelope) -> Vec<ReplyToolDefinition> {
     manifest
         .manifest
@@ -4852,6 +4976,7 @@ async fn process_agent_tool_work(state: &ApiState, work: AgentToolWork) -> Resul
                     "status": "not_dispatched"
                 }),
                 None,
+                None,
             )
             .await;
         }
@@ -4866,12 +4991,39 @@ async fn process_agent_tool_work(state: &ApiState, work: AgentToolWork) -> Resul
     .await;
     match outcome {
         Ok(Ok(output)) => {
+            let subagent_spawn = if work.call.tool_name == subagents::SPAWN_AGENT_TOOL_NAME
+                && work.call.tool_version == subagents::SPAWN_AGENT_TOOL_VERSION
+            {
+                match prepare_agent_subagent_spawn(state, &work).await {
+                    Ok(spawn) => Some(spawn),
+                    Err(error) => {
+                        eprintln!("zeus rejected spawn_agent before child admission: {error}");
+                        return settle_known_agent_tool(
+                            state,
+                            &work,
+                            AgentToolCallStatus::Failed,
+                            serde_json::json!({
+                                "code": "subagent_admission_failed",
+                                "message": "The child Agent could not be safely admitted",
+                                "retryable": false,
+                                "status": "failed"
+                            }),
+                            None,
+                            None,
+                        )
+                        .await;
+                    }
+                }
+            } else {
+                None
+            };
             settle_known_agent_tool(
                 state,
                 &work,
                 AgentToolCallStatus::Succeeded,
                 output.value,
                 output.provider_request_id,
+                subagent_spawn,
             )
             .await
         }
@@ -4919,7 +5071,7 @@ async fn process_agent_tool_work(state: &ApiState, work: AgentToolWork) -> Resul
                     ),
                 }
             };
-            settle_known_agent_tool(state, &work, status, result, None).await
+            settle_known_agent_tool(state, &work, status, result, None, None).await
         }
         Err(_) => {
             eprintln!("zeus Agent tool task panicked; settling outcome_unknown");
@@ -4940,9 +5092,10 @@ async fn settle_known_agent_tool(
     status: AgentToolCallStatus,
     result_json: serde_json::Value,
     provider_request_id: Option<String>,
+    subagent_spawn: Option<AgentSubagentSpawnCommit>,
 ) -> Result<(), StoreError> {
-    let committed_status = status.clone();
-    let committed_result = result_json.clone();
+    let mut committed_status = status.clone();
+    let mut committed_result = result_json.clone();
     let next_request_json = continuation_request_json_for_work(work, &result_json);
     let commit = AgentToolCompletionCommit {
         call_id: work.call.call_id.clone(),
@@ -4951,12 +5104,44 @@ async fn settle_known_agent_tool(
         provider_request_id,
         next_request_json,
     };
-    let completion = match retry_agent_durable_progress("Agent tool", || {
-        state.store.complete_agent_tool(commit.clone())
-    })
-    .await
+    let complete = |commit: AgentToolCompletionCommit| {
+        let subagent_spawn = subagent_spawn.clone();
+        async move {
+            match subagent_spawn {
+                Some(spawn) => {
+                    state
+                        .store
+                        .complete_agent_tool_with_subagent(commit, spawn)
+                        .await
+                }
+                None => state.store.complete_agent_tool(commit).await,
+            }
+        }
+    };
+    let completion = match retry_agent_durable_progress("Agent tool", || complete(commit.clone()))
+        .await
     {
         Ok(completion) => completion,
+        Err(StoreError::SubagentAdmissionRejected) if subagent_spawn.is_some() => {
+            committed_status = AgentToolCallStatus::Failed;
+            committed_result = serde_json::json!({
+                "code": "subagent_capacity_exceeded",
+                "message": "The bounded child Agent capacity is exhausted",
+                "retryable": false,
+                "status": "failed"
+            });
+            let failed = AgentToolCompletionCommit {
+                call_id: work.call.call_id.clone(),
+                status: committed_status.clone(),
+                result_json: committed_result.clone(),
+                provider_request_id: None,
+                next_request_json: continuation_request_json_for_work(work, &committed_result),
+            };
+            retry_agent_durable_progress("Agent subagent rejection", || {
+                state.store.complete_agent_tool(failed.clone())
+            })
+            .await?
+        }
         Err(error) if commit.next_request_json.is_some() => {
             eprintln!(
                 "zeus could not persist an Agent tool continuation; terminalizing the same known result: {error}"
@@ -4964,7 +5149,7 @@ async fn settle_known_agent_tool(
             let mut fallback = commit;
             fallback.next_request_json = None;
             retry_agent_durable_progress("Agent tool known-result fallback", || {
-                state.store.complete_agent_tool(fallback.clone())
+                complete(fallback.clone())
             })
             .await?
         }
@@ -4975,6 +5160,9 @@ async fn settle_known_agent_tool(
             .store
             .apply_committed_goal_tool_result(work, &committed_result)
             .await?;
+    }
+    if subagent_spawn.is_some() && committed_status == AgentToolCallStatus::Succeeded {
+        kick_agent_model_worker(state);
     }
     if matches!(completion, AgentToolCompletion::ModelQueued { .. }) {
         kick_agent_model_worker(state);
@@ -7013,7 +7201,9 @@ impl From<StoreError> for ApiError {
             StoreError::InvalidAccountReplyProvider(reason) => {
                 Self::bad_request("invalid_reply_provider", reason.clone()).with_no_store()
             }
-            StoreError::StorageQuotaExceeded => Self::storage_quota_exceeded(),
+            StoreError::StorageQuotaExceeded | StoreError::SubagentAdmissionRejected => {
+                Self::storage_quota_exceeded()
+            }
             StoreError::PhysicalStorageExhausted => Self::physical_storage_exhausted(),
             StoreError::OperationCapacityExceeded => Self::sqlite_operation_capacity_exceeded(),
             StoreError::ReplyQueueCapacityExceeded => Self::reply_queue_capacity_exceeded(),
@@ -9560,7 +9750,7 @@ mod tests {
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
     }
 
-    struct ListAgentsThenFinalProvider {
+    struct SpawnListThenFinalProvider {
         metadata: ProviderMetadata,
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
     }
@@ -9949,11 +10139,11 @@ mod tests {
         }
     }
 
-    impl ListAgentsThenFinalProvider {
+    impl SpawnListThenFinalProvider {
         fn new(requests: Arc<StdMutex<Vec<ReplyRequest>>>) -> Self {
             Self {
                 metadata: ProviderMetadata {
-                    provider_id: "test-list-agents-then-final-provider".into(),
+                    provider_id: "test-spawn-list-then-final-provider".into(),
                     model: Some("test-model".into()),
                     reply_kind: ReplyKind::Model,
                 },
@@ -9962,36 +10152,78 @@ mod tests {
         }
     }
 
-    impl ReplyProvider for ListAgentsThenFinalProvider {
+    impl ReplyProvider for SpawnListThenFinalProvider {
         fn metadata(&self) -> &ProviderMetadata {
             &self.metadata
         }
 
         fn reply(&self, request: ReplyRequest) -> ReplyFuture<'_> {
-            let output = {
-                let mut requests = self.requests.lock().unwrap();
-                requests.push(request.clone());
-                match requests.len() {
-                    1 => {
-                        let tool = request
-                            .tools
-                            .iter()
-                            .find(|tool| tool.name == subagents::LIST_AGENTS_TOOL_NAME)
-                            .expect("every Agent request must expose list_agents");
-                        assert_eq!(
-                            tool.parameters["properties"]["cursor"]["maxLength"],
-                            subagents::LIST_AGENTS_CURSOR_MAX_BYTES
-                        );
-                        ReplyOutput::ToolCall {
-                            call: ReplyToolCall::new(
-                                "provider-call-list-agents-1",
-                                subagents::LIST_AGENTS_TOOL_NAME,
-                                serde_json::json!({"limit": 1}),
-                            ),
+            let output =
+                {
+                    let mut requests = self.requests.lock().unwrap();
+                    requests.push(request.clone());
+                    let child_prompt = request
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|message| message.role == ReplyRole::User)
+                        .map(|message| message.content.as_str());
+                    if matches!(
+                        child_prompt,
+                        Some("inspect child alpha" | "inspect child beta")
+                    ) {
+                        ReplyOutput::Final {
+                            content: format!("completed {child_prompt:?}"),
                         }
-                    }
-                    2 => {
-                        let result = request
+                    } else {
+                        let tool_results = request
+                            .messages
+                            .iter()
+                            .filter(|message| message.role == ReplyRole::Tool)
+                            .count();
+                        match tool_results {
+                            0 | 1 => {
+                                let spawn = request
+                                    .tools
+                                    .iter()
+                                    .find(|tool| tool.name == subagents::SPAWN_AGENT_TOOL_NAME)
+                                    .expect("every parent Agent request must expose spawn_agent");
+                                assert_eq!(
+                                    spawn.parameters["properties"]["prompt"]["maxLength"],
+                                    subagents::SPAWN_AGENT_PROMPT_MAX_BYTES
+                                );
+                                let suffix = if tool_results == 0 { "alpha" } else { "beta" };
+                                ReplyOutput::ToolCall {
+                                    call: ReplyToolCall::new(
+                                        format!("provider-call-spawn-agent-{suffix}"),
+                                        subagents::SPAWN_AGENT_TOOL_NAME,
+                                        serde_json::json!({
+                                            "description": format!("Child {suffix}"),
+                                            "prompt": format!("inspect child {suffix}"),
+                                        }),
+                                    ),
+                                }
+                            }
+                            2 => {
+                                let tool = request
+                                    .tools
+                                    .iter()
+                                    .find(|tool| tool.name == subagents::LIST_AGENTS_TOOL_NAME)
+                                    .expect("every parent Agent request must expose list_agents");
+                                assert_eq!(
+                                    tool.parameters["properties"]["cursor"]["maxLength"],
+                                    subagents::LIST_AGENTS_CURSOR_MAX_BYTES
+                                );
+                                ReplyOutput::ToolCall {
+                                    call: ReplyToolCall::new(
+                                        "provider-call-list-agents-1",
+                                        subagents::LIST_AGENTS_TOOL_NAME,
+                                        serde_json::json!({"limit": 1}),
+                                    ),
+                                }
+                            }
+                            3 => {
+                                let result = request
                             .messages
                             .iter()
                             .rev()
@@ -9999,24 +10231,25 @@ mod tests {
                             .and_then(|message| {
                                 serde_json::from_str::<serde_json::Value>(&message.content).ok()
                             })
-                            .expect("the second model request must contain the first catalog page");
-                        let cursor = result["next_cursor"]
-                            .as_str()
-                            .expect("the first one-item page must expose a cursor");
-                        ReplyOutput::ToolCall {
-                            call: ReplyToolCall::new(
-                                "provider-call-list-agents-2",
-                                subagents::LIST_AGENTS_TOOL_NAME,
-                                serde_json::json!({"cursor": cursor, "limit": 1}),
-                            ),
+                            .expect("the parent continuation must contain the first catalog page");
+                                let cursor = result["next_cursor"]
+                                    .as_str()
+                                    .expect("the first one-item page must expose a cursor");
+                                ReplyOutput::ToolCall {
+                                    call: ReplyToolCall::new(
+                                        "provider-call-list-agents-2",
+                                        subagents::LIST_AGENTS_TOOL_NAME,
+                                        serde_json::json!({"cursor": cursor, "limit": 1}),
+                                    ),
+                                }
+                            }
+                            4 => ReplyOutput::Final {
+                                content: "durable child catalog inspected".into(),
+                            },
+                            count => panic!("unexpected parent tool-result count {count}"),
                         }
                     }
-                    3 => ReplyOutput::Final {
-                        content: "durable child catalog inspected".into(),
-                    },
-                    call => panic!("unexpected list_agents provider call {call}"),
-                }
-            };
+                };
             let provider = self.metadata.clone();
             Box::pin(async move {
                 Ok(ReplyResponse {
@@ -12588,7 +12821,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_list_agents_pages_durable_direct_children_without_approval() {
+    async fn agent_spawn_and_list_agents_are_durable_without_approval() {
         let store = DemoStore::seeded().await.unwrap();
         let owner =
             provision_test_owner(&store, "user-agent-list-agents", "agent-list-agents-owner").await;
@@ -12603,27 +12836,25 @@ mod tests {
             )
             .await
             .unwrap();
-        for index in 0..2 {
-            store
-                .fork_session_for_actor(
-                    &owner.authz,
-                    "session-agent-list-agents",
-                    ForkSessionRequest {
-                        id: format!("session-agent-list-child-{index}"),
-                        title: format!("Durable child {index}"),
-                        through_sequence: 1,
-                    },
-                    &format!("fork-agent-list-child-{index}"),
-                )
-                .await
-                .unwrap();
-        }
+        store
+            .fork_session_for_actor(
+                &owner.authz,
+                "session-agent-list-agents",
+                ForkSessionRequest {
+                    id: "session-manual-fork-not-agent".into(),
+                    title: "Manual fork".into(),
+                    through_sequence: 1,
+                },
+                "fork-manual-not-agent",
+            )
+            .await
+            .unwrap();
 
         let requests = Arc::new(StdMutex::new(Vec::new()));
         let app = authenticated_app_with_provider(
             store.clone(),
             false,
-            Arc::new(ListAgentsThenFinalProvider::new(Arc::clone(&requests))),
+            Arc::new(SpawnListThenFinalProvider::new(Arc::clone(&requests))),
         )
         .unwrap();
         let started = app
@@ -12639,7 +12870,7 @@ mod tests {
                     .body(Body::from(
                         serde_json::json!({
                             "turn_id": "turn-agent-list-agents",
-                            "user_message": "inspect every direct child branch",
+                            "user_message": "inspect every direct child agent",
                             "expected_sequence": 1,
                         })
                         .to_string(),
@@ -12659,17 +12890,41 @@ mod tests {
             protocol::AgentTurnStatus::Succeeded,
         )
         .await;
-        assert_eq!(agent.model_steps, 3);
-        assert_eq!(agent.tool_calls, 2);
+        assert_eq!(agent.model_steps, 5);
+        assert_eq!(agent.tool_calls, 4);
+        assert_eq!(
+            agent
+                .calls
+                .iter()
+                .filter(|call| call.tool == subagents::SPAWN_AGENT_TOOL_NAME)
+                .count(),
+            2
+        );
+        assert_eq!(
+            agent
+                .calls
+                .iter()
+                .filter(|call| call.tool == subagents::LIST_AGENTS_TOOL_NAME)
+                .count(),
+            2
+        );
         assert!(agent.calls.iter().all(|call| {
-            call.tool == subagents::LIST_AGENTS_TOOL_NAME
-                && call.status == AgentToolCallStatus::Succeeded
-                && !call.approval_required
+            call.status == AgentToolCallStatus::Succeeded && !call.approval_required
         }));
 
         let recorded = requests.lock().unwrap().clone();
-        assert_eq!(recorded.len(), 3);
-        let pages = [&recorded[1], &recorded[2]]
+        assert_eq!(recorded.len(), 7);
+        let parent_requests = recorded
+            .iter()
+            .filter(|request| {
+                request.messages.iter().any(|message| {
+                    message.role == ReplyRole::User
+                        && message.content == "inspect every direct child agent"
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(parent_requests.len(), 5);
+        let pages = [&parent_requests[3], &parent_requests[4]]
             .into_iter()
             .map(|request| {
                 request
@@ -12693,13 +12948,16 @@ mod tests {
             .flat_map(|page| page.agents.iter())
             .map(|agent| agent.session.id.as_str())
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            ids,
-            std::collections::BTreeSet::from([
-                "session-agent-list-child-0",
-                "session-agent-list-child-1",
-            ])
-        );
+        assert_eq!(ids.len(), 2);
+        assert!(!ids.contains("session-manual-fork-not-agent"));
+        for child_id in ids {
+            let child = wait_for_ready_session(&store, &owner.authz, child_id).await;
+            assert_eq!(child.turns.len(), 1);
+            assert!(matches!(
+                child.turns[0].user_message.as_str(),
+                "inspect child alpha" | "inspect child beta"
+            ));
+        }
         store.verify_integrity().await.unwrap();
         drop(app);
     }

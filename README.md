@@ -86,12 +86,20 @@ indexed `created_at DESC, child_session_id ASC` keyset page, so a caller can
 resume branch traversal after reconnect or restart without loading an
 unbounded lineage graph or knowing child IDs in advance.
 
-Every Agent profile also exposes the read-only `list_agents` tool over that
-durable catalog. Runtime accepts it only from the exact persisted
-`started` Agent tool call, derives the parent Session and account/actor scope
-server-side, and returns direct children in opaque-cursor pages (default 16,
-maximum 32). This stage is discovery only: it does not expose model-facing
-spawn, message, interrupt, or recursive lineage traversal.
+Schema v36 adds durable `spawn_agent` admission. One successful parent tool
+completion atomically commits the child Session fork, initial user turn,
+deployment-bound child Agent/model job, and immutable parent-call binding.
+The child inherits only complete turns before the parent's current in-flight
+turn. Admission is bounded to eight direct children and three ancestry levels;
+capacity rejection rolls the whole child transaction back and becomes a known
+parent tool failure.
+
+Every Agent profile exposes `spawn_agent` plus the read-only `list_agents`
+tool. Both require the exact persisted `started` Agent tool scope and derive
+account, actor, parent Session, turn, and Agent identity server-side.
+`list_agents` returns only children admitted by `spawn_agent`, not arbitrary
+manual Session forks, in opaque-cursor pages (default 16, maximum 32). This
+stage starts background children but does not yet expose send or interrupt.
 
 Alpha+ bootstraps a local `acc_local` root and now supports a bounded local
 multi-account control plane. An owner can create accounts idempotently; one
@@ -954,6 +962,12 @@ and bounded memory, CPU, and PID resources.
   Schema v35 adds the direct-child keyset index used by the actor-scoped fork
   catalog. Cursor kind, account, actor, and parent scope are all authenticated;
   authorization is resolved before malformed cursor details are reported.
+  Schema v36 adds append-only `agent_subagent_spawns`. A successful
+  `spawn_agent@1-durable-session-fork` result is bound to deterministic child
+  Session/turn/Agent identities and to the exact parent call, history boundary,
+  actor revision, deployment manifest, prompt digest, and creation timestamp.
+  Startup deep integrity recomputes this chain and enforces the bounded direct
+  child and ancestry limits.
   Schema v28 adds append-only Agent todo snapshots. Each row is scoped to one
   account/Session/turn/Agent, advances a contiguous revision, and is bound to
   one exact successful `todo_write@1-single-active` call. SQLite triggers bind
@@ -1251,7 +1265,7 @@ directly.
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Current schema v35 retains durable Run attachment during migration and demo
+Current schema v36 retains durable Run attachment during migration and demo
 seeding, but Alpha+ does not expose a public attach-Run HTTP route.
 
 The application boundary now caps auth JSON at 8 KiB, command JSON at 512 KiB,
@@ -1276,7 +1290,7 @@ approval, dispatch, reply completion, attachment checks, and startup recovery
 use typed point queries or fixed 64-row batches. Production Session list/detail,
 Run detail, and overview reads now use indexed `LIMIT + 1` keyset pages inside
 actor-authorized SQLite snapshots; no production HTTP read loads a complete
-ledger or collection. Current schema v35 retains bounded Session, open-turn,
+ledger or collection. Current schema v36 retains bounded Session, open-turn,
 active reply/dispatch, auth-session, bootstrap-audit, event-slot, and logical
 event-payload-byte admission. Exact idempotent replay is checked before capacity,
 while accepted work consumes its reserved terminal slots and payload bytes
@@ -1365,18 +1379,18 @@ cancellation, schema v28 durable Agent planning, schema v29 durable Session
 Goals, schema v30 same-Session Goal rounds, schema v31 durable Session
 follow-ups, schema v32 durable Agent model output, schema v33 running-model
 cancellation, schema v34 durable Session forks, schema v35 durable fork catalog,
-Agent-scoped durable `list_agents`,
+schema v36 durable `spawn_agent` admission and Agent-scoped `list_agents`,
 Trusted Single-Node Ingress,
 Per-Operation SecretRef Resolution, the startup-bound Skill Catalog, and the
 bounded multi-account control plane:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 687 tests passed
+- `cargo test --workspace --all-targets --locked`: 693 tests passed
   across the top-level test targets, including 22 connector tests,
   8 deployment tests, 29 knowledge tests, 30 LLM unit and 18 provider-contract
-  tests, 4 Goal tests, 5 Skill Catalog tests, 3 Subagent Catalog tests,
-  283 storage tests, 21 workflow tests, 52 runtime tests, 21 protocol tests,
+  tests, 4 Goal tests, 5 Skill Catalog tests, 6 Subagent tests,
+  286 storage tests, 21 workflow tests, 52 runtime tests, 21 protocol tests,
   94 API library tests, 18 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,

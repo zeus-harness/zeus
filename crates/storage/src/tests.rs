@@ -36,10 +36,10 @@ use crate::{
     AccountAuditCheckpointCommit, AccountId, AccountReplyProviderCommit, AccountReplyProviderState,
     AgentGoalRoundSpec, AgentKnowledgeContextSpec, AgentModelClaimOutcome, AgentModelCompletion,
     AgentModelFailureCommit, AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit,
-    AgentPromptCommit, AgentPromptState, AgentReviewCommit, AgentToolCallSpec,
-    AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit, AgentToolStartOutcome,
-    AgentTurnSpec, AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit,
-    ClaimOutcome, CommitOutcome, CreateAccountCommit, CreateMemberCommit,
+    AgentPromptCommit, AgentPromptState, AgentReviewCommit, AgentSubagentSpawnCommit,
+    AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
+    AgentToolStartOutcome, AgentTurnSpec, AuthSessionCommit, AuthSessionId, AuthzContext,
+    BootstrapOwnerCommit, ClaimOutcome, CommitOutcome, CreateAccountCommit, CreateMemberCommit,
     DEFAULT_SESSION_AGENT_PROMPT_REVISION, DEFAULT_SESSION_AGENT_SYSTEM_PROMPT,
     DispatchCompleteCommit, DispatchJobSpec, DispatchRecoveryCommit, DispatchStartCommit,
     DispatchStatus, KnowledgeCatalogCommit, MemberSetupCommit, MemberSetupToken,
@@ -1772,7 +1772,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         versions,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36,
         ]
     );
     let owner: Option<String> = connection
@@ -1922,7 +1922,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 35);
+    assert_eq!(version, 36);
     let configured_account: (String, String, String, i64) = connection
         .query_row(
             r#"SELECT
@@ -2640,7 +2640,7 @@ async fn v12_identity_and_run_crash_prefix_migrates_then_recovers_the_primary_se
     assert_eq!(
         recovered,
         (
-            35,
+            36,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into()
@@ -4387,7 +4387,7 @@ async fn v5_configured_database_migrates_to_the_local_owner_membership() {
     assert_eq!(
         migrated,
         (
-            35,
+            36,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into(),
@@ -4513,7 +4513,7 @@ async fn v13_configured_active_work_migrates_with_account_authority_and_exact_vo
             },
         )
         .unwrap();
-    assert_eq!(migrated_counts, (35, 1, 1, 2, 1));
+    assert_eq!(migrated_counts, (36, 1, 1, 2, 1));
 }
 
 #[tokio::test]
@@ -4875,7 +4875,7 @@ async fn v14_database_migrates_through_v19_with_member_and_audit_roots() {
             },
         )
         .unwrap();
-    assert_eq!(state, (35, 1, 1, 1, 19));
+    assert_eq!(state, (36, 1, 1, 1, 19));
 }
 
 #[tokio::test]
@@ -4914,7 +4914,7 @@ async fn v15_migration_seeds_the_configured_audit_detail_limit() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (35, 2));
+    assert_eq!(state, (36, 2));
 }
 
 #[tokio::test]
@@ -4959,7 +4959,7 @@ async fn v15_reopen_rejects_a_lower_audit_detail_limit_without_mutating_policy()
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (35, 4));
+    assert_eq!(state, (36, 4));
     drop(connection);
 
     let reopened = SqliteStore::open_with_limits(database.path(), original_limits)
@@ -5375,6 +5375,86 @@ async fn readiness_rejects_a_weakened_v34_session_fork_mapping_trigger() {
             if message == "durability trigger `session_fork_turns_validate_insert` differs from the authoritative migration"),
         "unexpected weakened-trigger error: {error:?}"
     );
+}
+
+#[tokio::test]
+async fn readiness_rejects_a_weakened_v36_subagent_binding_trigger() {
+    let database = TestDatabase::new();
+    {
+        let store = SqliteStore::open(database.path()).await.unwrap();
+        store.readiness().await.unwrap();
+    }
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER agent_tool_calls_bind_subagent_spawn;
+               CREATE TRIGGER agent_tool_calls_bind_subagent_spawn
+               BEFORE UPDATE OF status, result_json ON agent_tool_calls
+               WHEN 0
+               BEGIN
+                   SELECT 1;
+               END;"#,
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("a same-name weakened subagent binding trigger must fail"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(&error, StorageError::CorruptData(message)
+            if message == "durability trigger `agent_tool_calls_bind_subagent_spawn` differs from the authoritative migration"),
+        "unexpected weakened-trigger error: {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn v35_database_migrates_to_the_durable_subagent_catalog() {
+    let database = TestDatabase::new();
+    drop(SqliteStore::open(database.path()).await.unwrap());
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    drop_v36_fixture_objects(&connection);
+    assert_eq!(
+        connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        35
+    );
+    drop(connection);
+
+    let migrated = SqliteStore::open(database.path()).await.unwrap();
+    migrated.readiness().await.unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let state = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT MAX(version) FROM schema_migrations),
+                   (SELECT COUNT(*) FROM sqlite_schema
+                    WHERE type = 'table' AND name = 'agent_subagent_spawns'),
+                   (SELECT COUNT(*) FROM sqlite_schema
+                    WHERE type = 'index' AND name = 'agent_subagent_spawns_parent_idx'),
+                   (SELECT COUNT(*) FROM sqlite_schema
+                    WHERE type = 'trigger' AND name IN (
+                        'agent_subagent_spawns_validate_insert',
+                        'agent_subagent_spawns_reject_update',
+                        'agent_subagent_spawns_reject_delete',
+                        'agent_tool_calls_bind_subagent_spawn'
+                    ))"#,
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(state, (36, 1, 1, 4));
 }
 
 #[tokio::test]
@@ -7321,7 +7401,7 @@ async fn v19_agent_manifest_is_canonical_actor_scoped_reused_and_secret_free() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(version, 35);
+    assert_eq!(version, 36);
     assert_eq!(
         manifest_rows, 1,
         "the identical manifest must be deduplicated"
@@ -15547,22 +15627,21 @@ async fn session_fork_catalog_is_indexed_bounded_scoped_and_cursor_safe() {
 
 #[tokio::test]
 async fn list_agents_catalog_requires_the_exact_started_agent_tool_scope() {
-    let store = created_owned_session_store().await;
-    for index in 0..2 {
-        store
-            .fork_session_for_actor(
-                &owner_authz(),
-                "session-alpha",
-                ForkSessionRequest {
-                    id: format!("session-agent-child-{index}"),
-                    title: format!("Agent child {index}"),
-                    through_sequence: 1,
-                },
-                &format!("create-agent-child-{index}"),
-            )
-            .await
-            .unwrap();
-    }
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    store
+        .fork_session_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            ForkSessionRequest {
+                id: "session-manual-child".into(),
+                title: "Manual child".into(),
+                through_sequence: 1,
+            },
+            "create-manual-child",
+        )
+        .await
+        .unwrap();
 
     let manifest = list_agents_test_agent_manifest();
     store
@@ -15570,16 +15649,124 @@ async fn list_agents_catalog_requires_the_exact_started_agent_tool_scope() {
             &owner_authz(),
             "session-alpha",
             StartTurnRequest {
-                turn_id: "turn-list-agents".into(),
-                user_message: "inspect durable child branches".into(),
+                turn_id: "turn-spawn-agent".into(),
+                user_message: "delegate one bounded task".into(),
                 expected_sequence: 1,
+            },
+            "start-spawn-agent",
+            agent_turn_spec_with_manifest(
+                "agent-spawn-agent",
+                "turn-spawn-agent",
+                manifest.clone(),
+                "delegate one bounded task",
+            ),
+        )
+        .await
+        .unwrap();
+    let AgentModelClaimOutcome::Claimed(model) =
+        store.claim_next_agent_model(&manifest).await.unwrap()
+    else {
+        panic!("the spawn_agent model proposal must start");
+    };
+    let spawn_arguments = json!({
+        "description": "Bounded child",
+        "prompt": "inspect the durable child boundary",
+    });
+    let call = spawn_agent_tool_call_spec("call-spawn-agent", spawn_arguments);
+    store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: model.id,
+            response_json: agent_tool_response_json(&call),
+            resolution: AgentModelResolution::ToolCall { call: call.clone() },
+        })
+        .await
+        .unwrap();
+    let AgentToolClaimOutcome::Claimed(_work) =
+        store.claim_next_agent_tool(&manifest).await.unwrap()
+    else {
+        panic!("the admitted spawn_agent tool must start");
+    };
+    let identity = subagents::spawn_agent_identity("session-alpha", &call.call_id).unwrap();
+    let child_prompt = "inspect the durable child boundary";
+    let child_spec = agent_turn_spec_with_manifest(
+        &identity.agent_id,
+        &identity.turn_id,
+        manifest.clone(),
+        child_prompt,
+    );
+    let result = json!({"subagent_id": identity.session_id});
+    let completion = store
+        .complete_agent_tool_with_subagent(
+            AgentToolCompletionCommit {
+                call_id: call.call_id,
+                status: AgentToolCallStatus::Succeeded,
+                result_json: result,
+                provider_request_id: None,
+                next_request_json: None,
+            },
+            AgentSubagentSpawnCommit {
+                parent_sequence: 1,
+                fork: ForkSessionRequest {
+                    id: identity.session_id.clone(),
+                    title: "Bounded child".into(),
+                    through_sequence: 1,
+                },
+                start: StartTurnRequest {
+                    turn_id: identity.turn_id.clone(),
+                    user_message: child_prompt.into(),
+                    expected_sequence: 1,
+                },
+                agent: child_spec,
+            },
+        )
+        .await
+        .unwrap();
+    let AgentToolCompletion::Terminal(parent_terminal) = completion else {
+        panic!("spawn without a continuation must terminalize only the parent turn");
+    };
+    let AgentModelClaimOutcome::Claimed(child_job) =
+        store.claim_next_agent_model(&manifest).await.unwrap()
+    else {
+        panic!("the child Agent model job must be claimable");
+    };
+    assert_eq!(child_job.agent_id, identity.agent_id);
+    store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: child_job.id,
+            response_json: agent_final_response_json("child complete"),
+            resolution: AgentModelResolution::Final {
+                assistant_message: "child complete".into(),
+                provenance: agent_model_provenance(),
+            },
+        })
+        .await
+        .unwrap();
+    let resumed = store
+        .resume_session_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            ResumeSessionRequest {
+                expected_sequence: parent_terminal.session.sequence,
+            },
+            "resume-after-spawn",
+        )
+        .await
+        .unwrap();
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-list-agents".into(),
+                user_message: "inspect durable child agents".into(),
+                expected_sequence: resumed.session.sequence,
             },
             "start-list-agents",
             agent_turn_spec_with_manifest(
                 "agent-list-agents",
                 "turn-list-agents",
                 manifest.clone(),
-                "inspect durable child branches",
+                "inspect durable child agents",
             ),
         )
         .await
@@ -15589,12 +15776,14 @@ async fn list_agents_catalog_requires_the_exact_started_agent_tool_scope() {
     else {
         panic!("the list_agents model proposal must start");
     };
-    let call = list_agents_tool_call_spec("call-list-agents", json!({"limit": 1}));
+    let list_call = list_agents_tool_call_spec("call-list-agents", json!({"limit": 1}));
     store
         .complete_agent_model_success(AgentModelSuccessCommit {
             job_id: model.id,
-            response_json: agent_tool_response_json(&call),
-            resolution: AgentModelResolution::ToolCall { call: call.clone() },
+            response_json: agent_tool_response_json(&list_call),
+            resolution: AgentModelResolution::ToolCall {
+                call: list_call.clone(),
+            },
         })
         .await
         .unwrap();
@@ -15617,27 +15806,9 @@ async fn list_agents_catalog_requires_the_exact_started_agent_tool_scope() {
         .await
         .unwrap();
     assert_eq!(first.items.len(), 1);
-    let second = store
-        .session_fork_page_for_started_agent_tool(
-            &scope,
-            &work.call.call_id,
-            first.next_cursor.as_deref(),
-            1,
-        )
-        .await
-        .unwrap();
-    assert_eq!(second.items.len(), 1);
-    assert!(second.next_cursor.is_none());
-    let ids = first
-        .items
-        .iter()
-        .chain(&second.items)
-        .map(|item| item.session.id.as_str())
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        ids,
-        BTreeSet::from(["session-agent-child-0", "session-agent-child-1"])
-    );
+    assert!(first.next_cursor.is_none());
+    assert_eq!(first.items[0].session.id, identity.session_id);
+    assert_ne!(first.items[0].session.id, "session-manual-child");
 
     assert!(matches!(
         store
@@ -15653,7 +15824,7 @@ async fn list_agents_catalog_requires_the_exact_started_agent_tool_scope() {
     let foreign_scope = tools::ExecutionScope::new(
         scope.account_id.clone(),
         scope.actor_id.clone(),
-        "session-agent-child-0",
+        "session-manual-child",
         scope.turn_id.clone(),
         scope.agent_id.clone(),
     )
@@ -15664,6 +15835,156 @@ async fn list_agents_catalog_requires_the_exact_started_agent_tool_scope() {
             .await,
         Err(StorageError::AgentToolCallNotFound(_))
     ));
+    store.verify_integrity().await.unwrap();
+    drop(store);
+
+    let reopened = SqliteStore::open(database.path()).await.unwrap();
+    reopened.verify_integrity().await.unwrap();
+    drop(reopened);
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let reject_update = stored_trigger_sql(&connection, "agent_subagent_spawns_reject_update");
+    connection
+        .execute_batch("DROP TRIGGER agent_subagent_spawns_reject_update;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE agent_subagent_spawns SET prompt_digest = ?1 WHERE call_id = ?2",
+            params!["0".repeat(64), "call-spawn-agent"],
+        )
+        .unwrap();
+    connection.execute_batch(&reject_update).unwrap();
+    drop(connection);
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("tampered subagent evidence must fail startup"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StorageError::CorruptData(message)
+            if message.contains("inconsistent durable child evidence")));
+}
+
+#[tokio::test]
+async fn spawn_agent_capacity_rejection_rolls_back_every_child_row() {
+    let limits = StorageLimits {
+        sessions_per_actor: 1,
+        sessions_per_account: 1,
+        sessions_global: 1,
+        ..StorageLimits::default()
+    };
+    let store = SqliteStore::open_with_limits(":memory:", limits)
+        .await
+        .unwrap();
+    store
+        .bind_runtime_identity(test_agent_runtime_identity())
+        .await
+        .unwrap();
+    store
+        .create_session(alpha_session_request(), "create-session-alpha")
+        .await
+        .unwrap();
+    bootstrap_test_owner(&store).await;
+
+    let manifest = list_agents_test_agent_manifest();
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-spawn-capacity".into(),
+                user_message: "attempt bounded delegation".into(),
+                expected_sequence: 1,
+            },
+            "start-spawn-capacity",
+            agent_turn_spec_with_manifest(
+                "agent-spawn-capacity",
+                "turn-spawn-capacity",
+                manifest.clone(),
+                "attempt bounded delegation",
+            ),
+        )
+        .await
+        .unwrap();
+    let AgentModelClaimOutcome::Claimed(model) =
+        store.claim_next_agent_model(&manifest).await.unwrap()
+    else {
+        panic!("the capacity test model proposal must start");
+    };
+    let arguments = json!({
+        "description": "Rejected child",
+        "prompt": "this child must never become visible",
+    });
+    let call = spawn_agent_tool_call_spec("call-spawn-capacity", arguments);
+    store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: model.id,
+            response_json: agent_tool_response_json(&call),
+            resolution: AgentModelResolution::ToolCall { call: call.clone() },
+        })
+        .await
+        .unwrap();
+    let AgentToolClaimOutcome::Claimed(_work) =
+        store.claim_next_agent_tool(&manifest).await.unwrap()
+    else {
+        panic!("the capacity test spawn tool must start");
+    };
+    let identity = subagents::spawn_agent_identity("session-alpha", &call.call_id).unwrap();
+    let child_prompt = "this child must never become visible";
+    let rejection = store
+        .complete_agent_tool_with_subagent(
+            AgentToolCompletionCommit {
+                call_id: call.call_id.clone(),
+                status: AgentToolCallStatus::Succeeded,
+                result_json: json!({"subagent_id": identity.session_id}),
+                provider_request_id: None,
+                next_request_json: None,
+            },
+            AgentSubagentSpawnCommit {
+                parent_sequence: 1,
+                fork: ForkSessionRequest {
+                    id: identity.session_id.clone(),
+                    title: "Rejected child".into(),
+                    through_sequence: 1,
+                },
+                start: StartTurnRequest {
+                    turn_id: identity.turn_id.clone(),
+                    user_message: child_prompt.into(),
+                    expected_sequence: 1,
+                },
+                agent: agent_turn_spec_with_manifest(
+                    &identity.agent_id,
+                    &identity.turn_id,
+                    manifest,
+                    child_prompt,
+                ),
+            },
+        )
+        .await;
+    assert!(matches!(
+        rejection,
+        Err(StorageError::SubagentAdmissionRejected)
+    ));
+    assert!(matches!(
+        store
+            .session_summary_for_actor(&owner_authz(), &identity.session_id)
+            .await,
+        Err(StorageError::SessionNotFound(session_id)) if session_id == identity.session_id
+    ));
+
+    store
+        .complete_agent_tool(AgentToolCompletionCommit {
+            call_id: call.call_id,
+            status: AgentToolCallStatus::Failed,
+            result_json: json!({
+                "code": "subagent_capacity_exceeded",
+                "message": "The bounded child Agent capacity is exhausted",
+                "retryable": false,
+                "status": "failed",
+            }),
+            provider_request_id: None,
+            next_request_json: None,
+        })
+        .await
+        .unwrap();
     store.verify_integrity().await.unwrap();
 }
 
@@ -20111,7 +20432,7 @@ async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempot
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, (1_i64..=35).collect::<Vec<_>>());
+    assert_eq!(versions, (1_i64..=36).collect::<Vec<_>>());
     assert_eq!(
         connection
             .query_row(
@@ -22579,19 +22900,23 @@ fn todo_test_agent_manifest() -> ManifestEnvelope {
 
 fn list_agents_test_agent_manifest() -> ManifestEnvelope {
     let mut manifest = test_agent_manifest().manifest;
-    let descriptor = subagents::list_agents_descriptor();
-    manifest.deployment.spec.tools.push(
-        ManifestTool::new(
-            descriptor.name,
-            descriptor.version,
-            descriptor.description,
-            descriptor.input_schema.provider_json_schema().unwrap(),
-            descriptor.effect,
-            descriptor.sandbox_profile,
-            ToolExecutorStatus::Available,
-        )
-        .unwrap(),
-    );
+    for descriptor in [
+        subagents::list_agents_descriptor(),
+        subagents::spawn_agent_descriptor(),
+    ] {
+        manifest.deployment.spec.tools.push(
+            ManifestTool::new(
+                descriptor.name,
+                descriptor.version,
+                descriptor.description,
+                descriptor.input_schema.provider_json_schema().unwrap(),
+                descriptor.effect,
+                descriptor.sandbox_profile,
+                ToolExecutorStatus::Available,
+            )
+            .unwrap(),
+        );
+    }
     manifest
         .deployment
         .spec
@@ -22905,6 +23230,23 @@ fn todo_agent_tool_call_spec(call_id: &str, expected_revision: u64) -> AgentTool
 
 fn list_agents_tool_call_spec(call_id: &str, arguments_json: Value) -> AgentToolCallSpec {
     let descriptor = subagents::list_agents_descriptor();
+    AgentToolCallSpec {
+        call_id: call_id.into(),
+        provider_call_id: format!("provider-call-{call_id}"),
+        tool_name: descriptor.name,
+        tool_version: descriptor.version,
+        arguments_digest: tools::arguments_digest(&arguments_json),
+        arguments_json,
+        effect: descriptor.effect,
+        sandbox_profile: descriptor.sandbox_profile,
+        executor_status: ToolExecutorStatus::Available,
+        policy_decision: PolicyDecision::Allow,
+        policy_revision: "local/v1".into(),
+    }
+}
+
+fn spawn_agent_tool_call_spec(call_id: &str, arguments_json: Value) -> AgentToolCallSpec {
+    let descriptor = subagents::spawn_agent_descriptor();
     AgentToolCallSpec {
         call_id: call_id.into(),
         provider_call_id: format!("provider-call-{call_id}"),
@@ -23955,6 +24297,14 @@ fn drop_v34_fixture_objects(connection: &rusqlite::Connection) {
 }
 
 fn drop_v35_fixture_objects(connection: &rusqlite::Connection) {
+    let version: i64 = connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    if version >= 36 {
+        drop_v36_fixture_objects(connection);
+    }
     let schema_reject_update = migration_trigger_sql(
         include_str!("../migrations/0020_agent_execution_ledger.sql"),
         "schema_migrations_reject_update",
@@ -23969,6 +24319,32 @@ fn drop_v35_fixture_objects(connection: &rusqlite::Connection) {
                DROP TRIGGER schema_migrations_reject_delete;
                DROP INDEX session_forks_children_idx;
                DELETE FROM schema_migrations WHERE version = 35;"#,
+        )
+        .unwrap();
+    connection.execute_batch(schema_reject_update).unwrap();
+    connection.execute_batch(schema_reject_delete).unwrap();
+}
+
+fn drop_v36_fixture_objects(connection: &rusqlite::Connection) {
+    let schema_reject_update = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_update",
+    );
+    let schema_reject_delete = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_delete",
+    );
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER schema_migrations_reject_update;
+               DROP TRIGGER schema_migrations_reject_delete;
+               DROP TRIGGER agent_tool_calls_bind_subagent_spawn;
+               DROP TRIGGER agent_subagent_spawns_validate_insert;
+               DROP TRIGGER agent_subagent_spawns_reject_update;
+               DROP TRIGGER agent_subagent_spawns_reject_delete;
+               DROP INDEX agent_subagent_spawns_parent_idx;
+               DROP TABLE agent_subagent_spawns;
+               DELETE FROM schema_migrations WHERE version = 36;"#,
         )
         .unwrap();
     connection.execute_batch(schema_reject_update).unwrap();

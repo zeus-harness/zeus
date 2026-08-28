@@ -62,7 +62,7 @@ use crate::{
     UpdateAccountAuditPolicyCommit,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 35;
+const CURRENT_SCHEMA_VERSION: i64 = 36;
 const LOCAL_ACCOUNT_ID: &str = "acc_local";
 const MAX_ACCOUNTS_PER_USER: i64 = 16;
 const MAX_ACCOUNTS_GLOBAL: i64 = 64;
@@ -107,6 +107,13 @@ const MIGRATION_0033: &str =
     include_str!("../migrations/0033_agent_running_model_cancellation.sql");
 const MIGRATION_0034: &str = include_str!("../migrations/0034_session_forks.sql");
 const MIGRATION_0035: &str = include_str!("../migrations/0035_session_fork_catalog.sql");
+const MIGRATION_0036: &str = include_str!("../migrations/0036_agent_subagent_spawns.sql");
+const MIGRATION_0036_TRIGGER_NAMES: &[&str] = &[
+    "agent_subagent_spawns_validate_insert",
+    "agent_subagent_spawns_reject_update",
+    "agent_subagent_spawns_reject_delete",
+    "agent_tool_calls_bind_subagent_spawn",
+];
 const MIGRATION_0034_TRIGGER_NAMES: &[&str] = &[
     "session_forks_validate_insert",
     "session_forks_reject_update",
@@ -907,15 +914,21 @@ impl SqliteStore {
         let limits = self.limits.clone();
         let physical_limits = self.physical_limits.clone();
         self.with_connection(move |connection| {
-            fork_session(
-                connection,
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let response = fork_session(
+                &transaction,
                 &context,
                 &parent_session_id,
                 request,
                 &key,
                 &limits,
                 &physical_limits,
-            )
+                false,
+                None,
+            )?;
+            transaction.commit()?;
+            Ok(response)
         })
         .await
     }
@@ -3790,6 +3803,13 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
             params![35, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 36 {
+        transaction.execute_batch(MIGRATION_0036)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![36, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
     // The execution verifier now understands the v22 knowledge binding. Run
     // it only after every missing schema step has been installed so upgrades
     // from v19 and older never query a column that does not exist yet. This
@@ -3805,6 +3825,7 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
         verify_session_followup_integrity(&transaction)?;
         agent::verify_agent_model_output_integrity(&transaction)?;
         verify_session_fork_integrity(&transaction)?;
+        agent::verify_agent_subagent_spawn_integrity(&transaction)?;
         provider::verify_account_reply_provider_integrity(&transaction)?;
         execution::verify_agent_execution_integrity(&transaction)?;
     }
@@ -4461,12 +4482,13 @@ fn readiness(
                'agent_knowledge_contexts', 'agent_knowledge_legacy_boundary',
                'agent_knowledge_legacy_agents', 'account_knowledge_catalogs',
                'knowledge_catalog_receipts', 'session_compaction_jobs',
-               'agent_todo_snapshots', 'session_forks', 'session_fork_turns'
+               'agent_todo_snapshots', 'session_forks', 'session_fork_turns',
+               'agent_subagent_spawns'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if table_count != 46 {
+    if table_count != 47 {
         return Err(StorageError::CorruptData(
             "one or more required tables are missing".into(),
         ));
@@ -4834,12 +4856,13 @@ fn readiness(
                'agent_model_output_chunks_job_idx',
                'session_forks_parent_idx',
                'session_fork_turns_parent_idx',
-               'session_forks_children_idx'
+               'session_forks_children_idx',
+               'agent_subagent_spawns_parent_idx'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if point_query_indexes != 80 {
+    if point_query_indexes != 81 {
         return Err(StorageError::CorruptData(
             "one or more point-query indexes are missing".into(),
         ));
@@ -5049,13 +5072,17 @@ fn readiness(
                'session_fork_turns_validate_insert',
                'session_fork_turns_reject_update',
                'session_fork_turns_reject_delete',
+               'agent_subagent_spawns_validate_insert',
+               'agent_subagent_spawns_reject_update',
+               'agent_subagent_spawns_reject_delete',
+               'agent_tool_calls_bind_subagent_spawn',
                'schema_migrations_reject_update',
                'schema_migrations_reject_delete'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 179 {
+    if trigger_count != 183 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
         ));
@@ -5073,8 +5100,10 @@ fn readiness(
     verify_migration_trigger_definitions(connection, MIGRATION_0032, MIGRATION_0032_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0033, MIGRATION_0033_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0034, MIGRATION_0034_TRIGGER_NAMES)?;
+    verify_migration_trigger_definitions(connection, MIGRATION_0036, MIGRATION_0036_TRIGGER_NAMES)?;
     verify_session_followup_integrity(connection)?;
     verify_session_fork_integrity(connection)?;
+    agent::verify_agent_subagent_spawn_integrity(connection)?;
 
     let agent_pending_call_fk: i64 = connection.query_row(
         r#"SELECT COUNT(*)
@@ -11272,22 +11301,29 @@ struct ForkSourceTurn {
 
 #[allow(clippy::too_many_arguments)]
 fn fork_session(
-    connection: &mut Connection,
+    connection: &Connection,
     context: &AuthzContext,
     parent_session_id: &str,
     request: ForkSessionRequest,
     idempotency_key: &str,
     limits: &StorageLimits,
     physical_limits: &SqlitePhysicalLimits,
+    internal_authority: bool,
+    forced_timestamp: Option<&str>,
 ) -> Result<ForkSessionResponse, StorageError> {
     normalized_key(idempotency_key)?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    require_current_authority(&transaction, context, AccountCapability::SessionWrite)?;
-    require_active_session_actor(&transaction, parent_session_id, context)?;
+    let transaction = connection;
+    if internal_authority {
+        require_goal_round_authority(transaction, parent_session_id, context)?;
+        require_session_account(transaction, parent_session_id, &context.account_id)?;
+    } else {
+        require_current_authority(transaction, context, AccountCapability::SessionWrite)?;
+        require_active_session_actor(transaction, parent_session_id, context)?;
+    }
     validate_fork_session_request(&request)?;
     let fingerprint = session_command_fingerprint(Some(parent_session_id), &request)?;
     if let Some(mut response) = load_session_command_receipt_for_actor::<ForkSessionResponse>(
-        &transaction,
+        transaction,
         context,
         idempotency_key,
         "fork_session",
@@ -11295,26 +11331,25 @@ fn fork_session(
         None,
     )? {
         response.replayed = true;
-        transaction.commit()?;
         return Ok(response);
     }
 
     require_connection_physical_capacity(
-        &transaction,
+        transaction,
         physical_limits,
         PhysicalCapacityGate::Admission,
     )?;
-    let parent = query_session_summary(&transaction, parent_session_id)?;
-    validate_session_event_tail(&transaction, &parent)?;
-    validate_active_turn_projection(&transaction, &parent)?;
+    let parent = query_session_summary(transaction, parent_session_id)?;
+    validate_session_event_tail(transaction, &parent)?;
+    validate_active_turn_projection(transaction, &parent)?;
     if request.through_sequence == 0 || request.through_sequence > parent.sequence {
         return Err(StorageError::ConcurrentModification);
     }
-    if query_session_summary_optional(&transaction, &request.id)?.is_some() {
+    if query_session_summary_optional(transaction, &request.id)?.is_some() {
         return Err(StorageError::SessionAlreadyExists(request.id));
     }
     require_session_count_capacity(
-        &transaction,
+        transaction,
         context.account_id.as_str(),
         Some(&context.user_id),
         limits,
@@ -11322,12 +11357,12 @@ fn fork_session(
 
     let max_inherited_turns = limits.session_event_slots_per_session.saturating_sub(1) / 3;
     let source = query_session_fork_source_turns(
-        &transaction,
+        transaction,
         parent_session_id,
         request.through_sequence,
         max_inherited_turns,
     )?;
-    let timestamp = now();
+    let timestamp = forced_timestamp.map(str::to_owned).unwrap_or_else(now);
     transaction.execute(
         r#"INSERT INTO sessions(
                id, title, status, created_at, updated_at, sequence,
@@ -11464,7 +11499,7 @@ fn fork_session(
                 .ok_or(StorageError::IntegerOutOfRange("fork event payload bytes"))
         })?;
     require_session_event_capacity(
-        &transaction,
+        transaction,
         &request.id,
         EventCapacityRequest::events(prepared_events.len(), payload_bytes),
         limits,
@@ -11472,9 +11507,9 @@ fn fork_session(
 
     let mut event_index = 0usize;
     let (created_event, created_payload) = &prepared_events[event_index];
-    insert_session_event(&transaction, &request.id, created_event, created_payload)?;
+    insert_session_event(transaction, &request.id, created_event, created_payload)?;
     update_session_projection(
-        &transaction,
+        transaction,
         &request.id,
         0,
         SessionStatus::Ready,
@@ -11521,9 +11556,9 @@ fn fork_session(
                     "fork prepared event sequence is not contiguous".into(),
                 ));
             }
-            insert_session_event(&transaction, &request.id, event, payload)?;
+            insert_session_event(transaction, &request.id, event, payload)?;
             update_session_projection(
-                &transaction,
+                transaction,
                 &request.id,
                 expected_sequence - 1,
                 SessionStatus::Ready,
@@ -11576,12 +11611,12 @@ fn fork_session(
         created_at: timestamp,
     };
     let response = ForkSessionResponse {
-        session: query_session_summary(&transaction, &request.id)?,
+        session: query_session_summary(transaction, &request.id)?,
         fork,
         replayed: false,
     };
     insert_session_command_receipt_for_actor(
-        &transaction,
+        transaction,
         context,
         idempotency_key,
         "fork_session",
@@ -11590,7 +11625,6 @@ fn fork_session(
         &request.id,
         response.session.sequence,
     )?;
-    transaction.commit()?;
     Ok(response)
 }
 
@@ -13282,6 +13316,133 @@ fn start_turn(
         reply_job: stored_job,
         agent_work: stored_agent,
     })
+}
+
+/// Inserts the first turn and Agent job for a child Session inside the parent
+/// tool-completion transaction. The parent spawn row is the idempotency and
+/// provenance authority, so this path intentionally creates no standalone
+/// `start_turn` command receipt.
+pub(super) fn insert_subagent_initial_turn(
+    connection: &Connection,
+    child_session_id: &str,
+    request: &StartTurnRequest,
+    agent_spec: &AgentTurnSpec,
+    limits: &StorageLimits,
+    physical_limits: &SqlitePhysicalLimits,
+    timestamp: &str,
+) -> Result<(AgentTurn, AgentModelJob), StorageError> {
+    validated_durable_reference(child_session_id, "child session ID")?;
+    validate_start_turn_request(request)?;
+    agent::validate_agent_turn_spec(agent_spec)?;
+    require_goal_round_authority(connection, child_session_id, &agent_spec.authz)?;
+    require_connection_physical_capacity(
+        connection,
+        physical_limits,
+        PhysicalCapacityGate::Admission,
+    )?;
+    let turn_exists = connection
+        .query_row(
+            "SELECT 1 FROM session_turns WHERE id = ?1",
+            [&request.turn_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if turn_exists.is_some() {
+        return Err(StorageError::InvalidSessionTransition(format!(
+            "turn `{}` already exists",
+            request.turn_id
+        )));
+    }
+    let summary = query_session_summary(connection, child_session_id)?;
+    require_session_sequence(&summary, request.expected_sequence)?;
+    if summary.status != SessionStatus::Ready || summary.active_turn_id.is_some() {
+        return Err(StorageError::InvalidSessionTransition(format!(
+            "session `{child_session_id}` must be ready before starting a subagent turn"
+        )));
+    }
+    require_open_turn_capacity(
+        connection,
+        agent_spec.authz.account_id.as_str(),
+        Some(&agent_spec.authz.user_id),
+        limits,
+    )?;
+    require_reply_queue_capacity(
+        connection,
+        agent_spec.authz.account_id.as_str(),
+        Some(&agent_spec.authz.user_id),
+        limits,
+    )?;
+    let finalization_payload_reservation = session_finalization_payload_reservation(
+        &request.turn_id,
+        Some(&agent_spec.provider_name),
+        agent_spec.model_name.as_deref(),
+    )?;
+    let sequence = next_session_sequence(summary.sequence)?;
+    let event = build_session_event(
+        child_session_id,
+        sequence,
+        timestamp,
+        SessionEventData::UserMessage {
+            turn_id: request.turn_id.clone(),
+            content: request.user_message.clone(),
+        },
+    );
+    let payload = encode_event_payload(&event)?;
+    require_session_event_capacity(
+        connection,
+        child_session_id,
+        EventCapacityRequest {
+            new_event_slots: 1,
+            new_event_payload_bytes: payload.bytes,
+            new_reserved_slots: 2,
+            new_reserved_payload_bytes: finalization_payload_reservation,
+        },
+        limits,
+    )?;
+    let ordinal: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM session_turns WHERE session_id = ?1",
+        [&child_session_id],
+        |row| row.get(0),
+    )?;
+    connection.execute(
+        r#"INSERT INTO session_turns(
+               id, session_id, ordinal, status, user_message, assistant_message,
+               started_at, completed_at
+           ) VALUES (?1, ?2, ?3, 'open', ?4, NULL, ?5, NULL)"#,
+        params![
+            request.turn_id,
+            child_session_id,
+            ordinal,
+            request.user_message,
+            timestamp
+        ],
+    )?;
+    insert_session_finalization_reservation(
+        connection,
+        agent_spec.authz.account_id.as_str(),
+        Some(&agent_spec.authz.user_id),
+        child_session_id,
+        &request.turn_id,
+        finalization_payload_reservation,
+        timestamp,
+    )?;
+    insert_session_event(connection, child_session_id, &event, &payload)?;
+    update_session_projection(
+        connection,
+        child_session_id,
+        summary.sequence,
+        SessionStatus::Running,
+        Some(&request.turn_id),
+        sequence,
+        timestamp,
+    )?;
+    agent::insert_agent_turn(
+        connection,
+        child_session_id,
+        &request.turn_id,
+        agent_spec,
+        timestamp,
+    )
 }
 
 fn insert_reply_job(

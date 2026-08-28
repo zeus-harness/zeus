@@ -76,26 +76,26 @@ pub use storage::{
     AgentModelStartOutcome, AgentModelSuccessCommit, AgentOperationClaim, AgentOperationKind,
     AgentPreparedModel, AgentPreparedTool, AgentPromptCommit, AgentPromptRevisionPage,
     AgentPromptRevisionSummary, AgentPromptState, AgentPromptUpdateResult, AgentReviewCommit,
-    AgentReviewContext, AgentReviewResult, AgentTerminalCompletion, AgentToolCall,
-    AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
-    AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurn,
-    AgentTurnEnqueueResponse, AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal,
-    AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, CreateAccountCommit,
-    CreateAccountResult, CreateMemberResult, DEFAULT_SESSION_AGENT_PROMPT_REVISION,
-    DEFAULT_SESSION_AGENT_SYSTEM_PROMPT, InFlightWorkSummary, KnowledgeCatalogCommit,
-    KnowledgeCatalogRevisionPage, KnowledgeCatalogRevisionSummary, KnowledgeCatalogState,
-    KnowledgeCatalogUpdateResult, MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit,
-    MemberSetupResult, MemberSetupToken, MemberTransitionResult, MembershipRevision,
-    MembershipRole, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit, ReplyJob,
-    ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
-    ReplySuccessCommit, RotateMemberSetupTokenResult, SESSION_AGENT_PROMPT_ID,
-    SessionCompactionClaimOutcome, SessionCompactionFailureCommit, SessionCompactionJob,
-    SessionCompactionSuccessCommit, SessionContextCheckpoint, SessionFollowupCandidate,
-    SessionForkPage, SessionSummaryPage, SqliteOperationLimits, SqliteOperationLimitsError,
-    SqlitePhysicalLimits, SqlitePhysicalLimitsError, StorageLimits, StorageLimitsError,
-    StoredAccount, StoredAccountStatus, StoredCredential, StoredMember, StoredMemberPage,
-    StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserRole, StoredUserStatus,
-    SwitchAuthSessionCommit, SwitchAuthSessionResult, TransitionMemberCommit,
+    AgentReviewContext, AgentReviewResult, AgentSubagentSpawnCandidate, AgentSubagentSpawnCommit,
+    AgentTerminalCompletion, AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome,
+    AgentToolCompletion, AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit,
+    AgentToolStartOutcome, AgentToolWork, AgentTurn, AgentTurnEnqueueResponse,
+    AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthSessionId,
+    AuthzContext, BootstrapOwnerCommit, CreateAccountCommit, CreateAccountResult,
+    CreateMemberResult, DEFAULT_SESSION_AGENT_PROMPT_REVISION, DEFAULT_SESSION_AGENT_SYSTEM_PROMPT,
+    InFlightWorkSummary, KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage,
+    KnowledgeCatalogRevisionSummary, KnowledgeCatalogState, KnowledgeCatalogUpdateResult,
+    MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit, MemberSetupResult, MemberSetupToken,
+    MemberTransitionResult, MembershipRevision, MembershipRole, ReplyClaimOutcome, ReplyCompletion,
+    ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus,
+    ReplyOutcomeUnknownCommit, ReplySuccessCommit, RotateMemberSetupTokenResult,
+    SESSION_AGENT_PROMPT_ID, SessionCompactionClaimOutcome, SessionCompactionFailureCommit,
+    SessionCompactionJob, SessionCompactionSuccessCommit, SessionContextCheckpoint,
+    SessionFollowupCandidate, SessionForkPage, SessionSummaryPage, SqliteOperationLimits,
+    SqliteOperationLimitsError, SqlitePhysicalLimits, SqlitePhysicalLimitsError, StorageLimits,
+    StorageLimitsError, StoredAccount, StoredAccountStatus, StoredCredential, StoredMember,
+    StoredMemberPage, StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserRole,
+    StoredUserStatus, SwitchAuthSessionCommit, SwitchAuthSessionResult, TransitionMemberCommit,
     UpdateAccountAuditPolicyCommit,
 };
 use storage::{
@@ -105,8 +105,10 @@ use storage::{
     SqliteStore, StorageError,
 };
 use subagents::{
-    LIST_AGENTS_TOOL_NAME, LIST_AGENTS_TOOL_VERSION, ListAgentsResult, SubagentError,
-    list_agents_descriptor, prepare_list_agents, register_subagent_tools,
+    LIST_AGENTS_TOOL_NAME, LIST_AGENTS_TOOL_VERSION, ListAgentsResult, SPAWN_AGENT_TOOL_NAME,
+    SPAWN_AGENT_TOOL_VERSION, SpawnAgentResult, SubagentError, list_agents_descriptor,
+    prepare_list_agents, prepare_spawn_agent, register_subagent_tools, spawn_agent_descriptor,
+    spawn_agent_identity,
 };
 use terminal::TerminalService;
 use thiserror::Error;
@@ -626,6 +628,8 @@ pub enum StoreError {
     OperationCapacityExceeded,
     #[error("the durable reply queue is at capacity")]
     ReplyQueueCapacityExceeded,
+    #[error("the durable subagent admission is at capacity")]
+    SubagentAdmissionRejected,
     #[error("the durable dispatch queue is at capacity")]
     DispatchQueueCapacityExceeded,
     #[error("the authentication session store is at capacity")]
@@ -747,6 +751,7 @@ impl From<StorageError> for StoreError {
             StorageError::PhysicalStorageExhausted => Self::PhysicalStorageExhausted,
             StorageError::OperationCapacityExceeded => Self::OperationCapacityExceeded,
             StorageError::ReplyQueueCapacityExceeded => Self::ReplyQueueCapacityExceeded,
+            StorageError::SubagentAdmissionRejected => Self::SubagentAdmissionRejected,
             StorageError::DispatchQueueCapacityExceeded => Self::DispatchQueueCapacityExceeded,
             StorageError::AuthSessionCapacityExceeded => Self::AuthSessionCapacityExceeded,
             StorageError::AccountCapacityExceeded => Self::AccountCapacityExceeded,
@@ -1764,6 +1769,27 @@ impl DemoStore {
                     StoreError::Registry(RegistryError::Executor(ExecutorError::Failed {
                         code: "list_agents_result_encoding_failed".into(),
                         message: "The durable child catalog could not be encoded".into(),
+                        retryable: false,
+                    }))
+                })?,
+                replayed: false,
+                provider_request_id: None,
+            });
+        }
+        if resolved.call.tool == SPAWN_AGENT_TOOL_NAME
+            && resolved.call.tool_version == SPAWN_AGENT_TOOL_VERSION
+        {
+            prepare_spawn_agent(&resolved.call.arguments).map_err(subagent_executor_error)?;
+            let identity = spawn_agent_identity(&scope.session_id, &resolved.call.call_id)
+                .map_err(subagent_executor_error)?;
+            return Ok(ToolOutput {
+                value: serde_json::to_value(SpawnAgentResult {
+                    subagent_id: identity.session_id,
+                })
+                .map_err(|_| {
+                    StoreError::Registry(RegistryError::Executor(ExecutorError::Failed {
+                        code: "spawn_agent_result_encoding_failed".into(),
+                        message: "The durable child identity could not be encoded".into(),
                         retryable: false,
                     }))
                 })?,
@@ -3284,6 +3310,40 @@ impl DemoStore {
         Ok(completion)
     }
 
+    /// Atomically commit a successful parent `spawn_agent` result and the
+    /// complete durable child admission.
+    pub async fn complete_agent_tool_with_subagent(
+        &self,
+        commit: AgentToolCompletionCommit,
+        spawn: AgentSubagentSpawnCommit,
+    ) -> Result<AgentToolCompletion, StoreError> {
+        let completion = retry_durable_progress("Agent subagent completion", || async {
+            Ok(self
+                .storage
+                .complete_agent_tool_with_subagent(commit.clone(), spawn.clone())
+                .await?)
+        })
+        .await?;
+        if let AgentToolCompletion::Terminal(terminal) = &completion {
+            if !terminal.replayed {
+                self.publish_session_event(&terminal.session.id, terminal.event.clone());
+            }
+            self.cleanup_agent_terminal_resources(&terminal.agent).await;
+        }
+        Ok(completion)
+    }
+
+    pub async fn subagent_spawn_candidate_for_started_tool(
+        &self,
+        scope: &ExecutionScope,
+        call_id: &str,
+    ) -> Result<AgentSubagentSpawnCandidate, StoreError> {
+        Ok(self
+            .storage
+            .subagent_spawn_candidate_for_started_tool(scope, call_id)
+            .await?)
+    }
+
     /// Commit an indeterminate connector outcome without ever re-queuing it.
     pub async fn complete_agent_tool_outcome_unknown(
         &self,
@@ -4590,15 +4650,16 @@ fn register_runtime_subagent_tools(
     environment: &str,
     policy_revision: &str,
 ) -> Result<(), StoreError> {
-    let descriptor = list_agents_descriptor();
-    policy_rules.push(PolicyRule {
-        revision: policy_revision.into(),
-        tool: descriptor.name,
-        environment: environment.into(),
-        effect: descriptor.effect,
-        sandbox_profile: descriptor.sandbox_profile,
-        decision: PolicyDecision::Allow,
-    });
+    for descriptor in [list_agents_descriptor(), spawn_agent_descriptor()] {
+        policy_rules.push(PolicyRule {
+            revision: policy_revision.into(),
+            tool: descriptor.name,
+            environment: environment.into(),
+            effect: descriptor.effect,
+            sandbox_profile: descriptor.sandbox_profile,
+            decision: PolicyDecision::Allow,
+        });
+    }
     register_subagent_tools(registry)?;
     Ok(())
 }
@@ -4609,6 +4670,10 @@ fn subagent_executor_error(error: SubagentError) -> StoreError {
         SubagentError::InvalidLimit => "list_agents_invalid_limit",
         SubagentError::InvalidCursor => "list_agents_invalid_cursor",
         SubagentError::InvalidResult => "list_agents_invalid_result",
+        SubagentError::InvalidSpawnArguments => "spawn_agent_invalid_arguments",
+        SubagentError::InvalidSpawnDescription => "spawn_agent_invalid_description",
+        SubagentError::InvalidSpawnPrompt => "spawn_agent_invalid_prompt",
+        SubagentError::InvalidSpawnIdentity => "spawn_agent_invalid_identity",
     };
     StoreError::Registry(RegistryError::Executor(ExecutorError::Failed {
         code: code.into(),
@@ -5124,7 +5189,7 @@ mod tests {
         let store = local_store(&paths, false).await;
 
         let definitions = store.session_agent_tool_definitions().unwrap();
-        assert_eq!(definitions.len(), 6);
+        assert_eq!(definitions.len(), 7);
         assert_eq!(definitions[0].name, goals::CREATE_GOAL_TOOL_NAME);
         assert_eq!(definitions[1].name, connectors::DEV_MARKER_TOOL_NAME);
         assert_eq!(
@@ -5149,16 +5214,21 @@ mod tests {
             definitions[3].input_schema["properties"]["cursor"]["maxLength"],
             subagents::LIST_AGENTS_CURSOR_MAX_BYTES
         );
-        assert_eq!(definitions[4].name, planning::TODO_WRITE_TOOL_NAME);
+        assert_eq!(definitions[4].name, subagents::SPAWN_AGENT_TOOL_NAME);
         assert_eq!(
-            definitions[4].input_schema["properties"]["todos"]["maxItems"],
+            definitions[4].input_schema["properties"]["prompt"]["maxLength"],
+            subagents::SPAWN_AGENT_PROMPT_MAX_BYTES
+        );
+        assert_eq!(definitions[5].name, planning::TODO_WRITE_TOOL_NAME);
+        assert_eq!(
+            definitions[5].input_schema["properties"]["todos"]["maxItems"],
             planning::TODO_MAX_ITEMS
         );
         assert_eq!(
-            definitions[4].input_schema["properties"]["todos"]["items"]["properties"]["status"]["enum"],
+            definitions[5].input_schema["properties"]["todos"]["items"]["properties"]["status"]["enum"],
             serde_json::json!(["pending", "in_progress", "completed"])
         );
-        assert_eq!(definitions[5].name, goals::UPDATE_GOAL_TOOL_NAME);
+        assert_eq!(definitions[6].name, goals::UPDATE_GOAL_TOOL_NAME);
 
         let production = DemoStore::seeded().await.unwrap();
         assert_eq!(
@@ -5172,6 +5242,7 @@ mod tests {
                 goals::CREATE_GOAL_TOOL_NAME,
                 goals::GET_GOAL_TOOL_NAME,
                 subagents::LIST_AGENTS_TOOL_NAME,
+                subagents::SPAWN_AGENT_TOOL_NAME,
                 planning::TODO_WRITE_TOOL_NAME,
                 goals::UPDATE_GOAL_TOOL_NAME,
             ]
@@ -5399,6 +5470,7 @@ mod tests {
                 subagents::LIST_AGENTS_TOOL_NAME,
                 skills::SKILL_LIST_TOOL_NAME,
                 skills::SKILL_LOAD_TOOL_NAME,
+                subagents::SPAWN_AGENT_TOOL_NAME,
                 planning::TODO_WRITE_TOOL_NAME,
                 goals::UPDATE_GOAL_TOOL_NAME,
             ]
