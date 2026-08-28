@@ -59,8 +59,9 @@ use protocol::{
     OverviewResponse, PolicyDecision, ResourceEnvelopeError, ResumeSessionRequest,
     ResumeSessionResponse, ReviewDecision, ReviewRequest, ReviewResponse, RunDetail,
     RunDetailPagination, RunEvent, RunEventData, RunEventPage, RunSummary, SessionDetail,
-    SessionEvent, SessionEventData, SessionEventPage, SessionFollowup, SessionSummary, SessionTurn,
-    StartTurnRequest, StartTurnResponse, ToolCall, ToolExecutorStatus, ToolOutcome,
+    SessionEvent, SessionEventData, SessionEventPage, SessionFlushBarrier, SessionFollowup,
+    SessionSummary, SessionTurn, StartTurnRequest, StartTurnResponse, ToolCall, ToolExecutorStatus,
+    ToolOutcome,
 };
 use serde_json::Value;
 use skills::{SkillCatalog, register_skill_tools, skill_tool_descriptors};
@@ -2589,6 +2590,32 @@ impl DemoStore {
         Ok(self
             .storage
             .session_followups_for_actor(context, session_id)
+            .await?)
+    }
+
+    pub async fn capture_session_flush_barrier_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+    ) -> Result<SessionFlushBarrier, StoreError> {
+        validate_durable_reference(session_id, "session ID")?;
+        self.authorize_session_for_actor(context, session_id)
+            .await?;
+        Ok(self
+            .storage
+            .capture_session_flush_barrier_for_actor(context, session_id)
+            .await?)
+    }
+
+    pub async fn observe_session_flush_barrier_for_actor(
+        &self,
+        context: &AuthzContext,
+        barrier: SessionFlushBarrier,
+    ) -> Result<SessionFlushBarrier, StoreError> {
+        validate_durable_reference(&barrier.session_id, "session ID")?;
+        Ok(self
+            .storage
+            .observe_session_flush_barrier_for_actor(context, barrier)
             .await?)
     }
 

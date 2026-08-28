@@ -19,9 +19,9 @@ use protocol::{
     ResourceEnvelopeError, ResumeSessionRequest, ResumeSessionResponse, ReviewDecision,
     ReviewResponse, RunEvent, RunEventData, RunEventPage, RunStatus, RunSummary, SandboxProfile,
     SessionDetail, SessionDetailPagination, SessionEvent, SessionEventData, SessionEventPage,
-    SessionFlushAck, SessionFollowup, SessionFollowupStatus, SessionStatus, SessionSummary,
-    SessionTurn, SessionTurnStatus, Severity, StartTurnRequest, StartTurnResponse, ToolCallStatus,
-    ToolEffect, ToolOutcome,
+    SessionFlushAck, SessionFlushBarrier, SessionFlushBarrierStatus, SessionFollowup,
+    SessionFollowupStatus, SessionStatus, SessionSummary, SessionTurn, SessionTurnStatus, Severity,
+    StartTurnRequest, StartTurnResponse, ToolCallStatus, ToolEffect, ToolOutcome,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Serialize, de::DeserializeOwned};
@@ -1252,6 +1252,54 @@ impl SqliteStore {
             let items = query_session_followups(&transaction, &session_id)?;
             transaction.commit()?;
             Ok(items)
+        })
+        .await
+    }
+
+    /// Captures the exact active turn and follow-up prefix admitted before a
+    /// Session flush barrier. SQLite commits are already synchronous; this
+    /// snapshot gives the caller a stable boundary to wait through without
+    /// later work extending the wait forever.
+    pub async fn capture_session_flush_barrier_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+    ) -> Result<SessionFlushBarrier, StorageError> {
+        let context = validated_authz_context(context)?;
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        self.with_connection(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            require_current_authority(&transaction, &context, AccountCapability::Read)?;
+            require_active_session_actor(&transaction, &session_id, &context)?;
+            let barrier = capture_session_flush_barrier(&transaction, &session_id)?;
+            transaction.commit()?;
+            Ok(barrier)
+        })
+        .await
+    }
+
+    /// Revalidates authority and observes one previously captured barrier.
+    /// The immutable boundary, rather than the Session's current head, decides
+    /// which work must settle.
+    pub async fn observe_session_flush_barrier_for_actor(
+        &self,
+        context: &AuthzContext,
+        barrier: SessionFlushBarrier,
+    ) -> Result<SessionFlushBarrier, StorageError> {
+        let context = validated_authz_context(context)?;
+        let session_id = validated_durable_reference(&barrier.session_id, "session ID")?.to_owned();
+        if let Some(turn_id) = barrier.active_turn_id.as_deref() {
+            validated_durable_reference(turn_id, "turn ID")?;
+        }
+        self.with_connection(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            require_current_authority(&transaction, &context, AccountCapability::Read)?;
+            require_active_session_actor(&transaction, &session_id, &context)?;
+            let observed = observe_session_flush_barrier(&transaction, barrier)?;
+            transaction.commit()?;
+            Ok(observed)
         })
         .await
     }
@@ -11252,6 +11300,164 @@ fn query_session_followups(
         .rev()
         .map(|turn_id| query_session_followup(connection, session_id, &turn_id))
         .collect()
+}
+
+fn capture_session_flush_barrier(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<SessionFlushBarrier, StorageError> {
+    let session = query_session_summary(connection, session_id)?;
+    let through_followup_ordinal = connection.query_row(
+        "SELECT COALESCE(MAX(ordinal), 0) FROM session_followups WHERE session_id = ?1",
+        [session_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let first_unsettled_followup_ordinal = connection.query_row(
+        r#"SELECT MIN(followup.ordinal)
+           FROM session_followups followup
+           LEFT JOIN agent_turns agent ON agent.id = followup.claimed_agent_id
+           WHERE followup.session_id = ?1
+             AND (
+                 followup.status = 'queued'
+                 OR (
+                     followup.status = 'claimed'
+                     AND (
+                         agent.id IS NULL
+                         OR agent.status NOT IN ('succeeded', 'failed', 'needs_attention')
+                     )
+                 )
+             )"#,
+        [session_id],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    let after_followup_ordinal = first_unsettled_followup_ordinal
+        .map(|ordinal| {
+            ordinal.checked_sub(1).ok_or_else(|| {
+                StorageError::CorruptData(
+                    "Session flush follow-up interval starts before ordinal one".into(),
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or(through_followup_ordinal);
+    let barrier = SessionFlushBarrier {
+        session_id: session.id,
+        through_sequence: session.sequence,
+        after_followup_ordinal: i64_to_u64(
+            after_followup_ordinal,
+            "Session flush settled follow-up ordinal",
+        )?,
+        through_followup_ordinal: i64_to_u64(
+            through_followup_ordinal,
+            "Session flush follow-up ordinal",
+        )?,
+        active_turn_id: session.active_turn_id,
+        status: if session.status == SessionStatus::NeedsAttention {
+            SessionFlushBarrierStatus::NeedsAttention
+        } else {
+            SessionFlushBarrierStatus::Pending
+        },
+        observed_sequence: session.sequence,
+    };
+    observe_session_flush_barrier(connection, barrier)
+}
+
+fn observe_session_flush_barrier(
+    connection: &Connection,
+    mut barrier: SessionFlushBarrier,
+) -> Result<SessionFlushBarrier, StorageError> {
+    let session = query_session_summary(connection, &barrier.session_id)?;
+    barrier.observed_sequence = session.sequence;
+    if barrier.status.is_terminal() {
+        return Ok(barrier);
+    }
+
+    let mut pending = false;
+    let mut needs_attention = false;
+    if let Some(turn_id) = barrier.active_turn_id.as_deref() {
+        match query_session_turn(connection, &barrier.session_id, turn_id)?.status {
+            SessionTurnStatus::Open => pending = true,
+            SessionTurnStatus::Flushed => {}
+            SessionTurnStatus::Interrupted => needs_attention = true,
+        }
+    }
+
+    let through_followup_ordinal = u64_to_i64(
+        barrier.through_followup_ordinal,
+        "Session flush follow-up ordinal",
+    )?;
+    let after_followup_ordinal = u64_to_i64(
+        barrier.after_followup_ordinal,
+        "Session flush settled follow-up ordinal",
+    )?;
+    if after_followup_ordinal > through_followup_ordinal {
+        return Err(StorageError::CorruptData(
+            "Session flush follow-up interval is reversed".into(),
+        ));
+    }
+    let mut statement = connection.prepare(
+        r#"SELECT followup.status, agent.status, turn.status
+           FROM session_followups followup
+           LEFT JOIN agent_turns agent ON agent.id = followup.claimed_agent_id
+           LEFT JOIN session_turns turn
+             ON turn.session_id = followup.session_id AND turn.id = followup.turn_id
+           WHERE followup.session_id = ?1
+             AND followup.ordinal > ?2 AND followup.ordinal <= ?3
+           ORDER BY followup.ordinal"#,
+    )?;
+    let rows = statement.query_map(
+        params![
+            barrier.session_id,
+            after_followup_ordinal,
+            through_followup_ordinal
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        },
+    )?;
+    for row in rows {
+        let (followup_status, agent_status, turn_status) = row?;
+        match followup_status.as_str() {
+            "queued" => pending = true,
+            "discarded" => {}
+            "claimed" => match (agent_status.as_deref(), turn_status.as_deref()) {
+                (Some("succeeded"), Some("flushed")) => {}
+                (Some("failed" | "needs_attention"), _) | (_, Some("interrupted")) => {
+                    needs_attention = true;
+                }
+                (
+                    Some(
+                        "waiting_model" | "model_running" | "waiting_approval" | "tool_queued"
+                        | "tool_running",
+                    ),
+                    Some("open"),
+                ) => pending = true,
+                _ => {
+                    return Err(StorageError::CorruptData(
+                        "claimed Session follow-up has inconsistent Agent or turn state".into(),
+                    ));
+                }
+            },
+            _ => {
+                return Err(StorageError::CorruptData(format!(
+                    "unknown Session follow-up status `{followup_status}`"
+                )));
+            }
+        }
+    }
+
+    barrier.status = if needs_attention {
+        SessionFlushBarrierStatus::NeedsAttention
+    } else if pending {
+        SessionFlushBarrierStatus::Pending
+    } else {
+        SessionFlushBarrierStatus::Quiescent
+    };
+    Ok(barrier)
 }
 
 fn enqueue_session_followup(

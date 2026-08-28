@@ -1093,6 +1093,14 @@ directly.
   `turn_id`/`user_message`/`expected_sequence` command shape and returns `202`
   after durable FIFO enqueue. `GET` on the same path returns the latest 100
   inbox records in ordinal order, including claimed or discarded outcomes.
+- `POST /api/v1/sessions/{session_id}/flush?timeout_ms=...` is a server-owned
+  quiescence barrier. It freezes the active turn and highest follow-up ordinal
+  visible at admission, excludes follow-ups already settled before admission,
+  then waits only for that bounded durable interval. The timeout
+  defaults to 10 seconds and is capped at 30 seconds; a settled barrier returns
+  `200` with `quiescent` or `needs_attention`, while an expired wait returns
+  `202 pending` plus `Retry-After`. Later turns and follow-ups cannot starve an
+  existing barrier, and every observation revalidates actor authority.
 - `GET /api/v1/sessions/{session_id}/turns/{turn_id}/agent` returns the
   actor-scoped durable Agent state, deployment-manifest digest, and ordered
   tool calls.
@@ -1125,7 +1133,8 @@ directly.
   lets an owner approve the exact persisted call or reject it as a structured
   model-visible result. The decision is idempotent and never accepts a
   client-supplied continuation transcript.
-- Browsers cannot submit assistant content. The legacy
+- Browsers cannot submit assistant content. The production Session-level
+  flush barrier above has no request body and never finalizes a turn. The legacy
   `POST /api/v1/sessions/{session_id}/turns/{turn_id}/flush` route exists only
   in a private `#[cfg(test)]` contract router that bootstraps a real test owner;
   it is absent from the production server.
@@ -1301,11 +1310,11 @@ bounded multi-account control plane:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 670 tests passed
+- `cargo test --workspace --all-targets --locked`: 674 tests passed
   across the top-level test targets, including 22 connector tests,
   8 deployment tests, 29 knowledge tests, 30 LLM unit and 18 provider-contract
-  tests, 4 Goal tests, 5 Skill Catalog tests, 273 storage tests, 21 workflow
-  tests, 52 runtime tests, 21 protocol tests, 90 API library tests, 18 API main/config
+  tests, 4 Goal tests, 5 Skill Catalog tests, 276 storage tests, 21 workflow
+  tests, 52 runtime tests, 21 protocol tests, 91 API library tests, 18 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,

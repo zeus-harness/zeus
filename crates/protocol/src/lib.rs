@@ -1370,6 +1370,35 @@ pub struct SessionFollowupListResponse {
     pub items: Vec<SessionFollowup>,
 }
 
+/// Result of waiting for the exact Session work admitted before a flush
+/// barrier was captured. Work accepted after `through_sequence` or
+/// `through_followup_ordinal` does not extend the barrier.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionFlushBarrierStatus {
+    Pending,
+    Quiescent,
+    NeedsAttention,
+}
+
+impl SessionFlushBarrierStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Quiescent | Self::NeedsAttention)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFlushBarrier {
+    pub session_id: String,
+    pub through_sequence: u64,
+    pub after_followup_ordinal: u64,
+    pub through_followup_ordinal: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_turn_id: Option<String>,
+    pub status: SessionFlushBarrierStatus,
+    pub observed_sequence: u64,
+}
+
 /// One append-only text delta emitted by a started Agent model operation.
 /// `sequence` is contiguous across every model step in the owning Agent turn;
 /// `ordinal` is contiguous within one provider operation.
@@ -1402,7 +1431,8 @@ pub struct FlushSessionRequest {
     pub expected_sequence: u64,
 }
 
-/// Commit acknowledgement for the `session/flush` durability barrier.
+/// Commit acknowledgement for the legacy turn-finalization command. This is
+/// distinct from the server-owned Session flush barrier above.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionFlushAck {
     pub session_id: String,
@@ -2183,6 +2213,23 @@ mod tests {
             serde_json::to_value(SessionTurnStatus::Flushed).unwrap(),
             "flushed"
         );
+        let barrier = SessionFlushBarrier {
+            session_id: "session-1".into(),
+            through_sequence: 4,
+            after_followup_ordinal: 0,
+            through_followup_ordinal: 2,
+            active_turn_id: Some("turn-1".into()),
+            status: SessionFlushBarrierStatus::Pending,
+            observed_sequence: 4,
+        };
+        let barrier_value = serde_json::to_value(&barrier).unwrap();
+        assert_eq!(barrier_value["status"], "pending");
+        assert_eq!(
+            serde_json::from_value::<SessionFlushBarrier>(barrier_value).unwrap(),
+            barrier
+        );
+        assert!(!SessionFlushBarrierStatus::Pending.is_terminal());
+        assert!(SessionFlushBarrierStatus::Quiescent.is_terminal());
     }
 
     #[test]

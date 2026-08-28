@@ -60,9 +60,9 @@ use protocol::{
     LogoutResponse, MemberSetupRequest, MemberSetupTokenResponse, PolicyDecision, ProblemDetails,
     ReplyProviderCatalogResponse, ReplyProviderDescriptor, ResumeSessionRequest,
     ResumeSessionResponse, ReviewDecision, ReviewRequest, ReviewResponse,
-    RotateMemberSetupTokenRequest, RunDetail, SessionDetail, SessionEvent,
-    SessionFollowupListResponse, SessionStatus, SessionTurn, StartTurnRequest,
-    SwitchAccountRequest, ThemePreference, UpdateAccountAuditPolicyRequest,
+    RotateMemberSetupTokenRequest, RunDetail, SessionDetail, SessionEvent, SessionFlushBarrier,
+    SessionFlushBarrierStatus, SessionFollowupListResponse, SessionStatus, SessionTurn,
+    StartTurnRequest, SwitchAccountRequest, ThemePreference, UpdateAccountAuditPolicyRequest,
     UpdateAccountReplyProviderRequest, UpdateMemberRequest, UpdateMemberResponse,
     UpdatePreferencesRequest, UserPreferences,
 };
@@ -119,6 +119,9 @@ const INVALID_LOGIN_ACCOUNT_KEY: &str = "<invalid-username>";
 const SSE_GLOBAL_CONNECTION_LIMIT: usize = 64;
 const SSE_ACTOR_CONNECTION_LIMIT: usize = 4;
 const SSE_CAPACITY_RETRY_AFTER: Duration = Duration::from_secs(2);
+const SESSION_FLUSH_DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+const SESSION_FLUSH_MAX_TIMEOUT: Duration = Duration::from_secs(30);
+const SESSION_FLUSH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const WORKER_ERROR_RETRY_DELAY: Duration = Duration::from_millis(25);
 const WORKER_ERROR_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 const AGENT_COMPLETION_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
@@ -1053,6 +1056,12 @@ struct AgentOutputQuery {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SessionFlushQuery {
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SessionListQuery {
     cursor: Option<String>,
     limit: Option<usize>,
@@ -1261,6 +1270,7 @@ fn build_authenticated_app(state: ApiState) -> Router {
         .route("/api/v1/sessions", get(list_sessions).post(create_session))
         .route("/api/v1/sessions/{id}", get(session_detail))
         .route("/api/v1/sessions/{id}/resume", post(resume_session))
+        .route("/api/v1/sessions/{id}/flush", post(flush_session))
         .route(
             "/api/v1/sessions/{id}/followups",
             get(list_session_followups).post(enqueue_session_followup),
@@ -1509,6 +1519,7 @@ fn build_test_app(state: ApiState, request_auth: TestRequestAuth) -> Router {
         .route("/api/v1/sessions", get(list_sessions).post(create_session))
         .route("/api/v1/sessions/{id}", get(session_detail))
         .route("/api/v1/sessions/{id}/resume", post(resume_session))
+        .route("/api/v1/sessions/{id}/flush", post(flush_session))
         .route(
             "/api/v1/sessions/{id}/followups",
             get(list_session_followups).post(enqueue_session_followup),
@@ -5486,6 +5497,68 @@ async fn resume_session(
         .await?;
     kick_followup_worker(&state);
     Ok(Json(response))
+}
+
+async fn flush_session(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    Path(id): Path<String>,
+    query: Result<Query<SessionFlushQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    // Resolve actor authority before parsing barrier-specific input so a
+    // foreign Session is indistinguishable from a missing Session.
+    state
+        .store
+        .authorize_session_for_actor(&current.principal.authz, &id)
+        .await?;
+    let Query(query) = query.map_err(ApiError::invalid_query)?;
+    let timeout = query
+        .timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or(SESSION_FLUSH_DEFAULT_TIMEOUT);
+    if timeout > SESSION_FLUSH_MAX_TIMEOUT {
+        return Err(ApiError::bad_request(
+            "invalid_session_flush_timeout",
+            format!(
+                "Session flush timeout must be between 0 and {} milliseconds",
+                SESSION_FLUSH_MAX_TIMEOUT.as_millis()
+            ),
+        )
+        .with_no_store());
+    }
+
+    let mut barrier = state
+        .store
+        .capture_session_flush_barrier_for_actor(&current.principal.authz, &id)
+        .await?;
+    kick_agent_model_worker(&state);
+    kick_followup_worker(&state);
+    let deadline = Instant::now() + timeout;
+    while barrier.status == SessionFlushBarrierStatus::Pending {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        tokio::time::sleep_until((now + SESSION_FLUSH_POLL_INTERVAL).min(deadline)).await;
+        barrier = state
+            .store
+            .observe_session_flush_barrier_for_actor(&current.principal.authz, barrier)
+            .await?;
+    }
+    Ok(session_flush_response(barrier))
+}
+
+fn session_flush_response(barrier: SessionFlushBarrier) -> Response {
+    let pending = barrier.status == SessionFlushBarrierStatus::Pending;
+    let mut response = Json(barrier).into_response();
+    if pending {
+        *response.status_mut() = StatusCode::ACCEPTED;
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    }
+    no_store(response.headers_mut());
+    response
 }
 
 async fn list_session_followups(
@@ -16582,6 +16655,114 @@ mod tests {
         assert!(replayed.replayed);
         assert_eq!(replayed.ack, flushed.ack);
         assert_eq!(replayed.events, flushed.events);
+    }
+
+    #[tokio::test]
+    async fn session_flush_barrier_is_server_owned_bounded_and_no_store() {
+        let app = test_app().await;
+        create_test_session(&app, "session-flush-barrier").await;
+
+        let ready = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-flush-barrier/flush?timeout_ms=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::OK);
+        assert_eq!(
+            ready.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        let ready: SessionFlushBarrier = response_json(ready).await;
+        assert_eq!(ready.status, SessionFlushBarrierStatus::Quiescent);
+        assert_eq!(ready.through_sequence, 1);
+        assert_eq!(ready.through_followup_ordinal, 0);
+
+        let started = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-flush-barrier/turns")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "start-session-flush-barrier")
+                    .body(Body::from(
+                        r#"{"turn_id":"turn-flush-barrier","user_message":"Remain open","expected_sequence":1}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::OK);
+
+        let pending = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-flush-barrier/flush?timeout_ms=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            pending.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("1"))
+        );
+        assert_eq!(
+            pending.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        let pending: SessionFlushBarrier = response_json(pending).await;
+        assert_eq!(pending.status, SessionFlushBarrierStatus::Pending);
+        assert_eq!(
+            pending.active_turn_id.as_deref(),
+            Some("turn-flush-barrier")
+        );
+
+        let invalid = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-flush-barrier/flush?timeout_ms=30001")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        let problem: ProblemDetails = response_json(invalid).await;
+        assert_eq!(problem.code, "invalid_session_flush_timeout");
+
+        let flushed = app
+            .clone()
+            .oneshot(
+                Request::post(
+                    "/api/v1/sessions/session-flush-barrier/turns/turn-flush-barrier/flush",
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("idempotency-key", "finish-session-flush-barrier")
+                .body(Body::from(
+                    r#"{"turn_id":"turn-flush-barrier","assistant_message":"Done","expected_sequence":2}"#,
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(flushed.status(), StatusCode::OK);
+
+        let settled = app
+            .oneshot(
+                Request::post("/api/v1/sessions/session-flush-barrier/flush?timeout_ms=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(settled.status(), StatusCode::OK);
+        let settled: SessionFlushBarrier = response_json(settled).await;
+        assert_eq!(settled.status, SessionFlushBarrierStatus::Quiescent);
+        assert_eq!(settled.observed_sequence, 4);
     }
 
     #[tokio::test]

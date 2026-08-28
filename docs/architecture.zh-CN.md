@@ -50,7 +50,8 @@ Client / SvelteKit Web
 SQLite 是本地单实例 Alpha+ 的权威存储。Restate、MinIO 和 PostgreSQL 当前不是第二套事实源。
 当前 Web 认证后列出用户 Session，恢复仍存在的上次活动 Session，并行订阅 Run/Session SSE；
 命令响应和后续权威 Session GET 用于合并事件并校准投影。浏览器只能提交 user message，不能
-提交 assistant content 或调用生产 flush route。
+提交 assistant content 或调用 legacy turn-finalization flush route；Session-level flush barrier
+只观察服务端已接收的 durable work。
 Session 列表按 opaque cursor 逐页追加；保存的活动 Session 即使不在首屏，也先通过 actor-scoped
 point detail 恢复，只有权威 `404` 才回退 primary Session。
 
@@ -278,8 +279,14 @@ Session ledger 记录 `session_created`、`run_attached`、`user_message`、可�
   waiting-approval 状态可安全终止；model/tool running 返回 `agent_operation_in_flight`。成功取消后
   Session 进入 `needs_attention`，由显式 resume 回到 `ready`；取消、重放和 started-race 都不触发
   provider 或 connector I/O。
-- flush：仅保留在不带认证的 storage/runtime 合约测试 router；真实 authenticated server 不注册
-  此路由，浏览器不能上传 assistant content。
+- Session flush barrier：`POST /sessions/{id}/flush` 不接收 body，只在同一 SQLite snapshot 冻结
+  调用时的 active turn、Session sequence 与最大 follow-up ordinal，并等待这段 durable prefix 达到
+  `quiescent` 或 `needs_attention`。调用前已经 terminal 的历史 follow-up 不进入区间；调用之后的
+  新 turn/follow-up 不扩张边界；默认等待 10 秒、最大
+  30 秒，超时返回 `202 pending` 与 `Retry-After`，每次观察都重新校验 actor authority。
+- legacy turn flush：可上传 `assistant_message` 的
+  `POST /sessions/{id}/turns/{turn_id}/flush` 仅保留在 storage/runtime 合约和测试 router；真实
+  authenticated server 不注册此路由，浏览器不能上传 assistant content。
 - resume：只允许没有 active turn 的 `needs_attention` Session；追加
   `session_resumed`，投影回到 `ready` 并保存响应回执。
 
@@ -706,8 +713,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   刷新恢复、owner/member setup/登录、owner 成员与 audit 管理、设置/退出和
   system/light/dark。member 的审批卡只读。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化按项目既有统计口径是 670 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
-  provider contract 18、skills 5、storage 273、workflows 21、runtime 52、API library 90、API main/config 18）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化按项目既有统计口径是 674 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
+  provider contract 18、skills 5、storage 276、workflows 21、runtime 52、API library 91、API main/config 18）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
 提交 `af29089` 曾构建并运行在独立 `zeus-operation-acceptance` project（端口 `18089`）；既有

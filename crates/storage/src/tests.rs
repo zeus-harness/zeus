@@ -23,9 +23,9 @@ use protocol::{
     EnqueueSessionFollowupRequest, EventType, EvidenceSummary, FlushSessionRequest, IncidentStatus,
     IncidentSummary, Metric, MetricTone, NotDispatchedReason, PolicyDecision, ResumeSessionRequest,
     ReviewDecision, ReviewResponse, RunEvent, RunEventData, RunStatus, RunSummary, SandboxProfile,
-    SessionEvent, SessionEventData, SessionFollowupStatus, SessionStatus, SessionTurnStatus,
-    Severity, StartTurnRequest, ToolCall, ToolCallStatus, ToolEffect, ToolExecutorStatus,
-    ToolOutcome, ToolPolicySummary,
+    SessionEvent, SessionEventData, SessionFlushBarrierStatus, SessionFollowupStatus,
+    SessionStatus, SessionTurnStatus, Severity, StartTurnRequest, ToolCall, ToolCallStatus,
+    ToolEffect, ToolExecutorStatus, ToolOutcome, ToolPolicySummary,
 };
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
@@ -10196,6 +10196,238 @@ async fn session_followups_queue_during_a_turn_recover_fifo_and_claim_atomically
         Err(StorageError::CorruptData(message))
             if message.contains("not bound to its exact Agent turn")
     ));
+}
+
+#[tokio::test]
+async fn session_flush_barrier_waits_only_for_its_captured_turn_and_followup_prefix() {
+    let store = created_owned_session_store().await;
+    let ready = store
+        .capture_session_flush_barrier_for_actor(&owner_authz(), "session-alpha")
+        .await
+        .unwrap();
+    assert_eq!(ready.status, SessionFlushBarrierStatus::Quiescent);
+    assert_eq!(ready.through_sequence, 1);
+    assert_eq!(ready.through_followup_ordinal, 0);
+
+    store
+        .start_turn_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-before-flush-barrier".into(),
+                user_message: "Finish the admitted work".into(),
+                expected_sequence: 1,
+            },
+            "start-before-flush-barrier",
+        )
+        .await
+        .unwrap();
+    store
+        .enqueue_session_followup_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            EnqueueSessionFollowupRequest {
+                turn_id: "turn-flush-barrier-first-followup".into(),
+                user_message: "This follow-up belongs to the barrier".into(),
+                expected_sequence: 2,
+            },
+            "enqueue-flush-barrier-first-followup",
+        )
+        .await
+        .unwrap();
+    let barrier = store
+        .capture_session_flush_barrier_for_actor(&owner_authz(), "session-alpha")
+        .await
+        .unwrap();
+    assert_eq!(barrier.status, SessionFlushBarrierStatus::Pending);
+    assert_eq!(
+        barrier.active_turn_id.as_deref(),
+        Some("turn-before-flush-barrier")
+    );
+    assert_eq!(barrier.through_followup_ordinal, 1);
+
+    store
+        .enqueue_session_followup_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            EnqueueSessionFollowupRequest {
+                turn_id: "turn-flush-barrier-later-followup".into(),
+                user_message: "This later follow-up must not extend the barrier".into(),
+                expected_sequence: 2,
+            },
+            "enqueue-flush-barrier-later-followup",
+        )
+        .await
+        .unwrap();
+    store
+        .flush_turn_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            FlushSessionRequest {
+                turn_id: "turn-before-flush-barrier".into(),
+                assistant_message: Some("Initial work complete".into()),
+                expected_sequence: 2,
+            },
+            "finish-before-flush-barrier",
+        )
+        .await
+        .unwrap();
+    let candidate = store
+        .next_session_followup_candidate()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        candidate.followup.turn_id,
+        "turn-flush-barrier-first-followup"
+    );
+    let manifest = test_agent_manifest();
+    let spec = followup_agent_spec(&store, &candidate, manifest.clone()).await;
+    store
+        .start_followup_and_enqueue_agent(candidate, spec)
+        .await
+        .unwrap();
+    let AgentModelClaimOutcome::Claimed(job) =
+        store.claim_next_agent_model(&manifest).await.unwrap()
+    else {
+        panic!("the captured follow-up must own a model job");
+    };
+    store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: job.id,
+            response_json: agent_final_response_json("Captured follow-up complete"),
+            resolution: AgentModelResolution::Final {
+                assistant_message: "Captured follow-up complete".into(),
+                provenance: agent_model_provenance(),
+            },
+        })
+        .await
+        .unwrap();
+
+    let settled = store
+        .observe_session_flush_barrier_for_actor(&owner_authz(), barrier)
+        .await
+        .unwrap();
+    assert_eq!(settled.status, SessionFlushBarrierStatus::Quiescent);
+    assert_eq!(settled.through_followup_ordinal, 1);
+    let followups = store
+        .session_followups_for_actor(&owner_authz(), "session-alpha")
+        .await
+        .unwrap();
+    assert_eq!(followups[1].status, SessionFollowupStatus::Queued);
+}
+
+#[tokio::test]
+async fn session_flush_barrier_surfaces_interrupted_admitted_work_and_revalidates_authority() {
+    let store = created_owned_session_store().await;
+    store
+        .start_turn_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-flush-barrier-interrupted".into(),
+                user_message: "Interrupt this work during recovery".into(),
+                expected_sequence: 1,
+            },
+            "start-flush-barrier-interrupted",
+        )
+        .await
+        .unwrap();
+    let barrier = store
+        .capture_session_flush_barrier_for_actor(&owner_authz(), "session-alpha")
+        .await
+        .unwrap();
+    assert_eq!(barrier.status, SessionFlushBarrierStatus::Pending);
+    store.recover_open_turns().await.unwrap();
+    let attention = store
+        .observe_session_flush_barrier_for_actor(&owner_authz(), barrier.clone())
+        .await
+        .unwrap();
+    assert_eq!(attention.status, SessionFlushBarrierStatus::NeedsAttention);
+    assert_eq!(attention.observed_sequence, 3);
+
+    assert!(matches!(
+        store
+            .observe_session_flush_barrier_for_actor(&foreign_authz(), barrier)
+            .await,
+        Err(StorageError::AuthSessionNotFound)
+    ));
+}
+
+#[tokio::test]
+async fn session_flush_barrier_excludes_a_historical_failed_followup_after_resume() {
+    let store = created_owned_session_store().await;
+    store
+        .enqueue_session_followup_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            EnqueueSessionFollowupRequest {
+                turn_id: "turn-flush-barrier-failed-followup".into(),
+                user_message: "Fail this follow-up once".into(),
+                expected_sequence: 1,
+            },
+            "enqueue-flush-barrier-failed-followup",
+        )
+        .await
+        .unwrap();
+    let candidate = store
+        .next_session_followup_candidate()
+        .await
+        .unwrap()
+        .unwrap();
+    let manifest = test_agent_manifest();
+    let spec = followup_agent_spec(&store, &candidate, manifest.clone()).await;
+    store
+        .start_followup_and_enqueue_agent(candidate, spec)
+        .await
+        .unwrap();
+    let barrier = store
+        .capture_session_flush_barrier_for_actor(&owner_authz(), "session-alpha")
+        .await
+        .unwrap();
+    assert_eq!(barrier.status, SessionFlushBarrierStatus::Pending);
+    assert_eq!(barrier.after_followup_ordinal, 0);
+    assert_eq!(barrier.through_followup_ordinal, 1);
+    let AgentModelClaimOutcome::Claimed(job) =
+        store.claim_next_agent_model(&manifest).await.unwrap()
+    else {
+        panic!("the follow-up model job must be claimable");
+    };
+    store
+        .complete_agent_model_failure(AgentModelFailureCommit {
+            job_id: job.id,
+            error_json: json!({
+                "code": "provider_rejected",
+                "message": "the provider rejected this test request",
+            }),
+            outcome_unknown: false,
+        })
+        .await
+        .unwrap();
+    let attention = store
+        .observe_session_flush_barrier_for_actor(&owner_authz(), barrier)
+        .await
+        .unwrap();
+    assert_eq!(attention.status, SessionFlushBarrierStatus::NeedsAttention);
+
+    store
+        .resume_session_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            ResumeSessionRequest {
+                expected_sequence: 3,
+            },
+            "resume-flush-barrier-failed-followup",
+        )
+        .await
+        .unwrap();
+    let fresh = store
+        .capture_session_flush_barrier_for_actor(&owner_authz(), "session-alpha")
+        .await
+        .unwrap();
+    assert_eq!(fresh.status, SessionFlushBarrierStatus::Quiescent);
+    assert_eq!(fresh.after_followup_ordinal, 1);
+    assert_eq!(fresh.through_followup_ordinal, 1);
 }
 
 #[tokio::test]

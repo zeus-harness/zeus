@@ -223,7 +223,7 @@ immutable Skill。文件必须是最大 512 KiB 的 regular file；Unix final pa
 
 ## 5. 回复执行链
 
-浏览器只提交用户 prompt，不再调用公开 flush 或上传 `assistant_message`：
+浏览器只提交用户 prompt，不调用 legacy turn-finalization flush 或上传 `assistant_message`：
 
 ```text
 POST /sessions/{id}/turns
@@ -234,6 +234,12 @@ POST /sessions/{id}/turns
   -> transaction: assistant_message + turn_flushed + Agent/job succeeded
   -> Session SSE
 ```
+
+`POST /sessions/{id}/flush` 是独立的服务端 quiescence barrier，不是上述 turn finalization，也不接收
+assistant 内容。它在一个授权 SQLite snapshot 中冻结当前 active turn 和已接收 follow-up 前缀，等待
+这批工作进入 `quiescent` 或 `needs_attention`；之后到达的输入不会延长等待。默认 timeout 为 10 秒，
+最大 30 秒；调用前已经处理并 resume 的历史失败不污染新 barrier。未停稳时返回 `202 pending`，
+调用方可按 `Retry-After` 再次建立新 barrier。
 
 安全与恢复规则：
 
@@ -487,10 +493,10 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 按项目既有统计口径通过 670 个 Rust 测试（authz 7、connectors 22、deployment 8、
+- host 按项目既有统计口径通过 674 个 Rust 测试（authz 7、connectors 22、deployment 8、
   execution 16、goals 4、kernel 10、knowledge 29、LLM unit 30、provider contract 18、planning 4、
-  protocol 21、runtime 52、skills 5、storage 273、tenancy 15、terminal 10、tools 16、
-  workflows 21、API library 90、API main/config 18、graceful shutdown 1）与 28 个 Web Node 测试。
+  protocol 21、runtime 52、skills 5、storage 276、tenancy 15、terminal 10、tools 16、
+  workflows 21、API library 91、API main/config 18、graceful shutdown 1）与 28 个 Web Node 测试。
 - `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 
 ## 8. 容器与 OOM 验收边界
