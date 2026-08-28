@@ -8,8 +8,8 @@ Account Audit、schema v16 Session Reply Context Index 至 schema v25 Durable Se
 Compaction、schema v26 Account-scoped Reply Provider Selection、schema v27 Safe Agent
 Cancellation、schema v28 Durable Agent Planning、schema v29 Durable Session Goal、schema v30
 Same-Session Goal Round、schema v31 Durable Session Follow-up、schema v32 Durable Agent
-Model Output、schema v33 Running-model Cancellation、schema v34 Durable Session Fork、Trusted
-Single-Node Ingress、Per-Operation SecretRef Resolution、启动绑定的 Skill Catalog
+Model Output、schema v33 Running-model Cancellation、schema v34 Durable Session Fork、schema v35
+Durable Session Fork Catalog、Trusted Single-Node Ingress、Per-Operation SecretRef Resolution、启动绑定的 Skill Catalog
 与有界多账户控制面主机代码已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
 v11→v12→v13→v14 迁移证据，current-image 证据见本节验收结果，Linux Docker PID/OOM
 authoritative gate 待完成。
@@ -400,6 +400,8 @@ assistant 内容。它在一个授权 SQLite snapshot 中冻结当前 active tur
   并把 `fork_session` 纳入 actor/account-scoped command receipt。一个事务创建独立 child ledger，
   只复制 boundary 内完整 flushed user/assistant pair；trigger 与 deep readiness 验证无环谱系、
   deterministic child turn ID、exact event/provenance/timestamp 和唯一回执。
+- `0035_session_fork_catalog.sql`：增加 account/parent/direct-child keyset 复合索引，使 durable
+  fork catalog 可以按 `created_at DESC, child_session_id ASC` 有界遍历，不需要把 lineage 全量载入内存。
 
 schema v24 的 system prompt governance 复用 `0019` 的 prompt binding，并增加 durable
 head/revision/receipt。Owner-only `GET/PUT /api/v1/agent/prompt` 通过 expected-revision CAS 和
@@ -430,6 +432,9 @@ schema v34 的 `POST /api/v1/sessions/{parent_id}/forks` 接收新 Session ID/ti
 同 actor/key/输入只重放第一次原子响应并返回 `200`，异输入冲突。Child 的
 `SessionDetail.fork` 暴露 immutable parent ID/boundary/inherited count/created_at，但 child 后续模型
 上下文只读取自己的 ledger，不跟随 parent live state。
+schema v35 的 `GET /api/v1/sessions/{parent_id}/forks` 返回 direct-child summary 与 lineage metadata；
+默认 50、上限 100，下一页使用绑定 cursor kind/account/actor/parent 的 opaque cursor。授权先于
+query/cursor 解析，foreign parent 不会泄露游标是否合法。
 Knowledge v1 生成独立、受治理、带完整 digest 的 canonical context
 snapshot，不修改 system prompt。schema v22 已完成数据库绑定、
 Agent request 注入和 exact replay；LLM 协议层使用独立 durable `context` role，并只在
@@ -502,8 +507,10 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
   精确一致、旧 schema 原地迁移、same-name weakened trigger、断流 prefix 落盘，以及 actor-scoped
   JSON/SSE 的 durable replay 与 terminal close。
   schema v34 覆盖历史 boundary、complete-pair-only copy、幂等重放/冲突、跨 account 统一 404、
-  child 独立续聊与模型上下文、重启恢复、v1→v34 migration、same-name weakened trigger，以及
+  child 独立续聊与模型上下文、重启恢复、same-name weakened trigger，以及
   lineage count 数据篡改的启动 fail-closed。
+  schema v35 覆盖 50/50/1 direct-child keyset page、稳定无重复遍历、跨 parent/account cursor
+  隔离、limit 边界、索引 query plan、API continuation header，以及 v1→v35 migration。
 - Session/Run detail 只返回最新 bounded tail；opaque cursor 的 kind、resource scope、canonical
   encoding、future-head 和跨资源使用均有自动测试，返回页保持连续且升序。
 - disabled/降权/owner mismatch 的 reply 与 dispatch claim 不触达外部执行，并留下
@@ -512,9 +519,9 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 按项目既有统计口径通过 681 个 Rust 测试（authz 7、connectors 22、deployment 8、
+- host 按项目既有统计口径通过 682 个 Rust 测试（authz 7、connectors 22、deployment 8、
   execution 16、goals 4、kernel 10、knowledge 29、LLM unit 30、provider contract 18、planning 4、
-  protocol 21、runtime 52、skills 5、storage 281、tenancy 15、terminal 10、tools 16、
+  protocol 21、runtime 52、skills 5、storage 282、tenancy 15、terminal 10、tools 16、
   workflows 21、API library 93、API main/config 18、graceful shutdown 1）与 28 个 Web Node 测试。
 - `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 

@@ -80,6 +80,12 @@ actor-scoped command receipt commit atomically. Later parent activity cannot
 change child context, and deep integrity verifies the copied content,
 provenance, timestamps, mapping continuity, lineage acyclicity, and receipt.
 
+Schema v35 makes those forks discoverable as a durable, actor-scoped direct
+child catalog. The read uses an account/actor/parent-bound opaque cursor and an
+indexed `created_at DESC, child_session_id ASC` keyset page, so a caller can
+resume branch traversal after reconnect or restart without loading an
+unbounded lineage graph or knowing child IDs in advance.
+
 Alpha+ bootstraps a local `acc_local` root and now supports a bounded local
 multi-account control plane. An owner can create accounts idempotently; one
 user may belong to at most 16 accounts and one database may contain at most 64.
@@ -938,6 +944,9 @@ and bounded memory, CPU, and PID resources.
   an exact historical boundary; migration/readiness and deep integrity verify
   trigger definitions, mapping continuity, exact copied event evidence,
   acyclic lineage, and one authoritative receipt.
+  Schema v35 adds the direct-child keyset index used by the actor-scoped fork
+  catalog. Cursor kind, account, actor, and parent scope are all authenticated;
+  authorization is resolved before malformed cursor details are reported.
   Schema v28 adds append-only Agent todo snapshots. Each row is scoped to one
   account/Session/turn/Agent, advances a contiguous revision, and is bound to
   one exact successful `todo_write@1-single-active` call. SQLite triggers bind
@@ -1113,6 +1122,10 @@ directly.
   a private ledger containing only complete parent turns at or before the
   selected boundary; `GET /api/v1/sessions/{child_id}` exposes its immutable
   `fork` lineage metadata.
+- `GET /api/v1/sessions/{parent_session_id}/forks` lists direct child forks in
+  stable newest-first order. `limit` defaults to 50 and is capped at 100; the
+  body is a bare JSON array of child summary plus immutable lineage metadata,
+  and `X-Zeus-Next-Cursor` carries the parent-scoped continuation cursor.
 - `GET /api/v1/sessions/{session_id}` returns its current summary plus bounded,
   independently pageable tails of attached Run IDs, turns, and ordered Session
   events. Run-ID and turn pages default to 50 and are capped at 100; event pages
@@ -1231,7 +1244,7 @@ directly.
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Current schema v34 retains durable Run attachment during migration and demo
+Current schema v35 retains durable Run attachment during migration and demo
 seeding, but Alpha+ does not expose a public attach-Run HTTP route.
 
 The application boundary now caps auth JSON at 8 KiB, command JSON at 512 KiB,
@@ -1256,7 +1269,7 @@ approval, dispatch, reply completion, attachment checks, and startup recovery
 use typed point queries or fixed 64-row batches. Production Session list/detail,
 Run detail, and overview reads now use indexed `LIMIT + 1` keyset pages inside
 actor-authorized SQLite snapshots; no production HTTP read loads a complete
-ledger or collection. Current schema v34 retains bounded Session, open-turn,
+ledger or collection. Current schema v35 retains bounded Session, open-turn,
 active reply/dispatch, auth-session, bootstrap-audit, event-slot, and logical
 event-payload-byte admission. Exact idempotent replay is checked before capacity,
 while accepted work consumes its reserved terminal slots and payload bytes
@@ -1344,16 +1357,17 @@ account-scoped reply provider selection, schema v27 safe pre-start Agent
 cancellation, schema v28 durable Agent planning, schema v29 durable Session
 Goals, schema v30 same-Session Goal rounds, schema v31 durable Session
 follow-ups, schema v32 durable Agent model output, schema v33 running-model
-cancellation, schema v34 durable Session forks, Trusted Single-Node Ingress,
+cancellation, schema v34 durable Session forks, schema v35 durable fork catalog,
+Trusted Single-Node Ingress,
 Per-Operation SecretRef Resolution, the startup-bound Skill Catalog, and the
 bounded multi-account control plane:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 681 tests passed
+- `cargo test --workspace --all-targets --locked`: 682 tests passed
   across the top-level test targets, including 22 connector tests,
   8 deployment tests, 29 knowledge tests, 30 LLM unit and 18 provider-contract
-  tests, 4 Goal tests, 5 Skill Catalog tests, 281 storage tests, 21 workflow
+  tests, 4 Goal tests, 5 Skill Catalog tests, 282 storage tests, 21 workflow
   tests, 52 runtime tests, 21 protocol tests, 93 API library tests, 18 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,

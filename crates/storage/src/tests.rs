@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -1772,7 +1772,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         versions,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
         ]
     );
     let owner: Option<String> = connection
@@ -1922,7 +1922,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 34);
+    assert_eq!(version, 35);
     let configured_account: (String, String, String, i64) = connection
         .query_row(
             r#"SELECT
@@ -2640,7 +2640,7 @@ async fn v12_identity_and_run_crash_prefix_migrates_then_recovers_the_primary_se
     assert_eq!(
         recovered,
         (
-            34,
+            35,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into()
@@ -4387,7 +4387,7 @@ async fn v5_configured_database_migrates_to_the_local_owner_membership() {
     assert_eq!(
         migrated,
         (
-            34,
+            35,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into(),
@@ -4513,7 +4513,7 @@ async fn v13_configured_active_work_migrates_with_account_authority_and_exact_vo
             },
         )
         .unwrap();
-    assert_eq!(migrated_counts, (34, 1, 1, 2, 1));
+    assert_eq!(migrated_counts, (35, 1, 1, 2, 1));
 }
 
 #[tokio::test]
@@ -4875,7 +4875,7 @@ async fn v14_database_migrates_through_v19_with_member_and_audit_roots() {
             },
         )
         .unwrap();
-    assert_eq!(state, (34, 1, 1, 1, 19));
+    assert_eq!(state, (35, 1, 1, 1, 19));
 }
 
 #[tokio::test]
@@ -4914,7 +4914,7 @@ async fn v15_migration_seeds_the_configured_audit_detail_limit() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (34, 2));
+    assert_eq!(state, (35, 2));
 }
 
 #[tokio::test]
@@ -4959,7 +4959,7 @@ async fn v15_reopen_rejects_a_lower_audit_detail_limit_without_mutating_policy()
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (34, 4));
+    assert_eq!(state, (35, 4));
     drop(connection);
 
     let reopened = SqliteStore::open_with_limits(database.path(), original_limits)
@@ -7321,7 +7321,7 @@ async fn v19_agent_manifest_is_canonical_actor_scoped_reused_and_secret_free() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(version, 34);
+    assert_eq!(version, 35);
     assert_eq!(
         manifest_rows, 1,
         "the identical manifest must be deduplicated"
@@ -15431,6 +15431,121 @@ async fn session_fork_integrity_rejects_tampered_lineage_counts() {
 }
 
 #[tokio::test]
+async fn session_fork_catalog_is_indexed_bounded_scoped_and_cursor_safe() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    store
+        .create_session_for_actor(
+            &owner_authz(),
+            CreateSessionRequest {
+                id: "session-fork-other-parent".into(),
+                title: "Other fork parent".into(),
+            },
+            "create-fork-other-parent",
+        )
+        .await
+        .unwrap();
+    for index in 0..101 {
+        store
+            .fork_session_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                ForkSessionRequest {
+                    id: format!("session-fork-page-{index:03}"),
+                    title: format!("Fork page {index:03}"),
+                    through_sequence: 1,
+                },
+                &format!("fork-page-{index:03}"),
+            )
+            .await
+            .unwrap();
+    }
+
+    let first = store
+        .session_fork_page_for_actor(&owner_authz(), "session-alpha", None, 50)
+        .await
+        .unwrap();
+    assert_eq!(first.items.len(), 50);
+    let first_cursor = first.next_cursor.clone().unwrap();
+    let second = store
+        .session_fork_page_for_actor(&owner_authz(), "session-alpha", Some(&first_cursor), 50)
+        .await
+        .unwrap();
+    assert_eq!(second.items.len(), 50);
+    let second_cursor = second.next_cursor.clone().unwrap();
+    let third = store
+        .session_fork_page_for_actor(&owner_authz(), "session-alpha", Some(&second_cursor), 50)
+        .await
+        .unwrap();
+    assert_eq!(third.items.len(), 1);
+    assert!(third.next_cursor.is_none());
+
+    let items = first
+        .items
+        .iter()
+        .chain(&second.items)
+        .chain(&third.items)
+        .collect::<Vec<_>>();
+    let child_ids = items
+        .iter()
+        .map(|item| item.session.id.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(items.len(), 101);
+    assert_eq!(child_ids.len(), 101);
+    assert!(items.iter().all(|item| {
+        item.fork.parent_session_id == "session-alpha"
+            && item.fork.parent_sequence == 1
+            && item.fork.inherited_turns == 0
+    }));
+
+    assert!(matches!(
+        store
+            .session_fork_page_for_actor(
+                &owner_authz(),
+                "session-fork-other-parent",
+                Some(&first_cursor),
+                50,
+            )
+            .await,
+        Err(StorageError::InvalidPageCursor)
+    ));
+    assert!(matches!(
+        store
+            .session_fork_page_for_actor(&owner_authz(), "session-alpha", None, 0)
+            .await,
+        Err(StorageError::InvalidPageLimit { limit: 0, .. })
+    ));
+    let secondary_owner = insert_secondary_test_account(database.path());
+    assert!(matches!(
+        store
+            .session_fork_page_for_actor(
+                &secondary_owner,
+                "session-alpha",
+                Some("malformed-cursor"),
+                50,
+            )
+            .await,
+        Err(StorageError::SessionNotFound(session_id)) if session_id == "session-alpha"
+    ));
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let plan = explain_query_plan(
+        &connection,
+        r#"SELECT child.id
+           FROM session_forks fork
+           JOIN sessions child ON child.id = fork.child_session_id
+           WHERE fork.account_id = ?1 AND fork.parent_session_id = ?2
+           ORDER BY fork.created_at DESC, fork.child_session_id ASC
+           LIMIT 51"#,
+        params!["acc_local", "session-alpha"],
+    );
+    assert!(plan.contains("session_forks_children_idx"), "{plan}");
+    assert!(!plan.contains("USE TEMP B-TREE"), "{plan}");
+    drop(connection);
+    store.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
 async fn reply_context_is_complete_pair_only_and_stable_at_historical_sequence() {
     let database = TestDatabase::new();
     let store = created_owned_file_session_store(database.path()).await;
@@ -19874,7 +19989,7 @@ async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempot
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, (1_i64..=34).collect::<Vec<_>>());
+    assert_eq!(versions, (1_i64..=35).collect::<Vec<_>>());
     assert_eq!(
         connection
             .query_row(
@@ -23574,6 +23689,14 @@ fn drop_v33_fixture_objects(connection: &rusqlite::Connection) {
 }
 
 fn drop_v34_fixture_objects(connection: &rusqlite::Connection) {
+    let version: i64 = connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    if version >= 35 {
+        drop_v35_fixture_objects(connection);
+    }
     let schema_reject_update = migration_trigger_sql(
         include_str!("../migrations/0020_agent_execution_ledger.sql"),
         "schema_migrations_reject_update",
@@ -23665,6 +23788,27 @@ fn drop_v34_fixture_objects(connection: &rusqlite::Connection) {
     connection.execute_batch(receipt_require_authority).unwrap();
     connection.execute_batch(receipt_reject_update).unwrap();
     connection.execute_batch(receipt_reject_delete).unwrap();
+    connection.execute_batch(schema_reject_update).unwrap();
+    connection.execute_batch(schema_reject_delete).unwrap();
+}
+
+fn drop_v35_fixture_objects(connection: &rusqlite::Connection) {
+    let schema_reject_update = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_update",
+    );
+    let schema_reject_delete = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_delete",
+    );
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER schema_migrations_reject_update;
+               DROP TRIGGER schema_migrations_reject_delete;
+               DROP INDEX session_forks_children_idx;
+               DELETE FROM schema_migrations WHERE version = 35;"#,
+        )
+        .unwrap();
     connection.execute_batch(schema_reject_update).unwrap();
     connection.execute_batch(schema_reject_delete).unwrap();
 }

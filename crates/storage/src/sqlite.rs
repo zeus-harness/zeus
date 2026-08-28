@@ -20,9 +20,9 @@ use protocol::{
     ResumeSessionResponse, ReviewDecision, ReviewResponse, RunEvent, RunEventData, RunEventPage,
     RunStatus, RunSummary, SandboxProfile, SessionDetail, SessionDetailPagination, SessionEvent,
     SessionEventData, SessionEventPage, SessionFlushAck, SessionFlushBarrier,
-    SessionFlushBarrierStatus, SessionFollowup, SessionFollowupStatus, SessionFork, SessionStatus,
-    SessionSummary, SessionTurn, SessionTurnStatus, Severity, StartTurnRequest, StartTurnResponse,
-    ToolCallStatus, ToolEffect, ToolOutcome,
+    SessionFlushBarrierStatus, SessionFollowup, SessionFollowupStatus, SessionFork,
+    SessionForkSummary, SessionStatus, SessionSummary, SessionTurn, SessionTurnStatus, Severity,
+    StartTurnRequest, StartTurnResponse, ToolCallStatus, ToolEffect, ToolOutcome,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Serialize, de::DeserializeOwned};
@@ -54,14 +54,15 @@ use crate::{
     ReplySuccessCommit, ReviewCommit, ReviewContext, ReviewReceipt, RotateMemberSetupTokenCommit,
     RotateMemberSetupTokenResult, RunSnapshot, RuntimeIdentity, SessionCompactionClaimOutcome,
     SessionCompactionFailureCommit, SessionCompactionJob, SessionCompactionSuccessCommit,
-    SessionContextCheckpoint, SessionFollowupCandidate, SessionSummaryPage, SqliteOperationLimits,
-    SqlitePhysicalLimits, StorageError, StorageLimits, StoredAccount, StoredAccountStatus,
-    StoredCredential, StoredMember, StoredMemberPage, StoredMembershipStatus, StoredPreferences,
-    StoredRun, StoredUser, StoredUserRole, StoredUserStatus, SwitchAuthSessionCommit,
-    SwitchAuthSessionResult, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
+    SessionContextCheckpoint, SessionFollowupCandidate, SessionForkPage, SessionSummaryPage,
+    SqliteOperationLimits, SqlitePhysicalLimits, StorageError, StorageLimits, StoredAccount,
+    StoredAccountStatus, StoredCredential, StoredMember, StoredMemberPage, StoredMembershipStatus,
+    StoredPreferences, StoredRun, StoredUser, StoredUserRole, StoredUserStatus,
+    SwitchAuthSessionCommit, SwitchAuthSessionResult, TransitionMemberCommit,
+    UpdateAccountAuditPolicyCommit,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 34;
+const CURRENT_SCHEMA_VERSION: i64 = 35;
 const LOCAL_ACCOUNT_ID: &str = "acc_local";
 const MAX_ACCOUNTS_PER_USER: i64 = 16;
 const MAX_ACCOUNTS_GLOBAL: i64 = 64;
@@ -105,6 +106,7 @@ const MIGRATION_0032: &str = include_str!("../migrations/0032_agent_model_output
 const MIGRATION_0033: &str =
     include_str!("../migrations/0033_agent_running_model_cancellation.sql");
 const MIGRATION_0034: &str = include_str!("../migrations/0034_session_forks.sql");
+const MIGRATION_0035: &str = include_str!("../migrations/0035_session_fork_catalog.sql");
 const MIGRATION_0034_TRIGGER_NAMES: &[&str] = &[
     "session_forks_validate_insert",
     "session_forks_reject_update",
@@ -541,6 +543,30 @@ impl SqliteStore {
         let cursor = cursor.map(str::to_owned);
         self.with_connection(move |connection| {
             query_session_summary_page_for_actor(connection, &context, cursor.as_deref(), limit)
+        })
+        .await
+    }
+
+    /// Returns one actor-scoped keyset page of direct child Session forks.
+    pub async fn session_fork_page_for_actor(
+        &self,
+        context: &AuthzContext,
+        parent_session_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<SessionForkPage, StorageError> {
+        let context = validated_authz_context(context)?;
+        let parent_session_id =
+            validated_durable_reference(parent_session_id, "parent session ID")?.to_owned();
+        let cursor = cursor.map(str::to_owned);
+        self.with_connection(move |connection| {
+            query_session_fork_page_for_actor(
+                connection,
+                &context,
+                &parent_session_id,
+                cursor.as_deref(),
+                limit,
+            )
         })
         .await
     }
@@ -3757,6 +3783,13 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
             params![34, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 35 {
+        transaction.execute_batch(MIGRATION_0035)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![35, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
     // The execution verifier now understands the v22 knowledge binding. Run
     // it only after every missing schema step has been installed so upgrades
     // from v19 and older never query a column that does not exist yet. This
@@ -4800,12 +4833,13 @@ fn readiness(
                'agent_model_output_chunks_turn_page_idx',
                'agent_model_output_chunks_job_idx',
                'session_forks_parent_idx',
-               'session_fork_turns_parent_idx'
+               'session_fork_turns_parent_idx',
+               'session_forks_children_idx'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if point_query_indexes != 79 {
+    if point_query_indexes != 80 {
         return Err(StorageError::CorruptData(
             "one or more point-query indexes are missing".into(),
         ));
@@ -10295,6 +10329,124 @@ fn query_session_summary_page_for_actor(
         items: summaries,
         next_cursor,
     })
+}
+
+fn query_session_fork_page_for_actor(
+    connection: &mut Connection,
+    context: &AuthzContext,
+    parent_session_id: &str,
+    page_cursor: Option<&str>,
+    limit: usize,
+) -> Result<SessionForkPage, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    require_active_session_actor(&transaction, parent_session_id, context)?;
+    let fetch_limit = validated_read_page_limit(limit, COLLECTION_PAGE_MAX_LIMIT)?;
+    let page_cursor = page_cursor
+        .map(|value| {
+            cursor::decode_session_forks(
+                value,
+                context.account_id.as_str(),
+                &context.user_id,
+                parent_session_id,
+            )
+        })
+        .transpose()?;
+
+    let query_rows = |statement: &mut rusqlite::Statement<'_>,
+                      parameters: &[&dyn rusqlite::ToSql]| {
+        statement
+            .query_map(parameters, |row| {
+                Ok((
+                    decode_session_summary_row(row)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, String>(11)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let rows = if let Some(page_cursor) = page_cursor {
+        let mut statement = transaction.prepare(
+            r#"SELECT child.id, child.title, child.status, child.created_at,
+                      child.updated_at, child.sequence, child.projection_sequence,
+                      child.active_turn_id, fork.parent_session_id,
+                      fork.parent_sequence, fork.inherited_turn_count, fork.created_at
+               FROM session_forks fork
+               JOIN sessions child ON child.id = fork.child_session_id
+               WHERE fork.account_id = ?1
+                 AND fork.parent_session_id = ?2
+                 AND (fork.created_at < ?3
+                      OR (fork.created_at = ?3 AND fork.child_session_id > ?4))
+               ORDER BY fork.created_at DESC, fork.child_session_id ASC
+               LIMIT ?5"#,
+        )?;
+        query_rows(
+            &mut statement,
+            &[
+                &context.account_id.as_str(),
+                &parent_session_id,
+                &page_cursor.first,
+                &page_cursor.second,
+                &fetch_limit,
+            ],
+        )?
+    } else {
+        let mut statement = transaction.prepare(
+            r#"SELECT child.id, child.title, child.status, child.created_at,
+                      child.updated_at, child.sequence, child.projection_sequence,
+                      child.active_turn_id, fork.parent_session_id,
+                      fork.parent_sequence, fork.inherited_turn_count, fork.created_at
+               FROM session_forks fork
+               JOIN sessions child ON child.id = fork.child_session_id
+               WHERE fork.account_id = ?1
+                 AND fork.parent_session_id = ?2
+               ORDER BY fork.created_at DESC, fork.child_session_id ASC
+               LIMIT ?3"#,
+        )?;
+        query_rows(
+            &mut statement,
+            &[
+                &context.account_id.as_str(),
+                &parent_session_id,
+                &fetch_limit,
+            ],
+        )?
+    };
+
+    let has_more = rows.len() > limit;
+    let mut items = Vec::with_capacity(rows.len().min(limit));
+    for (stored_child, stored_parent_id, parent_sequence, inherited_turns, created_at) in
+        rows.into_iter().take(limit)
+    {
+        let child = stored_child.decode()?;
+        validate_session_event_tail(&transaction, &child)?;
+        items.push(SessionForkSummary {
+            session: child,
+            fork: SessionFork {
+                parent_session_id: stored_parent_id,
+                parent_sequence: i64_to_u64(parent_sequence, "fork parent sequence")?,
+                inherited_turns: i64_to_u64(inherited_turns, "fork inherited turn count")?,
+                created_at,
+            },
+        });
+    }
+    let next_cursor = if has_more {
+        let last = items.last().ok_or_else(|| {
+            StorageError::CorruptData("Session fork page sentinel has no returned item".into())
+        })?;
+        Some(cursor::encode_session_forks(
+            context.account_id.as_str(),
+            &context.user_id,
+            parent_session_id,
+            &last.fork.created_at,
+            &last.session.id,
+        )?)
+    } else {
+        None
+    };
+    transaction.commit()?;
+    Ok(SessionForkPage { items, next_cursor })
 }
 
 fn query_consistent_session_summary(

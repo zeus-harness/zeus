@@ -91,11 +91,12 @@ pub use storage::{
     ReplySuccessCommit, RotateMemberSetupTokenResult, SESSION_AGENT_PROMPT_ID,
     SessionCompactionClaimOutcome, SessionCompactionFailureCommit, SessionCompactionJob,
     SessionCompactionSuccessCommit, SessionContextCheckpoint, SessionFollowupCandidate,
-    SessionSummaryPage, SqliteOperationLimits, SqliteOperationLimitsError, SqlitePhysicalLimits,
-    SqlitePhysicalLimitsError, StorageLimits, StorageLimitsError, StoredAccount,
-    StoredAccountStatus, StoredCredential, StoredMember, StoredMemberPage, StoredMembershipStatus,
-    StoredPreferences, StoredUser, StoredUserRole, StoredUserStatus, SwitchAuthSessionCommit,
-    SwitchAuthSessionResult, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
+    SessionForkPage, SessionSummaryPage, SqliteOperationLimits, SqliteOperationLimitsError,
+    SqlitePhysicalLimits, SqlitePhysicalLimitsError, StorageLimits, StorageLimitsError,
+    StoredAccount, StoredAccountStatus, StoredCredential, StoredMember, StoredMemberPage,
+    StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserRole, StoredUserStatus,
+    SwitchAuthSessionCommit, SwitchAuthSessionResult, TransitionMemberCommit,
+    UpdateAccountAuditPolicyCommit,
 };
 use storage::{
     ClaimOutcome, CommitOutcome, CreateMemberCommit, DispatchCompleteCommit, DispatchContext,
@@ -2388,6 +2389,20 @@ impl DemoStore {
         Ok(self
             .storage
             .session_summary_page_for_actor(context, cursor, limit)
+            .await?)
+    }
+
+    pub async fn list_session_forks_for_actor(
+        &self,
+        context: &AuthzContext,
+        parent_session_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<SessionForkPage, StoreError> {
+        validate_durable_reference(parent_session_id, "parent session ID")?;
+        Ok(self
+            .storage
+            .session_fork_page_for_actor(context, parent_session_id, cursor, limit)
             .await?)
     }
 

@@ -1333,6 +1333,13 @@ pub struct SessionFork {
     pub created_at: String,
 }
 
+/// One direct child in a parent's durable fork catalog.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionForkSummary {
+    pub session: SessionSummary,
+    pub fork: SessionFork,
+}
+
 /// Creates a new Session from every complete conversation turn visible at
 /// `through_sequence` in the parent Session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

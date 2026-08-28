@@ -1070,6 +1070,13 @@ struct SessionListQuery {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SessionForkListQuery {
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MemberListQuery {
     cursor: Option<String>,
     limit: Option<usize>,
@@ -1270,7 +1277,10 @@ fn build_authenticated_app(state: ApiState) -> Router {
         .route("/api/v1/overview", get(overview))
         .route("/api/v1/sessions", get(list_sessions).post(create_session))
         .route("/api/v1/sessions/{id}", get(session_detail))
-        .route("/api/v1/sessions/{id}/forks", post(fork_session))
+        .route(
+            "/api/v1/sessions/{id}/forks",
+            get(list_session_forks).post(fork_session),
+        )
         .route("/api/v1/sessions/{id}/resume", post(resume_session))
         .route("/api/v1/sessions/{id}/flush", post(flush_session))
         .route(
@@ -5173,6 +5183,36 @@ async fn fork_session(
     Ok((status, Json(response)))
 }
 
+async fn list_session_forks(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    Path(parent_session_id): Path<String>,
+    query: Result<Query<SessionForkListQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    state
+        .store
+        .authorize_session_for_actor(&current.principal.authz, &parent_session_id)
+        .await?;
+    let Query(query) = query.map_err(ApiError::invalid_query)?;
+    let page = state
+        .store
+        .list_session_forks_for_actor(
+            &current.principal.authz,
+            &parent_session_id,
+            query.cursor.as_deref(),
+            query.limit.unwrap_or(COLLECTION_PAGE_DEFAULT_LIMIT),
+        )
+        .await?;
+    let mut headers = HeaderMap::new();
+    if let Some(cursor) = page.next_cursor {
+        headers.insert(
+            "x-zeus-next-cursor",
+            HeaderValue::from_str(&cursor).expect("opaque cursor is canonical base64url"),
+        );
+    }
+    Ok((headers, Json(page.items)).into_response())
+}
+
 async fn session_detail(
     State(state): State<ApiState>,
     Extension(current): Extension<CurrentAuth>,
@@ -7156,8 +7196,8 @@ mod tests {
     use llm::{ProviderMetadata, ReplyFuture, ReplyResponse};
     use protocol::{
         CreateSessionResponse, DEMO_RUN_ID, FlushSessionResponse, OverviewResponse, ReviewDecision,
-        ReviewRequest, ReviewResponse, SessionDetail, SessionStatus, SessionSummary,
-        StartTurnResponse,
+        ReviewRequest, ReviewResponse, SessionDetail, SessionForkSummary, SessionStatus,
+        SessionSummary, StartTurnResponse,
     };
     use rusqlite::{Connection, params};
     use tenancy::BootstrapToken;
@@ -11663,6 +11703,80 @@ mod tests {
         assert!(replay.replayed);
         assert_eq!(replay.session, forked.session);
         assert_eq!(replay.fork, forked.fork);
+
+        let second_fork = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-fork-parent/forks")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "fork-parent-at-beta")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": "session-fork-child-beta",
+                            "title": "Fork child at beta",
+                            "through_sequence": 7,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second_fork.status(), StatusCode::CREATED);
+
+        let first_page = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/sessions/session-fork-parent/forks?limit=1")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_page.status(), StatusCode::OK);
+        let next_cursor = first_page
+            .headers()
+            .get("x-zeus-next-cursor")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let first_page: Vec<SessionForkSummary> = response_json(first_page).await;
+        assert_eq!(first_page.len(), 1);
+
+        let second_page = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/sessions/session-fork-parent/forks?limit=1&cursor={next_cursor}"
+                ))
+                .header(header::HOST, "zeus.test")
+                .header(header::COOKIE, &owner.cookie_header)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second_page.status(), StatusCode::OK);
+        assert!(second_page.headers().get("x-zeus-next-cursor").is_none());
+        let second_page: Vec<SessionForkSummary> = response_json(second_page).await;
+        assert_eq!(second_page.len(), 1);
+        let mut catalog_ids = first_page
+            .into_iter()
+            .chain(second_page)
+            .map(|item| item.session.id)
+            .collect::<Vec<_>>();
+        catalog_ids.sort();
+        assert_eq!(
+            catalog_ids,
+            ["session-fork-child", "session-fork-child-beta"]
+        );
 
         let detail = app
             .clone()

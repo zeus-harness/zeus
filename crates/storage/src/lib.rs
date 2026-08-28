@@ -501,6 +501,12 @@ pub struct SessionSummaryPage {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionForkPage {
+    pub items: Vec<protocol::SessionForkSummary>,
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoundedRunRead {
     pub snapshot: RunSnapshot,
