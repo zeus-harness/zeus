@@ -751,6 +751,16 @@ pub enum SessionTurnStatus {
     Interrupted,
 }
 
+/// Durable lifecycle of a user follow-up accepted while another Session turn
+/// may still be running. Queued items are consumed FIFO by the Session driver.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionFollowupStatus {
+    Queued,
+    Claimed,
+    Discarded,
+}
+
 impl RunStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(
@@ -978,6 +988,22 @@ pub struct SessionTurn {
     pub started_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFollowup {
+    pub session_id: String,
+    pub turn_id: String,
+    pub ordinal: u64,
+    pub status: SessionFollowupStatus,
+    pub user_message: String,
+    pub enqueued_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discarded_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discard_reason: Option<String>,
 }
 
 /// Durable orchestration state for one Session turn.
@@ -1321,6 +1347,27 @@ pub struct StartTurnResponse {
     pub turn: SessionTurn,
     pub event: SessionEvent,
     pub replayed: bool,
+}
+
+/// Enqueues the next user turn without mutating the Session event sequence.
+/// `expected_sequence` is still a CAS guard at the enqueue linearization point.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnqueueSessionFollowupRequest {
+    pub turn_id: String,
+    pub user_message: String,
+    pub expected_sequence: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnqueueSessionFollowupResponse {
+    pub followup: SessionFollowup,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFollowupListResponse {
+    pub items: Vec<SessionFollowup>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

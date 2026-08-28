@@ -54,11 +54,12 @@ use planning::{
 use protocol::{
     Approval, ApprovalStatus, AssistantReplyKind, AttachRunRequest, AttachRunResponse,
     CancelAgentTurnResponse, CreateSessionRequest, CreateSessionResponse, EVENT_PAGE_DEFAULT_LIMIT,
-    FlushSessionRequest, FlushSessionResponse, NotDispatchedReason, OverviewResponse,
-    PolicyDecision, ResourceEnvelopeError, ResumeSessionRequest, ResumeSessionResponse,
-    ReviewDecision, ReviewRequest, ReviewResponse, RunDetail, RunDetailPagination, RunEvent,
-    RunEventData, RunEventPage, RunSummary, SessionDetail, SessionEvent, SessionEventData,
-    SessionEventPage, SessionSummary, SessionTurn, StartTurnRequest, StartTurnResponse, ToolCall,
+    EnqueueSessionFollowupRequest, EnqueueSessionFollowupResponse, FlushSessionRequest,
+    FlushSessionResponse, NotDispatchedReason, OverviewResponse, PolicyDecision,
+    ResourceEnvelopeError, ResumeSessionRequest, ResumeSessionResponse, ReviewDecision,
+    ReviewRequest, ReviewResponse, RunDetail, RunDetailPagination, RunEvent, RunEventData,
+    RunEventPage, RunSummary, SessionDetail, SessionEvent, SessionEventData, SessionEventPage,
+    SessionFollowup, SessionSummary, SessionTurn, StartTurnRequest, StartTurnResponse, ToolCall,
     ToolExecutorStatus, ToolOutcome,
 };
 use serde_json::Value;
@@ -88,11 +89,12 @@ pub use storage::{
     ReplyOutcomeUnknownCommit, ReplySuccessCommit, RotateMemberSetupTokenResult,
     SESSION_AGENT_PROMPT_ID, SessionCompactionClaimOutcome, SessionCompactionFailureCommit,
     SessionCompactionJob, SessionCompactionSuccessCommit, SessionContextCheckpoint,
-    SessionSummaryPage, SqliteOperationLimits, SqliteOperationLimitsError, SqlitePhysicalLimits,
-    SqlitePhysicalLimitsError, StorageLimits, StorageLimitsError, StoredAccount,
-    StoredAccountStatus, StoredCredential, StoredMember, StoredMemberPage, StoredMembershipStatus,
-    StoredPreferences, StoredUser, StoredUserRole, StoredUserStatus, SwitchAuthSessionCommit,
-    SwitchAuthSessionResult, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
+    SessionFollowupCandidate, SessionSummaryPage, SqliteOperationLimits,
+    SqliteOperationLimitsError, SqlitePhysicalLimits, SqlitePhysicalLimitsError, StorageLimits,
+    StorageLimitsError, StoredAccount, StoredAccountStatus, StoredCredential, StoredMember,
+    StoredMemberPage, StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserRole,
+    StoredUserStatus, SwitchAuthSessionCommit, SwitchAuthSessionResult, TransitionMemberCommit,
+    UpdateAccountAuditPolicyCommit,
 };
 use storage::{
     ClaimOutcome, CommitOutcome, CreateMemberCommit, DispatchCompleteCommit, DispatchContext,
@@ -2546,6 +2548,77 @@ impl DemoStore {
             .await?;
         if !response.replayed {
             self.publish_session_event(session_id, response.event.clone());
+        }
+        Ok(response)
+    }
+
+    /// Accept a user follow-up independently of the current turn lifecycle.
+    /// Holding the Goal activation gate through durable admission guarantees
+    /// that an accepted human message wins over automatic continuation.
+    pub async fn enqueue_session_followup_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        request: EnqueueSessionFollowupRequest,
+        idempotency_key: &str,
+    ) -> Result<EnqueueSessionFollowupResponse, StoreError> {
+        validate_durable_reference(session_id, "session ID")?;
+        validate_new_turn_id(&request.turn_id, "turn ID")?;
+        validate_user_message_value(&request.user_message, "user message")?;
+        validate_session_sequence(request.expected_sequence, "expected session sequence")?;
+        self.authorize_session_for_actor(context, session_id)
+            .await?;
+        let idempotency_key = normalized_idempotency_key(idempotency_key)?;
+        let mut activations = self.goal_activations.by_session.lock().await;
+        let response = self
+            .storage
+            .enqueue_session_followup_for_actor(context, session_id, request, idempotency_key)
+            .await?;
+        activations.remove(session_id);
+        Ok(response)
+    }
+
+    pub async fn session_followups_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+    ) -> Result<Vec<SessionFollowup>, StoreError> {
+        validate_durable_reference(session_id, "session ID")?;
+        self.authorize_session_for_actor(context, session_id)
+            .await?;
+        Ok(self
+            .storage
+            .session_followups_for_actor(context, session_id)
+            .await?)
+    }
+
+    pub async fn next_session_followup_candidate(
+        &self,
+    ) -> Result<Option<SessionFollowupCandidate>, StoreError> {
+        Ok(self.storage.next_session_followup_candidate().await?)
+    }
+
+    pub async fn start_followup_and_enqueue_agent(
+        &self,
+        candidate: SessionFollowupCandidate,
+        agent: AgentTurnSpec,
+    ) -> Result<AgentTurnEnqueueResponse, StoreError> {
+        if agent.environment != self.environment.as_ref() {
+            return Err(StoreError::InvalidAgentTransition(
+                "the follow-up Agent environment does not match the bound runtime".into(),
+            ));
+        }
+        self.validate_session_agent_manifest_binding(
+            &agent.manifest,
+            &agent.provider_name,
+            agent.model_name.as_deref(),
+        )?;
+        let response = self
+            .storage
+            .start_followup_and_enqueue_agent(candidate, agent)
+            .await?;
+        if !response.start.replayed {
+            self.publish_session_event(&response.start.session.id, response.start.event.clone());
         }
         Ok(response)
     }

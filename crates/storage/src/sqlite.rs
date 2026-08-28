@@ -14,11 +14,12 @@ use fs2::{FileExt, available_space};
 use protocol::{
     ApprovalScope, ApprovalStatus, AssistantReplyProvenance, AttachRunRequest, AttachRunResponse,
     COLLECTION_PAGE_MAX_LIMIT, CreateSessionRequest, CreateSessionResponse, EVENT_PAGE_MAX_LIMIT,
-    EventType, FlushSessionRequest, FlushSessionResponse, IncidentStatus, IncidentSummary,
-    NotDispatchedReason, ReadPageInfo, ResourceEnvelopeError, ResumeSessionRequest,
-    ResumeSessionResponse, ReviewDecision, ReviewResponse, RunEvent, RunEventData, RunEventPage,
-    RunStatus, RunSummary, SandboxProfile, SessionDetail, SessionDetailPagination, SessionEvent,
-    SessionEventData, SessionEventPage, SessionFlushAck, SessionStatus, SessionSummary,
+    EnqueueSessionFollowupRequest, EnqueueSessionFollowupResponse, EventType, FlushSessionRequest,
+    FlushSessionResponse, IncidentStatus, IncidentSummary, NotDispatchedReason, ReadPageInfo,
+    ResourceEnvelopeError, ResumeSessionRequest, ResumeSessionResponse, ReviewDecision,
+    ReviewResponse, RunEvent, RunEventData, RunEventPage, RunStatus, RunSummary, SandboxProfile,
+    SessionDetail, SessionDetailPagination, SessionEvent, SessionEventData, SessionEventPage,
+    SessionFlushAck, SessionFollowup, SessionFollowupStatus, SessionStatus, SessionSummary,
     SessionTurn, SessionTurnStatus, Severity, StartTurnRequest, StartTurnResponse, ToolCallStatus,
     ToolEffect, ToolOutcome,
 };
@@ -52,14 +53,14 @@ use crate::{
     ReplySuccessCommit, ReviewCommit, ReviewContext, ReviewReceipt, RotateMemberSetupTokenCommit,
     RotateMemberSetupTokenResult, RunSnapshot, RuntimeIdentity, SessionCompactionClaimOutcome,
     SessionCompactionFailureCommit, SessionCompactionJob, SessionCompactionSuccessCommit,
-    SessionContextCheckpoint, SessionSummaryPage, SqliteOperationLimits, SqlitePhysicalLimits,
-    StorageError, StorageLimits, StoredAccount, StoredAccountStatus, StoredCredential,
-    StoredMember, StoredMemberPage, StoredMembershipStatus, StoredPreferences, StoredRun,
-    StoredUser, StoredUserRole, StoredUserStatus, SwitchAuthSessionCommit, SwitchAuthSessionResult,
-    TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
+    SessionContextCheckpoint, SessionFollowupCandidate, SessionSummaryPage, SqliteOperationLimits,
+    SqlitePhysicalLimits, StorageError, StorageLimits, StoredAccount, StoredAccountStatus,
+    StoredCredential, StoredMember, StoredMemberPage, StoredMembershipStatus, StoredPreferences,
+    StoredRun, StoredUser, StoredUserRole, StoredUserStatus, SwitchAuthSessionCommit,
+    SwitchAuthSessionResult, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 30;
+const CURRENT_SCHEMA_VERSION: i64 = 31;
 const LOCAL_ACCOUNT_ID: &str = "acc_local";
 const MAX_ACCOUNTS_PER_USER: i64 = 16;
 const MAX_ACCOUNTS_GLOBAL: i64 = 64;
@@ -98,6 +99,7 @@ const MIGRATION_0027: &str = include_str!("../migrations/0027_agent_safe_cancell
 const MIGRATION_0028: &str = include_str!("../migrations/0028_agent_todo_snapshots.sql");
 const MIGRATION_0029: &str = include_str!("../migrations/0029_session_agent_goals.sql");
 const MIGRATION_0030: &str = include_str!("../migrations/0030_agent_goal_rounds.sql");
+const MIGRATION_0031: &str = include_str!("../migrations/0031_session_followups.sql");
 const MIGRATION_0022_TRIGGER_NAMES: &[&str] = &[
     "knowledge_corpus_revisions_reject_update",
     "knowledge_corpus_revisions_reject_delete",
@@ -164,6 +166,14 @@ const MIGRATION_0030_TRIGGER_NAMES: &[&str] = &[
     "agent_goal_rounds_reject_delete",
     "agent_goal_snapshots_validate_insert",
 ];
+const MIGRATION_0031_TRIGGER_NAMES: &[&str] = &[
+    "session_followups_validate_insert",
+    "session_followups_enforce_transition",
+    "session_followups_reject_delete",
+    "session_followup_receipts_require_authority",
+    "session_followup_receipts_reject_update",
+    "session_followup_receipts_reject_delete",
+];
 const RECOVERY_BATCH_LIMIT: i64 = 64;
 const AUTH_SESSION_CLEANUP_BATCH_LIMIT: i64 = 64;
 const BOOTSTRAP_AUDIT_ROLLUP_BATCH_LIMIT: i64 = 64;
@@ -190,6 +200,9 @@ const REPLY_RESPONSE_JSON_MAX_BYTES: usize = 512 * 1024;
 const REPLY_ERROR_JSON_MAX_BYTES: usize = 32 * 1024;
 const REPLY_AUTHORIZATION_REVOKED_REASON: &str =
     "reply authorization was revoked before provider execution";
+const SESSION_FOLLOWUP_AUTHORIZATION_REVOKED_REASON: &str =
+    "follow-up authorization was revoked before Agent admission";
+const SESSION_FOLLOWUP_QUEUE_MAX: i64 = 32;
 const DISPATCH_CALL_ID_MAX_BYTES: usize = 160;
 const DISPATCH_IDENTIFIER_MAX_BYTES: usize = 128;
 const DISPATCH_TOOL_NAME_MAX_BYTES: usize = 96;
@@ -905,6 +918,7 @@ impl SqliteStore {
                     reply_job: None,
                     agent_turn: None,
                     goal_round: None,
+                    followup: None,
                     limits: &limits,
                     physical_limits: &physical_limits,
                     fail_after_enqueue: false,
@@ -938,6 +952,7 @@ impl SqliteStore {
                     reply_job: None,
                     agent_turn: None,
                     goal_round: None,
+                    followup: None,
                     limits: &limits,
                     physical_limits: &physical_limits,
                     fail_after_enqueue: false,
@@ -979,6 +994,7 @@ impl SqliteStore {
                     reply_job: Some(job),
                     agent_turn: None,
                     goal_round: None,
+                    followup: None,
                     limits: &limits,
                     physical_limits: &physical_limits,
                     fail_after_enqueue: false,
@@ -1028,6 +1044,7 @@ impl SqliteStore {
                     reply_job: Some(job),
                     agent_turn: None,
                     goal_round: None,
+                    followup: None,
                     limits: &limits,
                     physical_limits: &physical_limits,
                     fail_after_enqueue: false,
@@ -1111,6 +1128,7 @@ impl SqliteStore {
                     reply_job: None,
                     agent_turn: Some(agent),
                     goal_round: None,
+                    followup: None,
                     limits: &limits,
                     physical_limits: &physical_limits,
                     fail_after_enqueue: false,
@@ -1161,6 +1179,7 @@ impl SqliteStore {
                     reply_job: None,
                     agent_turn: Some(agent),
                     goal_round: Some(goal_round),
+                    followup: None,
                     limits: &limits,
                     physical_limits: &physical_limits,
                     fail_after_enqueue: false,
@@ -1177,6 +1196,123 @@ impl SqliteStore {
                     .ok_or_else(|| {
                         StorageError::CorruptData(
                             "Goal round admission committed without durable Agent work".into(),
+                        )
+                    })
+            })
+        })
+        .await
+    }
+
+    /// Durably enqueue one ordinary user follow-up without changing the
+    /// Session event sequence. The inbox itself is the acknowledgement.
+    pub async fn enqueue_session_followup_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        request: EnqueueSessionFollowupRequest,
+        idempotency_key: &str,
+    ) -> Result<EnqueueSessionFollowupResponse, StorageError> {
+        let context = validated_authz_context(context)?;
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        let key = normalized_key(idempotency_key)?.to_owned();
+        let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            enqueue_session_followup(
+                connection,
+                &context,
+                &session_id,
+                request,
+                &key,
+                &limits,
+                &physical_limits,
+            )
+        })
+        .await
+    }
+
+    pub async fn session_followups_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+    ) -> Result<Vec<SessionFollowup>, StorageError> {
+        let context = validated_authz_context(context)?;
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        self.with_connection(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            require_current_authority(&transaction, &context, AccountCapability::Read)?;
+            require_active_session_actor(&transaction, &session_id, &context)?;
+            let items = query_session_followups(&transaction, &session_id)?;
+            transaction.commit()?;
+            Ok(items)
+        })
+        .await
+    }
+
+    /// Returns the oldest executable follow-up. Revoked authority is
+    /// terminalized in FIFO order so it cannot poison the queue forever.
+    pub async fn next_session_followup_candidate(
+        &self,
+    ) -> Result<Option<SessionFollowupCandidate>, StorageError> {
+        let physical_limits = self.physical_limits.clone();
+        self.with_progress_connection(move |connection| {
+            query_next_session_followup_candidate(connection, &physical_limits)
+        })
+        .await
+    }
+
+    /// Converts the exact first queued follow-up into a normal Session turn
+    /// and immutable initial Agent model job in one SQLite transaction.
+    pub async fn start_followup_and_enqueue_agent(
+        &self,
+        candidate: SessionFollowupCandidate,
+        agent: AgentTurnSpec,
+    ) -> Result<AgentTurnEnqueueResponse, StorageError> {
+        let context = validated_authz_context(&candidate.authz)?;
+        if agent.authz != context {
+            return Err(StorageError::SessionNotFound(candidate.session.id.clone()));
+        }
+        let session_id =
+            validated_durable_reference(&candidate.session.id, "session ID")?.to_owned();
+        let followup = candidate.followup;
+        let request = StartTurnRequest {
+            turn_id: followup.turn_id.clone(),
+            user_message: followup.user_message.clone(),
+            expected_sequence: candidate.session.sequence,
+        };
+        let key = format!("followup-{}", followup.turn_id);
+        normalized_key(&key)?;
+        let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            start_turn(
+                connection,
+                &session_id,
+                request,
+                &key,
+                StartTurnOptions {
+                    authz: Some(&context),
+                    reply_job: None,
+                    agent_turn: Some(agent),
+                    goal_round: None,
+                    followup: Some(followup),
+                    limits: &limits,
+                    physical_limits: &physical_limits,
+                    fail_after_enqueue: false,
+                },
+            )
+            .and_then(|outcome| {
+                outcome
+                    .agent_work
+                    .map(|(agent, job)| AgentTurnEnqueueResponse {
+                        start: outcome.start,
+                        agent,
+                        job,
+                    })
+                    .ok_or_else(|| {
+                        StorageError::CorruptData(
+                            "follow-up admission committed without durable Agent work".into(),
                         )
                     })
             })
@@ -2517,6 +2653,7 @@ impl SqliteStore {
                     reply_job: Some(job),
                     agent_turn: None,
                     goal_round: None,
+                    followup: None,
                     limits: &limits,
                     physical_limits: &physical_limits,
                     fail_after_enqueue: true,
@@ -3493,6 +3630,13 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
             params![30, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 31 {
+        transaction.execute_batch(MIGRATION_0031)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![31, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
     // The execution verifier now understands the v22 knowledge binding. Run
     // it only after every missing schema step has been installed so upgrades
     // from v19 and older never query a column that does not exist yet. This
@@ -3505,6 +3649,7 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
         agent::verify_agent_todo_integrity(&transaction)?;
         agent::verify_agent_goal_integrity(&transaction)?;
         agent::verify_agent_goal_round_integrity(&transaction)?;
+        verify_session_followup_integrity(&transaction)?;
         provider::verify_account_reply_provider_integrity(&transaction)?;
         execution::verify_agent_execution_integrity(&transaction)?;
     }
@@ -4511,12 +4656,14 @@ fn readiness(
                'account_agent_prompt_configs_active_prompt_idx',
                'agent_prompt_config_receipts_digest_idx',
                'account_reply_provider_configs_provider_idx',
-               'account_reply_provider_receipts_provider_idx'
+               'account_reply_provider_receipts_provider_idx',
+               'session_followups_ready_idx',
+               'session_followups_actor_capacity_idx'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if point_query_indexes != 73 {
+    if point_query_indexes != 75 {
         return Err(StorageError::CorruptData(
             "one or more point-query indexes are missing".into(),
         ));
@@ -4711,13 +4858,19 @@ fn readiness(
                'agent_goal_rounds_validate_insert',
                'agent_goal_rounds_reject_update',
                'agent_goal_rounds_reject_delete',
+               'session_followups_validate_insert',
+               'session_followups_enforce_transition',
+               'session_followups_reject_delete',
+               'session_followup_receipts_require_authority',
+               'session_followup_receipts_reject_update',
+               'session_followup_receipts_reject_delete',
                'schema_migrations_reject_update',
                'schema_migrations_reject_delete'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 164 {
+    if trigger_count != 170 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
         ));
@@ -4731,6 +4884,8 @@ fn readiness(
     verify_migration_trigger_definitions(connection, MIGRATION_0028, MIGRATION_0028_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0029, MIGRATION_0029_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0030, MIGRATION_0030_TRIGGER_NAMES)?;
+    verify_migration_trigger_definitions(connection, MIGRATION_0031, MIGRATION_0031_TRIGGER_NAMES)?;
+    verify_session_followup_integrity(connection)?;
 
     let agent_pending_call_fk: i64 = connection.query_row(
         r#"SELECT COUNT(*)
@@ -6251,6 +6406,10 @@ fn require_reply_queue_capacity(
                    SELECT 1 FROM agent_turns
                    WHERE account_id = ?1 AND actor_user_id = ?2
                      AND status NOT IN ('succeeded', 'failed', 'needs_attention')
+                   UNION ALL
+                   SELECT 1 FROM session_followups
+                   WHERE account_id = ?1 AND actor_user_id = ?2
+                     AND status = 'queued'
                    LIMIT ?3
                )"#,
             params![account_id, actor_user_id, actor_limit],
@@ -6268,6 +6427,9 @@ fn require_reply_queue_capacity(
                UNION ALL
                SELECT 1 FROM agent_turns WHERE account_id = ?1
                  AND status NOT IN ('succeeded', 'failed', 'needs_attention')
+               UNION ALL
+               SELECT 1 FROM session_followups WHERE account_id = ?1
+                 AND status = 'queued'
                LIMIT ?2
            )"#,
         params![account_id, account_limit],
@@ -6285,6 +6447,8 @@ fn require_reply_queue_capacity(
                UNION ALL
                SELECT 1 FROM agent_turns
                WHERE status NOT IN ('succeeded', 'failed', 'needs_attention')
+               UNION ALL
+               SELECT 1 FROM session_followups WHERE status = 'queued'
                LIMIT ?1
            )"#,
         [global_limit],
@@ -10881,11 +11045,513 @@ fn attach_run(
     Ok(response)
 }
 
+fn verify_session_followup_integrity(connection: &Connection) -> Result<(), StorageError> {
+    let broken_ordinal = connection
+        .query_row(
+            r#"SELECT session_id FROM session_followups
+               GROUP BY session_id
+               HAVING MIN(ordinal) <> 1 OR MAX(ordinal) <> COUNT(*)
+               LIMIT 1"#,
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(session_id) = broken_ordinal {
+        return Err(StorageError::CorruptData(format!(
+            "Session `{session_id}` follow-up ordinals are not contiguous"
+        )));
+    }
+    let broken_followup = connection
+        .query_row(
+            r#"SELECT followup.turn_id
+               FROM session_followups followup
+               WHERE (
+                   followup.status = 'claimed'
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM agent_turns agent
+                       JOIN session_turns turn
+                         ON turn.session_id = agent.session_id AND turn.id = agent.turn_id
+                       JOIN agent_model_jobs job
+                         ON job.agent_id = agent.id AND job.step = 1
+                       WHERE agent.id = followup.claimed_agent_id
+                         AND agent.account_id = followup.account_id
+                         AND agent.actor_user_id = followup.actor_user_id
+                         AND agent.actor_membership_revision = followup.actor_membership_revision
+                         AND agent.session_id = followup.session_id
+                         AND agent.turn_id = followup.turn_id
+                         AND agent.created_at = followup.claimed_at
+                         AND turn.started_at = followup.claimed_at
+                         AND job.queued_at = followup.claimed_at
+                   )
+               ) OR (
+                   followup.status <> 'claimed'
+                   AND EXISTS (SELECT 1 FROM session_turns turn WHERE turn.id = followup.turn_id)
+               )
+               LIMIT 1"#,
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(turn_id) = broken_followup {
+        return Err(StorageError::CorruptData(format!(
+            "Session follow-up `{turn_id}` is not bound to its exact Agent turn"
+        )));
+    }
+    let broken_receipt = connection
+        .query_row(
+            r#"SELECT receipt.turn_id
+               FROM session_followup_receipts receipt
+               JOIN session_followups followup
+                 ON followup.session_id = receipt.session_id
+                AND followup.turn_id = receipt.turn_id
+               WHERE receipt.account_id <> followup.account_id
+                  OR receipt.actor_user_id <> followup.actor_user_id
+                  OR receipt.actor_membership_revision <> followup.actor_membership_revision
+                  OR json_extract(receipt.request_fingerprint, '$.session_id') <> receipt.session_id
+                  OR json_extract(receipt.request_fingerprint, '$.request.turn_id') <> receipt.turn_id
+                  OR json_extract(receipt.request_fingerprint, '$.request.user_message') <> followup.user_message
+                  OR json_type(receipt.request_fingerprint, '$.request.expected_sequence') <> 'integer'
+                  OR json_extract(receipt.response_json, '$.replayed') <> 0
+                  OR json_extract(receipt.response_json, '$.followup.session_id') <> followup.session_id
+                  OR json_extract(receipt.response_json, '$.followup.turn_id') <> followup.turn_id
+                  OR json_extract(receipt.response_json, '$.followup.ordinal') <> followup.ordinal
+                  OR json_extract(receipt.response_json, '$.followup.status') <> 'queued'
+                  OR json_extract(receipt.response_json, '$.followup.user_message') <> followup.user_message
+                  OR json_extract(receipt.response_json, '$.followup.enqueued_at') <> followup.enqueued_at
+               LIMIT 1"#,
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(turn_id) = broken_receipt {
+        return Err(StorageError::CorruptData(format!(
+            "Session follow-up receipt `{turn_id}` does not match its admission"
+        )));
+    }
+    Ok(())
+}
+
+fn decode_session_followup_status(value: &str) -> Result<SessionFollowupStatus, StorageError> {
+    match value {
+        "queued" => Ok(SessionFollowupStatus::Queued),
+        "claimed" => Ok(SessionFollowupStatus::Claimed),
+        "discarded" => Ok(SessionFollowupStatus::Discarded),
+        other => Err(StorageError::CorruptData(format!(
+            "unsupported Session follow-up status `{other}`"
+        ))),
+    }
+}
+
+fn query_session_followup(
+    connection: &Connection,
+    session_id: &str,
+    turn_id: &str,
+) -> Result<SessionFollowup, StorageError> {
+    connection
+        .query_row(
+            r#"SELECT session_id, turn_id, ordinal, status, user_message,
+                      enqueued_at, claimed_at, discarded_at, discard_reason
+               FROM session_followups
+               WHERE session_id = ?1 AND turn_id = ?2"#,
+            params![session_id, turn_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| StorageError::SessionTurnNotFound(turn_id.to_owned()))
+        .and_then(
+            |(
+                session_id,
+                turn_id,
+                ordinal,
+                status,
+                user_message,
+                enqueued_at,
+                claimed_at,
+                discarded_at,
+                discard_reason,
+            )| {
+                Ok(SessionFollowup {
+                    session_id,
+                    turn_id,
+                    ordinal: i64_to_u64(ordinal, "Session follow-up ordinal")?,
+                    status: decode_session_followup_status(&status)?,
+                    user_message,
+                    enqueued_at,
+                    claimed_at,
+                    discarded_at,
+                    discard_reason,
+                })
+            },
+        )
+}
+
+fn query_session_followups(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Vec<SessionFollowup>, StorageError> {
+    let mut statement = connection.prepare(
+        r#"SELECT turn_id FROM session_followups
+           WHERE session_id = ?1
+           ORDER BY ordinal DESC LIMIT 100"#,
+    )?;
+    let turn_ids = statement
+        .query_map([session_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    turn_ids
+        .into_iter()
+        .rev()
+        .map(|turn_id| query_session_followup(connection, session_id, &turn_id))
+        .collect()
+}
+
+fn enqueue_session_followup(
+    connection: &mut Connection,
+    context: &AuthzContext,
+    session_id: &str,
+    request: EnqueueSessionFollowupRequest,
+    idempotency_key: &str,
+    limits: &StorageLimits,
+    physical_limits: &SqlitePhysicalLimits,
+) -> Result<EnqueueSessionFollowupResponse, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_current_authority(&transaction, context, AccountCapability::SessionWrite)?;
+    require_current_authority(&transaction, context, AccountCapability::Reply)?;
+    require_active_session_actor(&transaction, session_id, context)?;
+    let start_request = StartTurnRequest {
+        turn_id: request.turn_id.clone(),
+        user_message: request.user_message.clone(),
+        expected_sequence: request.expected_sequence,
+    };
+    validate_start_turn_request(&start_request)?;
+    normalized_key(idempotency_key)?;
+    let fingerprint = session_command_fingerprint(Some(session_id), &request)?;
+    let stored = transaction
+        .query_row(
+            r#"SELECT request_fingerprint, response_json
+               FROM session_followup_receipts
+               WHERE account_id = ?1 AND actor_user_id = ?2 AND idempotency_key = ?3"#,
+            params![
+                context.account_id.as_str(),
+                context.user_id,
+                idempotency_key
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    if let Some((stored_fingerprint, response_json)) = stored {
+        if stored_fingerprint != fingerprint {
+            return Err(StorageError::IdempotencyConflict);
+        }
+        let mut response: EnqueueSessionFollowupResponse = serde_json::from_str(&response_json)?;
+        if response.replayed {
+            return Err(StorageError::CorruptData(
+                "stored Session follow-up receipt is not original".into(),
+            ));
+        }
+        response.replayed = true;
+        transaction.commit()?;
+        return Ok(response);
+    }
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Admission,
+    )?;
+    let summary = query_session_summary(&transaction, session_id)?;
+    require_session_sequence(&summary, request.expected_sequence)?;
+    let conflicting_turn: i64 = transaction.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM session_turns WHERE id = ?1
+               UNION ALL
+               SELECT 1 FROM session_followups WHERE turn_id = ?1
+           )"#,
+        [&request.turn_id],
+        |row| row.get(0),
+    )?;
+    if conflicting_turn != 0 {
+        return Err(StorageError::InvalidSessionTransition(format!(
+            "turn `{}` already exists",
+            request.turn_id
+        )));
+    }
+    let queued_for_session: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM session_followups WHERE session_id = ?1 AND status = 'queued'",
+        [session_id],
+        |row| row.get(0),
+    )?;
+    if queued_for_session >= SESSION_FOLLOWUP_QUEUE_MAX {
+        return Err(StorageError::ReplyQueueCapacityExceeded);
+    }
+    require_reply_queue_capacity(
+        &transaction,
+        context.account_id.as_str(),
+        Some(&context.user_id),
+        limits,
+    )?;
+    let ordinal: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM session_followups WHERE session_id = ?1",
+        [session_id],
+        |row| row.get(0),
+    )?;
+    let timestamp = now();
+    transaction.execute(
+        r#"INSERT INTO session_followups(
+               account_id, actor_user_id, actor_membership_revision,
+               session_id, turn_id, ordinal, user_message, status,
+               claimed_agent_id, enqueued_at, claimed_at, discarded_at, discard_reason
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', NULL, ?8, NULL, NULL, NULL)"#,
+        params![
+            context.account_id.as_str(),
+            context.user_id,
+            u64_to_i64(context.membership_revision.get(), "membership revision")?,
+            session_id,
+            request.turn_id,
+            ordinal,
+            request.user_message,
+            timestamp,
+        ],
+    )?;
+    let response = EnqueueSessionFollowupResponse {
+        followup: query_session_followup(&transaction, session_id, &request.turn_id)?,
+        replayed: false,
+    };
+    transaction.execute(
+        r#"INSERT INTO session_followup_receipts(
+               account_id, actor_user_id, actor_membership_revision, idempotency_key,
+               request_fingerprint, response_json, session_id, turn_id, created_at
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+        params![
+            context.account_id.as_str(),
+            context.user_id,
+            u64_to_i64(context.membership_revision.get(), "membership revision")?,
+            idempotency_key,
+            fingerprint,
+            serde_json::to_string(&response)?,
+            session_id,
+            request.turn_id,
+            timestamp,
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(response)
+}
+
+fn query_next_session_followup_candidate(
+    connection: &mut Connection,
+    physical_limits: &SqlitePhysicalLimits,
+) -> Result<Option<SessionFollowupCandidate>, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    loop {
+        let row = transaction
+            .query_row(
+                r#"SELECT followup.account_id, followup.actor_user_id,
+                          followup.actor_membership_revision,
+                          followup.session_id, followup.turn_id
+                   FROM session_followups followup
+                   JOIN sessions session ON session.id = followup.session_id
+                   WHERE followup.status = 'queued'
+                     AND session.status = 'ready'
+                     AND session.active_turn_id IS NULL
+                     AND NOT EXISTS (
+                         SELECT 1 FROM session_followups prior
+                         WHERE prior.session_id = followup.session_id
+                           AND prior.status = 'queued'
+                           AND prior.ordinal < followup.ordinal
+                     )
+                   ORDER BY followup.enqueued_at, followup.session_id, followup.ordinal
+                   LIMIT 1"#,
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((account_id, actor_user_id, membership_revision, session_id, turn_id)) = row
+        else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let role = transaction
+            .query_row(
+                r#"SELECT membership.role
+                   FROM accounts account
+                   JOIN account_memberships membership
+                     ON membership.account_id = account.id
+                   JOIN users user ON user.id = membership.user_id
+                   WHERE account.id = ?1 AND account.status = 'active'
+                     AND membership.user_id = ?2 AND membership.status = 'active'
+                     AND membership.revision = ?3 AND user.status = 'active'"#,
+                params![account_id, actor_user_id, membership_revision],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let role = role.as_deref().map(decode_membership_role).transpose()?;
+        if !role.is_some_and(|role| {
+            membership_allows(role, AccountCapability::SessionWrite)
+                && membership_allows(role, AccountCapability::Reply)
+        }) {
+            require_connection_physical_capacity(
+                &transaction,
+                physical_limits,
+                PhysicalCapacityGate::ReservedProgress,
+            )?;
+            let timestamp = now();
+            let updated = transaction.execute(
+                r#"UPDATE session_followups
+                   SET status = 'discarded', discarded_at = ?3, discard_reason = ?4
+                   WHERE session_id = ?1 AND turn_id = ?2 AND status = 'queued'"#,
+                params![
+                    session_id,
+                    turn_id,
+                    timestamp,
+                    SESSION_FOLLOWUP_AUTHORIZATION_REVOKED_REASON,
+                ],
+            )?;
+            if updated != 1 {
+                return Err(StorageError::ConcurrentModification);
+            }
+            continue;
+        }
+        let account_id = AccountId::from_persistence(account_id).map_err(|error| {
+            StorageError::CorruptData(format!("invalid Session follow-up account: {error}"))
+        })?;
+        let membership_revision = MembershipRevision::new(i64_to_u64(
+            membership_revision,
+            "Session follow-up membership revision",
+        )?)
+        .map_err(|error| StorageError::CorruptData(error.to_string()))?;
+        let auth_session_id =
+            AuthSessionId::from_persistence("followup-driver-v1").map_err(|error| {
+                StorageError::CorruptData(format!(
+                    "invalid internal Session follow-up authority ID: {error}"
+                ))
+            })?;
+        let candidate = SessionFollowupCandidate {
+            authz: AuthzContext {
+                account_id,
+                user_id: actor_user_id,
+                membership_role: role.expect("validated above"),
+                membership_revision,
+                auth_session_id,
+            },
+            session: query_session_summary(&transaction, &session_id)?,
+            followup: query_session_followup(&transaction, &session_id, &turn_id)?,
+        };
+        transaction.commit()?;
+        return Ok(Some(candidate));
+    }
+}
+
+fn require_queued_followup_for_claim(
+    connection: &Connection,
+    followup: &SessionFollowup,
+    context: &AuthzContext,
+) -> Result<(), StorageError> {
+    let found: i64 = connection.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM session_followups queued
+               WHERE queued.account_id = ?1
+                 AND queued.actor_user_id = ?2
+                 AND queued.actor_membership_revision = ?3
+                 AND queued.session_id = ?4
+                 AND queued.turn_id = ?5
+                 AND queued.ordinal = ?6
+                 AND queued.user_message = ?7
+                 AND queued.enqueued_at = ?8
+                 AND queued.status = 'queued'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM session_followups prior
+                     WHERE prior.session_id = queued.session_id
+                       AND prior.status = 'queued'
+                       AND prior.ordinal < queued.ordinal
+                 )
+           )"#,
+        params![
+            context.account_id.as_str(),
+            context.user_id,
+            u64_to_i64(context.membership_revision.get(), "membership revision")?,
+            followup.session_id,
+            followup.turn_id,
+            u64_to_i64(followup.ordinal, "Session follow-up ordinal")?,
+            followup.user_message,
+            followup.enqueued_at,
+        ],
+        |row| row.get(0),
+    )?;
+    if found != 1 {
+        return Err(StorageError::ConcurrentModification);
+    }
+    Ok(())
+}
+
+fn claim_session_followup(
+    connection: &Connection,
+    followup: &SessionFollowup,
+    agent: &AgentTurn,
+    timestamp: &str,
+) -> Result<(), StorageError> {
+    let updated = connection.execute(
+        r#"UPDATE session_followups
+           SET status = 'claimed', claimed_agent_id = ?3, claimed_at = ?4
+           WHERE session_id = ?1 AND turn_id = ?2 AND status = 'queued'"#,
+        params![followup.session_id, followup.turn_id, agent.id, timestamp],
+    )?;
+    if updated != 1 {
+        return Err(StorageError::ConcurrentModification);
+    }
+    Ok(())
+}
+
+fn require_claimed_followup_matches_agent(
+    connection: &Connection,
+    followup: &SessionFollowup,
+    agent: &AgentTurn,
+) -> Result<(), StorageError> {
+    let stored = query_session_followup(connection, &followup.session_id, &followup.turn_id)?;
+    let claimed_agent_id: Option<String> = connection.query_row(
+        r#"SELECT claimed_agent_id FROM session_followups
+           WHERE session_id = ?1 AND turn_id = ?2"#,
+        params![followup.session_id, followup.turn_id],
+        |row| row.get(0),
+    )?;
+    if stored.status != SessionFollowupStatus::Claimed
+        || stored.ordinal != followup.ordinal
+        || stored.user_message != followup.user_message
+        || stored.enqueued_at != followup.enqueued_at
+        || claimed_agent_id.as_deref() != Some(agent.id.as_str())
+    {
+        return Err(StorageError::CorruptData(
+            "claimed Session follow-up does not match its Agent".into(),
+        ));
+    }
+    Ok(())
+}
+
 struct StartTurnOptions<'a> {
     authz: Option<&'a AuthzContext>,
     reply_job: Option<ReplyJobSpec>,
     agent_turn: Option<AgentTurnSpec>,
     goal_round: Option<AgentGoalRoundSpec>,
+    followup: Option<SessionFollowup>,
     limits: &'a StorageLimits,
     physical_limits: &'a SqlitePhysicalLimits,
     fail_after_enqueue: bool,
@@ -10949,6 +11615,7 @@ fn start_turn(
         reply_job,
         agent_turn,
         goal_round,
+        followup,
         limits,
         physical_limits,
         fail_after_enqueue,
@@ -10957,7 +11624,7 @@ fn start_turn(
     normalized_key(idempotency_key)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if let Some(context) = authz {
-        if goal_round.is_some() {
+        if goal_round.is_some() || followup.is_some() {
             require_goal_round_authority(&transaction, session_id, context)?;
         } else {
             require_current_authority(&transaction, context, AccountCapability::SessionWrite)?;
@@ -10990,6 +11657,22 @@ fn start_turn(
             ));
         }
     }
+    if let Some(followup) = &followup {
+        if authz.is_none() || agent_turn.is_none() || reply_job.is_some() || goal_round.is_some() {
+            return Err(StorageError::InvalidAgentTransition(
+                "a follow-up claim requires exactly one actor-bound Agent turn".into(),
+            ));
+        }
+        if followup.session_id != session_id
+            || followup.turn_id != request.turn_id
+            || followup.user_message != request.user_message
+            || followup.status != SessionFollowupStatus::Queued
+        {
+            return Err(StorageError::InvalidAgentTransition(
+                "the queued follow-up does not match its Agent turn request".into(),
+            ));
+        }
+    }
     let (fingerprint, legacy_fingerprint) = match (&reply_job, &agent_turn) {
         (Some(job), None) => (
             reply_start_fingerprint(session_id, &request, job)?,
@@ -10999,12 +11682,20 @@ fn start_turn(
         ),
         (None, Some(agent)) => {
             let fingerprint = agent::agent_start_fingerprint(session_id, &request, agent)?;
-            let fingerprint = match &goal_round {
-                Some(round) => serde_json::to_string(&json!({
+            let fingerprint = match (&goal_round, &followup) {
+                (Some(round), None) => serde_json::to_string(&json!({
                     "agent_start": serde_json::from_str::<Value>(&fingerprint)?,
                     "goal_round": round,
                 }))?,
-                None => fingerprint,
+                (None, Some(followup)) => serde_json::to_string(&json!({
+                    "agent_start": serde_json::from_str::<Value>(&fingerprint)?,
+                    "followup": {
+                        "ordinal": followup.ordinal,
+                        "enqueued_at": followup.enqueued_at,
+                    },
+                }))?,
+                (None, None) => fingerprint,
+                (Some(_), Some(_)) => unreachable!("dual automatic origins were rejected above"),
             };
             (fingerprint, None)
         }
@@ -11059,6 +11750,9 @@ fn start_turn(
                         round,
                     )?;
                 }
+                if let Some(followup) = &followup {
+                    require_claimed_followup_matches_agent(&transaction, followup, &agent)?;
+                }
                 Some((agent, job))
             }
             None => None,
@@ -11082,6 +11776,9 @@ fn start_turn(
             "session `{session_id}` must be ready before starting a turn"
         )));
     }
+    if let Some(followup) = &followup {
+        require_queued_followup_for_claim(&transaction, followup, authz.expect("validated"))?;
+    }
     let turn_exists = transaction
         .query_row(
             "SELECT 1 FROM session_turns WHERE id = ?1",
@@ -11089,7 +11786,18 @@ fn start_turn(
             |row| row.get::<_, i64>(0),
         )
         .optional()?;
-    if turn_exists.is_some() {
+    let queued_turn_exists = if followup.is_none() {
+        transaction
+            .query_row(
+                "SELECT 1 FROM session_followups WHERE turn_id = ?1",
+                [&request.turn_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+    } else {
+        None
+    };
+    if turn_exists.is_some() || queued_turn_exists.is_some() {
         return Err(StorageError::InvalidSessionTransition(format!(
             "turn `{}` already exists",
             request.turn_id
@@ -11098,7 +11806,7 @@ fn start_turn(
     let account_id = authz.map_or(LOCAL_ACCOUNT_ID, |context| context.account_id.as_str());
     let actor_user_id = authz.map(|context| context.user_id.as_str());
     require_open_turn_capacity(&transaction, account_id, actor_user_id, limits)?;
-    if reply_job.is_some() || agent_turn.is_some() {
+    if (reply_job.is_some() || agent_turn.is_some()) && followup.is_none() {
         require_reply_queue_capacity(&transaction, account_id, actor_user_id, limits)?;
     }
     let finalization_payload_reservation = session_finalization_payload_reservation(
@@ -11204,6 +11912,14 @@ fn start_turn(
             )
         })?;
         agent::insert_agent_goal_round(&transaction, &request, stored_agent, round, &timestamp)?;
+    }
+    if let Some(followup) = &followup {
+        let (stored_agent, _) = stored_agent.as_ref().ok_or_else(|| {
+            StorageError::CorruptData(
+                "follow-up admission did not create its required Agent".into(),
+            )
+        })?;
+        claim_session_followup(&transaction, followup, stored_agent, &timestamp)?;
     }
 
     #[cfg(test)]

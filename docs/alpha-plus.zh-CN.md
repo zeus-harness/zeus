@@ -7,7 +7,7 @@ Foundation、schema v14 Account-scoped Durable Authorization、schema v15 Member
 Account Audit、schema v16 Session Reply Context Index 至 schema v25 Durable Session Context
 Compaction、schema v26 Account-scoped Reply Provider Selection、schema v27 Safe Agent
 Cancellation、schema v28 Durable Agent Planning、schema v29 Durable Session Goal、schema v30
-Same-Session Goal Round、Trusted
+Same-Session Goal Round、schema v31 Durable Session Follow-up、Trusted
 Single-Node Ingress、Per-Operation SecretRef Resolution、启动绑定的 Skill Catalog
 与有界多账户控制面主机代码已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
 v11→v12→v13→v14 迁移证据，current-image 证据见本节验收结果，Linux Docker PID/OOM
@@ -380,6 +380,10 @@ POST /sessions/{id}/turns
   并绑定 exact Goal revision、连续 round、membership revision 与 canonical prompt digest。人工输入、
   取消、失败、权限失效、重启或 round cap 都停止续跑；人工 disarm 先验证 Session 权限，activation
   复核与 durable admission 共用进程内互斥门，失败和歧义结果不自动重试。
+- `0031_session_followups.sql`：增加普通用户输入的 durable FIFO inbox 与 actor-scoped receipt。
+  入队不推进 Session sequence；Session `ready` 后按最早 ordinal 原子创建正常 turn、Agent 和首个
+  model job。队列共享 active reply 容量，重启恢复，撤权在 provider I/O 前 durable discard，
+  `needs_attention` 时等待显式 resume。
 
 schema v24 的 system prompt governance 复用 `0019` 的 prompt binding，并增加 durable
 head/revision/receipt。Owner-only `GET/PUT /api/v1/agent/prompt` 通过 expected-revision CAS 和
@@ -468,6 +472,8 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
   503/Retry-After/no-store 映射合约都有确定性主机测试。schema v30 进一步把 process-local
   Goal activation、真实 Session turn admission、连续 round、exact prompt digest、membership
   recheck 与 complete/blocked termination 绑定；重启、人工输入、取消与失败均不会隐式续跑。
+  schema v31 覆盖 follow-up 运行中入队、重启恢复、FIFO claim、幂等冲突、共享容量、撤权 discard、
+  same-name weakened trigger 与 API worker 自动回复。
 - Session/Run detail 只返回最新 bounded tail；opaque cursor 的 kind、resource scope、canonical
   encoding、future-head 和跨资源使用均有自动测试，返回页保持连续且升序。
 - disabled/降权/owner mismatch 的 reply 与 dispatch claim 不触达外部执行，并留下
@@ -476,10 +482,10 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 按项目既有统计口径通过 658 个 Rust 测试（authz 7、connectors 22、deployment 8、
+- host 按项目既有统计口径通过 663 个 Rust 测试（authz 7、connectors 22、deployment 8、
   execution 16、goals 4、kernel 10、knowledge 29、LLM unit 30、provider contract 15、planning 4、
-  protocol 21、runtime 52、skills 5、storage 267、tenancy 15、terminal 10、tools 16、
-  workflows 21、API library 87、API main/config 18、graceful shutdown 1）与 28 个 Web Node 测试。
+  protocol 21、runtime 52、skills 5、storage 271、tenancy 15、terminal 10、tools 16、
+  workflows 21、API library 88、API main/config 18、graceful shutdown 1）与 28 个 Web Node 测试。
 - `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 
 ## 8. 容器与 OOM 验收边界

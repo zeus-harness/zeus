@@ -35,7 +35,7 @@ Client / SvelteKit Web
 - `skills`：启动时一次性加载的 strict version 1 Skill Catalog、确定性 digest，以及只读
   `skill_list` / `skill_load` executor；Skill body 只有通过普通工具结果才对模型可见。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
-- `storage`：schema v30 migration、有界 account/membership 权威、一次性 member setup、用户/偏好、
+- `storage`：schema v31 migration、有界 account/membership 权威、一次性 member setup、用户/偏好、
   account audit/rollup/policy/archive state、独立 Session/Run ledger、typed event lookup、
   account+actor-scoped 回执、durable Agent/model/tool/dispatch queue、不可变 deployment manifest，
   revisioned account knowledge catalog、owner-governed Agent prompt、account-scoped
@@ -137,6 +137,15 @@ durable admission 共用同一个进程内互斥门，已取得门的人工 disa
 越过。失败和歧义结果不自动重试。Deep readiness 会重建
 每轮之前的 Goal 状态、精确 driver prompt、turn/Agent/job 绑定和完整生命周期链。
 
+schema v31 增加普通用户 follow-up 的 durable FIFO inbox。入队在 `BEGIN IMMEDIATE` 中校验
+当前 login authority、Session scope、`expected_sequence`、幂等回执、每 Session 32 条上限及既有
+active-reply actor/account/global 配额，但不提前追加 `user_message` 或推进 Session sequence。
+Session 回到 `ready` 后，worker 只选择该 Session 最早的 queued row，复验捕获的 membership
+revision，并在同一事务中创建正常 Session turn、Agent、首个 model job 和事件，再把 inbox row
+绑定为 `claimed`。重启会恢复 queued 工作；撤权 row 按 FIFO durable `discarded` 且绝不触发
+provider I/O；`needs_attention` 时保持 parked，显式 resume 后继续。表、回执和状态迁移均由
+权威 trigger 与 deep readiness 校验。
+
 可选 `ZEUS_SKILLS_FILE` 在 SQLite 打开前加载 immutable Skill Catalog。文件使用 strict version 1
 JSON，regular file 上限 512 KiB，包含 1–64 个唯一的 lowercase provider-safe 名称；description
 上限 256 bytes，单个 UTF-8 body 上限 24 KiB，未知字段、重复名称、非规范 description 与不安全
@@ -199,6 +208,8 @@ ready ── start_turn ──► running / open turn + Agent + queued model job
                               └─ failure / unknown / restart ──► needs_attention / interrupted
                                                                     │
                                                                     └─ resume ──► ready
+
+queued follow-up ──(Session ready + exact authority)──► start_turn
 ```
 
 Session ledger 记录 `session_created`、`run_attached`、`user_message`、可选的
@@ -229,6 +240,10 @@ Session ledger 记录 `session_created`、`run_attached`、`user_message`、可�
   上下文。组装结果持久化在 job 中，迟到的幂等重试复用该 durable request，而不是从更晚的
   Session 状态重新生成。当前 user message 无法与 active prompt 一起装入初始预算时，API 在任何
   turn/job 写入前返回 `413 agent_request_too_large`；合法请求返回 `202`。
+- follow-up enqueue：允许现有 Session 在任意生命周期状态接收下一条用户输入；命令只写
+  `session_followups` 与独立 actor-scoped receipt，不推进 Session sequence。Worker 在 Session
+  `ready` 时按 FIFO 把它原子转换为上述普通 start 边界，因此历史、事件、Agent 与 provider
+  执行仍只有一套权威状态机。
 - Agent model worker：claim 事务先复验 active actor、Session owner、manifest digest、provider/
   model、profile/environment、policy revision、workflow limits、完整 typed transcript、prompt
   绑定与 provider-visible tool schema，再把 queued job durable claim 为 `started`。admission、
@@ -287,7 +302,7 @@ connector 在数据库事务和锁之外运行。
 
 API 监听端口之前按固定顺序完成：
 
-1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v30；按当前
+1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v31；按当前
    detailed-row limit 以最多 64 行 batch 压缩 bootstrap terminal audit prefix，再按稳定
    `(priority actor, expires_at, auth-session ID)` 顺序最多清理 64 个过期或绑定
    missing/disabled/suspended/stale-revision authority 的 auth session。

@@ -22,8 +22,8 @@ pub use physical::{SqlitePhysicalLimits, SqlitePhysicalLimitsError};
 use protocol::{
     AgentReviewResponse, AgentToolCallStatus, AgentTurnStatus, Approval, AssistantReplyProvenance,
     EvidenceSummary, IncidentSummary, Metric, PolicyDecision, ReadPageInfo, ReviewResponse,
-    RunEvent, RunSummary, SandboxProfile, SessionEvent, SessionSummary, SessionTurn,
-    StartTurnResponse, ToolCall, ToolEffect, ToolExecutorStatus, ToolPolicySummary,
+    RunEvent, RunSummary, SandboxProfile, SessionEvent, SessionFollowup, SessionSummary,
+    SessionTurn, StartTurnResponse, ToolCall, ToolEffect, ToolExecutorStatus, ToolPolicySummary,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -656,6 +656,16 @@ pub struct AgentGoalRoundCandidate {
     pub authz: AuthzContext,
     pub session: SessionSummary,
     pub goal: goals::GoalSnapshot,
+}
+
+/// Read-only scheduling candidate for the first queued follow-up of one Ready
+/// Session. The synthetic auth-session ID is internal; durable admission
+/// rechecks the captured membership revision without trusting a browser login.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionFollowupCandidate {
+    pub authz: AuthzContext,
+    pub session: SessionSummary,
+    pub followup: SessionFollowup,
 }
 
 impl AgentTurnSpec {

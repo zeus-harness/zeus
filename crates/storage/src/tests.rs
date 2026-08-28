@@ -20,11 +20,12 @@ use llm::{ReplyRequest, ReplyRole};
 use protocol::{
     AgentToolCallStatus, AgentTurnStatus, Approval, ApprovalScope, ApprovalStatus,
     AssistantReplyKind, AssistantReplyProvenance, AttachRunRequest, CreateSessionRequest,
-    EventType, EvidenceSummary, FlushSessionRequest, IncidentStatus, IncidentSummary, Metric,
-    MetricTone, NotDispatchedReason, PolicyDecision, ResumeSessionRequest, ReviewDecision,
-    ReviewResponse, RunEvent, RunEventData, RunStatus, RunSummary, SandboxProfile, SessionEvent,
-    SessionEventData, SessionStatus, SessionTurnStatus, Severity, StartTurnRequest, ToolCall,
-    ToolCallStatus, ToolEffect, ToolExecutorStatus, ToolOutcome, ToolPolicySummary,
+    EnqueueSessionFollowupRequest, EventType, EvidenceSummary, FlushSessionRequest, IncidentStatus,
+    IncidentSummary, Metric, MetricTone, NotDispatchedReason, PolicyDecision, ResumeSessionRequest,
+    ReviewDecision, ReviewResponse, RunEvent, RunEventData, RunStatus, RunSummary, SandboxProfile,
+    SessionEvent, SessionEventData, SessionFollowupStatus, SessionStatus, SessionTurnStatus,
+    Severity, StartTurnRequest, ToolCall, ToolCallStatus, ToolEffect, ToolExecutorStatus,
+    ToolOutcome, ToolPolicySummary,
 };
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
@@ -45,9 +46,9 @@ use crate::{
     ReplyJobStatus, ReplyOutcomeUnknownCommit, ReplySuccessCommit, ReviewCommit,
     RotateMemberSetupTokenCommit, RunSnapshot, RuntimeIdentity, SESSION_AGENT_PROMPT_ID,
     SessionCompactionClaimOutcome, SessionCompactionJobStatus, SessionCompactionSuccessCommit,
-    SqliteOperationLimits, SqlitePhysicalLimits, SqliteStore, StorageError, StorageLimits,
-    StoredMembershipStatus, StoredUserRole, StoredUserStatus, SwitchAuthSessionCommit,
-    TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
+    SessionFollowupCandidate, SqliteOperationLimits, SqlitePhysicalLimits, SqliteStore,
+    StorageError, StorageLimits, StoredMembershipStatus, StoredUserRole, StoredUserStatus,
+    SwitchAuthSessionCommit, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
@@ -1770,7 +1771,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         versions,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30,
+            25, 26, 27, 28, 29, 30, 31,
         ]
     );
     let owner: Option<String> = connection
@@ -1920,7 +1921,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 30);
+    assert_eq!(version, 31);
     let configured_account: (String, String, String, i64) = connection
         .query_row(
             r#"SELECT
@@ -2638,7 +2639,7 @@ async fn v12_identity_and_run_crash_prefix_migrates_then_recovers_the_primary_se
     assert_eq!(
         recovered,
         (
-            30,
+            31,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into()
@@ -4385,7 +4386,7 @@ async fn v5_configured_database_migrates_to_the_local_owner_membership() {
     assert_eq!(
         migrated,
         (
-            30,
+            31,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into(),
@@ -4511,7 +4512,7 @@ async fn v13_configured_active_work_migrates_with_account_authority_and_exact_vo
             },
         )
         .unwrap();
-    assert_eq!(migrated_counts, (30, 1, 1, 2, 1));
+    assert_eq!(migrated_counts, (31, 1, 1, 2, 1));
 }
 
 #[tokio::test]
@@ -4873,7 +4874,7 @@ async fn v14_database_migrates_through_v19_with_member_and_audit_roots() {
             },
         )
         .unwrap();
-    assert_eq!(state, (30, 1, 1, 1, 19));
+    assert_eq!(state, (31, 1, 1, 1, 19));
 }
 
 #[tokio::test]
@@ -4912,7 +4913,7 @@ async fn v15_migration_seeds_the_configured_audit_detail_limit() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (30, 2));
+    assert_eq!(state, (31, 2));
 }
 
 #[tokio::test]
@@ -4957,7 +4958,7 @@ async fn v15_reopen_rejects_a_lower_audit_detail_limit_without_mutating_policy()
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (30, 4));
+    assert_eq!(state, (31, 4));
     drop(connection);
 
     let reopened = SqliteStore::open_with_limits(database.path(), original_limits)
@@ -5243,6 +5244,38 @@ async fn readiness_rejects_a_weakened_v30_goal_round_trigger_definition() {
     assert!(
         matches!(&error, StorageError::CorruptData(message)
             if message == "durability trigger `agent_goal_rounds_validate_insert` differs from the authoritative migration"),
+        "unexpected weakened-trigger error: {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn readiness_rejects_a_weakened_v31_followup_transition_trigger_definition() {
+    let database = TestDatabase::new();
+    {
+        let store = SqliteStore::open(database.path()).await.unwrap();
+        store.readiness().await.unwrap();
+    }
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER session_followups_enforce_transition;
+               CREATE TRIGGER session_followups_enforce_transition
+               BEFORE UPDATE ON session_followups
+               WHEN 0
+               BEGIN
+                   SELECT 1;
+               END;"#,
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("a same-name weakened follow-up transition trigger must fail readiness"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(&error, StorageError::CorruptData(message)
+            if message == "durability trigger `session_followups_enforce_transition` differs from the authoritative migration"),
         "unexpected weakened-trigger error: {error:?}"
     );
 }
@@ -7191,7 +7224,7 @@ async fn v19_agent_manifest_is_canonical_actor_scoped_reused_and_secret_free() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(version, 30);
+    assert_eq!(version, 31);
     assert_eq!(
         manifest_rows, 1,
         "the identical manifest must be deduplicated"
@@ -9784,6 +9817,266 @@ async fn goal_round_admission_is_exact_atomic_append_only_and_restart_durable() 
         Err(StorageError::CorruptData(message))
             if message.contains("exact driver prompt")
     ));
+}
+
+#[tokio::test]
+async fn session_followups_queue_during_a_turn_recover_fifo_and_claim_atomically() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    store
+        .start_turn_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-before-followups".into(),
+                user_message: "Keep this turn open while more input arrives".into(),
+                expected_sequence: 1,
+            },
+            "turn-before-followups",
+        )
+        .await
+        .unwrap();
+
+    for (turn_id, message, key) in [
+        (
+            "turn-followup-first",
+            "Process this follow-up first",
+            "enqueue-followup-first",
+        ),
+        (
+            "turn-followup-second",
+            "Process this follow-up second",
+            "enqueue-followup-second",
+        ),
+    ] {
+        let admitted = store
+            .enqueue_session_followup_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                EnqueueSessionFollowupRequest {
+                    turn_id: turn_id.into(),
+                    user_message: message.into(),
+                    expected_sequence: 2,
+                },
+                key,
+            )
+            .await
+            .unwrap();
+        assert_eq!(admitted.followup.status, SessionFollowupStatus::Queued);
+    }
+    let replayed = store
+        .enqueue_session_followup_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            EnqueueSessionFollowupRequest {
+                turn_id: "turn-followup-first".into(),
+                user_message: "Process this follow-up first".into(),
+                expected_sequence: 2,
+            },
+            "enqueue-followup-first",
+        )
+        .await
+        .unwrap();
+    assert!(replayed.replayed);
+    assert!(matches!(
+        store
+            .enqueue_session_followup_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                EnqueueSessionFollowupRequest {
+                    turn_id: "turn-followup-first".into(),
+                    user_message: "Conflicting replay".into(),
+                    expected_sequence: 2,
+                },
+                "enqueue-followup-first",
+            )
+            .await,
+        Err(StorageError::IdempotencyConflict)
+    ));
+    assert!(
+        store
+            .next_session_followup_candidate()
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let flushed = store
+        .flush_turn_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            FlushSessionRequest {
+                turn_id: "turn-before-followups".into(),
+                assistant_message: Some("The original turn is complete".into()),
+                expected_sequence: 2,
+            },
+            "flush-before-followups",
+        )
+        .await
+        .unwrap();
+    assert_eq!(flushed.session.status, SessionStatus::Ready);
+    drop(store);
+
+    let reopened = SqliteStore::open(database.path()).await.unwrap();
+    let first = reopened
+        .next_session_followup_candidate()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.followup.turn_id, "turn-followup-first");
+    let manifest = test_agent_manifest();
+    let spec = followup_agent_spec(&reopened, &first, manifest.clone()).await;
+    let (left, right) = tokio::join!(
+        reopened.start_followup_and_enqueue_agent(first.clone(), spec.clone()),
+        reopened.start_followup_and_enqueue_agent(first, spec),
+    );
+    let left = left.unwrap();
+    let right = right.unwrap();
+    assert_ne!(left.start.replayed, right.start.replayed);
+    let admitted = if left.start.replayed { right } else { left };
+    assert_eq!(admitted.start.turn.id, "turn-followup-first");
+    assert!(
+        reopened
+            .next_session_followup_candidate()
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let AgentModelClaimOutcome::Claimed(job) =
+        reopened.claim_next_agent_model(&manifest).await.unwrap()
+    else {
+        panic!("the claimed follow-up Agent must own a model job");
+    };
+    let AgentModelCompletion::Final(completed) = reopened
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: job.id,
+            response_json: agent_final_response_json("First follow-up complete"),
+            resolution: AgentModelResolution::Final {
+                assistant_message: "First follow-up complete".into(),
+                provenance: agent_model_provenance(),
+            },
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("the first follow-up must finish normally");
+    };
+    assert_eq!(completed.session.status, SessionStatus::Ready);
+    let second = reopened
+        .next_session_followup_candidate()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.followup.turn_id, "turn-followup-second");
+    let items = reopened
+        .session_followups_for_actor(&owner_authz(), "session-alpha")
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].status, SessionFollowupStatus::Claimed);
+    assert_eq!(items[1].status, SessionFollowupStatus::Queued);
+    reopened.verify_integrity().await.unwrap();
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    assert!(connection
+        .execute(
+            "UPDATE session_followups SET user_message = 'tampered' WHERE turn_id = 'turn-followup-first'",
+            [],
+        )
+        .is_err());
+    assert!(
+        connection
+            .execute(
+                "DELETE FROM session_followups WHERE turn_id = 'turn-followup-first'",
+                [],
+            )
+            .is_err()
+    );
+    let transition_trigger =
+        stored_trigger_sql(&connection, "session_followups_enforce_transition");
+    connection
+        .execute_batch("DROP TRIGGER session_followups_enforce_transition;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE session_followups SET claimed_at = '2026-08-28T00:00:00.000Z' WHERE turn_id = 'turn-followup-first'",
+            [],
+        )
+        .unwrap();
+    connection.execute_batch(&transition_trigger).unwrap();
+    drop(connection);
+    assert!(matches!(
+        reopened.verify_integrity().await,
+        Err(StorageError::CorruptData(message))
+            if message.contains("not bound to its exact Agent turn")
+    ));
+}
+
+#[tokio::test]
+async fn revoked_followup_authority_is_discarded_without_blocking_the_queue() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    let member = provision_test_member_for_reply(&store).await;
+    store
+        .create_session_for_actor(
+            &member,
+            CreateSessionRequest {
+                id: "session-revoked-followup".into(),
+                title: "Revoked follow-up".into(),
+            },
+            "create-revoked-followup",
+        )
+        .await
+        .unwrap();
+    store
+        .enqueue_session_followup_for_actor(
+            &member,
+            "session-revoked-followup",
+            EnqueueSessionFollowupRequest {
+                turn_id: "turn-revoked-followup".into(),
+                user_message: "This must never reach a provider".into(),
+                expected_sequence: 1,
+            },
+            "enqueue-revoked-followup",
+        )
+        .await
+        .unwrap();
+    store
+        .transition_member(
+            &owner_authz(),
+            TransitionMemberCommit {
+                user_id: member.user_id,
+                expected_revision: member.membership_revision,
+                expected_role: MembershipRole::Member,
+                expected_status: StoredMembershipStatus::Active,
+                role: MembershipRole::Member,
+                status: StoredMembershipStatus::Disabled,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .next_session_followup_candidate()
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let (status, reason, agent_count): (String, String, i64) = connection
+        .query_row(
+            r#"SELECT followup.status, followup.discard_reason,
+                      (SELECT COUNT(*) FROM agent_turns agent
+                       WHERE agent.turn_id = followup.turn_id)
+               FROM session_followups followup
+               WHERE followup.turn_id = 'turn-revoked-followup'"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "discarded");
+    assert!(reason.contains("authorization was revoked"));
+    assert_eq!(agent_count, 0);
 }
 
 #[tokio::test]
@@ -17996,6 +18289,84 @@ async fn reply_queue_quota_admits_the_exact_limit_and_rejects_plus_one_atomicall
 }
 
 #[tokio::test]
+async fn queued_followups_share_the_durable_reply_capacity_budget() {
+    let limits = StorageLimits {
+        sessions_per_actor: 3,
+        sessions_per_account: 3,
+        sessions_global: 3,
+        open_turns_per_actor: 3,
+        open_turns_per_account: 3,
+        open_turns_global: 3,
+        active_reply_jobs_per_actor: 2,
+        active_reply_jobs_per_account: 2,
+        active_reply_jobs_global: 2,
+        ..StorageLimits::default()
+    };
+    let store = SqliteStore::open_with_limits(":memory:", limits)
+        .await
+        .unwrap();
+    bootstrap_test_owner(&store).await;
+    create_owned_test_sessions(
+        &store,
+        [
+            "session-capacity-reply",
+            "session-capacity-followup",
+            "session-capacity-overflow",
+        ],
+    )
+    .await;
+    store
+        .start_turn_and_enqueue_reply_for_actor(
+            &owner_authz(),
+            "session-capacity-reply",
+            StartTurnRequest {
+                turn_id: "turn-capacity-reply".into(),
+                user_message: "Consume one shared reply slot".into(),
+                expected_sequence: 1,
+            },
+            "start-capacity-reply",
+            reply_job_spec("reply-capacity-shared", "turn-capacity-reply"),
+        )
+        .await
+        .unwrap();
+    store
+        .enqueue_session_followup_for_actor(
+            &owner_authz(),
+            "session-capacity-followup",
+            EnqueueSessionFollowupRequest {
+                turn_id: "turn-capacity-followup".into(),
+                user_message: "Consume the second shared reply slot".into(),
+                expected_sequence: 1,
+            },
+            "enqueue-capacity-followup",
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .enqueue_session_followup_for_actor(
+                &owner_authz(),
+                "session-capacity-overflow",
+                EnqueueSessionFollowupRequest {
+                    turn_id: "turn-capacity-overflow".into(),
+                    user_message: "This is one shared slot beyond capacity".into(),
+                    expected_sequence: 1,
+                },
+                "enqueue-capacity-overflow",
+            )
+            .await,
+        Err(StorageError::ReplyQueueCapacityExceeded)
+    ));
+    assert!(
+        store
+            .session_followups_for_actor(&owner_authz(), "session-capacity-overflow")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn reply_reservations_cover_success_failure_and_missing_claim_fail_closed() {
     let database = TestDatabase::new();
     let store = created_owned_file_session_store(database.path()).await;
@@ -18630,7 +19001,7 @@ async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempot
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, (1_i64..=30).collect::<Vec<_>>());
+    assert_eq!(versions, (1_i64..=31).collect::<Vec<_>>());
     assert_eq!(
         connection
             .query_row(
@@ -20978,6 +21349,47 @@ fn agent_turn_spec_with_manifest(
     }
 }
 
+async fn followup_agent_spec(
+    store: &SqliteStore,
+    candidate: &SessionFollowupCandidate,
+    manifest: ManifestEnvelope,
+) -> AgentTurnSpec {
+    let history = store
+        .session_reply_turns_after_for_runtime(
+            &candidate.authz.account_id,
+            &candidate.session.id,
+            0,
+            candidate.session.sequence,
+            llm::AGENT_REQUEST_MAX_HISTORY_PAIRS_WITH_CONTEXT,
+        )
+        .await
+        .unwrap();
+    let corpus = CorpusRevisionEnvelope::new(Vec::new()).unwrap();
+    let snapshot = SelectionSnapshotEnvelope::new(
+        select_context(&candidate.followup.user_message, corpus.entries()).unwrap(),
+    )
+    .unwrap();
+    let request =
+        ReplyRequest::from_session_history_for_agent_with_optional_system_prompt_checkpoint_and_context(
+            &history,
+            &candidate.followup.user_message,
+            None,
+            None,
+            snapshot.snapshot().canonical_context(),
+        )
+        .unwrap();
+    AgentTurnSpec {
+        id: format!("agent-{}", candidate.followup.turn_id),
+        authz: candidate.authz.clone(),
+        manifest: manifest.clone(),
+        environment: "local".into(),
+        provider_name: "test-provider".into(),
+        model_name: Some("test-model".into()),
+        request_json: agent_request_with_tools(serde_json::to_value(request).unwrap(), &manifest),
+        knowledge: AgentKnowledgeContextSpec { corpus, snapshot },
+    }
+}
+
 fn test_agent_runtime_identity() -> RuntimeIdentity {
     RuntimeIdentity {
         profile: "local-development".into(),
@@ -22144,6 +22556,14 @@ fn drop_v29_fixture_objects(connection: &rusqlite::Connection) {
 }
 
 fn drop_v30_fixture_objects(connection: &rusqlite::Connection) {
+    let version: i64 = connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    if version >= 31 {
+        drop_v31_fixture_objects(connection);
+    }
     let schema_reject_update = migration_trigger_sql(
         include_str!("../migrations/0020_agent_execution_ledger.sql"),
         "schema_migrations_reject_update",
@@ -22170,6 +22590,36 @@ fn drop_v30_fixture_objects(connection: &rusqlite::Connection) {
         )
         .unwrap();
     connection.execute_batch(v29_goal_insert).unwrap();
+    connection.execute_batch(schema_reject_update).unwrap();
+    connection.execute_batch(schema_reject_delete).unwrap();
+}
+
+fn drop_v31_fixture_objects(connection: &rusqlite::Connection) {
+    let schema_reject_update = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_update",
+    );
+    let schema_reject_delete = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_delete",
+    );
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER schema_migrations_reject_update;
+               DROP TRIGGER schema_migrations_reject_delete;
+               DROP TRIGGER session_followup_receipts_require_authority;
+               DROP TRIGGER session_followup_receipts_reject_update;
+               DROP TRIGGER session_followup_receipts_reject_delete;
+               DROP TRIGGER session_followups_validate_insert;
+               DROP TRIGGER session_followups_enforce_transition;
+               DROP TRIGGER session_followups_reject_delete;
+               DROP TABLE session_followup_receipts;
+               DROP INDEX session_followups_ready_idx;
+               DROP INDEX session_followups_actor_capacity_idx;
+               DROP TABLE session_followups;
+               DELETE FROM schema_migrations WHERE version = 31;"#,
+        )
+        .unwrap();
     connection.execute_batch(schema_reject_update).unwrap();
     connection.execute_batch(schema_reject_delete).unwrap();
 }

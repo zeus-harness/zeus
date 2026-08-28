@@ -54,14 +54,16 @@ use protocol::{
     AuthenticationResponse, BootstrapRequest, COLLECTION_PAGE_DEFAULT_LIMIT,
     CancelAgentTurnRequest, CancelAgentTurnResponse, CreateAccountAuditCheckpointRequest,
     CreateAccountRequest, CreateAccountResponse, CreateMemberRequest, CreateSessionRequest,
-    CreateSessionResponse, EVENT_PAGE_DEFAULT_LIMIT, HealthResponse, InFlightWorkSummary,
-    LoginRequest, LogoutResponse, MemberSetupRequest, MemberSetupTokenResponse, PolicyDecision,
-    ProblemDetails, ReplyProviderCatalogResponse, ReplyProviderDescriptor, ResumeSessionRequest,
+    CreateSessionResponse, EVENT_PAGE_DEFAULT_LIMIT, EnqueueSessionFollowupRequest,
+    EnqueueSessionFollowupResponse, HealthResponse, InFlightWorkSummary, LoginRequest,
+    LogoutResponse, MemberSetupRequest, MemberSetupTokenResponse, PolicyDecision, ProblemDetails,
+    ReplyProviderCatalogResponse, ReplyProviderDescriptor, ResumeSessionRequest,
     ResumeSessionResponse, ReviewDecision, ReviewRequest, ReviewResponse,
-    RotateMemberSetupTokenRequest, RunDetail, SessionDetail, SessionEvent, SessionStatus,
-    SessionTurn, StartTurnRequest, SwitchAccountRequest, ThemePreference,
-    UpdateAccountAuditPolicyRequest, UpdateAccountReplyProviderRequest, UpdateMemberRequest,
-    UpdateMemberResponse, UpdatePreferencesRequest, UserPreferences,
+    RotateMemberSetupTokenRequest, RunDetail, SessionDetail, SessionEvent,
+    SessionFollowupListResponse, SessionStatus, SessionTurn, StartTurnRequest,
+    SwitchAccountRequest, ThemePreference, UpdateAccountAuditPolicyRequest,
+    UpdateAccountReplyProviderRequest, UpdateMemberRequest, UpdateMemberResponse,
+    UpdatePreferencesRequest, UserPreferences,
 };
 #[cfg(test)]
 use runtime::ReplyJobSpec;
@@ -897,6 +899,8 @@ struct ReplyExecutor {
     compaction_worker_wake: WorkerWakeState,
     agent_tool_drain: Mutex<()>,
     agent_tool_worker_wake: WorkerWakeState,
+    followup_drain: Mutex<()>,
+    followup_worker_wake: WorkerWakeState,
     goal_round_drain: Mutex<()>,
     goal_round_worker_wake: WorkerWakeState,
 }
@@ -917,6 +921,8 @@ impl ReplyExecutor {
             compaction_worker_wake: WorkerWakeState::default(),
             agent_tool_drain: Mutex::new(()),
             agent_tool_worker_wake: WorkerWakeState::default(),
+            followup_drain: Mutex::new(()),
+            followup_worker_wake: WorkerWakeState::default(),
             goal_round_drain: Mutex::new(()),
             goal_round_worker_wake: WorkerWakeState::default(),
         }
@@ -1247,6 +1253,10 @@ fn build_authenticated_app(state: ApiState) -> Router {
         .route("/api/v1/sessions", get(list_sessions).post(create_session))
         .route("/api/v1/sessions/{id}", get(session_detail))
         .route("/api/v1/sessions/{id}/resume", post(resume_session))
+        .route(
+            "/api/v1/sessions/{id}/followups",
+            get(list_session_followups).post(enqueue_session_followup),
+        )
         .route("/api/v1/sessions/{id}/turns", post(start_turn))
         .route("/api/v1/sessions/{id}/turns/{turn_id}", get(session_turn))
         .route(
@@ -1402,6 +1412,7 @@ fn build_authenticated_app(state: ApiState) -> Router {
     kick_agent_model_worker(&state);
     kick_compaction_worker(&state);
     kick_agent_tool_worker(&state);
+    kick_followup_worker(&state);
     router
 }
 
@@ -1482,6 +1493,10 @@ fn build_test_app(state: ApiState, request_auth: TestRequestAuth) -> Router {
         .route("/api/v1/sessions", get(list_sessions).post(create_session))
         .route("/api/v1/sessions/{id}", get(session_detail))
         .route("/api/v1/sessions/{id}/resume", post(resume_session))
+        .route(
+            "/api/v1/sessions/{id}/followups",
+            get(list_session_followups).post(enqueue_session_followup),
+        )
         .route("/api/v1/sessions/{id}/turns", post(test_start_turn))
         .route("/api/v1/sessions/{id}/turns/{turn_id}", get(session_turn))
         .route(
@@ -2085,6 +2100,7 @@ async fn replace_knowledge_catalog(
             idempotency_key,
         )
         .await?;
+    kick_followup_worker(&state);
     json_no_store(result)
 }
 
@@ -2116,6 +2132,7 @@ async fn replace_agent_prompt(
             idempotency_key,
         )
         .await?;
+    kick_followup_worker(&state);
     json_no_store(result)
 }
 
@@ -2783,6 +2800,7 @@ async fn update_account_reply_provider(
             idempotency_key,
         )
         .await?;
+    kick_followup_worker(&state);
     json_no_store(result)
 }
 
@@ -3435,6 +3453,7 @@ async fn process_reply_job(state: &ApiState, job: ReplyJob) -> Result<(), StoreE
             response_json,
         })
         .await?;
+    kick_followup_worker(state);
     Ok(())
 }
 
@@ -3645,6 +3664,150 @@ fn durable_goal_round_identity(
     digest.update(goal_revision.to_be_bytes());
     digest.update(round.to_be_bytes());
     format!("{:x}", digest.finalize())
+}
+
+fn kick_followup_worker(state: &ApiState) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let Some(executor) = &state.reply else {
+        return;
+    };
+    if !executor.followup_worker_wake.request() {
+        return;
+    }
+    let state = state.clone();
+    runtime.spawn(async move {
+        loop {
+            if let Err(error) = drain_session_followups(&state).await {
+                eprintln!("zeus follow-up worker stopped before admission: {error}");
+            }
+            let executor = state
+                .reply
+                .as_ref()
+                .expect("a scheduled follow-up worker requires a provider");
+            if !executor.followup_worker_wake.complete_cycle() {
+                return;
+            }
+        }
+    });
+}
+
+async fn drain_session_followups(state: &ApiState) -> Result<(), StoreError> {
+    let executor = state
+        .reply
+        .as_ref()
+        .expect("the follow-up worker is only started when a provider exists");
+    let _drain = executor.followup_drain.lock().await;
+    while let Some(candidate) = state.store.next_session_followup_candidate().await? {
+        admit_session_followup(state, executor, candidate).await?;
+    }
+    Ok(())
+}
+
+async fn admit_session_followup(
+    state: &ApiState,
+    executor: &ReplyExecutor,
+    candidate: runtime::SessionFollowupCandidate,
+) -> Result<(), StoreError> {
+    let user_message = candidate.followup.user_message.clone();
+    let default = executor
+        .providers
+        .default_state(candidate.authz.account_id.clone());
+    let selected = state
+        .store
+        .current_session_reply_provider_for_account(&candidate.authz.account_id, default)
+        .await?;
+    let provider = executor
+        .providers
+        .get(&selected.provider_id)
+        .ok_or_else(|| {
+            StoreError::InvalidAgentTransition(
+                "the selected follow-up provider is unavailable".into(),
+            )
+        })?;
+    let metadata = provider.metadata();
+    validate_provider_metadata(metadata)
+        .map_err(|error| StoreError::InvalidAgentTransition(error.to_string()))?;
+    if metadata.provider_id != selected.provider_id
+        || metadata.model != selected.model
+        || assistant_reply_kind(metadata.reply_kind) != selected.reply_kind
+    {
+        return Err(StoreError::InvalidAgentTransition(
+            "the selected follow-up provider binding changed".into(),
+        ));
+    }
+    let prompt = state
+        .store
+        .current_session_agent_prompt_for_account(&candidate.authz.account_id)
+        .await?;
+    validate_agent_initial_content_budget(&prompt.content, &user_message).map_err(|_| {
+        StoreError::InvalidAgentTransition(
+            "the follow-up exceeds the initial model content budget".into(),
+        )
+    })?;
+    let manifest = state.store.session_agent_manifest_with_prompt(
+        &prompt,
+        metadata.provider_id.clone(),
+        metadata.model.clone(),
+        assistant_reply_kind(metadata.reply_kind),
+    )?;
+    let knowledge = state
+        .store
+        .current_session_agent_knowledge_context_for_account(
+            &candidate.authz.account_id,
+            &user_message,
+        )
+        .await?;
+    let checkpoint = state
+        .store
+        .session_context_checkpoint_for_account(
+            &candidate.authz.account_id,
+            &candidate.session.id,
+            candidate.session.sequence,
+        )
+        .await?;
+    let reply_turns = state
+        .store
+        .session_reply_turns_after_for_account(
+            &candidate.authz.account_id,
+            &candidate.session.id,
+            checkpoint
+                .as_ref()
+                .map_or(0, |checkpoint| checkpoint.source_end_sequence),
+            candidate.session.sequence,
+            AGENT_REQUEST_MAX_HISTORY_PAIRS_WITH_CONTEXT,
+        )
+        .await?;
+    let mut reply_request = ReplyRequest::from_session_history_for_agent_with_optional_system_prompt_checkpoint_and_context(
+        &reply_turns,
+        user_message,
+        Some(prompt.content.as_str()),
+        checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.summary_text.as_str()),
+        knowledge.snapshot.snapshot().canonical_context(),
+    )
+    .map_err(|error| StoreError::InvalidAgentTransition(error.to_string()))?;
+    reply_request.tools = agent_tools_from_manifest(&manifest);
+    let request_json = persisted_agent_reply_request(&reply_request)
+        .map_err(|error| StoreError::InvalidAgentTransition(error.to_string()))?;
+    let agent = AgentTurnSpec {
+        id: durable_agent_id(&candidate.session.id, &candidate.followup.turn_id),
+        authz: candidate.authz.clone(),
+        environment: state.store.session_agent_environment().to_owned(),
+        provider_name: metadata.provider_id.clone(),
+        model_name: metadata.model.clone(),
+        request_json,
+        manifest,
+        knowledge,
+    };
+    state
+        .store
+        .start_followup_and_enqueue_agent(candidate, agent)
+        .await?;
+    kick_agent_model_worker(state);
+    Ok(())
 }
 
 fn kick_goal_round_worker(state: &ApiState) {
@@ -4378,6 +4541,7 @@ async fn process_agent_model_job(
         },
         AgentModelCompletion::Final(_) => {
             kick_compaction_worker(state);
+            kick_followup_worker(state);
             kick_goal_round_worker(state);
         }
         AgentModelCompletion::Terminal(_) => state.store.disarm_session_goal(&job.session_id).await,
@@ -5040,12 +5204,50 @@ async fn resume_session(
         .await?;
     let Json(request) = payload.map_err(ApiError::invalid_json)?;
     let idempotency_key = required_idempotency_key(&headers)?;
-    Ok(Json(
-        state
-            .store
-            .resume_session_for_actor(&current.principal.authz, &id, request, &idempotency_key)
-            .await?,
-    ))
+    let response = state
+        .store
+        .resume_session_for_actor(&current.principal.authz, &id, request, &idempotency_key)
+        .await?;
+    kick_followup_worker(&state);
+    Ok(Json(response))
+}
+
+async fn list_session_followups(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    Path(id): Path<String>,
+) -> Result<Json<SessionFollowupListResponse>, ApiError> {
+    let items = state
+        .store
+        .session_followups_for_actor(&current.principal.authz, &id)
+        .await?;
+    Ok(Json(SessionFollowupListResponse { items }))
+}
+
+async fn enqueue_session_followup(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    payload: Result<Json<EnqueueSessionFollowupRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<EnqueueSessionFollowupResponse>), ApiError> {
+    state
+        .store
+        .authorize_session_for_actor(&current.principal.authz, &id)
+        .await?;
+    let Json(request) = payload.map_err(ApiError::invalid_json)?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let response = state
+        .store
+        .enqueue_session_followup_for_actor(
+            &current.principal.authz,
+            &id,
+            request,
+            &idempotency_key,
+        )
+        .await?;
+    kick_followup_worker(&state);
+    Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
 async fn start_turn(
@@ -9892,6 +10094,92 @@ mod tests {
                 ))
             })
         }
+    }
+
+    #[tokio::test]
+    async fn durable_followup_endpoint_drives_the_next_agent_turn() {
+        let store = DemoStore::seeded().await.unwrap();
+        let owner = provision_test_owner(&store, "user-followup", "followup-owner").await;
+        let session_id = "session-durable-followup";
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: session_id.into(),
+                    title: "Durable follow-up".into(),
+                },
+                "create-durable-followup",
+            )
+            .await
+            .unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(RecordingProvider::new(Arc::clone(&requests))),
+        )
+        .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/sessions/{session_id}/followups"))
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "enqueue-durable-followup")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-durable-followup",
+                            "user_message": "Continue this Session from the durable inbox",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let admitted = response_json::<EnqueueSessionFollowupResponse>(response).await;
+        assert_eq!(
+            admitted.followup.status,
+            protocol::SessionFollowupStatus::Queued
+        );
+
+        let ready = wait_for_session_state_and_turns(
+            &store,
+            &owner.authz,
+            session_id,
+            SessionStatus::Ready,
+            1,
+        )
+        .await;
+        assert_eq!(ready.turns[0].id, "turn-durable-followup");
+        assert_eq!(
+            ready.turns[0].assistant_message.as_deref(),
+            Some("durable answer 1")
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
+
+        let response = app
+            .oneshot(
+                Request::get(format!("/api/v1/sessions/{session_id}/followups"))
+                    .header(header::HOST, "zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let list = response_json::<SessionFollowupListResponse>(response).await;
+        assert_eq!(list.items.len(), 1);
+        assert_eq!(
+            list.items[0].status,
+            protocol::SessionFollowupStatus::Claimed
+        );
     }
 
     #[tokio::test]
