@@ -32,7 +32,7 @@ use tenancy::{PasswordAuthenticator, PasswordHashRecord};
 
 use crate::{
     AccountAuditCheckpointCommit, AccountId, AccountReplyProviderCommit, AccountReplyProviderState,
-    AgentKnowledgeContextSpec, AgentModelClaimOutcome, AgentModelCompletion,
+    AgentGoalRoundSpec, AgentKnowledgeContextSpec, AgentModelClaimOutcome, AgentModelCompletion,
     AgentModelFailureCommit, AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit,
     AgentPromptCommit, AgentPromptState, AgentReviewCommit, AgentToolCallSpec,
     AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit, AgentToolStartOutcome,
@@ -1770,7 +1770,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         versions,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29,
+            25, 26, 27, 28, 29, 30,
         ]
     );
     let owner: Option<String> = connection
@@ -1920,7 +1920,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 29);
+    assert_eq!(version, 30);
     let configured_account: (String, String, String, i64) = connection
         .query_row(
             r#"SELECT
@@ -2638,7 +2638,7 @@ async fn v12_identity_and_run_crash_prefix_migrates_then_recovers_the_primary_se
     assert_eq!(
         recovered,
         (
-            29,
+            30,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into()
@@ -4385,7 +4385,7 @@ async fn v5_configured_database_migrates_to_the_local_owner_membership() {
     assert_eq!(
         migrated,
         (
-            29,
+            30,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into(),
@@ -4511,7 +4511,7 @@ async fn v13_configured_active_work_migrates_with_account_authority_and_exact_vo
             },
         )
         .unwrap();
-    assert_eq!(migrated_counts, (29, 1, 1, 2, 1));
+    assert_eq!(migrated_counts, (30, 1, 1, 2, 1));
 }
 
 #[tokio::test]
@@ -4873,7 +4873,7 @@ async fn v14_database_migrates_through_v19_with_member_and_audit_roots() {
             },
         )
         .unwrap();
-    assert_eq!(state, (29, 1, 1, 1, 19));
+    assert_eq!(state, (30, 1, 1, 1, 19));
 }
 
 #[tokio::test]
@@ -4912,7 +4912,7 @@ async fn v15_migration_seeds_the_configured_audit_detail_limit() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (29, 2));
+    assert_eq!(state, (30, 2));
 }
 
 #[tokio::test]
@@ -4957,7 +4957,7 @@ async fn v15_reopen_rejects_a_lower_audit_detail_limit_without_mutating_policy()
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (29, 4));
+    assert_eq!(state, (30, 4));
     drop(connection);
 
     let reopened = SqliteStore::open_with_limits(database.path(), original_limits)
@@ -5211,6 +5211,38 @@ async fn readiness_rejects_a_weakened_v29_goal_binding_trigger_definition() {
     assert!(
         matches!(&error, StorageError::CorruptData(message)
             if message == "durability trigger `agent_tool_calls_bind_goal_snapshot` differs from the authoritative migration"),
+        "unexpected weakened-trigger error: {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn readiness_rejects_a_weakened_v30_goal_round_trigger_definition() {
+    let database = TestDatabase::new();
+    {
+        let store = SqliteStore::open(database.path()).await.unwrap();
+        store.readiness().await.unwrap();
+    }
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER agent_goal_rounds_validate_insert;
+               CREATE TRIGGER agent_goal_rounds_validate_insert
+               BEFORE INSERT ON agent_goal_rounds
+               WHEN 0
+               BEGIN
+                   SELECT 1;
+               END;"#,
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("a same-name weakened Goal round trigger must fail readiness"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(&error, StorageError::CorruptData(message)
+            if message == "durability trigger `agent_goal_rounds_validate_insert` differs from the authoritative migration"),
         "unexpected weakened-trigger error: {error:?}"
     );
 }
@@ -7159,7 +7191,7 @@ async fn v19_agent_manifest_is_canonical_actor_scoped_reused_and_secret_free() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(version, 29);
+    assert_eq!(version, 30);
     assert_eq!(
         manifest_rows, 1,
         "the identical manifest must be deduplicated"
@@ -9507,6 +9539,250 @@ async fn session_goals_are_atomic_cas_bound_and_restart_durable() {
         reopened.verify_integrity().await,
         Err(StorageError::CorruptData(message))
             if message.contains("Agent goal")
+    ));
+}
+
+#[tokio::test]
+async fn goal_round_admission_is_exact_atomic_append_only_and_restart_durable() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    let manifest = goal_test_agent_manifest();
+    let initial_turn_id = "turn-goal-round-origin";
+    let initial_agent_id = "agent-goal-round-origin";
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: initial_turn_id.into(),
+                user_message: "Create a bounded Goal for autonomous rounds".into(),
+                expected_sequence: 1,
+            },
+            "goal-round-origin",
+            agent_turn_spec_with_manifest(
+                initial_agent_id,
+                initial_turn_id,
+                manifest.clone(),
+                "Create a bounded Goal for autonomous rounds",
+            ),
+        )
+        .await
+        .unwrap();
+    let AgentModelClaimOutcome::Claimed(first_job) =
+        store.claim_next_agent_model(&manifest).await.unwrap()
+    else {
+        panic!("the Goal origin model step must be claimable");
+    };
+    let create_call = goal_agent_tool_call_spec(
+        "agent-call-goal-round-create",
+        goals::CREATE_GOAL_TOOL_NAME,
+        json!({"objective":"Finish the durable Goal round contract","max_rounds":3}),
+    );
+    let created =
+        goals::prepare_create_goal(&create_call.arguments_json, None, &create_call.call_id)
+            .unwrap();
+    let create_result = serde_json::to_value(created.result()).unwrap();
+    let create_next = exact_agent_continuation_request(&first_job, &create_call, &create_result);
+    store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: first_job.id,
+            response_json: agent_tool_response_json(&create_call),
+            resolution: AgentModelResolution::ToolCall {
+                call: create_call.clone(),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.claim_next_agent_tool(&manifest).await.unwrap(),
+        AgentToolClaimOutcome::Claimed(_)
+    ));
+    store
+        .complete_agent_tool(AgentToolCompletionCommit {
+            call_id: create_call.call_id,
+            status: AgentToolCallStatus::Succeeded,
+            result_json: create_result,
+            provider_request_id: None,
+            next_request_json: Some(create_next),
+        })
+        .await
+        .unwrap();
+    let AgentModelClaimOutcome::Claimed(final_job) =
+        store.claim_next_agent_model(&manifest).await.unwrap()
+    else {
+        panic!("the Goal origin final model step must be claimable");
+    };
+    let AgentModelCompletion::Final(_) = store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: final_job.id,
+            response_json: agent_final_response_json("The Goal is armed."),
+            resolution: AgentModelResolution::Final {
+                assistant_message: "The Goal is armed.".into(),
+                provenance: agent_model_provenance(),
+            },
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("the Goal origin turn must finish normally");
+    };
+
+    let summary = store.session_summary("session-alpha").await.unwrap();
+    let prompt = goals::render_goal_round_prompt(created.snapshot(), 1).unwrap();
+    let prompt_digest = goals::goal_round_prompt_digest(&prompt).unwrap();
+    let history = store
+        .session_reply_turns_after_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            0,
+            summary.sequence,
+            llm::AGENT_REQUEST_MAX_HISTORY_PAIRS_WITH_CONTEXT,
+        )
+        .await
+        .unwrap();
+    let corpus = CorpusRevisionEnvelope::new(Vec::new()).unwrap();
+    let snapshot =
+        SelectionSnapshotEnvelope::new(select_context(&prompt, corpus.entries()).unwrap()).unwrap();
+    let mut round_request =
+        ReplyRequest::from_session_history_for_agent_with_optional_system_prompt_checkpoint_and_context(
+            &history,
+            &prompt,
+            None,
+            None,
+            snapshot.snapshot().canonical_context(),
+        )
+        .unwrap();
+    round_request.tools = manifest
+        .manifest
+        .deployment
+        .spec
+        .tools
+        .iter()
+        .map(|tool| {
+            llm::ReplyToolDefinition::new(&tool.name, tool.input_schema.clone())
+                .with_description(&tool.description)
+        })
+        .collect();
+    let round_spec = AgentGoalRoundSpec {
+        goal_id: created.snapshot().id.clone(),
+        goal_revision: created.snapshot().revision,
+        round: 1,
+        prompt_digest,
+    };
+    let turn_id = "goal-round-one";
+    let agent_spec = AgentTurnSpec {
+        id: "agent-goal-round-one".into(),
+        authz: owner_authz(),
+        manifest: manifest.clone(),
+        environment: "local".into(),
+        provider_name: "test-provider".into(),
+        model_name: Some("test-model".into()),
+        request_json: llm::persisted_agent_reply_request(&round_request).unwrap(),
+        knowledge: AgentKnowledgeContextSpec { corpus, snapshot },
+    };
+    let request = StartTurnRequest {
+        turn_id: turn_id.into(),
+        user_message: prompt.clone(),
+        expected_sequence: summary.sequence,
+    };
+    let mut forged_request = request.clone();
+    forged_request.user_message.push_str(" forged");
+    assert!(matches!(
+        store
+            .start_goal_round_and_enqueue_agent(
+                "session-alpha",
+                forged_request,
+                "goal-round-one-forged",
+                agent_spec.clone(),
+                round_spec.clone(),
+            )
+            .await,
+        Err(StorageError::InvalidAgentTransition(_))
+    ));
+    assert_eq!(
+        store.session_summary("session-alpha").await.unwrap(),
+        summary
+    );
+
+    let admitted = store
+        .start_goal_round_and_enqueue_agent(
+            "session-alpha",
+            request.clone(),
+            "goal-round-one",
+            agent_spec.clone(),
+            round_spec.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(!admitted.start.replayed);
+    let replayed = store
+        .start_goal_round_and_enqueue_agent(
+            "session-alpha",
+            request,
+            "goal-round-one",
+            agent_spec,
+            round_spec,
+        )
+        .await
+        .unwrap();
+    assert!(replayed.start.replayed);
+    assert_eq!(replayed.agent, admitted.agent);
+
+    let scope = tools::ExecutionScope::new(
+        AccountId::local().as_str(),
+        "user-owner",
+        "session-alpha",
+        turn_id,
+        "agent-goal-round-one",
+    )
+    .unwrap();
+    let current = store.current_session_goal(&scope).await.unwrap().unwrap();
+    assert_eq!(current.rounds_started, 1);
+    store.verify_integrity().await.unwrap();
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM agent_goal_rounds", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert!(
+        connection
+            .execute("DELETE FROM agent_goal_rounds", [])
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute(
+                "UPDATE agent_goal_rounds SET prompt_digest = ?1",
+                ["0".repeat(64)],
+            )
+            .is_err()
+    );
+    drop(connection);
+    drop(store);
+
+    let reopened = SqliteStore::open(database.path()).await.unwrap();
+    reopened.verify_integrity().await.unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let reject_update = stored_trigger_sql(&connection, "agent_goal_rounds_reject_update");
+    connection
+        .execute_batch("DROP TRIGGER agent_goal_rounds_reject_update;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE agent_goal_rounds SET prompt_digest = ?1",
+            ["0".repeat(64)],
+        )
+        .unwrap();
+    connection.execute_batch(&reject_update).unwrap();
+    drop(connection);
+    assert!(matches!(
+        reopened.verify_integrity().await,
+        Err(StorageError::CorruptData(message))
+            if message.contains("exact driver prompt")
     ));
 }
 
@@ -18354,7 +18630,7 @@ async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempot
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, (1_i64..=29).collect::<Vec<_>>());
+    assert_eq!(versions, (1_i64..=30).collect::<Vec<_>>());
     assert_eq!(
         connection
             .query_row(
@@ -21834,6 +22110,14 @@ fn drop_v28_fixture_objects(connection: &rusqlite::Connection) {
 }
 
 fn drop_v29_fixture_objects(connection: &rusqlite::Connection) {
+    let version: i64 = connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    if version >= 30 {
+        drop_v30_fixture_objects(connection);
+    }
     let schema_reject_update = migration_trigger_sql(
         include_str!("../migrations/0020_agent_execution_ledger.sql"),
         "schema_migrations_reject_update",
@@ -21855,6 +22139,37 @@ fn drop_v29_fixture_objects(connection: &rusqlite::Connection) {
                DELETE FROM schema_migrations WHERE version = 29;"#,
         )
         .unwrap();
+    connection.execute_batch(schema_reject_update).unwrap();
+    connection.execute_batch(schema_reject_delete).unwrap();
+}
+
+fn drop_v30_fixture_objects(connection: &rusqlite::Connection) {
+    let schema_reject_update = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_update",
+    );
+    let schema_reject_delete = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_delete",
+    );
+    let v29_goal_insert = migration_trigger_sql(
+        include_str!("../migrations/0029_session_agent_goals.sql"),
+        "agent_goal_snapshots_validate_insert",
+    );
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER schema_migrations_reject_update;
+               DROP TRIGGER schema_migrations_reject_delete;
+               DROP TRIGGER agent_goal_rounds_validate_insert;
+               DROP TRIGGER agent_goal_rounds_reject_update;
+               DROP TRIGGER agent_goal_rounds_reject_delete;
+               DROP TRIGGER agent_goal_snapshots_validate_insert;
+               DROP INDEX agent_goal_rounds_latest_idx;
+               DROP TABLE agent_goal_rounds;
+               DELETE FROM schema_migrations WHERE version = 30;"#,
+        )
+        .unwrap();
+    connection.execute_batch(v29_goal_insert).unwrap();
     connection.execute_batch(schema_reject_update).unwrap();
     connection.execute_batch(schema_reject_delete).unwrap();
 }

@@ -637,6 +637,27 @@ pub struct AgentTurnSpec {
     pub knowledge: AgentKnowledgeContextSpec,
 }
 
+/// Exact durable Goal identity consumed by one automatically admitted Session
+/// turn. The prompt itself remains in `StartTurnRequest.user_message`; its
+/// domain-separated digest prevents a forged or drifted driver message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AgentGoalRoundSpec {
+    pub goal_id: String,
+    pub goal_revision: u64,
+    pub round: u64,
+    pub prompt_digest: String,
+}
+
+/// Read-only scheduling candidate for one process-locally armed Goal. The
+/// synthetic auth-session ID is never persisted or accepted by public routes;
+/// the admission transaction rechecks account membership directly.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentGoalRoundCandidate {
+    pub authz: AuthzContext,
+    pub session: SessionSummary,
+    pub goal: goals::GoalSnapshot,
+}
+
 impl AgentTurnSpec {
     /// Return the server-derived command identity needed for an early receipt lookup.
     pub fn receipt_probe(&self) -> AgentTurnReceiptProbe {

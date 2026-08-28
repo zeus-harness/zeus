@@ -7,11 +7,12 @@
 //! being retried.
 
 use std::{
+    collections::BTreeMap,
     fmt,
     future::Future,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicU8, Ordering as AtomicOrdering},
     },
     time::Duration,
@@ -36,9 +37,9 @@ use deployment::{
 };
 pub use execution::{AgentExecutionExplain, AgentRunEpochExplain};
 use goals::{
-    CREATE_GOAL_TOOL_NAME, GET_GOAL_TOOL_NAME, GOAL_TOOL_VERSION, GoalError, GoalToolResult,
-    UPDATE_GOAL_TOOL_NAME, goal_tool_descriptors, prepare_create_goal, prepare_update_goal,
-    register_goal_tools,
+    CREATE_GOAL_TOOL_NAME, GET_GOAL_TOOL_NAME, GOAL_TOOL_VERSION, GoalActivation, GoalError,
+    GoalToolResult, GoalUpdateAction, UPDATE_GOAL_TOOL_NAME, decode_goal_tool_result,
+    goal_tool_descriptors, prepare_create_goal, prepare_update_goal, register_goal_tools,
 };
 use kernel::{
     DemoScenario, KernelError, LOCAL_POLICY_REVISION, PRODUCTION_POLICY_REVISION, apply_review,
@@ -66,28 +67,28 @@ pub use storage::{
     AGENT_SYSTEM_PROMPT_MAX_BYTES, AccountAuditArchiveState, AccountAuditCheckpointCommit,
     AccountAuditEvent, AccountAuditPage, AccountAuditPolicy, AccountAuditRollup, AccountAuditState,
     AccountId, AccountReplyProviderCommit, AccountReplyProviderState,
-    AccountReplyProviderUpdateResult, AgentFinalCompletion, AgentKnowledgeContextExplain,
-    AgentKnowledgeContextSpec, AgentModelClaimOutcome, AgentModelCompletion,
-    AgentModelFailureCommit, AgentModelJob, AgentModelJobStatus, AgentModelResolution,
-    AgentModelStartOutcome, AgentModelSuccessCommit, AgentOperationClaim, AgentOperationKind,
-    AgentPreparedModel, AgentPreparedTool, AgentPromptCommit, AgentPromptRevisionPage,
-    AgentPromptRevisionSummary, AgentPromptState, AgentPromptUpdateResult, AgentReviewCommit,
-    AgentReviewContext, AgentReviewResult, AgentTerminalCompletion, AgentToolCall,
-    AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
-    AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurn,
-    AgentTurnEnqueueResponse, AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal,
-    AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, CreateAccountCommit,
-    CreateAccountResult, CreateMemberResult, DEFAULT_SESSION_AGENT_PROMPT_REVISION,
-    DEFAULT_SESSION_AGENT_SYSTEM_PROMPT, InFlightWorkSummary, KnowledgeCatalogCommit,
-    KnowledgeCatalogRevisionPage, KnowledgeCatalogRevisionSummary, KnowledgeCatalogState,
-    KnowledgeCatalogUpdateResult, MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit,
-    MemberSetupResult, MemberSetupToken, MemberTransitionResult, MembershipRevision,
-    MembershipRole, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit, ReplyJob,
-    ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
-    ReplySuccessCommit, RotateMemberSetupTokenResult, SESSION_AGENT_PROMPT_ID,
-    SessionCompactionClaimOutcome, SessionCompactionFailureCommit, SessionCompactionJob,
-    SessionCompactionSuccessCommit, SessionContextCheckpoint, SessionSummaryPage,
-    SqliteOperationLimits, SqliteOperationLimitsError, SqlitePhysicalLimits,
+    AccountReplyProviderUpdateResult, AgentFinalCompletion, AgentGoalRoundCandidate,
+    AgentGoalRoundSpec, AgentKnowledgeContextExplain, AgentKnowledgeContextSpec,
+    AgentModelClaimOutcome, AgentModelCompletion, AgentModelFailureCommit, AgentModelJob,
+    AgentModelJobStatus, AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit,
+    AgentOperationClaim, AgentOperationKind, AgentPreparedModel, AgentPreparedTool,
+    AgentPromptCommit, AgentPromptRevisionPage, AgentPromptRevisionSummary, AgentPromptState,
+    AgentPromptUpdateResult, AgentReviewCommit, AgentReviewContext, AgentReviewResult,
+    AgentTerminalCompletion, AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome,
+    AgentToolCompletion, AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit,
+    AgentToolStartOutcome, AgentToolWork, AgentTurn, AgentTurnEnqueueResponse,
+    AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthSessionId,
+    AuthzContext, BootstrapOwnerCommit, CreateAccountCommit, CreateAccountResult,
+    CreateMemberResult, DEFAULT_SESSION_AGENT_PROMPT_REVISION, DEFAULT_SESSION_AGENT_SYSTEM_PROMPT,
+    InFlightWorkSummary, KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage,
+    KnowledgeCatalogRevisionSummary, KnowledgeCatalogState, KnowledgeCatalogUpdateResult,
+    MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit, MemberSetupResult, MemberSetupToken,
+    MemberTransitionResult, MembershipRevision, MembershipRole, ReplyClaimOutcome, ReplyCompletion,
+    ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus,
+    ReplyOutcomeUnknownCommit, ReplySuccessCommit, RotateMemberSetupTokenResult,
+    SESSION_AGENT_PROMPT_ID, SessionCompactionClaimOutcome, SessionCompactionFailureCommit,
+    SessionCompactionJob, SessionCompactionSuccessCommit, SessionContextCheckpoint,
+    SessionSummaryPage, SqliteOperationLimits, SqliteOperationLimitsError, SqlitePhysicalLimits,
     SqlitePhysicalLimitsError, StorageLimits, StorageLimitsError, StoredAccount,
     StoredAccountStatus, StoredCredential, StoredMember, StoredMemberPage, StoredMembershipStatus,
     StoredPreferences, StoredUser, StoredUserRole, StoredUserStatus, SwitchAuthSessionCommit,
@@ -269,7 +270,82 @@ pub struct DemoStore {
     primary_run_id: Arc<str>,
     dispatcher: Arc<Mutex<()>>,
     dispatcher_wake: Arc<WorkerWakeState>,
+    goal_activations: Arc<GoalActivationRegistry>,
     auto_dispatch: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArmedSessionGoal {
+    pub account_id: AccountId,
+    pub actor_user_id: String,
+    pub actor_membership_revision: MembershipRevision,
+    pub session_id: String,
+    pub goal_id: String,
+    pub revision: u64,
+}
+
+#[derive(Default)]
+struct GoalActivationRegistry {
+    by_session: StdMutex<BTreeMap<String, ArmedSessionGoal>>,
+}
+
+impl GoalActivationRegistry {
+    fn activation(&self, session_id: &str, goal_id: &str, revision: u64) -> GoalActivation {
+        let activations = self
+            .by_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if activations
+            .get(session_id)
+            .is_some_and(|entry| entry.goal_id == goal_id && entry.revision == revision)
+        {
+            GoalActivation::Armed
+        } else {
+            GoalActivation::Disarmed
+        }
+    }
+
+    fn set(&self, work: &AgentToolWork, goal_id: &str, revision: u64, activation: GoalActivation) {
+        let session_id = &work.call.session_id;
+        let mut activations = self
+            .by_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match activation {
+            GoalActivation::Armed => {
+                activations.insert(
+                    session_id.to_owned(),
+                    ArmedSessionGoal {
+                        account_id: work.call.account_id.clone(),
+                        actor_user_id: work.model_job.actor_user_id.clone(),
+                        actor_membership_revision: work.model_job.actor_membership_revision,
+                        session_id: session_id.to_owned(),
+                        goal_id: goal_id.to_owned(),
+                        revision,
+                    },
+                );
+            }
+            GoalActivation::Disarmed => {
+                activations.remove(session_id);
+            }
+        }
+    }
+
+    fn disarm(&self, session_id: &str) {
+        self.by_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(session_id);
+    }
+
+    fn armed(&self) -> Vec<ArmedSessionGoal> {
+        self.by_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
 }
 
 /// Secret-free tool definition suitable for a model-provider request.
@@ -1035,6 +1111,9 @@ impl DemoStore {
             primary_run_id: Arc::from(primary_run_id),
             dispatcher: Arc::new(Mutex::new(())),
             dispatcher_wake: Arc::new(WorkerWakeState::default()),
+            // Continuation authority is intentionally process-local. Opening
+            // or reopening a database never inherits automatic Goal work.
+            goal_activations: Arc::new(GoalActivationRegistry::default()),
             auto_dispatch,
         };
 
@@ -1162,6 +1241,21 @@ impl DemoStore {
         let corpus = self
             .storage
             .active_knowledge_corpus_for_actor(context)
+            .await?;
+        let snapshot = select_context(user_message, corpus.entries())
+            .and_then(SelectionSnapshotEnvelope::new)
+            .map_err(|error| StoreError::InvalidAgentTransition(error.to_string()))?;
+        Ok(AgentKnowledgeContextSpec { corpus, snapshot })
+    }
+
+    pub async fn current_session_agent_knowledge_context_for_account(
+        &self,
+        account_id: &AccountId,
+        user_message: &str,
+    ) -> Result<AgentKnowledgeContextSpec, StoreError> {
+        let corpus = self
+            .storage
+            .active_knowledge_corpus_for_runtime(account_id)
             .await?;
         let snapshot = select_context(user_message, corpus.entries())
             .and_then(SelectionSnapshotEnvelope::new)
@@ -1574,19 +1668,38 @@ impl DemoStore {
             )
         {
             let current = self.storage.current_session_goal(&scope).await?;
+            let current_activation = current.as_ref().map(|goal| {
+                self.goal_activations
+                    .activation(scope.session_id.as_str(), &goal.id, goal.revision)
+            });
             let result = match resolved.call.tool.as_str() {
-                GET_GOAL_TOOL_NAME => GoalToolResult { goal: current },
+                GET_GOAL_TOOL_NAME => GoalToolResult {
+                    activation: current_activation,
+                    goal: current,
+                },
                 CREATE_GOAL_TOOL_NAME => prepare_create_goal(
                     &resolved.call.arguments,
                     current.as_ref(),
                     &resolved.call.call_id,
                 )
                 .map_err(goal_executor_error)?
-                .result(),
+                .result_with_activation(GoalActivation::Armed),
                 UPDATE_GOAL_TOOL_NAME => {
-                    prepare_update_goal(&resolved.call.arguments, current.as_ref())
-                        .map_err(goal_executor_error)?
-                        .result()
+                    let prepared = prepare_update_goal(&resolved.call.arguments, current.as_ref())
+                        .map_err(goal_executor_error)?;
+                    let activation = match prepared.action() {
+                        Some(GoalUpdateAction::Edit) => {
+                            current_activation.unwrap_or(GoalActivation::Disarmed)
+                        }
+                        Some(GoalUpdateAction::Resume) => GoalActivation::Armed,
+                        Some(
+                            GoalUpdateAction::Pause
+                            | GoalUpdateAction::Complete
+                            | GoalUpdateAction::Blocked,
+                        ) => GoalActivation::Disarmed,
+                        None => unreachable!("an update mutation always has an action"),
+                    };
+                    prepared.result_with_activation(activation)
                 }
                 _ => unreachable!("goal tool name checked above"),
             };
@@ -1606,6 +1719,90 @@ impl DemoStore {
             .dispatch_scoped(resolved.call, &resolved.environment, scope)
             .await
             .map_err(StoreError::from)
+    }
+
+    /// Publish process-local continuation authority only after the matching
+    /// Goal mutation has committed durably. A restart constructs an empty
+    /// registry, so active durable Goals never self-resume across processes.
+    pub fn apply_committed_goal_tool_result(
+        &self,
+        work: &AgentToolWork,
+        result_json: &Value,
+    ) -> Result<(), StoreError> {
+        let call = &work.call;
+        if call.tool_version != GOAL_TOOL_VERSION
+            || !matches!(
+                call.tool_name.as_str(),
+                CREATE_GOAL_TOOL_NAME | UPDATE_GOAL_TOOL_NAME
+            )
+        {
+            return Ok(());
+        }
+        let result = decode_goal_tool_result(result_json).map_err(goal_executor_error)?;
+        let goal = result.goal.ok_or_else(|| {
+            StoreError::InvalidAgentTransition(
+                "a committed Goal mutation returned no Goal projection".into(),
+            )
+        })?;
+        let activation = result.activation.ok_or_else(|| {
+            StoreError::InvalidAgentTransition(
+                "a live Goal mutation omitted its activation observation".into(),
+            )
+        })?;
+        self.goal_activations
+            .set(work, &goal.id, goal.revision, activation);
+        Ok(())
+    }
+
+    pub fn armed_session_goals(&self) -> Vec<ArmedSessionGoal> {
+        self.goal_activations.armed()
+    }
+
+    pub fn is_session_goal_armed(&self, session_id: &str, goal_id: &str, revision: u64) -> bool {
+        self.goal_activations
+            .activation(session_id, goal_id, revision)
+            == GoalActivation::Armed
+    }
+
+    pub async fn agent_goal_round_candidate(
+        &self,
+        activation: &ArmedSessionGoal,
+    ) -> Result<Option<AgentGoalRoundCandidate>, StoreError> {
+        Ok(self
+            .storage
+            .agent_goal_round_candidate(
+                &activation.account_id,
+                &activation.actor_user_id,
+                activation.actor_membership_revision,
+                &activation.session_id,
+                &activation.goal_id,
+                activation.revision,
+            )
+            .await?)
+    }
+
+    pub fn prepare_goal_round(
+        &self,
+        candidate: &AgentGoalRoundCandidate,
+    ) -> Result<(String, AgentGoalRoundSpec), StoreError> {
+        let round = candidate.goal.rounds_started.saturating_add(1);
+        let prompt =
+            goals::render_goal_round_prompt(&candidate.goal, round).map_err(goal_executor_error)?;
+        let prompt_digest =
+            goals::goal_round_prompt_digest(&prompt).map_err(goal_executor_error)?;
+        Ok((
+            prompt,
+            AgentGoalRoundSpec {
+                goal_id: candidate.goal.id.clone(),
+                goal_revision: candidate.goal.revision,
+                round,
+                prompt_digest,
+            },
+        ))
+    }
+
+    pub fn disarm_session_goal(&self, session_id: &str) {
+        self.goal_activations.disarm(session_id);
     }
 
     pub async fn readiness(&self) -> Result<(), StoreError> {
@@ -2210,6 +2407,27 @@ impl DemoStore {
             .await?)
     }
 
+    pub async fn session_reply_turns_after_for_account(
+        &self,
+        account_id: &AccountId,
+        session_id: &str,
+        after_sequence: u64,
+        through_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionTurn>, StoreError> {
+        validate_durable_reference(session_id, "session ID")?;
+        Ok(self
+            .storage
+            .session_reply_turns_after_for_runtime(
+                account_id,
+                session_id,
+                after_sequence,
+                through_sequence,
+                limit,
+            )
+            .await?)
+    }
+
     pub async fn session_events_after_for_actor(
         &self,
         context: &AuthzContext,
@@ -2348,6 +2566,7 @@ impl DemoStore {
         request: StartTurnRequest,
         idempotency_key: &str,
     ) -> Result<StartTurnResponse, StoreError> {
+        self.disarm_session_goal(session_id);
         validate_durable_reference(session_id, "session ID")?;
         validate_new_turn_id(&request.turn_id, "turn ID")?;
         self.authorize_session_for_actor(context, session_id)
@@ -2435,6 +2654,7 @@ impl DemoStore {
         idempotency_key: &str,
         agent: AgentTurnSpec,
     ) -> Result<AgentTurnEnqueueResponse, StoreError> {
+        self.disarm_session_goal(session_id);
         validate_durable_reference(session_id, "session ID")?;
         validate_new_turn_id(&request.turn_id, "turn ID")?;
         self.authorize_session_for_actor(context, session_id)
@@ -2460,6 +2680,49 @@ impl DemoStore {
                 request,
                 idempotency_key,
                 agent,
+            )
+            .await?;
+        if !response.start.replayed {
+            self.publish_session_event(session_id, response.start.event.clone());
+        }
+        Ok(response)
+    }
+
+    /// Admit one exact automatic Goal round. Unlike a human request, this
+    /// consumes only process-local armed authority plus the durable membership
+    /// revision that armed it; storage rechecks both the Goal and actor state
+    /// atomically with the new Session turn.
+    pub async fn start_goal_round_and_enqueue_agent(
+        &self,
+        session_id: &str,
+        request: StartTurnRequest,
+        idempotency_key: &str,
+        agent: AgentTurnSpec,
+        goal_round: AgentGoalRoundSpec,
+    ) -> Result<AgentTurnEnqueueResponse, StoreError> {
+        validate_durable_reference(session_id, "session ID")?;
+        validate_new_turn_id(&request.turn_id, "turn ID")?;
+        validate_user_message_value(&request.user_message, "Goal round prompt")?;
+        validate_session_sequence(request.expected_sequence, "expected session sequence")?;
+        if agent.environment != self.environment.as_ref() {
+            return Err(StoreError::InvalidAgentTransition(
+                "the Goal round Agent environment does not match the bound runtime".into(),
+            ));
+        }
+        self.validate_session_agent_manifest_binding(
+            &agent.manifest,
+            &agent.provider_name,
+            agent.model_name.as_deref(),
+        )?;
+        let idempotency_key = normalized_idempotency_key(idempotency_key)?;
+        let response = self
+            .storage
+            .start_goal_round_and_enqueue_agent(
+                session_id,
+                request,
+                idempotency_key,
+                agent,
+                goal_round,
             )
             .await?;
         if !response.start.replayed {
@@ -2750,6 +3013,7 @@ impl DemoStore {
         turn_id: &str,
         expected_revision: u64,
     ) -> Result<CancelAgentTurnResponse, StoreError> {
+        self.disarm_session_goal(session_id);
         validate_durable_reference(session_id, "session ID")?;
         validate_durable_reference(turn_id, "turn ID")?;
         let completion = self
@@ -3049,6 +3313,18 @@ impl DemoStore {
         Ok(self
             .storage
             .session_context_checkpoint_for_actor(context, session_id, through_sequence)
+            .await?)
+    }
+
+    pub async fn session_context_checkpoint_for_account(
+        &self,
+        account_id: &AccountId,
+        session_id: &str,
+        through_sequence: u64,
+    ) -> Result<Option<SessionContextCheckpoint>, StoreError> {
+        Ok(self
+            .storage
+            .session_context_checkpoint_for_runtime(account_id, session_id, through_sequence)
             .await?)
     }
 

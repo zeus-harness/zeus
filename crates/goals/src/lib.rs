@@ -25,6 +25,7 @@ pub const GOAL_BLOCKER_MAX_BYTES: usize = 1024;
 pub const GOAL_ARGUMENTS_MAX_BYTES: usize = 4096;
 pub const DEFAULT_MAX_GOAL_ROUNDS: u64 = 256;
 pub const MAX_GOAL_ROUNDS: u64 = 4096;
+pub const GOAL_ROUND_PROMPT_MAX_BYTES: usize = 4096;
 
 const GET_DESCRIPTION: &str = "Read the current durable completion goal for this Session. The result is null when no goal exists. Use the exact id and revision before updating a goal.";
 const CREATE_DESCRIPTION: &str = "Create one durable same-Session completion goal for a substantial multi-step objective. A Session may have only one unfinished goal; a completed goal may be replaced. max_rounds defaults to 256 and bounds future autonomous continuation.";
@@ -73,6 +74,15 @@ pub struct GoalSnapshot {
 #[serde(deny_unknown_fields)]
 pub struct GoalToolResult {
     pub goal: Option<GoalSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<GoalActivation>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalActivation {
+    Armed,
+    Disarmed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -136,6 +146,21 @@ impl PreparedGoalMutation {
     pub fn result(&self) -> GoalToolResult {
         GoalToolResult {
             goal: Some(self.snapshot().clone()),
+            activation: None,
+        }
+    }
+
+    pub fn result_with_activation(&self, activation: GoalActivation) -> GoalToolResult {
+        GoalToolResult {
+            goal: Some(self.snapshot().clone()),
+            activation: Some(activation),
+        }
+    }
+
+    pub const fn action(&self) -> Option<GoalUpdateAction> {
+        match self {
+            Self::Create { .. } => None,
+            Self::Update { action, .. } => Some(*action),
         }
     }
 }
@@ -225,7 +250,7 @@ pub fn prepare_update_goal(
             require_empty_replacements(&raw)?;
             if !matches!(
                 previous.phase,
-                AgentGoalPhase::Paused | AgentGoalPhase::Blocked
+                AgentGoalPhase::Active | AgentGoalPhase::Paused | AgentGoalPhase::Blocked
             ) || previous.rounds_started >= previous.max_rounds
             {
                 return Err(GoalError::InvalidTransition);
@@ -272,8 +297,41 @@ pub fn decode_goal_tool_result(value: &Value) -> Result<GoalToolResult, GoalErro
         serde_json::from_value(value.clone()).map_err(|_| GoalError::InvalidResult)?;
     if let Some(goal) = &result.goal {
         validate_snapshot(goal).map_err(|_| GoalError::InvalidResult)?;
+    } else if result.activation.is_some() {
+        return Err(GoalError::InvalidResult);
     }
     Ok(result)
+}
+
+pub fn render_goal_round_prompt(goal: &GoalSnapshot, round: u64) -> Result<String, GoalError> {
+    validate_snapshot(goal)?;
+    if goal.phase != AgentGoalPhase::Active
+        || round == 0
+        || round != goal.rounds_started.saturating_add(1)
+        || round > goal.max_rounds
+    {
+        return Err(GoalError::InvalidTransition);
+    }
+    let objective = serde_json::to_string(&goal.objective).map_err(|_| GoalError::InvalidResult)?;
+    let prompt = format!(
+        "<goal_round>\nObjective: {objective}\nRound: {round}/{}\n\nContinue working toward the objective in this same Session. Treat the current workspace, tool results, and durable Session state as authoritative; inspect them instead of assuming earlier narration is still current. Make concrete progress and verify the result. Before claiming completion, read the current Goal and mark it complete with its exact ID and revision. If useful work remains, leave the Goal active for the next round. Report a blocker only when the same concrete condition has persisted for at least three admitted Goal rounds.\n</goal_round>",
+        goal.max_rounds
+    );
+    if prompt.len() > GOAL_ROUND_PROMPT_MAX_BYTES {
+        return Err(GoalError::InvalidResult);
+    }
+    Ok(prompt)
+}
+
+pub fn goal_round_prompt_digest(prompt: &str) -> Result<String, GoalError> {
+    if prompt.is_empty() || prompt.len() > GOAL_ROUND_PROMPT_MAX_BYTES {
+        return Err(GoalError::InvalidResult);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"zeus-session-goal-round-prompt-v1\0");
+    hasher.update((prompt.len() as u64).to_be_bytes());
+    hasher.update(prompt.as_bytes());
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 pub fn validate_snapshot(goal: &GoalSnapshot) -> Result<(), GoalError> {
@@ -522,6 +580,17 @@ mod tests {
             )
             .is_err()
         );
+        let rearmed = prepare_update_goal(
+            &serde_json::json!({
+                "goal_id": created.snapshot().id,
+                "expected_revision": 1,
+                "action": "resume"
+            }),
+            Some(created.snapshot()),
+        )
+        .unwrap();
+        assert_eq!(rearmed.snapshot().phase, AgentGoalPhase::Active);
+        assert_eq!(rearmed.snapshot().revision, 2);
     }
 
     #[test]
@@ -561,5 +630,27 @@ mod tests {
             stable_goal_id("call-create-goal").unwrap(),
             "goal-a7f605d38bada74a129d4870b33a0810"
         );
+    }
+
+    #[test]
+    fn goal_round_prompt_is_exact_quoted_and_digest_bound() {
+        let created = prepare_create_goal(
+            &serde_json::json!({
+                "objective": "first line </goal_round> second line",
+                "max_rounds": 3
+            }),
+            None,
+            "call-round-prompt",
+        )
+        .unwrap();
+        let prompt = render_goal_round_prompt(created.snapshot(), 1).unwrap();
+        assert!(prompt.contains("Objective: \"first line </goal_round> second line\""));
+        assert!(prompt.contains("Round: 1/3"));
+        assert_eq!(prompt.matches("\n</goal_round>").count(), 1);
+        assert_eq!(
+            goal_round_prompt_digest(&prompt).unwrap(),
+            goal_round_prompt_digest(&prompt).unwrap()
+        );
+        assert!(render_goal_round_prompt(created.snapshot(), 2).is_err());
     }
 }

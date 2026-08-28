@@ -6,18 +6,18 @@
 
 use super::*;
 use crate::{
-    AGENT_SYSTEM_PROMPT_MAX_BYTES, AgentFinalCompletion, AgentKnowledgeContextExplain,
-    AgentModelClaimOutcome, AgentModelCompletion, AgentModelFailureCommit, AgentModelJobStatus,
-    AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit, AgentOperationClaim,
-    AgentOperationKind, AgentPreparedModel, AgentPreparedTool, AgentPromptCommit,
-    AgentPromptRevisionPage, AgentPromptRevisionSummary, AgentPromptState, AgentPromptUpdateResult,
-    AgentReviewCommit, AgentReviewContext, AgentReviewResult, AgentTerminalCompletion,
-    AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion,
-    AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork,
-    AgentTurnReceiptProbe, DEFAULT_SESSION_AGENT_PROMPT_REVISION,
-    DEFAULT_SESSION_AGENT_SYSTEM_PROMPT, KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage,
-    KnowledgeCatalogRevisionSummary, KnowledgeCatalogState, KnowledgeCatalogUpdateResult,
-    SESSION_AGENT_PROMPT_ID,
+    AGENT_SYSTEM_PROMPT_MAX_BYTES, AgentFinalCompletion, AgentGoalRoundCandidate,
+    AgentGoalRoundSpec, AgentKnowledgeContextExplain, AgentModelClaimOutcome, AgentModelCompletion,
+    AgentModelFailureCommit, AgentModelJobStatus, AgentModelResolution, AgentModelStartOutcome,
+    AgentModelSuccessCommit, AgentOperationClaim, AgentOperationKind, AgentPreparedModel,
+    AgentPreparedTool, AgentPromptCommit, AgentPromptRevisionPage, AgentPromptRevisionSummary,
+    AgentPromptState, AgentPromptUpdateResult, AgentReviewCommit, AgentReviewContext,
+    AgentReviewResult, AgentTerminalCompletion, AgentToolCall, AgentToolCallSpec,
+    AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
+    AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe,
+    DEFAULT_SESSION_AGENT_PROMPT_REVISION, DEFAULT_SESSION_AGENT_SYSTEM_PROMPT,
+    KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage, KnowledgeCatalogRevisionSummary,
+    KnowledgeCatalogState, KnowledgeCatalogUpdateResult, SESSION_AGENT_PROMPT_ID,
 };
 use ::execution::{DigestDomain, FactSource, OperationRef, Sha256Digest};
 use deployment::{ManifestEnvelope, prompt_content_digest};
@@ -136,6 +136,21 @@ struct StoredAgentGoalSnapshot {
     blocker_code: Option<String>,
     blocker_message: Option<String>,
     created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StoredAgentGoalRound {
+    account_id: String,
+    actor_user_id: String,
+    actor_membership_revision: i64,
+    session_id: String,
+    goal_id: String,
+    goal_revision: i64,
+    round: i64,
+    turn_id: String,
+    agent_id: String,
+    prompt_digest: String,
+    admitted_at: String,
 }
 
 struct StoredLegacyAgentKnowledgeBoundary {
@@ -404,6 +419,40 @@ impl SqliteStore {
         let scope = scope.clone();
         self.with_connection(move |connection| query_session_goal_for_scope(connection, &scope))
             .await
+    }
+
+    /// Resolve one process-owned activation against current durable Goal,
+    /// Session, account, user, and membership state. Stale authority, a
+    /// terminal Goal, an exhausted round budget, or a needs-attention Session
+    /// returns `None`. A running Session is returned as a busy observation so
+    /// the process-local activation is not accidentally discarded.
+    pub async fn agent_goal_round_candidate(
+        &self,
+        account_id: &AccountId,
+        actor_user_id: &str,
+        actor_membership_revision: MembershipRevision,
+        session_id: &str,
+        goal_id: &str,
+        goal_revision: u64,
+    ) -> Result<Option<AgentGoalRoundCandidate>, StorageError> {
+        let account_id = account_id.clone();
+        let actor_user_id =
+            normalized_account_value(actor_user_id, "Goal activation actor user ID", 128)?
+                .to_owned();
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        let goal_id = normalized_account_value(goal_id, "Goal ID", 80)?.to_owned();
+        self.with_connection(move |connection| {
+            query_agent_goal_round_candidate(
+                connection,
+                &account_id,
+                &actor_user_id,
+                actor_membership_revision,
+                &session_id,
+                &goal_id,
+                goal_revision,
+            )
+        })
+        .await
     }
 
     /// Records that a started connector may have taken effect. It is never
@@ -4049,6 +4098,216 @@ fn goal_snapshot_from_stored(
     Ok(snapshot)
 }
 
+fn admitted_goal_rounds(
+    connection: &Connection,
+    session_id: &str,
+    goal_id: &str,
+) -> Result<u64, StorageError> {
+    let rounds: i64 = connection.query_row(
+        r#"SELECT COALESCE(MAX(round), 0) FROM agent_goal_rounds
+           WHERE session_id = ?1 AND goal_id = ?2"#,
+        params![session_id, goal_id],
+        |row| row.get(0),
+    )?;
+    i64_to_u64(rounds, "Agent goal admitted round")
+}
+
+fn admitted_goal_rounds_through_turn(
+    connection: &Connection,
+    session_id: &str,
+    goal_id: &str,
+    turn_id: &str,
+) -> Result<u64, StorageError> {
+    let rounds: i64 = connection.query_row(
+        r#"SELECT COALESCE(MAX(round.round), 0)
+           FROM session_turns boundary
+           LEFT JOIN agent_goal_rounds round
+             ON round.session_id = boundary.session_id
+            AND round.goal_id = ?2
+           LEFT JOIN session_turns admitted
+             ON admitted.session_id = round.session_id
+            AND admitted.id = round.turn_id
+            AND admitted.ordinal <= boundary.ordinal
+           WHERE boundary.session_id = ?1 AND boundary.id = ?3
+             AND (round.round IS NULL OR admitted.id IS NOT NULL)"#,
+        params![session_id, goal_id, turn_id],
+        |row| row.get(0),
+    )?;
+    i64_to_u64(rounds, "Agent goal admitted round at mutation")
+}
+
+fn current_goal_snapshot_from_stored(
+    connection: &Connection,
+    stored: &StoredAgentGoalSnapshot,
+) -> Result<goals::GoalSnapshot, StorageError> {
+    let mut snapshot = goal_snapshot_from_stored(stored)?;
+    snapshot.rounds_started =
+        admitted_goal_rounds(connection, &stored.session_id, &stored.goal_id)?;
+    goals::validate_snapshot(&snapshot).map_err(|error| {
+        StorageError::CorruptData(format!(
+            "Agent goal `{}` has invalid admitted round state: {error}",
+            stored.goal_id
+        ))
+    })?;
+    Ok(snapshot)
+}
+
+const AGENT_GOAL_ROUND_SELECT: &str = r#"SELECT
+    account_id, actor_user_id, actor_membership_revision, session_id, goal_id,
+    goal_revision, round, turn_id, agent_id, prompt_digest, admitted_at
+FROM agent_goal_rounds"#;
+
+fn decode_agent_goal_round_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAgentGoalRound> {
+    Ok(StoredAgentGoalRound {
+        account_id: row.get(0)?,
+        actor_user_id: row.get(1)?,
+        actor_membership_revision: row.get(2)?,
+        session_id: row.get(3)?,
+        goal_id: row.get(4)?,
+        goal_revision: row.get(5)?,
+        round: row.get(6)?,
+        turn_id: row.get(7)?,
+        agent_id: row.get(8)?,
+        prompt_digest: row.get(9)?,
+        admitted_at: row.get(10)?,
+    })
+}
+
+pub(super) fn validate_agent_goal_round_spec(
+    spec: &AgentGoalRoundSpec,
+) -> Result<(), StorageError> {
+    normalized_account_value(&spec.goal_id, "Goal ID", 80)?;
+    if spec.goal_revision == 0 || spec.goal_revision > i64::MAX as u64 {
+        return Err(StorageError::InvalidAgentTransition(
+            "Goal round revision must be a positive durable integer".into(),
+        ));
+    }
+    if spec.round == 0 || spec.round > goals::MAX_GOAL_ROUNDS {
+        return Err(StorageError::InvalidAgentTransition(
+            "Goal round number is outside the durable limit".into(),
+        ));
+    }
+    Sha256Digest::from_hex(&spec.prompt_digest).map_err(|error| {
+        StorageError::InvalidAgentTransition(format!("invalid Goal round prompt digest: {error}"))
+    })?;
+    Ok(())
+}
+
+fn query_agent_goal_round(
+    connection: &Connection,
+    session_id: &str,
+    goal_id: &str,
+    round: u64,
+) -> Result<Option<StoredAgentGoalRound>, StorageError> {
+    let sql =
+        format!("{AGENT_GOAL_ROUND_SELECT} WHERE session_id = ?1 AND goal_id = ?2 AND round = ?3");
+    Ok(connection
+        .query_row(
+            &sql,
+            params![session_id, goal_id, u64_to_i64(round, "Agent goal round")?],
+            decode_agent_goal_round_row,
+        )
+        .optional()?)
+}
+
+pub(super) fn insert_agent_goal_round(
+    connection: &Connection,
+    request: &StartTurnRequest,
+    agent: &AgentTurn,
+    spec: &AgentGoalRoundSpec,
+    admitted_at: &str,
+) -> Result<(), StorageError> {
+    validate_agent_goal_round_spec(spec)?;
+    let current = query_latest_agent_goal_snapshot(connection, &agent.session_id)?
+        .as_ref()
+        .map(|stored| current_goal_snapshot_from_stored(connection, stored))
+        .transpose()?
+        .ok_or_else(|| {
+            StorageError::InvalidAgentTransition(
+                "Goal round admission requires a current Goal".into(),
+            )
+        })?;
+    if current.id != spec.goal_id
+        || current.revision != spec.goal_revision
+        || current.phase != protocol::AgentGoalPhase::Active
+        || current.rounds_started.saturating_add(1) != spec.round
+        || spec.round > current.max_rounds
+    {
+        return Err(StorageError::AgentGoalRevisionConflict {
+            expected: spec.goal_revision,
+            current: current.revision,
+        });
+    }
+    let prompt = goals::render_goal_round_prompt(&current, spec.round).map_err(|error| {
+        StorageError::InvalidAgentTransition(format!("invalid Goal round prompt: {error}"))
+    })?;
+    let digest = goals::goal_round_prompt_digest(&prompt).map_err(|error| {
+        StorageError::InvalidAgentTransition(format!("invalid Goal round digest: {error}"))
+    })?;
+    if request.user_message != prompt || spec.prompt_digest != digest {
+        return Err(StorageError::InvalidAgentTransition(
+            "Goal round prompt does not match the exact current Goal".into(),
+        ));
+    }
+    connection.execute(
+        r#"INSERT INTO agent_goal_rounds(
+               account_id, actor_user_id, actor_membership_revision, session_id,
+               goal_id, goal_revision, round, turn_id, agent_id, prompt_digest,
+               admitted_at
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
+        params![
+            agent.account_id.as_str(),
+            agent.actor_user_id,
+            u64_to_i64(
+                agent.actor_membership_revision.get(),
+                "Agent goal round membership revision"
+            )?,
+            agent.session_id,
+            spec.goal_id,
+            u64_to_i64(spec.goal_revision, "Agent goal round revision")?,
+            u64_to_i64(spec.round, "Agent goal round")?,
+            agent.turn_id,
+            agent.id,
+            spec.prompt_digest,
+            admitted_at,
+        ],
+    )?;
+    Ok(())
+}
+
+pub(super) fn require_agent_goal_round_matches_spec(
+    connection: &Connection,
+    request: &StartTurnRequest,
+    agent: &AgentTurn,
+    spec: &AgentGoalRoundSpec,
+) -> Result<(), StorageError> {
+    let stored = query_agent_goal_round(connection, &agent.session_id, &spec.goal_id, spec.round)?
+        .ok_or(StorageError::IdempotencyConflict)?;
+    let digest = goals::goal_round_prompt_digest(&request.user_message).map_err(|_| {
+        StorageError::CorruptData("stored Goal round prompt is outside its envelope".into())
+    })?;
+    if stored.account_id != agent.account_id.as_str()
+        || stored.actor_user_id != agent.actor_user_id
+        || stored.actor_membership_revision
+            != u64_to_i64(
+                agent.actor_membership_revision.get(),
+                "Agent goal round membership revision",
+            )?
+        || stored.session_id != agent.session_id
+        || stored.goal_id != spec.goal_id
+        || stored.goal_revision != u64_to_i64(spec.goal_revision, "Agent goal round revision")?
+        || stored.round != u64_to_i64(spec.round, "Agent goal round")?
+        || stored.turn_id != agent.turn_id
+        || stored.agent_id != agent.id
+        || stored.prompt_digest != spec.prompt_digest
+        || stored.prompt_digest != digest
+        || stored.admitted_at != agent.created_at
+    {
+        return Err(StorageError::IdempotencyConflict);
+    }
+    Ok(())
+}
+
 fn query_session_goal_for_scope(
     connection: &Connection,
     scope: &ExecutionScope,
@@ -4074,8 +4333,94 @@ fn query_session_goal_for_scope(
     }
     query_latest_agent_goal_snapshot(connection, &scope.session_id)?
         .as_ref()
-        .map(goal_snapshot_from_stored)
+        .map(|stored| current_goal_snapshot_from_stored(connection, stored))
         .transpose()
+}
+
+pub(super) fn query_agent_goal_round_candidate(
+    connection: &mut Connection,
+    account_id: &AccountId,
+    actor_user_id: &str,
+    actor_membership_revision: MembershipRevision,
+    session_id: &str,
+    goal_id: &str,
+    goal_revision: u64,
+) -> Result<Option<AgentGoalRoundCandidate>, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let role: Option<String> = transaction
+        .query_row(
+            r#"SELECT membership.role
+               FROM accounts account
+               JOIN account_memberships membership
+                 ON membership.account_id = account.id
+               JOIN users user ON user.id = membership.user_id
+               JOIN sessions session ON session.account_id = account.id
+               WHERE account.id = ?1
+                 AND account.status = 'active'
+                 AND membership.user_id = ?2
+                 AND membership.status = 'active'
+                 AND membership.revision = ?3
+                 AND user.status = 'active'
+                 AND session.id = ?4"#,
+            params![
+                account_id.as_str(),
+                actor_user_id,
+                u64_to_i64(
+                    actor_membership_revision.get(),
+                    "Goal activation membership revision"
+                )?,
+                session_id,
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(role) = role else {
+        transaction.commit()?;
+        return Ok(None);
+    };
+    let role = decode_membership_role(&role)?;
+    if !membership_allows(role, AccountCapability::Reply) {
+        transaction.commit()?;
+        return Ok(None);
+    }
+    let session = query_session_summary(&transaction, session_id)?;
+    if session.status == protocol::SessionStatus::NeedsAttention {
+        transaction.commit()?;
+        return Ok(None);
+    }
+    let goal = query_latest_agent_goal_snapshot(&transaction, session_id)?
+        .as_ref()
+        .map(|stored| current_goal_snapshot_from_stored(&transaction, stored))
+        .transpose()?;
+    let Some(goal) = goal else {
+        transaction.commit()?;
+        return Ok(None);
+    };
+    if goal.id != goal_id
+        || goal.revision != goal_revision
+        || goal.phase != protocol::AgentGoalPhase::Active
+        || goal.rounds_started >= goal.max_rounds
+    {
+        transaction.commit()?;
+        return Ok(None);
+    }
+    let auth_session_id =
+        AuthSessionId::from_persistence("goal-round-driver-v1").map_err(|error| {
+            StorageError::CorruptData(format!("invalid internal Goal round authority ID: {error}"))
+        })?;
+    let candidate = AgentGoalRoundCandidate {
+        authz: AuthzContext {
+            account_id: account_id.clone(),
+            user_id: actor_user_id.to_owned(),
+            membership_role: role,
+            membership_revision: actor_membership_revision,
+            auth_session_id,
+        },
+        session,
+        goal,
+    };
+    transaction.commit()?;
+    Ok(Some(candidate))
 }
 
 fn query_latest_agent_goal_state(
@@ -4085,7 +4430,7 @@ fn query_latest_agent_goal_state(
     let Some(stored) = query_latest_agent_goal_snapshot(connection, session_id)? else {
         return Ok(None);
     };
-    let snapshot = goal_snapshot_from_stored(&stored)?;
+    let snapshot = current_goal_snapshot_from_stored(connection, &stored)?;
     let created_at: String = connection.query_row(
         r#"SELECT created_at FROM agent_goal_snapshots
            WHERE session_id = ?1 AND goal_id = ?2 AND goal_revision = 1"#,
@@ -6547,6 +6892,13 @@ pub(super) fn query_active_knowledge_corpus_for_actor(
     Ok(query_account_knowledge_catalog(connection, context.account_id.as_str())?.corpus)
 }
 
+pub(super) fn query_active_knowledge_corpus_for_runtime(
+    connection: &Connection,
+    account_id: &AccountId,
+) -> Result<knowledge::CorpusRevisionEnvelope, StorageError> {
+    Ok(query_account_knowledge_catalog(connection, account_id.as_str())?.corpus)
+}
+
 pub(super) fn query_account_knowledge_catalog_revision_for_admin(
     connection: &mut Connection,
     context: &AuthzContext,
@@ -8452,6 +8804,18 @@ pub(super) fn verify_agent_goal_integrity(connection: &Connection) -> Result<(),
             )));
         }
         let snapshot = goal_snapshot_from_stored(&stored)?;
+        let durable_snapshot_rounds = admitted_goal_rounds_through_turn(
+            connection,
+            &stored.session_id,
+            &snapshot.id,
+            &stored.turn_id,
+        )?;
+        if snapshot.rounds_started != durable_snapshot_rounds {
+            return Err(StorageError::CorruptData(format!(
+                "Agent goal snapshot `{}` has a forged admitted round count",
+                stored.call_id
+            )));
+        }
         let call = query_agent_tool_call(connection, &stored.call_id)?;
         let result = call
             .result_json
@@ -8470,15 +8834,29 @@ pub(super) fn verify_agent_goal_integrity(connection: &Connection) -> Result<(),
                     ))
                 })
             })?;
-        let previous = previous_by_session
+        let mut previous = previous_by_session
             .get(&stored.session_id)
-            .map(|(_, snapshot, _)| snapshot);
+            .map(|(_, snapshot, _)| snapshot.clone());
+        if let Some(previous) = &mut previous {
+            previous.rounds_started = admitted_goal_rounds_through_turn(
+                connection,
+                &stored.session_id,
+                &previous.id,
+                &stored.turn_id,
+            )?;
+            goals::validate_snapshot(previous).map_err(|error| {
+                StorageError::CorruptData(format!(
+                    "Agent goal mutation `{}` has invalid prior round state: {error}",
+                    stored.call_id
+                ))
+            })?;
+        }
         let prepared = match call.tool_name.as_str() {
             goals::CREATE_GOAL_TOOL_NAME => {
-                goals::prepare_create_goal(&call.arguments_json, previous, &call.call_id)
+                goals::prepare_create_goal(&call.arguments_json, previous.as_ref(), &call.call_id)
             }
             goals::UPDATE_GOAL_TOOL_NAME => {
-                goals::prepare_update_goal(&call.arguments_json, previous)
+                goals::prepare_update_goal(&call.arguments_json, previous.as_ref())
             }
             _ => Err(goals::GoalError::InvalidArguments),
         }
@@ -8511,6 +8889,141 @@ pub(super) fn verify_agent_goal_integrity(connection: &Connection) -> Result<(),
             stored.session_id.clone(),
             (stored.sequence, snapshot, stored.created_at),
         );
+    }
+    Ok(())
+}
+
+pub(super) fn verify_agent_goal_round_integrity(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    let orphaned: i64 = connection.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM agent_goal_rounds round
+               LEFT JOIN agent_turns agent ON agent.id = round.agent_id
+               LEFT JOIN session_turns turn
+                 ON turn.session_id = round.session_id AND turn.id = round.turn_id
+               LEFT JOIN agent_model_jobs job
+                 ON job.agent_id = round.agent_id AND job.step = 1
+               WHERE agent.id IS NULL OR turn.id IS NULL
+                  OR job.id IS NULL
+                  OR agent.account_id <> round.account_id
+                  OR agent.actor_user_id <> round.actor_user_id
+                  OR agent.actor_membership_revision <> round.actor_membership_revision
+                  OR agent.session_id <> round.session_id
+                  OR agent.turn_id <> round.turn_id
+                  OR agent.created_at <> round.admitted_at
+                  OR turn.started_at <> round.admitted_at
+                  OR job.queued_at <> round.admitted_at
+           )"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if orphaned != 0 {
+        return Err(StorageError::CorruptData(
+            "one or more Agent goal rounds are not bound to their exact Session turn".into(),
+        ));
+    }
+
+    let sql = format!("{AGENT_GOAL_ROUND_SELECT} ORDER BY session_id, goal_id, round");
+    let mut statement = connection.prepare(&sql)?;
+    let rounds = statement
+        .query_map([], decode_agent_goal_round_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    let mut prior = std::collections::BTreeMap::<(String, String), (u64, i64)>::new();
+    for stored in rounds {
+        let round = i64_to_u64(stored.round, "Agent goal round")?;
+        let goal_revision = i64_to_u64(stored.goal_revision, "Agent goal round revision")?;
+        let membership_revision = i64_to_u64(
+            stored.actor_membership_revision,
+            "Agent goal round membership revision",
+        )?;
+        if membership_revision == 0 {
+            return Err(StorageError::CorruptData(format!(
+                "Agent goal round `{}` has an invalid actor membership revision",
+                stored.turn_id
+            )));
+        }
+        let turn = query_session_turn(connection, &stored.session_id, &stored.turn_id)?;
+        let turn_ordinal = u64_to_i64(turn.ordinal, "Goal round turn ordinal")?;
+        let key = (stored.session_id.clone(), stored.goal_id.clone());
+        let expected_round = prior
+            .get(&key)
+            .map(|(round, _)| round.saturating_add(1))
+            .unwrap_or(1);
+        if round != expected_round
+            || prior
+                .get(&key)
+                .is_some_and(|(_, ordinal)| *ordinal >= turn_ordinal)
+        {
+            return Err(StorageError::CorruptData(format!(
+                "Agent goal round sequence is not contiguous for Goal `{}`",
+                stored.goal_id
+            )));
+        }
+        let snapshot_sql = r#"SELECT snapshot.account_id, snapshot.session_id, snapshot.sequence,
+                      snapshot.turn_id, snapshot.agent_id, snapshot.goal_id,
+                      snapshot.goal_revision, snapshot.call_id, snapshot.objective,
+                      snapshot.phase, snapshot.rounds_started, snapshot.max_rounds,
+                      snapshot.blocker_code, snapshot.blocker_message, snapshot.created_at
+               FROM agent_goal_snapshots snapshot
+               JOIN session_turns mutation
+                 ON mutation.session_id = snapshot.session_id
+                AND mutation.id = snapshot.turn_id
+               WHERE snapshot.session_id = ?1
+                 AND mutation.ordinal < ?2
+               ORDER BY snapshot.sequence DESC LIMIT 1"#;
+        let lifecycle = connection
+            .query_row(
+                snapshot_sql,
+                params![stored.session_id, turn_ordinal],
+                decode_agent_goal_snapshot_row,
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StorageError::CorruptData(format!(
+                    "Agent goal round `{}` has no prior Goal lifecycle state",
+                    stored.turn_id
+                ))
+            })?;
+        let mut goal = goal_snapshot_from_stored(&lifecycle)?;
+        goal.rounds_started = round.saturating_sub(1);
+        goals::validate_snapshot(&goal).map_err(|error| {
+            StorageError::CorruptData(format!(
+                "Agent goal round `{}` has invalid prior Goal state: {error}",
+                stored.turn_id
+            ))
+        })?;
+        if stored.account_id != lifecycle.account_id
+            || stored.goal_id != goal.id
+            || goal_revision != goal.revision
+            || goal.phase != protocol::AgentGoalPhase::Active
+            || round > goal.max_rounds
+        {
+            return Err(StorageError::CorruptData(format!(
+                "Agent goal round `{}` does not consume the exact active Goal revision",
+                stored.turn_id
+            )));
+        }
+        let prompt = goals::render_goal_round_prompt(&goal, round).map_err(|error| {
+            StorageError::CorruptData(format!(
+                "Agent goal round `{}` cannot reconstruct its prompt: {error}",
+                stored.turn_id
+            ))
+        })?;
+        let digest = goals::goal_round_prompt_digest(&prompt).map_err(|error| {
+            StorageError::CorruptData(format!(
+                "Agent goal round `{}` has an invalid prompt: {error}",
+                stored.turn_id
+            ))
+        })?;
+        if turn.user_message != prompt || stored.prompt_digest != digest {
+            return Err(StorageError::CorruptData(format!(
+                "Agent goal round `{}` is not bound to its exact driver prompt",
+                stored.turn_id
+            )));
+        }
+        prior.insert(key, (round, turn_ordinal));
     }
     Ok(())
 }
@@ -9146,7 +9659,7 @@ fn prepare_agent_goal_completion(
     }
     let current = query_latest_agent_goal_snapshot(connection, &call.session_id)?
         .as_ref()
-        .map(goal_snapshot_from_stored)
+        .map(|stored| current_goal_snapshot_from_stored(connection, stored))
         .transpose()?;
     let prepared = match call.tool_name.as_str() {
         goals::CREATE_GOAL_TOOL_NAME => {

@@ -35,7 +35,7 @@ Client / SvelteKit Web
 - `skills`：启动时一次性加载的 strict version 1 Skill Catalog、确定性 digest，以及只读
   `skill_list` / `skill_load` executor；Skill body 只有通过普通工具结果才对模型可见。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
-- `storage`：schema v29 migration、有界 account/membership 权威、一次性 member setup、用户/偏好、
+- `storage`：schema v30 migration、有界 account/membership 权威、一次性 member setup、用户/偏好、
   account audit/rollup/policy/archive state、独立 Session/Run ledger、typed event lookup、
   account+actor-scoped 回执、durable Agent/model/tool/dispatch queue、不可变 deployment manifest，
   revisioned account knowledge catalog、owner-governed Agent prompt、account-scoped
@@ -123,7 +123,17 @@ complete 或 blocked 转换。Mutation 在 runtime 预检后仍由 SQLite 在 kn
 事务内重复 CAS，写入 Session 内连续 sequence 和 Goal 内连续 revision 的 append-only snapshot；
 snapshot 与 exact account/Session/turn/Agent、started call、canonical result、phase、blocker 和时间绑定。
 Deep readiness 会从头重放全部 Goal 状态机并拒绝 missing snapshot、跨 scope 绑定、修改/删除及
-弱化 trigger。该阶段只建立可靠状态域与模型工具闭环；未来自动续行调度必须在此 CAS 权威之上实现。
+弱化 trigger。
+
+schema v30 在该 CAS 权威之上增加 same-Session Goal Round driver。`create_goal` 成功或显式
+`resume` 只在当前进程内 armed；数据库重开后 activation 为空，active Goal 不会自行恢复执行。
+每一轮必须原子写入真实 Session user turn、Agent、首个 model job 与 append-only
+`agent_goal_rounds` admission，绑定 exact Goal ID/revision、连续 round、actor membership revision、
+canonical prompt digest 与同一 timestamp；Goal Round Agent 的 complete/blocked 必须匹配本轮
+Goal revision，且自动 blocked 至少要求连续三轮；direct-human turn 仍可显式 complete 或 blocked。
+用户新 turn、取消、provider/tool 失败、`needs_attention`、完成、阻塞、权限失效或
+round cap 都会 disarm，失败和歧义结果不自动重试。Deep readiness 会重建每轮之前的 Goal 状态、精确
+driver prompt、turn/Agent/job 绑定和完整生命周期链。
 
 可选 `ZEUS_SKILLS_FILE` 在 SQLite 打开前加载 immutable Skill Catalog。文件使用 strict version 1
 JSON，regular file 上限 512 KiB，包含 1–64 个唯一的 lowercase provider-safe 名称；description
@@ -275,7 +285,7 @@ connector 在数据库事务和锁之外运行。
 
 API 监听端口之前按固定顺序完成：
 
-1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v29；按当前
+1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v30；按当前
    detailed-row limit 以最多 64 行 batch 压缩 bootstrap terminal audit prefix，再按稳定
    `(priority actor, expires_at, auth-session ID)` 顺序最多清理 64 个过期或绑定
    missing/disabled/suspended/stale-revision authority 的 auth session。
@@ -577,7 +587,7 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   legacy-set commitment、v23 owner-governed knowledge catalog head/ingestion receipt、v24
   owner-governed Agent prompt head/revision/receipt，以及 v25 non-destructive Session context
   compaction state machine、v26 account-scoped reply provider、v27 safe Agent cancellation 与
-  v28 durable Agent planning 与 v29 durable Session Goal，
+  v28 durable Agent planning、v29 durable Session Goal 与 v30 same-Session Goal Round，
   也覆盖 fresh schema
   和历史原地迁移；畸形 v21 升级会整体回滚，不留下 v22 版本或表，既有 v22 数据库则原地增加
   空的 revision-0 catalog projection，不改写已经固化的 Agent knowledge context。

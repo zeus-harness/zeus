@@ -37,29 +37,29 @@ use crate::{
     AccountAuditArchiveState, AccountAuditCheckpointCommit, AccountAuditEvent, AccountAuditPage,
     AccountAuditPolicy, AccountAuditRollup, AccountAuditState, AccountId,
     AccountReplyProviderCommit, AccountReplyProviderState, AccountReplyProviderUpdateResult,
-    AgentModelJob, AgentPromptCommit, AgentPromptRevisionPage, AgentPromptState,
-    AgentPromptUpdateResult, AgentTurn, AgentTurnEnqueueResponse, AgentTurnReceiptProbe,
-    AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthSessionId, AuthzContext,
-    BootstrapOwnerCommit, BoundedRunRead, ClaimOutcome, CommitOutcome, CreateAccountCommit,
-    CreateAccountResult, CreateMemberCommit, CreateMemberResult, DispatchCompleteCommit,
-    DispatchContext, DispatchJob, DispatchJobSpec, DispatchRecoveryCommit, DispatchRejection,
-    DispatchStartCommit, DispatchStatus, InFlightWorkSummary, KnowledgeCatalogCommit,
-    KnowledgeCatalogRevisionPage, KnowledgeCatalogState, KnowledgeCatalogUpdateResult,
-    MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit, MemberSetupResult, MemberTransitionResult,
-    MembershipRevision, MembershipRole, RecoveredSessionTurn, ReplyClaimOutcome, ReplyCompletion,
-    ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus,
-    ReplyOutcomeUnknownCommit, ReplySuccessCommit, ReviewCommit, ReviewContext, ReviewReceipt,
-    RotateMemberSetupTokenCommit, RotateMemberSetupTokenResult, RunSnapshot, RuntimeIdentity,
-    SessionCompactionClaimOutcome, SessionCompactionFailureCommit, SessionCompactionJob,
-    SessionCompactionSuccessCommit, SessionContextCheckpoint, SessionSummaryPage,
-    SqliteOperationLimits, SqlitePhysicalLimits, StorageError, StorageLimits, StoredAccount,
-    StoredAccountStatus, StoredCredential, StoredMember, StoredMemberPage, StoredMembershipStatus,
-    StoredPreferences, StoredRun, StoredUser, StoredUserRole, StoredUserStatus,
-    SwitchAuthSessionCommit, SwitchAuthSessionResult, TransitionMemberCommit,
-    UpdateAccountAuditPolicyCommit,
+    AgentGoalRoundSpec, AgentModelJob, AgentPromptCommit, AgentPromptRevisionPage,
+    AgentPromptState, AgentPromptUpdateResult, AgentTurn, AgentTurnEnqueueResponse,
+    AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthSessionId,
+    AuthzContext, BootstrapOwnerCommit, BoundedRunRead, ClaimOutcome, CommitOutcome,
+    CreateAccountCommit, CreateAccountResult, CreateMemberCommit, CreateMemberResult,
+    DispatchCompleteCommit, DispatchContext, DispatchJob, DispatchJobSpec, DispatchRecoveryCommit,
+    DispatchRejection, DispatchStartCommit, DispatchStatus, InFlightWorkSummary,
+    KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage, KnowledgeCatalogState,
+    KnowledgeCatalogUpdateResult, MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit,
+    MemberSetupResult, MemberTransitionResult, MembershipRevision, MembershipRole,
+    RecoveredSessionTurn, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit, ReplyJob,
+    ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
+    ReplySuccessCommit, ReviewCommit, ReviewContext, ReviewReceipt, RotateMemberSetupTokenCommit,
+    RotateMemberSetupTokenResult, RunSnapshot, RuntimeIdentity, SessionCompactionClaimOutcome,
+    SessionCompactionFailureCommit, SessionCompactionJob, SessionCompactionSuccessCommit,
+    SessionContextCheckpoint, SessionSummaryPage, SqliteOperationLimits, SqlitePhysicalLimits,
+    StorageError, StorageLimits, StoredAccount, StoredAccountStatus, StoredCredential,
+    StoredMember, StoredMemberPage, StoredMembershipStatus, StoredPreferences, StoredRun,
+    StoredUser, StoredUserRole, StoredUserStatus, SwitchAuthSessionCommit, SwitchAuthSessionResult,
+    TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 29;
+const CURRENT_SCHEMA_VERSION: i64 = 30;
 const LOCAL_ACCOUNT_ID: &str = "acc_local";
 const MAX_ACCOUNTS_PER_USER: i64 = 16;
 const MAX_ACCOUNTS_GLOBAL: i64 = 64;
@@ -97,6 +97,7 @@ const MIGRATION_0026: &str = include_str!("../migrations/0026_account_reply_prov
 const MIGRATION_0027: &str = include_str!("../migrations/0027_agent_safe_cancellation.sql");
 const MIGRATION_0028: &str = include_str!("../migrations/0028_agent_todo_snapshots.sql");
 const MIGRATION_0029: &str = include_str!("../migrations/0029_session_agent_goals.sql");
+const MIGRATION_0030: &str = include_str!("../migrations/0030_agent_goal_rounds.sql");
 const MIGRATION_0022_TRIGGER_NAMES: &[&str] = &[
     "knowledge_corpus_revisions_reject_update",
     "knowledge_corpus_revisions_reject_delete",
@@ -153,10 +154,15 @@ const MIGRATION_0028_TRIGGER_NAMES: &[&str] = &[
     "agent_tool_calls_bind_todo_snapshot",
 ];
 const MIGRATION_0029_TRIGGER_NAMES: &[&str] = &[
-    "agent_goal_snapshots_validate_insert",
     "agent_goal_snapshots_reject_update",
     "agent_goal_snapshots_reject_delete",
     "agent_tool_calls_bind_goal_snapshot",
+];
+const MIGRATION_0030_TRIGGER_NAMES: &[&str] = &[
+    "agent_goal_rounds_validate_insert",
+    "agent_goal_rounds_reject_update",
+    "agent_goal_rounds_reject_delete",
+    "agent_goal_snapshots_validate_insert",
 ];
 const RECOVERY_BATCH_LIMIT: i64 = 64;
 const AUTH_SESSION_CLEANUP_BATCH_LIMIT: i64 = 64;
@@ -635,6 +641,42 @@ impl SqliteStore {
         .await
     }
 
+    /// Worker-only bounded history read. The caller supplies a durable account
+    /// binding; Goal-round admission later rechecks the captured membership in
+    /// the same write transaction.
+    pub async fn session_reply_turns_after_for_runtime(
+        &self,
+        account_id: &AccountId,
+        session_id: &str,
+        after_sequence: u64,
+        through_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionTurn>, StorageError> {
+        let account_id = account_id.clone();
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        self.with_connection(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            require_session_account(&transaction, &session_id, &account_id)?;
+            let session = query_session_summary(&transaction, &session_id)?;
+            validate_session_event_tail(&transaction, &session)?;
+            validate_active_turn_projection(&transaction, &session)?;
+            if after_sequence > through_sequence || through_sequence > session.sequence {
+                return Err(StorageError::ConcurrentModification);
+            }
+            let turns = query_session_reply_turns_after(
+                &transaction,
+                &session_id,
+                after_sequence,
+                through_sequence,
+                limit,
+            )?;
+            transaction.commit()?;
+            Ok(turns)
+        })
+        .await
+    }
+
     /// Returns one projection after checking its durable event tail in the
     /// same read transaction. Unlike session detail, this never loads turns,
     /// attachments, or the complete event ledger.
@@ -862,6 +904,7 @@ impl SqliteStore {
                     authz: None,
                     reply_job: None,
                     agent_turn: None,
+                    goal_round: None,
                     limits: &limits,
                     physical_limits: &physical_limits,
                     fail_after_enqueue: false,
@@ -894,6 +937,7 @@ impl SqliteStore {
                     authz: Some(&context),
                     reply_job: None,
                     agent_turn: None,
+                    goal_round: None,
                     limits: &limits,
                     physical_limits: &physical_limits,
                     fail_after_enqueue: false,
@@ -934,6 +978,7 @@ impl SqliteStore {
                     authz: Some(&context),
                     reply_job: Some(job),
                     agent_turn: None,
+                    goal_round: None,
                     limits: &limits,
                     physical_limits: &physical_limits,
                     fail_after_enqueue: false,
@@ -982,6 +1027,7 @@ impl SqliteStore {
                     authz: Some(&context),
                     reply_job: Some(job),
                     agent_turn: None,
+                    goal_round: None,
                     limits: &limits,
                     physical_limits: &physical_limits,
                     fail_after_enqueue: false,
@@ -1064,6 +1110,7 @@ impl SqliteStore {
                     authz: Some(&context),
                     reply_job: None,
                     agent_turn: Some(agent),
+                    goal_round: None,
                     limits: &limits,
                     physical_limits: &physical_limits,
                     fail_after_enqueue: false,
@@ -1080,6 +1127,56 @@ impl SqliteStore {
                     .ok_or_else(|| {
                         StorageError::CorruptData(
                             "agent enqueue committed without durable work".into(),
+                        )
+                    })
+            })
+        })
+        .await
+    }
+
+    /// Atomically admits one process-authorized Goal round as a real Session
+    /// turn and Agent. The stored membership revision is revalidated without
+    /// depending on the browser login session that originally armed the Goal.
+    pub async fn start_goal_round_and_enqueue_agent(
+        &self,
+        session_id: &str,
+        request: StartTurnRequest,
+        idempotency_key: &str,
+        agent: AgentTurnSpec,
+        goal_round: AgentGoalRoundSpec,
+    ) -> Result<AgentTurnEnqueueResponse, StorageError> {
+        let context = validated_authz_context(&agent.authz)?;
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        let key = normalized_key(idempotency_key)?.to_owned();
+        let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            start_turn(
+                connection,
+                &session_id,
+                request,
+                &key,
+                StartTurnOptions {
+                    authz: Some(&context),
+                    reply_job: None,
+                    agent_turn: Some(agent),
+                    goal_round: Some(goal_round),
+                    limits: &limits,
+                    physical_limits: &physical_limits,
+                    fail_after_enqueue: false,
+                },
+            )
+            .and_then(|outcome| {
+                outcome
+                    .agent_work
+                    .map(|(agent, job)| AgentTurnEnqueueResponse {
+                        start: outcome.start,
+                        agent,
+                        job,
+                    })
+                    .ok_or_else(|| {
+                        StorageError::CorruptData(
+                            "Goal round admission committed without durable Agent work".into(),
                         )
                     })
             })
@@ -1261,6 +1358,25 @@ impl SqliteStore {
         let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
         self.with_connection(move |connection| {
             compaction::checkpoint_for_actor(connection, &context, &session_id, through_sequence)
+        })
+        .await
+    }
+
+    pub async fn session_context_checkpoint_for_runtime(
+        &self,
+        account_id: &AccountId,
+        session_id: &str,
+        through_sequence: u64,
+    ) -> Result<Option<SessionContextCheckpoint>, StorageError> {
+        let account_id = account_id.clone();
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        self.with_connection(move |connection| {
+            require_session_account(connection, &session_id, &account_id)?;
+            let session = query_session_summary(connection, &session_id)?;
+            if through_sequence > session.sequence {
+                return Err(StorageError::ConcurrentModification);
+            }
+            compaction::latest_checkpoint(connection, &session_id, through_sequence)
         })
         .await
     }
@@ -1591,6 +1707,17 @@ impl SqliteStore {
         let context = validated_authz_context(context)?;
         self.with_connection(move |connection| {
             agent::query_active_knowledge_corpus_for_actor(connection, &context)
+        })
+        .await
+    }
+
+    pub async fn active_knowledge_corpus_for_runtime(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<knowledge::CorpusRevisionEnvelope, StorageError> {
+        let account_id = account_id.clone();
+        self.with_connection(move |connection| {
+            agent::query_active_knowledge_corpus_for_runtime(connection, &account_id)
         })
         .await
     }
@@ -2389,6 +2516,7 @@ impl SqliteStore {
                     authz: Some(&context),
                     reply_job: Some(job),
                     agent_turn: None,
+                    goal_round: None,
                     limits: &limits,
                     physical_limits: &physical_limits,
                     fail_after_enqueue: true,
@@ -3358,6 +3486,13 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
             params![29, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 30 {
+        transaction.execute_batch(MIGRATION_0030)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![30, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
     // The execution verifier now understands the v22 knowledge binding. Run
     // it only after every missing schema step has been installed so upgrades
     // from v19 and older never query a column that does not exist yet. This
@@ -3369,6 +3504,7 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
         agent::verify_account_agent_prompt_integrity(&transaction)?;
         agent::verify_agent_todo_integrity(&transaction)?;
         agent::verify_agent_goal_integrity(&transaction)?;
+        agent::verify_agent_goal_round_integrity(&transaction)?;
         provider::verify_account_reply_provider_integrity(&transaction)?;
         execution::verify_agent_execution_integrity(&transaction)?;
     }
@@ -4572,13 +4708,16 @@ fn readiness(
                'agent_goal_snapshots_reject_update',
                'agent_goal_snapshots_reject_delete',
                'agent_tool_calls_bind_goal_snapshot',
+               'agent_goal_rounds_validate_insert',
+               'agent_goal_rounds_reject_update',
+               'agent_goal_rounds_reject_delete',
                'schema_migrations_reject_update',
                'schema_migrations_reject_delete'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 161 {
+    if trigger_count != 164 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
         ));
@@ -4591,6 +4730,7 @@ fn readiness(
     verify_migration_trigger_definitions(connection, MIGRATION_0027, MIGRATION_0027_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0028, MIGRATION_0028_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0029, MIGRATION_0029_TRIGGER_NAMES)?;
+    verify_migration_trigger_definitions(connection, MIGRATION_0030, MIGRATION_0030_TRIGGER_NAMES)?;
 
     let agent_pending_call_fk: i64 = connection.query_row(
         r#"SELECT COUNT(*)
@@ -5192,6 +5332,7 @@ fn readiness(
     agent::verify_account_agent_prompt_integrity(connection)?;
     agent::verify_agent_todo_integrity(connection)?;
     agent::verify_agent_goal_integrity(connection)?;
+    agent::verify_agent_goal_round_integrity(connection)?;
     provider::verify_account_reply_provider_integrity(connection)?;
     compaction::verify_integrity(connection)?;
     execution::verify_agent_execution_integrity(connection)?;
@@ -10744,6 +10885,7 @@ struct StartTurnOptions<'a> {
     authz: Option<&'a AuthzContext>,
     reply_job: Option<ReplyJobSpec>,
     agent_turn: Option<AgentTurnSpec>,
+    goal_round: Option<AgentGoalRoundSpec>,
     limits: &'a StorageLimits,
     physical_limits: &'a SqlitePhysicalLimits,
     fail_after_enqueue: bool,
@@ -10806,6 +10948,7 @@ fn start_turn(
         authz,
         reply_job,
         agent_turn,
+        goal_round,
         limits,
         physical_limits,
         fail_after_enqueue,
@@ -10814,8 +10957,12 @@ fn start_turn(
     normalized_key(idempotency_key)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if let Some(context) = authz {
-        require_current_authority(&transaction, context, AccountCapability::SessionWrite)?;
-        require_active_session_actor(&transaction, session_id, context)?;
+        if goal_round.is_some() {
+            require_goal_round_authority(&transaction, session_id, context)?;
+        } else {
+            require_current_authority(&transaction, context, AccountCapability::SessionWrite)?;
+            require_active_session_actor(&transaction, session_id, context)?;
+        }
     }
     validate_start_turn_request(&request)?;
     if let Some(job) = &reply_job {
@@ -10835,6 +10982,14 @@ fn start_turn(
             "a turn cannot enqueue both a legacy reply and an agent loop".into(),
         ));
     }
+    if let Some(round) = &goal_round {
+        agent::validate_agent_goal_round_spec(round)?;
+        if authz.is_none() || agent_turn.is_none() || reply_job.is_some() {
+            return Err(StorageError::InvalidAgentTransition(
+                "a Goal round requires exactly one actor-bound Agent turn".into(),
+            ));
+        }
+    }
     let (fingerprint, legacy_fingerprint) = match (&reply_job, &agent_turn) {
         (Some(job), None) => (
             reply_start_fingerprint(session_id, &request, job)?,
@@ -10842,10 +10997,17 @@ fn start_turn(
                 session_id, &request, job,
             )?),
         ),
-        (None, Some(agent)) => (
-            agent::agent_start_fingerprint(session_id, &request, agent)?,
-            None,
-        ),
+        (None, Some(agent)) => {
+            let fingerprint = agent::agent_start_fingerprint(session_id, &request, agent)?;
+            let fingerprint = match &goal_round {
+                Some(round) => serde_json::to_string(&json!({
+                    "agent_start": serde_json::from_str::<Value>(&fingerprint)?,
+                    "goal_round": round,
+                }))?,
+                None => fingerprint,
+            };
+            (fingerprint, None)
+        }
         (None, None) => (
             session_command_fingerprint(Some(session_id), &request)?,
             None,
@@ -10889,6 +11051,14 @@ fn start_turn(
                 let job = agent::query_agent_model_job(&transaction, &agent.id, 1)?;
                 agent::require_agent_knowledge_context_integrity(&transaction, &agent, &job)
                     .map_err(agent::corrupt_agent_integrity)?;
+                if let Some(round) = &goal_round {
+                    agent::require_agent_goal_round_matches_spec(
+                        &transaction,
+                        &request,
+                        &agent,
+                        round,
+                    )?;
+                }
                 Some((agent, job))
             }
             None => None,
@@ -11027,6 +11197,14 @@ fn start_turn(
     } else {
         None
     };
+    if let Some(round) = &goal_round {
+        let (stored_agent, _) = stored_agent.as_ref().ok_or_else(|| {
+            StorageError::CorruptData(
+                "Goal round admission did not create its required Agent".into(),
+            )
+        })?;
+        agent::insert_agent_goal_round(&transaction, &request, stored_agent, round, &timestamp)?;
+    }
 
     #[cfg(test)]
     if fail_after_enqueue {
@@ -12446,6 +12624,51 @@ fn require_current_authority(
     Ok(())
 }
 
+/// Revalidates the exact membership captured when a Goal was armed. Automatic
+/// rounds are process-owned work, so the original browser authentication
+/// session is deliberately neither required nor accepted as durable authority.
+fn require_goal_round_authority(
+    connection: &Connection,
+    session_id: &str,
+    context: &AuthzContext,
+) -> Result<(), StorageError> {
+    let role = connection
+        .query_row(
+            r#"SELECT membership.role
+               FROM accounts account
+               JOIN account_memberships membership
+                 ON membership.account_id = account.id
+               JOIN users user ON user.id = membership.user_id
+               JOIN sessions session ON session.account_id = account.id
+               WHERE account.id = ?1
+                 AND account.status = 'active'
+                 AND membership.user_id = ?2
+                 AND membership.status = 'active'
+                 AND membership.revision = ?3
+                 AND user.status = 'active'
+                 AND session.id = ?4"#,
+            params![
+                context.account_id.as_str(),
+                context.user_id,
+                u64_to_i64(context.membership_revision.get(), "membership revision")?,
+                session_id,
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(role) = role else {
+        return Err(StorageError::PermissionDenied);
+    };
+    let role = decode_membership_role(&role)?;
+    if role != context.membership_role
+        || !membership_allows(role, AccountCapability::SessionWrite)
+        || !membership_allows(role, AccountCapability::Reply)
+    {
+        return Err(StorageError::PermissionDenied);
+    }
+    Ok(())
+}
+
 fn current_durable_role(
     connection: &Connection,
     context: &AuthzContext,
@@ -12509,6 +12732,22 @@ fn require_active_session_actor(
     }
     if !membership_allows(durable_role, AccountCapability::Read) {
         return Err(StorageError::PermissionDenied);
+    }
+    Ok(())
+}
+
+fn require_session_account(
+    connection: &Connection,
+    session_id: &str,
+    account_id: &AccountId,
+) -> Result<(), StorageError> {
+    let authorized = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1 AND account_id = ?2)",
+        params![session_id, account_id.as_str()],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if authorized == 0 {
+        return Err(StorageError::SessionNotFound(session_id.to_owned()));
     }
     Ok(())
 }

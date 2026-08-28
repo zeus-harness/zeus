@@ -58,10 +58,10 @@ use protocol::{
     LoginRequest, LogoutResponse, MemberSetupRequest, MemberSetupTokenResponse, PolicyDecision,
     ProblemDetails, ReplyProviderCatalogResponse, ReplyProviderDescriptor, ResumeSessionRequest,
     ResumeSessionResponse, ReviewDecision, ReviewRequest, ReviewResponse,
-    RotateMemberSetupTokenRequest, RunDetail, SessionDetail, SessionEvent, SessionTurn,
-    StartTurnRequest, SwitchAccountRequest, ThemePreference, UpdateAccountAuditPolicyRequest,
-    UpdateAccountReplyProviderRequest, UpdateMemberRequest, UpdateMemberResponse,
-    UpdatePreferencesRequest, UserPreferences,
+    RotateMemberSetupTokenRequest, RunDetail, SessionDetail, SessionEvent, SessionStatus,
+    SessionTurn, StartTurnRequest, SwitchAccountRequest, ThemePreference,
+    UpdateAccountAuditPolicyRequest, UpdateAccountReplyProviderRequest, UpdateMemberRequest,
+    UpdateMemberResponse, UpdatePreferencesRequest, UserPreferences,
 };
 #[cfg(test)]
 use runtime::ReplyJobSpec;
@@ -69,10 +69,10 @@ use runtime::{
     AccountAuditCheckpointCommit, AccountAuditEvent as StoredAccountAuditEvent,
     AccountAuditPolicy as StoredAccountAuditPolicy, AccountAuditRollup as StoredAccountAuditRollup,
     AccountAuditState as StoredAccountAuditState, AccountReplyProviderState,
-    AccountReplyProviderUpdateResult, AgentKnowledgeContextExplain, AgentModelClaimOutcome,
-    AgentModelCompletion, AgentModelFailureCommit, AgentModelJob, AgentModelResolution,
-    AgentModelStartOutcome, AgentModelSuccessCommit, AgentPromptRevisionPage, AgentPromptState,
-    AgentPromptUpdateResult, AgentReviewCommit, AgentToolCall, AgentToolCallSpec,
+    AccountReplyProviderUpdateResult, AgentGoalRoundSpec, AgentKnowledgeContextExplain,
+    AgentModelClaimOutcome, AgentModelCompletion, AgentModelFailureCommit, AgentModelJob,
+    AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit, AgentPromptRevisionPage,
+    AgentPromptState, AgentPromptUpdateResult, AgentReviewCommit, AgentToolCall, AgentToolCallSpec,
     AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
     AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe,
     AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthzContext, BootstrapOwnerCommit,
@@ -897,6 +897,8 @@ struct ReplyExecutor {
     compaction_worker_wake: WorkerWakeState,
     agent_tool_drain: Mutex<()>,
     agent_tool_worker_wake: WorkerWakeState,
+    goal_round_drain: Mutex<()>,
+    goal_round_worker_wake: WorkerWakeState,
 }
 
 impl ReplyExecutor {
@@ -915,6 +917,8 @@ impl ReplyExecutor {
             compaction_worker_wake: WorkerWakeState::default(),
             agent_tool_drain: Mutex::new(()),
             agent_tool_worker_wake: WorkerWakeState::default(),
+            goal_round_drain: Mutex::new(()),
+            goal_round_worker_wake: WorkerWakeState::default(),
         }
     }
 }
@@ -3622,6 +3626,219 @@ fn durable_agent_id(session_id: &str, turn_id: &str) -> String {
     format!("{:x}", digest.finalize())
 }
 
+fn durable_goal_round_identity(
+    session_id: &str,
+    goal_id: &str,
+    goal_revision: u64,
+    round: u64,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"zeus-session-goal-round-v1\0");
+    for value in [session_id, goal_id] {
+        digest.update(
+            u64::try_from(value.len())
+                .expect("validated Goal round identifiers fit in u64")
+                .to_be_bytes(),
+        );
+        digest.update(value.as_bytes());
+    }
+    digest.update(goal_revision.to_be_bytes());
+    digest.update(round.to_be_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+fn kick_goal_round_worker(state: &ApiState) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let Some(executor) = &state.reply else {
+        return;
+    };
+    if !executor.goal_round_worker_wake.request() {
+        return;
+    }
+    let state = state.clone();
+    runtime.spawn(async move {
+        loop {
+            drain_goal_rounds(&state).await;
+            let executor = state
+                .reply
+                .as_ref()
+                .expect("a scheduled Goal round worker requires a provider");
+            if !executor.goal_round_worker_wake.complete_cycle() {
+                return;
+            }
+        }
+    });
+}
+
+async fn drain_goal_rounds(state: &ApiState) {
+    let executor = state
+        .reply
+        .as_ref()
+        .expect("the Goal round worker is only started when a provider exists");
+    let _drain = executor.goal_round_drain.lock().await;
+    for activation in state.store.armed_session_goals() {
+        let candidate = match state.store.agent_goal_round_candidate(&activation).await {
+            Ok(Some(candidate)) => candidate,
+            Ok(None) => {
+                state.store.disarm_session_goal(&activation.session_id);
+                continue;
+            }
+            Err(error) => {
+                eprintln!(
+                    "zeus disarmed Goal continuation after candidate resolution failed: {error}"
+                );
+                state.store.disarm_session_goal(&activation.session_id);
+                continue;
+            }
+        };
+        if candidate.session.status == SessionStatus::Running
+            || candidate.session.active_turn_id.is_some()
+        {
+            // The same armed Goal may already own an admitted round. Preserve
+            // activation until that turn reaches a terminal boundary; its
+            // final model completion will wake this worker again.
+            continue;
+        }
+        if let Err(error) = admit_goal_round(state, executor, candidate).await {
+            eprintln!("zeus disarmed Goal continuation after round admission failed: {error}");
+            state.store.disarm_session_goal(&activation.session_id);
+        }
+    }
+}
+
+async fn admit_goal_round(
+    state: &ApiState,
+    executor: &ReplyExecutor,
+    candidate: runtime::AgentGoalRoundCandidate,
+) -> Result<(), StoreError> {
+    let (user_message, goal_round): (String, AgentGoalRoundSpec) =
+        state.store.prepare_goal_round(&candidate)?;
+    let default = executor
+        .providers
+        .default_state(candidate.authz.account_id.clone());
+    let selected = state
+        .store
+        .current_session_reply_provider_for_account(&candidate.authz.account_id, default)
+        .await?;
+    let provider = executor
+        .providers
+        .get(&selected.provider_id)
+        .ok_or_else(|| {
+            StoreError::InvalidAgentTransition(
+                "the selected Goal round provider is unavailable".into(),
+            )
+        })?;
+    let metadata = provider.metadata();
+    validate_provider_metadata(metadata)
+        .map_err(|error| StoreError::InvalidAgentTransition(error.to_string()))?;
+    if metadata.provider_id != selected.provider_id
+        || metadata.model != selected.model
+        || assistant_reply_kind(metadata.reply_kind) != selected.reply_kind
+    {
+        return Err(StoreError::InvalidAgentTransition(
+            "the selected Goal round provider binding changed".into(),
+        ));
+    }
+    let prompt = state
+        .store
+        .current_session_agent_prompt_for_account(&candidate.authz.account_id)
+        .await?;
+    validate_agent_initial_content_budget(&prompt.content, &user_message).map_err(|_| {
+        StoreError::InvalidAgentTransition(
+            "the Goal round prompt exceeds the initial model content budget".into(),
+        )
+    })?;
+    let manifest = state.store.session_agent_manifest_with_prompt(
+        &prompt,
+        metadata.provider_id.clone(),
+        metadata.model.clone(),
+        assistant_reply_kind(metadata.reply_kind),
+    )?;
+    let knowledge = state
+        .store
+        .current_session_agent_knowledge_context_for_account(
+            &candidate.authz.account_id,
+            &user_message,
+        )
+        .await?;
+    let checkpoint = state
+        .store
+        .session_context_checkpoint_for_account(
+            &candidate.authz.account_id,
+            &candidate.session.id,
+            candidate.session.sequence,
+        )
+        .await?;
+    let reply_turns = state
+        .store
+        .session_reply_turns_after_for_account(
+            &candidate.authz.account_id,
+            &candidate.session.id,
+            checkpoint
+                .as_ref()
+                .map_or(0, |checkpoint| checkpoint.source_end_sequence),
+            candidate.session.sequence,
+            AGENT_REQUEST_MAX_HISTORY_PAIRS_WITH_CONTEXT,
+        )
+        .await?;
+    let mut reply_request = ReplyRequest::from_session_history_for_agent_with_optional_system_prompt_checkpoint_and_context(
+        &reply_turns,
+        user_message.clone(),
+        Some(prompt.content.as_str()),
+        checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.summary_text.as_str()),
+        knowledge.snapshot.snapshot().canonical_context(),
+    )
+    .map_err(|error| StoreError::InvalidAgentTransition(error.to_string()))?;
+    reply_request.tools = agent_tools_from_manifest(&manifest);
+    let request_json = persisted_agent_reply_request(&reply_request)
+        .map_err(|error| StoreError::InvalidAgentTransition(error.to_string()))?;
+    let identity = durable_goal_round_identity(
+        &candidate.session.id,
+        &goal_round.goal_id,
+        goal_round.goal_revision,
+        goal_round.round,
+    );
+    let turn_id = format!("goal-round-{identity}");
+    let request = StartTurnRequest {
+        turn_id: turn_id.clone(),
+        user_message,
+        expected_sequence: candidate.session.sequence,
+    };
+    let agent = AgentTurnSpec {
+        id: durable_agent_id(&candidate.session.id, &turn_id),
+        authz: candidate.authz,
+        environment: state.store.session_agent_environment().to_owned(),
+        provider_name: metadata.provider_id.clone(),
+        model_name: metadata.model.clone(),
+        request_json,
+        manifest,
+        knowledge,
+    };
+    if !state.store.is_session_goal_armed(
+        &candidate.session.id,
+        &goal_round.goal_id,
+        goal_round.goal_revision,
+    ) {
+        return Ok(());
+    }
+    state
+        .store
+        .start_goal_round_and_enqueue_agent(
+            &candidate.session.id,
+            request,
+            &format!("goal-round-{identity}"),
+            agent,
+            goal_round,
+        )
+        .await?;
+    kick_agent_model_worker(state);
+    Ok(())
+}
+
 fn kick_compaction_worker(state: &ApiState) {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         return;
@@ -4154,8 +4371,11 @@ async fn process_agent_model_job(
                 ));
             }
         },
-        AgentModelCompletion::Final(_) => kick_compaction_worker(state),
-        AgentModelCompletion::Terminal(_) => {}
+        AgentModelCompletion::Final(_) => {
+            kick_compaction_worker(state);
+            kick_goal_round_worker(state);
+        }
+        AgentModelCompletion::Terminal(_) => state.store.disarm_session_goal(&job.session_id),
     }
     Ok(())
 }
@@ -4176,6 +4396,7 @@ async fn settle_agent_model_failure(
         state.store.complete_agent_model_failure(commit.clone())
     })
     .await?;
+    state.store.disarm_session_goal(&job.session_id);
     Ok(())
 }
 
@@ -4373,6 +4594,8 @@ async fn settle_known_agent_tool(
     result_json: serde_json::Value,
     provider_request_id: Option<String>,
 ) -> Result<(), StoreError> {
+    let committed_status = status.clone();
+    let committed_result = result_json.clone();
     let next_request_json = continuation_request_json_for_work(work, &result_json);
     let commit = AgentToolCompletionCommit {
         call_id: work.call.call_id.clone(),
@@ -4400,8 +4623,15 @@ async fn settle_known_agent_tool(
         }
         Err(error) => return Err(error),
     };
+    if committed_status == AgentToolCallStatus::Succeeded {
+        state
+            .store
+            .apply_committed_goal_tool_result(work, &committed_result)?;
+    }
     if matches!(completion, AgentToolCompletion::ModelQueued { .. }) {
         kick_agent_model_worker(state);
+    } else {
+        state.store.disarm_session_goal(&work.call.session_id);
     }
     Ok(())
 }
@@ -4422,6 +4652,7 @@ async fn settle_agent_tool_outcome_unknown(
             .complete_agent_tool_outcome_unknown(commit.clone())
     })
     .await?;
+    state.store.disarm_session_goal(&call.session_id);
     Ok(())
 }
 
@@ -4642,6 +4873,7 @@ async fn cancel_agent_turn(
     Path((id, turn_id)): Path<(String, String)>,
     payload: Result<Json<CancelAgentTurnRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
+    state.store.disarm_session_goal(&id);
     let Json(request) = payload
         .map_err(ApiError::invalid_json)
         .map_err(ApiError::with_no_store)?;
@@ -4818,6 +5050,9 @@ async fn start_turn(
     headers: HeaderMap,
     payload: Result<Json<StartTurnRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
+    // A direct human turn always wins over process-local automatic
+    // continuation, including while its request context is still being built.
+    state.store.disarm_session_goal(&id);
     state
         .store
         .authorize_session_for_actor(&current.principal.authz, &id)
@@ -9003,6 +9238,38 @@ mod tests {
                     3 => ReplyOutput::Final {
                         content: "durable Goal created".into(),
                     },
+                    4 => ReplyOutput::ToolCall {
+                        call: ReplyToolCall::new(
+                            "provider-call-goal-round-read",
+                            goals::GET_GOAL_TOOL_NAME,
+                            serde_json::json!({}),
+                        ),
+                    },
+                    5 => {
+                        let goal_result = request
+                            .messages
+                            .iter()
+                            .rev()
+                            .find(|message| message.role == ReplyRole::Tool)
+                            .and_then(|message| {
+                                serde_json::from_str::<serde_json::Value>(&message.content).ok()
+                            })
+                            .expect("the Goal round read must return the current Goal");
+                        ReplyOutput::ToolCall {
+                            call: ReplyToolCall::new(
+                                "provider-call-goal-round-complete",
+                                goals::UPDATE_GOAL_TOOL_NAME,
+                                serde_json::json!({
+                                    "goal_id": goal_result["goal"]["id"],
+                                    "expected_revision": goal_result["goal"]["revision"],
+                                    "action": "complete"
+                                }),
+                            ),
+                        }
+                    }
+                    6 => ReplyOutput::Final {
+                        content: "durable Goal completed in round one".into(),
+                    },
                     call => panic!("unexpected Goal provider call {call}"),
                 }
             };
@@ -10798,8 +11065,19 @@ mod tests {
             .unwrap();
         assert_eq!(started.status(), StatusCode::ACCEPTED);
 
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if requests.lock().unwrap().len() >= 6 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the armed Goal must admit and finish its first round");
         let session = wait_for_ready_session(&store, &owner.authz, "session-agent-goal").await;
-        assert_eq!(session.session.sequence, 4);
+        assert_eq!(session.session.sequence, 7);
+        assert_eq!(session.turns.len(), 2);
         let agent = wait_for_agent_status(
             &store,
             &owner.authz,
@@ -10818,14 +11096,36 @@ mod tests {
         let goal = agent
             .goal
             .expect("create_goal must publish its durable Session projection");
-        assert_eq!(goal.revision, 1);
+        assert_eq!(goal.revision, 2);
         assert_eq!(goal.objective, "Deliver the durable Goal core");
-        assert_eq!(goal.phase, protocol::AgentGoalPhase::Active);
+        assert_eq!(goal.phase, protocol::AgentGoalPhase::Completed);
+        assert_eq!(goal.rounds_started, 1);
         assert_eq!(goal.max_rounds, 32);
-        assert_eq!(goal.call_id, agent.calls[1].call_id);
+        assert_ne!(goal.call_id, agent.calls[1].call_id);
+
+        let round_turn = session
+            .turns
+            .iter()
+            .find(|turn| turn.user_message.starts_with("<goal_round>\n"))
+            .expect("the Goal round must be a real Session turn");
+        let round_agent = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            "session-agent-goal",
+            &round_turn.id,
+            protocol::AgentTurnStatus::Succeeded,
+        )
+        .await;
+        assert_eq!(round_agent.model_steps, 3);
+        assert_eq!(round_agent.tool_calls, 2);
+        assert_eq!(round_agent.calls[0].tool, goals::GET_GOAL_TOOL_NAME);
+        assert_eq!(round_agent.calls[1].tool, goals::UPDATE_GOAL_TOOL_NAME);
+        assert!(round_agent.calls.iter().all(|call| {
+            call.status == AgentToolCallStatus::Succeeded && !call.approval_required
+        }));
 
         let recorded = requests.lock().unwrap().clone();
-        assert_eq!(recorded.len(), 3);
+        assert_eq!(recorded.len(), 6);
         let read_result = recorded[1]
             .messages
             .iter()
@@ -10846,6 +11146,28 @@ mod tests {
         assert_eq!(create_result["goal"]["id"], goal.id);
         assert_eq!(create_result["goal"]["revision"], 1);
         assert_eq!(create_result["goal"]["phase"], "active");
+        assert_eq!(create_result["activation"], "armed");
+        let round_prompt = recorded[3]
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == ReplyRole::User)
+            .expect("the Goal round must contain its exact driver prompt");
+        assert_eq!(round_prompt.content, round_turn.user_message);
+        assert!(round_prompt.content.contains("Round: 1/32"));
+        let completed_result = recorded[5]
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == ReplyRole::Tool)
+            .expect("the round completion must contain its exact Goal result");
+        let completed_result: serde_json::Value =
+            serde_json::from_str(&completed_result.content).unwrap();
+        assert_eq!(completed_result["goal"]["revision"], 2);
+        assert_eq!(completed_result["goal"]["rounds_started"], 1);
+        assert_eq!(completed_result["goal"]["phase"], "completed");
+        assert_eq!(completed_result["activation"], "disarmed");
+        store.readiness().await.unwrap();
         drop(app);
     }
 
