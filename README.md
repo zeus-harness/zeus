@@ -160,6 +160,19 @@ ledger, provider metadata, or application logs.
 Partial provider configuration fails startup. The endpoint and key are never
 writable through the browser Settings API.
 
+When a remote model is configured, Zeus registers that model as the startup
+default and also registers the explicit `local-fallback` provider. Authenticated
+actors can read the secret-free catalog at `GET /api/v1/providers`; account
+owners can read or change the effective selection with
+`GET|PUT /api/v1/account/reply-provider`. The `PUT` body contains only
+`provider_id` and `expected_revision` and requires `Idempotency-Key`; endpoint,
+credential, and SecretRef values are never accepted over HTTP. The selection is
+account-scoped, revisioned, audited, and durable. It affects only newly admitted
+turns: queued reply, compaction, model, and tool work keeps its exact provider
+binding and resolves that provider from the startup registry. If an explicitly
+selected or queued provider is absent after restart, Zeus fails closed instead
+of silently switching providers.
+
 Each accepted turn builds the initial provider request from exactly one stable
 system message, an optional durable compaction checkpoint, the newest complete,
 flushed user/assistant pairs that existed at the submitted
@@ -739,6 +752,12 @@ and bounded memory, CPU, and PID resources.
   a started call without a durable result becomes `outcome_unknown`. Failed or
   indeterminate generations block automatic re-enqueue, so the same source is
   never silently retried under a new job ID.
+  Schema v26 adds account-scoped reply-provider selection. It stores only the
+  secret-free provider/model/kind binding, owner authority, monotonic revision,
+  immutable idempotency receipt, and account-audit evidence. Revision zero is
+  the running service's implicit startup default. Provider endpoints,
+  credentials, and SecretRefs remain process-owned, and queued work retains its
+  immutable provider identity across later account selection changes.
   Existing Runs and events are decoded, validated, and migrated in place without
   rewriting their payloads. Runtime identity still binds profile, environment,
   primary Session and Run, policy ID, and policy revision; a mismatch fails
@@ -954,7 +973,7 @@ directly.
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Current schema v25 retains durable Run attachment during migration and demo
+Current schema v26 retains durable Run attachment during migration and demo
 seeding, but Alpha+ does not expose a public attach-Run HTTP route.
 
 The application boundary now caps auth JSON at 8 KiB, command JSON at 512 KiB,
@@ -979,7 +998,7 @@ approval, dispatch, reply completion, attachment checks, and startup recovery
 use typed point queries or fixed 64-row batches. Production Session list/detail,
 Run detail, and overview reads now use indexed `LIMIT + 1` keyset pages inside
 actor-authorized SQLite snapshots; no production HTTP read loads a complete
-ledger or collection. Current schema v25 retains bounded Session, open-turn,
+ledger or collection. Current schema v26 retains bounded Session, open-turn,
 active reply/dispatch, auth-session, bootstrap-audit, event-slot, and logical
 event-payload-byte admission. Exact idempotent replay is checked before capacity,
 while accepted work consumes its reserved terminal slots and payload bytes
@@ -1062,16 +1081,16 @@ Index, schema v17 Durable Session Agent Loop, schema v18 exact tool-completion
 replay, schema v19 deployment-manifest binding, schema v20 execution-ledger,
 schema v21 prepared claims, schema v22 durable knowledge-context binding, and
 schema v23 account knowledge catalog ingestion, schema v24 account Agent prompt
-governance, schema v25 durable Session context compaction, Trusted Single-Node
-Ingress, Per-Operation SecretRef Resolution, and the bounded multi-account
-control plane:
+governance, schema v25 durable Session context compaction, schema v26
+account-scoped reply provider selection, Trusted Single-Node Ingress,
+Per-Operation SecretRef Resolution, and the bounded multi-account control plane:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 611 tests passed
+- `cargo test --workspace --all-targets --locked`: 615 tests passed
   across the top-level test targets, including 22 connector tests,
   8 deployment tests, 29 knowledge tests, 30 LLM unit and 15 provider-contract
-  tests, 254 storage tests, 48 runtime tests, 80 API library tests, 11 API main/config
+  tests, 256 storage tests, 48 runtime tests, 82 API library tests, 11 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,

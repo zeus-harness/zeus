@@ -780,6 +780,40 @@ pub struct AgentPromptUpdateResult {
     pub replayed: bool,
 }
 
+/// Secret-free provider binding selected for one account.
+///
+/// Revision zero is the implicit provider chosen by the running service. An
+/// explicit owner update starts at revision one and persists only metadata
+/// that is already safe to bind into durable jobs and provenance.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AccountReplyProviderState {
+    pub account_id: AccountId,
+    pub revision: u64,
+    pub provider_id: String,
+    pub model: Option<String>,
+    pub reply_kind: protocol::AssistantReplyKind,
+    pub updated_by_user_id: Option<String>,
+    pub updated_by_membership_revision: Option<MembershipRevision>,
+    pub updated_at: Option<String>,
+}
+
+/// Server-resolved owner update. HTTP callers choose only `provider_id`; the
+/// service copies the remaining fields from its trusted startup registry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountReplyProviderCommit {
+    pub expected_revision: u64,
+    pub provider_id: String,
+    pub model: Option<String>,
+    pub reply_kind: protocol::AssistantReplyKind,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AccountReplyProviderUpdateResult {
+    pub provider: AccountReplyProviderState,
+    pub replayed: bool,
+}
+
 /// Bounded owner-facing metadata for one immutable Agent prompt revision.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct AgentPromptRevisionSummary {

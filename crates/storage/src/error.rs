@@ -76,6 +76,10 @@ pub enum StorageError {
     AgentPromptRevisionNotFound(u64),
     #[error("invalid account Agent prompt: {0}")]
     InvalidAgentPrompt(String),
+    #[error("the account reply provider changed concurrently")]
+    AccountReplyProviderRevisionConflict,
+    #[error("invalid account reply provider: {0}")]
+    InvalidAccountReplyProvider(String),
     #[error(
         "account audit policy for `{account_id}` retains {detail_rows} detail rows, above the configured limit {configured_limit}"
     )]

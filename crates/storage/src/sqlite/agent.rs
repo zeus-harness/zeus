@@ -113,6 +113,25 @@ struct StoredLegacyAgentKnowledgeCommitment {
 }
 
 impl SqliteStore {
+    /// Peek the exact queue head that this holder would prepare next. This does
+    /// not authorize provider I/O; the subsequent prepare/start transaction
+    /// rechecks the manifest, knowledge, and actor bindings.
+    pub async fn next_agent_model_for_holder(
+        &self,
+        holder_id: &str,
+    ) -> Result<Option<AgentModelJob>, StorageError> {
+        let holder_id = normalized_account_value(
+            holder_id,
+            "Agent operation holder ID",
+            AGENT_OPERATION_HOLDER_MAX_BYTES,
+        )?
+        .to_owned();
+        self.with_progress_connection(move |connection| {
+            peek_next_agent_model_for_holder(connection, &holder_id)
+        })
+        .await
+    }
+
     /// Durably prepares one queued model step without authorizing external I/O.
     /// A process crash in this phase is safe to reclaim because the job and
     /// Agent workflow both remain queued.
@@ -213,6 +232,25 @@ impl SqliteStore {
         let physical_limits = self.physical_limits.clone();
         self.with_progress_connection(move |connection| {
             complete_agent_model_failure(connection, commit, &physical_limits)
+        })
+        .await
+    }
+
+    /// Durably prepares one already-admitted tool call without authorizing
+    /// connector I/O. Its exact model transcript remains attached to the
+    /// returned preparation.
+    pub async fn next_agent_tool_for_holder(
+        &self,
+        holder_id: &str,
+    ) -> Result<Option<AgentToolWork>, StorageError> {
+        let holder_id = normalized_account_value(
+            holder_id,
+            "Agent operation holder ID",
+            AGENT_OPERATION_HOLDER_MAX_BYTES,
+        )?
+        .to_owned();
+        self.with_progress_connection(move |connection| {
+            peek_next_agent_tool_for_holder(connection, &holder_id)
         })
         .await
     }
@@ -478,6 +516,51 @@ impl SqliteStore {
         })
         .await
     }
+}
+
+fn peek_next_agent_model_for_holder(
+    connection: &mut Connection,
+    holder_id: &str,
+) -> Result<Option<AgentModelJob>, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (timestamp, _) = agent_operation_claim_window()?;
+    expire_prepared_agent_operation_claims(&transaction, &timestamp)?;
+    let job_id = if let Some(claim) = query_prepared_agent_operation_claim_for_holder(
+        &transaction,
+        AgentOperationKind::Model,
+        holder_id,
+    )? {
+        Some(claim.operation_id)
+    } else {
+        transaction
+            .query_row(
+                r#"SELECT id FROM agent_model_jobs
+                   WHERE status = 'queued'
+                     AND NOT EXISTS (
+                         SELECT 1 FROM agent_operation_claims claim
+                         WHERE claim.operation_kind = 'model'
+                           AND claim.operation_id = agent_model_jobs.id
+                           AND claim.phase IN ('prepared', 'started')
+                     )
+                   ORDER BY queued_at, id LIMIT 1"#,
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+    };
+    let job = job_id
+        .as_deref()
+        .map(|job_id| query_agent_model_job_by_id(&transaction, job_id))
+        .transpose()?;
+    if let Some(job) = job.as_ref()
+        && (job.status != AgentModelJobStatus::Queued || job.attempt != 0)
+    {
+        return Err(StorageError::CorruptData(
+            "the next Agent model queue binding is not queued".into(),
+        ));
+    }
+    transaction.commit()?;
+    Ok(job)
 }
 
 fn prepare_next_agent_model(
@@ -1364,6 +1447,54 @@ fn complete_agent_model_failure(
     let completion = interrupt_agent_turn(&transaction, &agent, reason)?;
     transaction.commit()?;
     Ok(completion)
+}
+
+fn peek_next_agent_tool_for_holder(
+    connection: &mut Connection,
+    holder_id: &str,
+) -> Result<Option<AgentToolWork>, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (timestamp, _) = agent_operation_claim_window()?;
+    expire_prepared_agent_operation_claims(&transaction, &timestamp)?;
+    let call_id = if let Some(claim) = query_prepared_agent_operation_claim_for_holder(
+        &transaction,
+        AgentOperationKind::Tool,
+        holder_id,
+    )? {
+        Some(claim.operation_id)
+    } else {
+        transaction
+            .query_row(
+                r#"SELECT call_id FROM agent_tool_calls
+                   WHERE status = 'queued'
+                     AND NOT EXISTS (
+                         SELECT 1 FROM agent_operation_claims claim
+                         WHERE claim.operation_kind = 'tool'
+                           AND claim.operation_id = agent_tool_calls.call_id
+                           AND claim.phase IN ('prepared', 'started')
+                     )
+                   ORDER BY created_at, call_id LIMIT 1"#,
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+    };
+    let work = call_id
+        .as_deref()
+        .map(|call_id| {
+            let call = query_agent_tool_call(&transaction, call_id)?;
+            if call.status != AgentToolCallStatus::Queued {
+                return Err(StorageError::CorruptData(
+                    "the next Agent tool queue binding is not queued".into(),
+                ));
+            }
+            let model_job = query_agent_model_job(&transaction, &call.agent_id, call.model_step)?;
+            validate_persisted_agent_model_tool_response(&model_job, &call)?;
+            Ok(AgentToolWork { call, model_job })
+        })
+        .transpose()?;
+    transaction.commit()?;
+    Ok(work)
 }
 
 fn prepare_next_agent_tool(

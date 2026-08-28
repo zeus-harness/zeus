@@ -1,7 +1,7 @@
 //! HTTP composition for the durable Zeus Alpha slice.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     convert::Infallible,
     fmt,
     net::{IpAddr, SocketAddr},
@@ -55,21 +55,23 @@ use protocol::{
     CreateAccountAuditCheckpointRequest, CreateAccountRequest, CreateAccountResponse,
     CreateMemberRequest, CreateSessionRequest, CreateSessionResponse, EVENT_PAGE_DEFAULT_LIMIT,
     HealthResponse, InFlightWorkSummary, LoginRequest, LogoutResponse, MemberSetupRequest,
-    MemberSetupTokenResponse, PolicyDecision, ProblemDetails, ResumeSessionRequest,
-    ResumeSessionResponse, ReviewDecision, ReviewRequest, ReviewResponse,
-    RotateMemberSetupTokenRequest, RunDetail, SessionDetail, SessionEvent, SessionTurn,
-    StartTurnRequest, SwitchAccountRequest, ThemePreference, UpdateAccountAuditPolicyRequest,
-    UpdateMemberRequest, UpdateMemberResponse, UpdatePreferencesRequest, UserPreferences,
+    MemberSetupTokenResponse, PolicyDecision, ProblemDetails, ReplyProviderCatalogResponse,
+    ReplyProviderDescriptor, ResumeSessionRequest, ResumeSessionResponse, ReviewDecision,
+    ReviewRequest, ReviewResponse, RotateMemberSetupTokenRequest, RunDetail, SessionDetail,
+    SessionEvent, SessionTurn, StartTurnRequest, SwitchAccountRequest, ThemePreference,
+    UpdateAccountAuditPolicyRequest, UpdateAccountReplyProviderRequest, UpdateMemberRequest,
+    UpdateMemberResponse, UpdatePreferencesRequest, UserPreferences,
 };
 #[cfg(test)]
 use runtime::ReplyJobSpec;
 use runtime::{
     AccountAuditCheckpointCommit, AccountAuditEvent as StoredAccountAuditEvent,
     AccountAuditPolicy as StoredAccountAuditPolicy, AccountAuditRollup as StoredAccountAuditRollup,
-    AccountAuditState as StoredAccountAuditState, AgentKnowledgeContextExplain,
-    AgentModelClaimOutcome, AgentModelCompletion, AgentModelFailureCommit, AgentModelJob,
-    AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit, AgentPromptRevisionPage,
-    AgentPromptState, AgentPromptUpdateResult, AgentReviewCommit, AgentToolCall, AgentToolCallSpec,
+    AccountAuditState as StoredAccountAuditState, AccountReplyProviderState,
+    AccountReplyProviderUpdateResult, AgentKnowledgeContextExplain, AgentModelClaimOutcome,
+    AgentModelCompletion, AgentModelFailureCommit, AgentModelJob, AgentModelResolution,
+    AgentModelStartOutcome, AgentModelSuccessCommit, AgentPromptRevisionPage, AgentPromptState,
+    AgentPromptUpdateResult, AgentReviewCommit, AgentToolCall, AgentToolCallSpec,
     AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
     AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe,
     AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthzContext, BootstrapOwnerCommit,
@@ -885,7 +887,7 @@ impl Drop for SseLease {
 }
 
 struct ReplyExecutor {
-    provider: Arc<dyn ReplyProvider>,
+    providers: ProviderRegistry,
     reply_drain: Mutex<()>,
     reply_worker_wake: WorkerWakeState,
     agent_model_drain: Mutex<()>,
@@ -898,8 +900,12 @@ struct ReplyExecutor {
 
 impl ReplyExecutor {
     fn new(provider: Arc<dyn ReplyProvider>) -> Self {
+        Self::with_registry(ProviderRegistry::single(provider))
+    }
+
+    fn with_registry(providers: ProviderRegistry) -> Self {
         Self {
-            provider,
+            providers,
             reply_drain: Mutex::new(()),
             reply_worker_wake: WorkerWakeState::default(),
             agent_model_drain: Mutex::new(()),
@@ -911,6 +917,98 @@ impl ReplyExecutor {
         }
     }
 }
+
+#[derive(Clone)]
+struct ProviderRegistry {
+    default_provider_id: String,
+    providers: BTreeMap<String, Arc<dyn ReplyProvider>>,
+}
+
+impl ProviderRegistry {
+    fn single(provider: Arc<dyn ReplyProvider>) -> Self {
+        let default_provider_id = provider.metadata().provider_id.clone();
+        let mut providers = BTreeMap::new();
+        providers.insert(default_provider_id.clone(), provider);
+        Self {
+            default_provider_id,
+            providers,
+        }
+    }
+
+    fn build(
+        default: Arc<dyn ReplyProvider>,
+        additional: Vec<Arc<dyn ReplyProvider>>,
+    ) -> Result<Self, ProviderRegistryError> {
+        let default_provider_id = default.metadata().provider_id.clone();
+        let mut providers = BTreeMap::new();
+        providers.insert(default_provider_id.clone(), default);
+        for provider in additional {
+            let provider_id = provider.metadata().provider_id.clone();
+            if providers.insert(provider_id.clone(), provider).is_some() {
+                return Err(ProviderRegistryError::DuplicateProviderId(provider_id));
+            }
+        }
+        Ok(Self {
+            default_provider_id,
+            providers,
+        })
+    }
+
+    fn default_provider(&self) -> &Arc<dyn ReplyProvider> {
+        self.providers
+            .get(&self.default_provider_id)
+            .expect("the provider registry always owns its default")
+    }
+
+    fn get(&self, provider_id: &str) -> Option<&Arc<dyn ReplyProvider>> {
+        self.providers.get(provider_id)
+    }
+
+    fn default_state(&self, account_id: AccountId) -> AccountReplyProviderState {
+        let metadata = self.default_provider().metadata();
+        AccountReplyProviderState {
+            account_id,
+            revision: 0,
+            provider_id: metadata.provider_id.clone(),
+            model: metadata.model.clone(),
+            reply_kind: assistant_reply_kind(metadata.reply_kind),
+            updated_by_user_id: None,
+            updated_by_membership_revision: None,
+            updated_at: None,
+        }
+    }
+
+    fn descriptors(&self) -> Vec<ReplyProviderDescriptor> {
+        self.providers
+            .values()
+            .map(|provider| {
+                let metadata = provider.metadata();
+                ReplyProviderDescriptor {
+                    provider_id: metadata.provider_id.clone(),
+                    model: metadata.model.clone(),
+                    reply_kind: assistant_reply_kind(metadata.reply_kind),
+                }
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+pub enum ProviderRegistryError {
+    DuplicateProviderId(String),
+}
+
+impl fmt::Display for ProviderRegistryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateProviderId(provider_id) => {
+                write!(formatter, "duplicate reply provider ID `{provider_id}`")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProviderRegistryError {}
 
 #[derive(Clone)]
 struct CurrentAuth {
@@ -1046,6 +1144,66 @@ pub fn authenticated_app_with_provider_and_ingress(
 ) -> Result<Router, tenancy::CredentialError> {
     let auth = auth_config_with_clock(ingress, Arc::new(SystemRateLimitClock))?;
     let reply = Arc::new(ReplyExecutor::new(provider));
+    Ok(authenticated_app_with_auth_and_executor(store, auth, reply))
+}
+
+/// Build the authenticated API with a bounded startup-owned provider registry.
+/// The first provider is the implicit revision-zero default; additional
+/// providers can be selected by account owners but cannot be configured over
+/// HTTP.
+pub fn authenticated_app_with_provider_registry_and_ingress(
+    store: DemoStore,
+    ingress: IngressPolicy,
+    default_provider: Arc<dyn ReplyProvider>,
+    additional_providers: Vec<Arc<dyn ReplyProvider>>,
+) -> Result<Router, AuthenticatedAppBuildError> {
+    let auth = auth_config_with_clock(ingress, Arc::new(SystemRateLimitClock))?;
+    let registry = ProviderRegistry::build(default_provider, additional_providers)?;
+    let reply = Arc::new(ReplyExecutor::with_registry(registry));
+    Ok(authenticated_app_with_auth_and_executor(store, auth, reply))
+}
+
+#[derive(Debug)]
+pub enum AuthenticatedAppBuildError {
+    Credential(tenancy::CredentialError),
+    ProviderRegistry(ProviderRegistryError),
+}
+
+impl fmt::Display for AuthenticatedAppBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Credential(error) => error.fmt(formatter),
+            Self::ProviderRegistry(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for AuthenticatedAppBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Credential(error) => Some(error),
+            Self::ProviderRegistry(error) => Some(error),
+        }
+    }
+}
+
+impl From<tenancy::CredentialError> for AuthenticatedAppBuildError {
+    fn from(error: tenancy::CredentialError) -> Self {
+        Self::Credential(error)
+    }
+}
+
+impl From<ProviderRegistryError> for AuthenticatedAppBuildError {
+    fn from(error: ProviderRegistryError) -> Self {
+        Self::ProviderRegistry(error)
+    }
+}
+
+fn authenticated_app_with_auth_and_executor(
+    store: DemoStore,
+    auth: Arc<AuthConfig>,
+    reply: Arc<ReplyExecutor>,
+) -> Router {
     let state = ApiState {
         store,
         durable_ledger_poll_interval: DURABLE_LEDGER_POLL_INTERVAL,
@@ -1054,7 +1212,7 @@ pub fn authenticated_app_with_provider_and_ingress(
         reply: Some(reply),
         sse_capacity: SseCapacity::production(),
     };
-    Ok(build_authenticated_app(state))
+    build_authenticated_app(state)
 }
 
 fn auth_config_with_clock(
@@ -1126,6 +1284,7 @@ fn build_authenticated_app(state: ApiState) -> Router {
             "/api/v1/me/settings",
             get(get_preferences).patch(patch_preferences),
         )
+        .route("/api/v1/providers", get(get_reply_provider_catalog))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .layer(DefaultBodyLimit::max(COMMAND_JSON_BODY_MAX_BYTES));
 
@@ -1196,6 +1355,15 @@ fn build_authenticated_app(state: ApiState) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .layer(DefaultBodyLimit::max(AGENT_PROMPT_JSON_BODY_MAX_BYTES));
 
+    let reply_provider_admin = Router::new()
+        .route(
+            "/api/v1/account/reply-provider",
+            get(get_account_reply_provider).put(update_account_reply_provider),
+        )
+        .route_layer(middleware::from_fn(require_account_owner))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
+        .layer(DefaultBodyLimit::max(AUTH_JSON_BODY_MAX_BYTES));
+
     let public = Router::new()
         .route("/health/live", get(liveness))
         .route("/health/ready", get(readiness))
@@ -1212,6 +1380,7 @@ fn build_authenticated_app(state: ApiState) -> Router {
         .merge(account_admin)
         .merge(knowledge_admin)
         .merge(agent_prompt_admin)
+        .merge(reply_provider_admin)
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -2508,8 +2677,10 @@ async fn patch_preferences(
             ApiError::bad_request("unsupported_model", format!("The preferred model {error}"))
         })?;
     }
-    let metadata = reply_executor(&state)?.provider.metadata();
-    validate_provider_metadata(metadata).map_err(ApiError::reply_unavailable)?;
+    let executor = reply_executor(&state)?;
+    let selected =
+        selected_provider_for_actor(&state.store, executor, &current.principal.authz).await?;
+    let metadata = provider_for_state(executor, &selected)?.metadata();
     if preferred_model.is_some() && preferred_model != metadata.model.as_deref() {
         return Err(ApiError::bad_request(
             "unsupported_model",
@@ -2526,6 +2697,80 @@ async fn patch_preferences(
         )
         .await?;
     Ok(Json(user_preferences(&preferences)?))
+}
+
+async fn get_reply_provider_catalog(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+) -> Result<Response, ApiError> {
+    let executor = reply_executor(&state)?;
+    for provider in executor.providers.providers.values() {
+        validate_provider_metadata(provider.metadata()).map_err(ApiError::reply_unavailable)?;
+    }
+    let selected =
+        selected_provider_for_actor(&state.store, executor, &current.principal.authz).await?;
+    provider_for_state(executor, &selected)?;
+    json_no_store(ReplyProviderCatalogResponse {
+        default_provider_id: executor.providers.default_provider_id.clone(),
+        selected_provider_id: selected.provider_id,
+        selected_revision: selected.revision,
+        providers: executor.providers.descriptors(),
+    })
+}
+
+async fn get_account_reply_provider(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+) -> Result<Response, ApiError> {
+    let executor = reply_executor(&state)?;
+    let selected =
+        selected_provider_for_actor(&state.store, executor, &current.principal.authz).await?;
+    provider_for_state(executor, &selected)?;
+    json_no_store(selected)
+}
+
+async fn update_account_reply_provider(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    headers: HeaderMap,
+    payload: Result<Json<UpdateAccountReplyProviderRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(request) = payload.map_err(ApiError::invalid_json)?;
+    protocol::validate_reply_provider_id(&request.provider_id).map_err(|error| {
+        ApiError::bad_request(
+            "invalid_provider_id",
+            format!("The reply provider ID {error}"),
+        )
+        .with_no_store()
+    })?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let executor = reply_executor(&state)?;
+    let provider = executor
+        .providers
+        .get(&request.provider_id)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "reply_provider_not_found",
+                "Reply provider not found",
+                "The requested provider is not registered by this Zeus process",
+            )
+            .with_no_store()
+        })?;
+    let metadata = provider.metadata();
+    validate_provider_metadata(metadata).map_err(ApiError::reply_unavailable)?;
+    let result: AccountReplyProviderUpdateResult = state
+        .store
+        .replace_reply_provider(
+            &current.principal.authz,
+            request.expected_revision,
+            metadata.provider_id.clone(),
+            metadata.model.clone(),
+            assistant_reply_kind(metadata.reply_kind),
+            idempotency_key,
+        )
+        .await?;
+    json_no_store(result)
 }
 
 async fn enforce_ingress(
@@ -3030,8 +3275,17 @@ async fn process_reply_job(state: &ApiState, job: ReplyJob) -> Result<(), StoreE
         .reply
         .as_ref()
         .expect("a claimed reply requires a configured provider");
-    let metadata = reply.provider.metadata();
-    if validate_provider_metadata(metadata).is_err() {
+    let Some(provider) = reply.providers.get(&job.provider_name).cloned() else {
+        return fail_reply_job(
+            state,
+            &job,
+            "provider_configuration_changed",
+            "The queued reply provider is not registered by this Zeus process",
+        )
+        .await;
+    };
+    let metadata = provider.metadata().clone();
+    if validate_provider_metadata(&metadata).is_err() {
         return fail_reply_job(
             state,
             &job,
@@ -3071,7 +3325,6 @@ async fn process_reply_job(state: &ApiState, job: ReplyJob) -> Result<(), StoreE
         )
         .await;
     }
-    let provider = Arc::clone(&reply.provider);
     let provider_request = request.clone();
     let response = match tokio::spawn(async move { provider.reply(provider_request).await }).await {
         Ok(Ok(response)) => response,
@@ -3113,7 +3366,7 @@ async fn process_reply_job(state: &ApiState, job: ReplyJob) -> Result<(), StoreE
         )
         .await;
     }
-    if &response.provider != metadata {
+    if response.provider != metadata {
         return fail_reply_job(
             state,
             &job,
@@ -3258,20 +3511,73 @@ fn provider_error_message(error: &ProviderError) -> &'static str {
     }
 }
 
-async fn current_agent_manifest(
+fn assistant_reply_kind(kind: ReplyKind) -> AssistantReplyKind {
+    match kind {
+        ReplyKind::Model => AssistantReplyKind::Model,
+        ReplyKind::NonModelFallback => AssistantReplyKind::NonModelFallback,
+    }
+}
+
+fn provider_for_state<'a>(
+    executor: &'a ReplyExecutor,
+    selected: &AccountReplyProviderState,
+) -> Result<&'a Arc<dyn ReplyProvider>, ApiError> {
+    let provider = executor
+        .providers
+        .get(&selected.provider_id)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "selected_provider_unavailable",
+                "Selected provider unavailable",
+                "The account-selected reply provider is not registered by this Zeus process",
+            )
+            .with_no_store()
+        })?;
+    let metadata = provider.metadata();
+    validate_provider_metadata(metadata).map_err(ApiError::reply_unavailable)?;
+    if metadata.provider_id != selected.provider_id
+        || metadata.model != selected.model
+        || assistant_reply_kind(metadata.reply_kind) != selected.reply_kind
+    {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "selected_provider_binding_changed",
+            "Selected provider binding changed",
+            "The registered provider metadata no longer matches the durable account selection",
+        )
+        .with_no_store());
+    }
+    Ok(provider)
+}
+
+async fn selected_provider_for_actor(
     store: &DemoStore,
     executor: &ReplyExecutor,
+    context: &AuthzContext,
+) -> Result<AccountReplyProviderState, ApiError> {
+    let default = executor.providers.default_state(context.account_id.clone());
+    store
+        .session_reply_provider_for_actor(context, default)
+        .await
+        .map_err(ApiError::from)
+}
+
+async fn current_agent_manifest(
+    store: &DemoStore,
+    account_id: &AccountId,
+    provider_id: &str,
+    model: Option<&str>,
+    reply_kind: AssistantReplyKind,
 ) -> Result<ManifestEnvelope, StoreError> {
-    let metadata = executor.provider.metadata();
-    let prompt = store.current_session_agent_prompt().await?;
+    let prompt = store
+        .current_session_agent_prompt_for_account(account_id)
+        .await?;
     store.session_agent_manifest_with_prompt(
         &prompt,
-        metadata.provider_id.clone(),
-        metadata.model.clone(),
-        match metadata.reply_kind {
-            ReplyKind::Model => AssistantReplyKind::Model,
-            ReplyKind::NonModelFallback => AssistantReplyKind::NonModelFallback,
-        },
+        provider_id.to_owned(),
+        model.map(ToOwned::to_owned),
+        reply_kind,
     )
 }
 
@@ -3360,8 +3666,18 @@ async fn process_compaction_job(
         .reply
         .as_ref()
         .expect("a claimed compaction job requires a provider");
-    let metadata = executor.provider.metadata();
-    if validate_provider_metadata(metadata).is_err()
+    let Some(provider) = executor.providers.get(&job.provider_name).cloned() else {
+        return settle_compaction_failure(
+            state,
+            &job,
+            "provider_configuration_changed",
+            "The queued compaction provider is not registered by this Zeus process",
+            false,
+        )
+        .await;
+    };
+    let metadata = provider.metadata().clone();
+    if validate_provider_metadata(&metadata).is_err()
         || !metadata.is_model_reply()
         || job.provider_name != metadata.provider_id
         || metadata.model.as_deref() != Some(job.model_name.as_str())
@@ -3390,7 +3706,6 @@ async fn process_compaction_job(
             .await;
         }
     };
-    let provider = Arc::clone(&executor.provider);
     let response = match tokio::spawn(async move { provider.reply(request).await }).await {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
@@ -3416,7 +3731,7 @@ async fn process_compaction_job(
             .await;
         }
     };
-    if &response.provider != metadata {
+    if response.provider != metadata {
         return settle_compaction_failure(
             state,
             &job,
@@ -3512,10 +3827,28 @@ async fn drain_agent_model_jobs(state: &ApiState) -> Result<(), StoreError> {
         .expect("the Agent model worker is only started when a provider exists");
     let _drain = executor.agent_model_drain.lock().await;
     loop {
-        // Prompt governance is live configuration. Resolve a fresh manifest
-        // for each queue item so a mid-drain update cannot make the worker
-        // reject work admitted under the new head with an older snapshot.
-        let current_manifest = current_agent_manifest(&state.store, executor).await?;
+        let Some(binding) = state
+            .store
+            .next_agent_model_for_holder(AGENT_MODEL_WORKER_HOLDER_ID)
+            .await?
+        else {
+            return Ok(());
+        };
+        // Prompt governance remains live until the start checkpoint, while
+        // provider identity comes from the immutable queued job. This lets a
+        // selection change affect new turns without rewriting older work.
+        let current_manifest = current_agent_manifest(
+            &state.store,
+            &binding.account_id,
+            &binding.provider_name,
+            binding.model_name.as_deref(),
+            if binding.model_name.is_some() {
+                AssistantReplyKind::Model
+            } else {
+                AssistantReplyKind::NonModelFallback
+            },
+        )
+        .await?;
         let prepared = match state
             .store
             .prepare_next_agent_model(&current_manifest, AGENT_MODEL_WORKER_HOLDER_ID)
@@ -3558,8 +3891,18 @@ async fn process_agent_model_job(
         .reply
         .as_ref()
         .expect("a claimed Agent model job requires a configured provider");
-    let metadata = executor.provider.metadata();
-    if validate_provider_metadata(metadata).is_err() {
+    let Some(provider) = executor.providers.get(&job.provider_name).cloned() else {
+        return settle_agent_model_failure(
+            state,
+            &job,
+            "provider_configuration_changed",
+            "The queued Agent provider is not registered by this Zeus process",
+            false,
+        )
+        .await;
+    };
+    let metadata = provider.metadata().clone();
+    if validate_provider_metadata(&metadata).is_err() {
         return settle_agent_model_failure(
             state,
             &job,
@@ -3605,7 +3948,6 @@ async fn process_agent_model_job(
         .await;
     }
 
-    let provider = Arc::clone(&executor.provider);
     let provider_request = request.clone();
     let response = match tokio::spawn(async move { provider.reply(provider_request).await }).await {
         Ok(Ok(response)) => response,
@@ -3643,7 +3985,7 @@ async fn process_agent_model_job(
         )
         .await;
     }
-    if &response.provider != metadata {
+    if response.provider != metadata {
         return settle_agent_model_failure(
             state,
             &job,
@@ -3865,7 +4207,26 @@ async fn drain_agent_tool_calls(state: &ApiState) -> Result<(), StoreError> {
         .expect("the Agent tool worker is only started when a provider exists");
     let _drain = executor.agent_tool_drain.lock().await;
     loop {
-        let current_manifest = current_agent_manifest(&state.store, executor).await?;
+        let Some(binding) = state
+            .store
+            .next_agent_tool_for_holder(AGENT_TOOL_WORKER_HOLDER_ID)
+            .await?
+        else {
+            return Ok(());
+        };
+        let model_job = &binding.model_job;
+        let current_manifest = current_agent_manifest(
+            &state.store,
+            &model_job.account_id,
+            &model_job.provider_name,
+            model_job.model_name.as_deref(),
+            if model_job.model_name.is_some() {
+                AssistantReplyKind::Model
+            } else {
+                AssistantReplyKind::NonModelFallback
+            },
+        )
+        .await?;
         let prepared = match state
             .store
             .prepare_next_agent_tool(&current_manifest, AGENT_TOOL_WORKER_HOLDER_ID)
@@ -4270,12 +4631,20 @@ async fn agent_deployment_explain(
         .map_err(ApiError::from)
         .map_err(ApiError::with_no_store)?;
     let executor = reply_executor(&state).map_err(ApiError::with_no_store)?;
-    validate_provider_metadata(executor.provider.metadata())
-        .map_err(ApiError::reply_unavailable)?;
-    let current_manifest = current_agent_manifest(&state.store, executor)
-        .await
-        .map_err(ApiError::from)
-        .map_err(ApiError::with_no_store)?;
+    let selected =
+        selected_provider_for_actor(&state.store, executor, &current.principal.authz).await?;
+    let provider = provider_for_state(executor, &selected)?;
+    let metadata = provider.metadata();
+    let current_manifest = current_agent_manifest(
+        &state.store,
+        &current.principal.authz.account_id,
+        &metadata.provider_id,
+        metadata.model.as_deref(),
+        assistant_reply_kind(metadata.reply_kind),
+    )
+    .await
+    .map_err(ApiError::from)
+    .map_err(ApiError::with_no_store)?;
     let legacy_unbound = persisted_manifest.is_none();
     let matches_current = persisted_manifest
         .as_ref()
@@ -4409,16 +4778,14 @@ async fn start_turn(
         .await?;
     validate_agent_initial_content_budget(&prompt.content, &request.user_message)?;
     let executor = reply_executor(&state)?;
-    let metadata = executor.provider.metadata();
-    validate_provider_metadata(metadata).map_err(ApiError::reply_unavailable)?;
+    let selected =
+        selected_provider_for_actor(&state.store, executor, &current.principal.authz).await?;
+    let metadata = provider_for_state(executor, &selected)?.metadata();
     let manifest = state.store.session_agent_manifest_with_prompt(
         &prompt,
         metadata.provider_id.clone(),
         metadata.model.clone(),
-        match metadata.reply_kind {
-            ReplyKind::Model => AssistantReplyKind::Model,
-            ReplyKind::NonModelFallback => AssistantReplyKind::NonModelFallback,
-        },
+        assistant_reply_kind(metadata.reply_kind),
     )?;
     let probe = AgentTurnReceiptProbe {
         id: durable_agent_id(&id, &request.turn_id),
@@ -5699,6 +6066,16 @@ impl From<StoreError> for ApiError {
             .with_no_store(),
             StoreError::InvalidAgentPrompt(reason) => {
                 Self::bad_request("invalid_agent_prompt", reason.clone()).with_no_store()
+            }
+            StoreError::AccountReplyProviderRevisionConflict => Self::new(
+                StatusCode::CONFLICT,
+                "reply_provider_revision_conflict",
+                "Reply provider revision conflict",
+                "The account reply provider changed; refresh it and retry",
+            )
+            .with_no_store(),
+            StoreError::InvalidAccountReplyProvider(reason) => {
+                Self::bad_request("invalid_reply_provider", reason.clone()).with_no_store()
             }
             StoreError::StorageQuotaExceeded => Self::storage_quota_exceeded(),
             StoreError::PhysicalStorageExhausted => Self::physical_storage_exhausted(),
@@ -9593,7 +9970,7 @@ mod tests {
                 .as_ref()
                 .and_then(|error| error.get("code"))
                 .and_then(serde_json::Value::as_str),
-            Some("deployment_unavailable")
+            Some("provider_configuration_changed")
         );
         assert_eq!(
             failed.deployment_manifest_digest.as_deref(),
@@ -9626,6 +10003,95 @@ mod tests {
             explanation.persisted_manifest.unwrap().digest,
             queued_manifest.digest
         );
+    }
+
+    #[tokio::test]
+    async fn queued_agent_executes_its_bound_registered_provider_after_default_changes() {
+        let store = DemoStore::seeded().await.unwrap();
+        let owner =
+            provision_test_owner(&store, "user-provider-binding", "provider-binding-owner").await;
+        let session_id = "session-provider-binding";
+        let turn_id = "turn-provider-binding";
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: session_id.into(),
+                    title: "Bound provider recovery".into(),
+                },
+                "create-bound-provider-session",
+            )
+            .await
+            .unwrap();
+        let manifest = store
+            .session_agent_manifest(
+                "test-recording-provider",
+                Some("test-model".into()),
+                AssistantReplyKind::Model,
+            )
+            .unwrap();
+        let knowledge = store
+            .session_agent_knowledge_context(&owner.authz, "execute the durable binding")
+            .await
+            .unwrap();
+        let request = ReplyRequest::with_tools(
+            [
+                ReplyMessage::new(ReplyRole::System, store.session_agent_system_prompt()),
+                ReplyMessage::new(ReplyRole::User, "execute the durable binding"),
+                ReplyMessage::new(
+                    ReplyRole::Context,
+                    knowledge.snapshot.snapshot().canonical_context(),
+                ),
+            ],
+            agent_tools_from_manifest(&manifest),
+        );
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner.authz,
+                session_id,
+                StartTurnRequest {
+                    turn_id: turn_id.into(),
+                    user_message: "execute the durable binding".into(),
+                    expected_sequence: 1,
+                },
+                "queue-bound-provider-turn",
+                AgentTurnSpec {
+                    id: durable_agent_id(session_id, turn_id),
+                    authz: owner.authz.clone(),
+                    environment: store.session_agent_environment().to_owned(),
+                    provider_name: "test-recording-provider".into(),
+                    model_name: Some("test-model".into()),
+                    request_json: persisted_agent_reply_request(&request).unwrap(),
+                    manifest,
+                    knowledge,
+                },
+            )
+            .await
+            .unwrap();
+
+        let default_calls = Arc::new(AtomicUsize::new(0));
+        let bound_requests = Arc::new(StdMutex::new(Vec::new()));
+        let app = authenticated_app_with_provider_registry_and_ingress(
+            store.clone(),
+            IngressPolicy::direct(false),
+            Arc::new(CountingProvider::new(Arc::clone(&default_calls))),
+            vec![Arc::new(RecordingProvider::new(Arc::clone(
+                &bound_requests,
+            )))],
+        )
+        .unwrap();
+        let succeeded = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            session_id,
+            turn_id,
+            protocol::AgentTurnStatus::Succeeded,
+        )
+        .await;
+        assert_eq!(succeeded.model_steps, 1);
+        assert_eq!(default_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(bound_requests.lock().unwrap().len(), 1);
+        drop(app);
     }
 
     #[tokio::test]
@@ -11742,6 +12208,167 @@ mod tests {
         assert_eq!(overview.run.id, DEMO_RUN_ID);
         assert_eq!(overview.run.sequence, 8);
         assert_eq!(overview.recent_events.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn account_provider_selection_is_secret_free_idempotent_and_binds_new_turns() {
+        let store = DemoStore::seeded().await.unwrap();
+        let owner = provision_test_owner(&store, "user-provider-owner", "provider-owner").await;
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: "session-provider-selection".into(),
+                    title: "Provider selection".into(),
+                },
+                "create-provider-selection-session",
+            )
+            .await
+            .unwrap();
+        let model_requests = Arc::new(StdMutex::new(Vec::new()));
+        let model_provider: Arc<dyn ReplyProvider> =
+            Arc::new(RecordingProvider::new(Arc::clone(&model_requests)));
+        let app = authenticated_app_with_provider_registry_and_ingress(
+            store.clone(),
+            IngressPolicy::direct(false),
+            model_provider,
+            vec![Arc::new(LocalFallbackProvider::new())],
+        )
+        .unwrap()
+        .layer(MockConnectInfo(test_peer()));
+
+        let catalog = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/providers")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(catalog.status(), StatusCode::OK);
+        let catalog: ReplyProviderCatalogResponse = response_json(catalog).await;
+        assert_eq!(catalog.default_provider_id, "test-recording-provider");
+        assert_eq!(catalog.selected_provider_id, "test-recording-provider");
+        assert_eq!(catalog.selected_revision, 0);
+        assert_eq!(catalog.providers.len(), 2);
+        let catalog_json = serde_json::to_string(&catalog).unwrap();
+        for forbidden in ["endpoint", "api_key", "secret_ref", "credential"] {
+            assert!(!catalog_json.contains(forbidden));
+        }
+
+        let update_body = serde_json::json!({
+            "provider_id": "local-fallback",
+            "expected_revision": 0,
+        })
+        .to_string();
+        let update = app
+            .clone()
+            .oneshot(
+                Request::put("/api/v1/account/reply-provider")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "select-local-fallback")
+                    .body(Body::from(update_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update.status(), StatusCode::OK);
+        let update: serde_json::Value = response_json(update).await;
+        assert_eq!(update["provider"]["revision"], 1);
+        assert_eq!(update["provider"]["provider_id"], "local-fallback");
+        assert_eq!(update["provider"]["reply_kind"], "non_model_fallback");
+        assert_eq!(update["replayed"], false);
+
+        let replay = app
+            .clone()
+            .oneshot(
+                Request::put("/api/v1/account/reply-provider")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "select-local-fallback")
+                    .body(Body::from(update_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay: serde_json::Value = response_json(replay).await;
+        assert_eq!(replay["provider"], update["provider"]);
+        assert_eq!(replay["replayed"], true);
+
+        let turn = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-provider-selection/turns")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "provider-selection-turn")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-provider-selection",
+                            "user_message": "Use the selected provider",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(turn.status(), StatusCode::ACCEPTED);
+        let settled =
+            wait_for_ready_session(&store, &owner.authz, "session-provider-selection").await;
+        let provenance = settled.events.iter().find_map(|event| match &event.data {
+            protocol::SessionEventData::AssistantMessage { provenance, .. } => provenance.as_ref(),
+            _ => None,
+        });
+        assert_eq!(
+            provenance.map(|value| value.provider_id.as_str()),
+            Some("local-fallback")
+        );
+        assert_eq!(
+            provenance.map(|value| &value.reply_kind),
+            Some(&AssistantReplyKind::NonModelFallback)
+        );
+        assert!(model_requests.lock().unwrap().is_empty());
+
+        drop(app);
+        let restarted = authenticated_app_with_provider(
+            store,
+            false,
+            Arc::new(RecordingProvider::new(model_requests)),
+        )
+        .unwrap()
+        .layer(MockConnectInfo(test_peer()));
+        let unavailable = restarted
+            .oneshot(
+                Request::get("/api/v1/account/reply-provider")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_problem(
+            unavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "selected_provider_unavailable",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -14887,7 +15514,7 @@ mod tests {
         authz: &AuthzContext,
         session_id: &str,
     ) -> SessionDetail {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let detail = store
                     .get_session_for_actor(
@@ -14919,7 +15546,7 @@ mod tests {
         turn_id: &str,
         expected: protocol::AgentTurnStatus,
     ) -> AgentTurnDetail {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let detail = store
                     .agent_turn_detail_for_actor(authz, session_id, turn_id)

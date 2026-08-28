@@ -31,22 +31,22 @@ use serde_json::{Value, json};
 use tenancy::{PasswordAuthenticator, PasswordHashRecord};
 
 use crate::{
-    AccountAuditCheckpointCommit, AccountId, AgentKnowledgeContextSpec, AgentModelClaimOutcome,
-    AgentModelCompletion, AgentModelFailureCommit, AgentModelResolution, AgentModelStartOutcome,
-    AgentModelSuccessCommit, AgentPromptCommit, AgentPromptState, AgentReviewCommit,
-    AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
-    AgentTurnSpec, AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit,
-    ClaimOutcome, CommitOutcome, CreateAccountCommit, CreateMemberCommit,
-    DEFAULT_SESSION_AGENT_PROMPT_REVISION, DEFAULT_SESSION_AGENT_SYSTEM_PROMPT,
-    DispatchCompleteCommit, DispatchJobSpec, DispatchRecoveryCommit, DispatchStartCommit,
-    DispatchStatus, KnowledgeCatalogCommit, MemberSetupCommit, MemberSetupToken,
-    MembershipRevision, MembershipRole, ReplyClaimOutcome, ReplyFailureCommit, ReplyJobSpec,
-    ReplyJobStatus, ReplyOutcomeUnknownCommit, ReplySuccessCommit, ReviewCommit,
-    RotateMemberSetupTokenCommit, RunSnapshot, RuntimeIdentity, SESSION_AGENT_PROMPT_ID,
-    SessionCompactionClaimOutcome, SessionCompactionJobStatus, SessionCompactionSuccessCommit,
-    SqliteOperationLimits, SqlitePhysicalLimits, SqliteStore, StorageError, StorageLimits,
-    StoredMembershipStatus, StoredUserRole, StoredUserStatus, SwitchAuthSessionCommit,
-    TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
+    AccountAuditCheckpointCommit, AccountId, AccountReplyProviderCommit, AccountReplyProviderState,
+    AgentKnowledgeContextSpec, AgentModelClaimOutcome, AgentModelCompletion,
+    AgentModelFailureCommit, AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit,
+    AgentPromptCommit, AgentPromptState, AgentReviewCommit, AgentToolCallSpec,
+    AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit, AgentTurnSpec,
+    AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, ClaimOutcome,
+    CommitOutcome, CreateAccountCommit, CreateMemberCommit, DEFAULT_SESSION_AGENT_PROMPT_REVISION,
+    DEFAULT_SESSION_AGENT_SYSTEM_PROMPT, DispatchCompleteCommit, DispatchJobSpec,
+    DispatchRecoveryCommit, DispatchStartCommit, DispatchStatus, KnowledgeCatalogCommit,
+    MemberSetupCommit, MemberSetupToken, MembershipRevision, MembershipRole, ReplyClaimOutcome,
+    ReplyFailureCommit, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
+    ReplySuccessCommit, ReviewCommit, RotateMemberSetupTokenCommit, RunSnapshot, RuntimeIdentity,
+    SESSION_AGENT_PROMPT_ID, SessionCompactionClaimOutcome, SessionCompactionJobStatus,
+    SessionCompactionSuccessCommit, SqliteOperationLimits, SqlitePhysicalLimits, SqliteStore,
+    StorageError, StorageLimits, StoredMembershipStatus, StoredUserRole, StoredUserStatus,
+    SwitchAuthSessionCommit, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
@@ -92,6 +92,27 @@ fn member_authz() -> AuthzContext {
         membership_role: MembershipRole::Member,
         membership_revision: MembershipRevision::new(1).unwrap(),
         auth_session_id: AuthSessionId::from_persistence("asi_test_member").unwrap(),
+    }
+}
+
+fn test_reply_provider_default(
+    account_id: AccountId,
+    provider_id: &str,
+    model: Option<&str>,
+) -> AccountReplyProviderState {
+    AccountReplyProviderState {
+        account_id,
+        revision: 0,
+        provider_id: provider_id.into(),
+        model: model.map(ToOwned::to_owned),
+        reply_kind: if model.is_some() {
+            AssistantReplyKind::Model
+        } else {
+            AssistantReplyKind::NonModelFallback
+        },
+        updated_by_user_id: None,
+        updated_by_membership_revision: None,
+        updated_at: None,
     }
 }
 
@@ -432,6 +453,115 @@ async fn memory_progress_waits_for_its_connection_before_entering_the_blocking_p
     progress_started_rx.await.unwrap();
     progress.await.unwrap().unwrap();
     assert_eq!(store.operation_test_snapshot(), (0, 0));
+}
+
+#[tokio::test]
+async fn account_reply_provider_is_revisioned_idempotent_and_survives_restart() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    bootstrap_test_owner(&store).await;
+    let startup_default =
+        test_reply_provider_default(AccountId::local(), "startup-provider-a", Some("model-a"));
+    let baseline = store
+        .reply_provider_for_actor(&owner_authz(), startup_default.clone())
+        .await
+        .unwrap();
+    assert_eq!(baseline, startup_default);
+
+    let commit = AccountReplyProviderCommit {
+        expected_revision: 0,
+        provider_id: "startup-provider-b".into(),
+        model: Some("model-b".into()),
+        reply_kind: AssistantReplyKind::Model,
+        idempotency_key: "provider-selection-1".into(),
+    };
+    let updated = store
+        .replace_reply_provider(&owner_authz(), commit.clone())
+        .await
+        .unwrap();
+    assert!(!updated.replayed);
+    assert_eq!(updated.provider.revision, 1);
+    assert_eq!(updated.provider.provider_id, "startup-provider-b");
+    assert_eq!(updated.provider.model.as_deref(), Some("model-b"));
+    let replay = store
+        .replace_reply_provider(&owner_authz(), commit)
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.provider, updated.provider);
+
+    assert!(matches!(
+        store
+            .replace_reply_provider(
+                &owner_authz(),
+                AccountReplyProviderCommit {
+                    expected_revision: 0,
+                    provider_id: "startup-provider-c".into(),
+                    model: Some("model-c".into()),
+                    reply_kind: AssistantReplyKind::Model,
+                    idempotency_key: "provider-selection-conflict".into(),
+                },
+            )
+            .await,
+        Err(StorageError::AccountReplyProviderRevisionConflict)
+    ));
+    drop(store);
+
+    let reopened = SqliteStore::open(database.path()).await.unwrap();
+    let changed_startup_default =
+        test_reply_provider_default(AccountId::local(), "startup-provider-c", Some("model-c"));
+    let selected = reopened
+        .reply_provider_for_actor(&owner_authz(), changed_startup_default)
+        .await
+        .unwrap();
+    assert_eq!(selected, updated.provider);
+    reopened.readiness().await.unwrap();
+}
+
+#[tokio::test]
+async fn account_reply_provider_integrity_rejects_a_forged_receipt() {
+    let database = TestDatabase::new();
+    let store = SqliteStore::open(database.path()).await.unwrap();
+    bootstrap_test_owner(&store).await;
+    store
+        .replace_reply_provider(
+            &owner_authz(),
+            AccountReplyProviderCommit {
+                expected_revision: 0,
+                provider_id: "integrity-provider".into(),
+                model: Some("integrity-model".into()),
+                reply_kind: AssistantReplyKind::Model,
+                idempotency_key: "provider-integrity-selection".into(),
+            },
+        )
+        .await
+        .unwrap();
+    drop(store);
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let receipt_guard = migration_trigger_sql(
+        include_str!("../migrations/0026_account_reply_provider.sql"),
+        "account_reply_provider_receipts_reject_update",
+    );
+    connection
+        .execute_batch("DROP TRIGGER account_reply_provider_receipts_reject_update;")
+        .unwrap();
+    connection
+        .execute(
+            r#"UPDATE account_reply_provider_receipts
+               SET request_fingerprint = '{"expected_revision":0,"provider_id":"forged","model":"integrity-model","reply_kind":"model"}'
+               WHERE account_id = 'acc_local' AND provider_revision = 1"#,
+            [],
+        )
+        .unwrap();
+    connection.execute_batch(receipt_guard).unwrap();
+    drop(connection);
+
+    assert!(matches!(
+        SqliteStore::open(database.path()).await,
+        Err(StorageError::CorruptData(message))
+            if message.contains("receipt 1 has an invalid fingerprint")
+    ));
 }
 
 #[tokio::test]
@@ -1639,7 +1769,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         versions,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25,
+            25, 26,
         ]
     );
     let owner: Option<String> = connection
@@ -1781,7 +1911,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
     assert_eq!(
         run_event_payloads(database.path(), &long_run_id),
         payloads_before,
-        "v9-v25 migrations must not rewrite immutable event payloads"
+        "v9-v26 migrations must not rewrite immutable event payloads"
     );
     let connection = rusqlite::Connection::open(database.path()).unwrap();
     let version: i64 = connection
@@ -1789,7 +1919,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 25);
+    assert_eq!(version, 26);
     let configured_account: (String, String, String, i64) = connection
         .query_row(
             r#"SELECT
@@ -2507,7 +2637,7 @@ async fn v12_identity_and_run_crash_prefix_migrates_then_recovers_the_primary_se
     assert_eq!(
         recovered,
         (
-            25,
+            26,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into()
@@ -4254,7 +4384,7 @@ async fn v5_configured_database_migrates_to_the_local_owner_membership() {
     assert_eq!(
         migrated,
         (
-            25,
+            26,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into(),
@@ -4380,7 +4510,7 @@ async fn v13_configured_active_work_migrates_with_account_authority_and_exact_vo
             },
         )
         .unwrap();
-    assert_eq!(migrated_counts, (25, 1, 1, 2, 1));
+    assert_eq!(migrated_counts, (26, 1, 1, 2, 1));
 }
 
 #[tokio::test]
@@ -4742,7 +4872,7 @@ async fn v14_database_migrates_through_v19_with_member_and_audit_roots() {
             },
         )
         .unwrap();
-    assert_eq!(state, (25, 1, 1, 1, 19));
+    assert_eq!(state, (26, 1, 1, 1, 19));
 }
 
 #[tokio::test]
@@ -4781,7 +4911,7 @@ async fn v15_migration_seeds_the_configured_audit_detail_limit() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (25, 2));
+    assert_eq!(state, (26, 2));
 }
 
 #[tokio::test]
@@ -4826,7 +4956,7 @@ async fn v15_reopen_rejects_a_lower_audit_detail_limit_without_mutating_policy()
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (25, 4));
+    assert_eq!(state, (26, 4));
     drop(connection);
 
     let reopened = SqliteStore::open_with_limits(database.path(), original_limits)
@@ -6932,7 +7062,7 @@ async fn v19_agent_manifest_is_canonical_actor_scoped_reused_and_secret_free() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(version, 25);
+    assert_eq!(version, 26);
     assert_eq!(
         manifest_rows, 1,
         "the identical manifest must be deduplicated"
@@ -17288,7 +17418,7 @@ async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempot
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, (1_i64..=25).collect::<Vec<_>>());
+    assert_eq!(versions, (1_i64..=26).collect::<Vec<_>>());
     assert_eq!(
         connection
             .query_row(
@@ -20531,6 +20661,14 @@ fn drop_v24_fixture_objects(connection: &rusqlite::Connection) {
 }
 
 fn drop_v25_fixture_objects(connection: &rusqlite::Connection) {
+    let version: i64 = connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    if version >= 26 {
+        drop_v26_fixture_objects(connection);
+    }
     let schema_reject_update = migration_trigger_sql(
         include_str!("../migrations/0020_agent_execution_ledger.sql"),
         "schema_migrations_reject_update",
@@ -20552,6 +20690,36 @@ fn drop_v25_fixture_objects(connection: &rusqlite::Connection) {
                DROP INDEX session_compaction_jobs_latest_success_idx;
                DROP TABLE session_compaction_jobs;
                DELETE FROM schema_migrations WHERE version = 25;"#,
+        )
+        .unwrap();
+    connection.execute_batch(schema_reject_update).unwrap();
+    connection.execute_batch(schema_reject_delete).unwrap();
+}
+
+fn drop_v26_fixture_objects(connection: &rusqlite::Connection) {
+    let schema_reject_update = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_update",
+    );
+    let schema_reject_delete = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_delete",
+    );
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER schema_migrations_reject_update;
+               DROP TRIGGER schema_migrations_reject_delete;
+               DROP TRIGGER account_reply_provider_configs_require_current_owner;
+               DROP TRIGGER account_reply_provider_configs_enforce_revision;
+               DROP TRIGGER account_reply_provider_configs_reject_delete;
+               DROP TRIGGER account_reply_provider_receipts_require_current_owner;
+               DROP TRIGGER account_reply_provider_receipts_reject_update;
+               DROP TRIGGER account_reply_provider_receipts_reject_delete;
+               DROP INDEX account_reply_provider_configs_provider_idx;
+               DROP INDEX account_reply_provider_receipts_provider_idx;
+               DROP TABLE account_reply_provider_receipts;
+               DROP TABLE account_reply_provider_configs;
+               DELETE FROM schema_migrations WHERE version = 26;"#,
         )
         .unwrap();
     connection.execute_batch(schema_reject_update).unwrap();

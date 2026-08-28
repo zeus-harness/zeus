@@ -459,6 +459,31 @@ pub struct UpdatePreferencesRequest {
     pub expected_revision: u64,
 }
 
+/// Secret-free provider metadata registered by the running Zeus service.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyProviderDescriptor {
+    pub provider_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub reply_kind: AssistantReplyKind,
+}
+
+/// Authenticated provider catalog and effective selection for one account.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyProviderCatalogResponse {
+    pub default_provider_id: String,
+    pub selected_provider_id: String,
+    pub selected_revision: u64,
+    pub providers: Vec<ReplyProviderDescriptor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateAccountReplyProviderRequest {
+    pub provider_id: String,
+    pub expected_revision: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogoutResponse {
     pub status: String,

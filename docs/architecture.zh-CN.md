@@ -29,10 +29,11 @@ Client / SvelteKit Web
 - `authz`：account capability matrix，以及精确工具名规则、策略 revision、环境和 effect guard；没有命中即拒绝。
 - `tools`：工具描述、注册表、参数验证和 object-safe executor 边界。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
-- `storage`：schema v25 migration、有界 account/membership 权威、一次性 member setup、用户/偏好、
+- `storage`：schema v26 migration、有界 account/membership 权威、一次性 member setup、用户/偏好、
   account audit/rollup/policy/archive state、独立 Session/Run ledger、typed event lookup、
   account+actor-scoped 回执、durable Agent/model/tool/dispatch queue、不可变 deployment manifest，
-  revisioned account knowledge catalog、owner-governed Agent prompt，以及
+  revisioned account knowledge catalog、owner-governed Agent prompt、account-scoped
+  secret-free reply provider selection，以及
   actor/account/global logical capacity、physical capacity 和 operation capacity。
 - `runtime`：Session 命令编排、Agent model/tool 与 Run worker、运行时 manifest 构建、提交后 SSE
   提示和启动恢复。
@@ -81,6 +82,13 @@ schema v25 增加非破坏性的 Session context compaction。最后一个成功
 compaction job 只允许 `queued -> started -> succeeded|failed|outcome_unknown` 单向迁移；重启可继续
 queued job，但 started 且无 durable 结果的调用只结算为 `outcome_unknown`。failed 或
 outcome_unknown generation 都会阻断自动重排队，不得换一个 job ID 重放同一 source。
+
+schema v26 增加 account-scoped reply provider 选择。revision 0 表示进程启动时注册的隐式默认
+Provider；owner 只能从启动注册表暴露的 secret-free `provider_id/model/reply_kind` 中选择，并通过
+expected-revision CAS、`Idempotency-Key` receipt 与 account audit 单事务提交。HTTP 和 SQLite 均不
+接收 endpoint、credential 或 SecretRef。选择只影响新 turn；已排队的 reply、compaction、Agent
+model 与 tool work 保留 admission 时的精确 Provider binding，并由 worker 按该 binding 从注册表
+解析。重启后若显式选择或 queued binding 已不在注册表，执行 fail closed，不静默切换默认 Provider。
 
 ## 事件与状态
 
@@ -218,7 +226,7 @@ connector 在数据库事务和锁之外运行。
 
 API 监听端口之前按固定顺序完成：
 
-1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v25；按当前
+1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v26；按当前
    detailed-row limit 以最多 64 行 batch 压缩 bootstrap terminal audit prefix，再按稳定
    `(priority actor, expires_at, auth-session ID)` 顺序最多清理 64 个过期或绑定
    missing/disabled/suspended/stale-revision authority 的 auth session。
@@ -605,8 +613,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   刷新恢复、owner/member setup/登录、owner 成员与 audit 管理、设置/退出和
   system/light/dark。member 的审批卡只读。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化按项目既有统计口径是 611 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
-  provider contract 15、storage 254、runtime 48、API library 80、API main/config 11）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化按项目既有统计口径是 615 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
+  provider contract 15、storage 256、runtime 48、API library 82、API main/config 11）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
 提交 `af29089` 曾构建并运行在独立 `zeus-operation-acceptance` project（端口 `18089`）；既有

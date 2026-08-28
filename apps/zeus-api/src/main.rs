@@ -11,8 +11,8 @@ use std::{
 use zeroize::Zeroizing;
 
 use llm::{
-    LocalFallbackProvider, OpenAiCompatibleProvider, ReplyProvider, ResolvedSecret, SecretRef,
-    SecretResolveError, SecretResolveFuture, SecretResolver,
+    LocalFallbackProvider, OpenAiCompatibleProvider, ReplyKind, ReplyProvider, ResolvedSecret,
+    SecretRef, SecretResolveError, SecretResolveFuture, SecretResolver,
 };
 use runtime::{DemoStore, SqliteOperationLimits, SqlitePhysicalLimits, StorageLimits};
 use tenancy::BootstrapToken;
@@ -38,6 +38,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let public_origin = ingress.public_origin().unwrap_or("direct peer").to_owned();
     let reply_provider = configured_reply_provider().await?;
     let reply_provider_id = reply_provider.metadata().provider_id.clone();
+    let additional_reply_providers: Vec<Arc<dyn ReplyProvider>> =
+        if reply_provider.metadata().reply_kind == ReplyKind::Model {
+            vec![Arc::new(LocalFallbackProvider::new())]
+        } else {
+            Vec::new()
+        };
     let store = match profile.as_str() {
         "production-guarded" => {
             DemoStore::open_with_limits_and_physical_and_operations(
@@ -101,8 +107,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let listener = tokio::net::TcpListener::bind(address).await?;
-    let app =
-        zeus_api::authenticated_app_with_provider_and_ingress(store, ingress, reply_provider)?;
+    let app = zeus_api::authenticated_app_with_provider_registry_and_ingress(
+        store,
+        ingress,
+        reply_provider,
+        additional_reply_providers,
+    )?;
 
     println!(
         "zeus-api listening on http://{address} with profile {profile}, ingress {ingress_mode} ({public_origin}), reply provider {reply_provider_id}, and SQLite at {database_path}"

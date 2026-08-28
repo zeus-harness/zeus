@@ -55,27 +55,29 @@ use serde_json::Value;
 pub use storage::{
     AGENT_SYSTEM_PROMPT_MAX_BYTES, AccountAuditArchiveState, AccountAuditCheckpointCommit,
     AccountAuditEvent, AccountAuditPage, AccountAuditPolicy, AccountAuditRollup, AccountAuditState,
-    AccountId, AgentFinalCompletion, AgentKnowledgeContextExplain, AgentKnowledgeContextSpec,
-    AgentModelClaimOutcome, AgentModelCompletion, AgentModelFailureCommit, AgentModelJob,
-    AgentModelJobStatus, AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit,
-    AgentOperationClaim, AgentOperationKind, AgentPreparedModel, AgentPreparedTool,
-    AgentPromptCommit, AgentPromptRevisionPage, AgentPromptRevisionSummary, AgentPromptState,
-    AgentPromptUpdateResult, AgentReviewCommit, AgentReviewContext, AgentReviewResult,
-    AgentTerminalCompletion, AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome,
-    AgentToolCompletion, AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit,
-    AgentToolStartOutcome, AgentToolWork, AgentTurn, AgentTurnEnqueueResponse,
-    AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthSessionId,
-    AuthzContext, BootstrapOwnerCommit, CreateAccountCommit, CreateAccountResult,
-    CreateMemberResult, DEFAULT_SESSION_AGENT_PROMPT_REVISION, DEFAULT_SESSION_AGENT_SYSTEM_PROMPT,
-    InFlightWorkSummary, KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage,
-    KnowledgeCatalogRevisionSummary, KnowledgeCatalogState, KnowledgeCatalogUpdateResult,
-    MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit, MemberSetupResult, MemberSetupToken,
-    MemberTransitionResult, MembershipRevision, MembershipRole, ReplyClaimOutcome, ReplyCompletion,
-    ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus,
-    ReplyOutcomeUnknownCommit, ReplySuccessCommit, RotateMemberSetupTokenResult,
-    SESSION_AGENT_PROMPT_ID, SessionCompactionClaimOutcome, SessionCompactionFailureCommit,
-    SessionCompactionJob, SessionCompactionSuccessCommit, SessionContextCheckpoint,
-    SessionSummaryPage, SqliteOperationLimits, SqliteOperationLimitsError, SqlitePhysicalLimits,
+    AccountId, AccountReplyProviderCommit, AccountReplyProviderState,
+    AccountReplyProviderUpdateResult, AgentFinalCompletion, AgentKnowledgeContextExplain,
+    AgentKnowledgeContextSpec, AgentModelClaimOutcome, AgentModelCompletion,
+    AgentModelFailureCommit, AgentModelJob, AgentModelJobStatus, AgentModelResolution,
+    AgentModelStartOutcome, AgentModelSuccessCommit, AgentOperationClaim, AgentOperationKind,
+    AgentPreparedModel, AgentPreparedTool, AgentPromptCommit, AgentPromptRevisionPage,
+    AgentPromptRevisionSummary, AgentPromptState, AgentPromptUpdateResult, AgentReviewCommit,
+    AgentReviewContext, AgentReviewResult, AgentTerminalCompletion, AgentToolCall,
+    AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
+    AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurn,
+    AgentTurnEnqueueResponse, AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal,
+    AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, CreateAccountCommit,
+    CreateAccountResult, CreateMemberResult, DEFAULT_SESSION_AGENT_PROMPT_REVISION,
+    DEFAULT_SESSION_AGENT_SYSTEM_PROMPT, InFlightWorkSummary, KnowledgeCatalogCommit,
+    KnowledgeCatalogRevisionPage, KnowledgeCatalogRevisionSummary, KnowledgeCatalogState,
+    KnowledgeCatalogUpdateResult, MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit,
+    MemberSetupResult, MemberSetupToken, MemberTransitionResult, MembershipRevision,
+    MembershipRole, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit, ReplyJob,
+    ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
+    ReplySuccessCommit, RotateMemberSetupTokenResult, SESSION_AGENT_PROMPT_ID,
+    SessionCompactionClaimOutcome, SessionCompactionFailureCommit, SessionCompactionJob,
+    SessionCompactionSuccessCommit, SessionContextCheckpoint, SessionSummaryPage,
+    SqliteOperationLimits, SqliteOperationLimitsError, SqlitePhysicalLimits,
     SqlitePhysicalLimitsError, StorageLimits, StorageLimitsError, StoredAccount,
     StoredAccountStatus, StoredCredential, StoredMember, StoredMemberPage, StoredMembershipStatus,
     StoredPreferences, StoredUser, StoredUserRole, StoredUserStatus, SwitchAuthSessionCommit,
@@ -427,6 +429,10 @@ pub enum StoreError {
     AgentPromptRevisionNotFound(u64),
     #[error("invalid account Agent prompt: {0}")]
     InvalidAgentPrompt(String),
+    #[error("the account reply provider revision changed concurrently")]
+    AccountReplyProviderRevisionConflict,
+    #[error("invalid account reply provider: {0}")]
+    InvalidAccountReplyProvider(String),
     #[error("the durable storage quota is exhausted")]
     StorageQuotaExceeded,
     #[error("SQLite physical storage cannot safely accept this operation")]
@@ -536,6 +542,12 @@ impl From<StorageError> for StoreError {
                 Self::AgentPromptRevisionNotFound(revision)
             }
             StorageError::InvalidAgentPrompt(detail) => Self::InvalidAgentPrompt(detail),
+            StorageError::AccountReplyProviderRevisionConflict => {
+                Self::AccountReplyProviderRevisionConflict
+            }
+            StorageError::InvalidAccountReplyProvider(detail) => {
+                Self::InvalidAccountReplyProvider(detail)
+            }
             StorageError::StorageQuotaExceeded => Self::StorageQuotaExceeded,
             StorageError::PhysicalStorageExhausted => Self::PhysicalStorageExhausted,
             StorageError::OperationCapacityExceeded => Self::OperationCapacityExceeded,
@@ -990,12 +1002,68 @@ impl DemoStore {
         Ok(self.storage.active_agent_prompt_for_actor(context).await?)
     }
 
-    /// Resolve the active local-account prompt for trusted worker manifest
+    /// Resolve the active account prompt for trusted worker manifest
     /// construction. Storage checks the binding again in the claim transaction.
-    pub async fn current_session_agent_prompt(&self) -> Result<AgentPromptState, StoreError> {
+    pub async fn current_session_agent_prompt_for_account(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<AgentPromptState, StoreError> {
         Ok(self
             .storage
-            .active_agent_prompt_for_runtime(&AccountId::local())
+            .active_agent_prompt_for_runtime(account_id)
+            .await?)
+    }
+
+    /// Backward-compatible local-account prompt lookup used by direct runtime
+    /// tests and legacy callers.
+    pub async fn current_session_agent_prompt(&self) -> Result<AgentPromptState, StoreError> {
+        self.current_session_agent_prompt_for_account(&AccountId::local())
+            .await
+    }
+
+    pub async fn session_reply_provider_for_actor(
+        &self,
+        context: &AuthzContext,
+        startup_default: AccountReplyProviderState,
+    ) -> Result<AccountReplyProviderState, StoreError> {
+        Ok(self
+            .storage
+            .reply_provider_for_actor(context, startup_default)
+            .await?)
+    }
+
+    pub async fn current_session_reply_provider_for_account(
+        &self,
+        account_id: &AccountId,
+        startup_default: AccountReplyProviderState,
+    ) -> Result<AccountReplyProviderState, StoreError> {
+        Ok(self
+            .storage
+            .reply_provider_for_runtime(account_id, startup_default)
+            .await?)
+    }
+
+    pub async fn replace_reply_provider(
+        &self,
+        context: &AuthzContext,
+        expected_revision: u64,
+        provider_id: String,
+        model: Option<String>,
+        reply_kind: AssistantReplyKind,
+        idempotency_key: String,
+    ) -> Result<AccountReplyProviderUpdateResult, StoreError> {
+        Ok(self
+            .storage
+            .replace_reply_provider(
+                context,
+                AccountReplyProviderCommit {
+                    expected_revision,
+                    provider_id,
+                    model,
+                    reply_kind,
+                    idempotency_key,
+                },
+            )
             .await?)
     }
 
@@ -2265,6 +2333,15 @@ impl DemoStore {
 
     /// Durable model-worker preparation façade. This phase does not authorize
     /// provider I/O and is therefore safe to reclaim after expiry or restart.
+    pub async fn next_agent_model_for_holder(
+        &self,
+        holder_id: &str,
+    ) -> Result<Option<AgentModelJob>, StoreError> {
+        Ok(self.storage.next_agent_model_for_holder(holder_id).await?)
+    }
+
+    /// Durable model-worker preparation façade. This phase does not authorize
+    /// provider I/O and is therefore safe to reclaim after expiry or restart.
     pub async fn prepare_next_agent_model(
         &self,
         manifest: &ManifestEnvelope,
@@ -2409,6 +2486,15 @@ impl DemoStore {
         self.cleanup_agent_terminal_resources(&completion.agent)
             .await;
         Ok(completion)
+    }
+
+    /// Durable tool-worker preparation façade. A rejected preparation has
+    /// already terminalized its Session, so it is published and skipped.
+    pub async fn next_agent_tool_for_holder(
+        &self,
+        holder_id: &str,
+    ) -> Result<Option<AgentToolWork>, StoreError> {
+        Ok(self.storage.next_agent_tool_for_holder(holder_id).await?)
     }
 
     /// Durable tool-worker preparation façade. A rejected preparation has

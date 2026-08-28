@@ -31,32 +31,35 @@ use crate::cursor;
 mod agent;
 mod compaction;
 mod execution;
+mod provider;
 use crate::operation::{OperationClass, OperationLimiter};
 use crate::{
     AccountAuditArchiveState, AccountAuditCheckpointCommit, AccountAuditEvent, AccountAuditPage,
-    AccountAuditPolicy, AccountAuditRollup, AccountAuditState, AccountId, AgentModelJob,
-    AgentPromptCommit, AgentPromptRevisionPage, AgentPromptState, AgentPromptUpdateResult,
-    AgentTurn, AgentTurnEnqueueResponse, AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal,
-    AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, BoundedRunRead,
-    ClaimOutcome, CommitOutcome, CreateAccountCommit, CreateAccountResult, CreateMemberCommit,
-    CreateMemberResult, DispatchCompleteCommit, DispatchContext, DispatchJob, DispatchJobSpec,
-    DispatchRecoveryCommit, DispatchRejection, DispatchStartCommit, DispatchStatus,
-    InFlightWorkSummary, KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage,
-    KnowledgeCatalogState, KnowledgeCatalogUpdateResult, MEMBER_SETUP_TOKEN_TTL_SECONDS,
-    MemberSetupCommit, MemberSetupResult, MemberTransitionResult, MembershipRevision,
-    MembershipRole, RecoveredSessionTurn, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit,
-    ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
-    ReplySuccessCommit, ReviewCommit, ReviewContext, ReviewReceipt, RotateMemberSetupTokenCommit,
-    RotateMemberSetupTokenResult, RunSnapshot, RuntimeIdentity, SessionCompactionClaimOutcome,
-    SessionCompactionFailureCommit, SessionCompactionJob, SessionCompactionSuccessCommit,
-    SessionContextCheckpoint, SessionSummaryPage, SqliteOperationLimits, SqlitePhysicalLimits,
-    StorageError, StorageLimits, StoredAccount, StoredAccountStatus, StoredCredential,
-    StoredMember, StoredMemberPage, StoredMembershipStatus, StoredPreferences, StoredRun,
-    StoredUser, StoredUserRole, StoredUserStatus, SwitchAuthSessionCommit, SwitchAuthSessionResult,
-    TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
+    AccountAuditPolicy, AccountAuditRollup, AccountAuditState, AccountId,
+    AccountReplyProviderCommit, AccountReplyProviderState, AccountReplyProviderUpdateResult,
+    AgentModelJob, AgentPromptCommit, AgentPromptRevisionPage, AgentPromptState,
+    AgentPromptUpdateResult, AgentTurn, AgentTurnEnqueueResponse, AgentTurnReceiptProbe,
+    AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthSessionId, AuthzContext,
+    BootstrapOwnerCommit, BoundedRunRead, ClaimOutcome, CommitOutcome, CreateAccountCommit,
+    CreateAccountResult, CreateMemberCommit, CreateMemberResult, DispatchCompleteCommit,
+    DispatchContext, DispatchJob, DispatchJobSpec, DispatchRecoveryCommit, DispatchRejection,
+    DispatchStartCommit, DispatchStatus, InFlightWorkSummary, KnowledgeCatalogCommit,
+    KnowledgeCatalogRevisionPage, KnowledgeCatalogState, KnowledgeCatalogUpdateResult,
+    MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit, MemberSetupResult, MemberTransitionResult,
+    MembershipRevision, MembershipRole, RecoveredSessionTurn, ReplyClaimOutcome, ReplyCompletion,
+    ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus,
+    ReplyOutcomeUnknownCommit, ReplySuccessCommit, ReviewCommit, ReviewContext, ReviewReceipt,
+    RotateMemberSetupTokenCommit, RotateMemberSetupTokenResult, RunSnapshot, RuntimeIdentity,
+    SessionCompactionClaimOutcome, SessionCompactionFailureCommit, SessionCompactionJob,
+    SessionCompactionSuccessCommit, SessionContextCheckpoint, SessionSummaryPage,
+    SqliteOperationLimits, SqlitePhysicalLimits, StorageError, StorageLimits, StoredAccount,
+    StoredAccountStatus, StoredCredential, StoredMember, StoredMemberPage, StoredMembershipStatus,
+    StoredPreferences, StoredRun, StoredUser, StoredUserRole, StoredUserStatus,
+    SwitchAuthSessionCommit, SwitchAuthSessionResult, TransitionMemberCommit,
+    UpdateAccountAuditPolicyCommit,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 25;
+const CURRENT_SCHEMA_VERSION: i64 = 26;
 const LOCAL_ACCOUNT_ID: &str = "acc_local";
 const MAX_ACCOUNTS_PER_USER: i64 = 16;
 const MAX_ACCOUNTS_GLOBAL: i64 = 64;
@@ -90,6 +93,7 @@ const MIGRATION_0022: &str = include_str!("../migrations/0022_agent_knowledge_co
 const MIGRATION_0023: &str = include_str!("../migrations/0023_account_knowledge_catalog.sql");
 const MIGRATION_0024: &str = include_str!("../migrations/0024_account_agent_prompt.sql");
 const MIGRATION_0025: &str = include_str!("../migrations/0025_session_context_compaction.sql");
+const MIGRATION_0026: &str = include_str!("../migrations/0026_account_reply_provider.sql");
 const MIGRATION_0022_TRIGGER_NAMES: &[&str] = &[
     "knowledge_corpus_revisions_reject_update",
     "knowledge_corpus_revisions_reject_delete",
@@ -129,6 +133,14 @@ const MIGRATION_0025_TRIGGER_NAMES: &[&str] = &[
     "session_compaction_jobs_reject_identity_update",
     "session_compaction_jobs_enforce_transition",
     "session_compaction_jobs_reject_delete",
+];
+const MIGRATION_0026_TRIGGER_NAMES: &[&str] = &[
+    "account_reply_provider_configs_require_current_owner",
+    "account_reply_provider_configs_enforce_revision",
+    "account_reply_provider_configs_reject_delete",
+    "account_reply_provider_receipts_require_current_owner",
+    "account_reply_provider_receipts_reject_update",
+    "account_reply_provider_receipts_reject_delete",
 ];
 const RECOVERY_BATCH_LIMIT: i64 = 64;
 const AUTH_SESSION_CLEANUP_BATCH_LIMIT: i64 = 64;
@@ -1706,6 +1718,55 @@ impl SqliteStore {
         .await
     }
 
+    /// Resolve the effective account provider after checking Reply authority.
+    /// `startup_default` is used only for the implicit revision-zero state.
+    pub async fn reply_provider_for_actor(
+        &self,
+        context: &AuthzContext,
+        startup_default: AccountReplyProviderState,
+    ) -> Result<AccountReplyProviderState, StorageError> {
+        let context = validated_authz_context(context)?;
+        provider::validate_startup_default(&context.account_id, &startup_default)?;
+        self.with_connection(move |connection| {
+            provider::query_account_reply_provider_for_actor(connection, &context, startup_default)
+        })
+        .await
+    }
+
+    /// Resolve provider selection for trusted worker manifest construction.
+    pub async fn reply_provider_for_runtime(
+        &self,
+        account_id: &AccountId,
+        startup_default: AccountReplyProviderState,
+    ) -> Result<AccountReplyProviderState, StorageError> {
+        provider::validate_startup_default(account_id, &startup_default)?;
+        let account_id = account_id.clone();
+        self.with_connection(move |connection| {
+            provider::query_account_reply_provider(connection, &account_id, startup_default)
+        })
+        .await
+    }
+
+    pub async fn replace_reply_provider(
+        &self,
+        context: &AuthzContext,
+        commit: AccountReplyProviderCommit,
+    ) -> Result<AccountReplyProviderUpdateResult, StorageError> {
+        let context = validated_authz_context(context)?;
+        let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            provider::replace_account_reply_provider(
+                connection,
+                &context,
+                commit,
+                &limits,
+                &physical_limits,
+            )
+        })
+        .await
+    }
+
     pub async fn get_member(
         &self,
         context: &AuthzContext,
@@ -3253,6 +3314,13 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
             params![25, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 26 {
+        transaction.execute_batch(MIGRATION_0026)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![26, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
     // The execution verifier now understands the v22 knowledge binding. Run
     // it only after every missing schema step has been installed so upgrades
     // from v19 and older never query a column that does not exist yet. This
@@ -3262,6 +3330,7 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
         agent::verify_agent_knowledge_context_integrity(&transaction)?;
         agent::verify_account_knowledge_catalog_integrity(&transaction)?;
         agent::verify_account_agent_prompt_integrity(&transaction)?;
+        provider::verify_account_reply_provider_integrity(&transaction)?;
         execution::verify_agent_execution_integrity(&transaction)?;
     }
     validate_configured_account_audit_policies(&transaction, limits)?;
@@ -4094,6 +4163,28 @@ fn readiness(
         ));
     }
 
+    let account_reply_provider_columns: i64 = connection.query_row(
+        r#"SELECT
+               (SELECT COUNT(*) FROM pragma_table_info('account_reply_provider_configs')
+                WHERE name IN (
+                    'account_id', 'revision', 'provider_id', 'model', 'reply_kind',
+                    'updated_by_user_id', 'updated_by_membership_revision', 'updated_at'
+                ))
+             + (SELECT COUNT(*) FROM pragma_table_info('account_reply_provider_receipts')
+                WHERE name IN (
+                    'account_id', 'actor_user_id', 'actor_membership_revision',
+                    'idempotency_key', 'request_fingerprint', 'provider_revision',
+                    'provider_id', 'model', 'reply_kind', 'created_at'
+                ))"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if account_reply_provider_columns != 18 {
+        return Err(StorageError::CorruptData(
+            "account reply provider schema is missing".into(),
+        ));
+    }
+
     let agent_execution_columns: i64 = connection.query_row(
         r#"SELECT
                (SELECT COUNT(*) FROM pragma_table_info('agent_run_epochs')
@@ -4226,12 +4317,14 @@ fn readiness(
                'knowledge_catalog_receipts_corpus_idx',
                'agent_prompt_revisions_account_created_idx',
                'account_agent_prompt_configs_active_prompt_idx',
-               'agent_prompt_config_receipts_digest_idx'
+               'agent_prompt_config_receipts_digest_idx',
+               'account_reply_provider_configs_provider_idx',
+               'account_reply_provider_receipts_provider_idx'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if point_query_indexes != 71 {
+    if point_query_indexes != 73 {
         return Err(StorageError::CorruptData(
             "one or more point-query indexes are missing".into(),
         ));
@@ -4405,6 +4498,12 @@ fn readiness(
                'agent_prompt_config_receipts_require_current_owner',
                'agent_prompt_config_receipts_reject_update',
                'agent_prompt_config_receipts_reject_delete',
+               'account_reply_provider_configs_require_current_owner',
+               'account_reply_provider_configs_enforce_revision',
+               'account_reply_provider_configs_reject_delete',
+               'account_reply_provider_receipts_require_current_owner',
+               'account_reply_provider_receipts_reject_update',
+               'account_reply_provider_receipts_reject_delete',
                'session_compaction_jobs_validate_insert',
                'session_compaction_jobs_reject_identity_update',
                'session_compaction_jobs_enforce_transition',
@@ -4415,7 +4514,7 @@ fn readiness(
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 147 {
+    if trigger_count != 153 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
         ));
@@ -4424,6 +4523,7 @@ fn readiness(
     verify_migration_trigger_definitions(connection, MIGRATION_0023, MIGRATION_0023_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0024, MIGRATION_0024_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0025, MIGRATION_0025_TRIGGER_NAMES)?;
+    verify_migration_trigger_definitions(connection, MIGRATION_0026, MIGRATION_0026_TRIGGER_NAMES)?;
 
     let agent_pending_call_fk: i64 = connection.query_row(
         r#"SELECT COUNT(*)
@@ -5007,6 +5107,7 @@ fn readiness(
     agent::verify_agent_knowledge_context_integrity(connection)?;
     agent::verify_account_knowledge_catalog_integrity(connection)?;
     agent::verify_account_agent_prompt_integrity(connection)?;
+    provider::verify_account_reply_provider_integrity(connection)?;
     compaction::verify_integrity(connection)?;
     execution::verify_agent_execution_integrity(connection)?;
     let (user_count, ownerless_active_accounts): (i64, i64) = connection.query_row(

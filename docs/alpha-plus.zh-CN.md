@@ -5,7 +5,8 @@ Event Feed、Point-query Durable Context、Bounded Read Models、SQLite Capacity
 Physical/Operation Capacity、Bootstrap Audit Retention、schema v13 Account Membership
 Foundation、schema v14 Account-scoped Durable Authorization、schema v15 Member Lifecycle /
 Account Audit、schema v16 Session Reply Context Index 至 schema v25 Durable Session Context
-Compaction、Trusted Single-Node Ingress、Per-Operation SecretRef Resolution 与有界多账户控制面主机代码已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
+Compaction、schema v26 Account-scoped Reply Provider Selection、Trusted Single-Node Ingress、
+Per-Operation SecretRef Resolution 与有界多账户控制面主机代码已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
 v11→v12→v13→v14 迁移证据，current-image 证据见本节验收结果，Linux Docker PID/OOM
 authoritative gate 待完成。
 
@@ -343,6 +344,9 @@ POST /sessions/{id}/turns
 - `0025_session_context_compaction.sql`：增加不可变 source boundary/digest、上代 checkpoint、模型
   配置和 exact request 绑定，以及 `queued -> started -> succeeded|failed|outcome_unknown` 单向状态
   机。成功 summary 最多 16 KiB 且必须严格小于被替换 source；raw Session ledger 保持不变。
+- `0026_account_reply_provider.sql`：增加 account-scoped secret-free Provider head、单调 revision、
+  immutable idempotency receipt、current-owner trigger 和 account audit 绑定。revision 0 保持为进程
+  startup default；endpoint、credential、SecretRef 不进入 HTTP 或 SQLite。
 
 schema v24 的 system prompt governance 复用 `0019` 的 prompt binding，并增加 durable
 head/revision/receipt。Owner-only `GET/PUT /api/v1/agent/prompt` 通过 expected-revision CAS 和
@@ -354,6 +358,11 @@ schema v25 的 compaction 与 prompt/knowledge 分离：它只压缩已经完整
 边界的历史 turn；后续 Agent request 同时绑定成功 checkpoint 和 checkpoint 之后的原始 tail。
 新回合组装与 compaction 成功并发时，存储层按请求实际携带的 checkpoint（包括没有 checkpoint）
 做精确重建，避免把安全的旧快照误判为损坏。
+schema v26 由 startup Provider registry 与 durable account selection 组成。Authenticated actor 可
+读取 `GET /api/v1/providers` 的 secret-free catalog，owner 通过
+`GET|PUT /api/v1/account/reply-provider` 选择已注册 Provider。选择只影响新 turn；queued reply、
+compaction、Agent model/tool work 继续按 immutable job binding 解析 Provider。显式选择或 queued
+binding 在重启后不再注册时 fail closed，不回退到另一个默认模型。
 Knowledge v1 生成独立、受治理、带完整 digest 的 canonical context
 snapshot，不修改 system prompt。schema v22 已完成数据库绑定、
 Agent request 注入和 exact replay；LLM 协议层使用独立 durable `context` role，并只在
@@ -425,8 +434,8 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 按项目既有统计口径通过 611 个 Rust 测试（connectors 22、deployment 8、knowledge 29、
-  LLM unit 30、provider contract 15、storage 254、runtime 48、API library 80、API main/config 11）与 28 个 Web Node 测试。
+- host 按项目既有统计口径通过 615 个 Rust 测试（connectors 22、deployment 8、knowledge 29、
+  LLM unit 30、provider contract 15、storage 256、runtime 48、API library 82、API main/config 11）与 28 个 Web Node 测试。
 - `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 
 ## 8. 容器与 OOM 验收边界
