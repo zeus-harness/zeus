@@ -698,6 +698,16 @@ pub struct AgentSubagentMessageCandidate {
     pub child_session: SessionSummary,
 }
 
+/// Current authority and active child Agent captured for one exact started
+/// `interrupt_agent` call. Storage derives every identity from the persisted
+/// parent call and immutable direct-child binding.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentSubagentInterruptCandidate {
+    pub authz: AuthzContext,
+    pub child_session: SessionSummary,
+    pub child_agent: AgentTurn,
+}
+
 /// Read-only scheduling candidate for the first queued follow-up of one Ready
 /// Session. The synthetic auth-session ID is internal; durable admission
 /// rechecks the captured membership revision without trusting a browser login.

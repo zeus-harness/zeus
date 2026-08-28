@@ -76,27 +76,27 @@ pub use storage::{
     AgentModelStartOutcome, AgentModelSuccessCommit, AgentOperationClaim, AgentOperationKind,
     AgentPreparedModel, AgentPreparedTool, AgentPromptCommit, AgentPromptRevisionPage,
     AgentPromptRevisionSummary, AgentPromptState, AgentPromptUpdateResult, AgentReviewCommit,
-    AgentReviewContext, AgentReviewResult, AgentSubagentMessageCandidate,
-    AgentSubagentSpawnCandidate, AgentSubagentSpawnCommit, AgentTerminalCompletion, AgentToolCall,
-    AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
-    AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurn,
-    AgentTurnEnqueueResponse, AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal,
-    AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, CreateAccountCommit,
-    CreateAccountResult, CreateMemberResult, DEFAULT_SESSION_AGENT_PROMPT_REVISION,
-    DEFAULT_SESSION_AGENT_SYSTEM_PROMPT, InFlightWorkSummary, KnowledgeCatalogCommit,
-    KnowledgeCatalogRevisionPage, KnowledgeCatalogRevisionSummary, KnowledgeCatalogState,
-    KnowledgeCatalogUpdateResult, MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit,
-    MemberSetupResult, MemberSetupToken, MemberTransitionResult, MembershipRevision,
-    MembershipRole, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit, ReplyJob,
-    ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
-    ReplySuccessCommit, RotateMemberSetupTokenResult, SESSION_AGENT_PROMPT_ID,
-    SessionCompactionClaimOutcome, SessionCompactionFailureCommit, SessionCompactionJob,
-    SessionCompactionSuccessCommit, SessionContextCheckpoint, SessionFollowupCandidate,
-    SessionForkPage, SessionSummaryPage, SqliteOperationLimits, SqliteOperationLimitsError,
-    SqlitePhysicalLimits, SqlitePhysicalLimitsError, StorageLimits, StorageLimitsError,
-    StoredAccount, StoredAccountStatus, StoredCredential, StoredMember, StoredMemberPage,
-    StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserRole, StoredUserStatus,
-    SwitchAuthSessionCommit, SwitchAuthSessionResult, TransitionMemberCommit,
+    AgentReviewContext, AgentReviewResult, AgentSubagentInterruptCandidate,
+    AgentSubagentMessageCandidate, AgentSubagentSpawnCandidate, AgentSubagentSpawnCommit,
+    AgentTerminalCompletion, AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome,
+    AgentToolCompletion, AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit,
+    AgentToolStartOutcome, AgentToolWork, AgentTurn, AgentTurnEnqueueResponse,
+    AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthSessionId,
+    AuthzContext, BootstrapOwnerCommit, CreateAccountCommit, CreateAccountResult,
+    CreateMemberResult, DEFAULT_SESSION_AGENT_PROMPT_REVISION, DEFAULT_SESSION_AGENT_SYSTEM_PROMPT,
+    InFlightWorkSummary, KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage,
+    KnowledgeCatalogRevisionSummary, KnowledgeCatalogState, KnowledgeCatalogUpdateResult,
+    MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit, MemberSetupResult, MemberSetupToken,
+    MemberTransitionResult, MembershipRevision, MembershipRole, ReplyClaimOutcome, ReplyCompletion,
+    ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus,
+    ReplyOutcomeUnknownCommit, ReplySuccessCommit, RotateMemberSetupTokenResult,
+    SESSION_AGENT_PROMPT_ID, SessionCompactionClaimOutcome, SessionCompactionFailureCommit,
+    SessionCompactionJob, SessionCompactionSuccessCommit, SessionContextCheckpoint,
+    SessionFollowupCandidate, SessionForkPage, SessionSummaryPage, SqliteOperationLimits,
+    SqliteOperationLimitsError, SqlitePhysicalLimits, SqlitePhysicalLimitsError, StorageLimits,
+    StorageLimitsError, StoredAccount, StoredAccountStatus, StoredCredential, StoredMember,
+    StoredMemberPage, StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserRole,
+    StoredUserStatus, SwitchAuthSessionCommit, SwitchAuthSessionResult, TransitionMemberCommit,
     UpdateAccountAuditPolicyCommit,
 };
 use storage::{
@@ -107,12 +107,14 @@ use storage::{
 };
 use subagents::{
     GET_AGENT_RESULT_TOOL_NAME, GET_AGENT_RESULT_TOOL_VERSION, GetAgentResult,
-    GetAgentResultStatus, LIST_AGENTS_TOOL_NAME, LIST_AGENTS_TOOL_VERSION, ListAgentsResult,
+    GetAgentResultStatus, INTERRUPT_AGENT_TOOL_NAME, INTERRUPT_AGENT_TOOL_VERSION,
+    InterruptAgentResult, LIST_AGENTS_TOOL_NAME, LIST_AGENTS_TOOL_VERSION, ListAgentsResult,
     SEND_MESSAGE_TOOL_NAME, SEND_MESSAGE_TOOL_VERSION, SPAWN_AGENT_TOOL_NAME,
     SPAWN_AGENT_TOOL_VERSION, SendMessageResult, SpawnAgentResult, SubagentError,
-    get_agent_result_descriptor, list_agents_descriptor, prepare_get_agent_result,
-    prepare_list_agents, prepare_send_message, prepare_spawn_agent, register_subagent_tools,
-    send_message_descriptor, send_message_identity, spawn_agent_descriptor, spawn_agent_identity,
+    get_agent_result_descriptor, interrupt_agent_descriptor, list_agents_descriptor,
+    prepare_get_agent_result, prepare_interrupt_agent, prepare_list_agents, prepare_send_message,
+    prepare_spawn_agent, register_subagent_tools, send_message_descriptor, send_message_identity,
+    spawn_agent_descriptor, spawn_agent_identity,
 };
 use terminal::TerminalService;
 use thiserror::Error;
@@ -1863,6 +1865,63 @@ impl DemoStore {
                 provider_request_id: None,
             });
         }
+        if resolved.call.tool == INTERRUPT_AGENT_TOOL_NAME
+            && resolved.call.tool_version == INTERRUPT_AGENT_TOOL_VERSION
+        {
+            let request = prepare_interrupt_agent(&resolved.call.arguments)
+                .map_err(subagent_executor_error)?;
+            let mut retries = 0_u8;
+            let completion = loop {
+                let candidate = self
+                    .storage
+                    .subagent_interrupt_candidate_for_started_tool(
+                        &scope,
+                        &resolved.call.call_id,
+                        request.subagent_id(),
+                    )
+                    .await
+                    .map_err(|error| subagent_interrupt_store_error(error.into()))?;
+                let result = self
+                    .cancel_subagent_turn_for_actor(
+                        &candidate.authz,
+                        &candidate.child_session.id,
+                        &candidate.child_agent.turn_id,
+                        candidate.child_agent.revision,
+                    )
+                    .await;
+                match result {
+                    Err(StoreError::AgentRevisionConflict | StoreError::ConcurrentModification)
+                        if retries < 3 =>
+                    {
+                        retries += 1;
+                    }
+                    result => break result.map_err(subagent_interrupt_store_error)?,
+                }
+            };
+            if completion.agent.session_id != request.subagent_id()
+                || completion.agent.status != protocol::AgentTurnStatus::Failed
+            {
+                return Err(StoreError::ExecutionInvariant(
+                    "interrupt_agent completion disagrees with its direct child".into(),
+                ));
+            }
+            let result = InterruptAgentResult::new(
+                completion.agent.session_id.clone(),
+                completion.agent.turn_id.clone(),
+            )
+            .map_err(subagent_executor_error)?;
+            return Ok(ToolOutput {
+                value: serde_json::to_value(result).map_err(|_| {
+                    StoreError::Registry(RegistryError::Executor(ExecutorError::Failed {
+                        code: "interrupt_agent_result_encoding_failed".into(),
+                        message: "The durable child interruption could not be encoded".into(),
+                        retryable: false,
+                    }))
+                })?,
+                replayed: completion.replayed,
+                provider_request_id: None,
+            });
+        }
         if resolved.call.tool == SEND_MESSAGE_TOOL_NAME
             && resolved.call.tool_version == SEND_MESSAGE_TOOL_VERSION
         {
@@ -2923,6 +2982,31 @@ impl DemoStore {
             .await?;
         activations.remove(session_id);
         Ok(response)
+    }
+
+    async fn cancel_subagent_turn_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        turn_id: &str,
+        expected_revision: u64,
+    ) -> Result<AgentCancellationCompletion, StoreError> {
+        validate_durable_reference(session_id, "session ID")?;
+        validate_durable_reference(turn_id, "turn ID")?;
+        let completion = self
+            .storage
+            .cancel_subagent_turn_for_actor(context, session_id, turn_id, expected_revision)
+            .await?;
+        if let Some(job_id) = completion.started_model_job_id.as_deref() {
+            self.agent_model_cancellations.cancel(job_id);
+        }
+        self.disarm_session_goal(session_id).await;
+        if !completion.replayed {
+            self.publish_session_event(&completion.session.id, completion.event.clone());
+        }
+        self.cleanup_agent_terminal_resources(&completion.agent)
+            .await;
+        Ok(completion)
     }
 
     pub async fn session_followups_for_actor(
@@ -4802,6 +4886,7 @@ fn register_runtime_subagent_tools(
 ) -> Result<(), StoreError> {
     for descriptor in [
         get_agent_result_descriptor(),
+        interrupt_agent_descriptor(),
         list_agents_descriptor(),
         send_message_descriptor(),
         spawn_agent_descriptor(),
@@ -4829,6 +4914,9 @@ fn subagent_executor_error(error: SubagentError) -> StoreError {
         SubagentError::InvalidResultSubagentId => "get_agent_result_invalid_subagent_id",
         SubagentError::InvalidResultRange => "get_agent_result_invalid_range",
         SubagentError::InvalidAgentResult => "get_agent_result_invalid_result",
+        SubagentError::InvalidInterruptArguments => "interrupt_agent_invalid_arguments",
+        SubagentError::InvalidInterruptSubagentId => "interrupt_agent_invalid_subagent_id",
+        SubagentError::InvalidInterruptResult => "interrupt_agent_invalid_result",
         SubagentError::InvalidSendArguments => "send_message_invalid_arguments",
         SubagentError::InvalidSendSubagentId => "send_message_invalid_subagent_id",
         SubagentError::InvalidSendMessage => "send_message_invalid_message",
@@ -4884,6 +4972,33 @@ fn snapshot_from_scenario(scenario: &DemoScenario) -> RunSnapshot {
         metrics: scenario.metrics.clone(),
         evidence: scenario.evidence.clone(),
         tool_policy: Some(scenario.tool_policy.clone()),
+    }
+}
+
+fn subagent_interrupt_store_error(error: StoreError) -> StoreError {
+    match error {
+        StoreError::AgentOperationInFlight => {
+            StoreError::Registry(RegistryError::Executor(ExecutorError::Failed {
+                code: "interrupt_agent_operation_in_flight".into(),
+                message: "The child tool crossed its durable started checkpoint and cannot be reported as cancelled".into(),
+                retryable: false,
+            }))
+        }
+        StoreError::AgentAlreadyTerminal => {
+            StoreError::Registry(RegistryError::Executor(ExecutorError::Failed {
+                code: "interrupt_agent_not_running".into(),
+                message: "The direct child has no active Agent turn to interrupt".into(),
+                retryable: false,
+            }))
+        }
+        StoreError::AgentToolCallNotFound(_) | StoreError::AgentTurnNotFound(_) => {
+            StoreError::Registry(RegistryError::Executor(ExecutorError::Failed {
+                code: "interrupt_agent_not_found".into(),
+                message: "The requested direct child is not available in this parent Agent scope".into(),
+                retryable: false,
+            }))
+        }
+        other => other,
     }
 }
 
@@ -5353,7 +5468,7 @@ mod tests {
         let store = local_store(&paths, false).await;
 
         let definitions = store.session_agent_tool_definitions().unwrap();
-        assert_eq!(definitions.len(), 9);
+        assert_eq!(definitions.len(), 10);
         assert_eq!(definitions[0].name, goals::CREATE_GOAL_TOOL_NAME);
         assert_eq!(definitions[1].name, connectors::DEV_MARKER_TOOL_NAME);
         assert_eq!(
@@ -5378,31 +5493,36 @@ mod tests {
             protocol::SESSION_ID_MAX_BYTES
         );
         assert_eq!(definitions[3].name, goals::GET_GOAL_TOOL_NAME);
-        assert_eq!(definitions[4].name, subagents::LIST_AGENTS_TOOL_NAME);
+        assert_eq!(definitions[4].name, subagents::INTERRUPT_AGENT_TOOL_NAME);
         assert_eq!(
-            definitions[4].input_schema["properties"]["cursor"]["maxLength"],
+            definitions[4].input_schema["properties"]["subagent_id"]["maxLength"],
+            protocol::SESSION_ID_MAX_BYTES
+        );
+        assert_eq!(definitions[5].name, subagents::LIST_AGENTS_TOOL_NAME);
+        assert_eq!(
+            definitions[5].input_schema["properties"]["cursor"]["maxLength"],
             subagents::LIST_AGENTS_CURSOR_MAX_BYTES
         );
-        assert_eq!(definitions[5].name, subagents::SEND_MESSAGE_TOOL_NAME);
+        assert_eq!(definitions[6].name, subagents::SEND_MESSAGE_TOOL_NAME);
         assert_eq!(
-            definitions[5].input_schema["properties"]["message"]["maxLength"],
+            definitions[6].input_schema["properties"]["message"]["maxLength"],
             subagents::SEND_MESSAGE_MAX_BYTES
         );
-        assert_eq!(definitions[6].name, subagents::SPAWN_AGENT_TOOL_NAME);
+        assert_eq!(definitions[7].name, subagents::SPAWN_AGENT_TOOL_NAME);
         assert_eq!(
-            definitions[6].input_schema["properties"]["prompt"]["maxLength"],
+            definitions[7].input_schema["properties"]["prompt"]["maxLength"],
             subagents::SPAWN_AGENT_PROMPT_MAX_BYTES
         );
-        assert_eq!(definitions[7].name, planning::TODO_WRITE_TOOL_NAME);
+        assert_eq!(definitions[8].name, planning::TODO_WRITE_TOOL_NAME);
         assert_eq!(
-            definitions[7].input_schema["properties"]["todos"]["maxItems"],
+            definitions[8].input_schema["properties"]["todos"]["maxItems"],
             planning::TODO_MAX_ITEMS
         );
         assert_eq!(
-            definitions[7].input_schema["properties"]["todos"]["items"]["properties"]["status"]["enum"],
+            definitions[8].input_schema["properties"]["todos"]["items"]["properties"]["status"]["enum"],
             serde_json::json!(["pending", "in_progress", "completed"])
         );
-        assert_eq!(definitions[8].name, goals::UPDATE_GOAL_TOOL_NAME);
+        assert_eq!(definitions[9].name, goals::UPDATE_GOAL_TOOL_NAME);
 
         let production = DemoStore::seeded().await.unwrap();
         assert_eq!(
@@ -5416,6 +5536,7 @@ mod tests {
                 goals::CREATE_GOAL_TOOL_NAME,
                 subagents::GET_AGENT_RESULT_TOOL_NAME,
                 goals::GET_GOAL_TOOL_NAME,
+                subagents::INTERRUPT_AGENT_TOOL_NAME,
                 subagents::LIST_AGENTS_TOOL_NAME,
                 subagents::SEND_MESSAGE_TOOL_NAME,
                 subagents::SPAWN_AGENT_TOOL_NAME,
@@ -5644,6 +5765,7 @@ mod tests {
                 connectors::DEV_MARKER_TOOL_NAME,
                 subagents::GET_AGENT_RESULT_TOOL_NAME,
                 goals::GET_GOAL_TOOL_NAME,
+                subagents::INTERRUPT_AGENT_TOOL_NAME,
                 subagents::LIST_AGENTS_TOOL_NAME,
                 subagents::SEND_MESSAGE_TOOL_NAME,
                 skills::SKILL_LIST_TOOL_NAME,

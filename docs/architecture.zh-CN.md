@@ -34,7 +34,7 @@ Client / SvelteKit Web
   生命周期与 revision CAS；它只准备有界规范状态，持久化权威仍由 SQLite 掌握。
 - `skills`：启动时一次性加载的 strict version 1 Skill Catalog、确定性 digest，以及只读
   `skill_list` / `skill_load` executor；Skill body 只有通过普通工具结果才对模型可见。
-- `subagents`：`spawn_agent` / `list_agents` / `get_agent_result` / `send_message` 工具契约、
+- `subagents`：`spawn_agent` / `list_agents` / `get_agent_result` / `send_message` / `interrupt_agent` 工具契约、
   严格参数边界、确定性 child/message identity 与有界结果；durable scope、原子 admission、目录分页、
   终态结果读取和 follow-up 入队由 runtime/storage 掌握，不由通用 executor 接受调用方自报身份。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
@@ -156,7 +156,16 @@ turn ID 与 idempotency key；storage 复用 schema v31 Session follow-up FIFO �
 Running child 在当前 turn 结束后按 FIFO 消费；`needs_attention` child 在具备显式恢复协议前拒绝续发。
 进程自有 continuation 不依赖短期浏览器登录 session，但仍要求原 account/member/user 有效且具备
 SessionWrite/Reply 权限。入队之后、parent tool completion 之前若进程崩溃，parent call 按既有
-LocalWrite 语义进入 `outcome_unknown`，不会盲目重发。当前阶段仍不提供 interrupt 或递归全图加载。
+LocalWrite 语义进入 `outcome_unknown`，不会盲目重发。
+
+`interrupt_agent@1-direct-child-cancel` 继续沿用 exact started parent scope 和 immutable direct-child
+binding，并从 child 当前 active turn 派生 Agent revision，不信任模型提供 revision/turn/account/actor。
+Storage 复用既有 cancellation transaction：queued/running model 与 waiting-approval/queued tool 会写入
+`user_cancelled` fact 和 `turn_interrupted`；running model 同时通知本进程 drop provider stream。已经
+durable started 的 tool 返回 `interrupt_agent_operation_in_flight`，不会伪造“已取消外部副作用”。
+Process-owned 中断复验原 membership revision 与 SessionWrite/Reply 权限，不依赖短期登录 session；
+成功 parent tool result 的 deep integrity 还必须能还原直属 child 的 exact user-cancelled terminal evidence。
+当前阶段不递归加载完整 child graph。
 
 schema v28 增加 Agent turn 自有的 durable plan。`todo_write@1-single-active` 每次提交完整列表，
 最多 24 项、每项 256 UTF-8 bytes、至多一个 `in_progress`；首写 `expected_revision=0`，之后严格
@@ -772,8 +781,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   刷新恢复、owner/member setup/登录、owner 成员与 audit 管理、设置/退出和
   system/light/dark。member 的审批卡只读。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化按项目既有统计口径是 699 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
-  provider contract 18、skills 5、subagents 10、storage 286、workflows 21、runtime 52、API library 96、API main/config 18）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化按项目既有统计口径是 702 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
+  provider contract 18、skills 5、subagents 11、storage 286、workflows 21、runtime 52、API library 98、API main/config 18）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
 提交 `af29089` 曾构建并运行在独立 `zeus-operation-acceptance` project（端口 `18089`）；既有

@@ -715,7 +715,7 @@ pub fn stable_agent_call_id(
     model_step: u32,
     call_ordinal: u32,
 ) -> Result<String, RegistryError> {
-    validate_id_component(agent_id, "agent id")?;
+    validate_agent_id_component(agent_id)?;
     let mut input = Vec::with_capacity(agent_id.len() + 40);
     input.extend_from_slice(b"zeus-agent-tool-call-v1\0");
     input.extend_from_slice(
@@ -916,6 +916,20 @@ fn validate_id_component(value: &str, label: &str) -> Result<(), RegistryError> 
     {
         return Err(RegistryError::InvalidCall(format!(
             "{label} contains unsupported characters or is too long"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_agent_id_component(value: &str) -> Result<(), RegistryError> {
+    if value.is_empty()
+        || value.len() > MAX_EXECUTION_SCOPE_FIELD_BYTES
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte == b'.'
+        })
+    {
+        return Err(RegistryError::InvalidCall(format!(
+            "agent id contains unsupported characters or is longer than {MAX_EXECUTION_SCOPE_FIELD_BYTES} bytes"
         )));
     }
     Ok(())
@@ -1191,6 +1205,10 @@ mod tests {
         assert_ne!(first, stable_agent_call_id("agent-turn-7", 4, 1).unwrap());
         assert_ne!(first, stable_agent_call_id("agent-turn-7", 3, 2).unwrap());
         assert!(stable_agent_call_id("model supplied/tool", 3, 1).is_err());
+        assert!(stable_agent_call_id(&"a".repeat(MAX_EXECUTION_SCOPE_FIELD_BYTES), 3, 1).is_ok());
+        assert!(
+            stable_agent_call_id(&"a".repeat(MAX_EXECUTION_SCOPE_FIELD_BYTES + 1), 3, 1).is_err()
+        );
     }
 
     #[test]

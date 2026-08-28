@@ -9771,6 +9771,16 @@ mod tests {
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
     }
 
+    struct SpawnInterruptThenFinalProvider {
+        metadata: ProviderMetadata,
+        requests: Arc<StdMutex<Vec<ReplyRequest>>>,
+    }
+
+    struct InterruptForeignThenFinalProvider {
+        metadata: ProviderMetadata,
+        target_session_id: String,
+    }
+
     struct GoalReadCreateThenFinalProvider {
         metadata: ProviderMetadata,
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
@@ -10194,6 +10204,32 @@ mod tests {
         }
     }
 
+    impl SpawnInterruptThenFinalProvider {
+        fn new(requests: Arc<StdMutex<Vec<ReplyRequest>>>) -> Self {
+            Self {
+                metadata: ProviderMetadata {
+                    provider_id: "test-spawn-interrupt-provider".into(),
+                    model: Some("test-model".into()),
+                    reply_kind: ReplyKind::Model,
+                },
+                requests,
+            }
+        }
+    }
+
+    impl InterruptForeignThenFinalProvider {
+        fn new(target_session_id: impl Into<String>) -> Self {
+            Self {
+                metadata: ProviderMetadata {
+                    provider_id: "test-interrupt-foreign-provider".into(),
+                    model: Some("test-model".into()),
+                    reply_kind: ReplyKind::Model,
+                },
+                target_session_id: target_session_id.into(),
+            }
+        }
+    }
+
     impl ReplyProvider for SpawnListThenFinalProvider {
         fn metadata(&self) -> &ProviderMetadata {
             &self.metadata
@@ -10492,6 +10528,138 @@ mod tests {
                         }
                     }
                 }
+            };
+            let provider = self.metadata.clone();
+            Box::pin(async move {
+                Ok(ReplyResponse {
+                    output,
+                    finish_reason: Some("stop".into()),
+                    provider,
+                })
+            })
+        }
+    }
+
+    impl ReplyProvider for SpawnInterruptThenFinalProvider {
+        fn metadata(&self) -> &ProviderMetadata {
+            &self.metadata
+        }
+
+        fn reply(&self, request: ReplyRequest) -> ReplyFuture<'_> {
+            let output = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(request.clone());
+                let current_user = request
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == ReplyRole::User)
+                    .map(|message| message.content.as_str());
+                if current_user == Some("child interrupt target") {
+                    ReplyOutput::ToolCall {
+                        call: ReplyToolCall::new(
+                            "provider-call-child-awaiting-approval",
+                            "dev_marker_write",
+                            serde_json::json!({"marker": "child-must-not-run"}),
+                        ),
+                    }
+                } else {
+                    let tool_results = request
+                        .messages
+                        .iter()
+                        .filter(|message| message.role == ReplyRole::Tool)
+                        .map(|message| {
+                            serde_json::from_str::<serde_json::Value>(&message.content).unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    match tool_results.as_slice() {
+                        [] => ReplyOutput::ToolCall {
+                            call: ReplyToolCall::new(
+                                "provider-call-spawn-interrupt-child",
+                                subagents::SPAWN_AGENT_TOOL_NAME,
+                                serde_json::json!({
+                                    "description": "Interruptible child",
+                                    "prompt": "child interrupt target",
+                                }),
+                            ),
+                        },
+                        [spawned] => {
+                            let subagent_id = spawned["subagent_id"]
+                                .as_str()
+                                .expect("spawn_agent must return its child ID");
+                            let tool = request
+                                .tools
+                                .iter()
+                                .find(|tool| tool.name == subagents::INTERRUPT_AGENT_TOOL_NAME)
+                                .expect("every parent Agent request must expose interrupt_agent");
+                            assert_eq!(
+                                tool.parameters["properties"]["subagent_id"]["maxLength"],
+                                protocol::SESSION_ID_MAX_BYTES
+                            );
+                            ReplyOutput::ToolCall {
+                                call: ReplyToolCall::new(
+                                    "provider-call-interrupt-child",
+                                    subagents::INTERRUPT_AGENT_TOOL_NAME,
+                                    serde_json::json!({"subagent_id": subagent_id}),
+                                ),
+                            }
+                        }
+                        [spawned, interrupted] => {
+                            assert_eq!(interrupted["subagent_id"], spawned["subagent_id"]);
+                            assert_eq!(interrupted["status"], "interrupted");
+                            assert!(interrupted["turn_id"].is_string());
+                            ReplyOutput::Final {
+                                content: "parent durably interrupted the child".into(),
+                            }
+                        }
+                        results => {
+                            panic!("unexpected parent tool-result count {}", results.len())
+                        }
+                    }
+                }
+            };
+            let provider = self.metadata.clone();
+            Box::pin(async move {
+                Ok(ReplyResponse {
+                    output,
+                    finish_reason: Some("stop".into()),
+                    provider,
+                })
+            })
+        }
+    }
+
+    impl ReplyProvider for InterruptForeignThenFinalProvider {
+        fn metadata(&self) -> &ProviderMetadata {
+            &self.metadata
+        }
+
+        fn reply(&self, request: ReplyRequest) -> ReplyFuture<'_> {
+            let tool_results = request
+                .messages
+                .iter()
+                .filter(|message| message.role == ReplyRole::Tool)
+                .map(|message| serde_json::from_str::<serde_json::Value>(&message.content).unwrap())
+                .collect::<Vec<_>>();
+            let output = match tool_results.as_slice() {
+                [] => ReplyOutput::ToolCall {
+                    call: ReplyToolCall::new(
+                        "provider-call-interrupt-foreign",
+                        subagents::INTERRUPT_AGENT_TOOL_NAME,
+                        serde_json::json!({"subagent_id": self.target_session_id}),
+                    ),
+                },
+                [failed] => {
+                    assert_eq!(failed["code"], "interrupt_agent_not_found");
+                    assert_eq!(failed["status"], "failed");
+                    ReplyOutput::Final {
+                        content: "parent respected the direct-child boundary".into(),
+                    }
+                }
+                results => panic!(
+                    "unexpected foreign interrupt result count {}",
+                    results.len()
+                ),
             };
             let provider = self.metadata.clone();
             Box::pin(async move {
@@ -13428,6 +13596,239 @@ mod tests {
             protocol::SessionFollowupStatus::Claimed
         );
         assert_eq!(requests.lock().unwrap().len(), 6);
+        store.verify_integrity().await.unwrap();
+        drop(app);
+    }
+
+    #[tokio::test]
+    async fn agent_interrupt_durably_cancels_only_its_active_direct_child() {
+        let unique = UserId::generate().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "zeus-api-agent-interrupt-{}",
+            unique.as_str().replace(':', "-")
+        ));
+        let path = root.join("zeus.db");
+        let marker_root = root.join("markers");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = DemoStore::open_local(&path, &marker_root).await.unwrap();
+        let owner =
+            provision_test_owner(&store, "user-agent-interrupt", "agent-interrupt-owner").await;
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: "session-agent-interrupt".into(),
+                    title: "Durable child interruption".into(),
+                },
+                "create-agent-interrupt",
+            )
+            .await
+            .unwrap();
+
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(SpawnInterruptThenFinalProvider::new(Arc::clone(&requests))),
+        )
+        .unwrap();
+        let started = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-agent-interrupt/turns")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "start-agent-interrupt")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-agent-interrupt",
+                            "user_message": "stop one active direct child",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+
+        let parent = wait_for_ready_session(&store, &owner.authz, "session-agent-interrupt").await;
+        assert_eq!(
+            parent.turns[0].assistant_message.as_deref(),
+            Some("parent durably interrupted the child")
+        );
+        let agent = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            "session-agent-interrupt",
+            "turn-agent-interrupt",
+            protocol::AgentTurnStatus::Succeeded,
+        )
+        .await;
+        assert_eq!(agent.model_steps, 3);
+        assert_eq!(agent.tool_calls, 2);
+        assert_eq!(agent.calls[0].tool, subagents::SPAWN_AGENT_TOOL_NAME);
+        assert_eq!(agent.calls[1].tool, subagents::INTERRUPT_AGENT_TOOL_NAME);
+        assert!(agent.calls.iter().all(|call| {
+            call.status == AgentToolCallStatus::Succeeded && !call.approval_required
+        }));
+        let spawned: subagents::SpawnAgentResult =
+            serde_json::from_value(agent.calls[0].output.clone().unwrap()).unwrap();
+        let interrupted: subagents::InterruptAgentResult =
+            serde_json::from_value(agent.calls[1].output.clone().unwrap()).unwrap();
+        assert_eq!(interrupted.subagent_id, spawned.subagent_id);
+        assert_eq!(
+            interrupted.status,
+            subagents::InterruptAgentStatus::Interrupted
+        );
+
+        let child = store
+            .get_session_for_actor(
+                &owner.authz,
+                &spawned.subagent_id,
+                None,
+                50,
+                None,
+                50,
+                None,
+                50,
+            )
+            .await
+            .unwrap();
+        assert_eq!(child.session.status, SessionStatus::NeedsAttention);
+        assert_eq!(child.turns.len(), 1);
+        assert_eq!(child.turns[0].id, interrupted.turn_id);
+        let child_agent = store
+            .agent_turn_detail_for_actor(&owner.authz, &spawned.subagent_id, &interrupted.turn_id)
+            .await
+            .unwrap();
+        assert_eq!(child_agent.status, protocol::AgentTurnStatus::Failed);
+        assert_eq!(
+            child_agent
+                .last_error
+                .as_ref()
+                .and_then(|error| error.get("code"))
+                .and_then(serde_json::Value::as_str),
+            Some("user_cancelled")
+        );
+        assert!(child_agent.calls.iter().all(|call| {
+            call.status == AgentToolCallStatus::Cancelled && call.approval_required
+        }));
+        assert_eq!(std::fs::read_dir(&marker_root).unwrap().count(), 0);
+        let recorded = requests.lock().unwrap().clone();
+        assert!((3..=4).contains(&recorded.len()));
+        assert!(
+            recorded
+                .iter()
+                .filter(|request| request.messages.iter().any(|message| {
+                    message.role == ReplyRole::User && message.content == "child interrupt target"
+                }))
+                .count()
+                <= 1
+        );
+        store.verify_integrity().await.unwrap();
+        drop(app);
+        drop(store);
+        tokio::task::yield_now().await;
+        cleanup_test_database(&path);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_interrupt_rejects_a_manual_session_fork() {
+        let store = DemoStore::seeded().await.unwrap();
+        let owner = provision_test_owner(
+            &store,
+            "user-agent-interrupt-foreign",
+            "agent-interrupt-foreign-owner",
+        )
+        .await;
+        let parent_id = "session-agent-interrupt-foreign";
+        let manual_child_id = "session-agent-interrupt-manual-child";
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: parent_id.into(),
+                    title: "Reject foreign interrupt".into(),
+                },
+                "create-agent-interrupt-foreign",
+            )
+            .await
+            .unwrap();
+        store
+            .fork_session_for_actor(
+                &owner.authz,
+                parent_id,
+                ForkSessionRequest {
+                    id: manual_child_id.into(),
+                    title: "Manual child outside Agent catalog".into(),
+                    through_sequence: 1,
+                },
+                "fork-agent-interrupt-manual-child",
+            )
+            .await
+            .unwrap();
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(InterruptForeignThenFinalProvider::new(manual_child_id)),
+        )
+        .unwrap();
+        let started = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/sessions/{parent_id}/turns"))
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "start-agent-interrupt-foreign")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-agent-interrupt-foreign",
+                            "user_message": "do not interrupt a manual fork",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+        let parent = wait_for_ready_session(&store, &owner.authz, parent_id).await;
+        assert_eq!(
+            parent.turns[0].assistant_message.as_deref(),
+            Some("parent respected the direct-child boundary")
+        );
+        let agent = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            parent_id,
+            "turn-agent-interrupt-foreign",
+            protocol::AgentTurnStatus::Succeeded,
+        )
+        .await;
+        assert_eq!(agent.model_steps, 2);
+        assert_eq!(agent.tool_calls, 1);
+        assert_eq!(agent.calls[0].tool, subagents::INTERRUPT_AGENT_TOOL_NAME);
+        assert_eq!(agent.calls[0].status, AgentToolCallStatus::Failed);
+        assert_eq!(
+            agent.calls[0].error.as_ref().unwrap()["code"],
+            "interrupt_agent_not_found"
+        );
+        let manual_child = store
+            .get_session_for_actor(&owner.authz, manual_child_id, None, 50, None, 50, None, 50)
+            .await
+            .unwrap();
+        assert_eq!(manual_child.session.status, SessionStatus::Ready);
+        assert!(manual_child.turns.is_empty());
         store.verify_integrity().await.unwrap();
         drop(app);
     }

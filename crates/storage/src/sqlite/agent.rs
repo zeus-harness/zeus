@@ -12,11 +12,11 @@ use crate::{
     AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit, AgentOperationClaim,
     AgentOperationKind, AgentPreparedModel, AgentPreparedTool, AgentPromptCommit,
     AgentPromptRevisionPage, AgentPromptRevisionSummary, AgentPromptState, AgentPromptUpdateResult,
-    AgentReviewCommit, AgentReviewContext, AgentReviewResult, AgentSubagentMessageCandidate,
-    AgentSubagentResultSnapshot, AgentSubagentSpawnCandidate, AgentSubagentSpawnCommit,
-    AgentTerminalCompletion, AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome,
-    AgentToolCompletion, AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit,
-    AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe,
+    AgentReviewCommit, AgentReviewContext, AgentReviewResult, AgentSubagentInterruptCandidate,
+    AgentSubagentMessageCandidate, AgentSubagentResultSnapshot, AgentSubagentSpawnCandidate,
+    AgentSubagentSpawnCommit, AgentTerminalCompletion, AgentToolCall, AgentToolCallSpec,
+    AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
+    AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe,
     DEFAULT_SESSION_AGENT_PROMPT_REVISION, DEFAULT_SESSION_AGENT_SYSTEM_PROMPT,
     KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage, KnowledgeCatalogRevisionSummary,
     KnowledgeCatalogState, KnowledgeCatalogUpdateResult, SESSION_AGENT_PROMPT_ID,
@@ -558,6 +558,29 @@ impl SqliteStore {
         .await
     }
 
+    /// Resolves one active direct child and its exact durable authority for a
+    /// durably started `interrupt_agent` call.
+    pub async fn subagent_interrupt_candidate_for_started_tool(
+        &self,
+        scope: &ExecutionScope,
+        call_id: &str,
+        child_session_id: &str,
+    ) -> Result<AgentSubagentInterruptCandidate, StorageError> {
+        let scope = scope.clone();
+        let call_id = validated_durable_reference(call_id, "Agent tool call ID")?.to_owned();
+        let child_session_id =
+            validated_durable_reference(child_session_id, "subagent Session ID")?.to_owned();
+        self.with_connection(move |connection| {
+            query_subagent_interrupt_candidate_for_started_tool(
+                connection,
+                &scope,
+                &call_id,
+                &child_session_id,
+            )
+        })
+        .await
+    }
+
     /// Resolves the immutable parent history boundary, current durable
     /// authority, and exact parent deployment for one started `spawn_agent`
     /// call. The model supplies none of these identities.
@@ -646,6 +669,38 @@ impl SqliteStore {
                 &turn_id,
                 expected_revision,
                 &physical_limits,
+                AgentCancelAuthority::UserAuthSession,
+            )
+        })
+        .await
+    }
+
+    /// Cancel one direct child Agent after an exact parent tool call has
+    /// established process-owned authority. Durable membership is rechecked,
+    /// but no browser login session participates in the worker operation.
+    pub async fn cancel_subagent_turn_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        turn_id: &str,
+        expected_revision: u64,
+    ) -> Result<AgentCancellationCompletion, StorageError> {
+        if expected_revision == 0 || expected_revision > i64::MAX as u64 {
+            return Err(StorageError::AgentRevisionConflict);
+        }
+        let context = validated_authz_context(context)?;
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        let turn_id = validated_durable_reference(turn_id, "turn ID")?.to_owned();
+        let physical_limits = self.physical_limits.clone();
+        self.with_progress_connection(move |connection| {
+            cancel_agent_turn_for_actor(
+                connection,
+                &context,
+                &session_id,
+                &turn_id,
+                expected_revision,
+                &physical_limits,
+                AgentCancelAuthority::AgentProcess,
             )
         })
         .await
@@ -3918,6 +3973,12 @@ enum AgentCancelOperation {
     Tool(AgentToolCall),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgentCancelAuthority {
+    UserAuthSession,
+    AgentProcess,
+}
+
 fn cancel_agent_turn_for_actor(
     connection: &mut Connection,
     context: &AuthzContext,
@@ -3925,9 +3986,17 @@ fn cancel_agent_turn_for_actor(
     turn_id: &str,
     expected_revision: u64,
     physical_limits: &SqlitePhysicalLimits,
+    authority: AgentCancelAuthority,
 ) -> Result<AgentCancellationCompletion, StorageError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    require_active_session_actor(&transaction, session_id, context)?;
+    match authority {
+        AgentCancelAuthority::UserAuthSession => {
+            require_active_session_actor(&transaction, session_id, context)?;
+        }
+        AgentCancelAuthority::AgentProcess => {
+            require_process_owned_session_authority(&transaction, session_id, context)?;
+        }
+    }
     let mut agent = query_agent_turn_for_session_turn(&transaction, session_id, turn_id)?;
     if agent.account_id != context.account_id {
         return Err(StorageError::AgentTurnNotFound(turn_id.to_owned()));
@@ -4959,6 +5028,122 @@ fn query_subagent_message_candidate_for_started_tool(
             auth_session_id,
         },
         child_session,
+    };
+    transaction.commit()?;
+    Ok(candidate)
+}
+
+fn query_subagent_interrupt_candidate_for_started_tool(
+    connection: &mut Connection,
+    scope: &ExecutionScope,
+    call_id: &str,
+    child_session_id: &str,
+) -> Result<AgentSubagentInterruptCandidate, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let call = query_agent_tool_call(&transaction, call_id)?;
+    let parent_agent = query_agent_turn(&transaction, &call.agent_id)?;
+    if call.status != AgentToolCallStatus::Running
+        || call.tool_name != subagents::INTERRUPT_AGENT_TOOL_NAME
+        || call.tool_version != subagents::INTERRUPT_AGENT_TOOL_VERSION
+        || call.account_id.as_str() != scope.account_id
+        || call.session_id != scope.session_id
+        || call.turn_id != scope.turn_id
+        || call.agent_id != scope.agent_id
+        || parent_agent.account_id.as_str() != scope.account_id
+        || parent_agent.actor_user_id != scope.actor_id
+        || parent_agent.session_id != scope.session_id
+        || parent_agent.turn_id != scope.turn_id
+    {
+        return Err(StorageError::AgentToolCallNotFound(call_id.to_owned()));
+    }
+    let direct_child: i64 = transaction.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM agent_subagent_spawns spawn
+               WHERE spawn.account_id = ?1
+                 AND spawn.actor_user_id = ?2
+                 AND spawn.parent_session_id = ?3
+                 AND spawn.child_session_id = ?4
+           )"#,
+        params![
+            parent_agent.account_id.as_str(),
+            parent_agent.actor_user_id,
+            parent_agent.session_id,
+            child_session_id,
+        ],
+        |row| row.get(0),
+    )?;
+    if direct_child == 0 {
+        return Err(StorageError::AgentToolCallNotFound(call_id.to_owned()));
+    }
+    let role = transaction
+        .query_row(
+            r#"SELECT membership.role
+               FROM accounts account
+               JOIN account_memberships membership
+                 ON membership.account_id = account.id
+               JOIN users user ON user.id = membership.user_id
+               JOIN sessions parent ON parent.account_id = account.id
+               JOIN sessions child ON child.account_id = account.id
+               WHERE account.id = ?1
+                 AND account.status = 'active'
+                 AND membership.user_id = ?2
+                 AND membership.status = 'active'
+                 AND membership.revision = ?3
+                 AND user.status = 'active'
+                 AND parent.id = ?4
+                 AND child.id = ?5"#,
+            params![
+                parent_agent.account_id.as_str(),
+                parent_agent.actor_user_id,
+                u64_to_i64(
+                    parent_agent.actor_membership_revision.get(),
+                    "subagent interrupt membership revision"
+                )?,
+                parent_agent.session_id,
+                child_session_id,
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|role| decode_membership_role(&role))
+        .transpose()?
+        .filter(|role| membership_allows(*role, AccountCapability::Reply))
+        .ok_or(StorageError::PermissionDenied)?;
+    let child_session = query_session_summary(&transaction, child_session_id)?;
+    validate_session_event_tail(&transaction, &child_session)?;
+    let child_turn_id = child_session
+        .active_turn_id
+        .as_deref()
+        .filter(|_| child_session.status == SessionStatus::Running)
+        .ok_or(StorageError::AgentAlreadyTerminal)?;
+    let child_agent =
+        query_agent_turn_for_session_turn(&transaction, child_session_id, child_turn_id)?;
+    if child_agent.account_id != parent_agent.account_id
+        || child_agent.actor_user_id != parent_agent.actor_user_id
+        || child_agent.actor_membership_revision != parent_agent.actor_membership_revision
+        || child_agent.session_id != child_session.id
+        || child_agent.turn_id != child_turn_id
+    {
+        return Err(StorageError::CorruptData(format!(
+            "subagent `{child_session_id}` active Agent disagrees with its parent binding"
+        )));
+    }
+    let auth_session_id =
+        AuthSessionId::from_persistence("subagent-interrupt-driver-v1").map_err(|error| {
+            StorageError::CorruptData(format!(
+                "invalid internal subagent interrupt authority ID: {error}"
+            ))
+        })?;
+    let candidate = AgentSubagentInterruptCandidate {
+        authz: AuthzContext {
+            account_id: parent_agent.account_id,
+            user_id: parent_agent.actor_user_id,
+            membership_role: role,
+            membership_revision: parent_agent.actor_membership_revision,
+            auth_session_id,
+        },
+        child_session,
+        child_agent,
     };
     transaction.commit()?;
     Ok(candidate)
@@ -7754,6 +7939,79 @@ pub(super) fn verify_agent_subagent_spawn_integrity(
         {
             return Err(StorageError::CorruptData(format!(
                 "send_message call `{call_id}` has inconsistent durable follow-up evidence"
+            )));
+        }
+    }
+
+    let mut statement = connection.prepare(
+        r#"SELECT call_id FROM agent_tool_calls
+           WHERE tool_name = ?1 AND tool_version = ?2 AND status = 'succeeded'
+           ORDER BY call_id"#,
+    )?;
+    let interrupt_call_ids = statement
+        .query_map(
+            params![
+                subagents::INTERRUPT_AGENT_TOOL_NAME,
+                subagents::INTERRUPT_AGENT_TOOL_VERSION,
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for call_id in interrupt_call_ids {
+        let call = query_agent_tool_call(connection, &call_id)?;
+        let parent_agent = query_agent_turn(connection, &call.agent_id)?;
+        let request =
+            subagents::prepare_interrupt_agent(&call.arguments_json).map_err(|error| {
+                StorageError::CorruptData(format!(
+                    "interrupt_agent call `{call_id}` has invalid durable arguments: {error}"
+                ))
+            })?;
+        let result: subagents::InterruptAgentResult =
+            serde_json::from_value(call.result_json.clone().ok_or_else(|| {
+                StorageError::CorruptData(format!(
+                    "interrupt_agent call `{call_id}` has no successful durable result"
+                ))
+            })?)
+            .map_err(|error| {
+                StorageError::CorruptData(format!(
+                    "interrupt_agent call `{call_id}` has an invalid durable result: {error}"
+                ))
+            })?;
+        let direct_child: i64 = connection.query_row(
+            r#"SELECT EXISTS(
+                   SELECT 1 FROM agent_subagent_spawns spawn
+                   WHERE spawn.account_id = ?1
+                     AND spawn.actor_user_id = ?2
+                     AND spawn.parent_session_id = ?3
+                     AND spawn.child_session_id = ?4
+               )"#,
+            params![
+                call.account_id.as_str(),
+                parent_agent.actor_user_id,
+                call.session_id,
+                request.subagent_id(),
+            ],
+            |row| row.get(0),
+        )?;
+        let child_agent =
+            query_agent_turn_for_session_turn(connection, request.subagent_id(), &result.turn_id)?;
+        let completion = query_agent_terminal_completion(connection, &child_agent)?;
+        require_user_cancelled_completion(&completion)?;
+        if call.account_id != parent_agent.account_id
+            || call.session_id != parent_agent.session_id
+            || call.turn_id != parent_agent.turn_id
+            || direct_child == 0
+            || result.subagent_id != request.subagent_id()
+            || result.status != subagents::InterruptAgentStatus::Interrupted
+            || child_agent.account_id != parent_agent.account_id
+            || child_agent.actor_user_id != parent_agent.actor_user_id
+            || child_agent.actor_membership_revision != parent_agent.actor_membership_revision
+            || child_agent.session_id != result.subagent_id
+            || child_agent.turn_id != result.turn_id
+        {
+            return Err(StorageError::CorruptData(format!(
+                "interrupt_agent call `{call_id}` has inconsistent durable cancellation evidence"
             )));
         }
     }

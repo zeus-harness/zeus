@@ -2,9 +2,9 @@
 //!
 //! The runtime resolves the exact started Agent scope. Storage atomically
 //! admits a background child for `spawn_agent`, lists only those bound
-//! children for `list_agents`, and exposes a bounded terminal-result snapshot
-//! for `get_agent_result`; message delivery and interruption remain separate
-//! future capabilities.
+//! children for `list_agents`, exposes a bounded terminal-result snapshot for
+//! `get_agent_result`, and gates durable direct-child continuation and
+//! interruption through exact started parent tool scopes.
 
 use std::collections::BTreeMap;
 
@@ -29,6 +29,9 @@ pub const GET_AGENT_RESULT_TOOL_VERSION: &str = "1-direct-child-snapshot";
 pub const GET_AGENT_RESULT_ARGUMENTS_MAX_BYTES: usize = 1024;
 pub const GET_AGENT_RESULT_DEFAULT_MAX_BYTES: usize = 8 * 1024;
 pub const GET_AGENT_RESULT_MAX_BYTES: usize = 8 * 1024;
+pub const INTERRUPT_AGENT_TOOL_NAME: &str = "interrupt_agent";
+pub const INTERRUPT_AGENT_TOOL_VERSION: &str = "1-direct-child-cancel";
+pub const INTERRUPT_AGENT_ARGUMENTS_MAX_BYTES: usize = 1024;
 pub const SEND_MESSAGE_TOOL_NAME: &str = "send_message";
 pub const SEND_MESSAGE_TOOL_VERSION: &str = "1-direct-child-followup";
 pub const SEND_MESSAGE_MAX_BYTES: usize = 12 * 1024;
@@ -41,10 +44,11 @@ pub const SPAWN_AGENT_ARGUMENTS_MAX_BYTES: usize = 16 * 1024;
 pub const SPAWN_AGENT_MAX_DEPTH: usize = 3;
 pub const SPAWN_AGENT_MAX_DIRECT_CHILDREN: usize = 8;
 
-const LIST_AGENTS_DESCRIPTION: &str = "List this Session's durable direct child branches by stable child Session ID and immutable fork boundary. This is a bounded read, not completion polling: use the opaque next_cursor to continue when present. A returned child is independently continuable, but this tool does not send it work, interrupt it, or claim that it is currently executing.";
+const LIST_AGENTS_DESCRIPTION: &str = "List this Session's durable direct child branches by stable child Session ID and immutable fork boundary. This is a bounded read, not completion polling: use the opaque next_cursor to continue when present. Use send_message to continue a child, interrupt_agent to stop active work, and get_agent_result to read terminal output.";
 const GET_AGENT_RESULT_DESCRIPTION: &str = "Read one durable direct child's current status and, after successful completion, a bounded page of its final assistant output. The child must have been created by this parent Session's spawn_agent call. Failed or indeterminate children never expose partial output. Continue a large successful result with next_after_byte.";
+const INTERRUPT_AGENT_DESCRIPTION: &str = "Durably interrupt one currently active direct child created by this parent Session's spawn_agent call. Queued or running model work and tools that have not crossed their durable started checkpoint can be cancelled. A tool that is already running is outcome-sensitive and will not be reported as cancelled.";
 const SEND_MESSAGE_DESCRIPTION: &str = "Durably enqueue one follow-up message for a direct child created by this parent Session's spawn_agent call. The stable message_id acknowledges FIFO admission, not child completion. A ready child is scheduled and a running child consumes the message after its current turn; use get_agent_result to read completed output.";
-const SPAWN_AGENT_DESCRIPTION: &str = "Start one durable background child Agent that inherits this Session's completed turns before the current in-flight turn. The call returns after the child Session, initial prompt, and first model job are atomically admitted; it does not wait for the child result. Use list_agents to rediscover the stable child ID, send_message to continue it, and get_agent_result to read terminal output. This stage does not provide interrupt control.";
+const SPAWN_AGENT_DESCRIPTION: &str = "Start one durable background child Agent that inherits this Session's completed turns before the current in-flight turn. The call returns after the child Session, initial prompt, and first model job are atomically admitted; it does not wait for the child result. Use list_agents to rediscover the stable child ID, send_message to continue it, interrupt_agent to stop active work, and get_agent_result to read terminal output.";
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum SubagentError {
@@ -64,6 +68,12 @@ pub enum SubagentError {
     InvalidResultRange,
     #[error("get_agent_result result exceeds its bounded output contract")]
     InvalidAgentResult,
+    #[error("interrupt_agent arguments are not a strict bounded object")]
+    InvalidInterruptArguments,
+    #[error("interrupt_agent subagent_id is not a canonical bounded identifier")]
+    InvalidInterruptSubagentId,
+    #[error("interrupt_agent result exceeds its bounded output contract")]
+    InvalidInterruptResult,
     #[error("send_message arguments are not a strict bounded object")]
     InvalidSendArguments,
     #[error("send_message subagent_id is not a canonical bounded identifier")]
@@ -187,6 +197,58 @@ struct RawSendMessageRequest {
 pub struct SendMessageRequest {
     subagent_id: String,
     message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInterruptAgentRequest {
+    subagent_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InterruptAgentRequest {
+    subagent_id: String,
+}
+
+impl InterruptAgentRequest {
+    pub fn subagent_id(&self) -> &str {
+        &self.subagent_id
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterruptAgentStatus {
+    Interrupted,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InterruptAgentResult {
+    pub subagent_id: String,
+    pub turn_id: String,
+    pub status: InterruptAgentStatus,
+}
+
+impl InterruptAgentResult {
+    pub fn new(subagent_id: String, turn_id: String) -> Result<Self, SubagentError> {
+        if protocol::validate_session_id(&subagent_id).is_err()
+            || protocol::validate_turn_id(&turn_id).is_err()
+        {
+            return Err(SubagentError::InvalidInterruptResult);
+        }
+        let result = Self {
+            subagent_id,
+            turn_id,
+            status: InterruptAgentStatus::Interrupted,
+        };
+        let encoded =
+            serde_json::to_vec(&result).map_err(|_| SubagentError::InvalidInterruptResult)?;
+        if encoded.len() > TOOL_OUTPUT_MAX_SERIALIZED_BYTES {
+            return Err(SubagentError::InvalidInterruptResult);
+        }
+        Ok(result)
+    }
 }
 
 impl SendMessageRequest {
@@ -474,6 +536,22 @@ pub fn prepare_send_message(arguments: &Value) -> Result<SendMessageRequest, Sub
     })
 }
 
+pub fn prepare_interrupt_agent(arguments: &Value) -> Result<InterruptAgentRequest, SubagentError> {
+    let encoded =
+        serde_json::to_vec(arguments).map_err(|_| SubagentError::InvalidInterruptArguments)?;
+    if encoded.len() > INTERRUPT_AGENT_ARGUMENTS_MAX_BYTES {
+        return Err(SubagentError::InvalidInterruptArguments);
+    }
+    let raw: RawInterruptAgentRequest = serde_json::from_value(arguments.clone())
+        .map_err(|_| SubagentError::InvalidInterruptArguments)?;
+    if protocol::validate_session_id(&raw.subagent_id).is_err() {
+        return Err(SubagentError::InvalidInterruptSubagentId);
+    }
+    Ok(InterruptAgentRequest {
+        subagent_id: raw.subagent_id,
+    })
+}
+
 pub fn send_message_identity(
     parent_session_id: &str,
     call_id: &str,
@@ -668,8 +746,26 @@ pub fn send_message_descriptor() -> ToolDescriptor {
     }
 }
 
+pub fn interrupt_agent_descriptor() -> ToolDescriptor {
+    ToolDescriptor {
+        name: INTERRUPT_AGENT_TOOL_NAME.into(),
+        version: INTERRUPT_AGENT_TOOL_VERSION.into(),
+        description: INTERRUPT_AGENT_DESCRIPTION.into(),
+        effect: ToolEffect::LocalWrite,
+        sandbox_profile: SandboxProfile::ReadOnly,
+        input_schema: ObjectSchema {
+            max_serialized_bytes: INTERRUPT_AGENT_ARGUMENTS_MAX_BYTES,
+            properties: BTreeMap::from([(
+                "subagent_id".into(),
+                ParameterSpec::required_string(protocol::SESSION_ID_MAX_BYTES),
+            )]),
+        },
+    }
+}
+
 pub fn register_subagent_tools(registry: &mut ToolRegistry) -> Result<(), RegistryError> {
     registry.register(get_agent_result_descriptor(), RuntimeSubagentExecutor)?;
+    registry.register(interrupt_agent_descriptor(), RuntimeSubagentExecutor)?;
     registry.register(list_agents_descriptor(), RuntimeSubagentExecutor)?;
     registry.register(send_message_descriptor(), RuntimeSubagentExecutor)?;
     registry.register(spawn_agent_descriptor(), RuntimeSubagentExecutor)
@@ -750,6 +846,7 @@ mod tests {
         register_subagent_tools(&mut registry).unwrap();
         assert!(registry.descriptor(LIST_AGENTS_TOOL_NAME).is_some());
         assert!(registry.descriptor(GET_AGENT_RESULT_TOOL_NAME).is_some());
+        assert!(registry.descriptor(INTERRUPT_AGENT_TOOL_NAME).is_some());
         assert!(registry.descriptor(SEND_MESSAGE_TOOL_NAME).is_some());
     }
 
@@ -908,6 +1005,32 @@ mod tests {
         let result =
             SendMessageResult::new("subagent-child".into(), "subagent-message-1".into()).unwrap();
         assert!(serde_json::to_vec(&result).unwrap().len() <= TOOL_OUTPUT_MAX_SERIALIZED_BYTES);
+    }
+
+    #[test]
+    fn interrupt_agent_request_descriptor_and_result_are_strict() {
+        let request = prepare_interrupt_agent(&serde_json::json!({
+            "subagent_id": "subagent-child",
+        }))
+        .unwrap();
+        assert_eq!(request.subagent_id(), "subagent-child");
+        for invalid in [
+            serde_json::json!({"subagent_id": " bad"}),
+            serde_json::json!({"subagent_id": "child", "extra": true}),
+            serde_json::json!({}),
+        ] {
+            assert!(prepare_interrupt_agent(&invalid).is_err(), "{invalid}");
+        }
+        let descriptor = interrupt_agent_descriptor();
+        assert_eq!(descriptor.effect, ToolEffect::LocalWrite);
+        assert_eq!(descriptor.sandbox_profile, SandboxProfile::ReadOnly);
+        assert_eq!(
+            descriptor.input_schema.provider_json_schema().unwrap()["additionalProperties"],
+            false
+        );
+        let result =
+            InterruptAgentResult::new("subagent-child".into(), "turn-child".into()).unwrap();
+        assert_eq!(result.status, InterruptAgentStatus::Interrupted);
     }
 
     #[test]
