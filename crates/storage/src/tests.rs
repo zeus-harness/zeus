@@ -1771,7 +1771,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         versions,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32,
+            25, 26, 27, 28, 29, 30, 31, 32, 33,
         ]
     );
     let owner: Option<String> = connection
@@ -1921,7 +1921,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 32);
+    assert_eq!(version, 33);
     let configured_account: (String, String, String, i64) = connection
         .query_row(
             r#"SELECT
@@ -2639,7 +2639,7 @@ async fn v12_identity_and_run_crash_prefix_migrates_then_recovers_the_primary_se
     assert_eq!(
         recovered,
         (
-            32,
+            33,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into()
@@ -4386,7 +4386,7 @@ async fn v5_configured_database_migrates_to_the_local_owner_membership() {
     assert_eq!(
         migrated,
         (
-            32,
+            33,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into(),
@@ -4512,7 +4512,7 @@ async fn v13_configured_active_work_migrates_with_account_authority_and_exact_vo
             },
         )
         .unwrap();
-    assert_eq!(migrated_counts, (32, 1, 1, 2, 1));
+    assert_eq!(migrated_counts, (33, 1, 1, 2, 1));
 }
 
 #[tokio::test]
@@ -4874,7 +4874,7 @@ async fn v14_database_migrates_through_v19_with_member_and_audit_roots() {
             },
         )
         .unwrap();
-    assert_eq!(state, (32, 1, 1, 1, 19));
+    assert_eq!(state, (33, 1, 1, 1, 19));
 }
 
 #[tokio::test]
@@ -4913,7 +4913,7 @@ async fn v15_migration_seeds_the_configured_audit_detail_limit() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (32, 2));
+    assert_eq!(state, (33, 2));
 }
 
 #[tokio::test]
@@ -4958,7 +4958,7 @@ async fn v15_reopen_rejects_a_lower_audit_detail_limit_without_mutating_policy()
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (32, 4));
+    assert_eq!(state, (33, 4));
     drop(connection);
 
     let reopened = SqliteStore::open_with_limits(database.path(), original_limits)
@@ -5308,6 +5308,38 @@ async fn readiness_rejects_a_weakened_v32_agent_output_trigger_definition() {
     assert!(
         matches!(&error, StorageError::CorruptData(message)
             if message == "durability trigger `agent_model_output_chunks_validate_insert` differs from the authoritative migration"),
+        "unexpected weakened-trigger error: {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn readiness_rejects_a_weakened_v33_running_model_cancellation_trigger() {
+    let database = TestDatabase::new();
+    {
+        let store = SqliteStore::open(database.path()).await.unwrap();
+        store.readiness().await.unwrap();
+    }
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER agent_model_jobs_enforce_forward_transition;
+               CREATE TRIGGER agent_model_jobs_enforce_forward_transition
+               BEFORE UPDATE ON agent_model_jobs
+               WHEN 0
+               BEGIN
+                   SELECT 1;
+               END;"#,
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("a same-name weakened running-model cancellation trigger must fail"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(&error, StorageError::CorruptData(message)
+            if message == "durability trigger `agent_model_jobs_enforce_forward_transition` differs from the authoritative migration"),
         "unexpected weakened-trigger error: {error:?}"
     );
 }
@@ -7256,7 +7288,7 @@ async fn v19_agent_manifest_is_canonical_actor_scoped_reused_and_secret_free() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(version, 32);
+    assert_eq!(version, 33);
     assert_eq!(
         manifest_rows, 1,
         "the identical manifest must be deduplicated"
@@ -12680,27 +12712,28 @@ async fn prepared_model_cancellation_wins_without_authorizing_provider_io() {
 }
 
 #[tokio::test]
-async fn started_model_checkpoint_wins_the_cancellation_race() {
-    let store = created_owned_session_store().await;
+async fn running_model_cancellation_is_epoch_bound_replayable_and_restart_safe() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
     store
         .start_turn_and_enqueue_agent_for_actor(
             &owner_authz(),
             "session-alpha",
             StartTurnRequest {
                 turn_id: "turn-agent-cancel-started-model".into(),
-                user_message: "Do not misreport an in-flight provider call".into(),
+                user_message: "Stop the running provider call".into(),
                 expected_sequence: 1,
             },
             "agent-cancel-started-model-start",
             agent_turn_spec(
                 "agent-cancel-started-model",
                 "turn-agent-cancel-started-model",
-                "Do not misreport an in-flight provider call",
+                "Stop the running provider call",
             ),
         )
         .await
         .unwrap();
-    let AgentModelClaimOutcome::Claimed(_) = store
+    let AgentModelClaimOutcome::Claimed(job) = store
         .claim_next_agent_model(&test_agent_manifest())
         .await
         .unwrap()
@@ -12716,16 +12749,25 @@ async fn started_model_checkpoint_wins_the_cancellation_race() {
         .await
         .unwrap();
     assert_eq!(detail.status, AgentTurnStatus::ModelRunning);
+    let cancelled = store
+        .cancel_agent_turn_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            "turn-agent-cancel-started-model",
+            detail.revision,
+        )
+        .await
+        .unwrap();
+    assert!(!cancelled.replayed);
+    assert_eq!(
+        cancelled.started_model_job_id.as_deref(),
+        Some(job.id.as_str())
+    );
+    assert_eq!(cancelled.agent.status, AgentTurnStatus::Failed);
     assert!(matches!(
-        store
-            .cancel_agent_turn_for_actor(
-                &owner_authz(),
-                "session-alpha",
-                "turn-agent-cancel-started-model",
-                detail.revision,
-            )
-            .await,
-        Err(StorageError::AgentOperationInFlight)
+        &cancelled.event.data,
+        SessionEventData::TurnInterrupted { reason, .. }
+            if reason == "agent turn was cancelled while model execution was in progress"
     ));
     let after = store
         .agent_turn_detail_for_actor(
@@ -12735,8 +12777,82 @@ async fn started_model_checkpoint_wins_the_cancellation_race() {
         )
         .await
         .unwrap();
-    assert_eq!(after, detail);
+    assert_eq!(after.status, AgentTurnStatus::Failed);
+    assert_eq!(after.revision, detail.revision + 1);
+
+    let late_failure = store
+        .complete_agent_model_failure(AgentModelFailureCommit {
+            job_id: job.id.clone(),
+            error_json: json!({"code": "late_provider_failure", "message": "lost race"}),
+            outcome_unknown: false,
+        })
+        .await
+        .unwrap();
+    assert!(late_failure.replayed);
+    assert_eq!(late_failure.agent, cancelled.agent);
+    let late_success = store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: job.id.clone(),
+            response_json: agent_final_response_json("late provider success"),
+            resolution: AgentModelResolution::Final {
+                assistant_message: "late provider success".into(),
+                provenance: agent_model_provenance(),
+            },
+        })
+        .await
+        .unwrap();
+    let AgentModelCompletion::Terminal(late_success) = late_success else {
+        panic!("a late provider success must replay the winning cancellation");
+    };
+    assert!(late_success.replayed);
+    assert_eq!(late_success.agent, cancelled.agent);
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let persisted: (String, i64, Option<String>, Option<String>, String) = connection
+        .query_row(
+            r#"SELECT job.status, job.attempt, job.started_at, job.finished_at, claim.phase
+               FROM agent_model_jobs job
+               JOIN agent_operation_claims claim
+                 ON claim.operation_kind = 'model'
+                AND claim.operation_id = job.id
+               WHERE job.id = ?1"#,
+            [&job.id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(persisted.0, "failed");
+    assert_eq!(persisted.1, 1);
+    assert!(persisted.2.is_some());
+    assert!(persisted.3.is_some());
+    assert_eq!(persisted.4, "released");
+    drop(connection);
     store.verify_integrity().await.unwrap();
+    drop(store);
+
+    let reopened = SqliteStore::open(database.path()).await.unwrap();
+    let replay = reopened
+        .cancel_agent_turn_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            "turn-agent-cancel-started-model",
+            detail.revision,
+        )
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(
+        replay.started_model_job_id.as_deref(),
+        Some(job.id.as_str())
+    );
+    reopened.verify_integrity().await.unwrap();
 }
 
 #[tokio::test]
@@ -12838,6 +12954,65 @@ async fn prepared_tool_and_waiting_approval_can_cancel_before_dispatch() {
         );
         store.verify_integrity().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn started_tool_remains_outcome_sensitive_and_cannot_be_cancelled() {
+    let store = created_owned_session_store().await;
+    let turn_id = "turn-agent-cancel-running-tool";
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: turn_id.into(),
+                user_message: "Do not guess whether this tool stopped".into(),
+                expected_sequence: 1,
+            },
+            "agent-cancel-running-tool-start",
+            agent_turn_spec(
+                "agent-cancel-running-tool",
+                turn_id,
+                "Do not guess whether this tool stopped",
+            ),
+        )
+        .await
+        .unwrap();
+    let AgentModelClaimOutcome::Claimed(model_job) = store
+        .claim_next_agent_model(&test_agent_manifest())
+        .await
+        .unwrap()
+    else {
+        panic!("the model proposal must start");
+    };
+    let call = agent_tool_call_spec("agent-call-cancel-running", PolicyDecision::Allow);
+    store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: model_job.id.clone(),
+            response_json: agent_tool_response_json(&call),
+            resolution: AgentModelResolution::ToolCall { call },
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .claim_next_agent_tool(&test_agent_manifest())
+            .await
+            .unwrap(),
+        AgentToolClaimOutcome::Claimed(_)
+    ));
+    let detail = store
+        .agent_turn_detail_for_actor(&owner_authz(), "session-alpha", turn_id)
+        .await
+        .unwrap();
+    assert_eq!(detail.status, AgentTurnStatus::ToolRunning);
+    assert!(matches!(
+        store
+            .cancel_agent_turn_for_actor(&owner_authz(), "session-alpha", turn_id, detail.revision,)
+            .await,
+        Err(StorageError::AgentOperationInFlight)
+    ));
+    store.verify_integrity().await.unwrap();
 }
 
 #[tokio::test]
@@ -19419,7 +19594,7 @@ async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempot
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, (1_i64..=32).collect::<Vec<_>>());
+    assert_eq!(versions, (1_i64..=33).collect::<Vec<_>>());
     assert_eq!(
         connection
             .query_row(
@@ -23051,6 +23226,14 @@ fn drop_v31_fixture_objects(connection: &rusqlite::Connection) {
 }
 
 fn drop_v32_fixture_objects(connection: &rusqlite::Connection) {
+    let version: i64 = connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    if version >= 33 {
+        drop_v33_fixture_objects(connection);
+    }
     let schema_reject_update = migration_trigger_sql(
         include_str!("../migrations/0020_agent_execution_ledger.sql"),
         "schema_migrations_reject_update",
@@ -23072,6 +23255,32 @@ fn drop_v32_fixture_objects(connection: &rusqlite::Connection) {
                DELETE FROM schema_migrations WHERE version = 32;"#,
         )
         .unwrap();
+    connection.execute_batch(schema_reject_update).unwrap();
+    connection.execute_batch(schema_reject_delete).unwrap();
+}
+
+fn drop_v33_fixture_objects(connection: &rusqlite::Connection) {
+    let schema_reject_update = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_update",
+    );
+    let schema_reject_delete = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_delete",
+    );
+    let legacy_model_transition = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "agent_model_jobs_enforce_forward_transition",
+    );
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER schema_migrations_reject_update;
+               DROP TRIGGER schema_migrations_reject_delete;
+               DROP TRIGGER agent_model_jobs_enforce_forward_transition;
+               DELETE FROM schema_migrations WHERE version = 33;"#,
+        )
+        .unwrap();
+    connection.execute_batch(legacy_model_transition).unwrap();
     connection.execute_batch(schema_reject_update).unwrap();
     connection.execute_batch(schema_reject_delete).unwrap();
 }

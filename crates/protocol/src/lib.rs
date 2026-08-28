@@ -1190,8 +1190,8 @@ pub struct AgentTurnDetail {
     pub completed_at: Option<String>,
 }
 
-/// Compare-and-set request to cancel one Agent turn before external I/O has
-/// crossed its durable started checkpoint.
+/// Compare-and-set request to cancel one Agent turn. Running models are
+/// cancellable; a started tool remains outcome-sensitive and is rejected.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CancelAgentTurnRequest {

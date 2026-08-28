@@ -6,18 +6,19 @@
 
 use super::*;
 use crate::{
-    AGENT_SYSTEM_PROMPT_MAX_BYTES, AgentFinalCompletion, AgentGoalRoundCandidate,
-    AgentGoalRoundSpec, AgentKnowledgeContextExplain, AgentModelClaimOutcome, AgentModelCompletion,
-    AgentModelFailureCommit, AgentModelJobStatus, AgentModelResolution, AgentModelStartOutcome,
-    AgentModelSuccessCommit, AgentOperationClaim, AgentOperationKind, AgentPreparedModel,
-    AgentPreparedTool, AgentPromptCommit, AgentPromptRevisionPage, AgentPromptRevisionSummary,
-    AgentPromptState, AgentPromptUpdateResult, AgentReviewCommit, AgentReviewContext,
-    AgentReviewResult, AgentTerminalCompletion, AgentToolCall, AgentToolCallSpec,
-    AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
-    AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe,
-    DEFAULT_SESSION_AGENT_PROMPT_REVISION, DEFAULT_SESSION_AGENT_SYSTEM_PROMPT,
-    KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage, KnowledgeCatalogRevisionSummary,
-    KnowledgeCatalogState, KnowledgeCatalogUpdateResult, SESSION_AGENT_PROMPT_ID,
+    AGENT_SYSTEM_PROMPT_MAX_BYTES, AgentCancellationCompletion, AgentFinalCompletion,
+    AgentGoalRoundCandidate, AgentGoalRoundSpec, AgentKnowledgeContextExplain,
+    AgentModelClaimOutcome, AgentModelCompletion, AgentModelFailureCommit, AgentModelJobStatus,
+    AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit, AgentOperationClaim,
+    AgentOperationKind, AgentPreparedModel, AgentPreparedTool, AgentPromptCommit,
+    AgentPromptRevisionPage, AgentPromptRevisionSummary, AgentPromptState, AgentPromptUpdateResult,
+    AgentReviewCommit, AgentReviewContext, AgentReviewResult, AgentTerminalCompletion,
+    AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion,
+    AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork,
+    AgentTurnReceiptProbe, DEFAULT_SESSION_AGENT_PROMPT_REVISION,
+    DEFAULT_SESSION_AGENT_SYSTEM_PROMPT, KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage,
+    KnowledgeCatalogRevisionSummary, KnowledgeCatalogState, KnowledgeCatalogUpdateResult,
+    SESSION_AGENT_PROMPT_ID,
 };
 use ::execution::{DigestDomain, FactSource, OperationRef, Sha256Digest};
 use deployment::{ManifestEnvelope, prompt_content_digest};
@@ -509,16 +510,16 @@ impl SqliteStore {
         .await
     }
 
-    /// Cancel one authenticated Agent turn only while its current operation
-    /// remains queued or waiting for approval. A durable started checkpoint
-    /// wins the race and is never represented as a successful cancellation.
+    /// Cancel one authenticated Agent turn while its model is queued or
+    /// running, or while a tool is still waiting for dispatch. A tool's
+    /// durable started checkpoint remains an outcome-sensitive boundary.
     pub async fn cancel_agent_turn_for_actor(
         &self,
         context: &AuthzContext,
         session_id: &str,
         turn_id: &str,
         expected_revision: u64,
-    ) -> Result<AgentTerminalCompletion, StorageError> {
+    ) -> Result<AgentCancellationCompletion, StorageError> {
         if expected_revision == 0 || expected_revision > i64::MAX as u64 {
             return Err(StorageError::AgentRevisionConflict);
         }
@@ -1178,6 +1179,14 @@ fn complete_agent_model_success(
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let job = query_agent_model_job_by_id(&transaction, &commit.job_id)?;
     let mut agent = query_agent_turn(&transaction, &job.agent_id)?;
+    if job.status == AgentModelJobStatus::Failed
+        && job.error_json.as_ref().is_some_and(is_user_cancelled_error)
+    {
+        let completion = query_agent_terminal_completion(&transaction, &agent)?;
+        require_user_cancelled_completion(&completion)?;
+        transaction.commit()?;
+        return Ok(AgentModelCompletion::Terminal(Box::new(completion)));
+    }
     validate_agent_response_matches_job(&job, &commit.response_json, &commit.resolution)?;
     if job.status != AgentModelJobStatus::Started {
         let replay = replay_agent_model_success(&transaction, &job, &agent, &commit)?;
@@ -1785,6 +1794,14 @@ fn complete_agent_model_failure(
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let job = query_agent_model_job_by_id(&transaction, &commit.job_id)?;
     let mut agent = query_agent_turn(&transaction, &job.agent_id)?;
+    if job.status == AgentModelJobStatus::Failed
+        && job.error_json.as_ref().is_some_and(is_user_cancelled_error)
+    {
+        let completion = query_agent_terminal_completion(&transaction, &agent)?;
+        require_user_cancelled_completion(&completion)?;
+        transaction.commit()?;
+        return Ok(completion);
+    }
     if job.status != AgentModelJobStatus::Started {
         let expected = if commit.outcome_unknown {
             AgentModelJobStatus::OutcomeUnknown
@@ -3760,11 +3777,13 @@ fn query_bounded_agent_turn_events(
 }
 
 const USER_CANCELLED_CODE: &str = "user_cancelled";
-const USER_CANCELLED_INTERRUPTION_REASON: &str =
+const USER_CANCELLED_BEFORE_START_INTERRUPTION_REASON: &str =
     "agent turn was cancelled before external execution started";
+const USER_CANCELLED_MODEL_RUNNING_INTERRUPTION_REASON: &str =
+    "agent turn was cancelled while model execution was in progress";
 
 enum AgentCancelOperation {
-    Model(AgentModelJob),
+    Model { job: AgentModelJob, started: bool },
     Tool(AgentToolCall),
 }
 
@@ -3775,7 +3794,7 @@ fn cancel_agent_turn_for_actor(
     turn_id: &str,
     expected_revision: u64,
     physical_limits: &SqlitePhysicalLimits,
-) -> Result<AgentTerminalCompletion, StorageError> {
+) -> Result<AgentCancellationCompletion, StorageError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     require_active_session_actor(&transaction, session_id, context)?;
     let mut agent = query_agent_turn_for_session_turn(&transaction, session_id, turn_id)?;
@@ -3787,16 +3806,25 @@ fn cancel_agent_turn_for_actor(
     {
         let completion = query_agent_terminal_completion(&transaction, &agent)?;
         require_user_cancelled_completion(&completion)?;
+        let started_model_job_id = user_cancelled_started_model_job_id(&transaction, &agent.id)?;
         transaction.commit()?;
-        return Ok(completion);
+        return Ok(AgentCancellationCompletion {
+            terminal: completion,
+            started_model_job_id,
+        });
     }
     if agent.revision != expected_revision {
         return Err(StorageError::AgentRevisionConflict);
     }
     let operation = match agent.status {
-        AgentTurnStatus::WaitingModel => {
-            AgentCancelOperation::Model(query_one_queued_agent_model_job(&transaction, &agent.id)?)
-        }
+        AgentTurnStatus::WaitingModel => AgentCancelOperation::Model {
+            job: query_one_queued_agent_model_job(&transaction, &agent.id)?,
+            started: false,
+        },
+        AgentTurnStatus::ModelRunning => AgentCancelOperation::Model {
+            job: query_one_started_agent_model_job(&transaction, &agent.id)?,
+            started: true,
+        },
         AgentTurnStatus::WaitingApproval | AgentTurnStatus::ToolQueued => {
             let call_id = agent.pending_call_id.as_deref().ok_or_else(|| {
                 StorageError::CorruptData(
@@ -3816,7 +3844,7 @@ fn cancel_agent_turn_for_actor(
             }
             AgentCancelOperation::Tool(call)
         }
-        AgentTurnStatus::ModelRunning | AgentTurnStatus::ToolRunning => {
+        AgentTurnStatus::ToolRunning => {
             return Err(StorageError::AgentOperationInFlight);
         }
         AgentTurnStatus::Succeeded | AgentTurnStatus::Failed | AgentTurnStatus::NeedsAttention => {
@@ -3832,13 +3860,25 @@ fn cancel_agent_turn_for_actor(
         PhysicalCapacityGate::Finalization,
     )?;
     let timestamp = now();
-    let error_json = user_cancelled_error();
+    let started_model_job_id = match &operation {
+        AgentCancelOperation::Model { job, started: true } => Some(job.id.clone()),
+        _ => None,
+    };
+    let error_json = user_cancelled_error(started_model_job_id.is_some());
     let command = WorkflowCommand::UserCancelled;
     let transition = reduce(&agent.workflow_state, command.clone())
         .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
-    let (subject, input_digest) = match &operation {
-        AgentCancelOperation::Model(job) => (model_subject(job), model_request_digest(job)?),
-        AgentCancelOperation::Tool(call) => (tool_subject(call), tool_input_digest(call)?),
+    let (subject, input_digest, epoch_digest) = match &operation {
+        AgentCancelOperation::Model { job, started } => (
+            model_subject(job),
+            model_request_digest(job)?,
+            started
+                .then(|| {
+                    super::execution::epoch_digest_for_operation(&transaction, "model", &job.id)
+                })
+                .transpose()?,
+        ),
+        AgentCancelOperation::Tool(call) => (tool_subject(call), tool_input_digest(call)?, None),
     };
     persist_agent_workflow_transition(
         &transaction,
@@ -3852,7 +3892,7 @@ fn cancel_agent_turn_for_actor(
             external_call: None,
             emitted_result: None,
             emitted_result_digest: None,
-            epoch_digest: None,
+            epoch_digest,
             source: FactSource::Live,
             subject: Some(subject),
             input_digest: Some(input_digest),
@@ -3866,23 +3906,41 @@ fn cancel_agent_turn_for_actor(
     )?;
 
     match operation {
-        AgentCancelOperation::Model(job) => {
-            let changed = transaction.execute(
-                r#"UPDATE agent_model_jobs
-                   SET status = 'failed', attempt = 1, error_json = ?1,
-                       started_at = ?2, finished_at = ?2
-                   WHERE id = ?3 AND status = 'queued' AND attempt = 0"#,
-                params![serde_json::to_string(&error_json)?, timestamp, job.id],
-            )?;
-            if changed != 1 {
-                return Err(StorageError::ConcurrentModification);
+        AgentCancelOperation::Model { job, started } => {
+            if started {
+                let changed = transaction.execute(
+                    r#"UPDATE agent_model_jobs
+                       SET status = 'failed', error_json = ?1, finished_at = ?2
+                       WHERE id = ?3 AND status = 'started' AND attempt = 1"#,
+                    params![serde_json::to_string(&error_json)?, timestamp, job.id],
+                )?;
+                if changed != 1 {
+                    return Err(StorageError::ConcurrentModification);
+                }
+                release_started_agent_operation_claim(
+                    &transaction,
+                    AgentOperationKind::Model,
+                    &job.id,
+                    &timestamp,
+                )?;
+            } else {
+                let changed = transaction.execute(
+                    r#"UPDATE agent_model_jobs
+                       SET status = 'failed', attempt = 1, error_json = ?1,
+                           started_at = ?2, finished_at = ?2
+                       WHERE id = ?3 AND status = 'queued' AND attempt = 0"#,
+                    params![serde_json::to_string(&error_json)?, timestamp, job.id],
+                )?;
+                if changed != 1 {
+                    return Err(StorageError::ConcurrentModification);
+                }
+                release_prepared_claim_for_cancel(
+                    &transaction,
+                    AgentOperationKind::Model,
+                    &job.id,
+                    &timestamp,
+                )?;
             }
-            release_prepared_claim_for_cancel(
-                &transaction,
-                AgentOperationKind::Model,
-                &job.id,
-                &timestamp,
-            )?;
         }
         AgentCancelOperation::Tool(call) => {
             let changed = transaction.execute(
@@ -3902,10 +3960,17 @@ fn cancel_agent_turn_for_actor(
             )?;
         }
     }
-    let completion =
-        interrupt_agent_turn(&transaction, &agent, USER_CANCELLED_INTERRUPTION_REASON)?;
+    let interruption_reason = if started_model_job_id.is_some() {
+        USER_CANCELLED_MODEL_RUNNING_INTERRUPTION_REASON
+    } else {
+        USER_CANCELLED_BEFORE_START_INTERRUPTION_REASON
+    };
+    let completion = interrupt_agent_turn(&transaction, &agent, interruption_reason)?;
     transaction.commit()?;
-    Ok(completion)
+    Ok(AgentCancellationCompletion {
+        terminal: completion,
+        started_model_job_id,
+    })
 }
 
 fn query_one_queued_agent_model_job(
@@ -3926,6 +3991,56 @@ fn query_one_queued_agent_model_job(
         ));
     }
     Ok(jobs.remove(0))
+}
+
+fn query_one_started_agent_model_job(
+    connection: &Connection,
+    agent_id: &str,
+) -> Result<AgentModelJob, StorageError> {
+    let mut statement = connection.prepare(&format!(
+        "{} WHERE agent_id = ?1 AND status = 'started' ORDER BY step LIMIT 2",
+        model_job_select()
+    ))?;
+    let mut jobs = statement
+        .query_map([agent_id], decode_agent_model_job_row)?
+        .map(|row| row?.decode())
+        .collect::<Result<Vec<_>, StorageError>>()?;
+    if jobs.len() != 1 {
+        return Err(StorageError::CorruptData(
+            "cancellable Agent model phase must own exactly one started job".into(),
+        ));
+    }
+    Ok(jobs.remove(0))
+}
+
+fn user_cancelled_started_model_job_id(
+    connection: &Connection,
+    agent_id: &str,
+) -> Result<Option<String>, StorageError> {
+    let mut statement = connection.prepare(
+        r#"SELECT job.id
+           FROM agent_model_jobs job
+           WHERE job.agent_id = ?1
+             AND job.status = 'failed'
+             AND json_extract(job.error_json, '$.code') = 'user_cancelled'
+             AND EXISTS (
+                 SELECT 1 FROM agent_run_epochs epoch
+                 WHERE epoch.agent_id = job.agent_id
+                   AND epoch.operation_kind = 'model'
+                   AND epoch.model_job_id = job.id
+             )
+           ORDER BY job.step DESC LIMIT 2"#,
+    )?;
+    let job_ids = statement
+        .query_map([agent_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    match job_ids.as_slice() {
+        [] => Ok(None),
+        [job_id] => Ok(Some(job_id.clone())),
+        _ => Err(StorageError::CorruptData(
+            "cancelled Agent owns more than one started model cancellation".into(),
+        )),
+    }
 }
 
 fn release_prepared_claim_for_cancel(
@@ -3959,15 +4074,25 @@ fn release_prepared_claim_for_cancel(
     Ok(())
 }
 
-fn user_cancelled_error() -> Value {
-    json!({
-        "code": USER_CANCELLED_CODE,
-        "message": "the actor cancelled the Agent before external execution started"
-    })
+fn user_cancelled_error(model_was_running: bool) -> Value {
+    let message = if model_was_running {
+        "the actor cancelled the Agent while model execution was in progress"
+    } else {
+        "the actor cancelled the Agent before external execution started"
+    };
+    json!({ "code": USER_CANCELLED_CODE, "message": message })
 }
 
 fn is_user_cancelled_error(error: &Value) -> bool {
-    error.get("code").and_then(Value::as_str) == Some(USER_CANCELLED_CODE)
+    is_prestart_user_cancelled_error(error) || is_running_model_user_cancelled_error(error)
+}
+
+pub(super) fn is_prestart_user_cancelled_error(error: &Value) -> bool {
+    error == &user_cancelled_error(false)
+}
+
+pub(super) fn is_running_model_user_cancelled_error(error: &Value) -> bool {
+    error == &user_cancelled_error(true)
 }
 
 fn agent_was_user_cancelled(agent: &AgentTurn) -> bool {
@@ -3981,14 +4106,17 @@ fn agent_was_user_cancelled(agent: &AgentTurn) -> bool {
 fn require_user_cancelled_completion(
     completion: &AgentTerminalCompletion,
 ) -> Result<(), StorageError> {
-    if !agent_was_user_cancelled(&completion.agent)
-        || !matches!(
-            &completion.event.data,
-            SessionEventData::TurnInterrupted { turn_id, reason }
-                if turn_id == &completion.agent.turn_id
-                    && reason == USER_CANCELLED_INTERRUPTION_REASON
-        )
-    {
+    let error = completion.agent.last_error_json.as_ref();
+    let event_matches = matches!(
+        &completion.event.data,
+        SessionEventData::TurnInterrupted { turn_id, reason }
+            if turn_id == &completion.agent.turn_id
+                && ((reason == USER_CANCELLED_BEFORE_START_INTERRUPTION_REASON
+                    && error.is_some_and(is_prestart_user_cancelled_error))
+                    || (reason == USER_CANCELLED_MODEL_RUNNING_INTERRUPTION_REASON
+                        && error.is_some_and(is_running_model_user_cancelled_error)))
+    );
+    if !agent_was_user_cancelled(&completion.agent) || !event_matches {
         return Err(StorageError::CorruptData(
             "replayed Agent cancellation does not match its durable terminal evidence".into(),
         ));

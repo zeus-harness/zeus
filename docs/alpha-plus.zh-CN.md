@@ -373,6 +373,9 @@ assistant 内容。它在一个授权 SQLite snapshot 中冻结当前 active tur
 - `0027_agent_safe_cancellation.sql`：扩展 tool-call durability trigger，只允许没有 RunEpoch 的
   queued/waiting-approval call 在匹配当前 `user_cancelled` execution fact 时进入 `cancelled`；既有
   approval、dispatch、known-result 与 outcome-unknown 单向迁移规则保持不变。
+- `0033_agent_running_model_cancellation.sql`：只扩展 model-job durability trigger。started model
+  仅可在当前 execution head 是绑定同一 RunEpoch 的 `user_cancelled` fact 时进入 `failed`；started
+  tool 的副作用边界不变。
 - `0028_agent_todo_snapshots.sql`：增加 Agent-owned whole-list plan snapshot。每次成功
   `todo_write@1-single-active` 必须从当前 revision 连续前进，snapshot 与 exact started call、规范化
   result、三态 counters、SHA-256 digest 和完成时间同事务绑定；update/delete、缺失成功 snapshot、
@@ -410,10 +413,12 @@ binding 在重启后不再注册时 fail closed，不回退到另一个默认模
 startup registry 既支持兼容的单远端环境变量，也支持上述 bounded 多 Provider 文件；有远端项时
 始终额外注册显式 `local-fallback`，但不会在选中远端失败时自动切换。
 schema v27 的取消命令由 authenticated actor 通过 `PUT .../agent/cancel` 发起，并以
-`expected_revision` 做 CAS。仅 `waiting_model`、`waiting_approval`、`tool_queued` 可成功；prepared
-operation claim 与取消终态在同一事务释放/提交，不写 RunEpoch。若 durable started checkpoint 已
-存在则返回 `agent_operation_in_flight`，不能声称 provider/connector 已被取消。相同旧 revision
-重放第一次响应，终态 Session 按既有 interrupted contract 进入 `needs_attention`，需要显式 resume。
+`expected_revision` 做 CAS。queued/prepared model 与 waiting-approval/tool-queued 仍按 epochless
+`user_cancelled` fact 原子释放 claim 并进入终态。schema v33 进一步允许 `model_running`：取消 fact
+绑定既有 model RunEpoch，model job 与 started claim 在同一事务终止，已落盘 output prefix 保留，
+匹配的本进程 provider stream 在提交后协作式 drop。若 tool 已越过 durable started checkpoint，仍
+返回 `agent_operation_in_flight`，不能声称 connector 副作用已取消。相同旧 revision 重放第一次
+响应，终态 Session 按既有 interrupted contract 进入 `needs_attention`，需要显式 resume。
 Knowledge v1 生成独立、受治理、带完整 digest 的 canonical context
 snapshot，不修改 system prompt。schema v22 已完成数据库绑定、
 Agent request 注入和 exact replay；LLM 协议层使用独立 durable `context` role，并只在

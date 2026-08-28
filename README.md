@@ -65,6 +65,13 @@ already received prefix, settles the operation conservatively, and is never
 silently retried. Actor-scoped JSON and SSE endpoints replay output from SQLite,
 so reconnect and process restart do not depend on an in-memory broadcast.
 
+Schema v33 makes an authenticated running-model cancellation a durable,
+epoch-bound terminal transition. The cancellation transaction wins or loses
+atomically against provider completion, releases the started operation claim,
+preserves every already-published output chunk, and signals the matching local
+worker to drop its stream. Started tools remain outcome-sensitive and cannot
+be reported as cancelled.
+
 Alpha+ bootstraps a local `acc_local` root and now supports a bounded local
 multi-account control plane. An owner can create accounts idempotently; one
 user may belong to at most 16 accounts and one database may contain at most 64.
@@ -775,14 +782,16 @@ and bounded memory, CPU, and PID resources.
   `needs_attention` exactly once and is never automatically replayed because
   the external call may have taken effect.
   Other open turns follow the same interruption/resume contract.
-- An authenticated actor may cancel its own Agent turn only while the current
-  model/tool operation is queued, prepared, or waiting for approval. The
-  command uses the Agent revision as a compare-and-set token, commits one
-  `user_cancelled` workflow fact and `turn_interrupted` event, and releases any
-  prepared claim without creating a RunEpoch. Repeating the original revision
-  reconstructs the exact response. A durable model/tool `started` checkpoint
-  wins the race and returns a conflict; Zeus never reports an in-flight
-  provider or connector call as cancelled.
+- An authenticated actor may cancel its own Agent turn while its model is
+  queued, prepared, or running, or while a tool is waiting for approval or
+  dispatch. The command uses the Agent revision as a compare-and-set token and
+  commits one `user_cancelled` workflow fact with the `turn_interrupted` event.
+  Pre-start cancellation remains epochless; running-model cancellation binds
+  the exact RunEpoch, terminalizes the model job, releases its started claim,
+  and asks the matching local worker to drop the provider stream. Repeating the
+  original revision reconstructs the exact response. A tool `started`
+  checkpoint still returns a conflict because connector side effects may be
+  unknown.
 - Session commands do not change the Run ledger or wake the dispatch worker.
   Session and Run are joined by durable ownership, not by sharing an event
   sequence or transaction stream.
@@ -906,6 +915,10 @@ and bounded memory, CPU, and PID resources.
   epochless `user_cancelled` fact, no tool RunEpoch exists, and the persisted
   result carries the fixed cancellation code. All older tool transitions keep
   their existing fail-closed rules.
+  Schema v33 extends the model-job transition trigger only for an epoch-bound
+  `user_cancelled` fact. It permits `started -> failed` after the Agent has
+  atomically entered its cancellation terminal state; successful, failed, and
+  outcome-unknown model paths retain their prior exact fact bindings.
   Schema v28 adds append-only Agent todo snapshots. Each row is scoped to one
   account/Session/turn/Agent, advances a contiguous revision, and is bound to
   one exact successful `todo_write@1-single-active` call. SQLite triggers bind
@@ -1114,12 +1127,13 @@ directly.
   `Cache-Control: no-store`; no volatile publisher is the source of truth.
 - `PUT /api/v1/sessions/{session_id}/turns/{turn_id}/agent/cancel` accepts
   `{"expected_revision":...}` and uses that revision as a replayable CAS.
-  Cancellation succeeds only before the active provider/connector operation
-  crosses its durable `started` checkpoint. A stale revision returns
-  `409 agent_revision_conflict`, an already-started operation returns
+  Cancellation succeeds for a queued or running model and for a tool that has
+  not crossed its durable `started` checkpoint. A stale revision returns
+  `409 agent_revision_conflict`, a started tool returns
   `409 agent_operation_in_flight`, and another terminal result returns
   `409 agent_already_terminal`. Success and error responses use
-  `Cache-Control: no-store`.
+  `Cache-Control: no-store`; already-published model-output chunks remain
+  replayable after cancellation.
 - `GET /api/v1/sessions/{session_id}/turns/{turn_id}/agent/explain` returns the
   actor-scoped persisted and current secret-free manifests plus a deterministic
   JSON-pointer diff. It explicitly marks pre-v19 unbound history and whether
@@ -1304,17 +1318,18 @@ governance, schema v25 durable Session context compaction, schema v26
 account-scoped reply provider selection, schema v27 safe pre-start Agent
 cancellation, schema v28 durable Agent planning, schema v29 durable Session
 Goals, schema v30 same-Session Goal rounds, schema v31 durable Session
-follow-ups, schema v32 durable Agent model output, Trusted Single-Node Ingress,
+follow-ups, schema v32 durable Agent model output, schema v33 running-model
+cancellation, Trusted Single-Node Ingress,
 Per-Operation SecretRef Resolution, the startup-bound Skill Catalog, and the
 bounded multi-account control plane:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 674 tests passed
+- `cargo test --workspace --all-targets --locked`: 677 tests passed
   across the top-level test targets, including 22 connector tests,
   8 deployment tests, 29 knowledge tests, 30 LLM unit and 18 provider-contract
-  tests, 4 Goal tests, 5 Skill Catalog tests, 276 storage tests, 21 workflow
-  tests, 52 runtime tests, 21 protocol tests, 91 API library tests, 18 API main/config
+  tests, 4 Goal tests, 5 Skill Catalog tests, 278 storage tests, 21 workflow
+  tests, 52 runtime tests, 21 protocol tests, 92 API library tests, 18 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,
@@ -1332,6 +1347,11 @@ bounded multi-account control plane:
   parsing, typed reply/tool
   payload envelopes, canonical dispatch admission, and one-shot oversized
   provider/executor settlement without persisting the rejected payload.
+  Agent cancellation coverage includes queued and prepared races, epoch-bound
+  running-model cancellation and replay after restart, late provider
+  success/failure losing to the committed cancellation, cooperative provider
+  stream drop with durable-prefix replay, started-tool rejection, and v33
+  trigger-definition tamper detection.
   Operation-capacity coverage proves the seven-slot ordinary lane, fail-fast
   general admission, one-deadline progress waiting, progress priority at the
   single-connection in-memory gate, cancellation and partial-permit cleanup,

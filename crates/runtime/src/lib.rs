@@ -12,8 +12,8 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     sync::{
-        Arc,
-        atomic::{AtomicU8, Ordering as AtomicOrdering},
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, AtomicU8, Ordering as AtomicOrdering},
     },
     time::Duration,
 };
@@ -69,33 +69,33 @@ pub use storage::{
     AGENT_SYSTEM_PROMPT_MAX_BYTES, AccountAuditArchiveState, AccountAuditCheckpointCommit,
     AccountAuditEvent, AccountAuditPage, AccountAuditPolicy, AccountAuditRollup, AccountAuditState,
     AccountId, AccountReplyProviderCommit, AccountReplyProviderState,
-    AccountReplyProviderUpdateResult, AgentFinalCompletion, AgentGoalRoundCandidate,
-    AgentGoalRoundSpec, AgentKnowledgeContextExplain, AgentKnowledgeContextSpec,
-    AgentModelClaimOutcome, AgentModelCompletion, AgentModelFailureCommit, AgentModelJob,
-    AgentModelJobStatus, AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit,
-    AgentOperationClaim, AgentOperationKind, AgentPreparedModel, AgentPreparedTool,
-    AgentPromptCommit, AgentPromptRevisionPage, AgentPromptRevisionSummary, AgentPromptState,
-    AgentPromptUpdateResult, AgentReviewCommit, AgentReviewContext, AgentReviewResult,
-    AgentTerminalCompletion, AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome,
-    AgentToolCompletion, AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit,
-    AgentToolStartOutcome, AgentToolWork, AgentTurn, AgentTurnEnqueueResponse,
-    AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthSessionId,
-    AuthzContext, BootstrapOwnerCommit, CreateAccountCommit, CreateAccountResult,
-    CreateMemberResult, DEFAULT_SESSION_AGENT_PROMPT_REVISION, DEFAULT_SESSION_AGENT_SYSTEM_PROMPT,
-    InFlightWorkSummary, KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage,
-    KnowledgeCatalogRevisionSummary, KnowledgeCatalogState, KnowledgeCatalogUpdateResult,
-    MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit, MemberSetupResult, MemberSetupToken,
-    MemberTransitionResult, MembershipRevision, MembershipRole, ReplyClaimOutcome, ReplyCompletion,
-    ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus,
-    ReplyOutcomeUnknownCommit, ReplySuccessCommit, RotateMemberSetupTokenResult,
-    SESSION_AGENT_PROMPT_ID, SessionCompactionClaimOutcome, SessionCompactionFailureCommit,
-    SessionCompactionJob, SessionCompactionSuccessCommit, SessionContextCheckpoint,
-    SessionFollowupCandidate, SessionSummaryPage, SqliteOperationLimits,
-    SqliteOperationLimitsError, SqlitePhysicalLimits, SqlitePhysicalLimitsError, StorageLimits,
-    StorageLimitsError, StoredAccount, StoredAccountStatus, StoredCredential, StoredMember,
-    StoredMemberPage, StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserRole,
-    StoredUserStatus, SwitchAuthSessionCommit, SwitchAuthSessionResult, TransitionMemberCommit,
-    UpdateAccountAuditPolicyCommit,
+    AccountReplyProviderUpdateResult, AgentCancellationCompletion, AgentFinalCompletion,
+    AgentGoalRoundCandidate, AgentGoalRoundSpec, AgentKnowledgeContextExplain,
+    AgentKnowledgeContextSpec, AgentModelClaimOutcome, AgentModelCompletion,
+    AgentModelFailureCommit, AgentModelJob, AgentModelJobStatus, AgentModelResolution,
+    AgentModelStartOutcome, AgentModelSuccessCommit, AgentOperationClaim, AgentOperationKind,
+    AgentPreparedModel, AgentPreparedTool, AgentPromptCommit, AgentPromptRevisionPage,
+    AgentPromptRevisionSummary, AgentPromptState, AgentPromptUpdateResult, AgentReviewCommit,
+    AgentReviewContext, AgentReviewResult, AgentTerminalCompletion, AgentToolCall,
+    AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
+    AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurn,
+    AgentTurnEnqueueResponse, AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal,
+    AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, CreateAccountCommit,
+    CreateAccountResult, CreateMemberResult, DEFAULT_SESSION_AGENT_PROMPT_REVISION,
+    DEFAULT_SESSION_AGENT_SYSTEM_PROMPT, InFlightWorkSummary, KnowledgeCatalogCommit,
+    KnowledgeCatalogRevisionPage, KnowledgeCatalogRevisionSummary, KnowledgeCatalogState,
+    KnowledgeCatalogUpdateResult, MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit,
+    MemberSetupResult, MemberSetupToken, MemberTransitionResult, MembershipRevision,
+    MembershipRole, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit, ReplyJob,
+    ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
+    ReplySuccessCommit, RotateMemberSetupTokenResult, SESSION_AGENT_PROMPT_ID,
+    SessionCompactionClaimOutcome, SessionCompactionFailureCommit, SessionCompactionJob,
+    SessionCompactionSuccessCommit, SessionContextCheckpoint, SessionFollowupCandidate,
+    SessionSummaryPage, SqliteOperationLimits, SqliteOperationLimitsError, SqlitePhysicalLimits,
+    SqlitePhysicalLimitsError, StorageLimits, StorageLimitsError, StoredAccount,
+    StoredAccountStatus, StoredCredential, StoredMember, StoredMemberPage, StoredMembershipStatus,
+    StoredPreferences, StoredUser, StoredUserRole, StoredUserStatus, SwitchAuthSessionCommit,
+    SwitchAuthSessionResult, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
 use storage::{
     ClaimOutcome, CommitOutcome, CreateMemberCommit, DispatchCompleteCommit, DispatchContext,
@@ -105,7 +105,7 @@ use storage::{
 };
 use terminal::TerminalService;
 use thiserror::Error;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, Notify, broadcast};
 pub use tools::{ExecutionScope, ToolOutput};
 use tools::{ExecutorError, RegistryError, ToolRegistry, arguments_digest, stable_agent_call_id};
 
@@ -273,6 +273,7 @@ pub struct DemoStore {
     primary_run_id: Arc<str>,
     dispatcher: Arc<Mutex<()>>,
     dispatcher_wake: Arc<WorkerWakeState>,
+    agent_model_cancellations: Arc<AgentModelCancellationRegistry>,
     goal_activations: Arc<GoalActivationRegistry>,
     auto_dispatch: bool,
 }
@@ -290,6 +291,104 @@ pub struct ArmedSessionGoal {
 #[derive(Default)]
 struct GoalActivationRegistry {
     by_session: Mutex<BTreeMap<String, ArmedSessionGoal>>,
+}
+
+#[derive(Default)]
+struct AgentModelCancellationRegistry {
+    by_job: StdMutex<BTreeMap<String, Arc<AgentModelCancellationSignal>>>,
+}
+
+#[derive(Default)]
+struct AgentModelCancellationSignal {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+/// Process-local cooperative cancellation handle for one durably prepared
+/// model operation. The durable SQLite transition remains authoritative; this
+/// handle only shortens the lifetime of the matching provider stream.
+pub struct AgentModelCancellationGuard {
+    registry: Arc<AgentModelCancellationRegistry>,
+    job_id: String,
+    signal: Arc<AgentModelCancellationSignal>,
+}
+
+impl AgentModelCancellationSignal {
+    fn cancel(&self) {
+        if !self.cancelled.swap(true, AtomicOrdering::AcqRel) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.cancelled.load(AtomicOrdering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl AgentModelCancellationRegistry {
+    fn register(self: &Arc<Self>, job_id: &str) -> AgentModelCancellationGuard {
+        let mut by_job = self
+            .by_job
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let signal = match by_job.entry(job_id.to_owned()) {
+            std::collections::btree_map::Entry::Vacant(entry) => entry
+                .insert(Arc::new(AgentModelCancellationSignal::default()))
+                .clone(),
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                // Duplicate registration would imply two workers can reach
+                // the same external operation. Cancel both rather than let a
+                // replacement signal hide the first provider stream.
+                entry.get().cancel();
+                entry.get().clone()
+            }
+        };
+        AgentModelCancellationGuard {
+            registry: self.clone(),
+            job_id: job_id.to_owned(),
+            signal,
+        }
+    }
+
+    fn cancel(&self, job_id: &str) {
+        let signal = self
+            .by_job
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(job_id)
+            .cloned();
+        if let Some(signal) = signal {
+            signal.cancel();
+        }
+    }
+}
+
+impl AgentModelCancellationGuard {
+    pub async fn cancelled(&self) {
+        self.signal.cancelled().await;
+    }
+}
+
+impl Drop for AgentModelCancellationGuard {
+    fn drop(&mut self) {
+        let mut by_job = self
+            .registry
+            .by_job
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if by_job
+            .get(&self.job_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.signal))
+        {
+            by_job.remove(&self.job_id);
+        }
+    }
 }
 
 impl GoalActivationRegistry {
@@ -1106,6 +1205,7 @@ impl DemoStore {
             primary_run_id: Arc::from(primary_run_id),
             dispatcher: Arc::new(Mutex::new(())),
             dispatcher_wake: Arc::new(WorkerWakeState::default()),
+            agent_model_cancellations: Arc::new(AgentModelCancellationRegistry::default()),
             // Continuation authority is intentionally process-local. Opening
             // or reopening a database never inherits automatic Goal work.
             goal_activations: Arc::new(GoalActivationRegistry::default()),
@@ -3134,8 +3234,15 @@ impl DemoStore {
         Ok(completion)
     }
 
-    /// Cancel an Agent turn only while no provider or connector operation has
-    /// crossed its durable started checkpoint. The revision CAS makes an
+    /// Register the exact model job before its durable start checkpoint so a
+    /// concurrent authenticated cancellation can cooperatively stop the
+    /// provider stream without a start-to-registration race.
+    pub fn register_agent_model_cancellation(&self, job_id: &str) -> AgentModelCancellationGuard {
+        self.agent_model_cancellations.register(job_id)
+    }
+
+    /// Cancel an Agent turn while a model is queued or running, or before a
+    /// tool crosses its durable started checkpoint. The revision CAS makes an
     /// ambiguous successful response reconstructable without a second state
     /// transition.
     pub async fn cancel_agent_turn_for_actor(
@@ -3149,11 +3256,17 @@ impl DemoStore {
         validate_durable_reference(turn_id, "turn ID")?;
         self.authorize_session_for_actor(context, session_id)
             .await?;
-        self.disarm_session_goal(session_id).await;
-        let completion = self
+        let AgentCancellationCompletion {
+            terminal: completion,
+            started_model_job_id,
+        } = self
             .storage
             .cancel_agent_turn_for_actor(context, session_id, turn_id, expected_revision)
             .await?;
+        if let Some(job_id) = started_model_job_id {
+            self.agent_model_cancellations.cancel(&job_id);
+        }
+        self.disarm_session_goal(session_id).await;
         let detail = self
             .storage
             .agent_turn_detail_for_actor(context, session_id, turn_id)

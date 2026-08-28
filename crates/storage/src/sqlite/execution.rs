@@ -1018,7 +1018,8 @@ fn validate_fact_epoch_binding(
                 | Command::ModelFinal { .. }
                 | Command::ModelToolProposal { .. }
                 | Command::ModelFailed
-                | Command::ModelOutcomeUnknown,
+                | Command::ModelOutcomeUnknown
+                | Command::UserCancelled,
             RunOperation::Model { .. }
         )
     ) || matches!(
@@ -1294,6 +1295,20 @@ fn validate_terminal_fact_material(
                 DigestDomain::ExecutionError,
                 required_material(job.error_json.as_ref(), "model error")?,
             )?
+        }
+        (Command::UserCancelled, RunOperation::Model { job_id, .. }) => {
+            let job = super::agent::query_agent_model_job_by_id(connection, job_id)?;
+            let error = required_material(job.error_json.as_ref(), "model cancellation error")?;
+            if job.status != AgentModelJobStatus::Failed
+                || job.finished_at.as_deref() != Some(recorded_at.as_str())
+                || !super::agent::is_running_model_user_cancelled_error(error)
+            {
+                return Err(StorageError::CorruptData(format!(
+                    "RunEpoch `{}` cancellation fact disagrees with its model job status",
+                    epoch.digest
+                )));
+            }
+            digest_json(DigestDomain::ExecutionError, error)?
         }
         (Command::ToolResultKnown { kind, result_bytes }, RunOperation::Tool { call_id, .. }) => {
             let call = super::agent::query_agent_tool_call(connection, call_id)?;
@@ -1719,7 +1734,11 @@ fn validate_epochless_operation_fact(
                 && job.finished_at.as_deref() == Some(envelope.fact.recorded_at.as_str())
                 && digest_json(DigestDomain::ModelRequest, &job.request_json)? == *input_digest
                 && output_digest.as_ref() == Some(&expected_output)
-                && error.get("code").and_then(Value::as_str) == rejection_error_code
+                && if matches!(command, Command::UserCancelled) {
+                    super::agent::is_prestart_user_cancelled_error(error)
+                } else {
+                    error.get("code").and_then(Value::as_str) == rejection_error_code
+                }
         }
         (
             Command::AuthorizationRevoked
@@ -1749,7 +1768,11 @@ fn validate_epochless_operation_fact(
                 && call.finished_at.as_deref() == Some(envelope.fact.recorded_at.as_str())
                 && expected_input == *input_digest
                 && output_digest.as_ref() == Some(&expected_output)
-                && error.get("code").and_then(Value::as_str) == rejection_error_code
+                && if matches!(command, Command::UserCancelled) {
+                    super::agent::is_prestart_user_cancelled_error(error)
+                } else {
+                    error.get("code").and_then(Value::as_str) == rejection_error_code
+                }
         }
         (
             Command::ApprovalApproved,
@@ -2285,6 +2308,7 @@ fn validate_epoch_durable_binding(
                     | Command::ModelToolProposal { .. }
                     | Command::ModelFailed
                     | Command::ModelOutcomeUnknown
+                    | Command::UserCancelled
                     | Command::ToolResultKnown { .. }
                     | Command::ToolOutcomeUnknown,
                 ..

@@ -60,7 +60,7 @@ use crate::{
     SwitchAuthSessionResult, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 32;
+const CURRENT_SCHEMA_VERSION: i64 = 33;
 const LOCAL_ACCOUNT_ID: &str = "acc_local";
 const MAX_ACCOUNTS_PER_USER: i64 = 16;
 const MAX_ACCOUNTS_GLOBAL: i64 = 64;
@@ -101,6 +101,8 @@ const MIGRATION_0029: &str = include_str!("../migrations/0029_session_agent_goal
 const MIGRATION_0030: &str = include_str!("../migrations/0030_agent_goal_rounds.sql");
 const MIGRATION_0031: &str = include_str!("../migrations/0031_session_followups.sql");
 const MIGRATION_0032: &str = include_str!("../migrations/0032_agent_model_output_chunks.sql");
+const MIGRATION_0033: &str =
+    include_str!("../migrations/0033_agent_running_model_cancellation.sql");
 const MIGRATION_0022_TRIGGER_NAMES: &[&str] = &[
     "knowledge_corpus_revisions_reject_update",
     "knowledge_corpus_revisions_reject_delete",
@@ -180,6 +182,7 @@ const MIGRATION_0032_TRIGGER_NAMES: &[&str] = &[
     "agent_model_output_chunks_reject_update",
     "agent_model_output_chunks_reject_delete",
 ];
+const MIGRATION_0033_TRIGGER_NAMES: &[&str] = &["agent_model_jobs_enforce_forward_transition"];
 const RECOVERY_BATCH_LIMIT: i64 = 64;
 const AUTH_SESSION_CLEANUP_BATCH_LIMIT: i64 = 64;
 const BOOTSTRAP_AUDIT_ROLLUP_BATCH_LIMIT: i64 = 64;
@@ -3698,6 +3701,13 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
             params![32, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 33 {
+        transaction.execute_batch(MIGRATION_0033)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![33, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
     // The execution verifier now understands the v22 knowledge binding. Run
     // it only after every missing schema step has been installed so upgrades
     // from v19 and older never query a column that does not exist yet. This
@@ -4969,6 +4979,7 @@ fn readiness(
     verify_migration_trigger_definitions(connection, MIGRATION_0030, MIGRATION_0030_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0031, MIGRATION_0031_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0032, MIGRATION_0032_TRIGGER_NAMES)?;
+    verify_migration_trigger_definitions(connection, MIGRATION_0033, MIGRATION_0033_TRIGGER_NAMES)?;
     verify_session_followup_integrity(connection)?;
 
     let agent_pending_call_fk: i64 = connection.query_row(

@@ -1257,6 +1257,22 @@ pub struct AgentTerminalCompletion {
     pub replayed: bool,
 }
 
+/// Durable Agent cancellation plus the exact in-process model operation that
+/// may still be streaming after the cancellation transaction wins.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentCancellationCompletion {
+    pub terminal: AgentTerminalCompletion,
+    pub started_model_job_id: Option<String>,
+}
+
+impl std::ops::Deref for AgentCancellationCompletion {
+    type Target = AgentTerminalCompletion;
+
+    fn deref(&self) -> &Self::Target {
+        &self.terminal
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentFinalCompletion {
     pub agent: AgentTurn,

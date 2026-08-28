@@ -110,6 +110,13 @@ RunEpoch。取消事务写入精确的 epochless `user_cancelled` execution fact
 `turn_interrupted`。若 model/tool 已有 durable `started` checkpoint，取消返回 conflict，不能把
 可能已经计费或产生副作用的外部调用伪装为已取消。相同旧 revision 只重建第一次终态响应。
 
+schema v33 将运行中的 model 纳入取消边界，但不放宽 tool。`model_running` 取消与 provider completion
+在 SQLite immediate transaction 上竞争；取消胜出时写入绑定精确 RunEpoch 的 `user_cancelled` fact，
+把 started model job 终止为 `failed`、释放 started claim，并保留所有已落盘 output chunks。Runtime 在
+model durable start 之前注册进程内 cancellation handle，事务提交后通知匹配 worker 丢弃 provider
+stream；尚未落盘的小尾巴从未通过 durable SSE 发布，不会形成可见回滚。已 started 的 tool 仍返回
+`agent_operation_in_flight`，因为 connector 副作用可能已经发生。
+
 schema v28 增加 Agent turn 自有的 durable plan。`todo_write@1-single-active` 每次提交完整列表，
 最多 24 项、每项 256 UTF-8 bytes、至多一个 `in_progress`；首写 `expected_revision=0`，之后严格
 CAS。Runtime 在 executor 前按 server-derived account/actor/Session/turn/Agent scope 预检 revision，
@@ -275,10 +282,11 @@ Session ledger 记录 `session_created`、`run_attached`、`user_message`、可�
   与 model-visible JSON `null` 不得混淆。continuation 再次校验同一 prompt 绑定，并原样保留已
   持久化的 system message 与 transcript；重启恢复只重放该 exact request，不从当前 prompt 或
   Session 状态重新拼接输入。
-- Agent cancel：`PUT .../agent/cancel` 接收 `expected_revision`。queued、prepared 或
-  waiting-approval 状态可安全终止；model/tool running 返回 `agent_operation_in_flight`。成功取消后
-  Session 进入 `needs_attention`，由显式 resume 回到 `ready`；取消、重放和 started-race 都不触发
-  provider 或 connector I/O。
+- Agent cancel：`PUT .../agent/cancel` 接收 `expected_revision`。queued、prepared、
+  waiting-approval 或 model-running 状态可终止；model-running 取消绑定既有 RunEpoch 并协作式停止
+  本进程 provider stream，已落盘 prefix 保持可重放。tool-running 返回
+  `agent_operation_in_flight`。成功取消后 Session 进入 `needs_attention`，由显式 resume 回到
+  `ready`；重放不创建第二个终态。
 - Session flush barrier：`POST /sessions/{id}/flush` 不接收 body，只在同一 SQLite snapshot 冻结
   调用时的 active turn、Session sequence 与最大 follow-up ordinal，并等待这段 durable prefix 达到
   `quiescent` 或 `needs_attention`。调用前已经 terminal 的历史 follow-up 不进入区间；调用之后的

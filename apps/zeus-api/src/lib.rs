@@ -73,15 +73,16 @@ use runtime::{
     AccountAuditPolicy as StoredAccountAuditPolicy, AccountAuditRollup as StoredAccountAuditRollup,
     AccountAuditState as StoredAccountAuditState, AccountReplyProviderState,
     AccountReplyProviderUpdateResult, AgentGoalRoundSpec, AgentKnowledgeContextExplain,
-    AgentModelClaimOutcome, AgentModelCompletion, AgentModelFailureCommit, AgentModelJob,
-    AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit, AgentPromptRevisionPage,
-    AgentPromptState, AgentPromptUpdateResult, AgentReviewCommit, AgentToolCall, AgentToolCallSpec,
-    AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
-    AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe,
-    AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthzContext, BootstrapOwnerCommit,
-    CreateAccountCommit, DemoStore, EntryRevision, KnowledgeCatalogRevisionPage,
-    KnowledgeCatalogState, KnowledgeCatalogUpdateResult, MemberSetupCommit, PublishedEvent,
-    ReplyClaimOutcome, ReplyFailureCommit, ReplyJob, ReplyOutcomeUnknownCommit, ReplySuccessCommit,
+    AgentModelCancellationGuard, AgentModelClaimOutcome, AgentModelCompletion,
+    AgentModelFailureCommit, AgentModelJob, AgentModelResolution, AgentModelStartOutcome,
+    AgentModelSuccessCommit, AgentPromptRevisionPage, AgentPromptState, AgentPromptUpdateResult,
+    AgentReviewCommit, AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome,
+    AgentToolCompletion, AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit,
+    AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal,
+    AuthSessionCommit, AuthzContext, BootstrapOwnerCommit, CreateAccountCommit, DemoStore,
+    EntryRevision, KnowledgeCatalogRevisionPage, KnowledgeCatalogState,
+    KnowledgeCatalogUpdateResult, MemberSetupCommit, PublishedEvent, ReplyClaimOutcome,
+    ReplyFailureCommit, ReplyJob, ReplyOutcomeUnknownCommit, ReplySuccessCommit,
     SessionCompactionClaimOutcome, SessionCompactionFailureCommit, SessionCompactionJob,
     SessionCompactionSuccessCommit, StoreError, StoredAccount, StoredAccountStatus, StoredMember,
     StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserStatus,
@@ -4293,6 +4294,9 @@ async fn drain_agent_model_jobs(state: &ApiState) -> Result<(), StoreError> {
             AgentModelClaimOutcome::Rejected(_) => continue,
             AgentModelClaimOutcome::NotAvailable => return Ok(()),
         };
+        let cancellation = state
+            .store
+            .register_agent_model_cancellation(&prepared.job.id);
         let Some(started) =
             retry_prepared_agent_start("Agent model", &prepared.claim.expires_at, || {
                 state
@@ -4307,7 +4311,7 @@ async fn drain_agent_model_jobs(state: &ApiState) -> Result<(), StoreError> {
             AgentModelStartOutcome::Started(job) => *job,
             AgentModelStartOutcome::Rejected(_) => continue,
         };
-        process_agent_model_job(state, job, &current_manifest).await?;
+        process_agent_model_job(state, job, &current_manifest, cancellation).await?;
     }
 }
 
@@ -4315,6 +4319,7 @@ async fn process_agent_model_job(
     state: &ApiState,
     job: AgentModelJob,
     current_manifest: &ManifestEnvelope,
+    cancellation: AgentModelCancellationGuard,
 ) -> Result<(), StoreError> {
     let executor = state
         .reply
@@ -4381,7 +4386,14 @@ async fn process_agent_model_job(
     let output_store = state.store.clone();
     let output_job_id = job.id.clone();
     let response = match tokio::spawn(async move {
-        consume_agent_provider_stream(output_store, output_job_id, provider, provider_request).await
+        consume_agent_provider_stream(
+            output_store,
+            output_job_id,
+            provider,
+            provider_request,
+            cancellation,
+        )
+        .await
     })
     .await
     {
@@ -4409,6 +4421,7 @@ async fn process_agent_model_job(
             )
             .await;
         }
+        Ok(Err(AgentProviderStreamError::Cancelled)) => return Ok(()),
         Err(_) => {
             eprintln!("zeus Agent provider task panicked; settling outcome_unknown");
             return settle_agent_model_failure(
@@ -4607,6 +4620,7 @@ const AGENT_OUTPUT_CHUNK_MAX_BYTES: usize = 4 * 1024;
 enum AgentProviderStreamError {
     Provider(ProviderError),
     Durable(StoreError),
+    Cancelled,
 }
 
 impl From<ProviderError> for AgentProviderStreamError {
@@ -4620,11 +4634,22 @@ async fn consume_agent_provider_stream(
     job_id: String,
     provider: Arc<dyn ReplyProvider>,
     request: ReplyRequest,
+    cancellation: AgentModelCancellationGuard,
 ) -> Result<ReplyResponse, AgentProviderStreamError> {
     let mut stream = provider.stream_reply(request);
     let mut buffer = String::new();
     let mut completed = None;
-    while let Some(event) = stream.next().await {
+    loop {
+        let event = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return Err(AgentProviderStreamError::Cancelled);
+            }
+            event = stream.next() => event,
+        };
+        let Some(event) = event else {
+            break;
+        };
         if completed.is_some() {
             return Err(ProviderError::InvalidResponse.into());
         }
@@ -6997,8 +7022,8 @@ impl From<StoreError> for ApiError {
             StoreError::AgentOperationInFlight => Self::new(
                 StatusCode::CONFLICT,
                 "agent_operation_in_flight",
-                "Agent operation is already in flight",
-                "The Agent turn cannot be cancelled after external execution has started",
+                "Agent tool is already in flight",
+                "The Agent turn cannot be cancelled after tool execution has started",
             )
             .with_no_store(),
             StoreError::AgentAlreadyTerminal => Self::new(
@@ -9443,6 +9468,21 @@ mod tests {
         delta: String,
     }
 
+    struct CancelAwareStreamingProvider {
+        metadata: ProviderMetadata,
+        prefix: String,
+        blocked: Arc<tokio::sync::Barrier>,
+        dropped: Arc<AtomicUsize>,
+    }
+
+    struct StreamDropCounter(Arc<AtomicUsize>);
+
+    impl Drop for StreamDropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Release);
+        }
+    }
+
     struct ToolThenFinalProvider {
         metadata: ProviderMetadata,
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
@@ -9727,6 +9767,47 @@ mod tests {
                 Ok(ReplyStreamEvent::TextDelta(self.delta.clone())),
                 Err(ProviderError::Transport),
             ]))
+        }
+    }
+
+    impl CancelAwareStreamingProvider {
+        fn new(
+            prefix: String,
+            blocked: Arc<tokio::sync::Barrier>,
+            dropped: Arc<AtomicUsize>,
+        ) -> Self {
+            Self {
+                metadata: ProviderMetadata {
+                    provider_id: "test-cancel-aware-streaming-provider".into(),
+                    model: Some("test-model".into()),
+                    reply_kind: ReplyKind::Model,
+                },
+                prefix,
+                blocked,
+                dropped,
+            }
+        }
+    }
+
+    impl ReplyProvider for CancelAwareStreamingProvider {
+        fn metadata(&self) -> &ProviderMetadata {
+            &self.metadata
+        }
+
+        fn reply(&self, _request: ReplyRequest) -> ReplyFuture<'_> {
+            Box::pin(std::future::pending())
+        }
+
+        fn stream_reply(&self, _request: ReplyRequest) -> llm::ReplyStream<'_> {
+            let prefix = self.prefix.clone();
+            let blocked = self.blocked.clone();
+            let dropped = self.dropped.clone();
+            Box::pin(async_stream::stream! {
+                let _drop_counter = StreamDropCounter(dropped);
+                yield Ok(ReplyStreamEvent::TextDelta(prefix));
+                blocked.wait().await;
+                std::future::pending::<()>().await;
+            })
         }
     }
 
@@ -10719,6 +10800,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn running_model_cancel_drops_provider_stream_and_keeps_durable_prefix() {
+        let store = DemoStore::seeded().await.unwrap();
+        let owner =
+            provision_test_owner(&store, "user-running-cancel", "running-cancel-owner").await;
+        let session_id = "session-running-model-cancel";
+        let turn_id = "turn-running-model-cancel";
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: session_id.into(),
+                    title: "Running model cancellation".into(),
+                },
+                "create-running-model-cancel",
+            )
+            .await
+            .unwrap();
+        let prefix = "p".repeat(AGENT_OUTPUT_FLUSH_TARGET_BYTES);
+        let blocked = Arc::new(tokio::sync::Barrier::new(2));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(CancelAwareStreamingProvider::new(
+                prefix.clone(),
+                blocked.clone(),
+                dropped.clone(),
+            )),
+        )
+        .unwrap();
+
+        let started = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/sessions/{session_id}/turns"))
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "start-running-model-cancel")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": turn_id,
+                            "user_message": "stop after the durable prefix",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+        tokio::time::timeout(Duration::from_secs(2), blocked.wait())
+            .await
+            .expect("provider stream must reach its cancellable wait point");
+        let detail = store
+            .agent_turn_detail_for_actor(&owner.authz, session_id, turn_id)
+            .await
+            .unwrap();
+        assert_eq!(detail.status, protocol::AgentTurnStatus::ModelRunning);
+
+        let cancelled = app
+            .oneshot(
+                Request::put(format!(
+                    "/api/v1/sessions/{session_id}/turns/{turn_id}/agent/cancel"
+                ))
+                .header(header::HOST, "zeus.test")
+                .header(header::ORIGIN, "http://zeus.test")
+                .header(header::COOKIE, &owner.cookie_header)
+                .header(CSRF_HEADER, &owner.csrf_token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"expected_revision": detail.revision}).to_string(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancelled.status(), StatusCode::OK);
+        let cancelled: CancelAgentTurnResponse = response_json(cancelled).await;
+        assert_eq!(cancelled.agent.status, protocol::AgentTurnStatus::Failed);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while dropped.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation must drop the active provider stream");
+        let output = store
+            .agent_output_chunk_page_for_actor(&owner.authz, session_id, turn_id, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(output.items.len(), 1);
+        assert_eq!(output.items[0].content, prefix);
+        assert!(output.terminal);
+        store.readiness().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn durable_followup_endpoint_drives_the_next_agent_turn() {
         let store = DemoStore::seeded().await.unwrap();
         let owner = provision_test_owner(&store, "user-followup", "followup-owner").await;
@@ -11484,7 +11667,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_cancel_endpoint_is_cas_replayable_and_rejects_started_work() {
+    async fn agent_cancel_endpoint_is_cas_replayable_and_stops_running_models() {
         let store = DemoStore::seeded().await.unwrap();
         let (app, request_auth) = app_with_auth(store.clone()).await;
         let session_id = "session-agent-cancel-api";
@@ -11630,7 +11813,7 @@ mod tests {
             .unwrap();
         let started = enqueue(
             "turn-agent-cancel-started-api",
-            "reject cancellation after provider start",
+            "cancel after provider start",
             resumed.session.sequence,
         )
         .await;
@@ -11647,7 +11830,7 @@ mod tests {
             .await
             .unwrap();
         assert!(started_detail.revision > started.agent.revision);
-        let in_flight = app
+        let running_cancelled = app
             .oneshot(
                 Request::put(format!(
                     "/api/v1/sessions/{session_id}/turns/turn-agent-cancel-started-api/agent/cancel"
@@ -11660,11 +11843,17 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(in_flight.status(), StatusCode::CONFLICT);
+        assert_eq!(running_cancelled.status(), StatusCode::OK);
+        let running_cancelled: CancelAgentTurnResponse = response_json(running_cancelled).await;
         assert_eq!(
-            response_json::<ProblemDetails>(in_flight).await.code,
-            "agent_operation_in_flight"
+            running_cancelled.agent.status,
+            protocol::AgentTurnStatus::Failed
         );
+        assert!(matches!(
+            running_cancelled.event.data,
+            protocol::SessionEventData::TurnInterrupted { ref reason, .. }
+                if reason == "agent turn was cancelled while model execution was in progress"
+        ));
         store.readiness().await.unwrap();
     }
 

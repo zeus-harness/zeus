@@ -486,6 +486,7 @@ pub fn reduce(state: &State, command: Command) -> Result<Transition, Error> {
                 state,
                 &[
                     AgentStatus::ModelQueued,
+                    AgentStatus::ModelStarted,
                     AgentStatus::WaitingApproval,
                     AgentStatus::ToolQueued,
                     AgentStatus::ContinuationQueued,
@@ -1208,7 +1209,7 @@ mod tests {
     }
 
     #[test]
-    fn user_cancellation_is_terminal_only_before_an_external_start() {
+    fn user_cancellation_stops_models_but_not_started_tools() {
         let continuation = apply(
             started_tool(),
             Command::ToolResultKnown {
@@ -1219,6 +1220,7 @@ mod tests {
         .into_state();
         for state in [
             State::default(),
+            started_model(),
             waiting_approval(),
             queued_tool(),
             continuation,
@@ -1234,16 +1236,15 @@ mod tests {
             assert_eq!(cancelled.emitted_result(), None);
         }
 
-        for state in [started_model(), started_tool()] {
-            let status = state.status();
-            assert_eq!(
-                reduce(&state, Command::UserCancelled).unwrap_err(),
-                Error::InvalidTransition {
-                    status,
-                    command: CommandKind::UserCancelled,
-                }
-            );
-        }
+        let state = started_tool();
+        let status = state.status();
+        assert_eq!(
+            reduce(&state, Command::UserCancelled).unwrap_err(),
+            Error::InvalidTransition {
+                status,
+                command: CommandKind::UserCancelled,
+            }
+        );
     }
 
     #[test]
