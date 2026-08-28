@@ -59,7 +59,7 @@ use crate::{
     UpdateAccountAuditPolicyCommit,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 28;
+const CURRENT_SCHEMA_VERSION: i64 = 29;
 const LOCAL_ACCOUNT_ID: &str = "acc_local";
 const MAX_ACCOUNTS_PER_USER: i64 = 16;
 const MAX_ACCOUNTS_GLOBAL: i64 = 64;
@@ -96,6 +96,7 @@ const MIGRATION_0025: &str = include_str!("../migrations/0025_session_context_co
 const MIGRATION_0026: &str = include_str!("../migrations/0026_account_reply_provider.sql");
 const MIGRATION_0027: &str = include_str!("../migrations/0027_agent_safe_cancellation.sql");
 const MIGRATION_0028: &str = include_str!("../migrations/0028_agent_todo_snapshots.sql");
+const MIGRATION_0029: &str = include_str!("../migrations/0029_session_agent_goals.sql");
 const MIGRATION_0022_TRIGGER_NAMES: &[&str] = &[
     "knowledge_corpus_revisions_reject_update",
     "knowledge_corpus_revisions_reject_delete",
@@ -150,6 +151,12 @@ const MIGRATION_0028_TRIGGER_NAMES: &[&str] = &[
     "agent_todo_snapshots_reject_update",
     "agent_todo_snapshots_reject_delete",
     "agent_tool_calls_bind_todo_snapshot",
+];
+const MIGRATION_0029_TRIGGER_NAMES: &[&str] = &[
+    "agent_goal_snapshots_validate_insert",
+    "agent_goal_snapshots_reject_update",
+    "agent_goal_snapshots_reject_delete",
+    "agent_tool_calls_bind_goal_snapshot",
 ];
 const RECOVERY_BATCH_LIMIT: i64 = 64;
 const AUTH_SESSION_CLEANUP_BATCH_LIMIT: i64 = 64;
@@ -3344,6 +3351,13 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
             params![28, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 29 {
+        transaction.execute_batch(MIGRATION_0029)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![29, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
     // The execution verifier now understands the v22 knowledge binding. Run
     // it only after every missing schema step has been installed so upgrades
     // from v19 and older never query a column that does not exist yet. This
@@ -3354,6 +3368,7 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
         agent::verify_account_knowledge_catalog_integrity(&transaction)?;
         agent::verify_account_agent_prompt_integrity(&transaction)?;
         agent::verify_agent_todo_integrity(&transaction)?;
+        agent::verify_agent_goal_integrity(&transaction)?;
         provider::verify_account_reply_provider_integrity(&transaction)?;
         execution::verify_agent_execution_integrity(&transaction)?;
     }
@@ -4553,13 +4568,17 @@ fn readiness(
                'agent_todo_snapshots_reject_update',
                'agent_todo_snapshots_reject_delete',
                'agent_tool_calls_bind_todo_snapshot',
+               'agent_goal_snapshots_validate_insert',
+               'agent_goal_snapshots_reject_update',
+               'agent_goal_snapshots_reject_delete',
+               'agent_tool_calls_bind_goal_snapshot',
                'schema_migrations_reject_update',
                'schema_migrations_reject_delete'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 157 {
+    if trigger_count != 161 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
         ));
@@ -4571,6 +4590,7 @@ fn readiness(
     verify_migration_trigger_definitions(connection, MIGRATION_0026, MIGRATION_0026_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0027, MIGRATION_0027_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0028, MIGRATION_0028_TRIGGER_NAMES)?;
+    verify_migration_trigger_definitions(connection, MIGRATION_0029, MIGRATION_0029_TRIGGER_NAMES)?;
 
     let agent_pending_call_fk: i64 = connection.query_row(
         r#"SELECT COUNT(*)
@@ -5171,6 +5191,7 @@ fn readiness(
     agent::verify_account_knowledge_catalog_integrity(connection)?;
     agent::verify_account_agent_prompt_integrity(connection)?;
     agent::verify_agent_todo_integrity(connection)?;
+    agent::verify_agent_goal_integrity(connection)?;
     provider::verify_account_reply_provider_integrity(connection)?;
     compaction::verify_integrity(connection)?;
     execution::verify_agent_execution_integrity(connection)?;

@@ -35,6 +35,16 @@ snapshot, exact tool call, continuation request, and execution ledger commit
 atomically; `AgentTurnDetail.todo` returns the latest durable projection after
 restart.
 
+Every Agent profile also exposes `get_goal`, `create_goal`, and `update_goal`
+for one durable completion Goal per Session. Goal mutation uses exact ID and
+revision CAS, supports `active`, `paused`, `blocked`, and `completed` phases,
+and needs no owner approval because it changes only Zeus-owned coordination
+state. Successful mutations, append-only SQLite snapshots, exact tool results,
+and continuation requests commit atomically; `AgentTurnDetail.goal` projects
+the latest Session Goal across turns and restarts. This slice establishes the
+durable Goal state and model tool loop; automatic future-round scheduling is a
+separate runtime phase.
+
 Alpha+ bootstraps a local `acc_local` root and now supports a bounded local
 multi-account control plane. An owner can create accounts idempotently; one
 user may belong to at most 16 accounts and one database may contain at most 64.
@@ -732,6 +742,13 @@ and bounded memory, CPU, and PID resources.
   known tool results so the next model step can correct them. Successful
   revisions are append-only, call-bound, digest-checked, and limited by the
   existing four-tool-call Agent ceiling.
+- `get_goal`, `create_goal`, and `update_goal` manage one Session-level
+  completion Goal. Reads return the current snapshot or `null`; mutations use
+  exact goal ID and revision CAS, and SQLite repeats their validation inside
+  the known-success completion transaction. Successful snapshots are
+  append-only and bound to the exact started tool call, canonical result, and
+  Session/turn/Agent scope. Goal state does not itself schedule a later worker
+  round in this slice.
 - Queued Agent jobs survive restart and remain claimable. Startup expires
   prepared-only claims without writing `outcome_unknown`, because they never
   authorized external I/O. A model or tool already marked `started` moves to
@@ -874,6 +891,13 @@ and bounded memory, CPU, and PID resources.
   one exact successful `todo_write@1-single-active` call. SQLite triggers bind
   the canonical result and counters to that row; deep readiness recomputes the
   domain-separated digest and verifies the complete call/result chain.
+  Schema v29 adds append-only Session Goal snapshots. A Session owns at most
+  one unfinished Goal; `create_goal` may replace only a completed Goal, while
+  `update_goal` requires the exact goal ID and contiguous revision. SQLite
+  binds every successful mutation to its exact account/Session/turn/Agent,
+  started call, canonical result, lifecycle transition, and timestamps. Deep
+  readiness replays the complete state machine and rejects missing, weakened,
+  mutated, or cross-scope history.
   Existing Runs and events are decoded, validated, and migrated in place without
   rewriting their payloads. Runtime identity still binds profile, environment,
   primary Session and Run, policy ID, and policy revision; a mismatch fails
@@ -1097,7 +1121,7 @@ directly.
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Current schema v28 retains durable Run attachment during migration and demo
+Current schema v29 retains durable Run attachment during migration and demo
 seeding, but Alpha+ does not expose a public attach-Run HTTP route.
 
 The application boundary now caps auth JSON at 8 KiB, command JSON at 512 KiB,
@@ -1122,7 +1146,7 @@ approval, dispatch, reply completion, attachment checks, and startup recovery
 use typed point queries or fixed 64-row batches. Production Session list/detail,
 Run detail, and overview reads now use indexed `LIMIT + 1` keyset pages inside
 actor-authorized SQLite snapshots; no production HTTP read loads a complete
-ledger or collection. Current schema v28 retains bounded Session, open-turn,
+ledger or collection. Current schema v29 retains bounded Session, open-turn,
 active reply/dispatch, auth-session, bootstrap-audit, event-slot, and logical
 event-payload-byte admission. Exact idempotent replay is checked before capacity,
 while accepted work consumes its reserved terminal slots and payload bytes
@@ -1207,17 +1231,18 @@ schema v21 prepared claims, schema v22 durable knowledge-context binding, and
 schema v23 account knowledge catalog ingestion, schema v24 account Agent prompt
 governance, schema v25 durable Session context compaction, schema v26
 account-scoped reply provider selection, schema v27 safe pre-start Agent
-cancellation, schema v28 durable Agent planning, Trusted Single-Node Ingress,
+cancellation, schema v28 durable Agent planning, schema v29 durable Session
+Goals, Trusted Single-Node Ingress,
 Per-Operation SecretRef Resolution, the startup-bound Skill Catalog, and the
 bounded multi-account control plane:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 645 tests passed
+- `cargo test --workspace --all-targets --locked`: 652 tests passed
   across the top-level test targets, including 22 connector tests,
   8 deployment tests, 29 knowledge tests, 30 LLM unit and 15 provider-contract
-  tests, 5 Skill Catalog tests, 261 storage tests, 21 workflow tests, 50 runtime
-  tests, 83 API library tests, 18 API main/config
+  tests, 3 Goal tests, 5 Skill Catalog tests, 265 storage tests, 21 workflow
+  tests, 51 runtime tests, 21 protocol tests, 85 API library tests, 18 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,

@@ -1046,6 +1046,40 @@ pub struct AgentTodoState {
     pub updated_at: String,
 }
 
+/// Durable lifecycle of the one completion goal attached to a Session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentGoalPhase {
+    Active,
+    Paused,
+    Blocked,
+    Completed,
+}
+
+/// Canonical explanation recorded when a Goal cannot make useful progress.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentGoalBlocker {
+    pub code: String,
+    pub message: String,
+}
+
+/// Latest durable same-Session completion Goal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentGoalState {
+    pub id: String,
+    pub revision: u64,
+    pub objective: String,
+    pub phase: AgentGoalPhase,
+    pub rounds_started: u64,
+    pub max_rounds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<AgentGoalBlocker>,
+    pub call_id: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 impl AgentToolCallStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(
@@ -1121,6 +1155,8 @@ pub struct AgentTurnDetail {
     pub last_error: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub todo: Option<AgentTodoState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<AgentGoalState>,
     pub calls: Vec<AgentToolCallDetail>,
     pub created_at: String,
     pub updated_at: String,
@@ -1870,6 +1906,7 @@ mod tests {
         });
         let legacy_detail: AgentTurnDetail = serde_json::from_value(legacy.clone()).unwrap();
         assert_eq!(legacy_detail.deployment_manifest_digest, None);
+        assert_eq!(legacy_detail.goal, None);
         assert!(
             !serde_json::to_value(&legacy_detail)
                 .unwrap()
@@ -1894,6 +1931,49 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<AgentTurnDetail>(serialized).unwrap(),
             bound_detail
+        );
+    }
+
+    #[test]
+    fn agent_turn_detail_goal_round_trips_as_a_bounded_projection() {
+        let detail: AgentTurnDetail = serde_json::from_value(json!({
+            "id": "agent-goal",
+            "session_id": "session-goal",
+            "turn_id": "turn-goal",
+            "status": "waiting_model",
+            "model_steps": 2,
+            "tool_calls": 1,
+            "tool_result_bytes": 128,
+            "revision": 5,
+            "goal": {
+                "id": "goal-0123456789abcdef0123456789abcdef",
+                "revision": 3,
+                "objective": "Ship the durable core",
+                "phase": "blocked",
+                "rounds_started": 4,
+                "max_rounds": 32,
+                "blocker": {
+                    "code": "model_reported",
+                    "message": "External authority is required"
+                },
+                "call_id": "call-goal",
+                "created_at": "2026-08-28T00:00:00Z",
+                "updated_at": "2026-08-28T00:01:00Z"
+            },
+            "calls": [],
+            "created_at": "2026-08-28T00:00:00Z",
+            "updated_at": "2026-08-28T00:01:00Z"
+        }))
+        .unwrap();
+
+        let goal = detail.goal.as_ref().unwrap();
+        assert_eq!(goal.phase, AgentGoalPhase::Blocked);
+        assert_eq!(goal.revision, 3);
+        assert_eq!(goal.blocker.as_ref().unwrap().code, "model_reported");
+        assert_eq!(
+            serde_json::from_value::<AgentTurnDetail>(serde_json::to_value(&detail).unwrap())
+                .unwrap(),
+            detail
         );
     }
 

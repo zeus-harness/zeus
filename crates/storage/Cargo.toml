@@ -15,6 +15,7 @@ base64.workspace = true
 chrono.workspace = true
 deployment.workspace = true
 execution.workspace = true
+goals.workspace = true
 fs2.workspace = true
 kernel.workspace = true
 knowledge.workspace = true

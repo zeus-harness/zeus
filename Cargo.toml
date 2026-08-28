@@ -37,6 +37,7 @@ authz = { path = "crates/authz" }
 connectors = { path = "crates/connectors" }
 deployment = { path = "crates/deployment" }
 execution = { path = "crates/execution" }
+goals = { path = "crates/goals" }
 kernel = { path = "crates/kernel" }
 knowledge = { path = "crates/knowledge" }
 libc = "0.2.189"

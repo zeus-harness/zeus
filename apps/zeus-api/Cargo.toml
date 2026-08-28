@@ -30,6 +30,7 @@ tokio.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+goals.workspace = true
 http-body-util.workspace = true
 rusqlite.workspace = true
 terminal.workspace = true

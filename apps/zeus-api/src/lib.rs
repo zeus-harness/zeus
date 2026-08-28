@@ -6196,6 +6196,13 @@ impl From<StoreError> for ApiError {
                 format!("The todo list changed from expected revision {expected} to {current}"),
             )
             .with_no_store(),
+            StoreError::AgentGoalRevisionConflict { expected, current } => Self::new(
+                StatusCode::CONFLICT,
+                "agent_goal_revision_conflict",
+                "Agent goal revision conflict",
+                format!("The Goal changed from expected revision {expected} to {current}"),
+            )
+            .with_no_store(),
             StoreError::AgentOperationInFlight => Self::new(
                 StatusCode::CONFLICT,
                 "agent_operation_in_flight",
@@ -8644,6 +8651,11 @@ mod tests {
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
     }
 
+    struct GoalReadCreateThenFinalProvider {
+        metadata: ProviderMetadata,
+        requests: Arc<StdMutex<Vec<ReplyRequest>>>,
+    }
+
     struct WorkspaceSearchThenFinalProvider {
         metadata: ProviderMetadata,
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
@@ -8859,8 +8871,9 @@ mod tests {
                             "provider-call-approved-1",
                             request
                                 .tools
-                                .first()
-                                .expect("the local Agent request must expose its server tool")
+                                .iter()
+                                .find(|tool| tool.name == "dev_marker_write")
+                                .expect("the local Agent request must expose dev_marker_write")
                                 .name
                                 .clone(),
                             serde_json::json!({ "marker": "agent-api-approved" }),
@@ -8934,6 +8947,63 @@ mod tests {
                         content: "durable plan completed".into(),
                     },
                     call => panic!("unexpected todo provider call {call}"),
+                }
+            };
+            let provider = self.metadata.clone();
+            Box::pin(async move {
+                Ok(ReplyResponse {
+                    output,
+                    finish_reason: Some("stop".into()),
+                    provider,
+                })
+            })
+        }
+    }
+
+    impl GoalReadCreateThenFinalProvider {
+        fn new(requests: Arc<StdMutex<Vec<ReplyRequest>>>) -> Self {
+            Self {
+                metadata: ProviderMetadata {
+                    provider_id: "test-goal-read-create-provider".into(),
+                    model: Some("test-model".into()),
+                    reply_kind: ReplyKind::Model,
+                },
+                requests,
+            }
+        }
+    }
+
+    impl ReplyProvider for GoalReadCreateThenFinalProvider {
+        fn metadata(&self) -> &ProviderMetadata {
+            &self.metadata
+        }
+
+        fn reply(&self, request: ReplyRequest) -> ReplyFuture<'_> {
+            let output = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(request.clone());
+                match requests.len() {
+                    1 => ReplyOutput::ToolCall {
+                        call: ReplyToolCall::new(
+                            "provider-call-goal-read",
+                            goals::GET_GOAL_TOOL_NAME,
+                            serde_json::json!({}),
+                        ),
+                    },
+                    2 => ReplyOutput::ToolCall {
+                        call: ReplyToolCall::new(
+                            "provider-call-goal-create",
+                            goals::CREATE_GOAL_TOOL_NAME,
+                            serde_json::json!({
+                                "objective": "Deliver the durable Goal core",
+                                "max_rounds": 32
+                            }),
+                        ),
+                    },
+                    3 => ReplyOutput::Final {
+                        content: "durable Goal created".into(),
+                    },
+                    call => panic!("unexpected Goal provider call {call}"),
                 }
             };
             let provider = self.metadata.clone();
@@ -9386,8 +9456,9 @@ mod tests {
                             "provider-call-history",
                             request
                                 .tools
-                                .first()
-                                .expect("the local Agent request must expose its server tool")
+                                .iter()
+                                .find(|tool| tool.name == "dev_marker_write")
+                                .expect("the local Agent request must expose dev_marker_write")
                                 .name
                                 .clone(),
                             serde_json::json!({ "marker": "history-trimmed" }),
@@ -10677,6 +10748,104 @@ mod tests {
         assert_eq!(result["revision"], 1);
         assert_eq!(result["digest"], todo.digest);
         assert_eq!(result["todos"][1]["status"], "in_progress");
+        drop(app);
+    }
+
+    #[tokio::test]
+    async fn agent_goal_read_create_persists_and_continues_without_approval() {
+        let store = DemoStore::seeded().await.unwrap();
+        let owner = provision_test_owner(&store, "user-agent-goal", "agent-goal-owner").await;
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: "session-agent-goal".into(),
+                    title: "Durable Agent goal".into(),
+                },
+                "create-agent-goal",
+            )
+            .await
+            .unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(GoalReadCreateThenFinalProvider::new(Arc::clone(&requests))),
+        )
+        .unwrap();
+
+        let started = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-agent-goal/turns")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "start-agent-goal")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-agent-goal",
+                            "user_message": "create a durable completion goal",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+
+        let session = wait_for_ready_session(&store, &owner.authz, "session-agent-goal").await;
+        assert_eq!(session.session.sequence, 4);
+        let agent = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            "session-agent-goal",
+            "turn-agent-goal",
+            protocol::AgentTurnStatus::Succeeded,
+        )
+        .await;
+        assert_eq!(agent.model_steps, 3);
+        assert_eq!(agent.tool_calls, 2);
+        assert_eq!(agent.calls[0].tool, goals::GET_GOAL_TOOL_NAME);
+        assert_eq!(agent.calls[1].tool, goals::CREATE_GOAL_TOOL_NAME);
+        assert!(agent.calls.iter().all(|call| {
+            call.status == AgentToolCallStatus::Succeeded && !call.approval_required
+        }));
+        let goal = agent
+            .goal
+            .expect("create_goal must publish its durable Session projection");
+        assert_eq!(goal.revision, 1);
+        assert_eq!(goal.objective, "Deliver the durable Goal core");
+        assert_eq!(goal.phase, protocol::AgentGoalPhase::Active);
+        assert_eq!(goal.max_rounds, 32);
+        assert_eq!(goal.call_id, agent.calls[1].call_id);
+
+        let recorded = requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 3);
+        let read_result = recorded[1]
+            .messages
+            .iter()
+            .find(|message| message.role == ReplyRole::Tool)
+            .expect("the first continuation must contain the Goal read result");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&read_result.content).unwrap(),
+            serde_json::json!({"goal": null})
+        );
+        let create_result = recorded[2]
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == ReplyRole::Tool)
+            .expect("the second continuation must contain the Goal create result");
+        let create_result: serde_json::Value =
+            serde_json::from_str(&create_result.content).unwrap();
+        assert_eq!(create_result["goal"]["id"], goal.id);
+        assert_eq!(create_result["goal"]["revision"], 1);
+        assert_eq!(create_result["goal"]["phase"], "active");
         drop(app);
     }
 

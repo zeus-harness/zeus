@@ -35,6 +35,11 @@ use deployment::{
     ManifestTool,
 };
 pub use execution::{AgentExecutionExplain, AgentRunEpochExplain};
+use goals::{
+    CREATE_GOAL_TOOL_NAME, GET_GOAL_TOOL_NAME, GOAL_TOOL_VERSION, GoalError, GoalToolResult,
+    UPDATE_GOAL_TOOL_NAME, goal_tool_descriptors, prepare_create_goal, prepare_update_goal,
+    register_goal_tools,
+};
 use kernel::{
     DemoScenario, KernelError, LOCAL_POLICY_REVISION, PRODUCTION_POLICY_REVISION, apply_review,
     apply_tool_result, start_tool_dispatch,
@@ -472,6 +477,8 @@ pub enum StoreError {
     AgentRevisionConflict,
     #[error("the Agent todo revision changed: expected {expected}, current {current}")]
     AgentTodoRevisionConflict { expected: u64, current: u64 },
+    #[error("the Session goal revision changed: expected {expected}, current {current}")]
+    AgentGoalRevisionConflict { expected: u64, current: u64 },
     #[error("the Agent external operation has already started")]
     AgentOperationInFlight,
     #[error("the Agent turn is already terminal")]
@@ -584,6 +591,9 @@ impl From<StorageError> for StoreError {
             StorageError::AgentRevisionConflict => Self::AgentRevisionConflict,
             StorageError::AgentTodoRevisionConflict { expected, current } => {
                 Self::AgentTodoRevisionConflict { expected, current }
+            }
+            StorageError::AgentGoalRevisionConflict { expected, current } => {
+                Self::AgentGoalRevisionConflict { expected, current }
             }
             StorageError::AgentOperationInFlight => Self::AgentOperationInFlight,
             StorageError::AgentAlreadyTerminal => Self::AgentAlreadyTerminal,
@@ -1556,6 +1566,41 @@ impl DemoStore {
                     },
                 )));
             }
+        }
+        if resolved.call.tool_version == GOAL_TOOL_VERSION
+            && matches!(
+                resolved.call.tool.as_str(),
+                GET_GOAL_TOOL_NAME | CREATE_GOAL_TOOL_NAME | UPDATE_GOAL_TOOL_NAME
+            )
+        {
+            let current = self.storage.current_session_goal(&scope).await?;
+            let result = match resolved.call.tool.as_str() {
+                GET_GOAL_TOOL_NAME => GoalToolResult { goal: current },
+                CREATE_GOAL_TOOL_NAME => prepare_create_goal(
+                    &resolved.call.arguments,
+                    current.as_ref(),
+                    &resolved.call.call_id,
+                )
+                .map_err(goal_executor_error)?
+                .result(),
+                UPDATE_GOAL_TOOL_NAME => {
+                    prepare_update_goal(&resolved.call.arguments, current.as_ref())
+                        .map_err(goal_executor_error)?
+                        .result()
+                }
+                _ => unreachable!("goal tool name checked above"),
+            };
+            return Ok(ToolOutput {
+                value: serde_json::to_value(result).map_err(|_| {
+                    StoreError::Registry(RegistryError::Executor(ExecutorError::Failed {
+                        code: "goal_result_encoding_failed".into(),
+                        message: "The Goal result could not be encoded".into(),
+                        retryable: false,
+                    }))
+                })?,
+                replayed: false,
+                provider_request_id: None,
+            });
         }
         self.registry
             .dispatch_scoped(resolved.call, &resolved.environment, scope)
@@ -3722,6 +3767,12 @@ impl RuntimeComponents {
                     &scenario.run.environment,
                     PRODUCTION_POLICY_REVISION,
                 )?;
+                register_runtime_goal_tools(
+                    &mut policy_rules,
+                    &mut registry,
+                    &scenario.run.environment,
+                    PRODUCTION_POLICY_REVISION,
+                )?;
                 register_runtime_skill_tools(
                     &mut policy_rules,
                     &mut registry,
@@ -3761,6 +3812,12 @@ impl RuntimeComponents {
                 }];
                 let mut registry = ToolRegistry::new();
                 register_runtime_planning_tool(
+                    &mut policy_rules,
+                    &mut registry,
+                    &scenario.run.environment,
+                    LOCAL_POLICY_REVISION,
+                )?;
+                register_runtime_goal_tools(
                     &mut policy_rules,
                     &mut registry,
                     &scenario.run.environment,
@@ -3879,6 +3936,47 @@ fn register_runtime_planning_tool(
     });
     register_todo_tool(registry)?;
     Ok(())
+}
+
+fn register_runtime_goal_tools(
+    policy_rules: &mut Vec<PolicyRule>,
+    registry: &mut ToolRegistry,
+    environment: &str,
+    policy_revision: &str,
+) -> Result<(), StoreError> {
+    for descriptor in goal_tool_descriptors() {
+        policy_rules.push(PolicyRule {
+            revision: policy_revision.into(),
+            tool: descriptor.name,
+            environment: environment.into(),
+            effect: descriptor.effect,
+            sandbox_profile: descriptor.sandbox_profile,
+            decision: PolicyDecision::Allow,
+        });
+    }
+    register_goal_tools(registry)?;
+    Ok(())
+}
+
+fn goal_executor_error(error: GoalError) -> StoreError {
+    let code = match error {
+        GoalError::InvalidArguments => "goal_invalid_arguments",
+        GoalError::InvalidObjective => "goal_invalid_objective",
+        GoalError::InvalidGoalId => "goal_invalid_id",
+        GoalError::InvalidRevision => "goal_invalid_revision",
+        GoalError::InvalidRoundLimit => "goal_invalid_round_limit",
+        GoalError::InvalidBlocker => "goal_invalid_blocker",
+        GoalError::GoalAlreadyActive => "goal_already_active",
+        GoalError::GoalMismatch => "goal_mismatch",
+        GoalError::RevisionConflict => "goal_revision_conflict",
+        GoalError::InvalidTransition => "goal_invalid_transition",
+        GoalError::InvalidResult => "goal_invalid_result",
+    };
+    StoreError::Registry(RegistryError::Executor(ExecutorError::Failed {
+        code: code.into(),
+        message: error.to_string(),
+        retryable: false,
+    }))
 }
 
 fn register_runtime_skill_tools(
@@ -4388,10 +4486,11 @@ mod tests {
         let store = local_store(&paths, false).await;
 
         let definitions = store.session_agent_tool_definitions().unwrap();
-        assert_eq!(definitions.len(), 2);
-        assert_eq!(definitions[0].name, connectors::DEV_MARKER_TOOL_NAME);
+        assert_eq!(definitions.len(), 5);
+        assert_eq!(definitions[0].name, goals::CREATE_GOAL_TOOL_NAME);
+        assert_eq!(definitions[1].name, connectors::DEV_MARKER_TOOL_NAME);
         assert_eq!(
-            definitions[0].input_schema,
+            definitions[1].input_schema,
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -4406,15 +4505,17 @@ mod tests {
                 "x-zeus-max-serialized-bytes": 160
             })
         );
-        assert_eq!(definitions[1].name, planning::TODO_WRITE_TOOL_NAME);
+        assert_eq!(definitions[2].name, goals::GET_GOAL_TOOL_NAME);
+        assert_eq!(definitions[3].name, planning::TODO_WRITE_TOOL_NAME);
         assert_eq!(
-            definitions[1].input_schema["properties"]["todos"]["maxItems"],
+            definitions[3].input_schema["properties"]["todos"]["maxItems"],
             planning::TODO_MAX_ITEMS
         );
         assert_eq!(
-            definitions[1].input_schema["properties"]["todos"]["items"]["properties"]["status"]["enum"],
+            definitions[3].input_schema["properties"]["todos"]["items"]["properties"]["status"]["enum"],
             serde_json::json!(["pending", "in_progress", "completed"])
         );
+        assert_eq!(definitions[4].name, goals::UPDATE_GOAL_TOOL_NAME);
 
         let production = DemoStore::seeded().await.unwrap();
         assert_eq!(
@@ -4424,7 +4525,12 @@ mod tests {
                 .iter()
                 .map(|definition| definition.name.as_str())
                 .collect::<Vec<_>>(),
-            [planning::TODO_WRITE_TOOL_NAME]
+            [
+                goals::CREATE_GOAL_TOOL_NAME,
+                goals::GET_GOAL_TOOL_NAME,
+                planning::TODO_WRITE_TOOL_NAME,
+                goals::UPDATE_GOAL_TOOL_NAME,
+            ]
         );
     }
 
@@ -4558,10 +4664,13 @@ mod tests {
                 .map(|definition| definition.name.as_str())
                 .collect::<Vec<_>>(),
             [
+                goals::CREATE_GOAL_TOOL_NAME,
                 connectors::DEV_MARKER_TOOL_NAME,
+                goals::GET_GOAL_TOOL_NAME,
                 skills::SKILL_LIST_TOOL_NAME,
                 skills::SKILL_LOAD_TOOL_NAME,
                 planning::TODO_WRITE_TOOL_NAME,
+                goals::UPDATE_GOAL_TOOL_NAME,
             ]
         );
         let manifest = store

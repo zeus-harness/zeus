@@ -513,6 +513,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "goals"
+version = "0.1.0"
+dependencies = [
+ "protocol",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tools",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1183,6 +1196,7 @@ dependencies = [
  "connectors",
  "deployment",
  "execution",
+ "goals",
  "kernel",
  "knowledge",
  "planning",
@@ -1432,6 +1446,7 @@ dependencies = [
  "deployment",
  "execution",
  "fs2",
+ "goals",
  "kernel",
  "knowledge",
  "llm",
@@ -2114,6 +2129,7 @@ dependencies = [
  "chrono",
  "deployment",
  "execution",
+ "goals",
  "http-body-util",
  "kernel",
  "libc",

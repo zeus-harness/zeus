@@ -22,7 +22,7 @@ use crate::{
 use ::execution::{DigestDomain, FactSource, OperationRef, Sha256Digest};
 use deployment::{ManifestEnvelope, prompt_content_digest};
 use protocol::{
-    AgentApprovalReview, AgentReviewResponse, AgentTodoState, AgentToolCallDetail,
+    AgentApprovalReview, AgentGoalState, AgentReviewResponse, AgentTodoState, AgentToolCallDetail,
     AgentToolCallStatus, AgentTurnDetail, AgentTurnStatus, AssistantReplyKind, PolicyDecision,
     ReviewDecision, ToolExecutorStatus,
 };
@@ -116,6 +116,25 @@ struct StoredAgentTodoSnapshot {
     pending_count: i64,
     in_progress_count: i64,
     completed_count: i64,
+    created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StoredAgentGoalSnapshot {
+    account_id: String,
+    session_id: String,
+    sequence: i64,
+    turn_id: String,
+    agent_id: String,
+    goal_id: String,
+    goal_revision: i64,
+    call_id: String,
+    objective: String,
+    phase: String,
+    rounds_started: i64,
+    max_rounds: i64,
+    blocker_code: Option<String>,
+    blocker_message: Option<String>,
     created_at: String,
 }
 
@@ -373,6 +392,18 @@ impl SqliteStore {
             query_agent_todo_revision_for_scope(connection, &scope)
         })
         .await
+    }
+
+    /// Returns the current canonical Goal for the Session that owns one exact
+    /// server-derived Agent execution scope. Foreign or stale scopes are never
+    /// allowed to observe another Session's Goal.
+    pub async fn current_session_goal(
+        &self,
+        scope: &ExecutionScope,
+    ) -> Result<Option<goals::GoalSnapshot>, StorageError> {
+        let scope = scope.clone();
+        self.with_connection(move |connection| query_session_goal_for_scope(connection, &scope))
+            .await
     }
 
     /// Records that a started connector may have taken effect. It is never
@@ -2057,10 +2088,17 @@ fn complete_agent_tool(
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let call = query_agent_tool_call(&transaction, &commit.call_id)?;
     let prepared_todo = prepare_agent_todo_completion(&call, &commit)?;
+    let prepared_goal = prepare_agent_goal_completion(
+        &transaction,
+        &call,
+        &commit,
+        call.status != AgentToolCallStatus::Running,
+    )?;
     let mut agent = query_agent_turn(&transaction, &call.agent_id)?;
     if call.status != AgentToolCallStatus::Running {
         let replay = replay_agent_tool_completion(&transaction, &call, &agent, &commit)?;
         verify_replayed_agent_todo_completion(&transaction, &call, prepared_todo.as_ref())?;
+        verify_replayed_agent_goal_completion(&transaction, &call, prepared_goal.as_ref())?;
         transaction.commit()?;
         return Ok(replay);
     }
@@ -2099,6 +2137,9 @@ fn complete_agent_tool(
     let timestamp = now();
     if let Some(prepared) = prepared_todo.as_ref() {
         insert_agent_todo_snapshot(&transaction, &call, prepared, &timestamp)?;
+    }
+    if let Some(snapshot) = prepared_goal.as_ref() {
+        insert_agent_goal_snapshot(&transaction, &call, snapshot, &timestamp)?;
     }
     let terminal_error =
         (settled.status() == WorkflowStatus::Failed).then(|| workflow_terminal_error(&settled));
@@ -3914,6 +3955,157 @@ fn query_latest_agent_todo_state(
     }))
 }
 
+const AGENT_GOAL_SNAPSHOT_SELECT: &str = r#"SELECT
+    account_id, session_id, sequence, turn_id, agent_id, goal_id, goal_revision,
+    call_id, objective, phase, rounds_started, max_rounds, blocker_code,
+    blocker_message, created_at
+FROM agent_goal_snapshots"#;
+
+fn decode_agent_goal_snapshot_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StoredAgentGoalSnapshot> {
+    Ok(StoredAgentGoalSnapshot {
+        account_id: row.get(0)?,
+        session_id: row.get(1)?,
+        sequence: row.get(2)?,
+        turn_id: row.get(3)?,
+        agent_id: row.get(4)?,
+        goal_id: row.get(5)?,
+        goal_revision: row.get(6)?,
+        call_id: row.get(7)?,
+        objective: row.get(8)?,
+        phase: row.get(9)?,
+        rounds_started: row.get(10)?,
+        max_rounds: row.get(11)?,
+        blocker_code: row.get(12)?,
+        blocker_message: row.get(13)?,
+        created_at: row.get(14)?,
+    })
+}
+
+fn query_latest_agent_goal_snapshot(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Option<StoredAgentGoalSnapshot>, StorageError> {
+    let sql = format!(
+        "{AGENT_GOAL_SNAPSHOT_SELECT} WHERE session_id = ?1 ORDER BY sequence DESC LIMIT 1"
+    );
+    Ok(connection
+        .query_row(&sql, [session_id], decode_agent_goal_snapshot_row)
+        .optional()?)
+}
+
+fn query_agent_goal_snapshot_for_call(
+    connection: &Connection,
+    call_id: &str,
+) -> Result<Option<StoredAgentGoalSnapshot>, StorageError> {
+    let sql = format!("{AGENT_GOAL_SNAPSHOT_SELECT} WHERE call_id = ?1");
+    Ok(connection
+        .query_row(&sql, [call_id], decode_agent_goal_snapshot_row)
+        .optional()?)
+}
+
+fn goal_snapshot_from_stored(
+    stored: &StoredAgentGoalSnapshot,
+) -> Result<goals::GoalSnapshot, StorageError> {
+    let blocker = match (&stored.blocker_code, &stored.blocker_message) {
+        (Some(code), Some(message)) => Some(protocol::AgentGoalBlocker {
+            code: code.clone(),
+            message: message.clone(),
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(StorageError::CorruptData(format!(
+                "Agent goal snapshot `{}` has a partial blocker",
+                stored.call_id
+            )));
+        }
+    };
+    let snapshot = goals::GoalSnapshot {
+        id: stored.goal_id.clone(),
+        revision: i64_to_u64(stored.goal_revision, "Agent goal revision")?,
+        objective: stored.objective.clone(),
+        phase: match stored.phase.as_str() {
+            "active" => protocol::AgentGoalPhase::Active,
+            "paused" => protocol::AgentGoalPhase::Paused,
+            "blocked" => protocol::AgentGoalPhase::Blocked,
+            "completed" => protocol::AgentGoalPhase::Completed,
+            other => {
+                return Err(StorageError::CorruptData(format!(
+                    "unknown Agent goal phase `{other}`"
+                )));
+            }
+        },
+        rounds_started: i64_to_u64(stored.rounds_started, "Agent goal rounds started")?,
+        max_rounds: i64_to_u64(stored.max_rounds, "Agent goal round limit")?,
+        blocker,
+    };
+    goals::validate_snapshot(&snapshot).map_err(|error| {
+        StorageError::CorruptData(format!(
+            "Agent goal snapshot `{}` is invalid: {error}",
+            stored.call_id
+        ))
+    })?;
+    Ok(snapshot)
+}
+
+fn query_session_goal_for_scope(
+    connection: &Connection,
+    scope: &ExecutionScope,
+) -> Result<Option<goals::GoalSnapshot>, StorageError> {
+    let found: Option<i64> = connection
+        .query_row(
+            r#"SELECT 1 FROM agent_turns agent
+               WHERE agent.id = ?1 AND agent.account_id = ?2
+                 AND agent.actor_user_id = ?3 AND agent.session_id = ?4
+                 AND agent.turn_id = ?5"#,
+            params![
+                scope.agent_id.as_str(),
+                scope.account_id.as_str(),
+                scope.actor_id.as_str(),
+                scope.session_id.as_str(),
+                scope.turn_id.as_str(),
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if found.is_none() {
+        return Err(StorageError::AgentTurnNotFound(scope.agent_id.clone()));
+    }
+    query_latest_agent_goal_snapshot(connection, &scope.session_id)?
+        .as_ref()
+        .map(goal_snapshot_from_stored)
+        .transpose()
+}
+
+fn query_latest_agent_goal_state(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Option<AgentGoalState>, StorageError> {
+    let Some(stored) = query_latest_agent_goal_snapshot(connection, session_id)? else {
+        return Ok(None);
+    };
+    let snapshot = goal_snapshot_from_stored(&stored)?;
+    let created_at: String = connection.query_row(
+        r#"SELECT created_at FROM agent_goal_snapshots
+           WHERE session_id = ?1 AND goal_id = ?2 AND goal_revision = 1"#,
+        params![session_id, snapshot.id.as_str()],
+        |row| row.get(0),
+    )?;
+    Ok(Some(AgentGoalState {
+        id: snapshot.id,
+        revision: snapshot.revision,
+        objective: snapshot.objective,
+        phase: snapshot.phase,
+        rounds_started: snapshot.rounds_started,
+        max_rounds: snapshot.max_rounds,
+        blocker: snapshot.blocker,
+        call_id: stored.call_id,
+        created_at,
+        updated_at: stored.created_at,
+    }))
+}
+
 pub(super) fn agent_turn_detail(
     connection: &Connection,
     agent: &AgentTurn,
@@ -3935,6 +4127,7 @@ pub(super) fn agent_turn_detail(
         pending_call_id: agent.pending_call_id.clone(),
         last_error: agent.last_error_json.clone(),
         todo: query_latest_agent_todo_state(connection, &agent.id)?,
+        goal: query_latest_agent_goal_state(connection, &agent.session_id)?,
         calls,
         created_at: agent.created_at.clone(),
         updated_at: agent.updated_at.clone(),
@@ -8211,6 +8404,117 @@ pub(super) fn verify_agent_todo_integrity(connection: &Connection) -> Result<(),
     Ok(())
 }
 
+pub(super) fn verify_agent_goal_integrity(connection: &Connection) -> Result<(), StorageError> {
+    let missing_or_unexpected_snapshot: i64 = connection.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1
+               FROM agent_tool_calls call
+               WHERE call.tool_version = '1-session-cas'
+                 AND call.tool_name IN ('create_goal', 'update_goal')
+                 AND (
+                     (call.status = 'succeeded' AND NOT EXISTS (
+                         SELECT 1 FROM agent_goal_snapshots snapshot
+                         WHERE snapshot.call_id = call.call_id
+                     ))
+                     OR (call.status <> 'succeeded' AND EXISTS (
+                         SELECT 1 FROM agent_goal_snapshots snapshot
+                         WHERE snapshot.call_id = call.call_id
+                     ))
+                 )
+           )"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if missing_or_unexpected_snapshot != 0 {
+        return Err(StorageError::CorruptData(
+            "one or more Agent goal mutations are not bound to exactly one successful snapshot"
+                .into(),
+        ));
+    }
+
+    let sql = format!("{AGENT_GOAL_SNAPSHOT_SELECT} ORDER BY session_id, sequence");
+    let mut statement = connection.prepare(&sql)?;
+    let snapshots = statement
+        .query_map([], decode_agent_goal_snapshot_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    let mut previous_by_session =
+        std::collections::BTreeMap::<String, (i64, goals::GoalSnapshot, String)>::new();
+    for stored in snapshots {
+        let expected_sequence = previous_by_session
+            .get(&stored.session_id)
+            .map(|(sequence, _, _)| sequence + 1)
+            .unwrap_or(1);
+        if stored.sequence != expected_sequence {
+            return Err(StorageError::CorruptData(format!(
+                "Agent goal snapshot sequence is not contiguous for Session `{}`",
+                stored.session_id
+            )));
+        }
+        let snapshot = goal_snapshot_from_stored(&stored)?;
+        let call = query_agent_tool_call(connection, &stored.call_id)?;
+        let result = call
+            .result_json
+            .as_ref()
+            .ok_or_else(|| {
+                StorageError::CorruptData(format!(
+                    "Agent goal snapshot `{}` has no durable tool result",
+                    stored.call_id
+                ))
+            })
+            .and_then(|value| {
+                goals::decode_goal_tool_result(value).map_err(|error| {
+                    StorageError::CorruptData(format!(
+                        "Agent goal result `{}` is invalid: {error}",
+                        stored.call_id
+                    ))
+                })
+            })?;
+        let previous = previous_by_session
+            .get(&stored.session_id)
+            .map(|(_, snapshot, _)| snapshot);
+        let prepared = match call.tool_name.as_str() {
+            goals::CREATE_GOAL_TOOL_NAME => {
+                goals::prepare_create_goal(&call.arguments_json, previous, &call.call_id)
+            }
+            goals::UPDATE_GOAL_TOOL_NAME => {
+                goals::prepare_update_goal(&call.arguments_json, previous)
+            }
+            _ => Err(goals::GoalError::InvalidArguments),
+        }
+        .map_err(|error| {
+            StorageError::CorruptData(format!(
+                "Agent goal mutation `{}` cannot be replayed: {error}",
+                stored.call_id
+            ))
+        })?;
+        let timestamp_monotonic = previous_by_session
+            .get(&stored.session_id)
+            .is_none_or(|(_, _, timestamp)| timestamp <= &stored.created_at);
+        if call.status != AgentToolCallStatus::Succeeded
+            || call.tool_version != goals::GOAL_TOOL_VERSION
+            || call.account_id.as_str() != stored.account_id
+            || call.session_id != stored.session_id
+            || call.turn_id != stored.turn_id
+            || call.agent_id != stored.agent_id
+            || call.finished_at.as_deref() != Some(stored.created_at.as_str())
+            || result.goal.as_ref() != Some(&snapshot)
+            || prepared.snapshot() != &snapshot
+            || !timestamp_monotonic
+        {
+            return Err(StorageError::CorruptData(format!(
+                "Agent goal snapshot `{}` is not bound to its exact completed call",
+                stored.call_id
+            )));
+        }
+        previous_by_session.insert(
+            stored.session_id.clone(),
+            (stored.sequence, snapshot, stored.created_at),
+        );
+    }
+    Ok(())
+}
+
 pub(super) fn validate_agent_turn_spec(spec: &AgentTurnSpec) -> Result<(), StorageError> {
     validate_agent_turn_receipt_probe(&spec.receipt_probe())?;
     validate_reply_json(
@@ -8813,6 +9117,143 @@ fn verify_replayed_agent_todo_completion(
         _ => Err(StorageError::InvalidAgentTransition(
             "Agent todo replay conflicts with its durable snapshot".into(),
         )),
+    }
+}
+
+fn prepare_agent_goal_completion(
+    connection: &Connection,
+    call: &AgentToolCall,
+    commit: &AgentToolCompletionCommit,
+    replay: bool,
+) -> Result<Option<goals::GoalSnapshot>, StorageError> {
+    if call.tool_version != goals::GOAL_TOOL_VERSION
+        || !matches!(
+            call.tool_name.as_str(),
+            goals::CREATE_GOAL_TOOL_NAME | goals::UPDATE_GOAL_TOOL_NAME
+        )
+        || commit.status != AgentToolCallStatus::Succeeded
+    {
+        return Ok(None);
+    }
+    let result = goals::decode_goal_tool_result(&commit.result_json).map_err(|error| {
+        StorageError::InvalidAgentTransition(format!("Agent goal result is not canonical: {error}"))
+    })?;
+    let result_goal = result.goal.ok_or_else(|| {
+        StorageError::InvalidAgentTransition("Agent goal mutation returned no goal".into())
+    })?;
+    if replay {
+        return Ok(Some(result_goal));
+    }
+    let current = query_latest_agent_goal_snapshot(connection, &call.session_id)?
+        .as_ref()
+        .map(goal_snapshot_from_stored)
+        .transpose()?;
+    let prepared = match call.tool_name.as_str() {
+        goals::CREATE_GOAL_TOOL_NAME => {
+            goals::prepare_create_goal(&call.arguments_json, current.as_ref(), &call.call_id)
+        }
+        goals::UPDATE_GOAL_TOOL_NAME => {
+            goals::prepare_update_goal(&call.arguments_json, current.as_ref())
+        }
+        _ => unreachable!("goal tool name checked above"),
+    }
+    .map_err(|error| {
+        if matches!(error, goals::GoalError::RevisionConflict) {
+            let expected = call
+                .arguments_json
+                .get("expected_revision")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let current = current.as_ref().map(|goal| goal.revision).unwrap_or(0);
+            StorageError::AgentGoalRevisionConflict { expected, current }
+        } else {
+            StorageError::InvalidAgentTransition(format!("Agent goal mutation is invalid: {error}"))
+        }
+    })?;
+    if prepared.snapshot() != &result_goal {
+        return Err(StorageError::InvalidAgentTransition(
+            "Agent goal result does not match its exact persisted arguments and prior state".into(),
+        ));
+    }
+    Ok(Some(result_goal))
+}
+
+fn insert_agent_goal_snapshot(
+    connection: &Connection,
+    call: &AgentToolCall,
+    snapshot: &goals::GoalSnapshot,
+    timestamp: &str,
+) -> Result<(), StorageError> {
+    goals::validate_snapshot(snapshot).map_err(|error| {
+        StorageError::InvalidAgentTransition(format!("Agent goal snapshot is invalid: {error}"))
+    })?;
+    let sequence: i64 = connection.query_row(
+        r#"SELECT COALESCE(MAX(sequence), 0) + 1
+           FROM agent_goal_snapshots WHERE session_id = ?1"#,
+        [&call.session_id],
+        |row| row.get(0),
+    )?;
+    let (blocker_code, blocker_message) = snapshot
+        .blocker
+        .as_ref()
+        .map(|blocker| (Some(blocker.code.as_str()), Some(blocker.message.as_str())))
+        .unwrap_or((None, None));
+    let changed = connection.execute(
+        r#"INSERT INTO agent_goal_snapshots(
+               account_id, session_id, sequence, turn_id, agent_id, goal_id,
+               goal_revision, call_id, objective, phase, rounds_started,
+               max_rounds, blocker_code, blocker_message, created_at
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"#,
+        params![
+            call.account_id.as_str(),
+            call.session_id,
+            sequence,
+            call.turn_id,
+            call.agent_id,
+            snapshot.id,
+            i64::try_from(snapshot.revision)
+                .map_err(|_| StorageError::IntegerOutOfRange("Agent goal revision"))?,
+            call.call_id,
+            snapshot.objective,
+            agent_goal_phase_to_db(&snapshot.phase),
+            i64::try_from(snapshot.rounds_started)
+                .map_err(|_| StorageError::IntegerOutOfRange("Agent goal rounds started"))?,
+            i64::try_from(snapshot.max_rounds)
+                .map_err(|_| StorageError::IntegerOutOfRange("Agent goal round limit"))?,
+            blocker_code,
+            blocker_message,
+            timestamp,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::ConcurrentModification);
+    }
+    Ok(())
+}
+
+fn verify_replayed_agent_goal_completion(
+    connection: &Connection,
+    call: &AgentToolCall,
+    prepared: Option<&goals::GoalSnapshot>,
+) -> Result<(), StorageError> {
+    let stored = query_agent_goal_snapshot_for_call(connection, &call.call_id)?;
+    match (prepared, stored) {
+        (Some(prepared), Some(stored)) if goal_snapshot_from_stored(&stored)? == *prepared => {
+            Ok(())
+        }
+        (None, None) => Ok(()),
+        _ => Err(StorageError::InvalidAgentTransition(
+            "Agent goal replay conflicts with its durable snapshot".into(),
+        )),
+    }
+}
+
+fn agent_goal_phase_to_db(phase: &protocol::AgentGoalPhase) -> &'static str {
+    match phase {
+        protocol::AgentGoalPhase::Active => "active",
+        protocol::AgentGoalPhase::Paused => "paused",
+        protocol::AgentGoalPhase::Blocked => "blocked",
+        protocol::AgentGoalPhase::Completed => "completed",
     }
 }
 

@@ -30,10 +30,12 @@ Client / SvelteKit Web
 - `tools`：工具描述、注册表、参数验证和 object-safe executor 边界。
 - `planning`：Agent turn 自有的结构化计划、`todo_write` whole-list/CAS 语义、规范化 digest 与
   policy-allow executor；它不直接写数据库。
+- `goals`：Session 级单一完成目标、`get_goal` / `create_goal` / `update_goal` 工具契约、严格
+  生命周期与 revision CAS；它只准备有界规范状态，持久化权威仍由 SQLite 掌握。
 - `skills`：启动时一次性加载的 strict version 1 Skill Catalog、确定性 digest，以及只读
   `skill_list` / `skill_load` executor；Skill body 只有通过普通工具结果才对模型可见。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
-- `storage`：schema v28 migration、有界 account/membership 权威、一次性 member setup、用户/偏好、
+- `storage`：schema v29 migration、有界 account/membership 权威、一次性 member setup、用户/偏好、
   account audit/rollup/policy/archive state、独立 Session/Run ledger、typed event lookup、
   account+actor-scoped 回执、durable Agent/model/tool/dispatch queue、不可变 deployment manifest，
   revisioned account knowledge catalog、owner-governed Agent prompt、account-scoped
@@ -113,6 +115,15 @@ SQLite 在 known-success 事务内再次校验并写入 append-only snapshot。S
 counts、domain-separated SHA-256 digest 和 finished timestamp 绑定；重放必须命中同一 snapshot，
 deep readiness 会重算全部链。失败或 stale CAS 是已知 tool result，不写 snapshot，也不会伪装为
 `outcome_unknown`。每个 Agent 的快照数自然受现有四次 tool-call 上限约束。
+
+schema v29 增加 Session 级 durable completion Goal。`get_goal@1-session-cas` 只读当前快照或
+`null`；`create_goal@1-session-cas` 仅在没有 Goal 或当前 Goal 已完成时创建新 Goal；
+`update_goal@1-session-cas` 必须携带精确 goal ID 与 expected revision，并执行 edit、pause、resume、
+complete 或 blocked 转换。Mutation 在 runtime 预检后仍由 SQLite 在 known-success tool completion
+事务内重复 CAS，写入 Session 内连续 sequence 和 Goal 内连续 revision 的 append-only snapshot；
+snapshot 与 exact account/Session/turn/Agent、started call、canonical result、phase、blocker 和时间绑定。
+Deep readiness 会从头重放全部 Goal 状态机并拒绝 missing snapshot、跨 scope 绑定、修改/删除及
+弱化 trigger。该阶段只建立可靠状态域与模型工具闭环；未来自动续行调度必须在此 CAS 权威之上实现。
 
 可选 `ZEUS_SKILLS_FILE` 在 SQLite 打开前加载 immutable Skill Catalog。文件使用 strict version 1
 JSON，regular file 上限 512 KiB，包含 1–64 个唯一的 lowercase provider-safe 名称；description
@@ -264,7 +275,7 @@ connector 在数据库事务和锁之外运行。
 
 API 监听端口之前按固定顺序完成：
 
-1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v28；按当前
+1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v29；按当前
    detailed-row limit 以最多 64 行 batch 压缩 bootstrap terminal audit prefix，再按稳定
    `(priority actor, expires_at, auth-session ID)` 顺序最多清理 64 个过期或绑定
    missing/disabled/suspended/stale-revision authority 的 auth session。
@@ -566,7 +577,7 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   legacy-set commitment、v23 owner-governed knowledge catalog head/ingestion receipt、v24
   owner-governed Agent prompt head/revision/receipt，以及 v25 non-destructive Session context
   compaction state machine、v26 account-scoped reply provider、v27 safe Agent cancellation 与
-  v28 durable Agent planning，
+  v28 durable Agent planning 与 v29 durable Session Goal，
   也覆盖 fresh schema
   和历史原地迁移；畸形 v21 升级会整体回滚，不留下 v22 版本或表，既有 v22 数据库则原地增加
   空的 revision-0 catalog projection，不改写已经固化的 Agent knowledge context。
