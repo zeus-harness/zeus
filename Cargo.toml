@@ -43,6 +43,7 @@ libc = "0.2.189"
 llm = { path = "crates/llm" }
 protocol = { path = "crates/protocol" }
 runtime = { path = "crates/runtime" }
+skills = { path = "crates/skills" }
 storage = { path = "crates/storage" }
 tenancy = { path = "crates/tenancy" }
 terminal = { path = "crates/terminal" }

@@ -52,6 +52,7 @@ use protocol::{
     ToolExecutorStatus, ToolOutcome,
 };
 use serde_json::Value;
+use skills::{SkillCatalog, register_skill_tools, skill_tool_descriptors};
 pub use storage::{
     AGENT_SYSTEM_PROMPT_MAX_BYTES, AccountAuditArchiveState, AccountAuditCheckpointCommit,
     AccountAuditEvent, AccountAuditPage, AccountAuditPolicy, AccountAuditRollup, AccountAuditState,
@@ -872,6 +873,28 @@ impl DemoStore {
         physical_limits: SqlitePhysicalLimits,
         operation_limits: SqliteOperationLimits,
     ) -> Result<Self, StoreError> {
+        Self::open_with_profile_and_limits_and_physical_and_operations_and_skills(
+            path,
+            profile,
+            limits,
+            physical_limits,
+            operation_limits,
+            None,
+        )
+        .await
+    }
+
+    /// Opens a runtime with an optional immutable Skill Catalog. Catalog tools
+    /// are registered for either profile and their catalog-digest versions are
+    /// included in every newly resolved Agent deployment manifest.
+    pub async fn open_with_profile_and_limits_and_physical_and_operations_and_skills(
+        path: impl AsRef<Path>,
+        profile: DemoProfile,
+        limits: StorageLimits,
+        physical_limits: SqlitePhysicalLimits,
+        operation_limits: SqliteOperationLimits,
+        skill_catalog: Option<Arc<SkillCatalog>>,
+    ) -> Result<Self, StoreError> {
         let storage = SqliteStore::open_with_limits_and_physical_and_operations(
             path,
             limits,
@@ -879,7 +902,8 @@ impl DemoStore {
             operation_limits,
         )
         .await?;
-        Self::from_storage(storage, profile, true).await
+        Self::from_storage_with_terminal_and_skills(storage, profile, true, None, skill_catalog)
+            .await
     }
 
     /// Creates an isolated production-profile store for tests.
@@ -887,6 +911,7 @@ impl DemoStore {
         Self::open(":memory:").await
     }
 
+    #[cfg(test)]
     async fn from_storage(
         storage: SqliteStore,
         profile: DemoProfile,
@@ -901,8 +926,25 @@ impl DemoStore {
         auto_dispatch: bool,
         terminal_service: Option<Arc<TerminalService>>,
     ) -> Result<Self, StoreError> {
+        Self::from_storage_with_terminal_and_skills(
+            storage,
+            profile,
+            auto_dispatch,
+            terminal_service,
+            None,
+        )
+        .await
+    }
+
+    async fn from_storage_with_terminal_and_skills(
+        storage: SqliteStore,
+        profile: DemoProfile,
+        auto_dispatch: bool,
+        terminal_service: Option<Arc<TerminalService>>,
+        skill_catalog: Option<Arc<SkillCatalog>>,
+    ) -> Result<Self, StoreError> {
         let terminal_service_for_cleanup = terminal_service.clone();
-        let components = RuntimeComponents::build(profile, terminal_service)?;
+        let components = RuntimeComponents::build(profile, terminal_service, skill_catalog)?;
         let profile_id = components.profile_id;
         let primary_session_id = components.primary_session_id;
         let primary_run_id = components.scenario.run.id.clone();
@@ -3612,6 +3654,7 @@ impl RuntimeComponents {
     fn build(
         profile: DemoProfile,
         terminal_service: Option<Arc<TerminalService>>,
+        skill_catalog: Option<Arc<SkillCatalog>>,
     ) -> Result<Self, StoreError> {
         match profile {
             DemoProfile::ProductionGuarded => {
@@ -3623,18 +3666,27 @@ impl RuntimeComponents {
                 }
                 let scenario = DemoScenario::zr_1842();
                 let call = requested_call(&scenario.events)?;
-                let policy = PolicyEngine::new(vec![PolicyRule {
+                let mut policy_rules = vec![PolicyRule {
                     revision: PRODUCTION_POLICY_REVISION.into(),
                     tool: call.tool,
                     environment: scenario.run.environment.clone(),
                     effect: call.effect,
                     sandbox_profile: call.sandbox_profile,
                     decision: PolicyDecision::RequireApproval,
-                }])?;
+                }];
+                let mut registry = ToolRegistry::new();
+                register_runtime_skill_tools(
+                    &mut policy_rules,
+                    &mut registry,
+                    &scenario.run.environment,
+                    PRODUCTION_POLICY_REVISION,
+                    skill_catalog.as_ref(),
+                )?;
+                let policy = PolicyEngine::new(policy_rules)?;
                 Ok(Self {
                     scenario,
                     policy,
-                    registry: ToolRegistry::new(),
+                    registry,
                     profile_id: "production-guarded",
                     primary_session_id: protocol::DEMO_SESSION_ID,
                     policy_id: PRODUCTION_POLICY_ID,
@@ -3735,6 +3787,13 @@ impl RuntimeComponents {
                         terminal_service,
                     )?;
                 }
+                register_runtime_skill_tools(
+                    &mut policy_rules,
+                    &mut registry,
+                    &scenario.run.environment,
+                    LOCAL_POLICY_REVISION,
+                    skill_catalog.as_ref(),
+                )?;
                 let policy = PolicyEngine::new(policy_rules)?;
                 Ok(Self {
                     scenario,
@@ -3748,6 +3807,30 @@ impl RuntimeComponents {
             }
         }
     }
+}
+
+fn register_runtime_skill_tools(
+    policy_rules: &mut Vec<PolicyRule>,
+    registry: &mut ToolRegistry,
+    environment: &str,
+    policy_revision: &str,
+    catalog: Option<&Arc<SkillCatalog>>,
+) -> Result<(), StoreError> {
+    let Some(catalog) = catalog else {
+        return Ok(());
+    };
+    for descriptor in skill_tool_descriptors(catalog) {
+        policy_rules.push(PolicyRule {
+            revision: policy_revision.into(),
+            tool: descriptor.name,
+            environment: environment.into(),
+            effect: descriptor.effect,
+            sandbox_profile: descriptor.sandbox_profile,
+            decision: PolicyDecision::Allow,
+        });
+    }
+    register_skill_tools(registry, Arc::clone(catalog))?;
+    Ok(())
 }
 
 struct ClaimedDispatch {
@@ -4056,9 +4139,9 @@ mod tests {
 
     use kernel::{LOCAL_MARKER_CALL_ID, PRODUCTION_DEMO_CALL_ID};
     use protocol::{
-        AgentToolCallStatus, ApprovalScope, DEMO_RUN_ID, DEMO_SESSION_ID, LOCAL_DEMO_RUN_ID,
-        LOCAL_DEMO_SESSION_ID, RunStatus, SandboxProfile, SessionStatus, SessionTurnStatus,
-        ToolCallStatus, ToolEffect,
+        AgentToolCallStatus, AgentTurnStatus, ApprovalScope, DEMO_RUN_ID, DEMO_SESSION_ID,
+        LOCAL_DEMO_RUN_ID, LOCAL_DEMO_SESSION_ID, RunStatus, SandboxProfile, SessionStatus,
+        SessionTurnStatus, ToolCallStatus, ToolEffect,
     };
     use rusqlite::{Connection, params};
     use storage::DispatchStatus;
@@ -4209,6 +4292,24 @@ mod tests {
         AgentKnowledgeContextSpec { corpus, snapshot }
     }
 
+    fn test_skill_catalog(content: &str) -> Arc<SkillCatalog> {
+        Arc::new(
+            SkillCatalog::from_json_slice(
+                &serde_json::to_vec(&serde_json::json!({
+                    "version": 1,
+                    "skills": [{
+                        "name": "incident_triage",
+                        "version": "1.0.0",
+                        "description": "Triage an incident using bounded evidence",
+                        "content": content,
+                    }]
+                }))
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+    }
+
     #[tokio::test]
     async fn session_agent_tool_definitions_expose_only_provider_contracts() {
         let paths = TestPaths::new("agent-tool-definitions");
@@ -4241,6 +4342,168 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn startup_skill_catalog_is_manifest_bound_and_policy_allowed() {
+        let paths = TestPaths::new("agent-skill-catalog");
+        let catalog = test_skill_catalog("# Incident triage\nInspect evidence before acting.");
+        let store = DemoStore::from_storage_with_terminal_and_skills(
+            SqliteStore::open(&paths.database).await.unwrap(),
+            DemoProfile::LocalDevelopment {
+                marker_root: paths.marker_root.clone(),
+                workspace_root: None,
+            },
+            false,
+            None,
+            Some(Arc::clone(&catalog)),
+        )
+        .await
+        .unwrap();
+        bootstrap_test_owner(&store).await;
+
+        let definitions = store.session_agent_tool_definitions().unwrap();
+        assert_eq!(
+            definitions
+                .iter()
+                .map(|definition| definition.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                connectors::DEV_MARKER_TOOL_NAME,
+                skills::SKILL_LIST_TOOL_NAME,
+                skills::SKILL_LOAD_TOOL_NAME,
+            ]
+        );
+        let manifest = store
+            .session_agent_manifest(
+                "test-provider",
+                Some("test-model".into()),
+                AssistantReplyKind::Model,
+            )
+            .unwrap();
+        for tool in manifest
+            .manifest
+            .deployment
+            .spec
+            .tools
+            .iter()
+            .filter(|tool| tool.name.starts_with("skill_"))
+        {
+            assert_eq!(tool.version, catalog.digest());
+            assert_eq!(tool.effect, ToolEffect::ReadOnly);
+            assert_eq!(tool.sandbox_profile, SandboxProfile::ReadOnly);
+        }
+        let resolved = store
+            .resolve_session_agent_tool(
+                "agent-skill-policy",
+                1,
+                0,
+                skills::SKILL_LOAD_TOOL_NAME,
+                serde_json::json!({"name": "incident_triage"}),
+            )
+            .unwrap();
+        assert_eq!(resolved.policy_evaluation().decision, PolicyDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn restart_skill_drift_rejects_queued_agent_before_claim() {
+        let paths = TestPaths::new("agent-skill-restart-drift");
+        let baseline_catalog = test_skill_catalog("# Triage\nUse revision one.");
+        let store = DemoStore::from_storage_with_terminal_and_skills(
+            SqliteStore::open(&paths.database).await.unwrap(),
+            DemoProfile::LocalDevelopment {
+                marker_root: paths.marker_root.clone(),
+                workspace_root: None,
+            },
+            false,
+            None,
+            Some(baseline_catalog),
+        )
+        .await
+        .unwrap();
+        bootstrap_test_owner(&store).await;
+        let owner = test_authz(TEST_OWNER_ID);
+        let manifest = store
+            .session_agent_manifest(
+                "test-provider",
+                Some("test-model".into()),
+                AssistantReplyKind::Model,
+            )
+            .unwrap();
+        let turn_id = "turn-skill-restart-drift";
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner,
+                LOCAL_DEMO_SESSION_ID,
+                StartTurnRequest {
+                    turn_id: turn_id.into(),
+                    user_message: "Use the deployment-bound triage skill.".into(),
+                    expected_sequence: 2,
+                },
+                "skill-restart-drift-start",
+                AgentTurnSpec {
+                    id: "agent-skill-restart-drift".into(),
+                    authz: owner.clone(),
+                    environment: LOCAL_DEV_ENVIRONMENT.into(),
+                    provider_name: "test-provider".into(),
+                    model_name: Some("test-model".into()),
+                    request_json: agent_request_for_manifest(
+                        &manifest,
+                        "Use the deployment-bound triage skill.",
+                    ),
+                    knowledge: agent_knowledge_for_message(
+                        "Use the deployment-bound triage skill.",
+                    ),
+                    manifest: manifest.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let changed_catalog = test_skill_catalog("# Triage\nUse revision two.");
+        let reopened = DemoStore::from_storage_with_terminal_and_skills(
+            SqliteStore::open(&paths.database).await.unwrap(),
+            DemoProfile::LocalDevelopment {
+                marker_root: paths.marker_root.clone(),
+                workspace_root: None,
+            },
+            false,
+            None,
+            Some(changed_catalog),
+        )
+        .await
+        .unwrap();
+        let error = reopened
+            .prepare_next_agent_model(&manifest, "skill-drift-holder")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::InvalidAgentTransition(message)
+                if message.contains("runtime-resolved deployment")
+        ));
+        let queued = reopened
+            .next_agent_model_for_holder("skill-drift-holder")
+            .await
+            .unwrap()
+            .expect("manifest drift must leave the model job queued and unclaimed");
+        assert_eq!(queued.status, AgentModelJobStatus::Queued);
+        let detail = reopened
+            .agent_turn_detail_for_actor(&owner, LOCAL_DEMO_SESSION_ID, turn_id)
+            .await
+            .unwrap();
+        assert_eq!(detail.status, AgentTurnStatus::WaitingModel);
+        assert_eq!(detail.model_steps, 0);
+        assert_eq!(detail.tool_calls, 0);
+        let current = reopened
+            .session_agent_manifest(
+                "test-provider",
+                Some("test-model".into()),
+                AssistantReplyKind::Model,
+            )
+            .unwrap();
+        assert_ne!(manifest.digest, current.digest);
     }
 
     #[tokio::test]

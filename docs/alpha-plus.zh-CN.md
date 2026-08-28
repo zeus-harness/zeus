@@ -7,7 +7,7 @@ Foundation、schema v14 Account-scoped Durable Authorization、schema v15 Member
 Account Audit、schema v16 Session Reply Context Index 至 schema v25 Durable Session Context
 Compaction、schema v26 Account-scoped Reply Provider Selection、schema v27 Safe Agent
 Cancellation、Trusted Single-Node Ingress、
-Per-Operation SecretRef Resolution 与有界多账户控制面主机代码已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
+Per-Operation SecretRef Resolution、启动绑定的 Skill Catalog 与有界多账户控制面主机代码已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
 v11→v12→v13→v14 迁移证据，current-image 证据见本节验收结果，Linux Docker PID/OOM
 authoritative gate 待完成。
 
@@ -208,6 +208,15 @@ Provider endpoint 只来自服务端配置，API key 可用兼容的 inline 环�
 1–16 个唯一逻辑名称，只接受 endpoint、model 与 `api_key_ref`，明确拒绝 inline key 和未知字段。
 `default` 可命名一个远端项或 `local-fallback`；逻辑名称不持久化。该模式不能与旧单 Provider 环境
 变量混用，且必须在 SQLite 打开前完成全部 Provider 构造、durable identity 去重与 SecretRef 预检。
+
+可选的 `ZEUS_SKILLS_FILE` 在 SQLite 打开前读取一次，使用 strict version 1 JSON 注册 1–64 个
+immutable Skill。文件必须是最大 512 KiB 的 regular file；Unix final path component no-follow。
+名称必须是唯一、lowercase provider-safe ASCII，description 上限 256 bytes，单个 UTF-8 body 上限
+24 KiB；未知字段、重复名称、非规范 description 和不安全 control character 直接阻断启动。
+`skill_list` / `skill_load` 都是 policy-allow 的 read-only 工具，完整 catalog SHA-256 digest 同时作为
+二者的 tool version 进入 DeploymentManifest。任何 Skill 字段改变都会令旧 queued Agent 在 claim
+前因 manifest drift 被拒绝；body 不内联到 manifest，只在模型选择 `skill_load` 后作为普通、完整
+持久化的工具结果进入上下文，因此 Catalog 内容不得包含 secret，也没有 HTTP 修改入口。
 
 ## 5. 回复执行链
 
@@ -449,8 +458,8 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 按项目既有统计口径通过 627 个 Rust 测试（connectors 22、deployment 8、knowledge 29、
-  LLM unit 30、provider contract 15、storage 261、workflows 21、runtime 48、API library 83、API main/config 16）与 28 个 Web Node 测试。
+- host 按项目既有统计口径通过 636 个 Rust 测试（connectors 22、deployment 8、knowledge 29、
+  LLM unit 30、provider contract 15、skills 5、storage 261、workflows 21、runtime 50、API library 83、API main/config 18）与 28 个 Web Node 测试。
 - `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 
 ## 8. 容器与 OOM 验收边界

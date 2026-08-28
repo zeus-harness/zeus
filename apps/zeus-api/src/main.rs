@@ -21,7 +21,8 @@ use llm::{
     LocalFallbackProvider, OpenAiCompatibleProvider, ReplyProvider, ResolvedSecret, SecretRef,
     SecretResolveError, SecretResolveFuture, SecretResolver,
 };
-use runtime::{DemoStore, SqliteOperationLimits, SqlitePhysicalLimits, StorageLimits};
+use runtime::{DemoProfile, DemoStore, SqliteOperationLimits, SqlitePhysicalLimits, StorageLimits};
+use skills::{SKILL_CATALOG_FILE_MAX_BYTES, SkillCatalog};
 use tenancy::BootstrapToken;
 use tokio::sync::oneshot;
 use zeus_api::IngressPolicy;
@@ -48,43 +49,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ingress = configured_ingress_policy()?;
     let ingress_mode = ingress.mode_name();
     let public_origin = ingress.public_origin().unwrap_or("direct peer").to_owned();
+    let skill_catalog = configured_skill_catalog()?;
+    let skill_count = skill_catalog.as_ref().map_or(0, |catalog| catalog.len());
     let reply_providers = configured_reply_providers().await?;
     let reply_provider_id = reply_providers.default.metadata().provider_id.clone();
-    let store = match profile.as_str() {
-        "production-guarded" => {
-            DemoStore::open_with_limits_and_physical_and_operations(
-                &database_path,
-                storage_limits.clone(),
-                physical_limits.clone(),
-                operation_limits.clone(),
-            )
-            .await?
-        }
+    let runtime_profile = match profile.as_str() {
+        "production-guarded" => DemoProfile::ProductionGuarded,
         "local-development" => {
             let marker_root = std::env::var("ZEUS_LOCAL_MARKER_ROOT")
                 .unwrap_or_else(|_| ".zeus/local-markers".into());
-            match optional_environment("ZEUS_LOCAL_WORKSPACE_ROOT")? {
-                Some(workspace_root) => {
-                    DemoStore::open_local_with_workspace_and_limits_and_physical_and_operations(
-                        &database_path,
-                        marker_root,
-                        workspace_root,
-                        storage_limits,
-                        physical_limits,
-                        operation_limits,
-                    )
-                    .await?
-                }
-                None => {
-                    DemoStore::open_local_with_limits_and_physical_and_operations(
-                        &database_path,
-                        marker_root,
-                        storage_limits,
-                        physical_limits,
-                        operation_limits,
-                    )
-                    .await?
-                }
+            DemoProfile::LocalDevelopment {
+                marker_root: marker_root.into(),
+                workspace_root: optional_environment("ZEUS_LOCAL_WORKSPACE_ROOT")?.map(Into::into),
             }
         }
         other => {
@@ -97,6 +73,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
     };
+    let store = DemoStore::open_with_profile_and_limits_and_physical_and_operations_and_skills(
+        &database_path,
+        runtime_profile,
+        storage_limits,
+        physical_limits,
+        operation_limits,
+        skill_catalog,
+    )
+    .await?;
     let address = std::env::var("ZEUS_LISTEN_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:8081".into())
         .parse::<SocketAddr>()?;
@@ -121,7 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     println!(
-        "zeus-api listening on http://{address} with profile {profile}, ingress {ingress_mode} ({public_origin}), reply provider {reply_provider_id}, and SQLite at {database_path}"
+        "zeus-api listening on http://{address} with profile {profile}, ingress {ingress_mode} ({public_origin}), reply provider {reply_provider_id}, {skill_count} startup skills, and SQLite at {database_path}"
     );
     serve_with_bounded_shutdown(listener, app).await?;
     Ok(())
@@ -369,6 +354,75 @@ fn parse_environment_capacity_with_legacy_alias(
             format!("{name} and its legacy alias {legacy_name} cannot both be set"),
         )),
     }
+}
+
+fn configured_skill_catalog() -> Result<Option<Arc<SkillCatalog>>, io::Error> {
+    let Some(path) = optional_environment("ZEUS_SKILLS_FILE")? else {
+        return Ok(None);
+    };
+    let bytes = read_bounded_skill_catalog_file(&path)?;
+    let catalog = SkillCatalog::from_json_slice(&bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("ZEUS_SKILLS_FILE is invalid: {error}"),
+        )
+    })?;
+    Ok(Some(Arc::new(catalog)))
+}
+
+fn read_bounded_skill_catalog_file(path: &str) -> Result<Vec<u8>, io::Error> {
+    let file = open_skill_catalog_file(path)?;
+    let metadata = file.metadata().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ZEUS_SKILLS_FILE metadata could not be read",
+        )
+    })?;
+    if !metadata.is_file() || metadata.len() > SKILL_CATALOG_FILE_MAX_BYTES as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "ZEUS_SKILLS_FILE must be a regular file no larger than {} bytes",
+                SKILL_CATALOG_FILE_MAX_BYTES
+            ),
+        ));
+    }
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(SKILL_CATALOG_FILE_MAX_BYTES));
+    file.take(SKILL_CATALOG_FILE_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ZEUS_SKILLS_FILE could not be read",
+            )
+        })?;
+    if bytes.len() > SKILL_CATALOG_FILE_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "ZEUS_SKILLS_FILE must be no larger than {} bytes",
+                SKILL_CATALOG_FILE_MAX_BYTES
+            ),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn open_skill_catalog_file(path: &str) -> Result<File, io::Error> {
+    #[cfg(unix)]
+    let result = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path);
+    #[cfg(not(unix))]
+    let result = File::open(path);
+    result.map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ZEUS_SKILLS_FILE could not be opened",
+        )
+    })
 }
 
 async fn configured_reply_providers() -> Result<ConfiguredReplyProviders, io::Error> {
@@ -1080,11 +1134,12 @@ mod tests {
         parse_environment_capacity_with_legacy_alias, parse_environment_flag,
         parse_environment_u64, parse_ingress_policy, parse_reply_provider_registry,
         parse_reply_provider_settings, read_bounded_reply_provider_registry_file,
-        select_reply_provider_configuration,
+        read_bounded_skill_catalog_file, select_reply_provider_configuration,
     };
     #[cfg(unix)]
     use super::{FileSecretResolver, SECRET_FILE_MAX_BYTES};
     use llm::{ReplyKind, SecretRef, SecretResolveError, SecretResolver};
+    use skills::SKILL_CATALOG_FILE_MAX_BYTES;
     use std::{env::VarError, io};
 
     #[test]
@@ -1534,6 +1589,65 @@ mod tests {
         );
         fs::remove_file(&path).unwrap();
         assert!(read_bounded_reply_provider_registry_file(path.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn skill_catalog_file_reader_accepts_only_bounded_regular_files() {
+        use std::{
+            fs,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "zeus-skill-catalog-{}-{nonce}.json",
+            std::process::id()
+        ));
+        fs::write(&path, b"{}").unwrap();
+        assert_eq!(
+            read_bounded_skill_catalog_file(path.to_str().unwrap()).unwrap(),
+            b"{}"
+        );
+        fs::write(&path, vec![b'x'; SKILL_CATALOG_FILE_MAX_BYTES + 1]).unwrap();
+        assert!(read_bounded_skill_catalog_file(path.to_str().unwrap()).is_err());
+        assert!(
+            read_bounded_skill_catalog_file(
+                std::env::temp_dir()
+                    .to_str()
+                    .expect("temporary path is UTF-8")
+            )
+            .is_err()
+        );
+        fs::remove_file(&path).unwrap();
+        assert!(read_bounded_skill_catalog_file(path.to_str().unwrap()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_catalog_file_reader_does_not_follow_symlinks() {
+        use std::{
+            fs,
+            os::unix::fs::symlink,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "zeus-skill-catalog-target-{}-{nonce}.json",
+            std::process::id()
+        ));
+        let link = path.with_extension("link");
+        fs::write(&path, b"{}").unwrap();
+        symlink(&path, &link).unwrap();
+        assert!(read_bounded_skill_catalog_file(link.to_str().unwrap()).is_err());
+        fs::remove_file(&link).unwrap();
+        fs::remove_file(&path).unwrap();
     }
 
     #[test]

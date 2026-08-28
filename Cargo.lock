@@ -1175,6 +1175,7 @@ dependencies = [
  "protocol",
  "rusqlite",
  "serde_json",
+ "skills",
  "storage",
  "terminal",
  "thiserror",
@@ -1364,6 +1365,19 @@ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
+]
+
+[[package]]
+name = "skills"
+version = "0.1.0"
+dependencies = [
+ "protocol",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tools",
 ]
 
 [[package]]
@@ -2095,6 +2109,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "skills",
  "tenancy",
  "terminal",
  "tokio",

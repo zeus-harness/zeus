@@ -28,6 +28,8 @@ Client / SvelteKit Web
 - `kernel`：纯状态转换，不读数据库、不执行外部工具。
 - `authz`：account capability matrix，以及精确工具名规则、策略 revision、环境和 effect guard；没有命中即拒绝。
 - `tools`：工具描述、注册表、参数验证和 object-safe executor 边界。
+- `skills`：启动时一次性加载的 strict version 1 Skill Catalog、确定性 digest，以及只读
+  `skill_list` / `skill_load` executor；Skill body 只有通过普通工具结果才对模型可见。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
 - `storage`：schema v27 migration、有界 account/membership 权威、一次性 member setup、用户/偏好、
   account audit/rollup/policy/archive state、独立 Session/Run ledger、typed event lookup、
@@ -101,6 +103,16 @@ schema v27 增加 Agent 安全取消的 SQLite durability boundary。Actor 以 A
 RunEpoch。取消事务写入精确的 epochless `user_cancelled` execution fact、固定错误码与
 `turn_interrupted`。若 model/tool 已有 durable `started` checkpoint，取消返回 conflict，不能把
 可能已经计费或产生副作用的外部调用伪装为已取消。相同旧 revision 只重建第一次终态响应。
+
+可选 `ZEUS_SKILLS_FILE` 在 SQLite 打开前加载 immutable Skill Catalog。文件使用 strict version 1
+JSON，regular file 上限 512 KiB，包含 1–64 个唯一的 lowercase provider-safe 名称；description
+上限 256 bytes，单个 UTF-8 body 上限 24 KiB，未知字段、重复名称、非规范 description 与不安全
+control character 均 fail closed。Unix 打开 final path component 时使用 no-follow。Catalog 构造后
+不再读取文件，`skill_list` 和 `skill_load` 以 read-only / policy-allow 工具进入普通 Agent Tool
+Registry。二者的 tool version 是完整 64-byte catalog SHA-256 digest，因此 name/version/description/
+body 任一变化都会改变 DeploymentManifest；旧 manifest 的 queued work 在 model/tool claim 前拒绝，
+不会用漂移后的说明继续执行。Manifest 只含工具描述与 digest，不内联 body；被选择的 body 作为
+普通工具结果完整持久化后才进入下一次模型请求，所以 Catalog 不得保存 secret。
 
 ## 事件与状态
 
@@ -632,8 +644,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   刷新恢复、owner/member setup/登录、owner 成员与 audit 管理、设置/退出和
   system/light/dark。member 的审批卡只读。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化按项目既有统计口径是 627 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
-  provider contract 15、storage 261、workflows 21、runtime 48、API library 83、API main/config 16）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化按项目既有统计口径是 636 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
+  provider contract 15、skills 5、storage 261、workflows 21、runtime 50、API library 83、API main/config 18）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
 提交 `af29089` 曾构建并运行在独立 `zeus-operation-acceptance` project（端口 `18089`）；既有

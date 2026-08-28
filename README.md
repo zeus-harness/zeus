@@ -21,6 +21,11 @@ and create-new-only file tools for testing a useful complete Agent loop. Restate
 MinIO, the networkless tool sandbox, and optional PostgreSQL are development
 topology for later milestones; they are not application state authorities.
 
+An optional startup Skill Catalog adds immutable `skill_list` and `skill_load`
+capabilities to either runtime profile. The exact catalog digest is the tool
+contract version inside each Agent deployment manifest, so queued work cannot
+silently observe changed skill instructions after a restart.
+
 Alpha+ bootstraps a local `acc_local` root and now supports a bounded local
 multi-account control plane. An owner can create accounts idempotently; one
 user may belong to at most 16 accounts and one database may contain at most 64.
@@ -196,6 +201,44 @@ ledger, provider metadata, or application logs.
 
 Partial provider configuration fails startup. The endpoint and key are never
 writable through the browser Settings API.
+
+To expose versioned, read-only Agent skills, point Zeus at one startup-owned
+strict JSON catalog:
+
+```json
+{
+  "version": 1,
+  "skills": [
+    {
+      "name": "incident_triage",
+      "version": "1.0.0",
+      "description": "Triage an incident using bounded evidence",
+      "content": "# Incident triage\nInspect evidence before acting."
+    }
+  ]
+}
+```
+
+```sh
+ZEUS_SKILLS_FILE=/etc/zeus/skills.json
+```
+
+The catalog must be a regular file no larger than 512 KiB and contain 1–64
+uniquely named skills. Names are lowercase provider-safe ASCII identifiers;
+descriptions are at most 256 bytes and each exact UTF-8 skill body is at most
+24 KiB. Unknown fields, unsupported catalog versions, duplicate names,
+non-canonical descriptions, unsafe control characters, and over-limit input
+fail startup before SQLite opens. Unix startup does not follow a symlink in
+the final path component. Skill bodies are not secrets: `skill_load` makes the
+selected body model-visible and Zeus persists that exact tool result.
+
+Both Skill tools are read-only and policy-allowed. Their 64-byte tool version
+is the deterministic SHA-256 catalog digest, which is included in the Agent
+deployment manifest. Changing any skill name, version, description, or body
+therefore changes the manifest; work admitted against the old catalog is
+rejected before a model/tool claim after restart instead of being executed
+against drifted instructions. The manifest contains descriptors and digests,
+not the skill bodies themselves, and there is no HTTP mutation path.
 
 The legacy single-provider form makes that remote model the startup default. A
 registry uses its explicit `default`; whenever at least one remote model is
@@ -1144,14 +1187,16 @@ schema v23 account knowledge catalog ingestion, schema v24 account Agent prompt
 governance, schema v25 durable Session context compaction, schema v26
 account-scoped reply provider selection, schema v27 safe pre-start Agent
 cancellation, Trusted Single-Node Ingress,
-Per-Operation SecretRef Resolution, and the bounded multi-account control plane:
+Per-Operation SecretRef Resolution, the startup-bound Skill Catalog, and the
+bounded multi-account control plane:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 627 tests passed
+- `cargo test --workspace --all-targets --locked`: 636 tests passed
   across the top-level test targets, including 22 connector tests,
   8 deployment tests, 29 knowledge tests, 30 LLM unit and 15 provider-contract
-  tests, 261 storage tests, 21 workflow tests, 48 runtime tests, 83 API library tests, 16 API main/config
+  tests, 5 Skill Catalog tests, 261 storage tests, 21 workflow tests, 50 runtime
+  tests, 83 API library tests, 18 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,
