@@ -104,6 +104,10 @@ use storage::{
     ReviewContext, ReviewReceipt, RotateMemberSetupTokenCommit, RunSnapshot, RuntimeIdentity,
     SqliteStore, StorageError,
 };
+use subagents::{
+    LIST_AGENTS_TOOL_NAME, LIST_AGENTS_TOOL_VERSION, ListAgentsResult, SubagentError,
+    list_agents_descriptor, prepare_list_agents, register_subagent_tools,
+};
 use terminal::TerminalService;
 use thiserror::Error;
 use tokio::sync::{Mutex, Notify, broadcast};
@@ -1738,6 +1742,34 @@ impl DemoStore {
             return Err(StoreError::PolicyChanged(
                 "the tool policy revision changed after server-side resolution".into(),
             ));
+        }
+        if resolved.call.tool == LIST_AGENTS_TOOL_NAME
+            && resolved.call.tool_version == LIST_AGENTS_TOOL_VERSION
+        {
+            let request =
+                prepare_list_agents(&resolved.call.arguments).map_err(subagent_executor_error)?;
+            let page = self
+                .storage
+                .session_fork_page_for_started_agent_tool(
+                    &scope,
+                    &resolved.call.call_id,
+                    request.cursor(),
+                    request.limit(),
+                )
+                .await?;
+            let result = ListAgentsResult::new(page.items, page.next_cursor)
+                .map_err(subagent_executor_error)?;
+            return Ok(ToolOutput {
+                value: serde_json::to_value(result).map_err(|_| {
+                    StoreError::Registry(RegistryError::Executor(ExecutorError::Failed {
+                        code: "list_agents_result_encoding_failed".into(),
+                        message: "The durable child catalog could not be encoded".into(),
+                        retryable: false,
+                    }))
+                })?,
+                replayed: false,
+                provider_request_id: None,
+            });
         }
         if resolved.call.tool == TODO_WRITE_TOOL_NAME
             && resolved.call.tool_version == TODO_WRITE_TOOL_VERSION
@@ -4334,6 +4366,12 @@ impl RuntimeComponents {
                     &scenario.run.environment,
                     PRODUCTION_POLICY_REVISION,
                 )?;
+                register_runtime_subagent_tools(
+                    &mut policy_rules,
+                    &mut registry,
+                    &scenario.run.environment,
+                    PRODUCTION_POLICY_REVISION,
+                )?;
                 register_runtime_skill_tools(
                     &mut policy_rules,
                     &mut registry,
@@ -4379,6 +4417,12 @@ impl RuntimeComponents {
                     LOCAL_POLICY_REVISION,
                 )?;
                 register_runtime_goal_tools(
+                    &mut policy_rules,
+                    &mut registry,
+                    &scenario.run.environment,
+                    LOCAL_POLICY_REVISION,
+                )?;
+                register_runtime_subagent_tools(
                     &mut policy_rules,
                     &mut registry,
                     &scenario.run.environment,
@@ -4532,6 +4576,39 @@ fn goal_executor_error(error: GoalError) -> StoreError {
         GoalError::RevisionConflict => "goal_revision_conflict",
         GoalError::InvalidTransition => "goal_invalid_transition",
         GoalError::InvalidResult => "goal_invalid_result",
+    };
+    StoreError::Registry(RegistryError::Executor(ExecutorError::Failed {
+        code: code.into(),
+        message: error.to_string(),
+        retryable: false,
+    }))
+}
+
+fn register_runtime_subagent_tools(
+    policy_rules: &mut Vec<PolicyRule>,
+    registry: &mut ToolRegistry,
+    environment: &str,
+    policy_revision: &str,
+) -> Result<(), StoreError> {
+    let descriptor = list_agents_descriptor();
+    policy_rules.push(PolicyRule {
+        revision: policy_revision.into(),
+        tool: descriptor.name,
+        environment: environment.into(),
+        effect: descriptor.effect,
+        sandbox_profile: descriptor.sandbox_profile,
+        decision: PolicyDecision::Allow,
+    });
+    register_subagent_tools(registry)?;
+    Ok(())
+}
+
+fn subagent_executor_error(error: SubagentError) -> StoreError {
+    let code = match error {
+        SubagentError::InvalidArguments => "list_agents_invalid_arguments",
+        SubagentError::InvalidLimit => "list_agents_invalid_limit",
+        SubagentError::InvalidCursor => "list_agents_invalid_cursor",
+        SubagentError::InvalidResult => "list_agents_invalid_result",
     };
     StoreError::Registry(RegistryError::Executor(ExecutorError::Failed {
         code: code.into(),
@@ -5047,7 +5124,7 @@ mod tests {
         let store = local_store(&paths, false).await;
 
         let definitions = store.session_agent_tool_definitions().unwrap();
-        assert_eq!(definitions.len(), 5);
+        assert_eq!(definitions.len(), 6);
         assert_eq!(definitions[0].name, goals::CREATE_GOAL_TOOL_NAME);
         assert_eq!(definitions[1].name, connectors::DEV_MARKER_TOOL_NAME);
         assert_eq!(
@@ -5067,16 +5144,21 @@ mod tests {
             })
         );
         assert_eq!(definitions[2].name, goals::GET_GOAL_TOOL_NAME);
-        assert_eq!(definitions[3].name, planning::TODO_WRITE_TOOL_NAME);
+        assert_eq!(definitions[3].name, subagents::LIST_AGENTS_TOOL_NAME);
         assert_eq!(
-            definitions[3].input_schema["properties"]["todos"]["maxItems"],
+            definitions[3].input_schema["properties"]["cursor"]["maxLength"],
+            subagents::LIST_AGENTS_CURSOR_MAX_BYTES
+        );
+        assert_eq!(definitions[4].name, planning::TODO_WRITE_TOOL_NAME);
+        assert_eq!(
+            definitions[4].input_schema["properties"]["todos"]["maxItems"],
             planning::TODO_MAX_ITEMS
         );
         assert_eq!(
-            definitions[3].input_schema["properties"]["todos"]["items"]["properties"]["status"]["enum"],
+            definitions[4].input_schema["properties"]["todos"]["items"]["properties"]["status"]["enum"],
             serde_json::json!(["pending", "in_progress", "completed"])
         );
-        assert_eq!(definitions[4].name, goals::UPDATE_GOAL_TOOL_NAME);
+        assert_eq!(definitions[5].name, goals::UPDATE_GOAL_TOOL_NAME);
 
         let production = DemoStore::seeded().await.unwrap();
         assert_eq!(
@@ -5089,6 +5171,7 @@ mod tests {
             [
                 goals::CREATE_GOAL_TOOL_NAME,
                 goals::GET_GOAL_TOOL_NAME,
+                subagents::LIST_AGENTS_TOOL_NAME,
                 planning::TODO_WRITE_TOOL_NAME,
                 goals::UPDATE_GOAL_TOOL_NAME,
             ]
@@ -5313,6 +5396,7 @@ mod tests {
                 goals::CREATE_GOAL_TOOL_NAME,
                 connectors::DEV_MARKER_TOOL_NAME,
                 goals::GET_GOAL_TOOL_NAME,
+                subagents::LIST_AGENTS_TOOL_NAME,
                 skills::SKILL_LIST_TOOL_NAME,
                 skills::SKILL_LOAD_TOOL_NAME,
                 planning::TODO_WRITE_TOOL_NAME,

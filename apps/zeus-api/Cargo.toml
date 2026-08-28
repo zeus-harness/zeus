@@ -34,5 +34,6 @@ zeroize.workspace = true
 goals.workspace = true
 http-body-util.workspace = true
 rusqlite.workspace = true
+subagents.workspace = true
 terminal.workspace = true
 tower.workspace = true

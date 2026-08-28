@@ -463,6 +463,31 @@ impl SqliteStore {
             .await
     }
 
+    /// Returns one direct-child fork page only for the exact Agent tool call
+    /// that has crossed its durable started checkpoint. The model supplies no
+    /// account, actor, parent Session, turn, or Agent identity.
+    pub async fn session_fork_page_for_started_agent_tool(
+        &self,
+        scope: &ExecutionScope,
+        call_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<SessionForkPage, StorageError> {
+        let scope = scope.clone();
+        let call_id = validated_durable_reference(call_id, "Agent tool call ID")?.to_owned();
+        let cursor = cursor.map(str::to_owned);
+        self.with_connection(move |connection| {
+            query_session_fork_page_for_started_agent_tool(
+                connection,
+                &scope,
+                &call_id,
+                cursor.as_deref(),
+                limit,
+            )
+        })
+        .await
+    }
+
     /// Resolve one process-owned activation against current durable Goal,
     /// Session, account, user, and membership state. Stale authority, a
     /// terminal Goal, an exhausted round budget, or a needs-attention Session
@@ -4333,6 +4358,60 @@ fn query_agent_todo_revision_for_scope(
         .optional()?;
     let revision = found.ok_or_else(|| StorageError::AgentTurnNotFound(scope.agent_id.clone()))?;
     i64_to_u64(revision, "Agent todo revision")
+}
+
+fn query_session_fork_page_for_started_agent_tool(
+    connection: &mut Connection,
+    scope: &ExecutionScope,
+    call_id: &str,
+    cursor: Option<&str>,
+    limit: usize,
+) -> Result<SessionForkPage, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let authorized: i64 = transaction.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1
+               FROM agent_turns agent
+               JOIN agent_tool_calls call
+                 ON call.agent_id = agent.id
+                AND call.account_id = agent.account_id
+                AND call.session_id = agent.session_id
+                AND call.turn_id = agent.turn_id
+               WHERE agent.id = ?1
+                 AND agent.account_id = ?2
+                 AND agent.actor_user_id = ?3
+                 AND agent.session_id = ?4
+                 AND agent.turn_id = ?5
+                 AND call.call_id = ?6
+                 AND call.tool_name = ?7
+                 AND call.tool_version = ?8
+                 AND call.status = 'started'
+           )"#,
+        params![
+            scope.agent_id.as_str(),
+            scope.account_id.as_str(),
+            scope.actor_id.as_str(),
+            scope.session_id.as_str(),
+            scope.turn_id.as_str(),
+            call_id,
+            subagents::LIST_AGENTS_TOOL_NAME,
+            subagents::LIST_AGENTS_TOOL_VERSION,
+        ],
+        |row| row.get(0),
+    )?;
+    if authorized == 0 {
+        return Err(StorageError::AgentToolCallNotFound(call_id.to_owned()));
+    }
+    let page = super::query_session_fork_page(
+        &transaction,
+        scope.account_id.as_str(),
+        scope.actor_id.as_str(),
+        scope.session_id.as_str(),
+        cursor,
+        limit,
+    )?;
+    transaction.commit()?;
+    Ok(page)
 }
 
 fn query_agent_todo_snapshot_for_call(

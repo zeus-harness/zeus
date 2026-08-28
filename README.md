@@ -86,6 +86,13 @@ indexed `created_at DESC, child_session_id ASC` keyset page, so a caller can
 resume branch traversal after reconnect or restart without loading an
 unbounded lineage graph or knowing child IDs in advance.
 
+Every Agent profile also exposes the read-only `list_agents` tool over that
+durable catalog. Runtime accepts it only from the exact persisted
+`started` Agent tool call, derives the parent Session and account/actor scope
+server-side, and returns direct children in opaque-cursor pages (default 16,
+maximum 32). This stage is discovery only: it does not expose model-facing
+spawn, message, interrupt, or recursive lineage traversal.
+
 Alpha+ bootstraps a local `acc_local` root and now supports a bounded local
 multi-account control plane. An owner can create accounts idempotently; one
 user may belong to at most 16 accounts and one database may contain at most 64.
@@ -1358,17 +1365,19 @@ cancellation, schema v28 durable Agent planning, schema v29 durable Session
 Goals, schema v30 same-Session Goal rounds, schema v31 durable Session
 follow-ups, schema v32 durable Agent model output, schema v33 running-model
 cancellation, schema v34 durable Session forks, schema v35 durable fork catalog,
+Agent-scoped durable `list_agents`,
 Trusted Single-Node Ingress,
 Per-Operation SecretRef Resolution, the startup-bound Skill Catalog, and the
 bounded multi-account control plane:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 682 tests passed
+- `cargo test --workspace --all-targets --locked`: 687 tests passed
   across the top-level test targets, including 22 connector tests,
   8 deployment tests, 29 knowledge tests, 30 LLM unit and 18 provider-contract
-  tests, 4 Goal tests, 5 Skill Catalog tests, 282 storage tests, 21 workflow
-  tests, 52 runtime tests, 21 protocol tests, 93 API library tests, 18 API main/config
+  tests, 4 Goal tests, 5 Skill Catalog tests, 3 Subagent Catalog tests,
+  283 storage tests, 21 workflow tests, 52 runtime tests, 21 protocol tests,
+  94 API library tests, 18 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,

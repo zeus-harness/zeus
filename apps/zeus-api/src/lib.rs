@@ -9560,6 +9560,11 @@ mod tests {
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
     }
 
+    struct ListAgentsThenFinalProvider {
+        metadata: ProviderMetadata,
+        requests: Arc<StdMutex<Vec<ReplyRequest>>>,
+    }
+
     struct GoalReadCreateThenFinalProvider {
         metadata: ProviderMetadata,
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
@@ -9941,6 +9946,85 @@ mod tests {
                 },
                 requests,
             }
+        }
+    }
+
+    impl ListAgentsThenFinalProvider {
+        fn new(requests: Arc<StdMutex<Vec<ReplyRequest>>>) -> Self {
+            Self {
+                metadata: ProviderMetadata {
+                    provider_id: "test-list-agents-then-final-provider".into(),
+                    model: Some("test-model".into()),
+                    reply_kind: ReplyKind::Model,
+                },
+                requests,
+            }
+        }
+    }
+
+    impl ReplyProvider for ListAgentsThenFinalProvider {
+        fn metadata(&self) -> &ProviderMetadata {
+            &self.metadata
+        }
+
+        fn reply(&self, request: ReplyRequest) -> ReplyFuture<'_> {
+            let output = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(request.clone());
+                match requests.len() {
+                    1 => {
+                        let tool = request
+                            .tools
+                            .iter()
+                            .find(|tool| tool.name == subagents::LIST_AGENTS_TOOL_NAME)
+                            .expect("every Agent request must expose list_agents");
+                        assert_eq!(
+                            tool.parameters["properties"]["cursor"]["maxLength"],
+                            subagents::LIST_AGENTS_CURSOR_MAX_BYTES
+                        );
+                        ReplyOutput::ToolCall {
+                            call: ReplyToolCall::new(
+                                "provider-call-list-agents-1",
+                                subagents::LIST_AGENTS_TOOL_NAME,
+                                serde_json::json!({"limit": 1}),
+                            ),
+                        }
+                    }
+                    2 => {
+                        let result = request
+                            .messages
+                            .iter()
+                            .rev()
+                            .find(|message| message.role == ReplyRole::Tool)
+                            .and_then(|message| {
+                                serde_json::from_str::<serde_json::Value>(&message.content).ok()
+                            })
+                            .expect("the second model request must contain the first catalog page");
+                        let cursor = result["next_cursor"]
+                            .as_str()
+                            .expect("the first one-item page must expose a cursor");
+                        ReplyOutput::ToolCall {
+                            call: ReplyToolCall::new(
+                                "provider-call-list-agents-2",
+                                subagents::LIST_AGENTS_TOOL_NAME,
+                                serde_json::json!({"cursor": cursor, "limit": 1}),
+                            ),
+                        }
+                    }
+                    3 => ReplyOutput::Final {
+                        content: "durable child catalog inspected".into(),
+                    },
+                    call => panic!("unexpected list_agents provider call {call}"),
+                }
+            };
+            let provider = self.metadata.clone();
+            Box::pin(async move {
+                Ok(ReplyResponse {
+                    output,
+                    finish_reason: Some("stop".into()),
+                    provider,
+                })
+            })
         }
     }
 
@@ -12500,6 +12584,123 @@ mod tests {
         assert_eq!(result["revision"], 1);
         assert_eq!(result["digest"], todo.digest);
         assert_eq!(result["todos"][1]["status"], "in_progress");
+        drop(app);
+    }
+
+    #[tokio::test]
+    async fn agent_list_agents_pages_durable_direct_children_without_approval() {
+        let store = DemoStore::seeded().await.unwrap();
+        let owner =
+            provision_test_owner(&store, "user-agent-list-agents", "agent-list-agents-owner").await;
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: "session-agent-list-agents".into(),
+                    title: "Durable child catalog".into(),
+                },
+                "create-agent-list-agents",
+            )
+            .await
+            .unwrap();
+        for index in 0..2 {
+            store
+                .fork_session_for_actor(
+                    &owner.authz,
+                    "session-agent-list-agents",
+                    ForkSessionRequest {
+                        id: format!("session-agent-list-child-{index}"),
+                        title: format!("Durable child {index}"),
+                        through_sequence: 1,
+                    },
+                    &format!("fork-agent-list-child-{index}"),
+                )
+                .await
+                .unwrap();
+        }
+
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(ListAgentsThenFinalProvider::new(Arc::clone(&requests))),
+        )
+        .unwrap();
+        let started = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-agent-list-agents/turns")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "start-agent-list-agents")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-agent-list-agents",
+                            "user_message": "inspect every direct child branch",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+
+        wait_for_ready_session(&store, &owner.authz, "session-agent-list-agents").await;
+        let agent = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            "session-agent-list-agents",
+            "turn-agent-list-agents",
+            protocol::AgentTurnStatus::Succeeded,
+        )
+        .await;
+        assert_eq!(agent.model_steps, 3);
+        assert_eq!(agent.tool_calls, 2);
+        assert!(agent.calls.iter().all(|call| {
+            call.tool == subagents::LIST_AGENTS_TOOL_NAME
+                && call.status == AgentToolCallStatus::Succeeded
+                && !call.approval_required
+        }));
+
+        let recorded = requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 3);
+        let pages = [&recorded[1], &recorded[2]]
+            .into_iter()
+            .map(|request| {
+                request
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == ReplyRole::Tool)
+                    .map(|message| {
+                        serde_json::from_str::<subagents::ListAgentsResult>(&message.content)
+                            .unwrap()
+                    })
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pages[0].agents.len(), 1);
+        assert!(pages[0].next_cursor.is_some());
+        assert_eq!(pages[1].agents.len(), 1);
+        assert!(pages[1].next_cursor.is_none());
+        let ids = pages
+            .iter()
+            .flat_map(|page| page.agents.iter())
+            .map(|agent| agent.session.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            ids,
+            std::collections::BTreeSet::from([
+                "session-agent-list-child-0",
+                "session-agent-list-child-1",
+            ])
+        );
+        store.verify_integrity().await.unwrap();
         drop(app);
     }
 

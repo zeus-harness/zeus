@@ -1220,6 +1220,7 @@ dependencies = [
  "serde_json",
  "skills",
  "storage",
+ "subagents",
  "terminal",
  "thiserror",
  "tokio",
@@ -1471,11 +1472,23 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "subagents",
  "tenancy",
  "thiserror",
  "tokio",
  "tools",
  "workflows",
+]
+
+[[package]]
+name = "subagents"
+version = "0.1.0"
+dependencies = [
+ "protocol",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tools",
 ]
 
 [[package]]
@@ -2158,6 +2171,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "skills",
+ "subagents",
  "tenancy",
  "terminal",
  "tokio",

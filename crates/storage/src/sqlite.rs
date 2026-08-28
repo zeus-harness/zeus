@@ -10340,15 +10340,30 @@ fn query_session_fork_page_for_actor(
 ) -> Result<SessionForkPage, StorageError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
     require_active_session_actor(&transaction, parent_session_id, context)?;
+    let page = query_session_fork_page(
+        &transaction,
+        context.account_id.as_str(),
+        &context.user_id,
+        parent_session_id,
+        page_cursor,
+        limit,
+    )?;
+    transaction.commit()?;
+    Ok(page)
+}
+
+fn query_session_fork_page(
+    connection: &Connection,
+    account_id: &str,
+    actor_user_id: &str,
+    parent_session_id: &str,
+    page_cursor: Option<&str>,
+    limit: usize,
+) -> Result<SessionForkPage, StorageError> {
     let fetch_limit = validated_read_page_limit(limit, COLLECTION_PAGE_MAX_LIMIT)?;
     let page_cursor = page_cursor
         .map(|value| {
-            cursor::decode_session_forks(
-                value,
-                context.account_id.as_str(),
-                &context.user_id,
-                parent_session_id,
-            )
+            cursor::decode_session_forks(value, account_id, actor_user_id, parent_session_id)
         })
         .transpose()?;
 
@@ -10367,7 +10382,7 @@ fn query_session_fork_page_for_actor(
             .collect::<Result<Vec<_>, _>>()
     };
     let rows = if let Some(page_cursor) = page_cursor {
-        let mut statement = transaction.prepare(
+        let mut statement = connection.prepare(
             r#"SELECT child.id, child.title, child.status, child.created_at,
                       child.updated_at, child.sequence, child.projection_sequence,
                       child.active_turn_id, fork.parent_session_id,
@@ -10384,7 +10399,7 @@ fn query_session_fork_page_for_actor(
         query_rows(
             &mut statement,
             &[
-                &context.account_id.as_str(),
+                &account_id,
                 &parent_session_id,
                 &page_cursor.first,
                 &page_cursor.second,
@@ -10392,7 +10407,7 @@ fn query_session_fork_page_for_actor(
             ],
         )?
     } else {
-        let mut statement = transaction.prepare(
+        let mut statement = connection.prepare(
             r#"SELECT child.id, child.title, child.status, child.created_at,
                       child.updated_at, child.sequence, child.projection_sequence,
                       child.active_turn_id, fork.parent_session_id,
@@ -10406,11 +10421,7 @@ fn query_session_fork_page_for_actor(
         )?;
         query_rows(
             &mut statement,
-            &[
-                &context.account_id.as_str(),
-                &parent_session_id,
-                &fetch_limit,
-            ],
+            &[&account_id, &parent_session_id, &fetch_limit],
         )?
     };
 
@@ -10420,7 +10431,7 @@ fn query_session_fork_page_for_actor(
         rows.into_iter().take(limit)
     {
         let child = stored_child.decode()?;
-        validate_session_event_tail(&transaction, &child)?;
+        validate_session_event_tail(connection, &child)?;
         items.push(SessionForkSummary {
             session: child,
             fork: SessionFork {
@@ -10436,8 +10447,8 @@ fn query_session_fork_page_for_actor(
             StorageError::CorruptData("Session fork page sentinel has no returned item".into())
         })?;
         Some(cursor::encode_session_forks(
-            context.account_id.as_str(),
-            &context.user_id,
+            account_id,
+            actor_user_id,
             parent_session_id,
             &last.fork.created_at,
             &last.session.id,
@@ -10445,7 +10456,6 @@ fn query_session_fork_page_for_actor(
     } else {
         None
     };
-    transaction.commit()?;
     Ok(SessionForkPage { items, next_cursor })
 }
 

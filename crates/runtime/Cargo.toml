@@ -23,6 +23,7 @@ protocol.workspace = true
 serde_json.workspace = true
 skills.workspace = true
 storage.workspace = true
+subagents.workspace = true
 terminal.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

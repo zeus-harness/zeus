@@ -34,6 +34,8 @@ Client / SvelteKit Web
   生命周期与 revision CAS；它只准备有界规范状态，持久化权威仍由 SQLite 掌握。
 - `skills`：启动时一次性加载的 strict version 1 Skill Catalog、确定性 digest，以及只读
   `skill_list` / `skill_load` executor；Skill body 只有通过普通工具结果才对模型可见。
+- `subagents`：只读 `list_agents` 工具契约、严格参数边界与有界结果；durable scope 和分页读取
+  由 runtime/storage 掌握，不由通用 executor 接受调用方自报身份。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
 - `storage`：schema v35 migration、有界 account/membership 权威、一次性 member setup、用户/偏好、
   account audit/rollup/policy/archive state、独立 Session/Run ledger、typed event lookup、
@@ -131,6 +133,12 @@ schema v35 增加 durable direct-child fork catalog。读取先复验 parent 的
 `created_at DESC, child_session_id ASC` 做 `LIMIT + 1` keyset page，并由对应复合索引避免全量
 lineage 扫描或临时排序。Catalog 只返回直接 child 的 Session summary 与 immutable fork metadata，
 递归分支遍历由调用方逐层完成。
+
+Agent-facing `list_agents@1-direct-session-forks` 复用 schema v35 的 durable catalog，但收紧为默认
+16、最多 32 条。Runtime 只在 exact Agent tool call 已落盘为 `started` 后分派，storage 在同一只读
+事务中复验 account/actor/Session/turn/Agent/call ID、工具名与版本，再从 server-derived parent
+Session 读取直接 child；伪造 call scope 在 cursor 解析前失败。该阶段只提供发现能力，不包含
+model-facing spawn、send、interrupt 或递归全图加载。
 
 schema v28 增加 Agent turn 自有的 durable plan。`todo_write@1-single-active` 每次提交完整列表，
 最多 24 项、每项 256 UTF-8 bytes、至多一个 `in_progress`；首写 `expected_revision=0`，之后严格
@@ -746,8 +754,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   刷新恢复、owner/member setup/登录、owner 成员与 audit 管理、设置/退出和
   system/light/dark。member 的审批卡只读。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化按项目既有统计口径是 682 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
-  provider contract 18、skills 5、storage 282、workflows 21、runtime 52、API library 93、API main/config 18）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化按项目既有统计口径是 687 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
+  provider contract 18、skills 5、subagents 3、storage 283、workflows 21、runtime 52、API library 94、API main/config 18）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
 提交 `af29089` 曾构建并运行在独立 `zeus-operation-acceptance` project（端口 `18089`）；既有

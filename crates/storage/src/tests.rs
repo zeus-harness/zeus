@@ -15546,6 +15546,128 @@ async fn session_fork_catalog_is_indexed_bounded_scoped_and_cursor_safe() {
 }
 
 #[tokio::test]
+async fn list_agents_catalog_requires_the_exact_started_agent_tool_scope() {
+    let store = created_owned_session_store().await;
+    for index in 0..2 {
+        store
+            .fork_session_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                ForkSessionRequest {
+                    id: format!("session-agent-child-{index}"),
+                    title: format!("Agent child {index}"),
+                    through_sequence: 1,
+                },
+                &format!("create-agent-child-{index}"),
+            )
+            .await
+            .unwrap();
+    }
+
+    let manifest = list_agents_test_agent_manifest();
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-list-agents".into(),
+                user_message: "inspect durable child branches".into(),
+                expected_sequence: 1,
+            },
+            "start-list-agents",
+            agent_turn_spec_with_manifest(
+                "agent-list-agents",
+                "turn-list-agents",
+                manifest.clone(),
+                "inspect durable child branches",
+            ),
+        )
+        .await
+        .unwrap();
+    let AgentModelClaimOutcome::Claimed(model) =
+        store.claim_next_agent_model(&manifest).await.unwrap()
+    else {
+        panic!("the list_agents model proposal must start");
+    };
+    let call = list_agents_tool_call_spec("call-list-agents", json!({"limit": 1}));
+    store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: model.id,
+            response_json: agent_tool_response_json(&call),
+            resolution: AgentModelResolution::ToolCall { call: call.clone() },
+        })
+        .await
+        .unwrap();
+    let AgentToolClaimOutcome::Claimed(work) =
+        store.claim_next_agent_tool(&manifest).await.unwrap()
+    else {
+        panic!("the admitted list_agents tool must start");
+    };
+    let scope = tools::ExecutionScope::new(
+        work.call.account_id.as_str(),
+        work.model_job.actor_user_id.as_str(),
+        work.call.session_id.as_str(),
+        work.call.turn_id.as_str(),
+        work.call.agent_id.as_str(),
+    )
+    .unwrap();
+
+    let first = store
+        .session_fork_page_for_started_agent_tool(&scope, &work.call.call_id, None, 1)
+        .await
+        .unwrap();
+    assert_eq!(first.items.len(), 1);
+    let second = store
+        .session_fork_page_for_started_agent_tool(
+            &scope,
+            &work.call.call_id,
+            first.next_cursor.as_deref(),
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.items.len(), 1);
+    assert!(second.next_cursor.is_none());
+    let ids = first
+        .items
+        .iter()
+        .chain(&second.items)
+        .map(|item| item.session.id.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        ids,
+        BTreeSet::from(["session-agent-child-0", "session-agent-child-1"])
+    );
+
+    assert!(matches!(
+        store
+            .session_fork_page_for_started_agent_tool(
+                &scope,
+                "call-not-started",
+                Some("malformed-cursor"),
+                1,
+            )
+            .await,
+        Err(StorageError::AgentToolCallNotFound(call_id)) if call_id == "call-not-started"
+    ));
+    let foreign_scope = tools::ExecutionScope::new(
+        scope.account_id.clone(),
+        scope.actor_id.clone(),
+        "session-agent-child-0",
+        scope.turn_id.clone(),
+        scope.agent_id.clone(),
+    )
+    .unwrap();
+    assert!(matches!(
+        store
+            .session_fork_page_for_started_agent_tool(&foreign_scope, &work.call.call_id, None, 1,)
+            .await,
+        Err(StorageError::AgentToolCallNotFound(_))
+    ));
+    store.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
 async fn reply_context_is_complete_pair_only_and_stable_at_historical_sequence() {
     let database = TestDatabase::new();
     let store = created_owned_file_session_store(database.path()).await;
@@ -22455,6 +22577,29 @@ fn todo_test_agent_manifest() -> ManifestEnvelope {
     ManifestEnvelope::new(manifest).unwrap()
 }
 
+fn list_agents_test_agent_manifest() -> ManifestEnvelope {
+    let mut manifest = test_agent_manifest().manifest;
+    let descriptor = subagents::list_agents_descriptor();
+    manifest.deployment.spec.tools.push(
+        ManifestTool::new(
+            descriptor.name,
+            descriptor.version,
+            descriptor.description,
+            descriptor.input_schema.provider_json_schema().unwrap(),
+            descriptor.effect,
+            descriptor.sandbox_profile,
+            ToolExecutorStatus::Available,
+        )
+        .unwrap(),
+    );
+    manifest
+        .deployment
+        .spec
+        .tools
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    ManifestEnvelope::new(manifest).unwrap()
+}
+
 fn goal_test_agent_manifest() -> ManifestEnvelope {
     let mut manifest = test_agent_manifest().manifest;
     for descriptor in goals::goal_tool_descriptors() {
@@ -22743,6 +22888,23 @@ fn todo_agent_tool_call_spec(call_id: &str, expected_revision: u64) -> AgentTool
         ]
     });
     let descriptor = planning::todo_write_descriptor();
+    AgentToolCallSpec {
+        call_id: call_id.into(),
+        provider_call_id: format!("provider-call-{call_id}"),
+        tool_name: descriptor.name,
+        tool_version: descriptor.version,
+        arguments_digest: tools::arguments_digest(&arguments_json),
+        arguments_json,
+        effect: descriptor.effect,
+        sandbox_profile: descriptor.sandbox_profile,
+        executor_status: ToolExecutorStatus::Available,
+        policy_decision: PolicyDecision::Allow,
+        policy_revision: "local/v1".into(),
+    }
+}
+
+fn list_agents_tool_call_spec(call_id: &str, arguments_json: Value) -> AgentToolCallSpec {
+    let descriptor = subagents::list_agents_descriptor();
     AgentToolCallSpec {
         call_id: call_id.into(),
         provider_call_id: format!("provider-call-{call_id}"),
