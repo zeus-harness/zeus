@@ -35,7 +35,7 @@ Client / SvelteKit Web
 - `skills`：启动时一次性加载的 strict version 1 Skill Catalog、确定性 digest，以及只读
   `skill_list` / `skill_load` executor；Skill body 只有通过普通工具结果才对模型可见。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
-- `storage`：schema v32 migration、有界 account/membership 权威、一次性 member setup、用户/偏好、
+- `storage`：schema v34 migration、有界 account/membership 权威、一次性 member setup、用户/偏好、
   account audit/rollup/policy/archive state、独立 Session/Run ledger、typed event lookup、
   account+actor-scoped 回执、durable Agent/model/tool/dispatch queue、不可变 model output、
   不可变 deployment manifest，
@@ -116,6 +116,15 @@ schema v33 将运行中的 model 纳入取消边界，但不放宽 tool。`model
 model durable start 之前注册进程内 cancellation handle，事务提交后通知匹配 worker 丢弃 provider
 stream；尚未落盘的小尾巴从未通过 durable SSE 发布，不会形成可见回滚。已 started 的 tool 仍返回
 `agent_operation_in_flight`，因为 connector 副作用可能已经发生。
+
+schema v34 增加 durable Session fork。Actor 提交 parent Session 与历史 `through_sequence`；
+storage 在同一个 `BEGIN IMMEDIATE` 中先复验当前 account/membership/SessionWrite 权限，再创建
+独立 child Session，只复制该边界内已经完整 `user_message -> assistant_message -> turn_flushed`
+的对话对。`session_forks` 固化 parent boundary、创建 actor/revision 与 inherited count，
+`session_fork_turns` 逐项绑定 parent/child turn 和两边的事件 sequence；child turn ID 使用域分离
+SHA-256 确定性生成。child 以后只从自己的 ledger 构建模型上下文，parent 后续输入不会渗入。
+映射、事件副本、谱系和 actor-scoped receipt 原子提交；trigger 与 deep integrity 复验 exact
+content/provenance/timestamp、连续映射、无环谱系和唯一回执。
 
 schema v28 增加 Agent turn 自有的 durable plan。`todo_write@1-single-active` 每次提交完整列表，
 最多 24 项、每项 256 UTF-8 bytes、至多一个 `in_progress`；首写 `expected_revision=0`，之后严格
@@ -230,20 +239,28 @@ ready ── start_turn ──► running / open turn + Agent + queued model job
                                                                     └─ resume ──► ready
 
 queued follow-up ──(Session ready + exact authority)──► start_turn
+
+parent ready/running/needs_attention ── fork@historical sequence ──► independent child ready
 ```
 
 Session ledger 记录 `session_created`、`run_attached`、`user_message`、可选的
 `assistant_message`、`turn_flushed`、`turn_interrupted` 和 `session_resumed`。一个 Session
 可以拥有多个 Run，但一个 Run 只能属于一个 Session。Session 命令不推进 Run sequence，
-也不触发 dispatch worker。
+也不触发 dispatch worker。Fork child 拥有全新的连续 ledger；parent/child 对应关系只保存在
+不可变 lineage/mapping 表，不通过共享 sequence 或读取 parent live state 维持。
 
 ## 写入边界
 
 所有 Session POST 都要求非空 `Idempotency-Key`。同 key、同请求返回持久化的第一次响应；
-同 key、不同请求返回冲突。除 create 外，命令还必须携带 `expected_sequence`，在
-`BEGIN IMMEDIATE` 中对 Session head 做 CAS。
+同 key、不同请求返回冲突。普通状态命令除 create 外携带 `expected_sequence`，在
+`BEGIN IMMEDIATE` 中对 Session head 做 CAS；fork 使用不可为零且不超过 parent head 的
+`through_sequence` 作为不可变历史边界。
 
 - create：写入 `ready` 投影、`session_created` 和完整响应回执。
+- fork：`POST /sessions/{parent_id}/forks` 写入新的 `ready` child、独立 `session_created`、
+  所有边界内完整对话对的事件/turn 副本、逐 turn source mapping、immutable lineage 和完整响应
+  回执。首次提交返回 `201`，同 key/同输入返回 stored response 并标记 replay、HTTP 返回 `200`；
+  同 key/异输入冲突。授权先于 receipt replay，foreign account 的 parent 与不存在资源同为 `404`。
 - start：只允许 actor 拥有的 `ready` Session；在一个事务中创建唯一 open turn、追加
   `user_message`、投影进入 `running`、保存 actor-scoped 响应回执，创建 Agent，绑定 canonical
   deployment manifest digest，并插入 immutable queued model job。事务前先以当前 actor 的 Reply
@@ -330,7 +347,7 @@ connector 在数据库事务和锁之外运行。
 
 API 监听端口之前按固定顺序完成：
 
-1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v32；按当前
+1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v34；按当前
    detailed-row limit 以最多 64 行 batch 压缩 bootstrap terminal audit prefix，再按稳定
    `(priority actor, expires_at, auth-session ID)` 顺序最多清理 64 个过期或绑定
    missing/disabled/suspended/stale-revision authority 的 auth session。
@@ -721,8 +738,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   刷新恢复、owner/member setup/登录、owner 成员与 audit 管理、设置/退出和
   system/light/dark。member 的审批卡只读。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化按项目既有统计口径是 674 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
-  provider contract 18、skills 5、storage 276、workflows 21、runtime 52、API library 91、API main/config 18）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化按项目既有统计口径是 681 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
+  provider contract 18、skills 5、storage 281、workflows 21、runtime 52、API library 93、API main/config 18）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
 提交 `af29089` 曾构建并运行在独立 `zeus-operation-acceptance` project（端口 `18089`）；既有

@@ -72,6 +72,14 @@ preserves every already-published output chunk, and signals the matching local
 worker to drop its stream. Started tools remain outcome-sensitive and cannot
 be reported as cancelled.
 
+Schema v34 adds durable Session forks. An authenticated actor selects an exact
+parent ledger sequence; Zeus copies only complete flushed user/assistant turns
+visible at that boundary into a new, independent Session ledger. Immutable
+lineage, per-turn source mappings, deterministic child turn IDs, and the
+actor-scoped command receipt commit atomically. Later parent activity cannot
+change child context, and deep integrity verifies the copied content,
+provenance, timestamps, mapping continuity, lineage acyclicity, and receipt.
+
 Alpha+ bootstraps a local `acc_local` root and now supports a bounded local
 multi-account control plane. An owner can create accounts idempotently; one
 user may belong to at most 16 accounts and one database may contain at most 64.
@@ -721,6 +729,11 @@ and bounded memory, CPU, and PID resources.
 - Authenticated Session creation writes the owner, projection,
   `session_created` event, and actor-scoped response receipt in one
   `BEGIN IMMEDIATE` transaction.
+- Authenticated Session fork creates a separate `ready` Session and ledger in
+  one transaction. It records the exact parent sequence and copies only
+  complete flushed user/assistant pairs visible there; interrupted, open, or
+  assistant-less turns are excluded. The child can continue independently and
+  never reads future parent state when rebuilding model context.
 - Starting a turn requires the expected Session sequence. It atomically creates
   the open turn, appends `user_message`, advances the Session to `running`,
   stores the actor-scoped response receipt, creates the durable Agent state,
@@ -919,6 +932,12 @@ and bounded memory, CPU, and PID resources.
   `user_cancelled` fact. It permits `started -> failed` after the Agent has
   atomically entered its cancellation terminal state; successful, failed, and
   outcome-unknown model paths retain their prior exact fact bindings.
+  Schema v34 adds immutable `session_forks` lineage and
+  `session_fork_turns` source mappings, and extends Session command receipts
+  with `fork_session`. The fork transaction creates an independent ledger from
+  an exact historical boundary; migration/readiness and deep integrity verify
+  trigger definitions, mapping continuity, exact copied event evidence,
+  acyclic lineage, and one authoritative receipt.
   Schema v28 adds append-only Agent todo snapshots. Each row is scoped to one
   account/Session/turn/Agent, advances a contiguous revision, and is bound to
   one exact successful `todo_write@1-single-active` call. SQLite triggers bind
@@ -1088,6 +1107,12 @@ directly.
   carries the opaque continuation cursor when another page exists.
   `POST /api/v1/sessions` creates one from `{"id":...,"title":...}` and
   returns `201` for both the first committed response and an idempotent replay.
+- `POST /api/v1/sessions/{parent_session_id}/forks` accepts
+  `{"id":...,"title":...,"through_sequence":...}`. It returns `201` for the
+  first atomic fork and `200` for an exact idempotent replay. The child receives
+  a private ledger containing only complete parent turns at or before the
+  selected boundary; `GET /api/v1/sessions/{child_id}` exposes its immutable
+  `fork` lineage metadata.
 - `GET /api/v1/sessions/{session_id}` returns its current summary plus bounded,
   independently pageable tails of attached Run IDs, turns, and ordered Session
   events. Run-ID and turn pages default to 50 and are capped at 100; event pages
@@ -1206,7 +1231,7 @@ directly.
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Current schema v32 retains durable Run attachment during migration and demo
+Current schema v34 retains durable Run attachment during migration and demo
 seeding, but Alpha+ does not expose a public attach-Run HTTP route.
 
 The application boundary now caps auth JSON at 8 KiB, command JSON at 512 KiB,
@@ -1231,7 +1256,7 @@ approval, dispatch, reply completion, attachment checks, and startup recovery
 use typed point queries or fixed 64-row batches. Production Session list/detail,
 Run detail, and overview reads now use indexed `LIMIT + 1` keyset pages inside
 actor-authorized SQLite snapshots; no production HTTP read loads a complete
-ledger or collection. Current schema v32 retains bounded Session, open-turn,
+ledger or collection. Current schema v34 retains bounded Session, open-turn,
 active reply/dispatch, auth-session, bootstrap-audit, event-slot, and logical
 event-payload-byte admission. Exact idempotent replay is checked before capacity,
 while accepted work consumes its reserved terminal slots and payload bytes
@@ -1319,17 +1344,17 @@ account-scoped reply provider selection, schema v27 safe pre-start Agent
 cancellation, schema v28 durable Agent planning, schema v29 durable Session
 Goals, schema v30 same-Session Goal rounds, schema v31 durable Session
 follow-ups, schema v32 durable Agent model output, schema v33 running-model
-cancellation, Trusted Single-Node Ingress,
+cancellation, schema v34 durable Session forks, Trusted Single-Node Ingress,
 Per-Operation SecretRef Resolution, the startup-bound Skill Catalog, and the
 bounded multi-account control plane:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 677 tests passed
+- `cargo test --workspace --all-targets --locked`: 681 tests passed
   across the top-level test targets, including 22 connector tests,
   8 deployment tests, 29 knowledge tests, 30 LLM unit and 18 provider-contract
-  tests, 4 Goal tests, 5 Skill Catalog tests, 278 storage tests, 21 workflow
-  tests, 52 runtime tests, 21 protocol tests, 92 API library tests, 18 API main/config
+  tests, 4 Goal tests, 5 Skill Catalog tests, 281 storage tests, 21 workflow
+  tests, 52 runtime tests, 21 protocol tests, 93 API library tests, 18 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,

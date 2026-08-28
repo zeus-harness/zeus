@@ -20,12 +20,13 @@ use llm::{ReplyRequest, ReplyRole};
 use protocol::{
     AgentToolCallStatus, AgentTurnStatus, Approval, ApprovalScope, ApprovalStatus,
     AssistantReplyKind, AssistantReplyProvenance, AttachRunRequest, CreateSessionRequest,
-    EnqueueSessionFollowupRequest, EventType, EvidenceSummary, FlushSessionRequest, IncidentStatus,
-    IncidentSummary, Metric, MetricTone, NotDispatchedReason, PolicyDecision, ResumeSessionRequest,
-    ReviewDecision, ReviewResponse, RunEvent, RunEventData, RunStatus, RunSummary, SandboxProfile,
-    SessionEvent, SessionEventData, SessionFlushBarrierStatus, SessionFollowupStatus,
-    SessionStatus, SessionTurnStatus, Severity, StartTurnRequest, ToolCall, ToolCallStatus,
-    ToolEffect, ToolExecutorStatus, ToolOutcome, ToolPolicySummary,
+    EnqueueSessionFollowupRequest, EventType, EvidenceSummary, FlushSessionRequest,
+    ForkSessionRequest, IncidentStatus, IncidentSummary, Metric, MetricTone, NotDispatchedReason,
+    PolicyDecision, ResumeSessionRequest, ReviewDecision, ReviewResponse, RunEvent, RunEventData,
+    RunStatus, RunSummary, SandboxProfile, SessionEvent, SessionEventData,
+    SessionFlushBarrierStatus, SessionFollowupStatus, SessionStatus, SessionTurnStatus, Severity,
+    StartTurnRequest, ToolCall, ToolCallStatus, ToolEffect, ToolExecutorStatus, ToolOutcome,
+    ToolPolicySummary,
 };
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
@@ -1771,7 +1772,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         versions,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33,
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
         ]
     );
     let owner: Option<String> = connection
@@ -1921,7 +1922,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 33);
+    assert_eq!(version, 34);
     let configured_account: (String, String, String, i64) = connection
         .query_row(
             r#"SELECT
@@ -2639,7 +2640,7 @@ async fn v12_identity_and_run_crash_prefix_migrates_then_recovers_the_primary_se
     assert_eq!(
         recovered,
         (
-            33,
+            34,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into()
@@ -4386,7 +4387,7 @@ async fn v5_configured_database_migrates_to_the_local_owner_membership() {
     assert_eq!(
         migrated,
         (
-            33,
+            34,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into(),
@@ -4512,7 +4513,7 @@ async fn v13_configured_active_work_migrates_with_account_authority_and_exact_vo
             },
         )
         .unwrap();
-    assert_eq!(migrated_counts, (33, 1, 1, 2, 1));
+    assert_eq!(migrated_counts, (34, 1, 1, 2, 1));
 }
 
 #[tokio::test]
@@ -4874,7 +4875,7 @@ async fn v14_database_migrates_through_v19_with_member_and_audit_roots() {
             },
         )
         .unwrap();
-    assert_eq!(state, (33, 1, 1, 1, 19));
+    assert_eq!(state, (34, 1, 1, 1, 19));
 }
 
 #[tokio::test]
@@ -4913,7 +4914,7 @@ async fn v15_migration_seeds_the_configured_audit_detail_limit() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (33, 2));
+    assert_eq!(state, (34, 2));
 }
 
 #[tokio::test]
@@ -4958,7 +4959,7 @@ async fn v15_reopen_rejects_a_lower_audit_detail_limit_without_mutating_policy()
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (33, 4));
+    assert_eq!(state, (34, 4));
     drop(connection);
 
     let reopened = SqliteStore::open_with_limits(database.path(), original_limits)
@@ -5340,6 +5341,38 @@ async fn readiness_rejects_a_weakened_v33_running_model_cancellation_trigger() {
     assert!(
         matches!(&error, StorageError::CorruptData(message)
             if message == "durability trigger `agent_model_jobs_enforce_forward_transition` differs from the authoritative migration"),
+        "unexpected weakened-trigger error: {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn readiness_rejects_a_weakened_v34_session_fork_mapping_trigger() {
+    let database = TestDatabase::new();
+    {
+        let store = SqliteStore::open(database.path()).await.unwrap();
+        store.readiness().await.unwrap();
+    }
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER session_fork_turns_validate_insert;
+               CREATE TRIGGER session_fork_turns_validate_insert
+               BEFORE INSERT ON session_fork_turns
+               WHEN 0
+               BEGIN
+                   SELECT 1;
+               END;"#,
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("a same-name weakened Session fork mapping trigger must fail"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(&error, StorageError::CorruptData(message)
+            if message == "durability trigger `session_fork_turns_validate_insert` differs from the authoritative migration"),
         "unexpected weakened-trigger error: {error:?}"
     );
 }
@@ -7288,7 +7321,7 @@ async fn v19_agent_manifest_is_canonical_actor_scoped_reused_and_secret_free() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(version, 33);
+    assert_eq!(version, 34);
     assert_eq!(
         manifest_rows, 1,
         "the identical manifest must be deduplicated"
@@ -15151,6 +15184,253 @@ async fn persisted_tool_call_tampering_cannot_diverge_from_the_model_response() 
 }
 
 #[tokio::test]
+async fn session_fork_copies_an_exact_historical_prefix_and_survives_restart() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    for (ordinal, (turn_id, user, assistant)) in [
+        ("turn-fork-parent-one", "remember alpha", "alpha is durable"),
+        ("turn-fork-parent-two", "remember beta", "beta is durable"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let expected_sequence = 1 + u64::try_from(ordinal).unwrap() * 3;
+        store
+            .start_turn_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: turn_id.into(),
+                    user_message: user.into(),
+                    expected_sequence,
+                },
+                &format!("fork-parent-start-{ordinal}"),
+            )
+            .await
+            .unwrap();
+        store
+            .flush_turn_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                FlushSessionRequest {
+                    turn_id: turn_id.into(),
+                    assistant_message: Some(assistant.into()),
+                    expected_sequence: expected_sequence + 1,
+                },
+                &format!("fork-parent-flush-{ordinal}"),
+            )
+            .await
+            .unwrap();
+    }
+
+    let request = ForkSessionRequest {
+        id: "session-fork-child".into(),
+        title: "Forked after alpha".into(),
+        through_sequence: 4,
+    };
+    let secondary_owner = insert_secondary_test_account(database.path());
+    assert!(matches!(
+        store
+            .fork_session_for_actor(
+                &secondary_owner,
+                "session-alpha",
+                request.clone(),
+                "cross-account-fork-alpha",
+            )
+            .await,
+        Err(StorageError::SessionNotFound(session_id)) if session_id == "session-alpha"
+    ));
+    assert!(matches!(
+        store
+            .get_session_for_actor(&secondary_owner, "session-fork-child")
+            .await,
+        Err(StorageError::SessionNotFound(session_id)) if session_id == "session-fork-child"
+    ));
+    let created = store
+        .fork_session_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            request.clone(),
+            "fork-alpha-prefix",
+        )
+        .await
+        .unwrap();
+    assert!(!created.replayed);
+    assert_eq!(created.session.sequence, 4);
+    assert_eq!(created.fork.parent_session_id, "session-alpha");
+    assert_eq!(created.fork.parent_sequence, 4);
+    assert_eq!(created.fork.inherited_turns, 1);
+
+    let replay = store
+        .fork_session_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            request.clone(),
+            "fork-alpha-prefix",
+        )
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.session, created.session);
+    assert_eq!(replay.fork, created.fork);
+    let mut conflict = request.clone();
+    conflict.title = "Different fork".into();
+    assert!(matches!(
+        store
+            .fork_session_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                conflict,
+                "fork-alpha-prefix",
+            )
+            .await,
+        Err(StorageError::IdempotencyConflict)
+    ));
+
+    let child = store
+        .get_session_for_actor(&owner_authz(), "session-fork-child")
+        .await
+        .unwrap();
+    assert_eq!(child.fork.as_ref(), Some(&created.fork));
+    assert_eq!(child.turns.len(), 1);
+    assert_ne!(child.turns[0].id, "turn-fork-parent-one");
+    assert_eq!(child.turns[0].user_message, "remember alpha");
+    assert_eq!(
+        child.turns[0].assistant_message.as_deref(),
+        Some("alpha is durable")
+    );
+    assert_eq!(child.events.len(), 4);
+    assert_eq!(
+        store
+            .session_reply_turns_for_actor(
+                &owner_authz(),
+                "session-fork-child",
+                created.session.sequence,
+                31,
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|turn| turn.user_message.as_str())
+            .collect::<Vec<_>>(),
+        ["remember alpha"]
+    );
+
+    store
+        .start_turn_for_actor(
+            &owner_authz(),
+            "session-fork-child",
+            StartTurnRequest {
+                turn_id: "turn-fork-child-next".into(),
+                user_message: "continue only from alpha".into(),
+                expected_sequence: 4,
+            },
+            "fork-child-next-start",
+        )
+        .await
+        .unwrap();
+    store
+        .flush_turn_for_actor(
+            &owner_authz(),
+            "session-fork-child",
+            FlushSessionRequest {
+                turn_id: "turn-fork-child-next".into(),
+                assistant_message: Some("continued independently".into()),
+                expected_sequence: 5,
+            },
+            "fork-child-next-flush",
+        )
+        .await
+        .unwrap();
+    store.verify_integrity().await.unwrap();
+    drop(store);
+
+    let reopened = SqliteStore::open(database.path()).await.unwrap();
+    let child = reopened
+        .get_session_for_actor(&owner_authz(), "session-fork-child")
+        .await
+        .unwrap();
+    assert_eq!(child.fork.as_ref(), Some(&created.fork));
+    assert_eq!(child.turns.len(), 2);
+    assert_eq!(
+        child
+            .turns
+            .iter()
+            .map(|turn| turn.user_message.as_str())
+            .collect::<Vec<_>>(),
+        ["remember alpha", "continue only from alpha"]
+    );
+    reopened.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn session_fork_integrity_rejects_tampered_lineage_counts() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    store
+        .start_turn_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-fork-tamper-parent".into(),
+                user_message: "preserve this source".into(),
+                expected_sequence: 1,
+            },
+            "fork-tamper-parent-start",
+        )
+        .await
+        .unwrap();
+    store
+        .flush_turn_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            FlushSessionRequest {
+                turn_id: "turn-fork-tamper-parent".into(),
+                assistant_message: Some("preserved".into()),
+                expected_sequence: 2,
+            },
+            "fork-tamper-parent-flush",
+        )
+        .await
+        .unwrap();
+    store
+        .fork_session_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            ForkSessionRequest {
+                id: "session-fork-tampered".into(),
+                title: "Tampered fork".into(),
+                through_sequence: 4,
+            },
+            "fork-tamper-create",
+        )
+        .await
+        .unwrap();
+    drop(store);
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let reject_update = stored_trigger_sql(&connection, "session_forks_reject_update");
+    connection
+        .execute_batch("DROP TRIGGER session_forks_reject_update;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE session_forks SET inherited_turn_count = 0 WHERE child_session_id = ?1",
+            ["session-fork-tampered"],
+        )
+        .unwrap();
+    connection.execute_batch(&reject_update).unwrap();
+    drop(connection);
+
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("tampered Session fork lineage must fail startup"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StorageError::CorruptData(message)
+            if message.contains("inherited-turn count is inconsistent")));
+}
+
+#[tokio::test]
 async fn reply_context_is_complete_pair_only_and_stable_at_historical_sequence() {
     let database = TestDatabase::new();
     let store = created_owned_file_session_store(database.path()).await;
@@ -19594,7 +19874,7 @@ async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempot
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, (1_i64..=33).collect::<Vec<_>>());
+    assert_eq!(versions, (1_i64..=34).collect::<Vec<_>>());
     assert_eq!(
         connection
             .query_row(
@@ -23260,6 +23540,14 @@ fn drop_v32_fixture_objects(connection: &rusqlite::Connection) {
 }
 
 fn drop_v33_fixture_objects(connection: &rusqlite::Connection) {
+    let version: i64 = connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    if version >= 34 {
+        drop_v34_fixture_objects(connection);
+    }
     let schema_reject_update = migration_trigger_sql(
         include_str!("../migrations/0020_agent_execution_ledger.sql"),
         "schema_migrations_reject_update",
@@ -23281,6 +23569,102 @@ fn drop_v33_fixture_objects(connection: &rusqlite::Connection) {
         )
         .unwrap();
     connection.execute_batch(legacy_model_transition).unwrap();
+    connection.execute_batch(schema_reject_update).unwrap();
+    connection.execute_batch(schema_reject_delete).unwrap();
+}
+
+fn drop_v34_fixture_objects(connection: &rusqlite::Connection) {
+    let schema_reject_update = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_update",
+    );
+    let schema_reject_delete = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_delete",
+    );
+    let receipt_require_authority = migration_trigger_sql(
+        include_str!("../migrations/0014_account_scoped_durable_authorization.sql"),
+        "session_command_receipts_require_authority",
+    );
+    let receipt_reject_update = migration_trigger_sql(
+        include_str!("../migrations/0014_account_scoped_durable_authorization.sql"),
+        "session_command_receipts_reject_update",
+    );
+    let receipt_reject_delete = migration_trigger_sql(
+        include_str!("../migrations/0014_account_scoped_durable_authorization.sql"),
+        "session_command_receipts_reject_delete",
+    );
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER schema_migrations_reject_update;
+               DROP TRIGGER schema_migrations_reject_delete;
+
+               DROP TRIGGER session_fork_turns_validate_insert;
+               DROP TRIGGER session_fork_turns_reject_update;
+               DROP TRIGGER session_fork_turns_reject_delete;
+               DROP INDEX session_fork_turns_parent_idx;
+               DROP TABLE session_fork_turns;
+
+               DROP TRIGGER session_forks_validate_insert;
+               DROP TRIGGER session_forks_reject_update;
+               DROP TRIGGER session_forks_reject_delete;
+               DROP INDEX session_forks_parent_idx;
+               DROP TABLE session_forks;
+
+               DROP TRIGGER session_command_receipts_require_authority;
+               DROP TRIGGER session_command_receipts_reject_update;
+               DROP TRIGGER session_command_receipts_reject_delete;
+               DROP INDEX session_command_receipts_actor_key_idx;
+               DROP INDEX session_command_receipts_prebootstrap_key_idx;
+               ALTER TABLE session_command_receipts
+                   RENAME TO session_command_receipts_v34;
+
+               CREATE TABLE session_command_receipts (
+                   account_id          TEXT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+                   actor_user_id       TEXT REFERENCES users(id) ON DELETE RESTRICT,
+                   idempotency_key     TEXT NOT NULL CHECK (length(trim(idempotency_key)) > 0),
+                   operation           TEXT NOT NULL CHECK (operation IN (
+                       'create_session', 'attach_run', 'start_turn',
+                       'flush_turn', 'resume_session'
+                   )),
+                   request_fingerprint TEXT NOT NULL CHECK (json_valid(request_fingerprint)),
+                   response_json       TEXT NOT NULL CHECK (json_valid(response_json)),
+                   session_id          TEXT NOT NULL,
+                   event_sequence      INTEGER NOT NULL CHECK (event_sequence > 0),
+                   created_at          TEXT NOT NULL,
+                   FOREIGN KEY (account_id, actor_user_id)
+                       REFERENCES account_memberships(account_id, user_id) ON DELETE RESTRICT,
+                   FOREIGN KEY (session_id, event_sequence)
+                       REFERENCES session_events(session_id, sequence) ON DELETE RESTRICT
+               ) STRICT;
+
+               INSERT INTO session_command_receipts(
+                   account_id, actor_user_id, idempotency_key, operation,
+                   request_fingerprint, response_json, session_id,
+                   event_sequence, created_at
+               )
+               SELECT account_id, actor_user_id, idempotency_key, operation,
+                      request_fingerprint, response_json, session_id,
+                      event_sequence, created_at
+               FROM session_command_receipts_v34;
+
+               DROP TABLE session_command_receipts_v34;
+
+               CREATE UNIQUE INDEX session_command_receipts_actor_key_idx
+                   ON session_command_receipts(
+                       account_id, actor_user_id, operation, idempotency_key
+                   )
+                   WHERE actor_user_id IS NOT NULL;
+               CREATE UNIQUE INDEX session_command_receipts_prebootstrap_key_idx
+                   ON session_command_receipts(account_id, operation, idempotency_key)
+                   WHERE actor_user_id IS NULL;
+
+               DELETE FROM schema_migrations WHERE version = 34;"#,
+        )
+        .unwrap();
+    connection.execute_batch(receipt_require_authority).unwrap();
+    connection.execute_batch(receipt_reject_update).unwrap();
+    connection.execute_batch(receipt_reject_delete).unwrap();
     connection.execute_batch(schema_reject_update).unwrap();
     connection.execute_batch(schema_reject_delete).unwrap();
 }

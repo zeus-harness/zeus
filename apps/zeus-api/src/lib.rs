@@ -56,15 +56,15 @@ use protocol::{
     CancelAgentTurnRequest, CancelAgentTurnResponse, CreateAccountAuditCheckpointRequest,
     CreateAccountRequest, CreateAccountResponse, CreateMemberRequest, CreateSessionRequest,
     CreateSessionResponse, EVENT_PAGE_DEFAULT_LIMIT, EnqueueSessionFollowupRequest,
-    EnqueueSessionFollowupResponse, HealthResponse, InFlightWorkSummary, LoginRequest,
-    LogoutResponse, MemberSetupRequest, MemberSetupTokenResponse, PolicyDecision, ProblemDetails,
-    ReplyProviderCatalogResponse, ReplyProviderDescriptor, ResumeSessionRequest,
-    ResumeSessionResponse, ReviewDecision, ReviewRequest, ReviewResponse,
-    RotateMemberSetupTokenRequest, RunDetail, SessionDetail, SessionEvent, SessionFlushBarrier,
-    SessionFlushBarrierStatus, SessionFollowupListResponse, SessionStatus, SessionTurn,
-    StartTurnRequest, SwitchAccountRequest, ThemePreference, UpdateAccountAuditPolicyRequest,
-    UpdateAccountReplyProviderRequest, UpdateMemberRequest, UpdateMemberResponse,
-    UpdatePreferencesRequest, UserPreferences,
+    EnqueueSessionFollowupResponse, ForkSessionRequest, ForkSessionResponse, HealthResponse,
+    InFlightWorkSummary, LoginRequest, LogoutResponse, MemberSetupRequest,
+    MemberSetupTokenResponse, PolicyDecision, ProblemDetails, ReplyProviderCatalogResponse,
+    ReplyProviderDescriptor, ResumeSessionRequest, ResumeSessionResponse, ReviewDecision,
+    ReviewRequest, ReviewResponse, RotateMemberSetupTokenRequest, RunDetail, SessionDetail,
+    SessionEvent, SessionFlushBarrier, SessionFlushBarrierStatus, SessionFollowupListResponse,
+    SessionStatus, SessionTurn, StartTurnRequest, SwitchAccountRequest, ThemePreference,
+    UpdateAccountAuditPolicyRequest, UpdateAccountReplyProviderRequest, UpdateMemberRequest,
+    UpdateMemberResponse, UpdatePreferencesRequest, UserPreferences,
 };
 #[cfg(test)]
 use runtime::ReplyJobSpec;
@@ -1270,6 +1270,7 @@ fn build_authenticated_app(state: ApiState) -> Router {
         .route("/api/v1/overview", get(overview))
         .route("/api/v1/sessions", get(list_sessions).post(create_session))
         .route("/api/v1/sessions/{id}", get(session_detail))
+        .route("/api/v1/sessions/{id}/forks", post(fork_session))
         .route("/api/v1/sessions/{id}/resume", post(resume_session))
         .route("/api/v1/sessions/{id}/flush", post(flush_session))
         .route(
@@ -5144,6 +5145,32 @@ async fn create_session(
         .create_session_for_actor(&current.principal.authz, request, &idempotency_key)
         .await?;
     Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn fork_session(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    Path(parent_session_id): Path<String>,
+    headers: HeaderMap,
+    payload: Result<Json<ForkSessionRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ForkSessionResponse>), ApiError> {
+    let Json(request) = payload.map_err(ApiError::invalid_json)?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let response = state
+        .store
+        .fork_session_for_actor(
+            &current.principal.authz,
+            &parent_session_id,
+            request,
+            &idempotency_key,
+        )
+        .await?;
+    let status = if response.replayed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((status, Json(response)))
 }
 
 async fn session_detail(
@@ -11538,6 +11565,171 @@ mod tests {
                 ReplyMessage::new(ReplyRole::Context, second_context),
             ]
         );
+
+        drop(app);
+        drop(store);
+        cleanup_test_database(&path);
+    }
+
+    #[tokio::test]
+    async fn session_fork_api_replays_an_exact_parent_prefix_into_new_agent_context() {
+        let unique = UserId::generate().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "zeus-api-session-fork-{}.db",
+            unique.as_str().replace(':', "-")
+        ));
+        let store = DemoStore::open(&path).await.unwrap();
+        let owner = provision_test_owner(&store, "user-fork", "fork-owner").await;
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: "session-fork-parent".into(),
+                    title: "Fork parent".into(),
+                },
+                "create-fork-parent",
+            )
+            .await
+            .unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(RecordingProvider::new(Arc::clone(&requests))),
+        )
+        .unwrap();
+
+        for (turn_id, message, sequence, key) in [
+            ("turn-fork-parent-alpha", "remember alpha", 1, "fork-alpha"),
+            ("turn-fork-parent-beta", "remember beta", 4, "fork-beta"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/v1/sessions/session-fork-parent/turns")
+                        .header(header::HOST, "zeus.test")
+                        .header(header::ORIGIN, "http://zeus.test")
+                        .header(header::COOKIE, &owner.cookie_header)
+                        .header(CSRF_HEADER, &owner.csrf_token)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header("idempotency-key", key)
+                        .body(Body::from(
+                            serde_json::json!({
+                                "turn_id": turn_id,
+                                "user_message": message,
+                                "expected_sequence": sequence,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let settled = wait_for_ready_session(&store, &owner.authz, "session-fork-parent").await;
+            assert_eq!(settled.session.sequence, sequence + 3);
+        }
+
+        let fork_request = || {
+            Request::post("/api/v1/sessions/session-fork-parent/forks")
+                .header(header::HOST, "zeus.test")
+                .header(header::ORIGIN, "http://zeus.test")
+                .header(header::COOKIE, &owner.cookie_header)
+                .header(CSRF_HEADER, &owner.csrf_token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("idempotency-key", "fork-parent-at-alpha")
+                .body(Body::from(
+                    serde_json::json!({
+                        "id": "session-fork-child",
+                        "title": "Fork child",
+                        "through_sequence": 4,
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+        let forked = app.clone().oneshot(fork_request()).await.unwrap();
+        assert_eq!(forked.status(), StatusCode::CREATED);
+        let forked: ForkSessionResponse = response_json(forked).await;
+        assert!(!forked.replayed);
+        assert_eq!(forked.session.sequence, 4);
+        assert_eq!(forked.fork.parent_session_id, "session-fork-parent");
+        assert_eq!(forked.fork.parent_sequence, 4);
+        assert_eq!(forked.fork.inherited_turns, 1);
+
+        let replay = app.clone().oneshot(fork_request()).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay: ForkSessionResponse = response_json(replay).await;
+        assert!(replay.replayed);
+        assert_eq!(replay.session, forked.session);
+        assert_eq!(replay.fork, forked.fork);
+
+        let detail = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/sessions/session-fork-child")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail: SessionDetail = response_json(detail).await;
+        assert_eq!(detail.fork.as_ref(), Some(&forked.fork));
+        assert_eq!(detail.turns.len(), 1);
+        assert_eq!(detail.turns[0].user_message, "remember alpha");
+
+        let continued = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-fork-child/turns")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "fork-child-continue")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-fork-child-continue",
+                            "user_message": "continue the alpha branch",
+                            "expected_sequence": 4,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(continued.status(), StatusCode::ACCEPTED);
+        wait_for_ready_session(&store, &owner.authz, "session-fork-child").await;
+
+        let recorded = requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 3);
+        let branch = &recorded[2].messages;
+        assert_eq!(branch[0].role, ReplyRole::System);
+        assert_eq!(
+            branch[1],
+            ReplyMessage::new(ReplyRole::User, "remember alpha")
+        );
+        assert_eq!(
+            branch[2],
+            ReplyMessage::new(ReplyRole::Assistant, "durable answer 1")
+        );
+        assert_eq!(
+            branch[3],
+            ReplyMessage::new(ReplyRole::User, "continue the alpha branch")
+        );
+        assert_eq!(branch.last().unwrap().role, ReplyRole::Context);
+        assert!(
+            branch
+                .iter()
+                .all(|message| !message.content.contains("remember beta")),
+            "the child must not observe parent history after its fork boundary"
+        );
+        store.verify_integrity().await.unwrap();
 
         drop(app);
         drop(store);

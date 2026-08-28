@@ -15,13 +15,14 @@ use protocol::{
     ApprovalScope, ApprovalStatus, AssistantReplyProvenance, AttachRunRequest, AttachRunResponse,
     COLLECTION_PAGE_MAX_LIMIT, CreateSessionRequest, CreateSessionResponse, EVENT_PAGE_MAX_LIMIT,
     EnqueueSessionFollowupRequest, EnqueueSessionFollowupResponse, EventType, FlushSessionRequest,
-    FlushSessionResponse, IncidentStatus, IncidentSummary, NotDispatchedReason, ReadPageInfo,
-    ResourceEnvelopeError, ResumeSessionRequest, ResumeSessionResponse, ReviewDecision,
-    ReviewResponse, RunEvent, RunEventData, RunEventPage, RunStatus, RunSummary, SandboxProfile,
-    SessionDetail, SessionDetailPagination, SessionEvent, SessionEventData, SessionEventPage,
-    SessionFlushAck, SessionFlushBarrier, SessionFlushBarrierStatus, SessionFollowup,
-    SessionFollowupStatus, SessionStatus, SessionSummary, SessionTurn, SessionTurnStatus, Severity,
-    StartTurnRequest, StartTurnResponse, ToolCallStatus, ToolEffect, ToolOutcome,
+    FlushSessionResponse, ForkSessionRequest, ForkSessionResponse, IncidentStatus, IncidentSummary,
+    NotDispatchedReason, ReadPageInfo, ResourceEnvelopeError, ResumeSessionRequest,
+    ResumeSessionResponse, ReviewDecision, ReviewResponse, RunEvent, RunEventData, RunEventPage,
+    RunStatus, RunSummary, SandboxProfile, SessionDetail, SessionDetailPagination, SessionEvent,
+    SessionEventData, SessionEventPage, SessionFlushAck, SessionFlushBarrier,
+    SessionFlushBarrierStatus, SessionFollowup, SessionFollowupStatus, SessionFork, SessionStatus,
+    SessionSummary, SessionTurn, SessionTurnStatus, Severity, StartTurnRequest, StartTurnResponse,
+    ToolCallStatus, ToolEffect, ToolOutcome,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Serialize, de::DeserializeOwned};
@@ -60,7 +61,7 @@ use crate::{
     SwitchAuthSessionResult, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 33;
+const CURRENT_SCHEMA_VERSION: i64 = 34;
 const LOCAL_ACCOUNT_ID: &str = "acc_local";
 const MAX_ACCOUNTS_PER_USER: i64 = 16;
 const MAX_ACCOUNTS_GLOBAL: i64 = 64;
@@ -103,6 +104,18 @@ const MIGRATION_0031: &str = include_str!("../migrations/0031_session_followups.
 const MIGRATION_0032: &str = include_str!("../migrations/0032_agent_model_output_chunks.sql");
 const MIGRATION_0033: &str =
     include_str!("../migrations/0033_agent_running_model_cancellation.sql");
+const MIGRATION_0034: &str = include_str!("../migrations/0034_session_forks.sql");
+const MIGRATION_0034_TRIGGER_NAMES: &[&str] = &[
+    "session_forks_validate_insert",
+    "session_forks_reject_update",
+    "session_forks_reject_delete",
+    "session_fork_turns_validate_insert",
+    "session_fork_turns_reject_update",
+    "session_fork_turns_reject_delete",
+    "session_command_receipts_require_authority",
+    "session_command_receipts_reject_update",
+    "session_command_receipts_reject_delete",
+];
 const MIGRATION_0022_TRIGGER_NAMES: &[&str] = &[
     "knowledge_corpus_revisions_reject_update",
     "knowledge_corpus_revisions_reject_delete",
@@ -845,6 +858,35 @@ impl SqliteStore {
                 request,
                 &key,
                 Some(&context),
+                &limits,
+                &physical_limits,
+            )
+        })
+        .await
+    }
+
+    /// Creates an independent child Session containing every complete parent
+    /// conversation turn committed at the requested historical boundary.
+    pub async fn fork_session_for_actor(
+        &self,
+        context: &AuthzContext,
+        parent_session_id: &str,
+        request: ForkSessionRequest,
+        idempotency_key: &str,
+    ) -> Result<ForkSessionResponse, StorageError> {
+        let context = validated_authz_context(context)?;
+        let parent_session_id =
+            validated_durable_reference(parent_session_id, "parent session ID")?.to_owned();
+        let key = normalized_key(idempotency_key)?.to_owned();
+        let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            fork_session(
+                connection,
+                &context,
+                &parent_session_id,
+                request,
+                &key,
                 &limits,
                 &physical_limits,
             )
@@ -3708,6 +3750,13 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
             params![33, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 34 {
+        transaction.execute_batch(MIGRATION_0034)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![34, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
     // The execution verifier now understands the v22 knowledge binding. Run
     // it only after every missing schema step has been installed so upgrades
     // from v19 and older never query a column that does not exist yet. This
@@ -3722,6 +3771,7 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
         agent::verify_agent_goal_round_integrity(&transaction)?;
         verify_session_followup_integrity(&transaction)?;
         agent::verify_agent_model_output_integrity(&transaction)?;
+        verify_session_fork_integrity(&transaction)?;
         provider::verify_account_reply_provider_integrity(&transaction)?;
         execution::verify_agent_execution_integrity(&transaction)?;
     }
@@ -4378,12 +4428,12 @@ fn readiness(
                'agent_knowledge_contexts', 'agent_knowledge_legacy_boundary',
                'agent_knowledge_legacy_agents', 'account_knowledge_catalogs',
                'knowledge_catalog_receipts', 'session_compaction_jobs',
-               'agent_todo_snapshots'
+               'agent_todo_snapshots', 'session_forks', 'session_fork_turns'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if table_count != 44 {
+    if table_count != 46 {
         return Err(StorageError::CorruptData(
             "one or more required tables are missing".into(),
         ));
@@ -4748,12 +4798,14 @@ fn readiness(
                'session_followups_ready_idx',
                'session_followups_actor_capacity_idx',
                'agent_model_output_chunks_turn_page_idx',
-               'agent_model_output_chunks_job_idx'
+               'agent_model_output_chunks_job_idx',
+               'session_forks_parent_idx',
+               'session_fork_turns_parent_idx'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if point_query_indexes != 77 {
+    if point_query_indexes != 79 {
         return Err(StorageError::CorruptData(
             "one or more point-query indexes are missing".into(),
         ));
@@ -4957,13 +5009,19 @@ fn readiness(
                'agent_model_output_chunks_validate_insert',
                'agent_model_output_chunks_reject_update',
                'agent_model_output_chunks_reject_delete',
+               'session_forks_validate_insert',
+               'session_forks_reject_update',
+               'session_forks_reject_delete',
+               'session_fork_turns_validate_insert',
+               'session_fork_turns_reject_update',
+               'session_fork_turns_reject_delete',
                'schema_migrations_reject_update',
                'schema_migrations_reject_delete'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 173 {
+    if trigger_count != 179 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
         ));
@@ -4980,7 +5038,9 @@ fn readiness(
     verify_migration_trigger_definitions(connection, MIGRATION_0031, MIGRATION_0031_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0032, MIGRATION_0032_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0033, MIGRATION_0033_TRIGGER_NAMES)?;
+    verify_migration_trigger_definitions(connection, MIGRATION_0034, MIGRATION_0034_TRIGGER_NAMES)?;
     verify_session_followup_integrity(connection)?;
+    verify_session_fork_integrity(connection)?;
 
     let agent_pending_call_fk: i64 = connection.query_row(
         r#"SELECT COUNT(*)
@@ -10337,6 +10397,7 @@ fn query_session_detail(
 
     let turns = query_session_turns(&transaction, session_id)?;
     let events = query_session_events(&transaction, session_id, 0)?;
+    let fork = query_session_fork(&transaction, session_id)?;
     let event_head = events.last().map_or(0, |event| event.sequence);
     if event_head != session.sequence {
         return Err(StorageError::CorruptData(format!(
@@ -10348,6 +10409,7 @@ fn query_session_detail(
     transaction.commit()?;
     Ok(SessionDetail {
         session,
+        fork,
         run_ids,
         turns,
         events,
@@ -10380,6 +10442,7 @@ fn query_session_detail_for_actor(
 
     let turns = query_session_turns(&transaction, session_id)?;
     let events = query_session_events(&transaction, session_id, 0)?;
+    let fork = query_session_fork(&transaction, session_id)?;
     let event_head = events.last().map_or(0, |event| event.sequence);
     if event_head != session.sequence {
         return Err(StorageError::CorruptData(format!(
@@ -10391,6 +10454,7 @@ fn query_session_detail_for_actor(
     transaction.commit()?;
     Ok(SessionDetail {
         session,
+        fork,
         run_ids,
         turns,
         events,
@@ -10451,6 +10515,7 @@ fn query_session_detail_page_for_actor(
     let session = query_session_summary(&transaction, session_id)?;
     validate_session_event_tail(&transaction, &session)?;
     validate_active_turn_projection(&transaction, &session)?;
+    let fork = query_session_fork(&transaction, session_id)?;
 
     let (run_ids, run_ids_page) = query_session_run_ids_tail(
         &transaction,
@@ -10485,6 +10550,7 @@ fn query_session_detail_page_for_actor(
     transaction.commit()?;
     Ok(SessionDetail {
         session,
+        fork,
         run_ids,
         turns,
         events,
@@ -10494,6 +10560,40 @@ fn query_session_detail_page_for_actor(
             events: events_page,
         }),
     })
+}
+
+fn query_session_fork(
+    connection: &Connection,
+    child_session_id: &str,
+) -> Result<Option<SessionFork>, StorageError> {
+    let stored = connection
+        .query_row(
+            r#"SELECT parent_session_id, parent_sequence,
+                      inherited_turn_count, created_at
+               FROM session_forks WHERE child_session_id = ?1"#,
+            [child_session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    stored
+        .map(
+            |(parent_session_id, parent_sequence, inherited_turns, created_at)| {
+                Ok(SessionFork {
+                    parent_session_id,
+                    parent_sequence: i64_to_u64(parent_sequence, "fork parent sequence")?,
+                    inherited_turns: i64_to_u64(inherited_turns, "fork inherited turns")?,
+                    created_at,
+                })
+            },
+        )
+        .transpose()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11000,6 +11100,456 @@ fn create_session(
     Ok(response)
 }
 
+#[derive(Debug)]
+struct ForkSourceTurn {
+    turn: SessionTurn,
+    user_event: SessionEvent,
+    assistant_event: SessionEvent,
+    flush_event: SessionEvent,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fork_session(
+    connection: &mut Connection,
+    context: &AuthzContext,
+    parent_session_id: &str,
+    request: ForkSessionRequest,
+    idempotency_key: &str,
+    limits: &StorageLimits,
+    physical_limits: &SqlitePhysicalLimits,
+) -> Result<ForkSessionResponse, StorageError> {
+    normalized_key(idempotency_key)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_current_authority(&transaction, context, AccountCapability::SessionWrite)?;
+    require_active_session_actor(&transaction, parent_session_id, context)?;
+    validate_fork_session_request(&request)?;
+    let fingerprint = session_command_fingerprint(Some(parent_session_id), &request)?;
+    if let Some(mut response) = load_session_command_receipt_for_actor::<ForkSessionResponse>(
+        &transaction,
+        context,
+        idempotency_key,
+        "fork_session",
+        &fingerprint,
+        None,
+    )? {
+        response.replayed = true;
+        transaction.commit()?;
+        return Ok(response);
+    }
+
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Admission,
+    )?;
+    let parent = query_session_summary(&transaction, parent_session_id)?;
+    validate_session_event_tail(&transaction, &parent)?;
+    validate_active_turn_projection(&transaction, &parent)?;
+    if request.through_sequence == 0 || request.through_sequence > parent.sequence {
+        return Err(StorageError::ConcurrentModification);
+    }
+    if query_session_summary_optional(&transaction, &request.id)?.is_some() {
+        return Err(StorageError::SessionAlreadyExists(request.id));
+    }
+    require_session_count_capacity(
+        &transaction,
+        context.account_id.as_str(),
+        Some(&context.user_id),
+        limits,
+    )?;
+
+    let max_inherited_turns = limits.session_event_slots_per_session.saturating_sub(1) / 3;
+    let source = query_session_fork_source_turns(
+        &transaction,
+        parent_session_id,
+        request.through_sequence,
+        max_inherited_turns,
+    )?;
+    let timestamp = now();
+    transaction.execute(
+        r#"INSERT INTO sessions(
+               id, title, status, created_at, updated_at, sequence,
+               projection_sequence, active_turn_id, owner_user_id, account_id
+           ) VALUES (?1, ?2, 'ready', ?3, ?3, 0, 0, NULL, ?4, ?5)"#,
+        params![
+            request.id,
+            request.title,
+            timestamp,
+            context.user_id,
+            context.account_id.as_str()
+        ],
+    )?;
+    transaction.execute(
+        r#"INSERT INTO session_forks(
+               child_session_id, account_id, parent_session_id, parent_sequence,
+               inherited_turn_count, created_by_user_id,
+               created_by_membership_revision, created_at
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+        params![
+            request.id,
+            context.account_id.as_str(),
+            parent_session_id,
+            u64_to_i64(request.through_sequence, "fork parent sequence")?,
+            i64::try_from(source.len())
+                .map_err(|_| StorageError::IntegerOutOfRange("fork inherited turn count"))?,
+            context.user_id,
+            u64_to_i64(
+                context.membership_revision.get(),
+                "fork actor membership revision"
+            )?,
+            timestamp,
+        ],
+    )?;
+
+    let mut prepared_events = Vec::with_capacity(
+        source
+            .len()
+            .checked_mul(3)
+            .and_then(|count| count.checked_add(1))
+            .ok_or(StorageError::IntegerOutOfRange("fork event count"))?,
+    );
+    let created = build_session_event(
+        &request.id,
+        1,
+        &timestamp,
+        SessionEventData::SessionCreated {
+            title: request.title.clone(),
+        },
+    );
+    prepared_events.push((created.clone(), encode_event_payload(&created)?));
+    let mut prepared_turns = Vec::with_capacity(source.len());
+    for (index, source_turn) in source.iter().enumerate() {
+        let ordinal = index
+            .checked_add(1)
+            .ok_or(StorageError::IntegerOutOfRange("fork turn ordinal"))?;
+        let ordinal_u64 = u64::try_from(ordinal)
+            .map_err(|_| StorageError::IntegerOutOfRange("fork turn ordinal"))?;
+        let child_turn_id = fork_turn_id(&request.id, &source_turn.turn.id);
+        let child_user_sequence = ordinal_u64
+            .checked_sub(1)
+            .and_then(|value| value.checked_mul(3))
+            .and_then(|value| value.checked_add(2))
+            .ok_or(StorageError::IntegerOutOfRange("fork child event sequence"))?;
+        let child_assistant_sequence = child_user_sequence
+            .checked_add(1)
+            .ok_or(StorageError::IntegerOutOfRange("fork child event sequence"))?;
+        let child_flush_sequence = child_assistant_sequence
+            .checked_add(1)
+            .ok_or(StorageError::IntegerOutOfRange("fork child event sequence"))?;
+
+        let SessionEventData::UserMessage { content, .. } = &source_turn.user_event.data else {
+            return Err(StorageError::CorruptData(
+                "fork source user event has the wrong payload kind".into(),
+            ));
+        };
+        let SessionEventData::AssistantMessage {
+            content: assistant_content,
+            provenance,
+            ..
+        } = &source_turn.assistant_event.data
+        else {
+            return Err(StorageError::CorruptData(
+                "fork source assistant event has the wrong payload kind".into(),
+            ));
+        };
+        let user_event = build_session_event(
+            &request.id,
+            child_user_sequence,
+            &source_turn.user_event.at,
+            SessionEventData::UserMessage {
+                turn_id: child_turn_id.clone(),
+                content: content.clone(),
+            },
+        );
+        let assistant_event = build_session_event(
+            &request.id,
+            child_assistant_sequence,
+            &source_turn.assistant_event.at,
+            SessionEventData::AssistantMessage {
+                turn_id: child_turn_id.clone(),
+                content: assistant_content.clone(),
+                provenance: provenance.clone(),
+            },
+        );
+        let flush_event = build_session_event(
+            &request.id,
+            child_flush_sequence,
+            &source_turn.flush_event.at,
+            SessionEventData::TurnFlushed {
+                turn_id: child_turn_id.clone(),
+            },
+        );
+        prepared_events.push((user_event.clone(), encode_event_payload(&user_event)?));
+        prepared_events.push((
+            assistant_event.clone(),
+            encode_event_payload(&assistant_event)?,
+        ));
+        prepared_events.push((flush_event.clone(), encode_event_payload(&flush_event)?));
+        prepared_turns.push((
+            source_turn,
+            child_turn_id,
+            ordinal_u64,
+            child_user_sequence,
+            child_assistant_sequence,
+            child_flush_sequence,
+        ));
+    }
+    let payload_bytes = prepared_events
+        .iter()
+        .try_fold(0i64, |total, (_, payload)| {
+            total
+                .checked_add(payload.bytes)
+                .ok_or(StorageError::IntegerOutOfRange("fork event payload bytes"))
+        })?;
+    require_session_event_capacity(
+        &transaction,
+        &request.id,
+        EventCapacityRequest::events(prepared_events.len(), payload_bytes),
+        limits,
+    )?;
+
+    let mut event_index = 0usize;
+    let (created_event, created_payload) = &prepared_events[event_index];
+    insert_session_event(&transaction, &request.id, created_event, created_payload)?;
+    update_session_projection(
+        &transaction,
+        &request.id,
+        0,
+        SessionStatus::Ready,
+        None,
+        1,
+        &timestamp,
+    )?;
+    event_index += 1;
+
+    for (
+        source_turn,
+        child_turn_id,
+        ordinal,
+        child_user_sequence,
+        child_assistant_sequence,
+        child_flush_sequence,
+    ) in &prepared_turns
+    {
+        transaction.execute(
+            r#"INSERT INTO session_turns(
+                   id, session_id, ordinal, status, user_message,
+                   assistant_message, started_at, completed_at
+               ) VALUES (?1, ?2, ?3, 'flushed', ?4, ?5, ?6, ?7)"#,
+            params![
+                child_turn_id,
+                request.id,
+                u64_to_i64(*ordinal, "fork turn ordinal")?,
+                source_turn.turn.user_message,
+                source_turn.turn.assistant_message,
+                source_turn.turn.started_at,
+                source_turn.turn.completed_at,
+            ],
+        )?;
+        for expected_sequence in [
+            *child_user_sequence,
+            *child_assistant_sequence,
+            *child_flush_sequence,
+        ] {
+            let (event, payload) = prepared_events.get(event_index).ok_or_else(|| {
+                StorageError::CorruptData("fork prepared event sequence is incomplete".into())
+            })?;
+            if event.sequence != expected_sequence {
+                return Err(StorageError::CorruptData(
+                    "fork prepared event sequence is not contiguous".into(),
+                ));
+            }
+            insert_session_event(&transaction, &request.id, event, payload)?;
+            update_session_projection(
+                &transaction,
+                &request.id,
+                expected_sequence - 1,
+                SessionStatus::Ready,
+                None,
+                expected_sequence,
+                &timestamp,
+            )?;
+            event_index += 1;
+        }
+        transaction.execute(
+            r#"INSERT INTO session_fork_turns(
+                   child_session_id, child_turn_id, parent_session_id, parent_turn_id,
+                   ordinal, parent_turn_ordinal, parent_user_sequence,
+                   parent_assistant_sequence, parent_flush_sequence,
+                   child_user_sequence, child_assistant_sequence, child_flush_sequence
+               ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
+            params![
+                request.id,
+                child_turn_id,
+                parent_session_id,
+                source_turn.turn.id,
+                u64_to_i64(*ordinal, "fork turn ordinal")?,
+                u64_to_i64(source_turn.turn.ordinal, "fork parent turn ordinal")?,
+                u64_to_i64(source_turn.user_event.sequence, "fork parent user sequence")?,
+                u64_to_i64(
+                    source_turn.assistant_event.sequence,
+                    "fork parent assistant sequence"
+                )?,
+                u64_to_i64(
+                    source_turn.flush_event.sequence,
+                    "fork parent flush sequence"
+                )?,
+                u64_to_i64(*child_user_sequence, "fork child user sequence")?,
+                u64_to_i64(*child_assistant_sequence, "fork child assistant sequence")?,
+                u64_to_i64(*child_flush_sequence, "fork child flush sequence")?,
+            ],
+        )?;
+    }
+    if event_index != prepared_events.len() {
+        return Err(StorageError::CorruptData(
+            "fork prepared event sequence has an unused suffix".into(),
+        ));
+    }
+
+    let fork = SessionFork {
+        parent_session_id: parent_session_id.to_owned(),
+        parent_sequence: request.through_sequence,
+        inherited_turns: u64::try_from(source.len())
+            .map_err(|_| StorageError::IntegerOutOfRange("fork inherited turn count"))?,
+        created_at: timestamp,
+    };
+    let response = ForkSessionResponse {
+        session: query_session_summary(&transaction, &request.id)?,
+        fork,
+        replayed: false,
+    };
+    insert_session_command_receipt_for_actor(
+        &transaction,
+        context,
+        idempotency_key,
+        "fork_session",
+        &fingerprint,
+        &response,
+        &request.id,
+        response.session.sequence,
+    )?;
+    transaction.commit()?;
+    Ok(response)
+}
+
+fn query_session_fork_source_turns(
+    connection: &Connection,
+    parent_session_id: &str,
+    through_sequence: u64,
+    max_turns: usize,
+) -> Result<Vec<ForkSourceTurn>, StorageError> {
+    let fetch_limit = max_turns
+        .checked_add(1)
+        .ok_or(StorageError::IntegerOutOfRange("fork source turn limit"))?;
+    let mut statement = connection.prepare(
+        r#"SELECT turn.id, turn.session_id, turn.ordinal, turn.status,
+                  turn.user_message, turn.assistant_message,
+                  turn.started_at, turn.completed_at
+           FROM session_events flushed
+           JOIN session_events assistant
+             ON assistant.session_id = flushed.session_id
+            AND assistant.turn_id = flushed.turn_id
+            AND assistant.sequence + 1 = flushed.sequence
+            AND assistant.event_kind = 'assistant_message'
+           JOIN session_events user
+             ON user.session_id = assistant.session_id
+            AND user.turn_id = assistant.turn_id
+            AND user.event_kind = 'user_message'
+            AND user.sequence < assistant.sequence
+           JOIN session_turns turn
+             ON turn.session_id = flushed.session_id
+            AND turn.id = flushed.turn_id
+           WHERE flushed.session_id = ?1
+             AND flushed.event_kind = 'turn_flushed'
+             AND flushed.sequence <= ?2
+             AND turn.status = 'flushed'
+             AND turn.assistant_message IS NOT NULL
+           ORDER BY flushed.sequence
+           LIMIT ?3"#,
+    )?;
+    let stored = statement
+        .query_map(
+            params![
+                parent_session_id,
+                u64_to_i64(through_sequence, "fork source sequence")?,
+                capacity_limit(fetch_limit)?
+            ],
+            decode_session_turn_row,
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    if stored.len() > max_turns {
+        return Err(StorageError::StorageQuotaExceeded);
+    }
+    let mut source = Vec::with_capacity(stored.len());
+    for stored in stored {
+        let turn = stored.decode()?;
+        let user_event =
+            query_session_turn_event(connection, parent_session_id, &turn.id, "user_message")?;
+        let assistant_event =
+            query_session_turn_event(connection, parent_session_id, &turn.id, "assistant_message")?;
+        let flush_event =
+            query_session_turn_event(connection, parent_session_id, &turn.id, "turn_flushed")?;
+        let SessionEventData::UserMessage {
+            turn_id: user_turn_id,
+            content: user_content,
+        } = &user_event.data
+        else {
+            return Err(StorageError::CorruptData(
+                "fork source user event has the wrong payload kind".into(),
+            ));
+        };
+        let SessionEventData::AssistantMessage {
+            turn_id: assistant_turn_id,
+            content: assistant_content,
+            ..
+        } = &assistant_event.data
+        else {
+            return Err(StorageError::CorruptData(
+                "fork source assistant event has the wrong payload kind".into(),
+            ));
+        };
+        let SessionEventData::TurnFlushed {
+            turn_id: flush_turn_id,
+        } = &flush_event.data
+        else {
+            return Err(StorageError::CorruptData(
+                "fork source flush event has the wrong payload kind".into(),
+            ));
+        };
+        if user_turn_id != &turn.id
+            || assistant_turn_id != &turn.id
+            || flush_turn_id != &turn.id
+            || user_content != &turn.user_message
+            || Some(assistant_content.as_str()) != turn.assistant_message.as_deref()
+            || user_event.sequence >= assistant_event.sequence
+            || assistant_event.sequence.checked_add(1) != Some(flush_event.sequence)
+            || flush_event.sequence > through_sequence
+        {
+            return Err(StorageError::CorruptData(format!(
+                "fork source turn `{}` differs from its immutable event triple",
+                turn.id
+            )));
+        }
+        source.push(ForkSourceTurn {
+            turn,
+            user_event,
+            assistant_event,
+            flush_event,
+        });
+    }
+    Ok(source)
+}
+
+fn fork_turn_id(child_session_id: &str, parent_turn_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"zeus.session-fork-turn.v1\0");
+    hasher.update(child_session_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(parent_turn_id.as_bytes());
+    format!("fork-turn-{:x}", hasher.finalize())
+}
+
 fn attach_run(
     connection: &mut Connection,
     session_id: &str,
@@ -11226,6 +11776,359 @@ fn verify_session_followup_integrity(connection: &Connection) -> Result<(), Stor
         )));
     }
     Ok(())
+}
+
+fn verify_session_fork_integrity(connection: &Connection) -> Result<(), StorageError> {
+    let lineage_cycle = connection
+        .query_row(
+            r#"WITH RECURSIVE ancestry(origin, session_id) AS (
+                   SELECT child_session_id, parent_session_id FROM session_forks
+                   UNION
+                   SELECT ancestry.origin, fork.parent_session_id
+                   FROM ancestry
+                   JOIN session_forks fork
+                     ON fork.child_session_id = ancestry.session_id
+               )
+               SELECT origin FROM ancestry WHERE origin = session_id LIMIT 1"#,
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(session_id) = lineage_cycle {
+        return Err(StorageError::CorruptData(format!(
+            "session fork `{session_id}` participates in a lineage cycle"
+        )));
+    }
+    let orphan_receipt = connection
+        .query_row(
+            r#"SELECT receipt.session_id
+               FROM session_command_receipts receipt
+               LEFT JOIN session_forks fork
+                 ON fork.child_session_id = receipt.session_id
+               WHERE receipt.operation = 'fork_session'
+                 AND fork.child_session_id IS NULL
+               LIMIT 1"#,
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(session_id) = orphan_receipt {
+        return Err(StorageError::CorruptData(format!(
+            "session fork receipt `{session_id}` has no lineage record"
+        )));
+    }
+
+    let mut statement = connection.prepare(
+        r#"SELECT fork.child_session_id, fork.account_id, fork.parent_session_id,
+                  fork.parent_sequence, fork.inherited_turn_count,
+                  fork.created_by_user_id, fork.created_by_membership_revision,
+                  fork.created_at, child.title, child.created_at,
+                  child.account_id, child.owner_user_id, parent.account_id
+           FROM session_forks fork
+           JOIN sessions child ON child.id = fork.child_session_id
+           JOIN sessions parent ON parent.id = fork.parent_session_id
+           ORDER BY fork.child_session_id"#,
+    )?;
+    let forks = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, String>(12)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    for (
+        child_session_id,
+        account_id,
+        parent_session_id,
+        parent_sequence,
+        inherited_turn_count,
+        created_by_user_id,
+        created_by_membership_revision,
+        created_at,
+        child_title,
+        child_created_at,
+        child_account_id,
+        child_owner_user_id,
+        parent_account_id,
+    ) in forks
+    {
+        let parent_sequence = i64_to_u64(parent_sequence, "fork parent sequence")?;
+        let inherited_turn_count = i64_to_u64(inherited_turn_count, "fork inherited turn count")?;
+        let created_by_membership_revision = i64_to_u64(
+            created_by_membership_revision,
+            "fork actor membership revision",
+        )?;
+        if child_session_id == parent_session_id
+            || account_id != child_account_id
+            || account_id != parent_account_id
+            || child_owner_user_id.as_deref() != Some(created_by_user_id.as_str())
+            || child_created_at != created_at
+            || created_by_membership_revision == 0
+        {
+            return Err(StorageError::CorruptData(format!(
+                "session fork `{child_session_id}` has inconsistent lineage authority"
+            )));
+        }
+        let parent = query_session_summary(connection, &parent_session_id)?;
+        if parent_sequence == 0 || parent_sequence > parent.sequence {
+            return Err(StorageError::CorruptData(format!(
+                "session fork `{child_session_id}` points beyond its parent ledger"
+            )));
+        }
+        query_session_event(connection, &parent_session_id, parent_sequence)?;
+
+        let mut mapping_statement = connection.prepare(
+            r#"SELECT child_turn_id, parent_turn_id, ordinal, parent_turn_ordinal,
+                      parent_user_sequence, parent_assistant_sequence,
+                      parent_flush_sequence, child_user_sequence,
+                      child_assistant_sequence, child_flush_sequence
+               FROM session_fork_turns
+               WHERE child_session_id = ?1
+               ORDER BY ordinal"#,
+        )?;
+        let mappings = mapping_statement
+            .query_map([&child_session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(mapping_statement);
+        if u64::try_from(mappings.len()).ok() != Some(inherited_turn_count) {
+            return Err(StorageError::CorruptData(format!(
+                "session fork `{child_session_id}` inherited-turn count is inconsistent"
+            )));
+        }
+        for (index, mapping) in mappings.into_iter().enumerate() {
+            let (
+                child_turn_id,
+                parent_turn_id,
+                ordinal,
+                parent_turn_ordinal,
+                parent_user_sequence,
+                parent_assistant_sequence,
+                parent_flush_sequence,
+                child_user_sequence,
+                child_assistant_sequence,
+                child_flush_sequence,
+            ) = mapping;
+            let expected_ordinal = u64::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_add(1))
+                .ok_or(StorageError::IntegerOutOfRange("fork mapping ordinal"))?;
+            let ordinal = i64_to_u64(ordinal, "fork mapping ordinal")?;
+            let parent_turn_ordinal = i64_to_u64(parent_turn_ordinal, "fork parent turn ordinal")?;
+            let parent_user_sequence =
+                i64_to_u64(parent_user_sequence, "fork parent user sequence")?;
+            let parent_assistant_sequence =
+                i64_to_u64(parent_assistant_sequence, "fork parent assistant sequence")?;
+            let parent_flush_sequence =
+                i64_to_u64(parent_flush_sequence, "fork parent flush sequence")?;
+            let child_user_sequence = i64_to_u64(child_user_sequence, "fork child user sequence")?;
+            let child_assistant_sequence =
+                i64_to_u64(child_assistant_sequence, "fork child assistant sequence")?;
+            let child_flush_sequence =
+                i64_to_u64(child_flush_sequence, "fork child flush sequence")?;
+            let expected_child_user_sequence = expected_ordinal
+                .checked_sub(1)
+                .and_then(|value| value.checked_mul(3))
+                .and_then(|value| value.checked_add(2))
+                .ok_or(StorageError::IntegerOutOfRange("fork child event sequence"))?;
+            if ordinal != expected_ordinal
+                || child_turn_id != fork_turn_id(&child_session_id, &parent_turn_id)
+                || child_user_sequence != expected_child_user_sequence
+                || child_assistant_sequence != child_user_sequence.checked_add(1).unwrap_or(0)
+                || child_flush_sequence != child_assistant_sequence.checked_add(1).unwrap_or(0)
+                || parent_user_sequence >= parent_assistant_sequence
+                || parent_assistant_sequence >= parent_flush_sequence
+                || parent_flush_sequence > parent_sequence
+            {
+                return Err(StorageError::CorruptData(format!(
+                    "session fork `{child_session_id}` has a noncanonical turn mapping"
+                )));
+            }
+            let child_turn = query_session_turn(connection, &child_session_id, &child_turn_id)?;
+            let parent_turn = query_session_turn(connection, &parent_session_id, &parent_turn_id)?;
+            if child_turn.ordinal != ordinal
+                || parent_turn.ordinal != parent_turn_ordinal
+                || child_turn.status != SessionTurnStatus::Flushed
+                || parent_turn.status != SessionTurnStatus::Flushed
+                || child_turn.user_message != parent_turn.user_message
+                || child_turn.assistant_message != parent_turn.assistant_message
+                || child_turn.started_at != parent_turn.started_at
+                || child_turn.completed_at != parent_turn.completed_at
+            {
+                return Err(StorageError::CorruptData(format!(
+                    "session fork `{child_session_id}` turn `{child_turn_id}` differs from its source"
+                )));
+            }
+            let parent_events = [
+                query_session_event(connection, &parent_session_id, parent_user_sequence)?,
+                query_session_event(connection, &parent_session_id, parent_assistant_sequence)?,
+                query_session_event(connection, &parent_session_id, parent_flush_sequence)?,
+            ];
+            let child_events = [
+                query_session_event(connection, &child_session_id, child_user_sequence)?,
+                query_session_event(connection, &child_session_id, child_assistant_sequence)?,
+                query_session_event(connection, &child_session_id, child_flush_sequence)?,
+            ];
+            if !fork_event_triple_matches(
+                &parent_events,
+                &child_events,
+                &parent_turn_id,
+                &child_turn_id,
+            ) {
+                return Err(StorageError::CorruptData(format!(
+                    "session fork `{child_session_id}` turn `{child_turn_id}` event evidence differs from its source"
+                )));
+            }
+        }
+
+        let fork_head = inherited_turn_count
+            .checked_mul(3)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(StorageError::IntegerOutOfRange("fork ledger head"))?;
+        let receipt_count: i64 = connection.query_row(
+            r#"SELECT COUNT(*) FROM session_command_receipts
+               WHERE operation = 'fork_session' AND session_id = ?1"#,
+            [&child_session_id],
+            |row| row.get(0),
+        )?;
+        if receipt_count != 1 {
+            return Err(StorageError::CorruptData(format!(
+                "session fork `{child_session_id}` must have exactly one durable command receipt"
+            )));
+        }
+        let (receipt_account, receipt_actor, fingerprint, response_json, event_sequence) =
+            connection.query_row(
+                r#"SELECT account_id, actor_user_id, request_fingerprint,
+                          response_json, event_sequence
+                   FROM session_command_receipts
+                   WHERE operation = 'fork_session' AND session_id = ?1"#,
+                [&child_session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )?;
+        let request = ForkSessionRequest {
+            id: child_session_id.clone(),
+            title: child_title.clone(),
+            through_sequence: parent_sequence,
+        };
+        let expected_fingerprint = session_command_fingerprint(Some(&parent_session_id), &request)?;
+        let stored_response = serde_json::from_str::<ForkSessionResponse>(&response_json)?;
+        let expected_response = ForkSessionResponse {
+            session: SessionSummary {
+                id: child_session_id.clone(),
+                title: child_title,
+                status: SessionStatus::Ready,
+                created_at: created_at.clone(),
+                updated_at: created_at.clone(),
+                sequence: fork_head,
+                active_turn_id: None,
+            },
+            fork: SessionFork {
+                parent_session_id: parent_session_id.clone(),
+                parent_sequence,
+                inherited_turns: inherited_turn_count,
+                created_at,
+            },
+            replayed: false,
+        };
+        if receipt_account != account_id
+            || receipt_actor.as_deref() != Some(created_by_user_id.as_str())
+            || fingerprint != expected_fingerprint
+            || i64_to_u64(event_sequence, "fork receipt event sequence")? != fork_head
+            || stored_response != expected_response
+        {
+            return Err(StorageError::CorruptData(format!(
+                "session fork `{child_session_id}` command receipt is inconsistent"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn fork_event_triple_matches(
+    parent: &[SessionEvent; 3],
+    child: &[SessionEvent; 3],
+    parent_turn_id: &str,
+    child_turn_id: &str,
+) -> bool {
+    if parent
+        .iter()
+        .zip(child)
+        .any(|(parent, child)| parent.at != child.at)
+    {
+        return false;
+    }
+    matches!(
+        (&parent[0].data, &child[0].data),
+        (
+            SessionEventData::UserMessage {
+                turn_id: parent_id,
+                content: parent_content,
+            },
+            SessionEventData::UserMessage {
+                turn_id: child_id,
+                content: child_content,
+            }
+        ) if parent_id == parent_turn_id
+            && child_id == child_turn_id
+            && parent_content == child_content
+    ) && matches!(
+        (&parent[1].data, &child[1].data),
+        (
+            SessionEventData::AssistantMessage {
+                turn_id: parent_id,
+                content: parent_content,
+                provenance: parent_provenance,
+            },
+            SessionEventData::AssistantMessage {
+                turn_id: child_id,
+                content: child_content,
+                provenance: child_provenance,
+            }
+        ) if parent_id == parent_turn_id
+            && child_id == child_turn_id
+            && parent_content == child_content
+            && parent_provenance == child_provenance
+    ) && matches!(
+        (&parent[2].data, &child[2].data),
+        (
+            SessionEventData::TurnFlushed { turn_id: parent_id },
+            SessionEventData::TurnFlushed { turn_id: child_id },
+        ) if parent_id == parent_turn_id && child_id == child_turn_id
+    )
 }
 
 fn decode_session_followup_status(value: &str) -> Result<SessionFollowupStatus, StorageError> {
@@ -14491,6 +15394,17 @@ fn validated_new_session_title<'a>(
 fn validate_create_session_request(request: &CreateSessionRequest) -> Result<(), StorageError> {
     validated_new_session_id(&request.id, "session ID")?;
     validated_new_session_title(&request.title, "session title")?;
+    Ok(())
+}
+
+fn validate_fork_session_request(request: &ForkSessionRequest) -> Result<(), StorageError> {
+    validated_new_session_id(&request.id, "session ID")?;
+    validated_new_session_title(&request.title, "session title")?;
+    if request.through_sequence == 0 {
+        return Err(StorageError::InvalidResourceEnvelope(
+            "fork through sequence must be greater than zero".into(),
+        ));
+    }
     Ok(())
 }
 

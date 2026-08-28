@@ -55,13 +55,13 @@ use protocol::{
     AgentOutputChunk, AgentOutputChunkPage, Approval, ApprovalStatus, AssistantReplyKind,
     AttachRunRequest, AttachRunResponse, CancelAgentTurnResponse, CreateSessionRequest,
     CreateSessionResponse, EVENT_PAGE_DEFAULT_LIMIT, EnqueueSessionFollowupRequest,
-    EnqueueSessionFollowupResponse, FlushSessionRequest, FlushSessionResponse, NotDispatchedReason,
-    OverviewResponse, PolicyDecision, ResourceEnvelopeError, ResumeSessionRequest,
-    ResumeSessionResponse, ReviewDecision, ReviewRequest, ReviewResponse, RunDetail,
-    RunDetailPagination, RunEvent, RunEventData, RunEventPage, RunSummary, SessionDetail,
-    SessionEvent, SessionEventData, SessionEventPage, SessionFlushBarrier, SessionFollowup,
-    SessionSummary, SessionTurn, StartTurnRequest, StartTurnResponse, ToolCall, ToolExecutorStatus,
-    ToolOutcome,
+    EnqueueSessionFollowupResponse, FlushSessionRequest, FlushSessionResponse, ForkSessionRequest,
+    ForkSessionResponse, NotDispatchedReason, OverviewResponse, PolicyDecision,
+    ResourceEnvelopeError, ResumeSessionRequest, ResumeSessionResponse, ReviewDecision,
+    ReviewRequest, ReviewResponse, RunDetail, RunDetailPagination, RunEvent, RunEventData,
+    RunEventPage, RunSummary, SessionDetail, SessionEvent, SessionEventData, SessionEventPage,
+    SessionFlushBarrier, SessionFollowup, SessionSummary, SessionTurn, StartTurnRequest,
+    StartTurnResponse, ToolCall, ToolExecutorStatus, ToolOutcome,
 };
 use serde_json::Value;
 use skills::{SkillCatalog, register_skill_tools, skill_tool_descriptors};
@@ -1904,6 +1904,11 @@ impl DemoStore {
         Ok(())
     }
 
+    pub async fn verify_integrity(&self) -> Result<(), StoreError> {
+        self.storage.verify_integrity().await?;
+        Ok(())
+    }
+
     pub async fn has_users(&self) -> Result<bool, StoreError> {
         Ok(self.storage.has_users().await?)
     }
@@ -2604,6 +2609,24 @@ impl DemoStore {
             self.publish_session_event(&response.session.id, response.event.clone());
         }
         Ok(response)
+    }
+
+    pub async fn fork_session_for_actor(
+        &self,
+        context: &AuthzContext,
+        parent_session_id: &str,
+        request: ForkSessionRequest,
+        idempotency_key: &str,
+    ) -> Result<ForkSessionResponse, StoreError> {
+        validate_durable_reference(parent_session_id, "parent session ID")?;
+        validate_new_session_id(&request.id, "session ID")?;
+        validate_new_session_title(&request.title, "session title")?;
+        validate_session_sequence(request.through_sequence, "fork through sequence")?;
+        let idempotency_key = normalized_idempotency_key(idempotency_key)?;
+        Ok(self
+            .storage
+            .fork_session_for_actor(context, parent_session_id, request, idempotency_key)
+            .await?)
     }
 
     pub async fn attach_run_for_actor(

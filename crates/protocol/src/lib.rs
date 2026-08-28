@@ -1299,6 +1299,8 @@ pub struct SessionDetailPagination {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionDetail {
     pub session: SessionSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork: Option<SessionFork>,
     pub run_ids: Vec<String>,
     pub turns: Vec<SessionTurn>,
     pub events: Vec<SessionEvent>,
@@ -1317,6 +1319,34 @@ pub struct CreateSessionRequest {
 pub struct CreateSessionResponse {
     pub session: SessionSummary,
     pub event: SessionEvent,
+    pub replayed: bool,
+}
+
+/// Immutable lineage for a Session created from one committed parent ledger
+/// boundary. Inherited turns are copied into the child ledger, so later parent
+/// activity cannot change the child transcript.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFork {
+    pub parent_session_id: String,
+    pub parent_sequence: u64,
+    pub inherited_turns: u64,
+    pub created_at: String,
+}
+
+/// Creates a new Session from every complete conversation turn visible at
+/// `through_sequence` in the parent Session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForkSessionRequest {
+    pub id: String,
+    pub title: String,
+    pub through_sequence: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkSessionResponse {
+    pub session: SessionSummary,
+    pub fork: SessionFork,
     pub replayed: bool,
 }
 
@@ -1904,6 +1934,15 @@ mod tests {
                 "turn_id": "turn-1",
                 "user_message": "Hello",
                 "expected_sequence": 1,
+                "unexpected": true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ForkSessionRequest>(json!({
+                "id": "session-fork",
+                "title": "Fork",
+                "through_sequence": 4,
                 "unexpected": true
             }))
             .is_err()
