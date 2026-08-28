@@ -14,6 +14,7 @@ use std::{
     pin::Pin,
 };
 
+use futures_core::Stream;
 use protocol::{SessionTurn, SessionTurnStatus};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -97,9 +98,18 @@ pub const REPLY_TOOL_DESCRIPTION_MAX_BYTES: usize = 4 * 1024;
 /// Maximum UTF-8 byte length of a provider finish reason.
 pub const FINISH_REASON_MAX_BYTES: usize = protocol::REPLY_FINISH_REASON_MAX_BYTES;
 
+/// Maximum UTF-8 bytes in one provider text delta before the runtime splits it
+/// into durable output records.
+pub const REPLY_STREAM_TEXT_DELTA_MAX_BYTES: usize = 64 * 1024;
+
 /// Boxed reply operation used by the object-safe provider interface.
 pub type ReplyFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ReplyResponse, ProviderError>> + Send + 'a>>;
+
+/// Object-safe stream returned by a provider operation. `Completed` is
+/// required exactly once and terminates the stream.
+pub type ReplyStream<'a> =
+    Pin<Box<dyn Stream<Item = Result<ReplyStreamEvent, ProviderError>> + Send + 'a>>;
 
 /// Boxed, per-operation secret resolution.
 pub type SecretResolveFuture<'a> =
@@ -708,6 +718,15 @@ pub struct ReplyResponse {
     pub provider: ProviderMetadata,
 }
 
+/// Ordered output emitted by one model operation. Text deltas are display
+/// evidence only; the completed typed response remains the authoritative input
+/// to the Agent state transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplyStreamEvent {
+    TextDelta(String),
+    Completed(ReplyResponse),
+}
+
 /// Controlled failures at the reply-provider boundary.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ProviderError {
@@ -750,6 +769,14 @@ pub trait ReplyProvider: Send + Sync {
 
     /// Request one assistant reply.
     fn reply(&self, request: ReplyRequest) -> ReplyFuture<'_>;
+
+    /// Stream one assistant reply. Providers without a native stream retain a
+    /// safe compatibility path that yields only the terminal typed response.
+    fn stream_reply(&self, request: ReplyRequest) -> ReplyStream<'_> {
+        Box::pin(async_stream::try_stream! {
+            yield ReplyStreamEvent::Completed(self.reply(request).await?);
+        })
+    }
 }
 
 /// Validate the complete provider-visible request and its aggregate envelope.

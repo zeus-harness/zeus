@@ -60,7 +60,7 @@ use crate::{
     SwitchAuthSessionResult, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 31;
+const CURRENT_SCHEMA_VERSION: i64 = 32;
 const LOCAL_ACCOUNT_ID: &str = "acc_local";
 const MAX_ACCOUNTS_PER_USER: i64 = 16;
 const MAX_ACCOUNTS_GLOBAL: i64 = 64;
@@ -100,6 +100,7 @@ const MIGRATION_0028: &str = include_str!("../migrations/0028_agent_todo_snapsho
 const MIGRATION_0029: &str = include_str!("../migrations/0029_session_agent_goals.sql");
 const MIGRATION_0030: &str = include_str!("../migrations/0030_agent_goal_rounds.sql");
 const MIGRATION_0031: &str = include_str!("../migrations/0031_session_followups.sql");
+const MIGRATION_0032: &str = include_str!("../migrations/0032_agent_model_output_chunks.sql");
 const MIGRATION_0022_TRIGGER_NAMES: &[&str] = &[
     "knowledge_corpus_revisions_reject_update",
     "knowledge_corpus_revisions_reject_delete",
@@ -173,6 +174,11 @@ const MIGRATION_0031_TRIGGER_NAMES: &[&str] = &[
     "session_followup_receipts_require_authority",
     "session_followup_receipts_reject_update",
     "session_followup_receipts_reject_delete",
+];
+const MIGRATION_0032_TRIGGER_NAMES: &[&str] = &[
+    "agent_model_output_chunks_validate_insert",
+    "agent_model_output_chunks_reject_update",
+    "agent_model_output_chunks_reject_delete",
 ];
 const RECOVERY_BATCH_LIMIT: i64 = 64;
 const AUTH_SESSION_CLEANUP_BATCH_LIMIT: i64 = 64;
@@ -3637,6 +3643,13 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
             params![31, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 32 {
+        transaction.execute_batch(MIGRATION_0032)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![32, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
     // The execution verifier now understands the v22 knowledge binding. Run
     // it only after every missing schema step has been installed so upgrades
     // from v19 and older never query a column that does not exist yet. This
@@ -3650,6 +3663,7 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
         agent::verify_agent_goal_integrity(&transaction)?;
         agent::verify_agent_goal_round_integrity(&transaction)?;
         verify_session_followup_integrity(&transaction)?;
+        agent::verify_agent_model_output_integrity(&transaction)?;
         provider::verify_account_reply_provider_integrity(&transaction)?;
         execution::verify_agent_execution_integrity(&transaction)?;
     }
@@ -4395,6 +4409,22 @@ fn readiness(
         ));
     }
 
+    let agent_output_columns: i64 = connection.query_row(
+        r#"SELECT COUNT(*) FROM pragma_table_info('agent_model_output_chunks')
+           WHERE name IN (
+               'account_id', 'actor_user_id', 'actor_membership_revision',
+               'session_id', 'turn_id', 'agent_id', 'job_id', 'step',
+               'sequence', 'ordinal', 'content', 'cumulative_bytes', 'created_at'
+           )"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if agent_output_columns != 13 {
+        return Err(StorageError::CorruptData(
+            "Agent model output chunk schema is missing".into(),
+        ));
+    }
+
     let agent_deployment_manifest_columns: i64 = connection.query_row(
         r#"SELECT COUNT(*)
            FROM pragma_table_info('agent_deployment_manifests')
@@ -4658,12 +4688,14 @@ fn readiness(
                'account_reply_provider_configs_provider_idx',
                'account_reply_provider_receipts_provider_idx',
                'session_followups_ready_idx',
-               'session_followups_actor_capacity_idx'
+               'session_followups_actor_capacity_idx',
+               'agent_model_output_chunks_turn_page_idx',
+               'agent_model_output_chunks_job_idx'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if point_query_indexes != 75 {
+    if point_query_indexes != 77 {
         return Err(StorageError::CorruptData(
             "one or more point-query indexes are missing".into(),
         ));
@@ -4864,13 +4896,16 @@ fn readiness(
                'session_followup_receipts_require_authority',
                'session_followup_receipts_reject_update',
                'session_followup_receipts_reject_delete',
+               'agent_model_output_chunks_validate_insert',
+               'agent_model_output_chunks_reject_update',
+               'agent_model_output_chunks_reject_delete',
                'schema_migrations_reject_update',
                'schema_migrations_reject_delete'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 170 {
+    if trigger_count != 173 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
         ));
@@ -4885,6 +4920,7 @@ fn readiness(
     verify_migration_trigger_definitions(connection, MIGRATION_0029, MIGRATION_0029_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0030, MIGRATION_0030_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0031, MIGRATION_0031_TRIGGER_NAMES)?;
+    verify_migration_trigger_definitions(connection, MIGRATION_0032, MIGRATION_0032_TRIGGER_NAMES)?;
     verify_session_followup_integrity(connection)?;
 
     let agent_pending_call_fk: i64 = connection.query_row(
@@ -5488,6 +5524,7 @@ fn readiness(
     agent::verify_agent_todo_integrity(connection)?;
     agent::verify_agent_goal_integrity(connection)?;
     agent::verify_agent_goal_round_integrity(connection)?;
+    agent::verify_agent_model_output_integrity(connection)?;
     provider::verify_account_reply_provider_integrity(connection)?;
     compaction::verify_integrity(connection)?;
     execution::verify_agent_execution_integrity(connection)?;

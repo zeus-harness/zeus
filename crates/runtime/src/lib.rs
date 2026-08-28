@@ -52,15 +52,15 @@ use planning::{
     todo_write_descriptor,
 };
 use protocol::{
-    Approval, ApprovalStatus, AssistantReplyKind, AttachRunRequest, AttachRunResponse,
-    CancelAgentTurnResponse, CreateSessionRequest, CreateSessionResponse, EVENT_PAGE_DEFAULT_LIMIT,
-    EnqueueSessionFollowupRequest, EnqueueSessionFollowupResponse, FlushSessionRequest,
-    FlushSessionResponse, NotDispatchedReason, OverviewResponse, PolicyDecision,
-    ResourceEnvelopeError, ResumeSessionRequest, ResumeSessionResponse, ReviewDecision,
-    ReviewRequest, ReviewResponse, RunDetail, RunDetailPagination, RunEvent, RunEventData,
-    RunEventPage, RunSummary, SessionDetail, SessionEvent, SessionEventData, SessionEventPage,
-    SessionFollowup, SessionSummary, SessionTurn, StartTurnRequest, StartTurnResponse, ToolCall,
-    ToolExecutorStatus, ToolOutcome,
+    AgentOutputChunk, AgentOutputChunkPage, Approval, ApprovalStatus, AssistantReplyKind,
+    AttachRunRequest, AttachRunResponse, CancelAgentTurnResponse, CreateSessionRequest,
+    CreateSessionResponse, EVENT_PAGE_DEFAULT_LIMIT, EnqueueSessionFollowupRequest,
+    EnqueueSessionFollowupResponse, FlushSessionRequest, FlushSessionResponse, NotDispatchedReason,
+    OverviewResponse, PolicyDecision, ResourceEnvelopeError, ResumeSessionRequest,
+    ResumeSessionResponse, ReviewDecision, ReviewRequest, ReviewResponse, RunDetail,
+    RunDetailPagination, RunEvent, RunEventData, RunEventPage, RunSummary, SessionDetail,
+    SessionEvent, SessionEventData, SessionEventPage, SessionFollowup, SessionSummary, SessionTurn,
+    StartTurnRequest, StartTurnResponse, ToolCall, ToolExecutorStatus, ToolOutcome,
 };
 use serde_json::Value;
 use skills::{SkillCatalog, register_skill_tools, skill_tool_descriptors};
@@ -2941,6 +2941,36 @@ impl DemoStore {
             AgentModelCompletion::ToolCall { .. } => {}
         }
         Ok(completion)
+    }
+
+    pub async fn append_agent_model_output_chunk(
+        &self,
+        job_id: &str,
+        content: String,
+    ) -> Result<AgentOutputChunk, StoreError> {
+        Ok(self
+            .storage
+            .append_agent_model_output_chunk(job_id, content)
+            .await?)
+    }
+
+    pub async fn agent_output_chunk_page_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        turn_id: &str,
+        after: u64,
+        limit: usize,
+    ) -> Result<AgentOutputChunkPage, StoreError> {
+        validate_durable_reference(session_id, "session ID")?;
+        validate_durable_reference(turn_id, "turn ID")?;
+        validate_session_sequence(after, "Agent output cursor")?;
+        self.authorize_session_for_actor(context, session_id)
+            .await?;
+        Ok(self
+            .storage
+            .agent_output_chunk_page_for_actor(context, session_id, turn_id, after, limit)
+            .await?)
     }
 
     /// Commit a known or indeterminate provider failure after model start.

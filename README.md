@@ -56,6 +56,15 @@ Queued input survives restart, shares the existing actor/account/global reply
 capacity budget, and is discarded before provider I/O if its captured
 membership authority has been revoked.
 
+Schema v32 makes model text observable without weakening the durable Agent
+state machine. OpenAI-compatible providers use bounded SSE; received text is
+coalesced into immutable SQLite chunks only after the model operation has a
+durable `started` checkpoint. The terminal typed response remains authoritative
+and must equal the exact chunk concatenation. A transport failure preserves the
+already received prefix, settles the operation conservatively, and is never
+silently retried. Actor-scoped JSON and SSE endpoints replay output from SQLite,
+so reconnect and process restart do not depend on an in-memory broadcast.
+
 Alpha+ bootstraps a local `acc_local` root and now supports a bounded local
 multi-account control plane. An owner can create accounts idempotently; one
 user may belong to at most 16 accounts and one database may contain at most 64.
@@ -932,6 +941,13 @@ and bounded memory, CPU, and PID resources.
   governed prompt/knowledge/provider changes wake the worker. Revoked work is
   durably discarded, while provider/configuration failure leaves it queued for
   explicit recovery rather than fabricating a response.
+  Schema v32 adds append-only `agent_model_output_chunks`. Each chunk is bound
+  to the exact account/actor membership, Session/turn/Agent, started model job,
+  step, contiguous Agent sequence, contiguous job ordinal, cumulative UTF-8
+  byte count, and timestamp. Updates and deletes are rejected; completion with
+  streamed text must be a final response whose exact content equals the chunk
+  concatenation. Deep readiness verifies bindings, continuity, cumulative
+  bytes, and terminal response equality.
   Existing Runs and events are decoded, validated, and migrated in place without
   rewriting their payloads. Runtime identity still binds profile, environment,
   primary Session and Run, policy ID, and policy revision; a mismatch fails
@@ -1080,6 +1096,14 @@ directly.
 - `GET /api/v1/sessions/{session_id}/turns/{turn_id}/agent` returns the
   actor-scoped durable Agent state, deployment-manifest digest, and ordered
   tool calls.
+- `GET /api/v1/sessions/{session_id}/turns/{turn_id}/output` returns a bounded
+  forward page of immutable model-output chunks. `after` defaults to `0`;
+  `limit` defaults to 128 and is capped at 256. The response includes the
+  durable head, `has_more`, `next_after`, and whether the Agent is terminal.
+  `GET` on the `/output/events` suffix replays the same chunks as
+  `agent.output` SSE, honors `Last-Event-ID`, revalidates login authority while
+  open, and closes after the terminal durable head is sent. Both routes use
+  `Cache-Control: no-store`; no volatile publisher is the source of truth.
 - `PUT /api/v1/sessions/{session_id}/turns/{turn_id}/agent/cancel` accepts
   `{"expected_revision":...}` and uses that revision as a replayable CAS.
   Cancellation succeeds only before the active provider/connector operation
@@ -1159,7 +1183,7 @@ directly.
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Current schema v31 retains durable Run attachment during migration and demo
+Current schema v32 retains durable Run attachment during migration and demo
 seeding, but Alpha+ does not expose a public attach-Run HTTP route.
 
 The application boundary now caps auth JSON at 8 KiB, command JSON at 512 KiB,
@@ -1184,7 +1208,7 @@ approval, dispatch, reply completion, attachment checks, and startup recovery
 use typed point queries or fixed 64-row batches. Production Session list/detail,
 Run detail, and overview reads now use indexed `LIMIT + 1` keyset pages inside
 actor-authorized SQLite snapshots; no production HTTP read loads a complete
-ledger or collection. Current schema v31 retains bounded Session, open-turn,
+ledger or collection. Current schema v32 retains bounded Session, open-turn,
 active reply/dispatch, auth-session, bootstrap-audit, event-slot, and logical
 event-payload-byte admission. Exact idempotent replay is checked before capacity,
 while accepted work consumes its reserved terminal slots and payload bytes
@@ -1271,17 +1295,17 @@ governance, schema v25 durable Session context compaction, schema v26
 account-scoped reply provider selection, schema v27 safe pre-start Agent
 cancellation, schema v28 durable Agent planning, schema v29 durable Session
 Goals, schema v30 same-Session Goal rounds, schema v31 durable Session
-follow-ups, Trusted Single-Node Ingress,
+follow-ups, schema v32 durable Agent model output, Trusted Single-Node Ingress,
 Per-Operation SecretRef Resolution, the startup-bound Skill Catalog, and the
 bounded multi-account control plane:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 663 tests passed
+- `cargo test --workspace --all-targets --locked`: 670 tests passed
   across the top-level test targets, including 22 connector tests,
-  8 deployment tests, 29 knowledge tests, 30 LLM unit and 15 provider-contract
-  tests, 4 Goal tests, 5 Skill Catalog tests, 271 storage tests, 21 workflow
-  tests, 52 runtime tests, 21 protocol tests, 88 API library tests, 18 API main/config
+  8 deployment tests, 29 knowledge tests, 30 LLM unit and 18 provider-contract
+  tests, 4 Goal tests, 5 Skill Catalog tests, 273 storage tests, 21 workflow
+  tests, 52 runtime tests, 21 protocol tests, 90 API library tests, 18 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,

@@ -6,7 +6,7 @@
 
 ```text
 Client / SvelteKit Web
-          │ same-origin REST + Run/Session SSE
+          │ same-origin REST + Run/Session/Agent-output SSE
           ▼
   Actor Auth / CSRF ───────► Axum API
                                  │
@@ -20,7 +20,7 @@ Client / SvelteKit Web
               turn / receipt   dispatch     model + tool   / Sandbox
 ```
 
-- `protocol`：认证、设置、Session/Run HTTP、SSE、turn 与可版本化事件合约。
+- `protocol`：认证、设置、Session/Run HTTP、SSE、turn、Agent output page 与可版本化事件合约。
 - `deployment`：版本化、规范化且不含 secret 的 Agent Spec / Deployment Manifest，负责稳定
   digest、系统提示词 ID/revision/content digest 绑定与确定性 JSON-pointer diff。
 - `tenancy`：本地身份、account/membership 授权上下文、Argon2id 密码、opaque token、CSRF 与域分离 digest。
@@ -35,16 +35,17 @@ Client / SvelteKit Web
 - `skills`：启动时一次性加载的 strict version 1 Skill Catalog、确定性 digest，以及只读
   `skill_list` / `skill_load` executor；Skill body 只有通过普通工具结果才对模型可见。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
-- `storage`：schema v31 migration、有界 account/membership 权威、一次性 member setup、用户/偏好、
+- `storage`：schema v32 migration、有界 account/membership 权威、一次性 member setup、用户/偏好、
   account audit/rollup/policy/archive state、独立 Session/Run ledger、typed event lookup、
-  account+actor-scoped 回执、durable Agent/model/tool/dispatch queue、不可变 deployment manifest，
+  account+actor-scoped 回执、durable Agent/model/tool/dispatch queue、不可变 model output、
+  不可变 deployment manifest，
   revisioned account knowledge catalog、owner-governed Agent prompt、account-scoped
   secret-free reply provider selection，以及
   actor/account/global logical capacity、physical capacity 和 operation capacity。
-- `runtime`：Session 命令编排、Agent model/tool 与 Run worker、运行时 manifest 构建、提交后 SSE
-  提示和启动恢复。
+- `runtime`：Session 命令编排、Agent model/tool 与 Run worker、运行时 manifest 构建、model delta
+  持久化、提交后 SSE 提示和启动恢复。
 - `zeus-api`：进程组合、owner/member 认证、账户创建/列表/原子切换、CSRF、owner-only 管理面、
-  provider 配置、REST/SSE 和 readiness。
+  provider 配置、REST/SSE、durable Agent output replay 和 readiness。
 
 SQLite 是本地单实例 Alpha+ 的权威存储。Restate、MinIO 和 PostgreSQL 当前不是第二套事实源。
 当前 Web 认证后列出用户 Session，恢复仍存在的上次活动 Session，并行订阅 Run/Session SSE；
@@ -145,6 +146,17 @@ revision，并在同一事务中创建正常 Session turn、Agent、首个 model
 绑定为 `claimed`。重启会恢复 queued 工作；撤权 row 按 FIFO durable `discarded` 且绝不触发
 provider I/O；`needs_attention` 时保持 parked，显式 resume 后继续。表、回执和状态迁移均由
 权威 trigger 与 deep readiness 校验。
+
+schema v32 增加 Agent model output 的 append-only display ledger。OpenAI-compatible provider
+改为读取有界 Chat Completions SSE；只有 model job 已经 durable `started` 后，runtime 才把文本
+delta 按 UTF-8 边界合并为最多 4 KiB 的 chunk。每 job 累计文本最多 64 KiB，每 chunk 绑定 exact
+account、actor membership revision、Session、turn、Agent、job、step、连续 Agent sequence、连续
+job ordinal、累计 byte count 与 timestamp。chunk 不推进 Session/Agent 状态，也不进入后续模型
+transcript；成功终态仍以 typed response 为权威，并必须逐字节等于该 job chunk 串联。若 transport
+在 `[DONE]` 前终止，已收到的尾部先落盘，再以 `outcome_unknown` 收口且不重试 provider。SQLite
+trigger 禁止修改/删除并约束 started binding，deep readiness 重算连续性、累计字节与成功终态相等性。
+Actor-scoped output page 使用 `LIMIT + 1` keyset；`agent.output` SSE 直接从 SQLite 重放、定期复验
+login authority，并在 terminal head 发完后关闭，不依赖进程内 broadcast 才能恢复。
 
 可选 `ZEUS_SKILLS_FILE` 在 SQLite 打开前加载 immutable Skill Catalog。文件使用 strict version 1
 JSON，regular file 上限 512 KiB，包含 1–64 个唯一的 lowercase provider-safe 名称；description
@@ -251,9 +263,10 @@ Session ledger 记录 `session_created`、`run_attached`、`user_message`、可�
   manifest digest 精确匹配。admission 发现错误会拒绝命令并回滚；已经 queued 的 work 在 claim
   时发现持久化 authority 缺失、损坏、promptless 或与当前 deployment drift，才 durable settle
   为 `deployment_unavailable`。两条路径都发生在 provider I/O 前，外部调用数为零。claim 成功后
-  才在数据库锁之外调用 provider。最终文本原子追加带 provenance 的 `assistant_message`、flush
-  turn 并写 `turn_flushed`；确定失败和 outcome unknown 都进入 `needs_attention`，不得自动重调
-  provider。
+  才在数据库锁之外调用 provider。流式文本先写上述 append-only output ledger；最终 typed 文本
+  只有与全部 durable chunks 精确相等时，才原子追加带 provenance 的 `assistant_message`、flush
+  turn 并写 `turn_flushed`。确定失败和 outcome unknown 都进入 `needs_attention`，不得自动重调
+  provider；已落盘 prefix 仍可由授权 actor 重放。
 - Agent tool worker：模型只能提出工具名与 arguments；服务端 registry/policy 生成不可变 call。
   require-approval 保留在 `waiting_approval`，拒绝和 policy deny 作为结构化 known result 返回模型。
   允许执行的 call 在 durable `started` checkpoint 后再次校验 manifest/registry/policy；只有通过
@@ -302,7 +315,7 @@ connector 在数据库事务和锁之外运行。
 
 API 监听端口之前按固定顺序完成：
 
-1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v31；按当前
+1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v32；按当前
    detailed-row limit 以最多 64 行 batch 压缩 bootstrap terminal audit prefix，再按稳定
    `(priority actor, expires_at, auth-session ID)` 顺序最多清理 64 个过期或绑定
    missing/disabled/suspended/stale-revision authority 的 auth session。
@@ -693,8 +706,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   刷新恢复、owner/member setup/登录、owner 成员与 audit 管理、设置/退出和
   system/light/dark。member 的审批卡只读。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化按项目既有统计口径是 636 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
-  provider contract 15、skills 5、storage 261、workflows 21、runtime 50、API library 83、API main/config 18）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化按项目既有统计口径是 670 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
+  provider contract 18、skills 5、storage 273、workflows 21、runtime 52、API library 90、API main/config 18）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
 提交 `af29089` 曾构建并运行在独立 `zeus-operation-acceptance` project（端口 `18089`）；既有

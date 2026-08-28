@@ -22,9 +22,9 @@ use crate::{
 use ::execution::{DigestDomain, FactSource, OperationRef, Sha256Digest};
 use deployment::{ManifestEnvelope, prompt_content_digest};
 use protocol::{
-    AgentApprovalReview, AgentGoalState, AgentReviewResponse, AgentTodoState, AgentToolCallDetail,
-    AgentToolCallStatus, AgentTurnDetail, AgentTurnStatus, AssistantReplyKind, PolicyDecision,
-    ReviewDecision, ToolExecutorStatus,
+    AgentApprovalReview, AgentGoalState, AgentOutputChunk, AgentOutputChunkPage,
+    AgentReviewResponse, AgentTodoState, AgentToolCallDetail, AgentToolCallStatus, AgentTurnDetail,
+    AgentTurnStatus, AssistantReplyKind, PolicyDecision, ReviewDecision, ToolExecutorStatus,
 };
 use tools::ExecutionScope;
 use workflows::{
@@ -48,6 +48,8 @@ const AGENT_KNOWLEDGE_LEGACY_SET_DIGEST_DOMAIN: &[u8] =
     b"zeus.agent-knowledge-legacy-set.sha256.v1\0";
 const AGENT_OPERATION_HOLDER_MAX_BYTES: usize = 128;
 const AGENT_OPERATION_CLAIM_TTL_SECONDS: i64 = 30;
+const AGENT_OUTPUT_CHUNK_MAX_BYTES: usize = 4 * 1024;
+const AGENT_OUTPUT_PAGE_MAX_LIMIT: usize = 256;
 const KNOWLEDGE_CATALOG_MAX_REVISIONS_PER_ACCOUNT: u64 = 256;
 const KNOWLEDGE_CORPUS_MAX_REVISIONS_PER_ACCOUNT: i64 = 128;
 const KNOWLEDGE_CORPUS_MAX_ENVELOPE_BYTES_PER_ACCOUNT: i64 = 64 * 1024 * 1024;
@@ -270,6 +272,45 @@ impl SqliteStore {
         let physical_limits = self.physical_limits.clone();
         self.with_progress_connection(move |connection| {
             complete_agent_model_success(connection, commit, &physical_limits)
+        })
+        .await
+    }
+
+    /// Append one exact provider text delta after the model start checkpoint.
+    /// The row is immutable display evidence and does not advance the Agent or
+    /// Session state machine.
+    pub async fn append_agent_model_output_chunk(
+        &self,
+        job_id: &str,
+        content: String,
+    ) -> Result<AgentOutputChunk, StorageError> {
+        let job_id = normalized_reply_value(job_id, "agent model job ID")?.to_owned();
+        if content.is_empty() || content.len() > AGENT_OUTPUT_CHUNK_MAX_BYTES {
+            return Err(StorageError::InvalidResourceEnvelope(format!(
+                "Agent output chunk must contain 1..={AGENT_OUTPUT_CHUNK_MAX_BYTES} UTF-8 bytes"
+            )));
+        }
+        let physical_limits = self.physical_limits.clone();
+        self.with_progress_connection(move |connection| {
+            append_agent_model_output_chunk(connection, &job_id, &content, &physical_limits)
+        })
+        .await
+    }
+
+    /// Read a bounded forward page of durable output for one Agent turn.
+    pub async fn agent_output_chunk_page_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        turn_id: &str,
+        after: u64,
+        limit: usize,
+    ) -> Result<AgentOutputChunkPage, StorageError> {
+        let context = validated_authz_context(context)?;
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        let turn_id = validated_durable_reference(turn_id, "turn ID")?.to_owned();
+        self.with_connection(move |connection| {
+            query_agent_output_chunk_page(connection, &context, &session_id, &turn_id, after, limit)
         })
         .await
     }
@@ -1148,6 +1189,7 @@ fn complete_agent_model_success(
             "agent model completion does not match the started workflow step".into(),
         ));
     }
+    require_agent_model_output_matches_resolution(&transaction, &job, &commit.resolution)?;
     require_open_agent_turn(&transaction, &agent)?;
     require_agent_finalization_capacity(&transaction, &agent)?;
     require_connection_physical_capacity(
@@ -1493,6 +1535,244 @@ fn complete_agent_model_success(
     )?;
     transaction.commit()?;
     Ok(completion)
+}
+
+fn append_agent_model_output_chunk(
+    connection: &mut Connection,
+    job_id: &str,
+    content: &str,
+    physical_limits: &SqlitePhysicalLimits,
+) -> Result<AgentOutputChunk, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::ReservedProgress,
+    )?;
+    let job = query_agent_model_job_by_id(&transaction, job_id)?;
+    if job.status != AgentModelJobStatus::Started {
+        return Err(StorageError::InvalidAgentTransition(
+            "Agent output can be appended only while its model operation is started".into(),
+        ));
+    }
+    let agent = query_agent_turn(&transaction, &job.agent_id)?;
+    if agent.status != AgentTurnStatus::ModelRunning || agent.model_steps != job.step {
+        return Err(StorageError::InvalidAgentTransition(
+            "Agent output does not match the active model workflow step".into(),
+        ));
+    }
+    let (sequence, ordinal, cumulative_bytes): (i64, i64, i64) = transaction.query_row(
+        r#"SELECT
+               COALESCE((SELECT MAX(sequence) FROM agent_model_output_chunks
+                         WHERE agent_id = ?1), 0) + 1,
+               COALESCE((SELECT MAX(ordinal) FROM agent_model_output_chunks
+                         WHERE job_id = ?2), 0) + 1,
+               COALESCE((SELECT MAX(cumulative_bytes) FROM agent_model_output_chunks
+                         WHERE job_id = ?2), 0) + ?3"#,
+        params![
+            job.agent_id,
+            job.id,
+            i64::try_from(content.len())
+                .map_err(|_| StorageError::IntegerOutOfRange("Agent output chunk bytes"))?
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let timestamp = now();
+    transaction.execute(
+        r#"INSERT INTO agent_model_output_chunks(
+               account_id, actor_user_id, actor_membership_revision,
+               session_id, turn_id, agent_id, job_id, step,
+               sequence, ordinal, content, cumulative_bytes, created_at
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
+        params![
+            job.account_id.as_str(),
+            job.actor_user_id,
+            u64_to_i64(job.actor_membership_revision.get(), "membership revision")?,
+            job.session_id,
+            job.turn_id,
+            job.agent_id,
+            job.id,
+            i64::from(job.step),
+            sequence,
+            ordinal,
+            content,
+            cumulative_bytes,
+            timestamp,
+        ],
+    )?;
+    let chunk = query_agent_output_chunk(&transaction, &agent.id, sequence)?;
+    transaction.commit()?;
+    Ok(chunk)
+}
+
+fn query_agent_output_chunk(
+    connection: &Connection,
+    agent_id: &str,
+    sequence: i64,
+) -> Result<AgentOutputChunk, StorageError> {
+    let row = connection
+        .query_row(
+            r#"SELECT sequence, job_id, step, ordinal, content,
+                      cumulative_bytes, created_at
+               FROM agent_model_output_chunks
+               WHERE agent_id = ?1 AND sequence = ?2"#,
+            params![agent_id, sequence],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StorageError::CorruptData(format!(
+                "Agent output chunk `{agent_id}/{sequence}` disappeared"
+            ))
+        })?;
+    decode_agent_output_chunk(row)
+}
+
+type AgentOutputChunkRow = (i64, String, i64, i64, String, i64, String);
+
+fn decode_agent_output_chunk(
+    (sequence, job_id, step, ordinal, content, cumulative_bytes, created_at): AgentOutputChunkRow,
+) -> Result<AgentOutputChunk, StorageError> {
+    Ok(AgentOutputChunk {
+        sequence: i64_to_u64(sequence, "Agent output sequence")?,
+        job_id,
+        step: u32::try_from(step)
+            .map_err(|_| StorageError::IntegerOutOfRange("Agent model step"))?,
+        ordinal: u32::try_from(ordinal)
+            .map_err(|_| StorageError::IntegerOutOfRange("Agent output ordinal"))?,
+        content,
+        cumulative_bytes: i64_to_u64(cumulative_bytes, "Agent output cumulative bytes")?,
+        created_at,
+    })
+}
+
+fn query_agent_output_chunk_page(
+    connection: &mut Connection,
+    context: &AuthzContext,
+    session_id: &str,
+    turn_id: &str,
+    after: u64,
+    limit: usize,
+) -> Result<AgentOutputChunkPage, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    require_active_session_actor(&transaction, session_id, context)?;
+    if limit == 0 || limit > AGENT_OUTPUT_PAGE_MAX_LIMIT {
+        return Err(StorageError::InvalidEventPageLimit {
+            limit,
+            max: AGENT_OUTPUT_PAGE_MAX_LIMIT,
+        });
+    }
+    let after = i64::try_from(after).map_err(|_| StorageError::EventCursorOutOfRange { after })?;
+    let agent = query_agent_turn_for_session_turn(&transaction, session_id, turn_id)?;
+    if agent.account_id != context.account_id {
+        return Err(StorageError::AgentTurnNotFound(turn_id.to_owned()));
+    }
+    let head: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(sequence), 0) FROM agent_model_output_chunks WHERE agent_id = ?1",
+        [&agent.id],
+        |row| row.get(0),
+    )?;
+    if after > head {
+        return Err(StorageError::EventCursorBeyondHead {
+            after: i64_to_u64(after, "Agent output cursor")?,
+            head_sequence: i64_to_u64(head, "Agent output head")?,
+        });
+    }
+    let query_limit = limit
+        .checked_add(1)
+        .ok_or(StorageError::IntegerOutOfRange("Agent output page limit"))?;
+    let mut statement = transaction.prepare(
+        r#"SELECT sequence, job_id, step, ordinal, content,
+                  cumulative_bytes, created_at
+           FROM agent_model_output_chunks
+           WHERE agent_id = ?1 AND sequence > ?2
+           ORDER BY sequence LIMIT ?3"#,
+    )?;
+    let rows = statement
+        .query_map(
+            params![
+                agent.id,
+                after,
+                i64::try_from(query_limit)
+                    .map_err(|_| StorageError::IntegerOutOfRange("Agent output page limit"))?
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    let has_more = rows.len() > limit;
+    let items = rows
+        .into_iter()
+        .take(limit)
+        .map(decode_agent_output_chunk)
+        .collect::<Result<Vec<_>, _>>()?;
+    let next_after = has_more
+        .then(|| items.last().map(|item| item.sequence))
+        .flatten();
+    let page = AgentOutputChunkPage {
+        items,
+        next_after,
+        head_sequence: i64_to_u64(head, "Agent output head")?,
+        has_more,
+        terminal: matches!(
+            agent.status,
+            AgentTurnStatus::Succeeded | AgentTurnStatus::Failed | AgentTurnStatus::NeedsAttention
+        ),
+    };
+    transaction.commit()?;
+    Ok(page)
+}
+
+fn require_agent_model_output_matches_resolution(
+    connection: &Connection,
+    job: &AgentModelJob,
+    resolution: &AgentModelResolution,
+) -> Result<(), StorageError> {
+    let mut statement = connection.prepare(
+        r#"SELECT content FROM agent_model_output_chunks
+           WHERE job_id = ?1 ORDER BY ordinal"#,
+    )?;
+    let chunks = statement
+        .query_map([&job.id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if chunks.is_empty() {
+        return Ok(());
+    }
+    let AgentModelResolution::Final {
+        assistant_message, ..
+    } = resolution
+    else {
+        return Err(StorageError::InvalidAgentTransition(
+            "a model tool response cannot finalize persisted text output".into(),
+        ));
+    };
+    let output = chunks.concat();
+    if output != *assistant_message {
+        return Err(StorageError::InvalidAgentTransition(
+            "the completed model text does not match its durable output chunks".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn complete_agent_model_failure(
@@ -6244,6 +6524,132 @@ pub(super) fn verify_agent_deployment_manifest_integrity(
                     "Agent tool deployment binding is inconsistent: {error}"
                 ))
             })?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn verify_agent_model_output_integrity(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    let broken_binding = connection
+        .query_row(
+            r#"SELECT chunk.job_id
+               FROM agent_model_output_chunks chunk
+               WHERE NOT EXISTS (
+                   SELECT 1
+                   FROM agent_model_jobs job
+                   JOIN agent_turns agent ON agent.id = job.agent_id
+                   WHERE job.id = chunk.job_id
+                     AND job.account_id = chunk.account_id
+                     AND job.actor_user_id = chunk.actor_user_id
+                     AND job.actor_membership_revision = chunk.actor_membership_revision
+                     AND job.session_id = chunk.session_id
+                     AND job.turn_id = chunk.turn_id
+                     AND job.agent_id = chunk.agent_id
+                     AND job.step = chunk.step
+                     AND agent.account_id = chunk.account_id
+                     AND agent.actor_user_id = chunk.actor_user_id
+                     AND agent.actor_membership_revision = chunk.actor_membership_revision
+                     AND agent.session_id = chunk.session_id
+                     AND agent.turn_id = chunk.turn_id
+               )
+               LIMIT 1"#,
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(job_id) = broken_binding {
+        return Err(StorageError::CorruptData(format!(
+            "Agent model output `{job_id}` has an invalid durable binding"
+        )));
+    }
+    let broken_sequence = connection
+        .query_row(
+            r#"SELECT owner_id FROM (
+                   SELECT agent_id AS owner_id
+                   FROM agent_model_output_chunks
+                   GROUP BY agent_id
+                   HAVING MIN(sequence) <> 1 OR MAX(sequence) <> COUNT(*)
+                   UNION ALL
+                   SELECT job_id AS owner_id
+                   FROM agent_model_output_chunks
+                   GROUP BY job_id
+                   HAVING MIN(ordinal) <> 1 OR MAX(ordinal) <> COUNT(*)
+                      OR MAX(cumulative_bytes) <>
+                         SUM(length(CAST(content AS BLOB)))
+               ) LIMIT 1"#,
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(owner_id) = broken_sequence {
+        return Err(StorageError::CorruptData(format!(
+            "Agent model output `{owner_id}` is not contiguous"
+        )));
+    }
+    let broken_cumulative = connection
+        .query_row(
+            r#"SELECT chunk.job_id
+               FROM agent_model_output_chunks chunk
+               WHERE chunk.cumulative_bytes <> (
+                   SELECT SUM(length(CAST(prior.content AS BLOB)))
+                   FROM agent_model_output_chunks prior
+                   WHERE prior.job_id = chunk.job_id
+                     AND prior.ordinal <= chunk.ordinal
+               )
+               LIMIT 1"#,
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(job_id) = broken_cumulative {
+        return Err(StorageError::CorruptData(format!(
+            "Agent model output `{job_id}` has an invalid cumulative byte count"
+        )));
+    }
+
+    let mut statement = connection
+        .prepare("SELECT DISTINCT job_id FROM agent_model_output_chunks ORDER BY job_id")?;
+    let job_ids = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for job_id in job_ids {
+        let job = query_agent_model_job_by_id(connection, &job_id)?;
+        if job.status != AgentModelJobStatus::Succeeded {
+            continue;
+        }
+        let response = job
+            .response_json
+            .clone()
+            .ok_or_else(|| {
+                StorageError::CorruptData(format!(
+                    "successful Agent model job `{job_id}` has no response"
+                ))
+            })
+            .and_then(|value| {
+                serde_json::from_value::<llm::ReplyResponse>(value).map_err(|error| {
+                    StorageError::CorruptData(format!(
+                        "Agent model job `{job_id}` has an invalid response: {error}"
+                    ))
+                })
+            })?;
+        let mut statement = connection.prepare(
+            r#"SELECT content FROM agent_model_output_chunks
+               WHERE job_id = ?1 ORDER BY ordinal"#,
+        )?;
+        let output = statement
+            .query_map([&job_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+            .concat();
+        match response.output {
+            llm::ReplyOutput::Final { content } if content == output => {}
+            _ => {
+                return Err(StorageError::CorruptData(format!(
+                    "Agent model output `{job_id}` does not match its terminal response"
+                )));
+            }
         }
     }
     Ok(())

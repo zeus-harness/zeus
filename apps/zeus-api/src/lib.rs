@@ -30,13 +30,14 @@ use axum::{
 };
 use deployment::{ManifestDiff, ManifestEnvelope};
 use execution::{AgentExecutionExplain, AgentRunEpochExplain};
+use futures_util::StreamExt;
 use llm::{
     AGENT_REQUEST_INITIAL_CONTENT_MAX_BYTES, AGENT_REQUEST_MAX_HISTORY_PAIRS_WITH_CONTEXT,
     LocalFallbackProvider, ProviderError, ReplyKind, ReplyOutput, ReplyProvider, ReplyRequest,
-    ReplyToolCall, ReplyToolDefinition, agent_continuation_request, persisted_agent_reply_request,
-    validate_agent_reply_request, validate_agent_reply_response_for_request,
-    validate_compaction_response, validate_provider_metadata, validate_reply_request,
-    validate_reply_response_for_request,
+    ReplyResponse, ReplyStreamEvent, ReplyToolCall, ReplyToolDefinition,
+    agent_continuation_request, persisted_agent_reply_request, validate_agent_reply_request,
+    validate_agent_reply_response_for_request, validate_compaction_response,
+    validate_provider_metadata, validate_reply_request, validate_reply_response_for_request,
 };
 #[cfg(test)]
 use llm::{ReplyMessage, ReplyRole};
@@ -1045,6 +1046,13 @@ struct EventsQuery {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct AgentOutputQuery {
+    after: Option<u64>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SessionListQuery {
     cursor: Option<String>,
     limit: Option<usize>,
@@ -1262,6 +1270,14 @@ fn build_authenticated_app(state: ApiState) -> Router {
         .route(
             "/api/v1/sessions/{id}/turns/{turn_id}/agent",
             get(agent_turn_detail),
+        )
+        .route(
+            "/api/v1/sessions/{id}/turns/{turn_id}/output",
+            get(agent_output_chunks),
+        )
+        .route(
+            "/api/v1/sessions/{id}/turns/{turn_id}/output/events",
+            get(agent_output_events),
         )
         .route(
             "/api/v1/sessions/{id}/turns/{turn_id}/agent/cancel",
@@ -1502,6 +1518,14 @@ fn build_test_app(state: ApiState, request_auth: TestRequestAuth) -> Router {
         .route(
             "/api/v1/sessions/{id}/turns/{turn_id}/agent",
             get(agent_turn_detail),
+        )
+        .route(
+            "/api/v1/sessions/{id}/turns/{turn_id}/output",
+            get(agent_output_chunks),
+        )
+        .route(
+            "/api/v1/sessions/{id}/turns/{turn_id}/output/events",
+            get(agent_output_events),
         )
         .route(
             "/api/v1/sessions/{id}/turns/{turn_id}/agent/cancel",
@@ -4343,9 +4367,15 @@ async fn process_agent_model_job(
     }
 
     let provider_request = request.clone();
-    let response = match tokio::spawn(async move { provider.reply(provider_request).await }).await {
+    let output_store = state.store.clone();
+    let output_job_id = job.id.clone();
+    let response = match tokio::spawn(async move {
+        consume_agent_provider_stream(output_store, output_job_id, provider, provider_request).await
+    })
+    .await
+    {
         Ok(Ok(response)) => response,
-        Ok(Err(error)) => {
+        Ok(Err(AgentProviderStreamError::Provider(error))) => {
             let outcome_unknown =
                 matches!(error, ProviderError::Timeout | ProviderError::Transport);
             return settle_agent_model_failure(
@@ -4354,6 +4384,17 @@ async fn process_agent_model_job(
                 provider_error_code(&error),
                 provider_error_message(&error),
                 outcome_unknown,
+            )
+            .await;
+        }
+        Ok(Err(AgentProviderStreamError::Durable(error))) => {
+            eprintln!("zeus could not persist streamed Agent output: {error}");
+            return settle_agent_model_failure(
+                state,
+                &job,
+                "durable_model_output_failed",
+                "The Agent output stream could not be persisted after model execution started",
+                true,
             )
             .await;
         }
@@ -4545,6 +4586,96 @@ async fn process_agent_model_job(
             kick_goal_round_worker(state);
         }
         AgentModelCompletion::Terminal(_) => state.store.disarm_session_goal(&job.session_id).await,
+    }
+    Ok(())
+}
+
+const AGENT_OUTPUT_FLUSH_TARGET_BYTES: usize = 256;
+const AGENT_OUTPUT_CHUNK_MAX_BYTES: usize = 4 * 1024;
+
+enum AgentProviderStreamError {
+    Provider(ProviderError),
+    Durable(StoreError),
+}
+
+impl From<ProviderError> for AgentProviderStreamError {
+    fn from(error: ProviderError) -> Self {
+        Self::Provider(error)
+    }
+}
+
+async fn consume_agent_provider_stream(
+    store: DemoStore,
+    job_id: String,
+    provider: Arc<dyn ReplyProvider>,
+    request: ReplyRequest,
+) -> Result<ReplyResponse, AgentProviderStreamError> {
+    let mut stream = provider.stream_reply(request);
+    let mut buffer = String::new();
+    let mut completed = None;
+    while let Some(event) = stream.next().await {
+        if completed.is_some() {
+            return Err(ProviderError::InvalidResponse.into());
+        }
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                persist_agent_output_prefix(&store, &job_id, &mut buffer, true).await?;
+                return Err(error.into());
+            }
+        };
+        match event {
+            ReplyStreamEvent::TextDelta(delta) => {
+                if delta.is_empty() {
+                    return Err(ProviderError::InvalidResponse.into());
+                }
+                buffer.push_str(&delta);
+                while buffer.len() >= AGENT_OUTPUT_FLUSH_TARGET_BYTES {
+                    persist_agent_output_prefix(&store, &job_id, &mut buffer, false).await?;
+                }
+            }
+            ReplyStreamEvent::Completed(response) => {
+                if completed.replace(response).is_some() {
+                    return Err(ProviderError::InvalidResponse.into());
+                }
+                persist_agent_output_prefix(&store, &job_id, &mut buffer, true).await?;
+            }
+        }
+    }
+    match completed {
+        Some(response) => Ok(response),
+        None => {
+            persist_agent_output_prefix(&store, &job_id, &mut buffer, true).await?;
+            Err(ProviderError::InvalidResponse.into())
+        }
+    }
+}
+
+async fn persist_agent_output_prefix(
+    store: &DemoStore,
+    job_id: &str,
+    buffer: &mut String,
+    flush_all: bool,
+) -> Result<(), AgentProviderStreamError> {
+    while !buffer.is_empty() && (flush_all || buffer.len() >= AGENT_OUTPUT_FLUSH_TARGET_BYTES) {
+        let target = if flush_all {
+            buffer.len().min(AGENT_OUTPUT_CHUNK_MAX_BYTES)
+        } else {
+            AGENT_OUTPUT_FLUSH_TARGET_BYTES.min(AGENT_OUTPUT_CHUNK_MAX_BYTES)
+        };
+        let mut end = target;
+        while end > 0 && !buffer.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == 0 {
+            return Err(ProviderError::InvalidResponse.into());
+        }
+        let remainder = buffer.split_off(end);
+        let content = std::mem::replace(buffer, remainder);
+        store
+            .append_agent_model_output_chunk(job_id, content)
+            .await
+            .map_err(AgentProviderStreamError::Durable)?;
     }
     Ok(())
 }
@@ -5035,6 +5166,151 @@ async fn agent_turn_detail(
             .agent_turn_detail_for_actor(&current.principal.authz, &id, &turn_id)
             .await?,
     ))
+}
+
+async fn agent_output_chunks(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    Path((id, turn_id)): Path<(String, String)>,
+    query: Result<Query<AgentOutputQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    state
+        .store
+        .authorize_session_for_actor(&current.principal.authz, &id)
+        .await?;
+    let Query(query) = query.map_err(ApiError::invalid_query)?;
+    let page = state
+        .store
+        .agent_output_chunk_page_for_actor(
+            &current.principal.authz,
+            &id,
+            &turn_id,
+            query.after.unwrap_or(0),
+            query.limit.unwrap_or(EVENT_PAGE_DEFAULT_LIMIT),
+        )
+        .await?;
+    json_no_store(page)
+}
+
+async fn agent_output_events(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    Path((id, turn_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    query: Result<Query<EventsQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    state
+        .store
+        .authorize_session_for_actor(&current.principal.authz, &id)
+        .await?;
+    let Query(query) = query.map_err(ApiError::invalid_query)?;
+    let after = event_cursor(&headers, query)?;
+    if !sse_auth_is_current(&state.store, &current).await {
+        return Err(ApiError::unauthorized());
+    }
+    let authz = current.principal.authz.clone();
+    let sse_lease = acquire_sse_lease(&state.sse_capacity, &authz)?;
+    let first = state
+        .store
+        .agent_output_chunk_page_for_actor(
+            &authz,
+            &id,
+            &turn_id,
+            after,
+            protocol::EVENT_PAGE_DEFAULT_LIMIT,
+        )
+        .await?;
+    let store = state.store.clone();
+    let poll_interval = state.durable_ledger_poll_interval;
+    let session_id = id;
+
+    let stream = async_stream::stream! {
+        let _sse_lease = sse_lease;
+        let mut cursor = after;
+        let mut page = first;
+        let mut stream_opened = false;
+        loop {
+            for chunk in page.items.drain(..) {
+                if chunk.sequence <= cursor {
+                    eprintln!("zeus Agent output SSE page did not advance its durable cursor");
+                    return;
+                }
+                cursor = chunk.sequence;
+                yield Ok::<Event, Infallible>(agent_output_sse_event(&chunk));
+            }
+            if page.has_more {
+                match store
+                    .agent_output_chunk_page_for_actor(
+                        &authz,
+                        &session_id,
+                        &turn_id,
+                        cursor,
+                        protocol::EVENT_PAGE_DEFAULT_LIMIT,
+                    )
+                    .await
+                {
+                    Ok(next) if !next.items.is_empty() => {
+                        page = next;
+                        continue;
+                    }
+                    Ok(_) => {
+                        eprintln!("zeus Agent output SSE page reported more data without progress");
+                        return;
+                    }
+                    Err(error) => {
+                        eprintln!("zeus Agent output SSE replay failed: {error:?}");
+                        return;
+                    }
+                }
+            }
+            if page.terminal && cursor == page.head_sequence {
+                return;
+            }
+            if !stream_opened {
+                yield Ok(Event::default().comment("stream-open"));
+                stream_opened = true;
+            }
+            tokio::time::sleep(poll_interval).await;
+            if !sse_auth_is_current(&store, &current).await {
+                return;
+            }
+            match store
+                .agent_output_chunk_page_for_actor(
+                    &authz,
+                    &session_id,
+                    &turn_id,
+                    cursor,
+                    protocol::EVENT_PAGE_DEFAULT_LIMIT,
+                )
+                .await
+            {
+                Ok(next) => page = next,
+                Err(error) => {
+                    eprintln!("zeus Agent output SSE durable poll failed: {error:?}");
+                    return;
+                }
+            }
+        }
+    };
+
+    let mut response = Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+fn agent_output_sse_event(chunk: &protocol::AgentOutputChunk) -> Event {
+    Event::default()
+        .event("agent.output")
+        .id(chunk.sequence.to_string())
+        .data(serde_json::to_string(chunk).expect("AgentOutputChunk must serialize"))
 }
 
 async fn cancel_agent_turn(
@@ -9083,6 +9359,17 @@ mod tests {
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
     }
 
+    struct StreamingProvider {
+        metadata: ProviderMetadata,
+        first_delta: String,
+        second_delta: String,
+    }
+
+    struct TruncatedStreamingProvider {
+        metadata: ProviderMetadata,
+        delta: String,
+    }
+
     struct ToolThenFinalProvider {
         metadata: ProviderMetadata,
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
@@ -9294,6 +9581,79 @@ mod tests {
                     provider,
                 })
             })
+        }
+    }
+
+    impl StreamingProvider {
+        fn new(first_delta: String, second_delta: String) -> Self {
+            Self {
+                metadata: ProviderMetadata {
+                    provider_id: "test-streaming-provider".into(),
+                    model: Some("test-model".into()),
+                    reply_kind: ReplyKind::Model,
+                },
+                first_delta,
+                second_delta,
+            }
+        }
+
+        fn response(&self) -> ReplyResponse {
+            ReplyResponse {
+                output: ReplyOutput::Final {
+                    content: format!("{}{}", self.first_delta, self.second_delta),
+                },
+                finish_reason: Some("stop".into()),
+                provider: self.metadata.clone(),
+            }
+        }
+    }
+
+    impl ReplyProvider for StreamingProvider {
+        fn metadata(&self) -> &ProviderMetadata {
+            &self.metadata
+        }
+
+        fn reply(&self, _request: ReplyRequest) -> ReplyFuture<'_> {
+            let response = self.response();
+            Box::pin(async move { Ok(response) })
+        }
+
+        fn stream_reply(&self, _request: ReplyRequest) -> llm::ReplyStream<'_> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(ReplyStreamEvent::TextDelta(self.first_delta.clone())),
+                Ok(ReplyStreamEvent::TextDelta(self.second_delta.clone())),
+                Ok(ReplyStreamEvent::Completed(self.response())),
+            ]))
+        }
+    }
+
+    impl TruncatedStreamingProvider {
+        fn new(delta: String) -> Self {
+            Self {
+                metadata: ProviderMetadata {
+                    provider_id: "test-truncated-streaming-provider".into(),
+                    model: Some("test-model".into()),
+                    reply_kind: ReplyKind::Model,
+                },
+                delta,
+            }
+        }
+    }
+
+    impl ReplyProvider for TruncatedStreamingProvider {
+        fn metadata(&self) -> &ProviderMetadata {
+            &self.metadata
+        }
+
+        fn reply(&self, _request: ReplyRequest) -> ReplyFuture<'_> {
+            Box::pin(async { Err(ProviderError::Transport) })
+        }
+
+        fn stream_reply(&self, _request: ReplyRequest) -> llm::ReplyStream<'_> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(ReplyStreamEvent::TextDelta(self.delta.clone())),
+                Err(ProviderError::Transport),
+            ]))
         }
     }
 
@@ -10094,6 +10454,195 @@ mod tests {
                 ))
             })
         }
+    }
+
+    #[tokio::test]
+    async fn agent_output_endpoints_replay_durable_stream_chunks() {
+        let store = DemoStore::seeded().await.unwrap();
+        let owner = provision_test_owner(&store, "user-output", "output-owner").await;
+        let session_id = "session-agent-output";
+        let turn_id = "turn-agent-output";
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: session_id.into(),
+                    title: "Durable Agent output".into(),
+                },
+                "create-agent-output",
+            )
+            .await
+            .unwrap();
+        let first_delta = "a".repeat(AGENT_OUTPUT_FLUSH_TARGET_BYTES);
+        let second_delta = " durable tail".to_owned();
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(StreamingProvider::new(
+                first_delta.clone(),
+                second_delta.clone(),
+            )),
+        )
+        .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/sessions/{session_id}/turns"))
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "start-agent-output")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": turn_id,
+                            "user_message": "stream a durable response",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let ready = wait_for_ready_session(&store, &owner.authz, session_id).await;
+        assert_eq!(
+            ready.turns[0].assistant_message.as_deref(),
+            Some(format!("{first_delta}{second_delta}").as_str())
+        );
+
+        let output = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/sessions/{session_id}/turns/{turn_id}/output?after=0&limit=1"
+                ))
+                .header(header::HOST, "zeus.test")
+                .header(header::COOKIE, &owner.cookie_header)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.status(), StatusCode::OK);
+        assert_eq!(
+            output.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        let first_page: protocol::AgentOutputChunkPage = response_json(output).await;
+        assert_eq!(first_page.items.len(), 1);
+        assert_eq!(first_page.items[0].content, first_delta);
+        assert_eq!(first_page.next_after, Some(1));
+        assert_eq!(first_page.head_sequence, 2);
+        assert!(first_page.has_more);
+        assert!(first_page.terminal);
+
+        let events = app
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/sessions/{session_id}/turns/{turn_id}/output/events?after=0"
+                ))
+                .header(header::HOST, "zeus.test")
+                .header(header::COOKIE, &owner.cookie_header)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.status(), StatusCode::OK);
+        assert_eq!(
+            events.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        let event_body = String::from_utf8(
+            events
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(event_body.matches("event: agent.output").count(), 2);
+        assert!(event_body.contains("id: 1"));
+        assert!(event_body.contains("id: 2"));
+        assert!(event_body.contains(&second_delta));
+    }
+
+    #[tokio::test]
+    async fn truncated_agent_stream_persists_its_received_prefix_before_settlement() {
+        let store = DemoStore::seeded().await.unwrap();
+        let owner = provision_test_owner(&store, "user-truncated-output", "truncated-owner").await;
+        let session_id = "session-truncated-output";
+        let turn_id = "turn-truncated-output";
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: session_id.into(),
+                    title: "Truncated Agent output".into(),
+                },
+                "create-truncated-output",
+            )
+            .await
+            .unwrap();
+        let received_prefix = "provider prefix before transport failure".to_owned();
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(TruncatedStreamingProvider::new(received_prefix.clone())),
+        )
+        .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::post(format!("/api/v1/sessions/{session_id}/turns"))
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "start-truncated-output")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": turn_id,
+                            "user_message": "preserve the received prefix",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let agent = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            session_id,
+            turn_id,
+            protocol::AgentTurnStatus::NeedsAttention,
+        )
+        .await;
+        assert_eq!(
+            agent
+                .last_error
+                .as_ref()
+                .and_then(|error| error.get("code"))
+                .and_then(serde_json::Value::as_str),
+            Some("provider_transport_failed")
+        );
+        let output = store
+            .agent_output_chunk_page_for_actor(&owner.authz, session_id, turn_id, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(output.items.len(), 1);
+        assert_eq!(output.items[0].content, received_prefix);
+        assert!(output.terminal);
     }
 
     #[tokio::test]

@@ -12,8 +12,9 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::{
-    ProviderError, ProviderMetadata, REPLY_TOOL_ARGUMENTS_MAX_BYTES, ReplyFuture, ReplyKind,
-    ReplyMessage, ReplyOutput, ReplyProvider, ReplyRequest, ReplyResponse, ReplyRole,
+    ProviderError, ProviderMetadata, REPLY_STREAM_TEXT_DELTA_MAX_BYTES,
+    REPLY_TOOL_ARGUMENTS_MAX_BYTES, ReplyFuture, ReplyKind, ReplyMessage, ReplyOutput,
+    ReplyProvider, ReplyRequest, ReplyResponse, ReplyRole, ReplyStream, ReplyStreamEvent,
     ReplyToolCall, ReplyToolDefinition, SecretRef, SecretResolveError, SecretResolver,
     validate_provider_metadata, validate_reply_request, validate_reply_response_for_request,
 };
@@ -250,6 +251,7 @@ impl OpenAiCompatibleProvider {
             messages,
             tool_choice: (!tools.is_empty()).then_some("auto"),
             tools,
+            stream: false,
         };
         let authorization = self.authorization_header().await?;
         let response = self
@@ -313,6 +315,110 @@ impl OpenAiCompatibleProvider {
         };
         validate_reply_response_for_request(&request, &response)?;
         Ok(response)
+    }
+
+    fn request_stream(&self, request: ReplyRequest) -> ReplyStream<'_> {
+        Box::pin(async_stream::try_stream! {
+            validate_reply_request(&request)?;
+            let messages = request
+                .messages
+                .iter()
+                .map(ChatCompletionRequestMessage::try_from)
+                .collect::<Result<Vec<_>, _>>()?;
+            let tools = request
+                .tools
+                .iter()
+                .map(ChatCompletionToolDefinition::from)
+                .collect::<Vec<_>>();
+            let wire_request = ChatCompletionRequest {
+                model: &self.model,
+                messages,
+                tool_choice: (!tools.is_empty()).then_some("auto"),
+                tools,
+                stream: true,
+            };
+            let authorization = self.authorization_header().await?;
+            let response = self
+                .client
+                .post(self.endpoint.clone())
+                .header(AUTHORIZATION, authorization)
+                .json(&wire_request)
+                .send()
+                .await
+                .map_err(map_transport_error)?;
+            let status = response.status();
+            if !status.is_success() {
+                Err(ProviderError::HttpStatus { status: status.as_u16() })?;
+            }
+            if response
+                .content_length()
+                .is_some_and(|length| length > self.max_response_bytes as u64)
+            {
+                Err(ProviderError::ResponseTooLarge {
+                    limit_bytes: self.max_response_bytes,
+                })?;
+            }
+
+            let mut response = response;
+            let mut pending = Vec::new();
+            let mut received_bytes = 0usize;
+            let mut accumulator = ChatCompletionStreamAccumulator::default();
+            let mut done = false;
+            while let Some(chunk) = response.chunk().await.map_err(map_transport_error)? {
+                received_bytes = received_bytes
+                    .checked_add(chunk.len())
+                    .ok_or(ProviderError::ResponseTooLarge {
+                        limit_bytes: self.max_response_bytes,
+                    })?;
+                if received_bytes > self.max_response_bytes {
+                    Err(ProviderError::ResponseTooLarge {
+                        limit_bytes: self.max_response_bytes,
+                    })?;
+                }
+                pending.extend_from_slice(&chunk);
+                while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+                    let mut line = pending.drain(..=newline).collect::<Vec<_>>();
+                    line.pop();
+                    if line.last() == Some(&b'\r') {
+                        line.pop();
+                    }
+                    let line = std::str::from_utf8(&line)
+                        .map_err(|_| ProviderError::InvalidResponse)?;
+                    let data = match line.strip_prefix("data:") {
+                        Some(data) => data,
+                        None
+                            if line.is_empty()
+                                || line.starts_with(':')
+                                || line.starts_with("event:")
+                                || line.starts_with("id:")
+                                || line.starts_with("retry:") =>
+                        {
+                            continue;
+                        }
+                        None => Err(ProviderError::InvalidResponse)?,
+                    };
+                    let data = data.strip_prefix(' ').unwrap_or(data);
+                    if data == "[DONE]" {
+                        done = true;
+                        break;
+                    }
+                    let event: ChatCompletionStreamResponse =
+                        serde_json::from_str(data).map_err(|_| ProviderError::InvalidResponse)?;
+                    if let Some(delta) = accumulator.apply(event)? {
+                        yield ReplyStreamEvent::TextDelta(delta);
+                    }
+                }
+                if done {
+                    break;
+                }
+            }
+            if !done || !pending.iter().all(u8::is_ascii_whitespace) {
+                Err(ProviderError::Transport)?;
+            }
+            let completed = accumulator.finish(self.metadata.clone())?;
+            validate_reply_response_for_request(&request, &completed)?;
+            yield ReplyStreamEvent::Completed(completed);
+        })
     }
 }
 
@@ -390,6 +496,10 @@ impl ReplyProvider for OpenAiCompatibleProvider {
     fn reply(&self, request: ReplyRequest) -> ReplyFuture<'_> {
         Box::pin(self.request(request))
     }
+
+    fn stream_reply(&self, request: ReplyRequest) -> ReplyStream<'_> {
+        self.request_stream(request)
+    }
 }
 
 fn map_transport_error(error: reqwest::Error) -> ProviderError {
@@ -408,6 +518,8 @@ struct ChatCompletionRequest<'a> {
     tools: Vec<ChatCompletionToolDefinition<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<&'static str>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    stream: bool,
 }
 
 #[derive(Serialize)]
@@ -546,6 +658,171 @@ struct ChatCompletionResponseToolCall {
 struct ChatCompletionResponseFunction {
     name: String,
     arguments: String,
+}
+
+#[derive(Deserialize)]
+struct ChatCompletionStreamResponse {
+    choices: Vec<ChatCompletionStreamChoice>,
+}
+
+#[derive(Deserialize)]
+struct ChatCompletionStreamChoice {
+    #[serde(default)]
+    index: u32,
+    delta: ChatCompletionStreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct ChatCompletionStreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ChatCompletionStreamToolCall>,
+}
+
+#[derive(Deserialize)]
+struct ChatCompletionStreamToolCall {
+    #[serde(default)]
+    index: u32,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    function: Option<ChatCompletionStreamFunction>,
+}
+
+#[derive(Default, Deserialize)]
+struct ChatCompletionStreamFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[derive(Default)]
+struct ChatCompletionStreamAccumulator {
+    text: String,
+    tool_id: String,
+    tool_name: String,
+    tool_arguments: String,
+    finish_reason: Option<String>,
+    saw_text: bool,
+    saw_tool: bool,
+    saw_finish: bool,
+}
+
+impl ChatCompletionStreamAccumulator {
+    fn apply(
+        &mut self,
+        response: ChatCompletionStreamResponse,
+    ) -> Result<Option<String>, ProviderError> {
+        if response.choices.is_empty() {
+            return Ok(None);
+        }
+        if response.choices.len() != 1 {
+            return Err(ProviderError::InvalidResponse);
+        }
+        let choice = response
+            .choices
+            .into_iter()
+            .next()
+            .expect("one streaming choice was checked above");
+        if choice.index != 0 || self.saw_finish {
+            return Err(ProviderError::InvalidResponse);
+        }
+        if let Some(reason) = choice.finish_reason {
+            if reason.is_empty() || self.finish_reason.replace(reason).is_some() {
+                return Err(ProviderError::InvalidResponse);
+            }
+            self.saw_finish = true;
+        }
+        let mut emitted = None;
+        if let Some(content) = choice.delta.content.filter(|content| !content.is_empty()) {
+            if self.saw_tool || content.len() > REPLY_STREAM_TEXT_DELTA_MAX_BYTES {
+                return Err(ProviderError::InvalidResponse);
+            }
+            self.saw_text = true;
+            let next_len = self
+                .text
+                .len()
+                .checked_add(content.len())
+                .ok_or(ProviderError::InvalidResponse)?;
+            if next_len > protocol::ASSISTANT_MESSAGE_MAX_BYTES {
+                return Err(ProviderError::TerminalPayloadTooLarge {
+                    limit_bytes: protocol::ASSISTANT_MESSAGE_MAX_BYTES,
+                });
+            }
+            self.text.push_str(&content);
+            emitted = Some(content);
+        }
+        if !choice.delta.tool_calls.is_empty() {
+            if self.saw_text || choice.delta.tool_calls.len() != 1 {
+                return Err(ProviderError::InvalidResponse);
+            }
+            self.saw_tool = true;
+            let call = choice
+                .delta
+                .tool_calls
+                .into_iter()
+                .next()
+                .expect("one streaming tool call was checked above");
+            if call.index != 0 || call.kind.as_deref().is_some_and(|kind| kind != "function") {
+                return Err(ProviderError::InvalidResponse);
+            }
+            if let Some(id) = call.id {
+                if (!self.tool_id.is_empty() && self.tool_id != id)
+                    || id.len() > crate::REPLY_TOOL_CALL_ID_MAX_BYTES
+                {
+                    return Err(ProviderError::InvalidResponse);
+                }
+                self.tool_id = id;
+            }
+            if let Some(function) = call.function {
+                if let Some(name) = function.name {
+                    self.tool_name.push_str(&name);
+                    if self.tool_name.len() > crate::REPLY_TOOL_NAME_MAX_BYTES {
+                        return Err(ProviderError::InvalidResponse);
+                    }
+                }
+                if let Some(arguments) = function.arguments {
+                    self.tool_arguments.push_str(&arguments);
+                    if self.tool_arguments.len() > REPLY_TOOL_ARGUMENTS_MAX_BYTES {
+                        return Err(ProviderError::InvalidResponse);
+                    }
+                }
+            }
+        }
+        Ok(emitted)
+    }
+
+    fn finish(self, metadata: ProviderMetadata) -> Result<ReplyResponse, ProviderError> {
+        if !self.saw_finish || self.saw_text == self.saw_tool {
+            return Err(ProviderError::InvalidResponse);
+        }
+        let output = if self.saw_text {
+            if self.text.trim().is_empty() {
+                return Err(ProviderError::InvalidResponse);
+            }
+            ReplyOutput::Final { content: self.text }
+        } else {
+            if self.tool_id.is_empty() || self.tool_name.is_empty() {
+                return Err(ProviderError::InvalidResponse);
+            }
+            let arguments = serde_json::from_str(&self.tool_arguments)
+                .map_err(|_| ProviderError::InvalidResponse)?;
+            ReplyOutput::ToolCall {
+                call: ReplyToolCall::new(self.tool_id, self.tool_name, arguments),
+            }
+        };
+        Ok(ReplyResponse {
+            output,
+            finish_reason: self.finish_reason,
+            provider: metadata,
+        })
+    }
 }
 
 fn decode_output(message: ChatCompletionMessage) -> Result<ReplyOutput, ProviderError> {

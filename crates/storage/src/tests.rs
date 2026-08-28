@@ -1771,7 +1771,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         versions,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31,
+            25, 26, 27, 28, 29, 30, 31, 32,
         ]
     );
     let owner: Option<String> = connection
@@ -1921,7 +1921,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 31);
+    assert_eq!(version, 32);
     let configured_account: (String, String, String, i64) = connection
         .query_row(
             r#"SELECT
@@ -2639,7 +2639,7 @@ async fn v12_identity_and_run_crash_prefix_migrates_then_recovers_the_primary_se
     assert_eq!(
         recovered,
         (
-            31,
+            32,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into()
@@ -4386,7 +4386,7 @@ async fn v5_configured_database_migrates_to_the_local_owner_membership() {
     assert_eq!(
         migrated,
         (
-            31,
+            32,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into(),
@@ -4512,7 +4512,7 @@ async fn v13_configured_active_work_migrates_with_account_authority_and_exact_vo
             },
         )
         .unwrap();
-    assert_eq!(migrated_counts, (31, 1, 1, 2, 1));
+    assert_eq!(migrated_counts, (32, 1, 1, 2, 1));
 }
 
 #[tokio::test]
@@ -4874,7 +4874,7 @@ async fn v14_database_migrates_through_v19_with_member_and_audit_roots() {
             },
         )
         .unwrap();
-    assert_eq!(state, (31, 1, 1, 1, 19));
+    assert_eq!(state, (32, 1, 1, 1, 19));
 }
 
 #[tokio::test]
@@ -4913,7 +4913,7 @@ async fn v15_migration_seeds_the_configured_audit_detail_limit() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (31, 2));
+    assert_eq!(state, (32, 2));
 }
 
 #[tokio::test]
@@ -4958,7 +4958,7 @@ async fn v15_reopen_rejects_a_lower_audit_detail_limit_without_mutating_policy()
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (31, 4));
+    assert_eq!(state, (32, 4));
     drop(connection);
 
     let reopened = SqliteStore::open_with_limits(database.path(), original_limits)
@@ -5276,6 +5276,38 @@ async fn readiness_rejects_a_weakened_v31_followup_transition_trigger_definition
     assert!(
         matches!(&error, StorageError::CorruptData(message)
             if message == "durability trigger `session_followups_enforce_transition` differs from the authoritative migration"),
+        "unexpected weakened-trigger error: {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn readiness_rejects_a_weakened_v32_agent_output_trigger_definition() {
+    let database = TestDatabase::new();
+    {
+        let store = SqliteStore::open(database.path()).await.unwrap();
+        store.readiness().await.unwrap();
+    }
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER agent_model_output_chunks_validate_insert;
+               CREATE TRIGGER agent_model_output_chunks_validate_insert
+               BEFORE INSERT ON agent_model_output_chunks
+               WHEN 0
+               BEGIN
+                   SELECT 1;
+               END;"#,
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("a same-name weakened Agent output trigger must fail readiness"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(&error, StorageError::CorruptData(message)
+            if message == "durability trigger `agent_model_output_chunks_validate_insert` differs from the authoritative migration"),
         "unexpected weakened-trigger error: {error:?}"
     );
 }
@@ -7224,7 +7256,7 @@ async fn v19_agent_manifest_is_canonical_actor_scoped_reused_and_secret_free() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(version, 31);
+    assert_eq!(version, 32);
     assert_eq!(
         manifest_rows, 1,
         "the identical manifest must be deduplicated"
@@ -8694,6 +8726,160 @@ async fn agent_manifest_collision_and_tamper_fail_closed() {
         SqliteStore::open(tamper_database.path()).await,
         Err(StorageError::CorruptData(_))
     ));
+}
+
+#[tokio::test]
+async fn agent_model_output_is_append_only_paginated_and_bound_to_final_reply() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    let request = StartTurnRequest {
+        turn_id: "turn-agent-output".into(),
+        user_message: "Stream this reply through durable Agent output".into(),
+        expected_sequence: 1,
+    };
+    let enqueued = store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            request.clone(),
+            "agent-output-start",
+            agent_turn_spec("agent-output", &request.turn_id, &request.user_message),
+        )
+        .await
+        .unwrap();
+    let AgentModelClaimOutcome::Claimed(claimed) = store
+        .claim_next_agent_model(&test_agent_manifest())
+        .await
+        .unwrap()
+    else {
+        panic!("the Agent output model job must be claimable");
+    };
+    assert_eq!(claimed.id, enqueued.job.id);
+
+    let first = store
+        .append_agent_model_output_chunk(&claimed.id, "durable ".into())
+        .await
+        .unwrap();
+    let second = store
+        .append_agent_model_output_chunk(&claimed.id, "stream".into())
+        .await
+        .unwrap();
+    assert_eq!(first.sequence, 1);
+    assert_eq!(first.ordinal, 1);
+    assert_eq!(first.cumulative_bytes, 8);
+    assert_eq!(second.sequence, 2);
+    assert_eq!(second.ordinal, 2);
+    assert_eq!(second.cumulative_bytes, 14);
+
+    let first_page = store
+        .agent_output_chunk_page_for_actor(&owner_authz(), "session-alpha", &request.turn_id, 0, 1)
+        .await
+        .unwrap();
+    assert_eq!(first_page.items, vec![first.clone()]);
+    assert_eq!(first_page.next_after, Some(1));
+    assert_eq!(first_page.head_sequence, 2);
+    assert!(first_page.has_more);
+    assert!(!first_page.terminal);
+
+    let second_page = store
+        .agent_output_chunk_page_for_actor(&owner_authz(), "session-alpha", &request.turn_id, 1, 1)
+        .await
+        .unwrap();
+    assert_eq!(second_page.items, vec![second.clone()]);
+    assert_eq!(second_page.head_sequence, 2);
+    assert!(!second_page.has_more);
+    assert!(!second_page.terminal);
+    assert!(matches!(
+        store
+            .agent_output_chunk_page_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                &request.turn_id,
+                3,
+                1,
+            )
+            .await,
+        Err(StorageError::EventCursorBeyondHead {
+            after: 3,
+            head_sequence: 2,
+        })
+    ));
+    assert!(matches!(
+        store
+            .agent_output_chunk_page_for_actor(
+                &foreign_authz(),
+                "session-alpha",
+                &request.turn_id,
+                u64::MAX,
+                0,
+            )
+            .await,
+        Err(StorageError::AuthSessionNotFound)
+    ));
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    assert!(
+        connection
+            .execute(
+                "UPDATE agent_model_output_chunks SET content = 'changed' WHERE agent_id = ?1 AND sequence = 1",
+                [&enqueued.agent.id],
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute(
+                "DELETE FROM agent_model_output_chunks WHERE agent_id = ?1 AND sequence = 1",
+                [&enqueued.agent.id],
+            )
+            .is_err()
+    );
+    drop(connection);
+
+    let mismatched = "durable mismatch";
+    assert!(matches!(
+        store
+            .complete_agent_model_success(AgentModelSuccessCommit {
+                job_id: claimed.id.clone(),
+                response_json: agent_final_response_json(mismatched),
+                resolution: AgentModelResolution::Final {
+                    assistant_message: mismatched.into(),
+                    provenance: agent_model_provenance(),
+                },
+            })
+            .await,
+        Err(StorageError::InvalidAgentTransition(message))
+            if message == "the completed model text does not match its durable output chunks"
+    ));
+
+    let assistant_message = "durable stream";
+    let completed = store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: claimed.id,
+            response_json: agent_final_response_json(assistant_message),
+            resolution: AgentModelResolution::Final {
+                assistant_message: assistant_message.into(),
+                provenance: agent_model_provenance(),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(matches!(completed, AgentModelCompletion::Final(_)));
+    let terminal_page = store
+        .agent_output_chunk_page_for_actor(&owner_authz(), "session-alpha", &request.turn_id, 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(terminal_page.items, vec![first, second]);
+    assert!(terminal_page.terminal);
+    store.verify_integrity().await.unwrap();
+
+    drop(store);
+    let reopened = SqliteStore::open(database.path()).await.unwrap();
+    let replayed_page = reopened
+        .agent_output_chunk_page_for_actor(&owner_authz(), "session-alpha", &request.turn_id, 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(replayed_page, terminal_page);
 }
 
 #[tokio::test]
@@ -19001,7 +19187,7 @@ async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempot
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, (1_i64..=31).collect::<Vec<_>>());
+    assert_eq!(versions, (1_i64..=32).collect::<Vec<_>>());
     assert_eq!(
         connection
             .query_row(
@@ -22595,6 +22781,14 @@ fn drop_v30_fixture_objects(connection: &rusqlite::Connection) {
 }
 
 fn drop_v31_fixture_objects(connection: &rusqlite::Connection) {
+    let version: i64 = connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    if version >= 32 {
+        drop_v32_fixture_objects(connection);
+    }
     let schema_reject_update = migration_trigger_sql(
         include_str!("../migrations/0020_agent_execution_ledger.sql"),
         "schema_migrations_reject_update",
@@ -22618,6 +22812,32 @@ fn drop_v31_fixture_objects(connection: &rusqlite::Connection) {
                DROP INDEX session_followups_actor_capacity_idx;
                DROP TABLE session_followups;
                DELETE FROM schema_migrations WHERE version = 31;"#,
+        )
+        .unwrap();
+    connection.execute_batch(schema_reject_update).unwrap();
+    connection.execute_batch(schema_reject_delete).unwrap();
+}
+
+fn drop_v32_fixture_objects(connection: &rusqlite::Connection) {
+    let schema_reject_update = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_update",
+    );
+    let schema_reject_delete = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_delete",
+    );
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER schema_migrations_reject_update;
+               DROP TRIGGER schema_migrations_reject_delete;
+               DROP TRIGGER agent_model_output_chunks_validate_insert;
+               DROP TRIGGER agent_model_output_chunks_reject_update;
+               DROP TRIGGER agent_model_output_chunks_reject_delete;
+               DROP INDEX agent_model_output_chunks_turn_page_idx;
+               DROP INDEX agent_model_output_chunks_job_idx;
+               DROP TABLE agent_model_output_chunks;
+               DELETE FROM schema_migrations WHERE version = 32;"#,
         )
         .unwrap();
     connection.execute_batch(schema_reject_update).unwrap();

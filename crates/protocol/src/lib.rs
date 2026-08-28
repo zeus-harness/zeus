@@ -1370,6 +1370,30 @@ pub struct SessionFollowupListResponse {
     pub items: Vec<SessionFollowup>,
 }
 
+/// One append-only text delta emitted by a started Agent model operation.
+/// `sequence` is contiguous across every model step in the owning Agent turn;
+/// `ordinal` is contiguous within one provider operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentOutputChunk {
+    pub sequence: u64,
+    pub job_id: String,
+    pub step: u32,
+    pub ordinal: u32,
+    pub content: String,
+    pub cumulative_bytes: u64,
+    pub created_at: String,
+}
+
+/// Bounded forward page used by both JSON replay and the output SSE feed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentOutputChunkPage {
+    pub items: Vec<AgentOutputChunk>,
+    pub next_after: Option<u64>,
+    pub head_sequence: u64,
+    pub has_more: bool,
+    pub terminal: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FlushSessionRequest {
     pub turn_id: String,

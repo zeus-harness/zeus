@@ -7,11 +7,12 @@ use std::{
     time::Duration,
 };
 
+use futures_util::StreamExt;
 use llm::{
     LocalFallbackProvider, OpenAiCompatibleProvider, ProviderError, REPLY_TOOL_ARGUMENTS_MAX_BYTES,
-    ReplyKind, ReplyMessage, ReplyOutput, ReplyProvider, ReplyRequest, ReplyRole, ReplyToolCall,
-    ReplyToolDefinition, ResolvedSecret, SecretRef, SecretResolveError, SecretResolveFuture,
-    SecretResolver,
+    ReplyKind, ReplyMessage, ReplyOutput, ReplyProvider, ReplyRequest, ReplyRole, ReplyStreamEvent,
+    ReplyToolCall, ReplyToolDefinition, ResolvedSecret, SecretRef, SecretResolveError,
+    SecretResolveFuture, SecretResolver,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -184,6 +185,120 @@ async fn local_fallback_is_object_safe_non_model_and_never_echoes_input() {
         panic!("local fallback must always return final text")
     };
     assert!(!content.contains(secret));
+}
+
+#[tokio::test]
+async fn openai_compatible_streams_text_deltas_then_one_typed_completion() {
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello \"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let mut server = spawn_mock(
+        "200 OK",
+        &[("Content-Type", "text/event-stream".into())],
+        body,
+        Duration::ZERO,
+    )
+    .await;
+    let provider =
+        OpenAiCompatibleProvider::new(&server.endpoint, "stream-model", "test-key").unwrap();
+    let mut stream = provider.stream_reply(request_with_secret("stream this"));
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.unwrap());
+    }
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0], ReplyStreamEvent::TextDelta("Hello ".into()));
+    assert_eq!(events[1], ReplyStreamEvent::TextDelta("world".into()));
+    let ReplyStreamEvent::Completed(response) = &events[2] else {
+        panic!("the stream must terminate with one typed response");
+    };
+    assert_eq!(
+        response.output,
+        ReplyOutput::Final {
+            content: "Hello world".into()
+        }
+    );
+    assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+
+    let captured = server.received.take().unwrap().await.unwrap();
+    let request: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
+    assert_eq!(request["stream"], true);
+}
+
+#[tokio::test]
+async fn openai_compatible_stream_accumulates_one_fragmented_tool_call() {
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_next\",\"type\":\"function\",\"function\":{\"name\":\"lookup_order\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"order\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"_id\\\":\\\"B-99\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let server = spawn_mock(
+        "200 OK",
+        &[("Content-Type", "text/event-stream".into())],
+        body,
+        Duration::ZERO,
+    )
+    .await;
+    let provider =
+        OpenAiCompatibleProvider::new(&server.endpoint, "stream-model", "test-key").unwrap();
+    let request = ReplyRequest::with_tools(
+        [ReplyMessage::new(ReplyRole::User, "Check order B-99")],
+        [lookup_tool()],
+    );
+    let events = provider
+        .stream_reply(request)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    let ReplyStreamEvent::Completed(response) = &events[0] else {
+        panic!("a streamed tool call must emit one terminal typed response");
+    };
+    assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
+    assert_eq!(
+        response.output,
+        ReplyOutput::ToolCall {
+            call: ReplyToolCall::new(
+                "call_next",
+                "lookup_order",
+                serde_json::json!({"order_id": "B-99"}),
+            )
+        }
+    );
+}
+
+#[tokio::test]
+async fn openai_compatible_stream_requires_done_after_delivered_prefix() {
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+    );
+    let server = spawn_mock(
+        "200 OK",
+        &[("Content-Type", "text/event-stream".into())],
+        body,
+        Duration::ZERO,
+    )
+    .await;
+    let provider =
+        OpenAiCompatibleProvider::new(&server.endpoint, "stream-model", "test-key").unwrap();
+    let mut stream = provider.stream_reply(request_with_secret("stream this"));
+    assert_eq!(
+        stream.next().await.unwrap().unwrap(),
+        ReplyStreamEvent::TextDelta("partial".into())
+    );
+    assert!(matches!(
+        stream.next().await.unwrap(),
+        Err(ProviderError::Transport)
+    ));
+    assert!(stream.next().await.is_none());
 }
 
 #[test]
