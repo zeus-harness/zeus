@@ -36,6 +36,10 @@ pub const SEND_MESSAGE_TOOL_NAME: &str = "send_message";
 pub const SEND_MESSAGE_TOOL_VERSION: &str = "1-direct-child-followup";
 pub const SEND_MESSAGE_MAX_BYTES: usize = 12 * 1024;
 pub const SEND_MESSAGE_ARGUMENTS_MAX_BYTES: usize = 16 * 1024;
+pub const REPORT_TOOL_NAME: &str = "report";
+pub const REPORT_TOOL_VERSION: &str = "1-durable-parent-followup";
+pub const REPORT_OUTPUT_MAX_BYTES: usize = 12 * 1024;
+pub const REPORT_ARGUMENTS_MAX_BYTES: usize = 16 * 1024;
 pub const WAIT_AGENT_TOOL_NAME: &str = "wait_agent";
 pub const WAIT_AGENT_TOOL_VERSION: &str = "1-direct-child-activity";
 pub const WAIT_AGENT_DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -54,6 +58,7 @@ const LIST_AGENTS_DESCRIPTION: &str = "List this Session's durable direct child 
 const GET_AGENT_RESULT_DESCRIPTION: &str = "Read one durable direct child's current status and, after successful completion, a bounded page of its final assistant output. The child must have been created by this parent Session's spawn_agent call. Failed or indeterminate children never expose partial output. Continue a large successful result with next_after_byte.";
 const INTERRUPT_AGENT_DESCRIPTION: &str = "Durably interrupt one currently active direct child created by this parent Session's spawn_agent call. Queued or running model work and tools that have not crossed their durable started checkpoint can be cancelled. A tool that is already running is outcome-sensitive and will not be reported as cancelled.";
 const SEND_MESSAGE_DESCRIPTION: &str = "Durably enqueue one follow-up message for a direct child created by this parent Session's spawn_agent call. The stable message_id acknowledges FIFO admission, not child completion. A ready child is scheduled and a running child consumes the message after its current turn; use get_agent_result to read completed output.";
+const REPORT_DESCRIPTION: &str = "Report selected, self-contained content to the durable direct parent that spawned this child Session. The receiver is derived from immutable lineage and cannot be selected by the caller. The report becomes a durable FIFO parent follow-up and wakes the parent for its next turn; reporting does not end this child turn. Call it before finishing when the parent needs your result. A failed call after admission may still have arrived, so do not blindly repeat it.";
 const WAIT_AGENT_DESCRIPTION: &str = "Wait for the next durable Session activity from any currently running direct child created by this parent Session's spawn_agent calls. This never wakes an inactive child. It returns no_progress immediately when no direct child can produce an event; after activity or timeout, call list_agents or get_agent_result for the authoritative durable state.";
 const SPAWN_AGENT_DESCRIPTION: &str = "Start one durable background child Agent that inherits this Session's completed turns before the current in-flight turn. The call returns after the child Session, initial prompt, and first model job are atomically admitted; it does not wait for the child result. Use list_agents to rediscover the stable child ID, send_message to continue it, interrupt_agent to stop active work, and get_agent_result to read terminal output.";
 
@@ -91,6 +96,14 @@ pub enum SubagentError {
     InvalidSendIdentity,
     #[error("send_message result exceeds its bounded output contract")]
     InvalidSendResult,
+    #[error("report arguments are not a strict bounded object")]
+    InvalidReportArguments,
+    #[error("report output is not a non-empty bounded message")]
+    InvalidReportOutput,
+    #[error("report durable identity input is invalid")]
+    InvalidReportIdentity,
+    #[error("report result exceeds its bounded output contract")]
+    InvalidReportResult,
     #[error("wait_agent arguments are not a strict bounded object")]
     InvalidWaitArguments,
     #[error(
@@ -212,6 +225,17 @@ struct RawSendMessageRequest {
 pub struct SendMessageRequest {
     subagent_id: String,
     message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawReportRequest {
+    output: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReportRequest {
+    output: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -352,11 +376,38 @@ impl SendMessageRequest {
     }
 }
 
+impl ReportRequest {
+    pub fn output(&self) -> &str {
+        &self.output
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SendMessageResult {
     pub subagent_id: String,
     pub message_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportResult {
+    pub message_id: String,
+}
+
+impl ReportResult {
+    pub fn new(message_id: String) -> Result<Self, SubagentError> {
+        if protocol::validate_turn_id(&message_id).is_err() {
+            return Err(SubagentError::InvalidReportResult);
+        }
+        let result = Self { message_id };
+        let encoded =
+            serde_json::to_vec(&result).map_err(|_| SubagentError::InvalidReportResult)?;
+        if encoded.len() > TOOL_OUTPUT_MAX_SERIALIZED_BYTES {
+            return Err(SubagentError::InvalidReportResult);
+        }
+        Ok(result)
+    }
 }
 
 impl SendMessageResult {
@@ -380,6 +431,12 @@ impl SendMessageResult {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SendMessageIdentity {
+    pub turn_id: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReportIdentity {
     pub turn_id: String,
     pub idempotency_key: String,
 }
@@ -627,6 +684,22 @@ pub fn prepare_send_message(arguments: &Value) -> Result<SendMessageRequest, Sub
     })
 }
 
+pub fn prepare_report(arguments: &Value) -> Result<ReportRequest, SubagentError> {
+    let encoded =
+        serde_json::to_vec(arguments).map_err(|_| SubagentError::InvalidReportArguments)?;
+    if encoded.len() > REPORT_ARGUMENTS_MAX_BYTES {
+        return Err(SubagentError::InvalidReportArguments);
+    }
+    let raw: RawReportRequest = serde_json::from_value(arguments.clone())
+        .map_err(|_| SubagentError::InvalidReportArguments)?;
+    if raw.output.len() > REPORT_OUTPUT_MAX_BYTES
+        || protocol::validate_user_message(&raw.output).is_err()
+    {
+        return Err(SubagentError::InvalidReportOutput);
+    }
+    Ok(ReportRequest { output: raw.output })
+}
+
 pub fn prepare_interrupt_agent(arguments: &Value) -> Result<InterruptAgentRequest, SubagentError> {
     let encoded =
         serde_json::to_vec(arguments).map_err(|_| SubagentError::InvalidInterruptArguments)?;
@@ -678,6 +751,44 @@ pub fn send_message_identity(
         turn_id: format!("subagent-message-{digest}"),
         idempotency_key: format!("subagent-message-{digest}"),
     })
+}
+
+pub fn report_identity(
+    child_session_id: &str,
+    call_id: &str,
+    parent_session_id: &str,
+) -> Result<ReportIdentity, SubagentError> {
+    if protocol::validate_session_id(child_session_id).is_err()
+        || !valid_identity_input(call_id)
+        || protocol::validate_session_id(parent_session_id).is_err()
+    {
+        return Err(SubagentError::InvalidReportIdentity);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"zeus.subagent-report.v1\0");
+    hash_field(&mut hasher, child_session_id.as_bytes());
+    hash_field(&mut hasher, call_id.as_bytes());
+    hash_field(&mut hasher, parent_session_id.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    Ok(ReportIdentity {
+        turn_id: format!("subagent-report-{digest}"),
+        idempotency_key: format!("subagent-report-{digest}"),
+    })
+}
+
+pub fn report_parent_message(
+    child_session_id: &str,
+    output: &str,
+) -> Result<String, SubagentError> {
+    if protocol::validate_session_id(child_session_id).is_err()
+        || output.len() > REPORT_OUTPUT_MAX_BYTES
+        || protocol::validate_user_message(output).is_err()
+    {
+        return Err(SubagentError::InvalidReportOutput);
+    }
+    let message = format!("Background subagent {child_session_id} reported:\n{output}");
+    protocol::validate_user_message(&message).map_err(|_| SubagentError::InvalidReportOutput)?;
+    Ok(message)
 }
 
 pub fn spawn_agent_identity(
@@ -851,6 +962,23 @@ pub fn send_message_descriptor() -> ToolDescriptor {
     }
 }
 
+pub fn report_descriptor() -> ToolDescriptor {
+    ToolDescriptor {
+        name: REPORT_TOOL_NAME.into(),
+        version: REPORT_TOOL_VERSION.into(),
+        description: REPORT_DESCRIPTION.into(),
+        effect: ToolEffect::LocalWrite,
+        sandbox_profile: SandboxProfile::ReadOnly,
+        input_schema: ObjectSchema {
+            max_serialized_bytes: REPORT_ARGUMENTS_MAX_BYTES,
+            properties: BTreeMap::from([(
+                "output".into(),
+                ParameterSpec::required_string(REPORT_OUTPUT_MAX_BYTES),
+            )]),
+        },
+    }
+}
+
 pub fn interrupt_agent_descriptor() -> ToolDescriptor {
     ToolDescriptor {
         name: INTERRUPT_AGENT_TOOL_NAME.into(),
@@ -894,6 +1022,7 @@ pub fn register_subagent_tools(registry: &mut ToolRegistry) -> Result<(), Regist
     registry.register(get_agent_result_descriptor(), RuntimeSubagentExecutor)?;
     registry.register(interrupt_agent_descriptor(), RuntimeSubagentExecutor)?;
     registry.register(list_agents_descriptor(), RuntimeSubagentExecutor)?;
+    registry.register(report_descriptor(), RuntimeSubagentExecutor)?;
     registry.register(send_message_descriptor(), RuntimeSubagentExecutor)?;
     registry.register(spawn_agent_descriptor(), RuntimeSubagentExecutor)?;
     registry.register(wait_agent_descriptor(), RuntimeSubagentExecutor)
@@ -975,6 +1104,7 @@ mod tests {
         assert!(registry.descriptor(LIST_AGENTS_TOOL_NAME).is_some());
         assert!(registry.descriptor(GET_AGENT_RESULT_TOOL_NAME).is_some());
         assert!(registry.descriptor(INTERRUPT_AGENT_TOOL_NAME).is_some());
+        assert!(registry.descriptor(REPORT_TOOL_NAME).is_some());
         assert!(registry.descriptor(SEND_MESSAGE_TOOL_NAME).is_some());
         assert!(registry.descriptor(WAIT_AGENT_TOOL_NAME).is_some());
     }
@@ -1133,6 +1263,58 @@ mod tests {
         );
         let result =
             SendMessageResult::new("subagent-child".into(), "subagent-message-1".into()).unwrap();
+        assert!(serde_json::to_vec(&result).unwrap().len() <= TOOL_OUTPUT_MAX_SERIALIZED_BYTES);
+    }
+
+    #[test]
+    fn report_request_identity_message_and_result_are_strict_and_parent_bound() {
+        let request = prepare_report(&serde_json::json!({
+            "output": "The storage invariant holds; see crates/storage/src/sqlite/agent.rs.",
+        }))
+        .unwrap();
+        assert!(request.output().contains("storage invariant"));
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"output": "  "}),
+            serde_json::json!({"output": "result", "receiver": "parent"}),
+        ] {
+            assert!(prepare_report(&invalid).is_err(), "{invalid}");
+        }
+
+        let first = report_identity("subagent-child", "call-1", "session-parent").unwrap();
+        assert_eq!(
+            first,
+            report_identity("subagent-child", "call-1", "session-parent").unwrap()
+        );
+        assert_ne!(
+            first,
+            report_identity("subagent-child", "call-2", "session-parent").unwrap()
+        );
+        assert_ne!(
+            first,
+            report_identity("subagent-child", "call-1", "session-other").unwrap()
+        );
+        protocol::validate_turn_id(&first.turn_id).unwrap();
+        protocol::validate_idempotency_key(&first.idempotency_key).unwrap();
+
+        let message = report_parent_message("subagent-child", request.output()).unwrap();
+        assert_eq!(
+            message,
+            format!(
+                "Background subagent subagent-child reported:\n{}",
+                request.output()
+            )
+        );
+        let descriptor = report_descriptor();
+        assert_eq!(descriptor.effect, ToolEffect::LocalWrite);
+        assert_eq!(descriptor.sandbox_profile, SandboxProfile::ReadOnly);
+        let schema = descriptor.input_schema.provider_json_schema().unwrap();
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            schema["properties"]["output"]["maxLength"],
+            REPORT_OUTPUT_MAX_BYTES
+        );
+        let result = ReportResult::new(first.turn_id).unwrap();
         assert!(serde_json::to_vec(&result).unwrap().len() <= TOOL_OUTPUT_MAX_SERIALIZED_BYTES);
     }
 

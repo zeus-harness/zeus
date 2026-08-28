@@ -13,10 +13,11 @@ use crate::{
     AgentOperationKind, AgentPreparedModel, AgentPreparedTool, AgentPromptCommit,
     AgentPromptRevisionPage, AgentPromptRevisionSummary, AgentPromptState, AgentPromptUpdateResult,
     AgentReviewCommit, AgentReviewContext, AgentReviewResult, AgentSubagentActivitySnapshot,
-    AgentSubagentInterruptCandidate, AgentSubagentMessageCandidate, AgentSubagentResultSnapshot,
-    AgentSubagentSpawnCandidate, AgentSubagentSpawnCommit, AgentTerminalCompletion, AgentToolCall,
-    AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
-    AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe,
+    AgentSubagentInterruptCandidate, AgentSubagentMessageCandidate, AgentSubagentReportCandidate,
+    AgentSubagentResultSnapshot, AgentSubagentSpawnCandidate, AgentSubagentSpawnCommit,
+    AgentTerminalCompletion, AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome,
+    AgentToolCompletion, AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit,
+    AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe,
     DEFAULT_SESSION_AGENT_PROMPT_REVISION, DEFAULT_SESSION_AGENT_SYSTEM_PROMPT,
     KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage, KnowledgeCatalogRevisionSummary,
     KnowledgeCatalogState, KnowledgeCatalogUpdateResult, SESSION_AGENT_PROMPT_ID,
@@ -570,6 +571,22 @@ impl SqliteStore {
                 &call_id,
                 &child_session_id,
             )
+        })
+        .await
+    }
+
+    /// Resolves the immutable direct parent and current durable authority for
+    /// one exact started child `report` call. The following FIFO admission
+    /// rechecks membership and the parent Session sequence atomically.
+    pub async fn subagent_report_candidate_for_started_tool(
+        &self,
+        scope: &ExecutionScope,
+        call_id: &str,
+    ) -> Result<AgentSubagentReportCandidate, StorageError> {
+        let scope = scope.clone();
+        let call_id = validated_durable_reference(call_id, "Agent tool call ID")?.to_owned();
+        self.with_connection(move |connection| {
+            query_subagent_report_candidate_for_started_tool(connection, &scope, &call_id)
         })
         .await
     }
@@ -5143,6 +5160,100 @@ fn query_subagent_message_candidate_for_started_tool(
     Ok(candidate)
 }
 
+fn query_subagent_report_candidate_for_started_tool(
+    connection: &mut Connection,
+    scope: &ExecutionScope,
+    call_id: &str,
+) -> Result<AgentSubagentReportCandidate, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let call = query_agent_tool_call(&transaction, call_id)?;
+    let child_agent = query_agent_turn(&transaction, &call.agent_id)?;
+    if call.status != AgentToolCallStatus::Running
+        || call.tool_name != subagents::REPORT_TOOL_NAME
+        || call.tool_version != subagents::REPORT_TOOL_VERSION
+        || call.account_id.as_str() != scope.account_id
+        || call.session_id != scope.session_id
+        || call.turn_id != scope.turn_id
+        || call.agent_id != scope.agent_id
+        || child_agent.account_id.as_str() != scope.account_id
+        || child_agent.actor_user_id != scope.actor_id
+        || child_agent.session_id != scope.session_id
+        || child_agent.turn_id != scope.turn_id
+    {
+        return Err(StorageError::AgentToolCallNotFound(call_id.to_owned()));
+    }
+    let parent_session_id = transaction
+        .query_row(
+            r#"SELECT spawn.parent_session_id
+               FROM agent_subagent_spawns spawn
+               WHERE spawn.account_id = ?1
+                 AND spawn.actor_user_id = ?2
+                 AND spawn.child_session_id = ?3"#,
+            params![
+                child_agent.account_id.as_str(),
+                child_agent.actor_user_id,
+                child_agent.session_id,
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| StorageError::AgentToolCallNotFound(call_id.to_owned()))?;
+    let role = transaction
+        .query_row(
+            r#"SELECT membership.role
+               FROM accounts account
+               JOIN account_memberships membership
+                 ON membership.account_id = account.id
+               JOIN users user ON user.id = membership.user_id
+               JOIN sessions parent ON parent.account_id = account.id
+               JOIN sessions child ON child.account_id = account.id
+               WHERE account.id = ?1
+                 AND account.status = 'active'
+                 AND membership.user_id = ?2
+                 AND membership.status = 'active'
+                 AND membership.revision = ?3
+                 AND user.status = 'active'
+                 AND parent.id = ?4
+                 AND child.id = ?5"#,
+            params![
+                child_agent.account_id.as_str(),
+                child_agent.actor_user_id,
+                u64_to_i64(
+                    child_agent.actor_membership_revision.get(),
+                    "subagent report membership revision"
+                )?,
+                parent_session_id,
+                child_agent.session_id,
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|role| decode_membership_role(&role))
+        .transpose()?
+        .filter(|role| membership_allows(*role, AccountCapability::Reply))
+        .ok_or(StorageError::PermissionDenied)?;
+    let parent_session = query_session_summary(&transaction, &parent_session_id)?;
+    validate_session_event_tail(&transaction, &parent_session)?;
+    let auth_session_id =
+        AuthSessionId::from_persistence("subagent-report-driver-v1").map_err(|error| {
+            StorageError::CorruptData(format!(
+                "invalid internal subagent report authority ID: {error}"
+            ))
+        })?;
+    let candidate = AgentSubagentReportCandidate {
+        authz: AuthzContext {
+            account_id: child_agent.account_id,
+            user_id: child_agent.actor_user_id,
+            membership_role: role,
+            membership_revision: child_agent.actor_membership_revision,
+            auth_session_id,
+        },
+        parent_session,
+    };
+    transaction.commit()?;
+    Ok(candidate)
+}
+
 fn query_subagent_interrupt_candidate_for_started_tool(
     connection: &mut Connection,
     scope: &ExecutionScope,
@@ -8049,6 +8160,118 @@ pub(super) fn verify_agent_subagent_spawn_integrity(
         {
             return Err(StorageError::CorruptData(format!(
                 "send_message call `{call_id}` has inconsistent durable follow-up evidence"
+            )));
+        }
+    }
+
+    let mut statement = connection.prepare(
+        r#"SELECT call_id FROM agent_tool_calls
+           WHERE tool_name = ?1 AND tool_version = ?2 AND status = 'succeeded'
+           ORDER BY call_id"#,
+    )?;
+    let report_call_ids = statement
+        .query_map(
+            params![subagents::REPORT_TOOL_NAME, subagents::REPORT_TOOL_VERSION],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for call_id in report_call_ids {
+        let call = query_agent_tool_call(connection, &call_id)?;
+        let child_agent = query_agent_turn(connection, &call.agent_id)?;
+        let request = subagents::prepare_report(&call.arguments_json).map_err(|error| {
+            StorageError::CorruptData(format!(
+                "report call `{call_id}` has invalid durable arguments: {error}"
+            ))
+        })?;
+        let result: subagents::ReportResult =
+            serde_json::from_value(call.result_json.clone().ok_or_else(|| {
+                StorageError::CorruptData(format!(
+                    "report call `{call_id}` has no successful durable result"
+                ))
+            })?)
+            .map_err(|error| {
+                StorageError::CorruptData(format!(
+                    "report call `{call_id}` has an invalid durable result: {error}"
+                ))
+            })?;
+        let parent_session_id: String = connection
+            .query_row(
+                r#"SELECT parent_session_id FROM agent_subagent_spawns
+                   WHERE account_id = ?1 AND actor_user_id = ?2 AND child_session_id = ?3"#,
+                params![
+                    call.account_id.as_str(),
+                    child_agent.actor_user_id,
+                    child_agent.session_id,
+                ],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StorageError::CorruptData(format!(
+                    "report call `{call_id}` does not belong to a durable child"
+                ))
+            })?;
+        let identity =
+            subagents::report_identity(&child_agent.session_id, &call.call_id, &parent_session_id)
+                .map_err(|error| {
+                    StorageError::CorruptData(format!(
+                        "report call `{call_id}` has invalid identity material: {error}"
+                    ))
+                })?;
+        let expected_message =
+            subagents::report_parent_message(&child_agent.session_id, request.output()).map_err(
+                |error| {
+                    StorageError::CorruptData(format!(
+                        "report call `{call_id}` has invalid parent content: {error}"
+                    ))
+                },
+            )?;
+        let followup = query_session_followup(connection, &parent_session_id, &identity.turn_id)?;
+        let (followup_account_id, followup_actor_user_id, followup_membership_revision): (
+            String,
+            String,
+            i64,
+        ) = connection.query_row(
+            r#"SELECT account_id, actor_user_id, actor_membership_revision
+               FROM session_followups WHERE session_id = ?1 AND turn_id = ?2"#,
+            params![parent_session_id, identity.turn_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let receipt_response: String = connection.query_row(
+            r#"SELECT response_json FROM session_followup_receipts
+               WHERE account_id = ?1 AND actor_user_id = ?2 AND idempotency_key = ?3"#,
+            params![
+                call.account_id.as_str(),
+                child_agent.actor_user_id,
+                identity.idempotency_key,
+            ],
+            |row| row.get(0),
+        )?;
+        let receipt: EnqueueSessionFollowupResponse = serde_json::from_str(&receipt_response)?;
+        if call.status != AgentToolCallStatus::Succeeded
+            || call.account_id != child_agent.account_id
+            || call.session_id != child_agent.session_id
+            || call.turn_id != child_agent.turn_id
+            || result.message_id != identity.turn_id
+            || followup.session_id != parent_session_id
+            || followup.turn_id != identity.turn_id
+            || followup.user_message != expected_message
+            || followup_account_id != call.account_id.as_str()
+            || followup_actor_user_id != child_agent.actor_user_id
+            || i64_to_u64(
+                followup_membership_revision,
+                "subagent report membership revision",
+            )? != child_agent.actor_membership_revision.get()
+            || receipt.replayed
+            || receipt.followup.session_id != followup.session_id
+            || receipt.followup.turn_id != followup.turn_id
+            || receipt.followup.ordinal != followup.ordinal
+            || receipt.followup.user_message != followup.user_message
+            || receipt.followup.enqueued_at != followup.enqueued_at
+        {
+            return Err(StorageError::CorruptData(format!(
+                "report call `{call_id}` has inconsistent durable parent evidence"
             )));
         }
     }

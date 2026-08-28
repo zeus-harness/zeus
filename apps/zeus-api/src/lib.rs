@@ -5164,8 +5164,10 @@ async fn settle_known_agent_tool(
     if subagent_spawn.is_some() && committed_status == AgentToolCallStatus::Succeeded {
         kick_agent_model_worker(state);
     }
-    if work.call.tool_name == subagents::SEND_MESSAGE_TOOL_NAME
-        && work.call.tool_version == subagents::SEND_MESSAGE_TOOL_VERSION
+    if ((work.call.tool_name == subagents::SEND_MESSAGE_TOOL_NAME
+        && work.call.tool_version == subagents::SEND_MESSAGE_TOOL_VERSION)
+        || (work.call.tool_name == subagents::REPORT_TOOL_NAME
+            && work.call.tool_version == subagents::REPORT_TOOL_VERSION))
         && committed_status == AgentToolCallStatus::Succeeded
     {
         kick_followup_worker(state);
@@ -9771,6 +9773,11 @@ mod tests {
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
     }
 
+    struct SpawnReportThenFinalProvider {
+        metadata: ProviderMetadata,
+        requests: Arc<StdMutex<Vec<ReplyRequest>>>,
+    }
+
     struct SpawnInterruptThenFinalProvider {
         metadata: ProviderMetadata,
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
@@ -10209,6 +10216,19 @@ mod tests {
         }
     }
 
+    impl SpawnReportThenFinalProvider {
+        fn new(requests: Arc<StdMutex<Vec<ReplyRequest>>>) -> Self {
+            Self {
+                metadata: ProviderMetadata {
+                    provider_id: "test-spawn-report-provider".into(),
+                    model: Some("test-model".into()),
+                    reply_kind: ReplyKind::Model,
+                },
+                requests,
+            }
+        }
+    }
+
     impl SpawnInterruptThenFinalProvider {
         fn new(requests: Arc<StdMutex<Vec<ReplyRequest>>>) -> Self {
             Self {
@@ -10586,6 +10606,103 @@ mod tests {
                             }
                         }
                     }
+                }
+            };
+            let provider = self.metadata.clone();
+            Box::pin(async move {
+                Ok(ReplyResponse {
+                    output,
+                    finish_reason: Some("stop".into()),
+                    provider,
+                })
+            })
+        }
+    }
+
+    impl ReplyProvider for SpawnReportThenFinalProvider {
+        fn metadata(&self) -> &ProviderMetadata {
+            &self.metadata
+        }
+
+        fn reply(&self, request: ReplyRequest) -> ReplyFuture<'_> {
+            let output = {
+                self.requests.lock().unwrap().push(request.clone());
+                let current_user = request
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == ReplyRole::User)
+                    .map(|message| message.content.as_str());
+                let tool_results = request
+                    .messages
+                    .iter()
+                    .filter(|message| message.role == ReplyRole::Tool)
+                    .map(|message| {
+                        serde_json::from_str::<serde_json::Value>(&message.content).unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                match current_user {
+                    Some("produce a durable parent report") => match tool_results.as_slice() {
+                        [] => {
+                            let tool = request
+                                .tools
+                                .iter()
+                                .find(|tool| tool.name == subagents::REPORT_TOOL_NAME)
+                                .expect("every spawned child must expose report");
+                            assert_eq!(
+                                tool.parameters["properties"]["output"]["maxLength"],
+                                subagents::REPORT_OUTPUT_MAX_BYTES
+                            );
+                            ReplyOutput::ToolCall {
+                                call: ReplyToolCall::new(
+                                    "provider-call-report-parent",
+                                    subagents::REPORT_TOOL_NAME,
+                                    serde_json::json!({
+                                        "output": "the durable child finding is ready",
+                                    }),
+                                ),
+                            }
+                        }
+                        [reported] => {
+                            assert!(
+                                reported["message_id"]
+                                    .as_str()
+                                    .is_some_and(|id| id.starts_with("subagent-report-"))
+                            );
+                            ReplyOutput::Final {
+                                content: "child reported and completed".into(),
+                            }
+                        }
+                        results => panic!("unexpected child report result count {}", results.len()),
+                    },
+                    Some(message) if message.starts_with("Background subagent ") => {
+                        assert!(message.ends_with("reported:\nthe durable child finding is ready"));
+                        assert!(tool_results.is_empty());
+                        ReplyOutput::Final {
+                            content: "parent consumed the durable child report".into(),
+                        }
+                    }
+                    _ => match tool_results.as_slice() {
+                        [] => ReplyOutput::ToolCall {
+                            call: ReplyToolCall::new(
+                                "provider-call-spawn-report-child",
+                                subagents::SPAWN_AGENT_TOOL_NAME,
+                                serde_json::json!({
+                                    "description": "Reporting child",
+                                    "prompt": "produce a durable parent report",
+                                }),
+                            ),
+                        },
+                        [spawned] => {
+                            assert!(spawned["subagent_id"].is_string());
+                            ReplyOutput::Final {
+                                content: "parent delegated the durable report".into(),
+                            }
+                        }
+                        results => {
+                            panic!("unexpected parent report result count {}", results.len())
+                        }
+                    },
                 }
             };
             let provider = self.metadata.clone();
@@ -13797,6 +13914,144 @@ mod tests {
             Some("child follow-up complete")
         );
         assert_eq!(requests.lock().unwrap().len(), 9);
+        store.verify_integrity().await.unwrap();
+        drop(app);
+    }
+
+    #[tokio::test]
+    async fn agent_report_durably_routes_one_edge_to_its_direct_parent() {
+        let store = DemoStore::seeded().await.unwrap();
+        let owner = provision_test_owner(&store, "user-agent-report", "agent-report-owner").await;
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: "session-agent-report".into(),
+                    title: "Durable child report".into(),
+                },
+                "create-agent-report",
+            )
+            .await
+            .unwrap();
+
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(SpawnReportThenFinalProvider::new(Arc::clone(&requests))),
+        )
+        .unwrap();
+        let started = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-agent-report/turns")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "start-agent-report")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-agent-report",
+                            "user_message": "delegate one durable child report",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+
+        let parent = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let parent = store
+                    .get_session_for_actor(
+                        &owner.authz,
+                        "session-agent-report",
+                        None,
+                        50,
+                        None,
+                        50,
+                        None,
+                        50,
+                    )
+                    .await
+                    .unwrap();
+                if parent.session.status == SessionStatus::Ready && parent.turns.len() == 2 {
+                    break parent;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the child report must wake and complete its durable parent follow-up");
+        assert_eq!(
+            parent.turns[0].assistant_message.as_deref(),
+            Some("parent delegated the durable report")
+        );
+        assert!(
+            parent.turns[1]
+                .user_message
+                .ends_with("reported:\nthe durable child finding is ready")
+        );
+        assert_eq!(
+            parent.turns[1].assistant_message.as_deref(),
+            Some("parent consumed the durable child report")
+        );
+
+        let parent_agent = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            "session-agent-report",
+            "turn-agent-report",
+            protocol::AgentTurnStatus::Succeeded,
+        )
+        .await;
+        assert_eq!(parent_agent.calls.len(), 1);
+        assert_eq!(parent_agent.calls[0].tool, subagents::SPAWN_AGENT_TOOL_NAME);
+        let spawned: subagents::SpawnAgentResult =
+            serde_json::from_value(parent_agent.calls[0].output.clone().unwrap()).unwrap();
+        assert!(parent.turns[1].user_message.starts_with(&format!(
+            "Background subagent {} reported:\n",
+            spawned.subagent_id
+        )));
+
+        let child = wait_for_ready_session(&store, &owner.authz, &spawned.subagent_id).await;
+        assert_eq!(child.turns.len(), 1);
+        assert_eq!(
+            child.turns[0].assistant_message.as_deref(),
+            Some("child reported and completed")
+        );
+        let child_agent = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            &spawned.subagent_id,
+            &child.turns[0].id,
+            protocol::AgentTurnStatus::Succeeded,
+        )
+        .await;
+        assert_eq!(child_agent.calls.len(), 1);
+        assert_eq!(child_agent.calls[0].tool, subagents::REPORT_TOOL_NAME);
+        assert_eq!(child_agent.calls[0].status, AgentToolCallStatus::Succeeded);
+        let report: subagents::ReportResult =
+            serde_json::from_value(child_agent.calls[0].output.clone().unwrap()).unwrap();
+        assert_eq!(report.message_id, parent.turns[1].id);
+
+        let followups = store
+            .session_followups_for_actor(&owner.authz, "session-agent-report")
+            .await
+            .unwrap();
+        assert_eq!(followups.len(), 1);
+        assert_eq!(followups[0].turn_id, report.message_id);
+        assert_eq!(followups[0].user_message, parent.turns[1].user_message);
+        assert_eq!(
+            followups[0].status,
+            protocol::SessionFollowupStatus::Claimed
+        );
+        assert_eq!(requests.lock().unwrap().len(), 5);
         store.verify_integrity().await.unwrap();
         drop(app);
     }

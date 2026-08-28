@@ -77,26 +77,27 @@ pub use storage::{
     AgentPreparedModel, AgentPreparedTool, AgentPromptCommit, AgentPromptRevisionPage,
     AgentPromptRevisionSummary, AgentPromptState, AgentPromptUpdateResult, AgentReviewCommit,
     AgentReviewContext, AgentReviewResult, AgentSubagentInterruptCandidate,
-    AgentSubagentMessageCandidate, AgentSubagentSpawnCandidate, AgentSubagentSpawnCommit,
-    AgentTerminalCompletion, AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome,
-    AgentToolCompletion, AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit,
-    AgentToolStartOutcome, AgentToolWork, AgentTurn, AgentTurnEnqueueResponse,
-    AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal, AuthSessionCommit, AuthSessionId,
-    AuthzContext, BootstrapOwnerCommit, CreateAccountCommit, CreateAccountResult,
-    CreateMemberResult, DEFAULT_SESSION_AGENT_PROMPT_REVISION, DEFAULT_SESSION_AGENT_SYSTEM_PROMPT,
-    InFlightWorkSummary, KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage,
-    KnowledgeCatalogRevisionSummary, KnowledgeCatalogState, KnowledgeCatalogUpdateResult,
-    MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit, MemberSetupResult, MemberSetupToken,
-    MemberTransitionResult, MembershipRevision, MembershipRole, ReplyClaimOutcome, ReplyCompletion,
-    ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus,
-    ReplyOutcomeUnknownCommit, ReplySuccessCommit, RotateMemberSetupTokenResult,
-    SESSION_AGENT_PROMPT_ID, SessionCompactionClaimOutcome, SessionCompactionFailureCommit,
-    SessionCompactionJob, SessionCompactionSuccessCommit, SessionContextCheckpoint,
-    SessionFollowupCandidate, SessionForkPage, SessionSummaryPage, SqliteOperationLimits,
-    SqliteOperationLimitsError, SqlitePhysicalLimits, SqlitePhysicalLimitsError, StorageLimits,
-    StorageLimitsError, StoredAccount, StoredAccountStatus, StoredCredential, StoredMember,
-    StoredMemberPage, StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserRole,
-    StoredUserStatus, SwitchAuthSessionCommit, SwitchAuthSessionResult, TransitionMemberCommit,
+    AgentSubagentMessageCandidate, AgentSubagentReportCandidate, AgentSubagentSpawnCandidate,
+    AgentSubagentSpawnCommit, AgentTerminalCompletion, AgentToolCall, AgentToolCallSpec,
+    AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
+    AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurn,
+    AgentTurnEnqueueResponse, AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal,
+    AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, CreateAccountCommit,
+    CreateAccountResult, CreateMemberResult, DEFAULT_SESSION_AGENT_PROMPT_REVISION,
+    DEFAULT_SESSION_AGENT_SYSTEM_PROMPT, InFlightWorkSummary, KnowledgeCatalogCommit,
+    KnowledgeCatalogRevisionPage, KnowledgeCatalogRevisionSummary, KnowledgeCatalogState,
+    KnowledgeCatalogUpdateResult, MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit,
+    MemberSetupResult, MemberSetupToken, MemberTransitionResult, MembershipRevision,
+    MembershipRole, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit, ReplyJob,
+    ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
+    ReplySuccessCommit, RotateMemberSetupTokenResult, SESSION_AGENT_PROMPT_ID,
+    SessionCompactionClaimOutcome, SessionCompactionFailureCommit, SessionCompactionJob,
+    SessionCompactionSuccessCommit, SessionContextCheckpoint, SessionFollowupCandidate,
+    SessionForkPage, SessionSummaryPage, SqliteOperationLimits, SqliteOperationLimitsError,
+    SqlitePhysicalLimits, SqlitePhysicalLimitsError, StorageLimits, StorageLimitsError,
+    StoredAccount, StoredAccountStatus, StoredCredential, StoredMember, StoredMemberPage,
+    StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserRole, StoredUserStatus,
+    SwitchAuthSessionCommit, SwitchAuthSessionResult, TransitionMemberCommit,
     UpdateAccountAuditPolicyCommit,
 };
 use storage::{
@@ -109,13 +110,15 @@ use subagents::{
     GET_AGENT_RESULT_TOOL_NAME, GET_AGENT_RESULT_TOOL_VERSION, GetAgentResult,
     GetAgentResultStatus, INTERRUPT_AGENT_TOOL_NAME, INTERRUPT_AGENT_TOOL_VERSION,
     InterruptAgentResult, LIST_AGENTS_TOOL_NAME, LIST_AGENTS_TOOL_VERSION, ListAgentsResult,
-    SEND_MESSAGE_TOOL_NAME, SEND_MESSAGE_TOOL_VERSION, SPAWN_AGENT_TOOL_NAME,
-    SPAWN_AGENT_TOOL_VERSION, SendMessageResult, SpawnAgentResult, SubagentError,
-    WAIT_AGENT_TOOL_NAME, WAIT_AGENT_TOOL_VERSION, WaitAgentResult, get_agent_result_descriptor,
-    interrupt_agent_descriptor, list_agents_descriptor, prepare_get_agent_result,
-    prepare_interrupt_agent, prepare_list_agents, prepare_send_message, prepare_spawn_agent,
-    prepare_wait_agent, register_subagent_tools, send_message_descriptor, send_message_identity,
-    spawn_agent_descriptor, spawn_agent_identity, wait_agent_descriptor,
+    REPORT_TOOL_NAME, REPORT_TOOL_VERSION, ReportResult, SEND_MESSAGE_TOOL_NAME,
+    SEND_MESSAGE_TOOL_VERSION, SPAWN_AGENT_TOOL_NAME, SPAWN_AGENT_TOOL_VERSION, SendMessageResult,
+    SpawnAgentResult, SubagentError, WAIT_AGENT_TOOL_NAME, WAIT_AGENT_TOOL_VERSION,
+    WaitAgentResult, get_agent_result_descriptor, interrupt_agent_descriptor,
+    list_agents_descriptor, prepare_get_agent_result, prepare_interrupt_agent, prepare_list_agents,
+    prepare_report, prepare_send_message, prepare_spawn_agent, prepare_wait_agent,
+    register_subagent_tools, report_descriptor, report_identity, report_parent_message,
+    send_message_descriptor, send_message_identity, spawn_agent_descriptor, spawn_agent_identity,
+    wait_agent_descriptor,
 };
 use terminal::TerminalService;
 use thiserror::Error;
@@ -1980,6 +1983,73 @@ impl DemoStore {
                     }))
                 })?,
                 replayed: completion.replayed,
+                provider_request_id: None,
+            });
+        }
+        if resolved.call.tool == REPORT_TOOL_NAME
+            && resolved.call.tool_version == REPORT_TOOL_VERSION
+        {
+            let request =
+                prepare_report(&resolved.call.arguments).map_err(subagent_executor_error)?;
+            let mut retries = 0_u8;
+            let (response, identity, parent_session_id, parent_message) = loop {
+                let candidate = self
+                    .storage
+                    .subagent_report_candidate_for_started_tool(&scope, &resolved.call.call_id)
+                    .await?;
+                let identity = report_identity(
+                    &scope.session_id,
+                    &resolved.call.call_id,
+                    &candidate.parent_session.id,
+                )
+                .map_err(subagent_executor_error)?;
+                let parent_message = report_parent_message(&scope.session_id, request.output())
+                    .map_err(subagent_executor_error)?;
+                let result = self
+                    .enqueue_subagent_followup_for_actor(
+                        &candidate.authz,
+                        &candidate.parent_session.id,
+                        EnqueueSessionFollowupRequest {
+                            turn_id: identity.turn_id.clone(),
+                            user_message: parent_message.clone(),
+                            expected_sequence: candidate.parent_session.sequence,
+                        },
+                        &identity.idempotency_key,
+                    )
+                    .await;
+                match result {
+                    Err(StoreError::ConcurrentModification) if retries < 3 => {
+                        retries += 1;
+                    }
+                    result => {
+                        break (
+                            result?,
+                            identity,
+                            candidate.parent_session.id,
+                            parent_message,
+                        );
+                    }
+                }
+            };
+            if response.followup.session_id != parent_session_id
+                || response.followup.turn_id != identity.turn_id
+                || response.followup.user_message != parent_message
+            {
+                return Err(StoreError::ExecutionInvariant(
+                    "report receipt disagrees with its durable direct parent".into(),
+                ));
+            }
+            let result =
+                ReportResult::new(response.followup.turn_id).map_err(subagent_executor_error)?;
+            return Ok(ToolOutput {
+                value: serde_json::to_value(result).map_err(|_| {
+                    StoreError::Registry(RegistryError::Executor(ExecutorError::Failed {
+                        code: "report_result_encoding_failed".into(),
+                        message: "The durable parent report receipt could not be encoded".into(),
+                        retryable: false,
+                    }))
+                })?,
+                replayed: response.replayed,
                 provider_request_id: None,
             });
         }
@@ -4949,6 +5019,7 @@ fn register_runtime_subagent_tools(
         get_agent_result_descriptor(),
         interrupt_agent_descriptor(),
         list_agents_descriptor(),
+        report_descriptor(),
         send_message_descriptor(),
         spawn_agent_descriptor(),
         wait_agent_descriptor(),
@@ -4984,6 +5055,10 @@ fn subagent_executor_error(error: SubagentError) -> StoreError {
         SubagentError::InvalidSendMessage => "send_message_invalid_message",
         SubagentError::InvalidSendIdentity => "send_message_invalid_identity",
         SubagentError::InvalidSendResult => "send_message_invalid_result",
+        SubagentError::InvalidReportArguments => "report_invalid_arguments",
+        SubagentError::InvalidReportOutput => "report_invalid_output",
+        SubagentError::InvalidReportIdentity => "report_invalid_identity",
+        SubagentError::InvalidReportResult => "report_invalid_result",
         SubagentError::InvalidWaitArguments => "wait_agent_invalid_arguments",
         SubagentError::InvalidWaitTimeout => "wait_agent_invalid_timeout",
         SubagentError::InvalidWaitResult => "wait_agent_invalid_result",
@@ -5533,7 +5608,7 @@ mod tests {
         let store = local_store(&paths, false).await;
 
         let definitions = store.session_agent_tool_definitions().unwrap();
-        assert_eq!(definitions.len(), 11);
+        assert_eq!(definitions.len(), 12);
         assert_eq!(definitions[0].name, goals::CREATE_GOAL_TOOL_NAME);
         assert_eq!(definitions[1].name, connectors::DEV_MARKER_TOOL_NAME);
         assert_eq!(
@@ -5568,27 +5643,32 @@ mod tests {
             definitions[5].input_schema["properties"]["cursor"]["maxLength"],
             subagents::LIST_AGENTS_CURSOR_MAX_BYTES
         );
-        assert_eq!(definitions[6].name, subagents::SEND_MESSAGE_TOOL_NAME);
+        assert_eq!(definitions[6].name, subagents::REPORT_TOOL_NAME);
         assert_eq!(
-            definitions[6].input_schema["properties"]["message"]["maxLength"],
+            definitions[6].input_schema["properties"]["output"]["maxLength"],
+            subagents::REPORT_OUTPUT_MAX_BYTES
+        );
+        assert_eq!(definitions[7].name, subagents::SEND_MESSAGE_TOOL_NAME);
+        assert_eq!(
+            definitions[7].input_schema["properties"]["message"]["maxLength"],
             subagents::SEND_MESSAGE_MAX_BYTES
         );
-        assert_eq!(definitions[7].name, subagents::SPAWN_AGENT_TOOL_NAME);
+        assert_eq!(definitions[8].name, subagents::SPAWN_AGENT_TOOL_NAME);
         assert_eq!(
-            definitions[7].input_schema["properties"]["prompt"]["maxLength"],
+            definitions[8].input_schema["properties"]["prompt"]["maxLength"],
             subagents::SPAWN_AGENT_PROMPT_MAX_BYTES
         );
-        assert_eq!(definitions[8].name, planning::TODO_WRITE_TOOL_NAME);
+        assert_eq!(definitions[9].name, planning::TODO_WRITE_TOOL_NAME);
         assert_eq!(
-            definitions[8].input_schema["properties"]["todos"]["maxItems"],
+            definitions[9].input_schema["properties"]["todos"]["maxItems"],
             planning::TODO_MAX_ITEMS
         );
         assert_eq!(
-            definitions[8].input_schema["properties"]["todos"]["items"]["properties"]["status"]["enum"],
+            definitions[9].input_schema["properties"]["todos"]["items"]["properties"]["status"]["enum"],
             serde_json::json!(["pending", "in_progress", "completed"])
         );
-        assert_eq!(definitions[9].name, goals::UPDATE_GOAL_TOOL_NAME);
-        assert_eq!(definitions[10].name, subagents::WAIT_AGENT_TOOL_NAME);
+        assert_eq!(definitions[10].name, goals::UPDATE_GOAL_TOOL_NAME);
+        assert_eq!(definitions[11].name, subagents::WAIT_AGENT_TOOL_NAME);
 
         let production = DemoStore::seeded().await.unwrap();
         assert_eq!(
@@ -5604,6 +5684,7 @@ mod tests {
                 goals::GET_GOAL_TOOL_NAME,
                 subagents::INTERRUPT_AGENT_TOOL_NAME,
                 subagents::LIST_AGENTS_TOOL_NAME,
+                subagents::REPORT_TOOL_NAME,
                 subagents::SEND_MESSAGE_TOOL_NAME,
                 subagents::SPAWN_AGENT_TOOL_NAME,
                 planning::TODO_WRITE_TOOL_NAME,
@@ -5834,6 +5915,7 @@ mod tests {
                 goals::GET_GOAL_TOOL_NAME,
                 subagents::INTERRUPT_AGENT_TOOL_NAME,
                 subagents::LIST_AGENTS_TOOL_NAME,
+                subagents::REPORT_TOOL_NAME,
                 subagents::SEND_MESSAGE_TOOL_NAME,
                 skills::SKILL_LIST_TOOL_NAME,
                 skills::SKILL_LOAD_TOOL_NAME,

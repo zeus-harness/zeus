@@ -34,7 +34,7 @@ Client / SvelteKit Web
   生命周期与 revision CAS；它只准备有界规范状态，持久化权威仍由 SQLite 掌握。
 - `skills`：启动时一次性加载的 strict version 1 Skill Catalog、确定性 digest，以及只读
   `skill_list` / `skill_load` executor；Skill body 只有通过普通工具结果才对模型可见。
-- `subagents`：`spawn_agent` / `list_agents` / `get_agent_result` / `send_message` / `interrupt_agent` / `wait_agent` 工具契约、
+- `subagents`：`spawn_agent` / `list_agents` / `get_agent_result` / `send_message` / `report` / `interrupt_agent` / `wait_agent` 工具契约、
   严格参数边界、确定性 child/message identity 与有界结果；durable scope、原子 admission、目录分页、
   终态结果读取和 follow-up 入队由 runtime/storage 掌握，不由通用 executor 接受调用方自报身份。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
@@ -169,6 +169,12 @@ snapshot 将 Running child 与存在 queued durable follow-up 的 Ready child �
 10 秒至 1 小时的显式有界 timeout。它不唤醒 child，也不把进程内通知当作权威状态；唤醒或超时后
 调用方必须重新 List/Result。`get_agent_result` 从 child 最新 turn 解析状态与终态输出，follow-up 完成
 后不会返回首次 spawn 的陈旧结果。
+`report@1-durable-parent-followup` 只接受 child 选择的有界内容，不接受 receiver 或 delivery mode。
+Storage 从 immutable `agent_subagent_spawns` 反向推导唯一直属 parent，并在 exact started child tool
+scope 下生成确定性 turn/idempotency identity；parent 消息封装为
+`Background subagent <child-id> reported:` 后接原始 output，复用 schema v31 durable FIFO/receipt。
+因此报告会唤醒 parent 的下一正常轮次、重启可恢复、嵌套时恰好向上一层路由，而且不会结束 child
+当前轮次。成功 tool result 的 deep integrity 必须能重建 lineage、封装内容、receipt 与 parent follow-up。
 Process-owned 中断复验原 membership revision 与 SessionWrite/Reply 权限，不依赖短期登录 session；
 成功 parent tool result 的 deep integrity 还必须能还原直属 child 的 exact user-cancelled terminal evidence。
 当前阶段不递归加载完整 child graph。
@@ -787,8 +793,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   刷新恢复、owner/member setup/登录、owner 成员与 audit 管理、设置/退出和
   system/light/dark。member 的审批卡只读。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化按项目既有统计口径是 704 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
-  provider contract 18、skills 5、subagents 12、storage 286、workflows 21、runtime 52、API library 99、API main/config 18）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化按项目既有统计口径是 706 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
+  provider contract 18、skills 5、subagents 13、storage 286、workflows 21、runtime 52、API library 100、API main/config 18）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
 提交 `af29089` 曾构建并运行在独立 `zeus-operation-acceptance` project（端口 `18089`）；既有

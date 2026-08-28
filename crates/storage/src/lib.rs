@@ -706,6 +706,15 @@ pub struct AgentSubagentMessageCandidate {
     pub child_session: SessionSummary,
 }
 
+/// Current authority and direct parent sequence captured for one exact started
+/// child `report` call. The receiver is derived from immutable spawn lineage;
+/// the child supplies only bounded report content.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentSubagentReportCandidate {
+    pub authz: AuthzContext,
+    pub parent_session: SessionSummary,
+}
+
 /// Current authority and active child Agent captured for one exact started
 /// `interrupt_agent` call. Storage derives every identity from the persisted
 /// parent call and immutable direct-child binding.

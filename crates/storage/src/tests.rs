@@ -16189,7 +16189,7 @@ async fn list_agents_catalog_requires_the_exact_started_agent_tool_scope() {
             .await,
         Err(StorageError::AgentToolCallNotFound(_))
     ));
-    store
+    let wait_terminal = match store
         .complete_agent_tool(AgentToolCompletionCommit {
             call_id: wait_call.call_id,
             status: AgentToolCallStatus::Succeeded,
@@ -16199,7 +16199,116 @@ async fn list_agents_catalog_requires_the_exact_started_agent_tool_scope() {
             next_request_json: None,
         })
         .await
+        .unwrap()
+    {
+        AgentToolCompletion::Terminal(completion) => completion,
+        AgentToolCompletion::ModelQueued { .. } => {
+            panic!("wait result without continuation must end")
+        }
+    };
+    assert_eq!(wait_terminal.session.id, "session-alpha");
+
+    let child_followup = store
+        .next_session_followup_candidate()
+        .await
+        .unwrap()
+        .expect("the queued direct-child follow-up must be claimable");
+    assert_eq!(child_followup.session.id, identity.session_id);
+    let child_followup_spec = followup_agent_spec(&store, &child_followup, manifest.clone()).await;
+    store
+        .start_followup_and_enqueue_agent(child_followup, child_followup_spec)
+        .await
         .unwrap();
+    let AgentModelClaimOutcome::Claimed(child_model) =
+        store.claim_next_agent_model(&manifest).await.unwrap()
+    else {
+        panic!("the direct-child follow-up model proposal must start");
+    };
+    let report_call = report_tool_call_spec(
+        "call-report-parent",
+        json!({"output": "the queued child boundary is durable"}),
+    );
+    store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: child_model.id,
+            response_json: agent_tool_response_json(&report_call),
+            resolution: AgentModelResolution::ToolCall {
+                call: report_call.clone(),
+            },
+        })
+        .await
+        .unwrap();
+    let AgentToolClaimOutcome::Claimed(report_work) =
+        store.claim_next_agent_tool(&manifest).await.unwrap()
+    else {
+        panic!("the child report tool must cross its started checkpoint");
+    };
+    let report_scope = tools::ExecutionScope::new(
+        report_work.call.account_id.as_str(),
+        report_work.model_job.actor_user_id.as_str(),
+        report_work.call.session_id.as_str(),
+        report_work.call.turn_id.as_str(),
+        report_work.call.agent_id.as_str(),
+    )
+    .unwrap();
+    let report_candidate = store
+        .subagent_report_candidate_for_started_tool(&report_scope, &report_work.call.call_id)
+        .await
+        .unwrap();
+    assert_eq!(report_candidate.parent_session.id, "session-alpha");
+    assert_eq!(
+        report_candidate.authz.auth_session_id.as_str(),
+        "subagent-report-driver-v1"
+    );
+    assert!(matches!(
+        store
+            .subagent_report_candidate_for_started_tool(&wait_scope, &report_work.call.call_id,)
+            .await,
+        Err(StorageError::AgentToolCallNotFound(_))
+    ));
+    let report_request = subagents::prepare_report(&report_call.arguments_json).unwrap();
+    let report_identity = subagents::report_identity(
+        &identity.session_id,
+        &report_call.call_id,
+        &report_candidate.parent_session.id,
+    )
+    .unwrap();
+    let report_message =
+        subagents::report_parent_message(&identity.session_id, report_request.output()).unwrap();
+    let report_receipt = store
+        .enqueue_subagent_followup_for_actor(
+            &report_candidate.authz,
+            &report_candidate.parent_session.id,
+            EnqueueSessionFollowupRequest {
+                turn_id: report_identity.turn_id.clone(),
+                user_message: report_message.clone(),
+                expected_sequence: report_candidate.parent_session.sequence,
+            },
+            &report_identity.idempotency_key,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report_receipt.followup.user_message, report_message);
+    store
+        .complete_agent_tool(AgentToolCompletionCommit {
+            call_id: report_call.call_id,
+            status: AgentToolCallStatus::Succeeded,
+            result_json: serde_json::to_value(
+                subagents::ReportResult::new(report_receipt.followup.turn_id).unwrap(),
+            )
+            .unwrap(),
+            provider_request_id: None,
+            next_request_json: None,
+        })
+        .await
+        .unwrap();
+    let parent_followups = store
+        .session_followups_for_actor(&owner_authz(), "session-alpha")
+        .await
+        .unwrap();
+    assert_eq!(parent_followups.len(), 1);
+    assert_eq!(parent_followups[0].turn_id, report_identity.turn_id);
+    assert_eq!(parent_followups[0].status, SessionFollowupStatus::Queued);
     store.verify_integrity().await.unwrap();
     drop(store);
 
@@ -23268,6 +23377,7 @@ fn list_agents_test_agent_manifest() -> ManifestEnvelope {
     for descriptor in [
         subagents::get_agent_result_descriptor(),
         subagents::list_agents_descriptor(),
+        subagents::report_descriptor(),
         subagents::send_message_descriptor(),
         subagents::spawn_agent_descriptor(),
         subagents::wait_agent_descriptor(),
@@ -23632,6 +23742,23 @@ fn get_agent_result_tool_call_spec(call_id: &str, arguments_json: Value) -> Agen
 
 fn send_message_tool_call_spec(call_id: &str, arguments_json: Value) -> AgentToolCallSpec {
     let descriptor = subagents::send_message_descriptor();
+    AgentToolCallSpec {
+        call_id: call_id.into(),
+        provider_call_id: format!("provider-call-{call_id}"),
+        tool_name: descriptor.name,
+        tool_version: descriptor.version,
+        arguments_digest: tools::arguments_digest(&arguments_json),
+        arguments_json,
+        effect: descriptor.effect,
+        sandbox_profile: descriptor.sandbox_profile,
+        executor_status: ToolExecutorStatus::Available,
+        policy_decision: PolicyDecision::Allow,
+        policy_revision: "local/v1".into(),
+    }
+}
+
+fn report_tool_call_spec(call_id: &str, arguments_json: Value) -> AgentToolCallSpec {
+    let descriptor = subagents::report_descriptor();
     AgentToolCallSpec {
         call_id: call_id.into(),
         provider_call_id: format!("provider-call-{call_id}"),

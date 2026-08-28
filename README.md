@@ -94,8 +94,9 @@ turn. Admission is bounded to eight direct children and three ancestry levels;
 capacity rejection rolls the whole child transaction back and becomes a known
 parent tool failure.
 
-Every Agent profile exposes `spawn_agent`, `send_message`, `interrupt_agent`,
-and the read-only `list_agents` / `get_agent_result` / `wait_agent` tools. All require the exact persisted
+Every Agent profile exposes `spawn_agent`, `send_message`, `report`,
+`interrupt_agent`, and the read-only `list_agents` / `get_agent_result` /
+`wait_agent` tools. All require the exact persisted
 `started` Agent tool scope and derive account, actor, parent Session, turn, and
 Agent identity server-side. `list_agents` returns only children admitted by
 `spawn_agent`, not arbitrary manual Session forks, in opaque-cursor pages
@@ -121,6 +122,13 @@ so do Ready children with an already queued durable follow-up, which closes the
 enqueue-to-worker-claim race. It never wakes an inactive child, returns
 `no_progress` immediately when none can make progress, and uses a bounded
 10-second-to-one-hour timeout instead of polling.
+`report@1-durable-parent-followup` is the reverse channel. A child supplies
+only bounded report content; storage derives its unique direct parent from the
+immutable spawn lineage and revalidates the exact started child tool scope.
+The deterministic acknowledgement is a durable parent FIFO message, not a
+read receipt. It wakes the parent for its next normal turn, survives restart,
+routes a nested child's report exactly one edge upward, and does not end the
+reporting child turn.
 
 Alpha+ bootstraps a local `acc_local` root and now supports a bounded local
 multi-account control plane. An owner can create accounts idempotently; one
@@ -1402,19 +1410,20 @@ follow-ups, schema v32 durable Agent model output, schema v33 running-model
 cancellation, schema v34 durable Session forks, schema v35 durable fork catalog,
 schema v36 durable `spawn_agent` admission, Agent-scoped `list_agents`,
 direct-child `get_agent_result`, durable `send_message`, and fail-closed
-direct-child `interrupt_agent`, plus event-driven `wait_agent`,
+direct-child `interrupt_agent`, event-driven `wait_agent`, and durable
+child-to-parent `report`,
 Trusted Single-Node Ingress,
 Per-Operation SecretRef Resolution, the startup-bound Skill Catalog, and the
 bounded multi-account control plane:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 704 tests passed
+- `cargo test --workspace --all-targets --locked`: 706 tests passed
   across the top-level test targets, including 22 connector tests,
   8 deployment tests, 29 knowledge tests, 30 LLM unit and 18 provider-contract
-  tests, 4 Goal tests, 5 Skill Catalog tests, 12 Subagent tests,
+  tests, 4 Goal tests, 5 Skill Catalog tests, 13 Subagent tests,
   286 storage tests, 21 workflow tests, 52 runtime tests, 21 protocol tests,
-  99 API library tests, 18 API main/config
+  100 API library tests, 18 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,
