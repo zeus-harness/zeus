@@ -12,7 +12,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex as StdMutex,
+        Arc,
         atomic::{AtomicU8, Ordering as AtomicOrdering},
     },
     time::Duration,
@@ -286,15 +286,12 @@ pub struct ArmedSessionGoal {
 
 #[derive(Default)]
 struct GoalActivationRegistry {
-    by_session: StdMutex<BTreeMap<String, ArmedSessionGoal>>,
+    by_session: Mutex<BTreeMap<String, ArmedSessionGoal>>,
 }
 
 impl GoalActivationRegistry {
-    fn activation(&self, session_id: &str, goal_id: &str, revision: u64) -> GoalActivation {
-        let activations = self
-            .by_session
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    async fn activation(&self, session_id: &str, goal_id: &str, revision: u64) -> GoalActivation {
+        let activations = self.by_session.lock().await;
         if activations
             .get(session_id)
             .is_some_and(|entry| entry.goal_id == goal_id && entry.revision == revision)
@@ -305,12 +302,15 @@ impl GoalActivationRegistry {
         }
     }
 
-    fn set(&self, work: &AgentToolWork, goal_id: &str, revision: u64, activation: GoalActivation) {
+    async fn set(
+        &self,
+        work: &AgentToolWork,
+        goal_id: &str,
+        revision: u64,
+        activation: GoalActivation,
+    ) {
         let session_id = &work.call.session_id;
-        let mut activations = self
-            .by_session
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut activations = self.by_session.lock().await;
         match activation {
             GoalActivation::Armed => {
                 activations.insert(
@@ -331,20 +331,12 @@ impl GoalActivationRegistry {
         }
     }
 
-    fn disarm(&self, session_id: &str) {
-        self.by_session
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(session_id);
+    async fn disarm(&self, session_id: &str) {
+        self.by_session.lock().await.remove(session_id);
     }
 
-    fn armed(&self) -> Vec<ArmedSessionGoal> {
-        self.by_session
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-            .cloned()
-            .collect()
+    async fn armed(&self) -> Vec<ArmedSessionGoal> {
+        self.by_session.lock().await.values().cloned().collect()
     }
 }
 
@@ -1668,10 +1660,14 @@ impl DemoStore {
             )
         {
             let current = self.storage.current_session_goal(&scope).await?;
-            let current_activation = current.as_ref().map(|goal| {
-                self.goal_activations
-                    .activation(scope.session_id.as_str(), &goal.id, goal.revision)
-            });
+            let current_activation = match current.as_ref() {
+                Some(goal) => Some(
+                    self.goal_activations
+                        .activation(scope.session_id.as_str(), &goal.id, goal.revision)
+                        .await,
+                ),
+                None => None,
+            };
             let result = match resolved.call.tool.as_str() {
                 GET_GOAL_TOOL_NAME => GoalToolResult {
                     activation: current_activation,
@@ -1724,7 +1720,7 @@ impl DemoStore {
     /// Publish process-local continuation authority only after the matching
     /// Goal mutation has committed durably. A restart constructs an empty
     /// registry, so active durable Goals never self-resume across processes.
-    pub fn apply_committed_goal_tool_result(
+    pub async fn apply_committed_goal_tool_result(
         &self,
         work: &AgentToolWork,
         result_json: &Value,
@@ -1750,18 +1746,13 @@ impl DemoStore {
             )
         })?;
         self.goal_activations
-            .set(work, &goal.id, goal.revision, activation);
+            .set(work, &goal.id, goal.revision, activation)
+            .await;
         Ok(())
     }
 
-    pub fn armed_session_goals(&self) -> Vec<ArmedSessionGoal> {
-        self.goal_activations.armed()
-    }
-
-    pub fn is_session_goal_armed(&self, session_id: &str, goal_id: &str, revision: u64) -> bool {
-        self.goal_activations
-            .activation(session_id, goal_id, revision)
-            == GoalActivation::Armed
+    pub async fn armed_session_goals(&self) -> Vec<ArmedSessionGoal> {
+        self.goal_activations.armed().await
     }
 
     pub async fn agent_goal_round_candidate(
@@ -1801,8 +1792,8 @@ impl DemoStore {
         ))
     }
 
-    pub fn disarm_session_goal(&self, session_id: &str) {
-        self.goal_activations.disarm(session_id);
+    pub async fn disarm_session_goal(&self, session_id: &str) {
+        self.goal_activations.disarm(session_id).await;
     }
 
     pub async fn readiness(&self) -> Result<(), StoreError> {
@@ -2566,11 +2557,11 @@ impl DemoStore {
         request: StartTurnRequest,
         idempotency_key: &str,
     ) -> Result<StartTurnResponse, StoreError> {
-        self.disarm_session_goal(session_id);
         validate_durable_reference(session_id, "session ID")?;
         validate_new_turn_id(&request.turn_id, "turn ID")?;
         self.authorize_session_for_actor(context, session_id)
             .await?;
+        self.disarm_session_goal(session_id).await;
         validate_user_message_value(&request.user_message, "user message")?;
         validate_session_sequence(request.expected_sequence, "expected session sequence")?;
         let idempotency_key = normalized_idempotency_key(idempotency_key)?;
@@ -2654,11 +2645,11 @@ impl DemoStore {
         idempotency_key: &str,
         agent: AgentTurnSpec,
     ) -> Result<AgentTurnEnqueueResponse, StoreError> {
-        self.disarm_session_goal(session_id);
         validate_durable_reference(session_id, "session ID")?;
         validate_new_turn_id(&request.turn_id, "turn ID")?;
         self.authorize_session_for_actor(context, session_id)
             .await?;
+        self.disarm_session_goal(session_id).await;
         validate_user_message_value(&request.user_message, "user message")?;
         validate_session_sequence(request.expected_sequence, "expected session sequence")?;
         if agent.environment != self.environment.as_ref() {
@@ -2699,7 +2690,7 @@ impl DemoStore {
         idempotency_key: &str,
         agent: AgentTurnSpec,
         goal_round: AgentGoalRoundSpec,
-    ) -> Result<AgentTurnEnqueueResponse, StoreError> {
+    ) -> Result<Option<AgentTurnEnqueueResponse>, StoreError> {
         validate_durable_reference(session_id, "session ID")?;
         validate_new_turn_id(&request.turn_id, "turn ID")?;
         validate_user_message_value(&request.user_message, "Goal round prompt")?;
@@ -2715,6 +2706,16 @@ impl DemoStore {
             agent.model_name.as_deref(),
         )?;
         let idempotency_key = normalized_idempotency_key(idempotency_key)?;
+        // Keep the process-local activation gate locked through the durable
+        // admission. A human turn or cancellation that disarms first prevents
+        // this stale candidate from crossing the SQLite transaction boundary.
+        let activations = self.goal_activations.by_session.lock().await;
+        if !activations.get(session_id).is_some_and(|activation| {
+            activation.goal_id == goal_round.goal_id
+                && activation.revision == goal_round.goal_revision
+        }) {
+            return Ok(None);
+        }
         let response = self
             .storage
             .start_goal_round_and_enqueue_agent(
@@ -2725,10 +2726,11 @@ impl DemoStore {
                 goal_round,
             )
             .await?;
+        drop(activations);
         if !response.start.replayed {
             self.publish_session_event(session_id, response.start.event.clone());
         }
-        Ok(response)
+        Ok(Some(response))
     }
 
     /// Durable model-worker preparation façade. This phase does not authorize
@@ -3013,9 +3015,11 @@ impl DemoStore {
         turn_id: &str,
         expected_revision: u64,
     ) -> Result<CancelAgentTurnResponse, StoreError> {
-        self.disarm_session_goal(session_id);
         validate_durable_reference(session_id, "session ID")?;
         validate_durable_reference(turn_id, "turn ID")?;
+        self.authorize_session_for_actor(context, session_id)
+            .await?;
+        self.disarm_session_goal(session_id).await;
         let completion = self
             .storage
             .cancel_agent_turn_for_actor(context, session_id, turn_id, expected_revision)
@@ -4808,6 +4812,91 @@ mod tests {
                 goals::UPDATE_GOAL_TOOL_NAME,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn goal_round_activation_is_authorized_process_local_and_required_for_admission() {
+        let paths = TestPaths::new("goal-round-process-activation");
+        let store = local_store(&paths, false).await;
+        store.goal_activations.by_session.lock().await.insert(
+            LOCAL_DEMO_SESSION_ID.into(),
+            ArmedSessionGoal {
+                account_id: AccountId::local(),
+                actor_user_id: TEST_OWNER_ID.into(),
+                actor_membership_revision: MembershipRevision::new(1).unwrap(),
+                session_id: LOCAL_DEMO_SESSION_ID.into(),
+                goal_id: "goal-process-local".into(),
+                revision: 1,
+            },
+        );
+        assert_eq!(store.armed_session_goals().await.len(), 1);
+        assert!(
+            store
+                .start_turn_for_actor(
+                    &test_authz("user-without-session-access"),
+                    LOCAL_DEMO_SESSION_ID,
+                    StartTurnRequest {
+                        turn_id: "unauthorized-goal-disarm".into(),
+                        user_message: "Do not alter another actor's Goal".into(),
+                        expected_sequence: 2,
+                    },
+                    "unauthorized-goal-disarm",
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(store.armed_session_goals().await.len(), 1);
+        drop(store);
+
+        let reopened = DemoStore::from_storage(
+            SqliteStore::open(&paths.database).await.unwrap(),
+            DemoProfile::LocalDevelopment {
+                marker_root: paths.marker_root.clone(),
+                workspace_root: None,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(reopened.armed_session_goals().await.is_empty());
+
+        let manifest = reopened
+            .session_agent_manifest(
+                "test-provider",
+                Some("test-model".into()),
+                AssistantReplyKind::Model,
+            )
+            .unwrap();
+        let message = "Continue a Goal that was active before restart";
+        let admitted = reopened
+            .start_goal_round_and_enqueue_agent(
+                LOCAL_DEMO_SESSION_ID,
+                StartTurnRequest {
+                    turn_id: "goal-round-after-restart".into(),
+                    user_message: message.into(),
+                    expected_sequence: 2,
+                },
+                "goal-round-after-restart",
+                AgentTurnSpec {
+                    id: "agent-goal-round-after-restart".into(),
+                    authz: test_authz(TEST_OWNER_ID),
+                    environment: LOCAL_DEV_ENVIRONMENT.into(),
+                    provider_name: "test-provider".into(),
+                    model_name: Some("test-model".into()),
+                    request_json: agent_request_for_manifest(&manifest, message),
+                    knowledge: agent_knowledge_for_message(message),
+                    manifest,
+                },
+                AgentGoalRoundSpec {
+                    goal_id: "goal-process-local".into(),
+                    goal_revision: 1,
+                    round: 1,
+                    prompt_digest: "0".repeat(64),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(admitted.is_none());
     }
 
     #[tokio::test]

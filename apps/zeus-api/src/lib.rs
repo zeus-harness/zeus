@@ -3678,18 +3678,24 @@ async fn drain_goal_rounds(state: &ApiState) {
         .as_ref()
         .expect("the Goal round worker is only started when a provider exists");
     let _drain = executor.goal_round_drain.lock().await;
-    for activation in state.store.armed_session_goals() {
+    for activation in state.store.armed_session_goals().await {
         let candidate = match state.store.agent_goal_round_candidate(&activation).await {
             Ok(Some(candidate)) => candidate,
             Ok(None) => {
-                state.store.disarm_session_goal(&activation.session_id);
+                state
+                    .store
+                    .disarm_session_goal(&activation.session_id)
+                    .await;
                 continue;
             }
             Err(error) => {
                 eprintln!(
                     "zeus disarmed Goal continuation after candidate resolution failed: {error}"
                 );
-                state.store.disarm_session_goal(&activation.session_id);
+                state
+                    .store
+                    .disarm_session_goal(&activation.session_id)
+                    .await;
                 continue;
             }
         };
@@ -3703,7 +3709,10 @@ async fn drain_goal_rounds(state: &ApiState) {
         }
         if let Err(error) = admit_goal_round(state, executor, candidate).await {
             eprintln!("zeus disarmed Goal continuation after round admission failed: {error}");
-            state.store.disarm_session_goal(&activation.session_id);
+            state
+                .store
+                .disarm_session_goal(&activation.session_id)
+                .await;
         }
     }
 }
@@ -3818,14 +3827,7 @@ async fn admit_goal_round(
         manifest,
         knowledge,
     };
-    if !state.store.is_session_goal_armed(
-        &candidate.session.id,
-        &goal_round.goal_id,
-        goal_round.goal_revision,
-    ) {
-        return Ok(());
-    }
-    state
+    let admitted = state
         .store
         .start_goal_round_and_enqueue_agent(
             &candidate.session.id,
@@ -3835,6 +3837,9 @@ async fn admit_goal_round(
             goal_round,
         )
         .await?;
+    if admitted.is_none() {
+        return Ok(());
+    }
     kick_agent_model_worker(state);
     Ok(())
 }
@@ -4375,7 +4380,7 @@ async fn process_agent_model_job(
             kick_compaction_worker(state);
             kick_goal_round_worker(state);
         }
-        AgentModelCompletion::Terminal(_) => state.store.disarm_session_goal(&job.session_id),
+        AgentModelCompletion::Terminal(_) => state.store.disarm_session_goal(&job.session_id).await,
     }
     Ok(())
 }
@@ -4396,7 +4401,7 @@ async fn settle_agent_model_failure(
         state.store.complete_agent_model_failure(commit.clone())
     })
     .await?;
-    state.store.disarm_session_goal(&job.session_id);
+    state.store.disarm_session_goal(&job.session_id).await;
     Ok(())
 }
 
@@ -4626,12 +4631,13 @@ async fn settle_known_agent_tool(
     if committed_status == AgentToolCallStatus::Succeeded {
         state
             .store
-            .apply_committed_goal_tool_result(work, &committed_result)?;
+            .apply_committed_goal_tool_result(work, &committed_result)
+            .await?;
     }
     if matches!(completion, AgentToolCompletion::ModelQueued { .. }) {
         kick_agent_model_worker(state);
     } else {
-        state.store.disarm_session_goal(&work.call.session_id);
+        state.store.disarm_session_goal(&work.call.session_id).await;
     }
     Ok(())
 }
@@ -4652,7 +4658,7 @@ async fn settle_agent_tool_outcome_unknown(
             .complete_agent_tool_outcome_unknown(commit.clone())
     })
     .await?;
-    state.store.disarm_session_goal(&call.session_id);
+    state.store.disarm_session_goal(&call.session_id).await;
     Ok(())
 }
 
@@ -4873,7 +4879,6 @@ async fn cancel_agent_turn(
     Path((id, turn_id)): Path<(String, String)>,
     payload: Result<Json<CancelAgentTurnRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    state.store.disarm_session_goal(&id);
     let Json(request) = payload
         .map_err(ApiError::invalid_json)
         .map_err(ApiError::with_no_store)?;
@@ -5050,13 +5055,13 @@ async fn start_turn(
     headers: HeaderMap,
     payload: Result<Json<StartTurnRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    // A direct human turn always wins over process-local automatic
-    // continuation, including while its request context is still being built.
-    state.store.disarm_session_goal(&id);
     state
         .store
         .authorize_session_for_actor(&current.principal.authz, &id)
         .await?;
+    // A direct, authorized human turn always wins over process-local automatic
+    // continuation, including while its request context is still being built.
+    state.store.disarm_session_goal(&id).await;
     let Json(request) = payload.map_err(ApiError::invalid_json)?;
     let idempotency_key = required_idempotency_key(&headers)?;
     validate_start_turn_envelope(&request)?;
@@ -8891,6 +8896,18 @@ mod tests {
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
     }
 
+    #[derive(Clone, Copy)]
+    enum GoalRoundTerminal {
+        FinalAtLimit,
+        KnownProviderFailure,
+    }
+
+    struct GoalCreateThenRoundTerminalProvider {
+        metadata: ProviderMetadata,
+        requests: Arc<StdMutex<Vec<ReplyRequest>>>,
+        terminal: GoalRoundTerminal,
+    }
+
     struct WorkspaceSearchThenFinalProvider {
         metadata: ProviderMetadata,
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
@@ -9275,6 +9292,69 @@ mod tests {
             };
             let provider = self.metadata.clone();
             Box::pin(async move {
+                Ok(ReplyResponse {
+                    output,
+                    finish_reason: Some("stop".into()),
+                    provider,
+                })
+            })
+        }
+    }
+
+    impl GoalCreateThenRoundTerminalProvider {
+        fn new(requests: Arc<StdMutex<Vec<ReplyRequest>>>, terminal: GoalRoundTerminal) -> Self {
+            Self {
+                metadata: ProviderMetadata {
+                    provider_id: "test-goal-round-terminal-provider".into(),
+                    model: Some("test-model".into()),
+                    reply_kind: ReplyKind::Model,
+                },
+                requests,
+                terminal,
+            }
+        }
+    }
+
+    impl ReplyProvider for GoalCreateThenRoundTerminalProvider {
+        fn metadata(&self) -> &ProviderMetadata {
+            &self.metadata
+        }
+
+        fn reply(&self, request: ReplyRequest) -> ReplyFuture<'_> {
+            let call = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(request);
+                requests.len()
+            };
+            let provider = self.metadata.clone();
+            let terminal = self.terminal;
+            Box::pin(async move {
+                let output = match call {
+                    1 => ReplyOutput::ToolCall {
+                        call: ReplyToolCall::new(
+                            "provider-call-goal-terminal-create",
+                            goals::CREATE_GOAL_TOOL_NAME,
+                            serde_json::json!({
+                                "objective": "Exercise one bounded Goal round",
+                                "max_rounds": 1
+                            }),
+                        ),
+                    },
+                    2 => ReplyOutput::Final {
+                        content: "The bounded Goal is armed.".into(),
+                    },
+                    3 => match terminal {
+                        GoalRoundTerminal::FinalAtLimit => ReplyOutput::Final {
+                            content: "The Goal remains active at its round limit.".into(),
+                        },
+                        GoalRoundTerminal::KnownProviderFailure => {
+                            return Err(ProviderError::InvalidRequest(
+                                "fixture Goal round rejection",
+                            ));
+                        }
+                    },
+                    unexpected => panic!("unexpected Goal terminal provider call {unexpected}"),
+                };
                 Ok(ReplyResponse {
                     output,
                     finish_reason: Some("stop".into()),
@@ -11167,6 +11247,216 @@ mod tests {
         assert_eq!(completed_result["goal"]["rounds_started"], 1);
         assert_eq!(completed_result["goal"]["phase"], "completed");
         assert_eq!(completed_result["activation"], "disarmed");
+        store.readiness().await.unwrap();
+        drop(app);
+    }
+
+    #[tokio::test]
+    async fn goal_round_provider_failure_disarms_without_retry_and_restart_stays_idle() {
+        let unique = UserId::generate().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "zeus-api-goal-round-failure-{}.db",
+            unique.as_str().replace(':', "-")
+        ));
+        let store = DemoStore::open(&path).await.unwrap();
+        let owner = provision_test_owner(
+            &store,
+            "user-goal-round-failure",
+            "goal-round-failure-owner",
+        )
+        .await;
+        let session_id = "session-goal-round-failure";
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: session_id.into(),
+                    title: "Goal round failure".into(),
+                },
+                "create-goal-round-failure",
+            )
+            .await
+            .unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(GoalCreateThenRoundTerminalProvider::new(
+                Arc::clone(&requests),
+                GoalRoundTerminal::KnownProviderFailure,
+            )),
+        )
+        .unwrap();
+
+        let started = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/sessions/{session_id}/turns"))
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "start-goal-round-failure")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-goal-round-failure",
+                            "user_message": "Create a bounded Goal and continue it",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+
+        let session = wait_for_session_state_and_turns(
+            &store,
+            &owner.authz,
+            session_id,
+            SessionStatus::NeedsAttention,
+            2,
+        )
+        .await;
+        let round_turn = session
+            .turns
+            .iter()
+            .find(|turn| turn.user_message.starts_with("<goal_round>\n"))
+            .unwrap();
+        let round_agent = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            session_id,
+            &round_turn.id,
+            protocol::AgentTurnStatus::Failed,
+        )
+        .await;
+        let goal = round_agent.goal.unwrap();
+        assert_eq!(goal.phase, protocol::AgentGoalPhase::Active);
+        assert_eq!(goal.rounds_started, 1);
+        assert_eq!(goal.max_rounds, 1);
+        assert_eq!(
+            round_agent.last_error.unwrap()["code"],
+            "provider_request_invalid"
+        );
+        wait_for_no_armed_goals(&store).await;
+        assert_eq!(requests.lock().unwrap().len(), 3);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(requests.lock().unwrap().len(), 3);
+
+        drop(app);
+        drop(store);
+        tokio::task::yield_now().await;
+
+        let reopened = DemoStore::open(&path).await.unwrap();
+        assert!(reopened.armed_session_goals().await.is_empty());
+        let restart_calls = Arc::new(AtomicUsize::new(0));
+        let reopened_app = authenticated_app_with_provider(
+            reopened.clone(),
+            false,
+            Arc::new(CountingProvider::new(Arc::clone(&restart_calls))),
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(restart_calls.load(Ordering::Relaxed), 0);
+        let persisted = reopened
+            .agent_turn_detail_for_actor(&owner.authz, session_id, &round_turn.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            persisted.goal.unwrap().phase,
+            protocol::AgentGoalPhase::Active
+        );
+
+        drop(reopened_app);
+        drop(reopened);
+        cleanup_test_database(&path);
+    }
+
+    #[tokio::test]
+    async fn goal_round_limit_disarms_without_fabricating_a_terminal_goal() {
+        let store = DemoStore::seeded().await.unwrap();
+        let owner =
+            provision_test_owner(&store, "user-goal-round-limit", "goal-round-limit-owner").await;
+        let session_id = "session-goal-round-limit";
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: session_id.into(),
+                    title: "Goal round limit".into(),
+                },
+                "create-goal-round-limit",
+            )
+            .await
+            .unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(GoalCreateThenRoundTerminalProvider::new(
+                Arc::clone(&requests),
+                GoalRoundTerminal::FinalAtLimit,
+            )),
+        )
+        .unwrap();
+
+        let started = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/sessions/{session_id}/turns"))
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "start-goal-round-limit")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-goal-round-limit",
+                            "user_message": "Use exactly one autonomous Goal round",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+
+        let session = wait_for_session_state_and_turns(
+            &store,
+            &owner.authz,
+            session_id,
+            SessionStatus::Ready,
+            2,
+        )
+        .await;
+        let round_turn = session
+            .turns
+            .iter()
+            .find(|turn| turn.user_message.starts_with("<goal_round>\n"))
+            .unwrap();
+        let round_agent = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            session_id,
+            &round_turn.id,
+            protocol::AgentTurnStatus::Succeeded,
+        )
+        .await;
+        let goal = round_agent.goal.unwrap();
+        assert_eq!(goal.phase, protocol::AgentGoalPhase::Active);
+        assert_eq!(goal.rounds_started, 1);
+        assert_eq!(goal.max_rounds, 1);
+        assert!(goal.blocker.is_none());
+        wait_for_no_armed_goals(&store).await;
+        assert_eq!(requests.lock().unwrap().len(), 3);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(requests.lock().unwrap().len(), 3);
         store.readiness().await.unwrap();
         drop(app);
     }
@@ -16450,6 +16740,51 @@ mod tests {
         })
         .await
         .expect("the durable assistant reply should settle")
+    }
+
+    async fn wait_for_session_state_and_turns(
+        store: &DemoStore,
+        authz: &AuthzContext,
+        session_id: &str,
+        status: SessionStatus,
+        minimum_turns: usize,
+    ) -> SessionDetail {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let detail = store
+                    .get_session_for_actor(
+                        authz,
+                        session_id,
+                        None,
+                        protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                        None,
+                        protocol::COLLECTION_PAGE_DEFAULT_LIMIT,
+                        None,
+                        protocol::EVENT_PAGE_DEFAULT_LIMIT,
+                    )
+                    .await
+                    .unwrap();
+                if detail.session.status == status && detail.turns.len() >= minimum_turns {
+                    break detail;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the Session should reach the expected state and turn count")
+    }
+
+    async fn wait_for_no_armed_goals(store: &DemoStore) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if store.armed_session_goals().await.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Goal continuation authority should be disarmed");
     }
 
     async fn wait_for_agent_status(

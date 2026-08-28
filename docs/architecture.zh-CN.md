@@ -132,8 +132,10 @@ schema v30 在该 CAS 权威之上增加 same-Session Goal Round driver。`creat
 canonical prompt digest 与同一 timestamp；Goal Round Agent 的 complete/blocked 必须匹配本轮
 Goal revision，且自动 blocked 至少要求连续三轮；direct-human turn 仍可显式 complete 或 blocked。
 用户新 turn、取消、provider/tool 失败、`needs_attention`、完成、阻塞、权限失效或
-round cap 都会 disarm，失败和歧义结果不自动重试。Deep readiness 会重建每轮之前的 Goal 状态、精确
-driver prompt、turn/Agent/job 绑定和完整生命周期链。
+round cap 都会 disarm；只有已通过 Session 授权的 actor 可以人工 disarm，且 activation 复核与
+durable admission 共用同一个进程内互斥门，已取得门的人工 disarm 不会再被 stale worker candidate
+越过。失败和歧义结果不自动重试。Deep readiness 会重建
+每轮之前的 Goal 状态、精确 driver prompt、turn/Agent/job 绑定和完整生命周期链。
 
 可选 `ZEUS_SKILLS_FILE` 在 SQLite 打开前加载 immutable Skill Catalog。文件使用 strict version 1
 JSON，regular file 上限 512 KiB，包含 1–64 个唯一的 lowercase provider-safe 名称；description

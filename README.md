@@ -41,9 +41,11 @@ revision CAS, supports `active`, `paused`, `blocked`, and `completed` phases,
 and needs no owner approval because it changes only Zeus-owned coordination
 state. Successful mutations, append-only SQLite snapshots, exact tool results,
 and continuation requests commit atomically; `AgentTurnDetail.goal` projects
-the latest Session Goal across turns and restarts. This slice establishes the
-durable Goal state and model tool loop; automatic future-round scheduling is a
-separate runtime phase.
+the latest Session Goal across turns and restarts. A successful create or
+explicit resume arms same-Session Goal Rounds only in the current process.
+Each round is a real durable Session turn, and restart, human input,
+cancellation, provider/tool failure, revoked authority, or the configured
+round limit stops automatic continuation without inventing completion.
 
 Alpha+ bootstraps a local `acc_local` root and now supports a bounded local
 multi-account control plane. An owner can create accounts idempotently; one
@@ -905,7 +907,10 @@ and bounded memory, CPU, and PID resources.
   revision, next round number, actor membership revision, canonical driver
   prompt digest, and timestamp. Human input, cancellation, provider/tool
   failure, `needs_attention`, completion, blocking, revoked authority, or the
-  fixed round cap disarms continuation. No failed or ambiguous round is retried
+  fixed round cap disarms continuation. Activation checking and durable round
+  admission share one process-local gate, and only an actor authorized for the
+  Session may disarm it, so a human disarm cannot be crossed by a stale worker
+  candidate. No failed or ambiguous round is retried
   implicitly. Deep readiness reconstructs every driver prompt and lifecycle
   transition; SQLite permits a Goal-round Agent only to complete its exact Goal
   revision, and permits an automatic `blocked` transition only from round three
@@ -1250,11 +1255,11 @@ bounded multi-account control plane:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 655 tests passed
+- `cargo test --workspace --all-targets --locked`: 658 tests passed
   across the top-level test targets, including 22 connector tests,
   8 deployment tests, 29 knowledge tests, 30 LLM unit and 15 provider-contract
   tests, 4 Goal tests, 5 Skill Catalog tests, 267 storage tests, 21 workflow
-  tests, 51 runtime tests, 21 protocol tests, 85 API library tests, 18 API main/config
+  tests, 52 runtime tests, 21 protocol tests, 87 API library tests, 18 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,

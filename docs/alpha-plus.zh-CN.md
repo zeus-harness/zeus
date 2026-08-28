@@ -374,7 +374,12 @@ POST /sessions/{id}/turns
   `create_goal@1-session-cas` / `update_goal@1-session-cas` 都绑定 exact started call、canonical
   result、account/Session/turn/Agent scope、Session sequence 与 Goal revision；单一 unfinished Goal、
   phase transition、blocker 和时间关系由 trigger 与 deep state-machine replay 双重校验。`get_goal`
-  只读当前投影，不生成 snapshot；当前阶段不包含自动未来轮次调度。
+  只读当前投影，不生成 snapshot。
+- `0030_agent_goal_rounds.sql`：增加 same-Session Goal Round admission。成功 create 或显式 resume
+  只在当前进程 armed；每轮原子写真实 Session turn、Agent、首个 model job 和 append-only round，
+  并绑定 exact Goal revision、连续 round、membership revision 与 canonical prompt digest。人工输入、
+  取消、失败、权限失效、重启或 round cap 都停止续跑；人工 disarm 先验证 Session 权限，activation
+  复核与 durable admission 共用进程内互斥门，失败和歧义结果不自动重试。
 
 schema v24 的 system prompt governance 复用 `0019` 的 prompt binding，并增加 durable
 head/revision/receipt。Owner-only `GET/PUT /api/v1/agent/prompt` 通过 expected-revision CAS 和
@@ -471,10 +476,10 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 按项目既有统计口径通过 655 个 Rust 测试（authz 7、connectors 22、deployment 8、
+- host 按项目既有统计口径通过 658 个 Rust 测试（authz 7、connectors 22、deployment 8、
   execution 16、goals 4、kernel 10、knowledge 29、LLM unit 30、provider contract 15、planning 4、
-  protocol 21、runtime 51、skills 5、storage 267、tenancy 15、terminal 10、tools 16、
-  workflows 21、API library 85、API main/config 18、graceful shutdown 1）与 28 个 Web Node 测试。
+  protocol 21、runtime 52、skills 5、storage 267、tenancy 15、terminal 10、tools 16、
+  workflows 21、API library 87、API main/config 18、graceful shutdown 1）与 28 个 Web Node 测试。
 - `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 
 ## 8. 容器与 OOM 验收边界
