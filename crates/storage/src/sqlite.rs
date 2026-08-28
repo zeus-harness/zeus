@@ -20,9 +20,10 @@ use protocol::{
     ResumeSessionResponse, ReviewDecision, ReviewResponse, RunEvent, RunEventData, RunEventPage,
     RunStatus, RunSummary, SandboxProfile, SessionDetail, SessionDetailPagination, SessionEvent,
     SessionEventData, SessionEventPage, SessionFlushAck, SessionFlushBarrier,
-    SessionFlushBarrierStatus, SessionFollowup, SessionFollowupStatus, SessionFork,
-    SessionForkSummary, SessionStatus, SessionSummary, SessionTurn, SessionTurnStatus, Severity,
-    StartTurnRequest, StartTurnResponse, ToolCallStatus, ToolEffect, ToolOutcome,
+    SessionFlushBarrierStatus, SessionFollowup, SessionFollowupSource, SessionFollowupSourceKind,
+    SessionFollowupStatus, SessionFork, SessionForkSummary, SessionStatus, SessionSummary,
+    SessionTurn, SessionTurnStatus, Severity, StartTurnRequest, StartTurnResponse, ToolCallStatus,
+    ToolEffect, ToolOutcome,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Serialize, de::DeserializeOwned};
@@ -62,7 +63,7 @@ use crate::{
     UpdateAccountAuditPolicyCommit,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 36;
+const CURRENT_SCHEMA_VERSION: i64 = 37;
 const LOCAL_ACCOUNT_ID: &str = "acc_local";
 const MAX_ACCOUNTS_PER_USER: i64 = 16;
 const MAX_ACCOUNTS_GLOBAL: i64 = 64;
@@ -108,6 +109,13 @@ const MIGRATION_0033: &str =
 const MIGRATION_0034: &str = include_str!("../migrations/0034_session_forks.sql");
 const MIGRATION_0035: &str = include_str!("../migrations/0035_session_fork_catalog.sql");
 const MIGRATION_0036: &str = include_str!("../migrations/0036_agent_subagent_spawns.sql");
+const MIGRATION_0037: &str = include_str!("../migrations/0037_session_followup_sources.sql");
+const MIGRATION_0037_TRIGGER_NAMES: &[&str] = &[
+    "session_followup_sources_validate_insert",
+    "session_followup_sources_reject_update",
+    "session_followup_sources_reject_delete",
+    "agent_tool_calls_bind_followup_source",
+];
 const MIGRATION_0036_TRIGGER_NAMES: &[&str] = &[
     "agent_subagent_spawns_validate_insert",
     "agent_subagent_spawns_reject_update",
@@ -1318,6 +1326,7 @@ impl SqliteStore {
                     limits: &limits,
                     physical_limits: &physical_limits,
                     authority: SessionFollowupAuthority::UserAuthSession,
+                    source: None,
                 },
             )
         })
@@ -1332,6 +1341,7 @@ impl SqliteStore {
         &self,
         context: &AuthzContext,
         session_id: &str,
+        source: SessionFollowupSource,
         request: EnqueueSessionFollowupRequest,
         idempotency_key: &str,
     ) -> Result<EnqueueSessionFollowupResponse, StorageError> {
@@ -1351,6 +1361,7 @@ impl SqliteStore {
                     limits: &limits,
                     physical_limits: &physical_limits,
                     authority: SessionFollowupAuthority::AgentProcess,
+                    source: Some(&source),
                 },
             )
         })
@@ -1372,6 +1383,34 @@ impl SqliteStore {
             let items = query_session_followups(&transaction, &session_id)?;
             transaction.commit()?;
             Ok(items)
+        })
+        .await
+    }
+
+    /// Resolve whether one account-owned Session was admitted through the
+    /// immutable `spawn_agent` lineage. Runtime manifest construction uses
+    /// this server-owned fact to expose `report` only to actual subagents.
+    pub async fn session_is_subagent_for_account(
+        &self,
+        account_id: &AccountId,
+        session_id: &str,
+    ) -> Result<bool, StorageError> {
+        let account_id = account_id.clone();
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        self.with_connection(move |connection| {
+            let found: i64 = connection.query_row(
+                r#"SELECT EXISTS(
+                       SELECT 1
+                       FROM sessions session
+                       JOIN agent_subagent_spawns spawn
+                         ON spawn.account_id = session.account_id
+                        AND spawn.child_session_id = session.id
+                       WHERE session.account_id = ?1 AND session.id = ?2
+                   )"#,
+                params![account_id.as_str(), session_id],
+                |row| row.get(0),
+            )?;
+            Ok(found != 0)
         })
         .await
     }
@@ -3846,6 +3885,13 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
             params![36, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 37 {
+        transaction.execute_batch(MIGRATION_0037)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![37, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
     // The execution verifier now understands the v22 knowledge binding. Run
     // it only after every missing schema step has been installed so upgrades
     // from v19 and older never query a column that does not exist yet. This
@@ -4519,12 +4565,12 @@ fn readiness(
                'agent_knowledge_legacy_agents', 'account_knowledge_catalogs',
                'knowledge_catalog_receipts', 'session_compaction_jobs',
                'agent_todo_snapshots', 'session_forks', 'session_fork_turns',
-               'agent_subagent_spawns'
+               'agent_subagent_spawns', 'session_followup_sources'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if table_count != 47 {
+    if table_count != 48 {
         return Err(StorageError::CorruptData(
             "one or more required tables are missing".into(),
         ));
@@ -5112,13 +5158,17 @@ fn readiness(
                'agent_subagent_spawns_reject_update',
                'agent_subagent_spawns_reject_delete',
                'agent_tool_calls_bind_subagent_spawn',
+               'session_followup_sources_validate_insert',
+               'session_followup_sources_reject_update',
+               'session_followup_sources_reject_delete',
+               'agent_tool_calls_bind_followup_source',
                'schema_migrations_reject_update',
                'schema_migrations_reject_delete'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 183 {
+    if trigger_count != 187 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
         ));
@@ -5137,6 +5187,7 @@ fn readiness(
     verify_migration_trigger_definitions(connection, MIGRATION_0033, MIGRATION_0033_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0034, MIGRATION_0034_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0036, MIGRATION_0036_TRIGGER_NAMES)?;
+    verify_migration_trigger_definitions(connection, MIGRATION_0037, MIGRATION_0037_TRIGGER_NAMES)?;
     verify_session_followup_integrity(connection)?;
     verify_session_fork_integrity(connection)?;
     agent::verify_agent_subagent_spawn_integrity(connection)?;
@@ -12374,12 +12425,24 @@ fn decode_session_followup_status(value: &str) -> Result<SessionFollowupStatus, 
     }
 }
 
+fn decode_session_followup_source_kind(
+    value: &str,
+) -> Result<SessionFollowupSourceKind, StorageError> {
+    match value {
+        "subagent_message" => Ok(SessionFollowupSourceKind::SubagentMessage),
+        "subagent_report" => Ok(SessionFollowupSourceKind::SubagentReport),
+        other => Err(StorageError::CorruptData(format!(
+            "unsupported Session follow-up source kind `{other}`"
+        ))),
+    }
+}
+
 fn query_session_followup(
     connection: &Connection,
     session_id: &str,
     turn_id: &str,
 ) -> Result<SessionFollowup, StorageError> {
-    connection
+    let stored = connection
         .query_row(
             r#"SELECT session_id, turn_id, ordinal, status, user_message,
                       enqueued_at, claimed_at, discarded_at, discard_reason
@@ -12401,32 +12464,62 @@ fn query_session_followup(
             },
         )
         .optional()?
-        .ok_or_else(|| StorageError::SessionTurnNotFound(turn_id.to_owned()))
-        .and_then(
+        .ok_or_else(|| StorageError::SessionTurnNotFound(turn_id.to_owned()))?;
+    let source = connection
+        .query_row(
+            r#"SELECT source_kind, source_session_id, source_agent_id, source_call_id
+               FROM session_followup_sources
+               WHERE session_id = ?1 AND turn_id = ?2"#,
+            params![session_id, turn_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(
             |(
-                session_id,
-                turn_id,
-                ordinal,
-                status,
-                user_message,
-                enqueued_at,
-                claimed_at,
-                discarded_at,
-                discard_reason,
-            )| {
-                Ok(SessionFollowup {
-                    session_id,
-                    turn_id,
-                    ordinal: i64_to_u64(ordinal, "Session follow-up ordinal")?,
-                    status: decode_session_followup_status(&status)?,
-                    user_message,
-                    enqueued_at,
-                    claimed_at,
-                    discarded_at,
-                    discard_reason,
+                kind,
+                source_session_id,
+                source_agent_id,
+                source_call_id,
+            )| -> Result<SessionFollowupSource, StorageError> {
+                Ok(SessionFollowupSource {
+                    kind: decode_session_followup_source_kind(&kind)?,
+                    source_session_id,
+                    source_agent_id,
+                    source_call_id,
                 })
             },
         )
+        .transpose()?;
+    let (
+        session_id,
+        turn_id,
+        ordinal,
+        status,
+        user_message,
+        enqueued_at,
+        claimed_at,
+        discarded_at,
+        discard_reason,
+    ) = stored;
+    Ok(SessionFollowup {
+        session_id,
+        turn_id,
+        ordinal: i64_to_u64(ordinal, "Session follow-up ordinal")?,
+        status: decode_session_followup_status(&status)?,
+        user_message,
+        source,
+        enqueued_at,
+        claimed_at,
+        discarded_at,
+        discard_reason,
+    })
 }
 
 fn query_session_followups(
@@ -12617,6 +12710,7 @@ struct EnqueueSessionFollowupOptions<'a> {
     limits: &'a StorageLimits,
     physical_limits: &'a SqlitePhysicalLimits,
     authority: SessionFollowupAuthority,
+    source: Option<&'a SessionFollowupSource>,
 }
 
 fn enqueue_session_followup(
@@ -12631,15 +12725,26 @@ fn enqueue_session_followup(
         limits,
         physical_limits,
         authority,
+        source,
     } = options;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     match authority {
         SessionFollowupAuthority::UserAuthSession => {
+            if source.is_some() {
+                return Err(StorageError::InvalidSessionTransition(
+                    "a public Session follow-up cannot carry Agent provenance".into(),
+                ));
+            }
             require_current_authority(&transaction, context, AccountCapability::SessionWrite)?;
             require_current_authority(&transaction, context, AccountCapability::Reply)?;
             require_active_session_actor(&transaction, session_id, context)?;
         }
         SessionFollowupAuthority::AgentProcess => {
+            if source.is_none() {
+                return Err(StorageError::InvalidSessionTransition(
+                    "an Agent Session follow-up requires durable provenance".into(),
+                ));
+            }
             require_process_owned_session_authority(&transaction, session_id, context)?;
         }
     }
@@ -12650,7 +12755,7 @@ fn enqueue_session_followup(
     };
     validate_start_turn_request(&start_request)?;
     normalized_key(idempotency_key)?;
-    let fingerprint = session_command_fingerprint(Some(session_id), &request)?;
+    let fingerprint = session_followup_fingerprint(session_id, &request, source)?;
     let stored = transaction
         .query_row(
             r#"SELECT request_fingerprint, response_json
@@ -12737,6 +12842,26 @@ fn enqueue_session_followup(
             timestamp,
         ],
     )?;
+    if let Some(source) = source {
+        transaction.execute(
+            r#"INSERT INTO session_followup_sources(
+                   session_id, turn_id, source_kind, source_session_id,
+                   source_agent_id, source_call_id, created_at
+               ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+            params![
+                session_id,
+                request.turn_id,
+                match source.kind {
+                    SessionFollowupSourceKind::SubagentMessage => "subagent_message",
+                    SessionFollowupSourceKind::SubagentReport => "subagent_report",
+                },
+                source.source_session_id,
+                source.source_agent_id,
+                source.source_call_id,
+                timestamp,
+            ],
+        )?;
+    }
     let response = EnqueueSessionFollowupResponse {
         followup: query_session_followup(&transaction, session_id, &request.turn_id)?,
         replayed: false,
@@ -13496,7 +13621,7 @@ pub(super) fn insert_subagent_initial_turn(
         sequence,
         timestamp,
     )?;
-    agent::insert_agent_turn(
+    agent::insert_subagent_turn(
         connection,
         child_session_id,
         &request.turn_id,
@@ -15538,6 +15663,21 @@ fn session_command_fingerprint<T: Serialize>(
     Ok(serde_json::to_string(&json!({
         "session_id": session_id,
         "request": request,
+    }))?)
+}
+
+fn session_followup_fingerprint(
+    session_id: &str,
+    request: &EnqueueSessionFollowupRequest,
+    source: Option<&SessionFollowupSource>,
+) -> Result<String, StorageError> {
+    let Some(source) = source else {
+        return session_command_fingerprint(Some(session_id), request);
+    };
+    Ok(serde_json::to_string(&json!({
+        "session_id": session_id,
+        "request": request,
+        "source": source,
     }))?)
 }
 

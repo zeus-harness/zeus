@@ -8009,6 +8009,15 @@ pub(super) fn verify_agent_subagent_spawn_integrity(
                 "spawn_agent call `{call_id}` has no parent history boundary"
             ))
         })?;
+        let manifests_match = match (
+            parent_agent.deployment_manifest_digest.as_deref(),
+            child_agent.deployment_manifest_digest.as_deref(),
+        ) {
+            (Some(parent_digest), Some(child_digest)) => {
+                subagent_manifest_derives_from_parent(connection, parent_digest, child_digest)?
+            }
+            _ => false,
+        };
         if call.status != AgentToolCallStatus::Succeeded
             || call.account_id.as_str() != account_id
             || call.session_id != parent_session_id
@@ -8041,7 +8050,7 @@ pub(super) fn verify_agent_subagent_spawn_integrity(
             || child_agent.turn_id != child_turn_id
             || child_turn.ordinal != inherited_turns + 1
             || child_user_sequence != expected_child_user_sequence
-            || child_agent.deployment_manifest_digest != parent_agent.deployment_manifest_digest
+            || !manifests_match
             || child_agent.environment != parent_agent.environment
             || child_agent.provider_name != parent_agent.provider_name
             || child_agent.model_name != parent_agent.model_name
@@ -8145,6 +8154,13 @@ pub(super) fn verify_agent_subagent_spawn_integrity(
             || followup.session_id != request.subagent_id()
             || followup.turn_id != identity.turn_id
             || followup.user_message != request.message()
+            || followup.source.as_ref()
+                != Some(&protocol::SessionFollowupSource {
+                    kind: protocol::SessionFollowupSourceKind::SubagentMessage,
+                    source_session_id: call.session_id.clone(),
+                    source_agent_id: call.agent_id.clone(),
+                    source_call_id: call.call_id.clone(),
+                })
             || followup_account_id != call.account_id.as_str()
             || followup_actor_user_id != parent_agent.actor_user_id
             || i64_to_u64(
@@ -8156,6 +8172,7 @@ pub(super) fn verify_agent_subagent_spawn_integrity(
             || receipt.followup.turn_id != followup.turn_id
             || receipt.followup.ordinal != followup.ordinal
             || receipt.followup.user_message != followup.user_message
+            || (receipt.followup.source.is_some() && receipt.followup.source != followup.source)
             || receipt.followup.enqueued_at != followup.enqueued_at
         {
             return Err(StorageError::CorruptData(format!(
@@ -8257,6 +8274,13 @@ pub(super) fn verify_agent_subagent_spawn_integrity(
             || followup.session_id != parent_session_id
             || followup.turn_id != identity.turn_id
             || followup.user_message != expected_message
+            || followup.source.as_ref()
+                != Some(&protocol::SessionFollowupSource {
+                    kind: protocol::SessionFollowupSourceKind::SubagentReport,
+                    source_session_id: call.session_id.clone(),
+                    source_agent_id: call.agent_id.clone(),
+                    source_call_id: call.call_id.clone(),
+                })
             || followup_account_id != call.account_id.as_str()
             || followup_actor_user_id != child_agent.actor_user_id
             || i64_to_u64(
@@ -8268,6 +8292,7 @@ pub(super) fn verify_agent_subagent_spawn_integrity(
             || receipt.followup.turn_id != followup.turn_id
             || receipt.followup.ordinal != followup.ordinal
             || receipt.followup.user_message != followup.user_message
+            || (receipt.followup.source.is_some() && receipt.followup.source != followup.source)
             || receipt.followup.enqueued_at != followup.enqueued_at
         {
             return Err(StorageError::CorruptData(format!(
@@ -11244,8 +11269,36 @@ pub(super) fn insert_agent_turn(
     spec: &AgentTurnSpec,
     queued_at: &str,
 ) -> Result<(AgentTurn, AgentModelJob), StorageError> {
+    insert_agent_turn_with_scope(connection, session_id, turn_id, spec, queued_at, None)
+}
+
+pub(super) fn insert_subagent_turn(
+    connection: &Connection,
+    session_id: &str,
+    turn_id: &str,
+    spec: &AgentTurnSpec,
+    queued_at: &str,
+) -> Result<(AgentTurn, AgentModelJob), StorageError> {
+    insert_agent_turn_with_scope(connection, session_id, turn_id, spec, queued_at, Some(true))
+}
+
+fn insert_agent_turn_with_scope(
+    connection: &Connection,
+    session_id: &str,
+    turn_id: &str,
+    spec: &AgentTurnSpec,
+    queued_at: &str,
+    forced_subagent: Option<bool>,
+) -> Result<(AgentTurn, AgentModelJob), StorageError> {
     validate_agent_turn_spec(spec)?;
     require_manifest_matches_runtime_identity(connection, &spec.manifest)?;
+    require_current_zeus_manifest_matches_session_scope(
+        connection,
+        spec.authz.account_id.as_str(),
+        session_id,
+        &spec.manifest,
+        forced_subagent,
+    )?;
     if !manifest_matches_current_agent_prompt(
         connection,
         spec.authz.account_id.as_str(),
@@ -11327,6 +11380,94 @@ pub(super) fn insert_agent_turn(
     require_agent_knowledge_context_integrity(connection, &agent, &job)?;
     super::execution::insert_native_head_and_admission(connection, &agent, &job, queued_at)?;
     Ok((agent, job))
+}
+
+fn require_current_zeus_manifest_matches_session_scope(
+    connection: &Connection,
+    account_id: &str,
+    session_id: &str,
+    manifest: &ManifestEnvelope,
+    forced_subagent: Option<bool>,
+) -> Result<(), StorageError> {
+    let spec = &manifest.manifest.deployment.spec;
+    if spec.spec_id != crate::SESSION_AGENT_SPEC_ID
+        || spec.revision != crate::CURRENT_SESSION_AGENT_SPEC_REVISION
+    {
+        return Ok(());
+    }
+    let report_tools = spec
+        .tools
+        .iter()
+        .filter(|tool| tool.name == subagents::REPORT_TOOL_NAME)
+        .collect::<Vec<_>>();
+    if report_tools.iter().any(|tool| {
+        tool.version != subagents::REPORT_TOOL_VERSION
+            || tool.executor_status != ToolExecutorStatus::Available
+    }) {
+        return Err(StorageError::InvalidAgentTransition(
+            "the Agent report capability does not match the current durable contract".into(),
+        ));
+    }
+    let is_subagent = match forced_subagent {
+        Some(value) => value,
+        None => {
+            let found: i64 = connection.query_row(
+                r#"SELECT EXISTS(
+                       SELECT 1 FROM agent_subagent_spawns
+                       WHERE account_id = ?1 AND child_session_id = ?2
+                   )"#,
+                params![account_id, session_id],
+                |row| row.get(0),
+            )?;
+            found != 0
+        }
+    };
+    if (is_subagent && report_tools.len() != 1) || (!is_subagent && !report_tools.is_empty()) {
+        return Err(StorageError::InvalidAgentTransition(
+            "the Agent report capability does not match durable Session lineage".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn subagent_manifest_derives_from_parent(
+    connection: &Connection,
+    parent_digest: &str,
+    child_digest: &str,
+) -> Result<bool, StorageError> {
+    let parent = query_agent_deployment_manifest(connection, parent_digest)?;
+    let child = query_agent_deployment_manifest(connection, child_digest)?;
+    let child_spec = &child.manifest.deployment.spec;
+    if child_spec.spec_id != crate::SESSION_AGENT_SPEC_ID
+        || child_spec.revision != crate::CURRENT_SESSION_AGENT_SPEC_REVISION
+    {
+        return Ok(parent_digest == child_digest);
+    }
+    let child_reports = child_spec
+        .tools
+        .iter()
+        .filter(|tool| tool.name == subagents::REPORT_TOOL_NAME)
+        .collect::<Vec<_>>();
+    if child_reports.len() != 1
+        || child_reports[0].version != subagents::REPORT_TOOL_VERSION
+        || child_reports[0].executor_status != ToolExecutorStatus::Available
+    {
+        return Ok(false);
+    }
+    let mut parent_spec = parent.manifest.deployment.spec.clone();
+    let mut normalized_child_spec = child_spec.clone();
+    parent_spec
+        .tools
+        .retain(|tool| tool.name != subagents::REPORT_TOOL_NAME);
+    normalized_child_spec
+        .tools
+        .retain(|tool| tool.name != subagents::REPORT_TOOL_NAME);
+    Ok(parent.schema_version == child.schema_version
+        && parent.manifest.schema_version == child.manifest.schema_version
+        && parent.manifest.deployment.schema_version == child.manifest.deployment.schema_version
+        && parent.manifest.deployment.deployment_id == child.manifest.deployment.deployment_id
+        && parent.manifest.deployment.revision == child.manifest.deployment.revision
+        && parent_spec == normalized_child_spec)
 }
 
 fn model_job_id(agent_id: &str, step: u32) -> String {
@@ -11828,11 +11969,6 @@ fn insert_agent_subagent_spawn(
         || spawn.agent.authz.account_id != parent_agent.account_id
         || spawn.agent.authz.user_id != parent_agent.actor_user_id
         || spawn.agent.authz.membership_revision != parent_agent.actor_membership_revision
-        || spawn.agent.manifest.digest
-            != parent_agent
-                .deployment_manifest_digest
-                .clone()
-                .unwrap_or_default()
         || spawn.agent.environment != parent_agent.environment
         || spawn.agent.provider_name != parent_agent.provider_name
         || spawn.agent.model_name != parent_agent.model_name
@@ -11872,6 +12008,31 @@ fn insert_agent_subagent_spawn(
         timestamp,
     )
     .map_err(subagent_admission_error)?;
+    let parent_manifest_digest = parent_agent
+        .deployment_manifest_digest
+        .as_deref()
+        .ok_or_else(|| {
+            StorageError::InvalidAgentTransition(
+                "spawn_agent parent has no durable deployment manifest".into(),
+            )
+        })?;
+    let child_manifest_digest = child_agent
+        .deployment_manifest_digest
+        .as_deref()
+        .ok_or_else(|| {
+            StorageError::InvalidAgentTransition(
+                "spawn_agent child has no durable deployment manifest".into(),
+            )
+        })?;
+    if !subagent_manifest_derives_from_parent(
+        connection,
+        parent_manifest_digest,
+        child_manifest_digest,
+    )? {
+        return Err(StorageError::InvalidAgentTransition(
+            "spawn_agent child deployment does not derive from its parent".into(),
+        ));
+    }
     let prompt_digest = subagents::spawn_prompt_digest(&spawn.start.user_message)
         .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
     connection.execute(

@@ -38,7 +38,7 @@ Client / SvelteKit Web
   严格参数边界、确定性 child/message identity 与有界结果；durable scope、原子 admission、目录分页、
   终态结果读取和 follow-up 入队由 runtime/storage 掌握，不由通用 executor 接受调用方自报身份。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
-- `storage`：schema v36 migration、有界 account/membership 权威、一次性 member setup、用户/偏好、
+- `storage`：schema v37 migration、有界 account/membership 权威、一次性 member setup、用户/偏好、
   account audit/rollup/policy/archive state、独立 Session/Run ledger、typed event lookup、
   account+actor-scoped 回执、durable Agent/model/tool/dispatch queue、不可变 model output、
   不可变 deployment manifest，
@@ -175,6 +175,12 @@ scope 下生成确定性 turn/idempotency identity；parent 消息封装为
 `Background subagent <child-id> reported:` 后接原始 output，复用 schema v31 durable FIFO/receipt。
 因此报告会唤醒 parent 的下一正常轮次、重启可恢复、嵌套时恰好向上一层路由，而且不会结束 child
 当前轮次。成功 tool result 的 deep integrity 必须能重建 lineage、封装内容、receipt 与 parent follow-up。
+schema v37 为 Agent-to-Agent follow-up 增加 immutable `session_followup_sources`。记录保存
+`subagent_message` / `subagent_report` 类型、source Session/Agent/call，并由 SQLite trigger 绑定 exact
+started tool 与直属谱系；FIFO claim 后仍保留，重启查询无需从文本前缀猜测来源。Session Agent
+manifest revision 3 同样由 durable `agent_subagent_spawns` 决定能力：root 不暴露 `report`，真实 child
+才增加该工具；worker claim、普通 follow-up、Goal round 与 child spawn 复用同一 lineage 判定，
+storage admission 再次 fail closed 复验。
 Process-owned 中断复验原 membership revision 与 SessionWrite/Reply 权限，不依赖短期登录 session；
 成功 parent tool result 的 deep integrity 还必须能还原直属 child 的 exact user-cancelled terminal evidence。
 当前阶段不递归加载完整 child graph。
@@ -402,7 +408,7 @@ connector 在数据库事务和锁之外运行。
 
 API 监听端口之前按固定顺序完成：
 
-1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v36；按当前
+1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v37；按当前
    detailed-row limit 以最多 64 行 batch 压缩 bootstrap terminal audit prefix，再按稳定
    `(priority actor, expires_at, auth-session ID)` 顺序最多清理 64 个过期或绑定
    missing/disabled/suspended/stale-revision authority 的 auth session。
@@ -793,8 +799,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   刷新恢复、owner/member setup/登录、owner 成员与 audit 管理、设置/退出和
   system/light/dark。member 的审批卡只读。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化按项目既有统计口径是 706 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
-  provider contract 18、skills 5、subagents 13、storage 286、workflows 21、runtime 52、API library 100、API main/config 18）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化按项目既有统计口径是 708 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
+  provider contract 18、skills 5、subagents 13、storage 288、workflows 21、runtime 52、API library 100、API main/config 18）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
 提交 `af29089` 曾构建并运行在独立 `zeus-operation-acceptance` project（端口 `18089`）；既有

@@ -9,7 +9,8 @@ Compaction、schema v26 Account-scoped Reply Provider Selection、schema v27 Saf
 Cancellation、schema v28 Durable Agent Planning、schema v29 Durable Session Goal、schema v30
 Same-Session Goal Round、schema v31 Durable Session Follow-up、schema v32 Durable Agent
 Model Output、schema v33 Running-model Cancellation、schema v34 Durable Session Fork、schema v35
-Durable Session Fork Catalog、schema v36 Durable Agent Subagent Spawn、Agent-scoped
+Durable Session Fork Catalog、schema v36 Durable Agent Subagent Spawn、schema v37 Durable
+Agent Follow-up Source / Scoped Report Manifest、Agent-scoped
 `spawn_agent` / `list_agents`、Trusted Single-Node Ingress、
 Per-Operation SecretRef Resolution、启动绑定的 Skill Catalog
 与有界多账户控制面主机代码已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
@@ -407,6 +408,9 @@ assistant 内容。它在一个授权 SQLite snapshot 中冻结当前 active tur
 - `0036_agent_subagent_spawns.sql`：增加 append-only `agent_subagent_spawns`，把 successful
   `spawn_agent` parent call、历史 boundary、child Session/turn/Agent、actor revision、deployment、
   prompt digest 与同一提交时间原子绑定；失败或容量拒绝不留下任何 child row。
+- `0037_session_followup_sources.sql`：增加 immutable `session_followup_sources`，把
+  `send_message` / `report` follow-up 与 exact started source Session/Agent/call、直属谱系和创建时间绑定；
+  manifest revision 3 只向 durable spawned child 暴露 `report`。
 
 schema v24 的 system prompt governance 复用 `0019` 的 prompt binding，并增加 durable
 head/revision/receipt。Owner-only `GET/PUT /api/v1/agent/prompt` 通过 expected-revision CAS 和
@@ -554,6 +558,8 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
   Agent ID 超过 64 bytes 时无法生成 stable tool call ID 的核心契约不一致。`wait_agent` 覆盖订阅先于
   snapshot、活动 child 终态唤醒、Ready+queued child 的可推进识别，以及没有可推进 child 时的即时 `no_progress`；
   `report` 覆盖 exact child scope、持久 parent FIFO 唤醒、确定性 receipt 与成功调用的 deep integrity。
+  schema v37 另覆盖 v36 原地迁移、same-name weakened source trigger 拒绝、root/child manifest
+  能力分离、双向 structured source 查询，以及 source 在 FIFO claim 和重启后的保持。
 - Session/Run detail 只返回最新 bounded tail；opaque cursor 的 kind、resource scope、canonical
   encoding、future-head 和跨资源使用均有自动测试，返回页保持连续且升序。
 - disabled/降权/owner mismatch 的 reply 与 dispatch claim 不触达外部执行，并留下
@@ -562,9 +568,9 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 按项目既有统计口径通过 706 个 Rust 测试（authz 7、connectors 22、deployment 8、
+- host 按项目既有统计口径通过 708 个 Rust 测试（authz 7、connectors 22、deployment 8、
   execution 16、goals 4、kernel 10、knowledge 29、LLM unit 30、provider contract 18、planning 4、
-  protocol 21、runtime 52、skills 5、subagents 13、storage 286、tenancy 15、terminal 10、tools 16、
+  protocol 21、runtime 52、skills 5、subagents 13、storage 288、tenancy 15、terminal 10、tools 16、
   workflows 21、API library 100、API main/config 18、graceful shutdown 1）与 28 个 Web Node 测试。
 - `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 

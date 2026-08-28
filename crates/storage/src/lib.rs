@@ -35,6 +35,8 @@ use workflows::State as AgentWorkflowState;
 
 pub const MEMBER_SETUP_TOKEN_TTL_SECONDS: i64 = 86_400;
 pub const SESSION_AGENT_PROMPT_ID: &str = "zeus-system-prompt";
+pub const SESSION_AGENT_SPEC_ID: &str = "zeus-session-agent";
+pub const CURRENT_SESSION_AGENT_SPEC_REVISION: &str = "3";
 pub const DEFAULT_SESSION_AGENT_PROMPT_REVISION: &str = "1";
 pub const DEFAULT_SESSION_AGENT_SYSTEM_PROMPT: &str = concat!(
     "You are Zeus, an execution agent operating inside a durable session.\n",

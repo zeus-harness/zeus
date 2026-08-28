@@ -761,6 +761,25 @@ pub enum SessionFollowupStatus {
     Discarded,
 }
 
+/// Server-owned provenance for a durable Agent-to-Agent follow-up. Ordinary
+/// user follow-ups deliberately have no source object: clients cannot forge
+/// Agent lineage by supplying this metadata on the public enqueue contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionFollowupSourceKind {
+    SubagentMessage,
+    SubagentReport,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionFollowupSource {
+    pub kind: SessionFollowupSourceKind,
+    pub source_session_id: String,
+    pub source_agent_id: String,
+    pub source_call_id: String,
+}
+
 impl RunStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(
@@ -997,6 +1016,8 @@ pub struct SessionFollowup {
     pub ordinal: u64,
     pub status: SessionFollowupStatus,
     pub user_message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SessionFollowupSource>,
     pub enqueued_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimed_at: Option<String>,

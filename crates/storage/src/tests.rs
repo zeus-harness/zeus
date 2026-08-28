@@ -24,9 +24,9 @@ use protocol::{
     ForkSessionRequest, IncidentStatus, IncidentSummary, Metric, MetricTone, NotDispatchedReason,
     PolicyDecision, ResumeSessionRequest, ReviewDecision, ReviewResponse, RunEvent, RunEventData,
     RunStatus, RunSummary, SandboxProfile, SessionEvent, SessionEventData,
-    SessionFlushBarrierStatus, SessionFollowupStatus, SessionStatus, SessionTurnStatus, Severity,
-    StartTurnRequest, ToolCall, ToolCallStatus, ToolEffect, ToolExecutorStatus, ToolOutcome,
-    ToolPolicySummary,
+    SessionFlushBarrierStatus, SessionFollowupSource, SessionFollowupSourceKind,
+    SessionFollowupStatus, SessionStatus, SessionTurnStatus, Severity, StartTurnRequest, ToolCall,
+    ToolCallStatus, ToolEffect, ToolExecutorStatus, ToolOutcome, ToolPolicySummary,
 };
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
@@ -1772,7 +1772,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         versions,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36,
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37,
         ]
     );
     let owner: Option<String> = connection
@@ -1922,7 +1922,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 36);
+    assert_eq!(version, 37);
     let configured_account: (String, String, String, i64) = connection
         .query_row(
             r#"SELECT
@@ -2640,7 +2640,7 @@ async fn v12_identity_and_run_crash_prefix_migrates_then_recovers_the_primary_se
     assert_eq!(
         recovered,
         (
-            36,
+            37,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into()
@@ -4387,7 +4387,7 @@ async fn v5_configured_database_migrates_to_the_local_owner_membership() {
     assert_eq!(
         migrated,
         (
-            36,
+            37,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into(),
@@ -4513,7 +4513,7 @@ async fn v13_configured_active_work_migrates_with_account_authority_and_exact_vo
             },
         )
         .unwrap();
-    assert_eq!(migrated_counts, (36, 1, 1, 2, 1));
+    assert_eq!(migrated_counts, (37, 1, 1, 2, 1));
 }
 
 #[tokio::test]
@@ -4875,7 +4875,7 @@ async fn v14_database_migrates_through_v19_with_member_and_audit_roots() {
             },
         )
         .unwrap();
-    assert_eq!(state, (36, 1, 1, 1, 19));
+    assert_eq!(state, (37, 1, 1, 1, 19));
 }
 
 #[tokio::test]
@@ -4914,7 +4914,7 @@ async fn v15_migration_seeds_the_configured_audit_detail_limit() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (36, 2));
+    assert_eq!(state, (37, 2));
 }
 
 #[tokio::test]
@@ -4959,7 +4959,7 @@ async fn v15_reopen_rejects_a_lower_audit_detail_limit_without_mutating_policy()
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (36, 4));
+    assert_eq!(state, (37, 4));
     drop(connection);
 
     let reopened = SqliteStore::open_with_limits(database.path(), original_limits)
@@ -5410,6 +5410,83 @@ async fn readiness_rejects_a_weakened_v36_subagent_binding_trigger() {
 }
 
 #[tokio::test]
+async fn readiness_rejects_a_weakened_v37_followup_source_binding_trigger() {
+    let database = TestDatabase::new();
+    {
+        let store = SqliteStore::open(database.path()).await.unwrap();
+        store.readiness().await.unwrap();
+    }
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER agent_tool_calls_bind_followup_source;
+               CREATE TRIGGER agent_tool_calls_bind_followup_source
+               BEFORE UPDATE OF status, result_json ON agent_tool_calls
+               WHEN 0
+               BEGIN
+                   SELECT 1;
+               END;"#,
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("a same-name weakened follow-up source trigger must fail"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(&error, StorageError::CorruptData(message)
+            if message == "durability trigger `agent_tool_calls_bind_followup_source` differs from the authoritative migration"),
+        "unexpected weakened-trigger error: {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn v36_database_migrates_to_durable_followup_sources() {
+    let database = TestDatabase::new();
+    drop(SqliteStore::open(database.path()).await.unwrap());
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    drop_v37_fixture_objects(&connection);
+    assert_eq!(
+        connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        36
+    );
+    drop(connection);
+
+    let migrated = SqliteStore::open(database.path()).await.unwrap();
+    migrated.readiness().await.unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let state = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT MAX(version) FROM schema_migrations),
+                   (SELECT COUNT(*) FROM sqlite_schema
+                    WHERE type = 'table' AND name = 'session_followup_sources'),
+                   (SELECT COUNT(*) FROM sqlite_schema
+                    WHERE type = 'trigger' AND name IN (
+                        'session_followup_sources_validate_insert',
+                        'session_followup_sources_reject_update',
+                        'session_followup_sources_reject_delete',
+                        'agent_tool_calls_bind_followup_source'
+                    ))"#,
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(state, (37, 1, 4));
+}
+
+#[tokio::test]
 async fn v35_database_migrates_to_the_durable_subagent_catalog() {
     let database = TestDatabase::new();
     drop(SqliteStore::open(database.path()).await.unwrap());
@@ -5454,7 +5531,7 @@ async fn v35_database_migrates_to_the_durable_subagent_catalog() {
             },
         )
         .unwrap();
-    assert_eq!(state, (36, 1, 1, 4));
+    assert_eq!(state, (37, 1, 1, 4));
 }
 
 #[tokio::test]
@@ -7401,7 +7478,7 @@ async fn v19_agent_manifest_is_canonical_actor_scoped_reused_and_secret_free() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(version, 36);
+    assert_eq!(version, 37);
     assert_eq!(
         manifest_rows, 1,
         "the identical manifest must be deduplicated"
@@ -16076,6 +16153,12 @@ async fn list_agents_catalog_requires_the_exact_started_agent_tool_scope() {
         .enqueue_subagent_followup_for_actor(
             &candidate.authz,
             &candidate.child_session.id,
+            SessionFollowupSource {
+                kind: SessionFollowupSourceKind::SubagentMessage,
+                source_session_id: send_work.call.session_id.clone(),
+                source_agent_id: send_work.call.agent_id.clone(),
+                source_call_id: send_work.call.call_id.clone(),
+            },
             EnqueueSessionFollowupRequest {
                 turn_id: send_identity.turn_id.clone(),
                 user_message: send_request.message().to_owned(),
@@ -16086,6 +16169,15 @@ async fn list_agents_catalog_requires_the_exact_started_agent_tool_scope() {
         .await
         .unwrap();
     assert_eq!(receipt.followup.turn_id, send_identity.turn_id);
+    assert_eq!(
+        receipt.followup.source,
+        Some(SessionFollowupSource {
+            kind: SessionFollowupSourceKind::SubagentMessage,
+            source_session_id: send_work.call.session_id.clone(),
+            source_agent_id: send_work.call.agent_id.clone(),
+            source_call_id: send_work.call.call_id.clone(),
+        })
+    );
     let send_terminal = match store
         .complete_agent_tool(AgentToolCompletionCommit {
             call_id: send_call.call_id,
@@ -16279,6 +16371,12 @@ async fn list_agents_catalog_requires_the_exact_started_agent_tool_scope() {
         .enqueue_subagent_followup_for_actor(
             &report_candidate.authz,
             &report_candidate.parent_session.id,
+            SessionFollowupSource {
+                kind: SessionFollowupSourceKind::SubagentReport,
+                source_session_id: report_work.call.session_id.clone(),
+                source_agent_id: report_work.call.agent_id.clone(),
+                source_call_id: report_work.call.call_id.clone(),
+            },
             EnqueueSessionFollowupRequest {
                 turn_id: report_identity.turn_id.clone(),
                 user_message: report_message.clone(),
@@ -16289,6 +16387,15 @@ async fn list_agents_catalog_requires_the_exact_started_agent_tool_scope() {
         .await
         .unwrap();
     assert_eq!(report_receipt.followup.user_message, report_message);
+    assert_eq!(
+        report_receipt.followup.source,
+        Some(SessionFollowupSource {
+            kind: SessionFollowupSourceKind::SubagentReport,
+            source_session_id: report_work.call.session_id.clone(),
+            source_agent_id: report_work.call.agent_id.clone(),
+            source_call_id: report_work.call.call_id.clone(),
+        })
+    );
     store
         .complete_agent_tool(AgentToolCompletionCommit {
             call_id: report_call.call_id,
@@ -16309,10 +16416,16 @@ async fn list_agents_catalog_requires_the_exact_started_agent_tool_scope() {
     assert_eq!(parent_followups.len(), 1);
     assert_eq!(parent_followups[0].turn_id, report_identity.turn_id);
     assert_eq!(parent_followups[0].status, SessionFollowupStatus::Queued);
+    let expected_parent_source = parent_followups[0].source.clone();
     store.verify_integrity().await.unwrap();
     drop(store);
 
     let reopened = SqliteStore::open(database.path()).await.unwrap();
+    let reopened_parent_followups = reopened
+        .session_followups_for_actor(&owner_authz(), "session-alpha")
+        .await
+        .unwrap();
+    assert_eq!(reopened_parent_followups[0].source, expected_parent_source);
     reopened.verify_integrity().await.unwrap();
     drop(reopened);
 
@@ -20906,7 +21019,7 @@ async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempot
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, (1_i64..=36).collect::<Vec<_>>());
+    assert_eq!(versions, (1_i64..=37).collect::<Vec<_>>());
     assert_eq!(
         connection
             .query_row(
@@ -24872,6 +24985,14 @@ fn drop_v35_fixture_objects(connection: &rusqlite::Connection) {
 }
 
 fn drop_v36_fixture_objects(connection: &rusqlite::Connection) {
+    let version: i64 = connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    if version >= 37 {
+        drop_v37_fixture_objects(connection);
+    }
     let schema_reject_update = migration_trigger_sql(
         include_str!("../migrations/0020_agent_execution_ledger.sql"),
         "schema_migrations_reject_update",
@@ -24891,6 +25012,31 @@ fn drop_v36_fixture_objects(connection: &rusqlite::Connection) {
                DROP INDEX agent_subagent_spawns_parent_idx;
                DROP TABLE agent_subagent_spawns;
                DELETE FROM schema_migrations WHERE version = 36;"#,
+        )
+        .unwrap();
+    connection.execute_batch(schema_reject_update).unwrap();
+    connection.execute_batch(schema_reject_delete).unwrap();
+}
+
+fn drop_v37_fixture_objects(connection: &rusqlite::Connection) {
+    let schema_reject_update = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_update",
+    );
+    let schema_reject_delete = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_delete",
+    );
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER schema_migrations_reject_update;
+               DROP TRIGGER schema_migrations_reject_delete;
+               DROP TRIGGER agent_tool_calls_bind_followup_source;
+               DROP TRIGGER session_followup_sources_validate_insert;
+               DROP TRIGGER session_followup_sources_reject_update;
+               DROP TRIGGER session_followup_sources_reject_delete;
+               DROP TABLE session_followup_sources;
+               DELETE FROM schema_migrations WHERE version = 37;"#,
         )
         .unwrap();
     connection.execute_batch(schema_reject_update).unwrap();

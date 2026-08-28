@@ -3645,6 +3645,7 @@ async fn selected_provider_for_actor(
 async fn current_agent_manifest(
     store: &DemoStore,
     account_id: &AccountId,
+    session_id: &str,
     provider_id: &str,
     model: Option<&str>,
     reply_kind: AssistantReplyKind,
@@ -3652,12 +3653,16 @@ async fn current_agent_manifest(
     let prompt = store
         .current_session_agent_prompt_for_account(account_id)
         .await?;
-    store.session_agent_manifest_with_prompt(
-        &prompt,
-        provider_id.to_owned(),
-        model.map(ToOwned::to_owned),
-        reply_kind,
-    )
+    store
+        .session_agent_manifest_with_prompt_for_session(
+            account_id,
+            session_id,
+            &prompt,
+            provider_id.to_owned(),
+            model.map(ToOwned::to_owned),
+            reply_kind,
+        )
+        .await
 }
 
 async fn prepare_agent_subagent_spawn(
@@ -3716,6 +3721,9 @@ async fn prepare_agent_subagent_spawn(
             candidate.parent_sequence,
         )
         .await?;
+    let child_manifest = state
+        .store
+        .session_subagent_manifest_from_parent(&candidate.manifest)?;
     let reply_turns = state
         .store
         .session_reply_turns_after_for_account(
@@ -3739,7 +3747,7 @@ async fn prepare_agent_subagent_spawn(
             knowledge.snapshot.snapshot().canonical_context(),
         )
         .map_err(|error| StoreError::InvalidAgentTransition(error.to_string()))?;
-    child_request.tools = agent_tools_from_manifest(&candidate.manifest);
+    child_request.tools = agent_tools_from_manifest(&child_manifest);
     let request_json = persisted_agent_reply_request(&child_request)
         .map_err(|error| StoreError::InvalidAgentTransition(error.to_string()))?;
     let inherited_events = candidate
@@ -3774,7 +3782,7 @@ async fn prepare_agent_subagent_spawn(
         agent: AgentTurnSpec {
             id: identity.agent_id,
             authz: candidate.authz,
-            manifest: candidate.manifest,
+            manifest: child_manifest,
             environment: state.store.session_agent_environment().to_owned(),
             provider_name: work.model_job.provider_name.clone(),
             model_name: work.model_job.model_name.clone(),
@@ -3917,12 +3925,17 @@ async fn admit_session_followup(
             "the follow-up exceeds the initial model content budget".into(),
         )
     })?;
-    let manifest = state.store.session_agent_manifest_with_prompt(
-        &prompt,
-        metadata.provider_id.clone(),
-        metadata.model.clone(),
-        assistant_reply_kind(metadata.reply_kind),
-    )?;
+    let manifest = state
+        .store
+        .session_agent_manifest_with_prompt_for_session(
+            &candidate.authz.account_id,
+            &candidate.session.id,
+            &prompt,
+            metadata.provider_id.clone(),
+            metadata.model.clone(),
+            assistant_reply_kind(metadata.reply_kind),
+        )
+        .await?;
     let knowledge = state
         .store
         .current_session_agent_knowledge_context_for_account(
@@ -4093,12 +4106,17 @@ async fn admit_goal_round(
             "the Goal round prompt exceeds the initial model content budget".into(),
         )
     })?;
-    let manifest = state.store.session_agent_manifest_with_prompt(
-        &prompt,
-        metadata.provider_id.clone(),
-        metadata.model.clone(),
-        assistant_reply_kind(metadata.reply_kind),
-    )?;
+    let manifest = state
+        .store
+        .session_agent_manifest_with_prompt_for_session(
+            &candidate.authz.account_id,
+            &candidate.session.id,
+            &prompt,
+            metadata.provider_id.clone(),
+            metadata.model.clone(),
+            assistant_reply_kind(metadata.reply_kind),
+        )
+        .await?;
     let knowledge = state
         .store
         .current_session_agent_knowledge_context_for_account(
@@ -4405,6 +4423,7 @@ async fn drain_agent_model_jobs(state: &ApiState) -> Result<(), StoreError> {
         let current_manifest = current_agent_manifest(
             &state.store,
             &binding.account_id,
+            &binding.session_id,
             &binding.provider_name,
             binding.model_name.as_deref(),
             if binding.model_name.is_some() {
@@ -4919,6 +4938,7 @@ async fn drain_agent_tool_calls(state: &ApiState) -> Result<(), StoreError> {
         let current_manifest = current_agent_manifest(
             &state.store,
             &model_job.account_id,
+            &model_job.session_id,
             &model_job.provider_name,
             model_job.model_name.as_deref(),
             if model_job.model_name.is_some() {
@@ -5667,6 +5687,7 @@ async fn agent_deployment_explain(
     let current_manifest = current_agent_manifest(
         &state.store,
         &current.principal.authz.account_id,
+        &id,
         &metadata.provider_id,
         metadata.model.as_deref(),
         assistant_reply_kind(metadata.reply_kind),
@@ -5913,12 +5934,17 @@ async fn start_turn(
     let selected =
         selected_provider_for_actor(&state.store, executor, &current.principal.authz).await?;
     let metadata = provider_for_state(executor, &selected)?.metadata();
-    let manifest = state.store.session_agent_manifest_with_prompt(
-        &prompt,
-        metadata.provider_id.clone(),
-        metadata.model.clone(),
-        assistant_reply_kind(metadata.reply_kind),
-    )?;
+    let manifest = state
+        .store
+        .session_agent_manifest_with_prompt_for_session(
+            &current.principal.authz.account_id,
+            &id,
+            &prompt,
+            metadata.provider_id.clone(),
+            metadata.model.clone(),
+            assistant_reply_kind(metadata.reply_kind),
+        )
+        .await?;
     let probe = AgentTurnReceiptProbe {
         id: durable_agent_id(&id, &request.turn_id),
         authz: current.principal.authz.clone(),
@@ -10676,33 +10702,47 @@ mod tests {
                         results => panic!("unexpected child report result count {}", results.len()),
                     },
                     Some(message) if message.starts_with("Background subagent ") => {
+                        assert!(
+                            request
+                                .tools
+                                .iter()
+                                .all(|tool| tool.name != subagents::REPORT_TOOL_NAME)
+                        );
                         assert!(message.ends_with("reported:\nthe durable child finding is ready"));
                         assert!(tool_results.is_empty());
                         ReplyOutput::Final {
                             content: "parent consumed the durable child report".into(),
                         }
                     }
-                    _ => match tool_results.as_slice() {
-                        [] => ReplyOutput::ToolCall {
-                            call: ReplyToolCall::new(
-                                "provider-call-spawn-report-child",
-                                subagents::SPAWN_AGENT_TOOL_NAME,
-                                serde_json::json!({
-                                    "description": "Reporting child",
-                                    "prompt": "produce a durable parent report",
-                                }),
-                            ),
-                        },
-                        [spawned] => {
-                            assert!(spawned["subagent_id"].is_string());
-                            ReplyOutput::Final {
-                                content: "parent delegated the durable report".into(),
+                    _ => {
+                        assert!(
+                            request
+                                .tools
+                                .iter()
+                                .all(|tool| tool.name != subagents::REPORT_TOOL_NAME)
+                        );
+                        match tool_results.as_slice() {
+                            [] => ReplyOutput::ToolCall {
+                                call: ReplyToolCall::new(
+                                    "provider-call-spawn-report-child",
+                                    subagents::SPAWN_AGENT_TOOL_NAME,
+                                    serde_json::json!({
+                                        "description": "Reporting child",
+                                        "prompt": "produce a durable parent report",
+                                    }),
+                                ),
+                            },
+                            [spawned] => {
+                                assert!(spawned["subagent_id"].is_string());
+                                ReplyOutput::Final {
+                                    content: "parent delegated the durable report".into(),
+                                }
+                            }
+                            results => {
+                                panic!("unexpected parent report result count {}", results.len())
                             }
                         }
-                        results => {
-                            panic!("unexpected parent report result count {}", results.len())
-                        }
-                    },
+                    }
                 }
             };
             let provider = self.metadata.clone();
@@ -13859,6 +13899,15 @@ mod tests {
         assert_eq!(followups.len(), 1);
         assert_eq!(followups[0].turn_id, sent.message_id);
         assert_eq!(
+            followups[0].source,
+            Some(protocol::SessionFollowupSource {
+                kind: protocol::SessionFollowupSourceKind::SubagentMessage,
+                source_session_id: agent.session_id.clone(),
+                source_agent_id: agent.id.clone(),
+                source_call_id: agent.calls[2].call_id.clone(),
+            })
+        );
+        assert_eq!(
             followups[0].status,
             protocol::SessionFollowupStatus::Claimed
         );
@@ -14047,6 +14096,15 @@ mod tests {
         assert_eq!(followups.len(), 1);
         assert_eq!(followups[0].turn_id, report.message_id);
         assert_eq!(followups[0].user_message, parent.turns[1].user_message);
+        assert_eq!(
+            followups[0].source,
+            Some(protocol::SessionFollowupSource {
+                kind: protocol::SessionFollowupSourceKind::SubagentReport,
+                source_session_id: spawned.subagent_id.clone(),
+                source_agent_id: child_agent.id.clone(),
+                source_call_id: child_agent.calls[0].call_id.clone(),
+            })
+        );
         assert_eq!(
             followups[0].status,
             protocol::SessionFollowupStatus::Claimed

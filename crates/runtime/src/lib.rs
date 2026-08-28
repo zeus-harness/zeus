@@ -60,8 +60,9 @@ use protocol::{
     ResourceEnvelopeError, ResumeSessionRequest, ResumeSessionResponse, ReviewDecision,
     ReviewRequest, ReviewResponse, RunDetail, RunDetailPagination, RunEvent, RunEventData,
     RunEventPage, RunSummary, SessionDetail, SessionEvent, SessionEventData, SessionEventPage,
-    SessionFlushBarrier, SessionFollowup, SessionSummary, SessionTurn, StartTurnRequest,
-    StartTurnResponse, ToolCall, ToolExecutorStatus, ToolOutcome,
+    SessionFlushBarrier, SessionFollowup, SessionFollowupSource, SessionFollowupSourceKind,
+    SessionSummary, SessionTurn, StartTurnRequest, StartTurnResponse, ToolCall, ToolExecutorStatus,
+    ToolOutcome,
 };
 use serde_json::Value;
 use skills::{SkillCatalog, register_skill_tools, skill_tool_descriptors};
@@ -82,23 +83,23 @@ pub use storage::{
     AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
     AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurn,
     AgentTurnEnqueueResponse, AgentTurnReceiptProbe, AgentTurnSpec, AuthPrincipal,
-    AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, CreateAccountCommit,
-    CreateAccountResult, CreateMemberResult, DEFAULT_SESSION_AGENT_PROMPT_REVISION,
-    DEFAULT_SESSION_AGENT_SYSTEM_PROMPT, InFlightWorkSummary, KnowledgeCatalogCommit,
-    KnowledgeCatalogRevisionPage, KnowledgeCatalogRevisionSummary, KnowledgeCatalogState,
-    KnowledgeCatalogUpdateResult, MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit,
-    MemberSetupResult, MemberSetupToken, MemberTransitionResult, MembershipRevision,
-    MembershipRole, ReplyClaimOutcome, ReplyCompletion, ReplyFailureCommit, ReplyJob,
-    ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
-    ReplySuccessCommit, RotateMemberSetupTokenResult, SESSION_AGENT_PROMPT_ID,
-    SessionCompactionClaimOutcome, SessionCompactionFailureCommit, SessionCompactionJob,
-    SessionCompactionSuccessCommit, SessionContextCheckpoint, SessionFollowupCandidate,
-    SessionForkPage, SessionSummaryPage, SqliteOperationLimits, SqliteOperationLimitsError,
-    SqlitePhysicalLimits, SqlitePhysicalLimitsError, StorageLimits, StorageLimitsError,
-    StoredAccount, StoredAccountStatus, StoredCredential, StoredMember, StoredMemberPage,
-    StoredMembershipStatus, StoredPreferences, StoredUser, StoredUserRole, StoredUserStatus,
-    SwitchAuthSessionCommit, SwitchAuthSessionResult, TransitionMemberCommit,
-    UpdateAccountAuditPolicyCommit,
+    AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit,
+    CURRENT_SESSION_AGENT_SPEC_REVISION, CreateAccountCommit, CreateAccountResult,
+    CreateMemberResult, DEFAULT_SESSION_AGENT_PROMPT_REVISION, DEFAULT_SESSION_AGENT_SYSTEM_PROMPT,
+    InFlightWorkSummary, KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage,
+    KnowledgeCatalogRevisionSummary, KnowledgeCatalogState, KnowledgeCatalogUpdateResult,
+    MEMBER_SETUP_TOKEN_TTL_SECONDS, MemberSetupCommit, MemberSetupResult, MemberSetupToken,
+    MemberTransitionResult, MembershipRevision, MembershipRole, ReplyClaimOutcome, ReplyCompletion,
+    ReplyFailureCommit, ReplyJob, ReplyJobEnqueueResponse, ReplyJobSpec, ReplyJobStatus,
+    ReplyOutcomeUnknownCommit, ReplySuccessCommit, RotateMemberSetupTokenResult,
+    SESSION_AGENT_PROMPT_ID, SESSION_AGENT_SPEC_ID, SessionCompactionClaimOutcome,
+    SessionCompactionFailureCommit, SessionCompactionJob, SessionCompactionSuccessCommit,
+    SessionContextCheckpoint, SessionFollowupCandidate, SessionForkPage, SessionSummaryPage,
+    SqliteOperationLimits, SqliteOperationLimitsError, SqlitePhysicalLimits,
+    SqlitePhysicalLimitsError, StorageLimits, StorageLimitsError, StoredAccount,
+    StoredAccountStatus, StoredCredential, StoredMember, StoredMemberPage, StoredMembershipStatus,
+    StoredPreferences, StoredUser, StoredUserRole, StoredUserStatus, SwitchAuthSessionCommit,
+    SwitchAuthSessionResult, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
 use storage::{
     ClaimOutcome, CommitOutcome, CreateMemberCommit, DispatchCompleteCommit, DispatchContext,
@@ -128,15 +129,19 @@ use tools::{ExecutorError, RegistryError, ToolRegistry, arguments_digest, stable
 
 const PRODUCTION_POLICY_ID: &str = "production-guarded";
 const LOCAL_POLICY_ID: &str = "local-development";
-const SESSION_AGENT_SPEC_ID: &str = "zeus-session-agent";
-const SESSION_AGENT_SPEC_REVISION: &str = "2";
 const SESSION_AGENT_DEPLOYMENT_ID_PREFIX: &str = "zeus-session-agent";
-const SESSION_AGENT_DEPLOYMENT_REVISION: &str = "2";
+const SESSION_AGENT_DEPLOYMENT_REVISION: &str = "3";
 const INTERNAL_PROGRESS_RETRY_DELAY: Duration = Duration::from_millis(25);
 const INTERNAL_PROGRESS_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 const WORKER_IDLE: u8 = 0;
 const WORKER_RUNNING: u8 = 1;
 const WORKER_PENDING: u8 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionAgentManifestScope {
+    Root,
+    Subagent,
+}
 
 #[derive(Default)]
 struct WorkerWakeState {
@@ -1256,7 +1261,7 @@ impl DemoStore {
         &self,
     ) -> Result<Vec<SessionAgentToolDefinition>, StoreError> {
         Ok(self
-            .session_agent_manifest_tools()?
+            .session_agent_manifest_tools(SessionAgentManifestScope::Root)?
             .into_iter()
             .map(|tool| SessionAgentToolDefinition {
                 name: tool.name,
@@ -1394,7 +1399,13 @@ impl DemoStore {
             DEFAULT_SESSION_AGENT_SYSTEM_PROMPT,
         )
         .map_err(invalid_deployment_manifest)?;
-        self.session_agent_manifest_with_binding(provider_id, model, reply_kind, prompt)
+        self.session_agent_manifest_with_binding(
+            provider_id,
+            model,
+            reply_kind,
+            prompt,
+            SessionAgentManifestScope::Root,
+        )
     }
 
     /// Build a deployment manifest bound to one exact durable account prompt.
@@ -1416,7 +1427,78 @@ impl DemoStore {
                 "the active Agent prompt content disagrees with its durable digest".into(),
             ));
         }
-        self.session_agent_manifest_with_binding(provider_id, model, reply_kind, binding)
+        self.session_agent_manifest_with_binding(
+            provider_id,
+            model,
+            reply_kind,
+            binding,
+            SessionAgentManifestScope::Root,
+        )
+    }
+
+    /// Build the exact current manifest for one durable Session. Only Sessions
+    /// admitted through `spawn_agent` receive the child-to-parent `report`
+    /// capability; ordinary root Sessions never expose it to their provider.
+    pub async fn session_agent_manifest_with_prompt_for_session(
+        &self,
+        account_id: &AccountId,
+        session_id: &str,
+        prompt: &AgentPromptState,
+        provider_id: impl Into<String>,
+        model: Option<String>,
+        reply_kind: AssistantReplyKind,
+    ) -> Result<ManifestEnvelope, StoreError> {
+        let scope = if self
+            .storage
+            .session_is_subagent_for_account(account_id, session_id)
+            .await?
+        {
+            SessionAgentManifestScope::Subagent
+        } else {
+            SessionAgentManifestScope::Root
+        };
+        let binding = ManifestPromptBinding::new(
+            prompt.prompt_id.clone(),
+            prompt.binding_revision.clone(),
+            prompt.content_digest.clone(),
+        )
+        .map_err(invalid_deployment_manifest)?;
+        if !binding.matches_content(&prompt.content) {
+            return Err(StoreError::ExecutionInvariant(
+                "the active Agent prompt content disagrees with its durable digest".into(),
+            ));
+        }
+        self.session_agent_manifest_with_binding(provider_id, model, reply_kind, binding, scope)
+    }
+
+    /// Derive a child manifest from one immutable parent manifest. Provider,
+    /// policy, prompt and workflow remain identical; only the server-owned
+    /// subagent capability set may differ.
+    pub fn session_subagent_manifest_from_parent(
+        &self,
+        parent: &ManifestEnvelope,
+    ) -> Result<ManifestEnvelope, StoreError> {
+        parent
+            .validate()
+            .map_err(invalid_agent_deployment_manifest)?;
+        let spec = &parent.manifest.deployment.spec;
+        self.validate_session_agent_manifest_binding(
+            parent,
+            &spec.provider.provider_id,
+            spec.provider.model.as_deref(),
+        )?;
+        let prompt = spec.prompt.clone().ok_or_else(|| {
+            StoreError::InvalidAgentTransition(
+                "the parent Agent manifest has no governed prompt binding".into(),
+            )
+        })?;
+        self.session_agent_manifest_with_binding(
+            spec.provider.provider_id.clone(),
+            spec.provider.model.clone(),
+            spec.provider.reply_kind.clone(),
+            prompt,
+            SessionAgentManifestScope::Subagent,
+        )
     }
 
     fn session_agent_manifest_with_binding(
@@ -1425,6 +1507,7 @@ impl DemoStore {
         model: Option<String>,
         reply_kind: AssistantReplyKind,
         prompt: ManifestPromptBinding,
+        scope: SessionAgentManifestScope,
     ) -> Result<ManifestEnvelope, StoreError> {
         let provider = ManifestProvider::new(provider_id, model, reply_kind)
             .map_err(invalid_deployment_manifest)?;
@@ -1435,7 +1518,7 @@ impl DemoStore {
         .map_err(invalid_deployment_manifest)?;
         let spec = AgentSpec::new(
             SESSION_AGENT_SPEC_ID,
-            SESSION_AGENT_SPEC_REVISION,
+            CURRENT_SESSION_AGENT_SPEC_REVISION,
             self.profile_id.as_ref(),
             self.environment.as_ref(),
             provider,
@@ -1449,7 +1532,7 @@ impl DemoStore {
             workflows::Limits::default(),
         )
         .map_err(invalid_deployment_manifest)?
-        .with_tools(self.session_agent_manifest_tools()?)
+        .with_tools(self.session_agent_manifest_tools(scope)?)
         .map_err(invalid_deployment_manifest)?;
         let deployment = AgentDeployment::new(
             format!("{SESSION_AGENT_DEPLOYMENT_ID_PREFIX}-{}", self.profile_id),
@@ -1517,19 +1600,33 @@ impl DemoStore {
                 "the Agent deployment prompt identity does not match Zeus".into(),
             ));
         }
-        let expected = self
+        let expected_root = self
             .session_agent_manifest_with_binding(
                 provider_id.to_owned(),
                 model.map(str::to_owned),
                 spec.provider.reply_kind.clone(),
-                prompt,
+                prompt.clone(),
+                SessionAgentManifestScope::Root,
             )
             .map_err(|error| {
                 StoreError::ExecutionInvariant(format!(
                     "the runtime could not resolve its current Agent deployment manifest: {error}"
                 ))
             })?;
-        if manifest != &expected {
+        let expected_subagent = self
+            .session_agent_manifest_with_binding(
+                provider_id.to_owned(),
+                model.map(str::to_owned),
+                spec.provider.reply_kind.clone(),
+                prompt,
+                SessionAgentManifestScope::Subagent,
+            )
+            .map_err(|error| {
+                StoreError::ExecutionInvariant(format!(
+                    "the runtime could not resolve its current subagent deployment manifest: {error}"
+                ))
+            })?;
+        if manifest != &expected_root && manifest != &expected_subagent {
             return Err(StoreError::InvalidAgentTransition(
                 "the Agent deployment manifest does not match the runtime-resolved deployment"
                     .into(),
@@ -1538,9 +1635,15 @@ impl DemoStore {
         Ok(())
     }
 
-    fn session_agent_manifest_tools(&self) -> Result<Vec<ManifestTool>, StoreError> {
+    fn session_agent_manifest_tools(
+        &self,
+        scope: SessionAgentManifestScope,
+    ) -> Result<Vec<ManifestTool>, StoreError> {
         self.registry
             .descriptors()
+            .filter(|descriptor| {
+                scope == SessionAgentManifestScope::Subagent || descriptor.name != REPORT_TOOL_NAME
+            })
             .map(|descriptor| {
                 ManifestTool::new(
                     descriptor.name.clone(),
@@ -2009,6 +2112,12 @@ impl DemoStore {
                     .enqueue_subagent_followup_for_actor(
                         &candidate.authz,
                         &candidate.parent_session.id,
+                        SessionFollowupSource {
+                            kind: SessionFollowupSourceKind::SubagentReport,
+                            source_session_id: scope.session_id.clone(),
+                            source_agent_id: scope.agent_id.clone(),
+                            source_call_id: resolved.call.call_id.clone(),
+                        },
                         EnqueueSessionFollowupRequest {
                             turn_id: identity.turn_id.clone(),
                             user_message: parent_message.clone(),
@@ -2078,6 +2187,12 @@ impl DemoStore {
                     .enqueue_subagent_followup_for_actor(
                         &candidate.authz,
                         &candidate.child_session.id,
+                        SessionFollowupSource {
+                            kind: SessionFollowupSourceKind::SubagentMessage,
+                            source_session_id: scope.session_id.clone(),
+                            source_agent_id: scope.agent_id.clone(),
+                            source_call_id: resolved.call.call_id.clone(),
+                        },
                         EnqueueSessionFollowupRequest {
                             turn_id: identity.turn_id.clone(),
                             user_message: request.message().to_owned(),
@@ -3098,6 +3213,7 @@ impl DemoStore {
         &self,
         context: &AuthzContext,
         session_id: &str,
+        source: SessionFollowupSource,
         request: EnqueueSessionFollowupRequest,
         idempotency_key: &str,
     ) -> Result<EnqueueSessionFollowupResponse, StoreError> {
@@ -3109,7 +3225,13 @@ impl DemoStore {
         let mut activations = self.goal_activations.by_session.lock().await;
         let response = self
             .storage
-            .enqueue_subagent_followup_for_actor(context, session_id, request, idempotency_key)
+            .enqueue_subagent_followup_for_actor(
+                context,
+                session_id,
+                source,
+                request,
+                idempotency_key,
+            )
             .await?;
         activations.remove(session_id);
         Ok(response)
@@ -5608,7 +5730,7 @@ mod tests {
         let store = local_store(&paths, false).await;
 
         let definitions = store.session_agent_tool_definitions().unwrap();
-        assert_eq!(definitions.len(), 12);
+        assert_eq!(definitions.len(), 11);
         assert_eq!(definitions[0].name, goals::CREATE_GOAL_TOOL_NAME);
         assert_eq!(definitions[1].name, connectors::DEV_MARKER_TOOL_NAME);
         assert_eq!(
@@ -5643,32 +5765,27 @@ mod tests {
             definitions[5].input_schema["properties"]["cursor"]["maxLength"],
             subagents::LIST_AGENTS_CURSOR_MAX_BYTES
         );
-        assert_eq!(definitions[6].name, subagents::REPORT_TOOL_NAME);
+        assert_eq!(definitions[6].name, subagents::SEND_MESSAGE_TOOL_NAME);
         assert_eq!(
-            definitions[6].input_schema["properties"]["output"]["maxLength"],
-            subagents::REPORT_OUTPUT_MAX_BYTES
-        );
-        assert_eq!(definitions[7].name, subagents::SEND_MESSAGE_TOOL_NAME);
-        assert_eq!(
-            definitions[7].input_schema["properties"]["message"]["maxLength"],
+            definitions[6].input_schema["properties"]["message"]["maxLength"],
             subagents::SEND_MESSAGE_MAX_BYTES
         );
-        assert_eq!(definitions[8].name, subagents::SPAWN_AGENT_TOOL_NAME);
+        assert_eq!(definitions[7].name, subagents::SPAWN_AGENT_TOOL_NAME);
         assert_eq!(
-            definitions[8].input_schema["properties"]["prompt"]["maxLength"],
+            definitions[7].input_schema["properties"]["prompt"]["maxLength"],
             subagents::SPAWN_AGENT_PROMPT_MAX_BYTES
         );
-        assert_eq!(definitions[9].name, planning::TODO_WRITE_TOOL_NAME);
+        assert_eq!(definitions[8].name, planning::TODO_WRITE_TOOL_NAME);
         assert_eq!(
-            definitions[9].input_schema["properties"]["todos"]["maxItems"],
+            definitions[8].input_schema["properties"]["todos"]["maxItems"],
             planning::TODO_MAX_ITEMS
         );
         assert_eq!(
-            definitions[9].input_schema["properties"]["todos"]["items"]["properties"]["status"]["enum"],
+            definitions[8].input_schema["properties"]["todos"]["items"]["properties"]["status"]["enum"],
             serde_json::json!(["pending", "in_progress", "completed"])
         );
-        assert_eq!(definitions[10].name, goals::UPDATE_GOAL_TOOL_NAME);
-        assert_eq!(definitions[11].name, subagents::WAIT_AGENT_TOOL_NAME);
+        assert_eq!(definitions[9].name, goals::UPDATE_GOAL_TOOL_NAME);
+        assert_eq!(definitions[10].name, subagents::WAIT_AGENT_TOOL_NAME);
 
         let production = DemoStore::seeded().await.unwrap();
         assert_eq!(
@@ -5684,7 +5801,6 @@ mod tests {
                 goals::GET_GOAL_TOOL_NAME,
                 subagents::INTERRUPT_AGENT_TOOL_NAME,
                 subagents::LIST_AGENTS_TOOL_NAME,
-                subagents::REPORT_TOOL_NAME,
                 subagents::SEND_MESSAGE_TOOL_NAME,
                 subagents::SPAWN_AGENT_TOOL_NAME,
                 planning::TODO_WRITE_TOOL_NAME,
@@ -5915,7 +6031,6 @@ mod tests {
                 goals::GET_GOAL_TOOL_NAME,
                 subagents::INTERRUPT_AGENT_TOOL_NAME,
                 subagents::LIST_AGENTS_TOOL_NAME,
-                subagents::REPORT_TOOL_NAME,
                 subagents::SEND_MESSAGE_TOOL_NAME,
                 skills::SKILL_LIST_TOOL_NAME,
                 skills::SKILL_LOAD_TOOL_NAME,
@@ -6082,9 +6197,9 @@ mod tests {
             first.manifest.deployment.deployment_id,
             "zeus-session-agent-local-development"
         );
-        assert_eq!(first.manifest.deployment.revision, "2");
+        assert_eq!(first.manifest.deployment.revision, "3");
         assert_eq!(first.manifest.deployment.spec.spec_id, "zeus-session-agent");
-        assert_eq!(first.manifest.deployment.spec.revision, "2");
+        assert_eq!(first.manifest.deployment.spec.revision, "3");
         assert_eq!(first.manifest.deployment.spec.profile, "local-development");
         let prompt = first
             .manifest
@@ -6103,6 +6218,30 @@ mod tests {
         assert_eq!(
             first.manifest.deployment.spec.loop_limits,
             workflows::Limits::default()
+        );
+        assert!(
+            first
+                .manifest
+                .deployment
+                .spec
+                .tools
+                .iter()
+                .all(|tool| tool.name != subagents::REPORT_TOOL_NAME)
+        );
+        let child = store.session_subagent_manifest_from_parent(&first).unwrap();
+        let report = child
+            .manifest
+            .deployment
+            .spec
+            .tools
+            .iter()
+            .filter(|tool| tool.name == subagents::REPORT_TOOL_NAME)
+            .collect::<Vec<_>>();
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].version, subagents::REPORT_TOOL_VERSION);
+        assert_eq!(
+            child.manifest.deployment.spec.tools.len(),
+            first.manifest.deployment.spec.tools.len() + 1
         );
 
         let serialized = String::from_utf8(first.canonical_json_bytes().unwrap()).unwrap();
