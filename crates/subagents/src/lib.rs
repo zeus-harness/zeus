@@ -36,6 +36,12 @@ pub const SEND_MESSAGE_TOOL_NAME: &str = "send_message";
 pub const SEND_MESSAGE_TOOL_VERSION: &str = "1-direct-child-followup";
 pub const SEND_MESSAGE_MAX_BYTES: usize = 12 * 1024;
 pub const SEND_MESSAGE_ARGUMENTS_MAX_BYTES: usize = 16 * 1024;
+pub const WAIT_AGENT_TOOL_NAME: &str = "wait_agent";
+pub const WAIT_AGENT_TOOL_VERSION: &str = "1-direct-child-activity";
+pub const WAIT_AGENT_DEFAULT_TIMEOUT_MS: u64 = 30_000;
+pub const WAIT_AGENT_MIN_TIMEOUT_MS: u64 = 10_000;
+pub const WAIT_AGENT_MAX_TIMEOUT_MS: u64 = 3_600_000;
+pub const WAIT_AGENT_ARGUMENTS_MAX_BYTES: usize = 128;
 pub const SPAWN_AGENT_TOOL_NAME: &str = "spawn_agent";
 pub const SPAWN_AGENT_TOOL_VERSION: &str = "1-durable-session-fork";
 pub const SPAWN_AGENT_DESCRIPTION_MAX_BYTES: usize = 256;
@@ -48,6 +54,7 @@ const LIST_AGENTS_DESCRIPTION: &str = "List this Session's durable direct child 
 const GET_AGENT_RESULT_DESCRIPTION: &str = "Read one durable direct child's current status and, after successful completion, a bounded page of its final assistant output. The child must have been created by this parent Session's spawn_agent call. Failed or indeterminate children never expose partial output. Continue a large successful result with next_after_byte.";
 const INTERRUPT_AGENT_DESCRIPTION: &str = "Durably interrupt one currently active direct child created by this parent Session's spawn_agent call. Queued or running model work and tools that have not crossed their durable started checkpoint can be cancelled. A tool that is already running is outcome-sensitive and will not be reported as cancelled.";
 const SEND_MESSAGE_DESCRIPTION: &str = "Durably enqueue one follow-up message for a direct child created by this parent Session's spawn_agent call. The stable message_id acknowledges FIFO admission, not child completion. A ready child is scheduled and a running child consumes the message after its current turn; use get_agent_result to read completed output.";
+const WAIT_AGENT_DESCRIPTION: &str = "Wait for the next durable Session activity from any currently running direct child created by this parent Session's spawn_agent calls. This never wakes an inactive child. It returns no_progress immediately when no direct child can produce an event; after activity or timeout, call list_agents or get_agent_result for the authoritative durable state.";
 const SPAWN_AGENT_DESCRIPTION: &str = "Start one durable background child Agent that inherits this Session's completed turns before the current in-flight turn. The call returns after the child Session, initial prompt, and first model job are atomically admitted; it does not wait for the child result. Use list_agents to rediscover the stable child ID, send_message to continue it, interrupt_agent to stop active work, and get_agent_result to read terminal output.";
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
@@ -84,6 +91,14 @@ pub enum SubagentError {
     InvalidSendIdentity,
     #[error("send_message result exceeds its bounded output contract")]
     InvalidSendResult,
+    #[error("wait_agent arguments are not a strict bounded object")]
+    InvalidWaitArguments,
+    #[error(
+        "wait_agent timeout must be between {WAIT_AGENT_MIN_TIMEOUT_MS} and {WAIT_AGENT_MAX_TIMEOUT_MS} milliseconds"
+    )]
+    InvalidWaitTimeout,
+    #[error("wait_agent result exceeds its bounded output contract")]
+    InvalidWaitResult,
     #[error("spawn_agent arguments are not a strict bounded object")]
     InvalidSpawnArguments,
     #[error("spawn_agent description is not a non-empty bounded display label")]
@@ -203,6 +218,82 @@ pub struct SendMessageRequest {
 #[serde(deny_unknown_fields)]
 struct RawInterruptAgentRequest {
     subagent_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWaitAgentRequest {
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaitAgentRequest {
+    timeout_ms: u64,
+}
+
+impl WaitAgentRequest {
+    pub const fn timeout_ms(&self) -> u64 {
+        self.timeout_ms
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitAgentNoProgressReason {
+    NoActiveChild,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaitAgentNoProgress {
+    pub reason: WaitAgentNoProgressReason,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaitAgentResult {
+    pub timed_out: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_progress: Option<WaitAgentNoProgress>,
+}
+
+impl WaitAgentResult {
+    pub fn activity() -> Result<Self, SubagentError> {
+        Self::validated(Self {
+            timed_out: false,
+            no_progress: None,
+        })
+    }
+
+    pub fn timed_out() -> Result<Self, SubagentError> {
+        Self::validated(Self {
+            timed_out: true,
+            no_progress: None,
+        })
+    }
+
+    pub fn no_active_child() -> Result<Self, SubagentError> {
+        Self::validated(Self {
+            timed_out: false,
+            no_progress: Some(WaitAgentNoProgress {
+                reason: WaitAgentNoProgressReason::NoActiveChild,
+                message: "No direct child is running. Re-list the durable child catalog and send a follow-up before waiting again.".into(),
+            }),
+        })
+    }
+
+    fn validated(result: Self) -> Result<Self, SubagentError> {
+        if result.timed_out && result.no_progress.is_some() {
+            return Err(SubagentError::InvalidWaitResult);
+        }
+        let encoded = serde_json::to_vec(&result).map_err(|_| SubagentError::InvalidWaitResult)?;
+        if encoded.len() > TOOL_OUTPUT_MAX_SERIALIZED_BYTES {
+            return Err(SubagentError::InvalidWaitResult);
+        }
+        Ok(result)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -552,6 +643,20 @@ pub fn prepare_interrupt_agent(arguments: &Value) -> Result<InterruptAgentReques
     })
 }
 
+pub fn prepare_wait_agent(arguments: &Value) -> Result<WaitAgentRequest, SubagentError> {
+    let encoded = serde_json::to_vec(arguments).map_err(|_| SubagentError::InvalidWaitArguments)?;
+    if encoded.len() > WAIT_AGENT_ARGUMENTS_MAX_BYTES {
+        return Err(SubagentError::InvalidWaitArguments);
+    }
+    let raw: RawWaitAgentRequest = serde_json::from_value(arguments.clone())
+        .map_err(|_| SubagentError::InvalidWaitArguments)?;
+    let timeout_ms = raw.timeout_ms.unwrap_or(WAIT_AGENT_DEFAULT_TIMEOUT_MS);
+    if !(WAIT_AGENT_MIN_TIMEOUT_MS..=WAIT_AGENT_MAX_TIMEOUT_MS).contains(&timeout_ms) {
+        return Err(SubagentError::InvalidWaitTimeout);
+    }
+    Ok(WaitAgentRequest { timeout_ms })
+}
+
 pub fn send_message_identity(
     parent_session_id: &str,
     call_id: &str,
@@ -763,12 +868,35 @@ pub fn interrupt_agent_descriptor() -> ToolDescriptor {
     }
 }
 
+pub fn wait_agent_descriptor() -> ToolDescriptor {
+    ToolDescriptor {
+        name: WAIT_AGENT_TOOL_NAME.into(),
+        version: WAIT_AGENT_TOOL_VERSION.into(),
+        description: WAIT_AGENT_DESCRIPTION.into(),
+        effect: ToolEffect::ReadOnly,
+        sandbox_profile: SandboxProfile::ReadOnly,
+        input_schema: ObjectSchema {
+            max_serialized_bytes: WAIT_AGENT_ARGUMENTS_MAX_BYTES,
+            properties: BTreeMap::from([(
+                "timeout_ms".into(),
+                ParameterSpec {
+                    parameter_type: ParameterType::Integer,
+                    required: false,
+                    min_length: None,
+                    max_length: None,
+                },
+            )]),
+        },
+    }
+}
+
 pub fn register_subagent_tools(registry: &mut ToolRegistry) -> Result<(), RegistryError> {
     registry.register(get_agent_result_descriptor(), RuntimeSubagentExecutor)?;
     registry.register(interrupt_agent_descriptor(), RuntimeSubagentExecutor)?;
     registry.register(list_agents_descriptor(), RuntimeSubagentExecutor)?;
     registry.register(send_message_descriptor(), RuntimeSubagentExecutor)?;
-    registry.register(spawn_agent_descriptor(), RuntimeSubagentExecutor)
+    registry.register(spawn_agent_descriptor(), RuntimeSubagentExecutor)?;
+    registry.register(wait_agent_descriptor(), RuntimeSubagentExecutor)
 }
 
 #[derive(Clone, Copy)]
@@ -848,6 +976,7 @@ mod tests {
         assert!(registry.descriptor(GET_AGENT_RESULT_TOOL_NAME).is_some());
         assert!(registry.descriptor(INTERRUPT_AGENT_TOOL_NAME).is_some());
         assert!(registry.descriptor(SEND_MESSAGE_TOOL_NAME).is_some());
+        assert!(registry.descriptor(WAIT_AGENT_TOOL_NAME).is_some());
     }
 
     #[test]
@@ -1031,6 +1160,43 @@ mod tests {
         let result =
             InterruptAgentResult::new("subagent-child".into(), "turn-child".into()).unwrap();
         assert_eq!(result.status, InterruptAgentStatus::Interrupted);
+    }
+
+    #[test]
+    fn wait_agent_request_descriptor_and_results_are_strict() {
+        let defaulted = prepare_wait_agent(&serde_json::json!({})).unwrap();
+        assert_eq!(defaulted.timeout_ms(), WAIT_AGENT_DEFAULT_TIMEOUT_MS);
+        let explicit = prepare_wait_agent(&serde_json::json!({
+            "timeout_ms": WAIT_AGENT_MAX_TIMEOUT_MS,
+        }))
+        .unwrap();
+        assert_eq!(explicit.timeout_ms(), WAIT_AGENT_MAX_TIMEOUT_MS);
+        for invalid in [
+            serde_json::json!({"timeout_ms": WAIT_AGENT_MIN_TIMEOUT_MS - 1}),
+            serde_json::json!({"timeout_ms": WAIT_AGENT_MAX_TIMEOUT_MS + 1}),
+            serde_json::json!({"timeout_ms": "30000"}),
+            serde_json::json!({"unknown": true}),
+        ] {
+            assert!(prepare_wait_agent(&invalid).is_err(), "{invalid}");
+        }
+
+        let descriptor = wait_agent_descriptor();
+        assert_eq!(descriptor.effect, ToolEffect::ReadOnly);
+        assert_eq!(descriptor.sandbox_profile, SandboxProfile::ReadOnly);
+        assert_eq!(
+            descriptor.input_schema.provider_json_schema().unwrap()["additionalProperties"],
+            false
+        );
+        assert!(WaitAgentResult::activity().unwrap().no_progress.is_none());
+        assert!(WaitAgentResult::timed_out().unwrap().timed_out);
+        assert_eq!(
+            WaitAgentResult::no_active_child()
+                .unwrap()
+                .no_progress
+                .unwrap()
+                .reason,
+            WaitAgentNoProgressReason::NoActiveChild
+        );
     }
 
     #[test]

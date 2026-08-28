@@ -7,7 +7,7 @@
 //! being retried.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     future::Future,
     path::{Path, PathBuf},
@@ -111,10 +111,11 @@ use subagents::{
     InterruptAgentResult, LIST_AGENTS_TOOL_NAME, LIST_AGENTS_TOOL_VERSION, ListAgentsResult,
     SEND_MESSAGE_TOOL_NAME, SEND_MESSAGE_TOOL_VERSION, SPAWN_AGENT_TOOL_NAME,
     SPAWN_AGENT_TOOL_VERSION, SendMessageResult, SpawnAgentResult, SubagentError,
-    get_agent_result_descriptor, interrupt_agent_descriptor, list_agents_descriptor,
-    prepare_get_agent_result, prepare_interrupt_agent, prepare_list_agents, prepare_send_message,
-    prepare_spawn_agent, register_subagent_tools, send_message_descriptor, send_message_identity,
-    spawn_agent_descriptor, spawn_agent_identity,
+    WAIT_AGENT_TOOL_NAME, WAIT_AGENT_TOOL_VERSION, WaitAgentResult, get_agent_result_descriptor,
+    interrupt_agent_descriptor, list_agents_descriptor, prepare_get_agent_result,
+    prepare_interrupt_agent, prepare_list_agents, prepare_send_message, prepare_spawn_agent,
+    prepare_wait_agent, register_subagent_tools, send_message_descriptor, send_message_identity,
+    spawn_agent_descriptor, spawn_agent_identity, wait_agent_descriptor,
 };
 use terminal::TerminalService;
 use thiserror::Error;
@@ -1837,6 +1838,78 @@ impl DemoStore {
                     StoreError::Registry(RegistryError::Executor(ExecutorError::Failed {
                         code: "get_agent_result_encoding_failed".into(),
                         message: "The durable child result could not be encoded".into(),
+                        retryable: false,
+                    }))
+                })?,
+                replayed: false,
+                provider_request_id: None,
+            });
+        }
+        if resolved.call.tool == WAIT_AGENT_TOOL_NAME
+            && resolved.call.tool_version == WAIT_AGENT_TOOL_VERSION
+        {
+            let request =
+                prepare_wait_agent(&resolved.call.arguments).map_err(subagent_executor_error)?;
+            // Subscribe before the durable snapshot. An event committed after
+            // this call starts but before the read completes is retained by
+            // the receiver instead of being lost between check and wait.
+            let mut receiver = self.session_publisher.subscribe();
+            let page = self
+                .storage
+                .session_fork_page_for_started_agent_tool(
+                    &scope,
+                    &resolved.call.call_id,
+                    None,
+                    subagents::SPAWN_AGENT_MAX_DIRECT_CHILDREN,
+                )
+                .await?;
+            if page.next_cursor.is_some() {
+                return Err(StoreError::ExecutionInvariant(
+                    "wait_agent direct-child snapshot exceeds the durable admission limit".into(),
+                ));
+            }
+            let active = page
+                .items
+                .into_iter()
+                .filter(|child| child.session.status == protocol::SessionStatus::Running)
+                .map(|child| child.session.id)
+                .collect::<BTreeSet<_>>();
+            let result = if active.is_empty() {
+                WaitAgentResult::no_active_child()
+            } else {
+                let activity = async {
+                    loop {
+                        match receiver.recv().await {
+                            Ok(event) if active.contains(&event.session_id) => return Ok(()),
+                            Ok(_) => {}
+                            // Lag proves at least one post-subscription edge;
+                            // the caller re-reads durable state after wakeup.
+                            Err(broadcast::error::RecvError::Lagged(_)) => return Ok(()),
+                            Err(broadcast::error::RecvError::Closed) => {
+                                return Err(StoreError::ExecutionInvariant(
+                                    "wait_agent activity channel closed while the runtime is live"
+                                        .into(),
+                                ));
+                            }
+                        }
+                    }
+                };
+                match tokio::time::timeout(Duration::from_millis(request.timeout_ms()), activity)
+                    .await
+                {
+                    Ok(result) => {
+                        result?;
+                        WaitAgentResult::activity()
+                    }
+                    Err(_) => WaitAgentResult::timed_out(),
+                }
+            }
+            .map_err(subagent_executor_error)?;
+            return Ok(ToolOutput {
+                value: serde_json::to_value(result).map_err(|_| {
+                    StoreError::Registry(RegistryError::Executor(ExecutorError::Failed {
+                        code: "wait_agent_result_encoding_failed".into(),
+                        message: "The child activity result could not be encoded".into(),
                         retryable: false,
                     }))
                 })?,
@@ -4890,6 +4963,7 @@ fn register_runtime_subagent_tools(
         list_agents_descriptor(),
         send_message_descriptor(),
         spawn_agent_descriptor(),
+        wait_agent_descriptor(),
     ] {
         policy_rules.push(PolicyRule {
             revision: policy_revision.into(),
@@ -4922,6 +4996,9 @@ fn subagent_executor_error(error: SubagentError) -> StoreError {
         SubagentError::InvalidSendMessage => "send_message_invalid_message",
         SubagentError::InvalidSendIdentity => "send_message_invalid_identity",
         SubagentError::InvalidSendResult => "send_message_invalid_result",
+        SubagentError::InvalidWaitArguments => "wait_agent_invalid_arguments",
+        SubagentError::InvalidWaitTimeout => "wait_agent_invalid_timeout",
+        SubagentError::InvalidWaitResult => "wait_agent_invalid_result",
         SubagentError::InvalidSpawnArguments => "spawn_agent_invalid_arguments",
         SubagentError::InvalidSpawnDescription => "spawn_agent_invalid_description",
         SubagentError::InvalidSpawnPrompt => "spawn_agent_invalid_prompt",
@@ -5468,7 +5545,7 @@ mod tests {
         let store = local_store(&paths, false).await;
 
         let definitions = store.session_agent_tool_definitions().unwrap();
-        assert_eq!(definitions.len(), 10);
+        assert_eq!(definitions.len(), 11);
         assert_eq!(definitions[0].name, goals::CREATE_GOAL_TOOL_NAME);
         assert_eq!(definitions[1].name, connectors::DEV_MARKER_TOOL_NAME);
         assert_eq!(
@@ -5523,6 +5600,7 @@ mod tests {
             serde_json::json!(["pending", "in_progress", "completed"])
         );
         assert_eq!(definitions[9].name, goals::UPDATE_GOAL_TOOL_NAME);
+        assert_eq!(definitions[10].name, subagents::WAIT_AGENT_TOOL_NAME);
 
         let production = DemoStore::seeded().await.unwrap();
         assert_eq!(
@@ -5542,6 +5620,7 @@ mod tests {
                 subagents::SPAWN_AGENT_TOOL_NAME,
                 planning::TODO_WRITE_TOOL_NAME,
                 goals::UPDATE_GOAL_TOOL_NAME,
+                subagents::WAIT_AGENT_TOOL_NAME,
             ]
         );
     }
@@ -5773,6 +5852,7 @@ mod tests {
                 subagents::SPAWN_AGENT_TOOL_NAME,
                 planning::TODO_WRITE_TOOL_NAME,
                 goals::UPDATE_GOAL_TOOL_NAME,
+                subagents::WAIT_AGENT_TOOL_NAME,
             ]
         );
         let manifest = store

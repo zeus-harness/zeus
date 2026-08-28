@@ -485,9 +485,9 @@ impl SqliteStore {
             .await
     }
 
-    /// Returns one direct-child fork page only for the exact Agent tool call
-    /// that has crossed its durable started checkpoint. The model supplies no
-    /// account, actor, parent Session, turn, or Agent identity.
+    /// Returns one direct-child fork page only for an exact catalog or activity
+    /// Agent tool call that has crossed its durable started checkpoint. The
+    /// model supplies no account, actor, parent Session, turn, or Agent identity.
     pub async fn session_fork_page_for_started_agent_tool(
         &self,
         scope: &ExecutionScope,
@@ -4558,8 +4558,8 @@ fn query_session_fork_page_for_started_agent_tool(
                  AND agent.session_id = ?4
                  AND agent.turn_id = ?5
                  AND call.call_id = ?6
-                 AND call.tool_name = ?7
-                 AND call.tool_version = ?8
+                 AND ((call.tool_name = ?7 AND call.tool_version = ?8)
+                      OR (call.tool_name = ?9 AND call.tool_version = ?10))
                  AND call.status = 'started'
            )"#,
         params![
@@ -4571,6 +4571,8 @@ fn query_session_fork_page_for_started_agent_tool(
             call_id,
             subagents::LIST_AGENTS_TOOL_NAME,
             subagents::LIST_AGENTS_TOOL_VERSION,
+            subagents::WAIT_AGENT_TOOL_NAME,
+            subagents::WAIT_AGENT_TOOL_VERSION,
         ],
         |row| row.get(0),
     )?;
@@ -4711,9 +4713,9 @@ fn query_agent_subagent_result_for_started_tool(
     child_session_id: &str,
 ) -> Result<AgentSubagentResultSnapshot, StorageError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
-    let child_binding = transaction
+    let stored_child_session_id = transaction
         .query_row(
-            r#"SELECT spawn.child_session_id, spawn.child_turn_id, spawn.child_agent_id
+            r#"SELECT spawn.child_session_id
                FROM agent_turns parent
                JOIN agent_tool_calls call
                  ON call.agent_id = parent.id
@@ -4745,18 +4747,30 @@ fn query_agent_subagent_result_for_started_tool(
                 subagents::GET_AGENT_RESULT_TOOL_VERSION,
                 child_session_id,
             ],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
+            |row| row.get::<_, String>(0),
         )
         .optional()?
         .ok_or_else(|| StorageError::AgentToolCallNotFound(call_id.to_owned()))?;
-    let (stored_child_session_id, child_turn_id, child_agent_id) = child_binding;
-    let child_agent = query_agent_turn(&transaction, &child_agent_id)?;
+    let child_session = query_session_summary(&transaction, &stored_child_session_id)?;
+    validate_session_event_tail(&transaction, &child_session)?;
+    let child_turn_id = match child_session.active_turn_id.as_deref() {
+        Some(turn_id) => turn_id.to_owned(),
+        None => transaction
+            .query_row(
+                r#"SELECT id FROM session_turns
+                   WHERE session_id = ?1 ORDER BY ordinal DESC LIMIT 1"#,
+                [&stored_child_session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StorageError::CorruptData(
+                    "direct subagent Session has no current or completed turn".into(),
+                )
+            })?,
+    };
+    let child_agent =
+        query_agent_turn_for_session_turn(&transaction, &stored_child_session_id, &child_turn_id)?;
     if child_agent.account_id.as_str() != scope.account_id
         || child_agent.actor_user_id != scope.actor_id
         || child_agent.session_id != stored_child_session_id
@@ -4786,10 +4800,8 @@ fn query_agent_subagent_result_for_started_tool(
             }
         }
         _ => {
-            let child_session = query_session_summary(&transaction, &stored_child_session_id)?;
             let child_turn =
                 query_session_turn(&transaction, &stored_child_session_id, &child_turn_id)?;
-            validate_session_event_tail(&transaction, &child_session)?;
             if child_session.status != SessionStatus::Running
                 || child_session.active_turn_id.as_deref() != Some(child_turn_id.as_str())
                 || child_turn.status != SessionTurnStatus::Open

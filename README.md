@@ -95,14 +95,16 @@ capacity rejection rolls the whole child transaction back and becomes a known
 parent tool failure.
 
 Every Agent profile exposes `spawn_agent`, `send_message`, `interrupt_agent`,
-and the read-only `list_agents` / `get_agent_result` tools. All require the exact persisted
+and the read-only `list_agents` / `get_agent_result` / `wait_agent` tools. All require the exact persisted
 `started` Agent tool scope and derive account, actor, parent Session, turn, and
 Agent identity server-side. `list_agents` returns only children admitted by
 `spawn_agent`, not arbitrary manual Session forks, in opaque-cursor pages
 (default 16, maximum 32). `get_agent_result` can read only a child created by
 that direct parent; successful final output uses UTF-8-safe pages of at most
 8 KiB, while failed or indeterminate children never expose partial output as
-success. `send_message@1-direct-child-followup` targets the same direct-child
+success. The result is resolved from the child's latest turn, so a completed
+follow-up cannot be hidden by the original spawn result.
+`send_message@1-direct-child-followup` targets the same direct-child
 scope and reuses the schema v31 durable FIFO: its deterministic receipt
 acknowledges admission, a ready child is scheduled immediately, and a running
 child consumes the message after its current turn. Process-owned delivery
@@ -112,7 +114,11 @@ direct-child boundary and the existing revision-CAS cancellation transaction:
 queued/running model work and pre-start tools are durably cancelled, while a
 tool past its durable started checkpoint returns a known refusal. The child
 Session enters `needs_attention`; the parent never fabricates successful
-external-operation cancellation.
+external-operation cancellation. `wait_agent@1-direct-child-activity`
+subscribes before taking its authorized durable child snapshot, then waits for
+the next Session event from a child that was running in that snapshot. It never
+wakes an inactive child, returns `no_progress` immediately when none can make
+progress, and uses a bounded 10-second-to-one-hour timeout instead of polling.
 
 Alpha+ bootstraps a local `acc_local` root and now supports a bounded local
 multi-account control plane. An owner can create accounts idempotently; one
@@ -1394,19 +1400,19 @@ follow-ups, schema v32 durable Agent model output, schema v33 running-model
 cancellation, schema v34 durable Session forks, schema v35 durable fork catalog,
 schema v36 durable `spawn_agent` admission, Agent-scoped `list_agents`,
 direct-child `get_agent_result`, durable `send_message`, and fail-closed
-direct-child `interrupt_agent`,
+direct-child `interrupt_agent`, plus event-driven `wait_agent`,
 Trusted Single-Node Ingress,
 Per-Operation SecretRef Resolution, the startup-bound Skill Catalog, and the
 bounded multi-account control plane:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 702 tests passed
+- `cargo test --workspace --all-targets --locked`: 704 tests passed
   across the top-level test targets, including 22 connector tests,
   8 deployment tests, 29 knowledge tests, 30 LLM unit and 18 provider-contract
-  tests, 4 Goal tests, 5 Skill Catalog tests, 11 Subagent tests,
+  tests, 4 Goal tests, 5 Skill Catalog tests, 12 Subagent tests,
   286 storage tests, 21 workflow tests, 52 runtime tests, 21 protocol tests,
-  98 API library tests, 18 API main/config
+  99 API library tests, 18 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,

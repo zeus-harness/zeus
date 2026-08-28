@@ -9776,6 +9776,11 @@ mod tests {
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
     }
 
+    struct SpawnWaitThenFinalProvider {
+        metadata: ProviderMetadata,
+        requests: Arc<StdMutex<Vec<ReplyRequest>>>,
+    }
+
     struct InterruptForeignThenFinalProvider {
         metadata: ProviderMetadata,
         target_session_id: String,
@@ -10217,6 +10222,19 @@ mod tests {
         }
     }
 
+    impl SpawnWaitThenFinalProvider {
+        fn new(requests: Arc<StdMutex<Vec<ReplyRequest>>>) -> Self {
+            Self {
+                metadata: ProviderMetadata {
+                    provider_id: "test-spawn-wait-provider".into(),
+                    model: Some("test-model".into()),
+                    reply_kind: ReplyKind::Model,
+                },
+                requests,
+            }
+        }
+    }
+
     impl InterruptForeignThenFinalProvider {
         fn new(target_session_id: impl Into<String>) -> Self {
             Self {
@@ -10458,6 +10476,47 @@ mod tests {
                     Some("child follow-up message") => ReplyOutput::Final {
                         content: "child follow-up complete".into(),
                     },
+                    Some("read latest child result") => {
+                        let tool_results = request
+                            .messages
+                            .iter()
+                            .filter(|message| message.role == ReplyRole::Tool)
+                            .map(|message| {
+                                serde_json::from_str::<serde_json::Value>(&message.content).unwrap()
+                            })
+                            .collect::<Vec<_>>();
+                        match tool_results.as_slice() {
+                            [] => ReplyOutput::ToolCall {
+                                call: ReplyToolCall::new(
+                                    "provider-call-list-before-latest-result",
+                                    subagents::LIST_AGENTS_TOOL_NAME,
+                                    serde_json::json!({"limit": 8}),
+                                ),
+                            },
+                            [listed] => {
+                                let subagent_id = listed["agents"][0]["session"]["id"]
+                                    .as_str()
+                                    .expect("the direct child catalog must contain its ID");
+                                ReplyOutput::ToolCall {
+                                    call: ReplyToolCall::new(
+                                        "provider-call-get-latest-child-result",
+                                        subagents::GET_AGENT_RESULT_TOOL_NAME,
+                                        serde_json::json!({"subagent_id": subagent_id}),
+                                    ),
+                                }
+                            }
+                            [_, result] => {
+                                assert_eq!(result["status"], "completed");
+                                assert_eq!(result["output"], "child follow-up complete");
+                                ReplyOutput::Final {
+                                    content: "parent read the latest child result".into(),
+                                }
+                            }
+                            results => {
+                                panic!("unexpected latest-result tool count {}", results.len())
+                            }
+                        }
+                    }
                     _ => {
                         let tool_results = request
                             .messages
@@ -10616,6 +10675,97 @@ mod tests {
                             panic!("unexpected parent tool-result count {}", results.len())
                         }
                     }
+                }
+            };
+            let provider = self.metadata.clone();
+            Box::pin(async move {
+                Ok(ReplyResponse {
+                    output,
+                    finish_reason: Some("stop".into()),
+                    provider,
+                })
+            })
+        }
+    }
+
+    impl ReplyProvider for SpawnWaitThenFinalProvider {
+        fn metadata(&self) -> &ProviderMetadata {
+            &self.metadata
+        }
+
+        fn reply(&self, request: ReplyRequest) -> ReplyFuture<'_> {
+            self.requests.lock().unwrap().push(request.clone());
+            let current_user = request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == ReplyRole::User)
+                .map(|message| message.content.as_str());
+            let output = if current_user == Some("child wait target") {
+                ReplyOutput::ToolCall {
+                    call: ReplyToolCall::new(
+                        "provider-call-child-waiting-approval",
+                        "dev_marker_write",
+                        serde_json::json!({"marker": "wait-child-must-not-run"}),
+                    ),
+                }
+            } else {
+                let tool_results = request
+                    .messages
+                    .iter()
+                    .filter(|message| message.role == ReplyRole::Tool)
+                    .map(|message| {
+                        serde_json::from_str::<serde_json::Value>(&message.content).unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                match tool_results.as_slice() {
+                    [] => ReplyOutput::ToolCall {
+                        call: ReplyToolCall::new(
+                            "provider-call-spawn-wait-child",
+                            subagents::SPAWN_AGENT_TOOL_NAME,
+                            serde_json::json!({
+                                "description": "Waitable child",
+                                "prompt": "child wait target",
+                            }),
+                        ),
+                    },
+                    [spawned] => {
+                        assert!(spawned["subagent_id"].is_string());
+                        let tool = request
+                            .tools
+                            .iter()
+                            .find(|tool| tool.name == subagents::WAIT_AGENT_TOOL_NAME)
+                            .expect("every parent Agent request must expose wait_agent");
+                        assert!(tool.parameters["properties"]["timeout_ms"].is_object());
+                        ReplyOutput::ToolCall {
+                            call: ReplyToolCall::new(
+                                "provider-call-wait-agent-activity",
+                                subagents::WAIT_AGENT_TOOL_NAME,
+                                serde_json::json!({
+                                    "timeout_ms": subagents::WAIT_AGENT_MIN_TIMEOUT_MS,
+                                }),
+                            ),
+                        }
+                    }
+                    [_, activity] => {
+                        assert_eq!(activity["timed_out"], false);
+                        assert!(activity.get("no_progress").is_none());
+                        ReplyOutput::ToolCall {
+                            call: ReplyToolCall::new(
+                                "provider-call-wait-agent-no-progress",
+                                subagents::WAIT_AGENT_TOOL_NAME,
+                                serde_json::json!({}),
+                            ),
+                        }
+                    }
+                    [_, _, no_progress] => {
+                        assert_eq!(no_progress["timed_out"], false);
+                        assert_eq!(no_progress["no_progress"]["reason"], "no_active_child");
+                        ReplyOutput::Final {
+                            content: "parent observed durable child activity".into(),
+                        }
+                    }
+                    results => panic!("unexpected parent tool-result count {}", results.len()),
                 }
             };
             let provider = self.metadata.clone();
@@ -13595,9 +13745,245 @@ mod tests {
             followups[0].status,
             protocol::SessionFollowupStatus::Claimed
         );
-        assert_eq!(requests.lock().unwrap().len(), 6);
+        let latest = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-agent-send-message/turns")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "read-agent-latest-child-result")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-agent-latest-child-result",
+                            "user_message": "read latest child result",
+                            "expected_sequence": parent.session.sequence,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(latest.status(), StatusCode::ACCEPTED);
+        let parent =
+            wait_for_ready_session(&store, &owner.authz, "session-agent-send-message").await;
+        assert_eq!(parent.turns.len(), 2);
+        assert_eq!(
+            parent.turns[1].assistant_message.as_deref(),
+            Some("parent read the latest child result")
+        );
+        let latest_agent = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            "session-agent-send-message",
+            "turn-agent-latest-child-result",
+            protocol::AgentTurnStatus::Succeeded,
+        )
+        .await;
+        let latest_result: subagents::GetAgentResult = serde_json::from_value(
+            latest_agent
+                .calls
+                .iter()
+                .find(|call| call.tool == subagents::GET_AGENT_RESULT_TOOL_NAME)
+                .and_then(|call| call.output.clone())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            latest_result.output.as_deref(),
+            Some("child follow-up complete")
+        );
+        assert_eq!(requests.lock().unwrap().len(), 9);
         store.verify_integrity().await.unwrap();
         drop(app);
+    }
+
+    #[tokio::test]
+    async fn agent_wait_wakes_on_direct_child_activity_and_shortcuts_without_progress() {
+        let unique = UserId::generate().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "zeus-api-agent-wait-{}",
+            unique.as_str().replace(':', "-")
+        ));
+        let path = root.join("zeus.db");
+        let marker_root = root.join("markers");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = DemoStore::open_local(&path, &marker_root).await.unwrap();
+        let owner = provision_test_owner(&store, "user-agent-wait", "agent-wait-owner").await;
+        let parent_session_id = "session-agent-wait";
+        let parent_turn_id = "turn-agent-wait";
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: parent_session_id.into(),
+                    title: "Durable child activity wait".into(),
+                },
+                "create-agent-wait",
+            )
+            .await
+            .unwrap();
+
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(SpawnWaitThenFinalProvider::new(Arc::clone(&requests))),
+        )
+        .unwrap();
+        let started = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/sessions/{parent_session_id}/turns"))
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "start-agent-wait")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": parent_turn_id,
+                            "user_message": "wait for one durable child",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+
+        let spawned = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(agent) = store
+                    .agent_turn_detail_for_actor(&owner.authz, parent_session_id, parent_turn_id)
+                    .await
+                    && agent.calls.iter().any(|call| {
+                        call.tool == subagents::WAIT_AGENT_TOOL_NAME
+                            && call.status == AgentToolCallStatus::Running
+                    })
+                    && let Some(spawned) = agent.calls.iter().find_map(|call| {
+                        (call.tool == subagents::SPAWN_AGENT_TOOL_NAME)
+                            .then(|| call.output.clone())
+                            .flatten()
+                            .and_then(|value| {
+                                serde_json::from_value::<subagents::SpawnAgentResult>(value).ok()
+                            })
+                    })
+                {
+                    break spawned;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the parent wait_agent call must reach its durable started checkpoint");
+
+        let child = store
+            .get_session_for_actor(
+                &owner.authz,
+                &spawned.subagent_id,
+                None,
+                50,
+                None,
+                50,
+                None,
+                50,
+            )
+            .await
+            .unwrap();
+        assert_eq!(child.session.status, SessionStatus::Running);
+        let child_turn_id = child.session.active_turn_id.as_deref().unwrap();
+        let mut cancelled = false;
+        for _ in 0..8 {
+            let child_agent = store
+                .agent_turn_detail_for_actor(&owner.authz, &spawned.subagent_id, child_turn_id)
+                .await
+                .unwrap();
+            match store
+                .cancel_agent_turn_for_actor(
+                    &owner.authz,
+                    &spawned.subagent_id,
+                    child_turn_id,
+                    child_agent.revision,
+                )
+                .await
+            {
+                Ok(_) => {
+                    cancelled = true;
+                    break;
+                }
+                Err(StoreError::AgentRevisionConflict | StoreError::ConcurrentModification) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("unexpected child cancellation error: {error}"),
+            }
+        }
+        assert!(
+            cancelled,
+            "the active child must be cancellable after bounded revision races"
+        );
+
+        let parent = wait_for_ready_session(&store, &owner.authz, parent_session_id).await;
+        assert_eq!(
+            parent.turns[0].assistant_message.as_deref(),
+            Some("parent observed durable child activity")
+        );
+        let agent = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            parent_session_id,
+            parent_turn_id,
+            protocol::AgentTurnStatus::Succeeded,
+        )
+        .await;
+        assert_eq!(agent.model_steps, 4);
+        assert_eq!(agent.tool_calls, 3);
+        assert_eq!(agent.calls[0].tool, subagents::SPAWN_AGENT_TOOL_NAME);
+        assert_eq!(agent.calls[1].tool, subagents::WAIT_AGENT_TOOL_NAME);
+        assert_eq!(agent.calls[2].tool, subagents::WAIT_AGENT_TOOL_NAME);
+        assert!(agent.calls.iter().all(|call| {
+            call.status == AgentToolCallStatus::Succeeded && !call.approval_required
+        }));
+        let activity: subagents::WaitAgentResult =
+            serde_json::from_value(agent.calls[1].output.clone().unwrap()).unwrap();
+        assert!(!activity.timed_out);
+        assert!(activity.no_progress.is_none());
+        let no_progress: subagents::WaitAgentResult =
+            serde_json::from_value(agent.calls[2].output.clone().unwrap()).unwrap();
+        assert!(!no_progress.timed_out);
+        assert_eq!(
+            no_progress.no_progress.unwrap().reason,
+            subagents::WaitAgentNoProgressReason::NoActiveChild
+        );
+
+        let child = store
+            .get_session_for_actor(
+                &owner.authz,
+                &spawned.subagent_id,
+                None,
+                50,
+                None,
+                50,
+                None,
+                50,
+            )
+            .await
+            .unwrap();
+        assert_eq!(child.session.status, SessionStatus::NeedsAttention);
+        assert_eq!(std::fs::read_dir(&marker_root).unwrap().count(), 0);
+        assert!((5..=6).contains(&requests.lock().unwrap().len()));
+        store.verify_integrity().await.unwrap();
+        drop(app);
+        drop(store);
+        tokio::task::yield_now().await;
+        cleanup_test_database(&path);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[tokio::test]
