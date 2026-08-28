@@ -163,8 +163,9 @@ binding，并从 child 当前 active turn 派生 Agent revision，不信任模�
 Storage 复用既有 cancellation transaction：queued/running model 与 waiting-approval/queued tool 会写入
 `user_cancelled` fact 和 `turn_interrupted`；running model 同时通知本进程 drop provider stream。已经
 durable started 的 tool 返回 `interrupt_agent_operation_in_flight`，不会伪造“已取消外部副作用”。
-`wait_agent@1-direct-child-activity` 在 durable direct-child snapshot 之前建立 Session event 订阅，
-只等待 snapshot 中 Running child 的下一次事件。没有 active child 时立即返回 `no_progress`；否则等待
+`wait_agent@1-direct-child-activity` 在 durable direct-child snapshot 之前建立 Session event 订阅。
+snapshot 将 Running child 与存在 queued durable follow-up 的 Ready child 都视为可推进，避免 enqueue
+已提交但 worker 尚未 claim 时错误返回 `no_progress`。没有可推进 child 时立即返回 `no_progress`；否则等待
 10 秒至 1 小时的显式有界 timeout。它不唤醒 child，也不把进程内通知当作权威状态；唤醒或超时后
 调用方必须重新 List/Result。`get_agent_result` 从 child 最新 turn 解析状态与终态输出，follow-up 完成
 后不会返回首次 spawn 的陈旧结果。

@@ -116,9 +116,11 @@ tool past its durable started checkpoint returns a known refusal. The child
 Session enters `needs_attention`; the parent never fabricates successful
 external-operation cancellation. `wait_agent@1-direct-child-activity`
 subscribes before taking its authorized durable child snapshot, then waits for
-the next Session event from a child that was running in that snapshot. It never
-wakes an inactive child, returns `no_progress` immediately when none can make
-progress, and uses a bounded 10-second-to-one-hour timeout instead of polling.
+the next Session event from a progress-capable child. Running children qualify;
+so do Ready children with an already queued durable follow-up, which closes the
+enqueue-to-worker-claim race. It never wakes an inactive child, returns
+`no_progress` immediately when none can make progress, and uses a bounded
+10-second-to-one-hour timeout instead of polling.
 
 Alpha+ bootstraps a local `acc_local` root and now supports a bounded local
 multi-account control plane. An owner can create accounts idempotently; one

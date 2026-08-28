@@ -458,7 +458,8 @@ account/member/user 与 SessionWrite/Reply 权限；崩溃窗口遵循 LocalWrit
 queued/running model 或尚未 started 的 tool 可取消，已经 started 的 tool 明确返回
 `interrupt_agent_operation_in_flight`；成功后 child 进入 `needs_attention`，不会伪造外部副作用已撤销。
 Wait 在读取 durable child snapshot 之前先订阅本进程 Session event，避免 check/wait 窗口丢失边沿；
-它只等待 snapshot 中处于 Running 的直属 child，10 秒至 1 小时有界 timeout，没有 active child 时
+snapshot 把 Running child 以及已经存在 queued durable follow-up 的 Ready child 都视为可推进，关闭
+enqueue 与 follow-up worker claim 之间错误 `no_progress` 的窗口。等待使用 10 秒至 1 小时有界 timeout，没有可推进 child 时
 立即返回 `no_progress`，且绝不隐式唤醒 child。活动或超时后由模型重新调用 List/Result 读取权威状态。
 当前阶段不递归加载完整 child graph。
 Knowledge v1 生成独立、受治理、带完整 digest 的 canonical context
@@ -546,7 +547,7 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
   覆盖 queued model / waiting approval 竞态、child
   `user_cancelled` terminal evidence、未执行工具和 parent continuation。另修复 deterministic child
   Agent ID 超过 64 bytes 时无法生成 stable tool call ID 的核心契约不一致。`wait_agent` 覆盖订阅先于
-  snapshot、活动 child 终态唤醒以及没有 active child 时的即时 `no_progress`。
+  snapshot、活动 child 终态唤醒、Ready+queued child 的可推进识别，以及没有可推进 child 时的即时 `no_progress`。
 - Session/Run detail 只返回最新 bounded tail；opaque cursor 的 kind、resource scope、canonical
   encoding、future-head 和跨资源使用均有自动测试，返回页保持连续且升序。
 - disabled/降权/owner mismatch 的 reply 与 dispatch claim 不触达外部执行，并留下

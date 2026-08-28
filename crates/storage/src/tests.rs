@@ -16086,7 +16086,7 @@ async fn list_agents_catalog_requires_the_exact_started_agent_tool_scope() {
         .await
         .unwrap();
     assert_eq!(receipt.followup.turn_id, send_identity.turn_id);
-    store
+    let send_terminal = match store
         .complete_agent_tool(AgentToolCompletionCommit {
             call_id: send_call.call_id,
             status: AgentToolCallStatus::Succeeded,
@@ -16098,6 +16098,103 @@ async fn list_agents_catalog_requires_the_exact_started_agent_tool_scope() {
                 .unwrap(),
             )
             .unwrap(),
+            provider_request_id: None,
+            next_request_json: None,
+        })
+        .await
+        .unwrap()
+    {
+        AgentToolCompletion::Terminal(completion) => completion,
+        AgentToolCompletion::ModelQueued { .. } => {
+            panic!("send result without continuation must end")
+        }
+    };
+    let resumed = store
+        .resume_session_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            ResumeSessionRequest {
+                expected_sequence: send_terminal.session.sequence,
+            },
+            "resume-for-wait-agent",
+        )
+        .await
+        .unwrap();
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-wait-agent".into(),
+                user_message: "wait for queued child progress".into(),
+                expected_sequence: resumed.session.sequence,
+            },
+            "start-wait-agent",
+            agent_turn_spec_with_manifest(
+                "agent-wait-agent",
+                "turn-wait-agent",
+                manifest.clone(),
+                "wait for queued child progress",
+            ),
+        )
+        .await
+        .unwrap();
+    let AgentModelClaimOutcome::Claimed(model) =
+        store.claim_next_agent_model(&manifest).await.unwrap()
+    else {
+        panic!("the wait_agent model proposal must start");
+    };
+    let wait_call = wait_agent_tool_call_spec("call-wait-agent", json!({}));
+    store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: model.id,
+            response_json: agent_tool_response_json(&wait_call),
+            resolution: AgentModelResolution::ToolCall {
+                call: wait_call.clone(),
+            },
+        })
+        .await
+        .unwrap();
+    let AgentToolClaimOutcome::Claimed(wait_work) =
+        store.claim_next_agent_tool(&manifest).await.unwrap()
+    else {
+        panic!("the wait_agent tool must cross its started checkpoint");
+    };
+    let wait_scope = tools::ExecutionScope::new(
+        wait_work.call.account_id.as_str(),
+        wait_work.model_job.actor_user_id.as_str(),
+        wait_work.call.session_id.as_str(),
+        wait_work.call.turn_id.as_str(),
+        wait_work.call.agent_id.as_str(),
+    )
+    .unwrap();
+    let activity = store
+        .agent_subagent_activity_for_started_tool(&wait_scope, &wait_work.call.call_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        activity.active_session_ids,
+        vec![identity.session_id.clone()]
+    );
+    assert_eq!(candidate.child_session.status, SessionStatus::Ready);
+    assert!(matches!(
+        store
+            .agent_subagent_activity_for_started_tool(&send_scope, &send_work.call.call_id)
+            .await,
+        Err(StorageError::AgentToolCallNotFound(_))
+    ));
+    assert!(matches!(
+        store
+            .agent_subagent_activity_for_started_tool(&foreign_scope, &wait_work.call.call_id)
+            .await,
+        Err(StorageError::AgentToolCallNotFound(_))
+    ));
+    store
+        .complete_agent_tool(AgentToolCompletionCommit {
+            call_id: wait_call.call_id,
+            status: AgentToolCallStatus::Succeeded,
+            result_json: serde_json::to_value(subagents::WaitAgentResult::activity().unwrap())
+                .unwrap(),
             provider_request_id: None,
             next_request_json: None,
         })
@@ -23173,6 +23270,7 @@ fn list_agents_test_agent_manifest() -> ManifestEnvelope {
         subagents::list_agents_descriptor(),
         subagents::send_message_descriptor(),
         subagents::spawn_agent_descriptor(),
+        subagents::wait_agent_descriptor(),
     ] {
         manifest.deployment.spec.tools.push(
             ManifestTool::new(
@@ -23534,6 +23632,23 @@ fn get_agent_result_tool_call_spec(call_id: &str, arguments_json: Value) -> Agen
 
 fn send_message_tool_call_spec(call_id: &str, arguments_json: Value) -> AgentToolCallSpec {
     let descriptor = subagents::send_message_descriptor();
+    AgentToolCallSpec {
+        call_id: call_id.into(),
+        provider_call_id: format!("provider-call-{call_id}"),
+        tool_name: descriptor.name,
+        tool_version: descriptor.version,
+        arguments_digest: tools::arguments_digest(&arguments_json),
+        arguments_json,
+        effect: descriptor.effect,
+        sandbox_profile: descriptor.sandbox_profile,
+        executor_status: ToolExecutorStatus::Available,
+        policy_decision: PolicyDecision::Allow,
+        policy_revision: "local/v1".into(),
+    }
+}
+
+fn wait_agent_tool_call_spec(call_id: &str, arguments_json: Value) -> AgentToolCallSpec {
+    let descriptor = subagents::wait_agent_descriptor();
     AgentToolCallSpec {
         call_id: call_id.into(),
         provider_call_id: format!("provider-call-{call_id}"),

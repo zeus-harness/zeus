@@ -1854,25 +1854,13 @@ impl DemoStore {
             // this call starts but before the read completes is retained by
             // the receiver instead of being lost between check and wait.
             let mut receiver = self.session_publisher.subscribe();
-            let page = self
+            let snapshot = self
                 .storage
-                .session_fork_page_for_started_agent_tool(
-                    &scope,
-                    &resolved.call.call_id,
-                    None,
-                    subagents::SPAWN_AGENT_MAX_DIRECT_CHILDREN,
-                )
+                .agent_subagent_activity_for_started_tool(&scope, &resolved.call.call_id)
                 .await?;
-            if page.next_cursor.is_some() {
-                return Err(StoreError::ExecutionInvariant(
-                    "wait_agent direct-child snapshot exceeds the durable admission limit".into(),
-                ));
-            }
-            let active = page
-                .items
+            let active = snapshot
+                .active_session_ids
                 .into_iter()
-                .filter(|child| child.session.status == protocol::SessionStatus::Running)
-                .map(|child| child.session.id)
                 .collect::<BTreeSet<_>>();
             let result = if active.is_empty() {
                 WaitAgentResult::no_active_child()

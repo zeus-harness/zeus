@@ -689,6 +689,14 @@ pub struct AgentSubagentResultSnapshot {
     pub completed_at: Option<String>,
 }
 
+/// Direct children that can still produce a Session activity edge for one
+/// exact started `wait_agent` call. A Ready child with a queued durable
+/// follow-up is progress-capable even before the follow-up worker claims it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentSubagentActivitySnapshot {
+    pub active_session_ids: Vec<String>,
+}
+
 /// Current authority and child sequence captured for one exact started
 /// `send_message` call. The immutable direct-parent binding is re-derived from
 /// storage; no model-supplied account, actor, or parent identity is trusted.

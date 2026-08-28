@@ -279,7 +279,7 @@ impl WaitAgentResult {
             timed_out: false,
             no_progress: Some(WaitAgentNoProgress {
                 reason: WaitAgentNoProgressReason::NoActiveChild,
-                message: "No direct child is running. Re-list the durable child catalog and send a follow-up before waiting again.".into(),
+                message: "No direct child has active or queued work. Re-list the durable child catalog and send a follow-up before waiting again.".into(),
             }),
         })
     }

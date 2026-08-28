@@ -12,10 +12,10 @@ use crate::{
     AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit, AgentOperationClaim,
     AgentOperationKind, AgentPreparedModel, AgentPreparedTool, AgentPromptCommit,
     AgentPromptRevisionPage, AgentPromptRevisionSummary, AgentPromptState, AgentPromptUpdateResult,
-    AgentReviewCommit, AgentReviewContext, AgentReviewResult, AgentSubagentInterruptCandidate,
-    AgentSubagentMessageCandidate, AgentSubagentResultSnapshot, AgentSubagentSpawnCandidate,
-    AgentSubagentSpawnCommit, AgentTerminalCompletion, AgentToolCall, AgentToolCallSpec,
-    AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
+    AgentReviewCommit, AgentReviewContext, AgentReviewResult, AgentSubagentActivitySnapshot,
+    AgentSubagentInterruptCandidate, AgentSubagentMessageCandidate, AgentSubagentResultSnapshot,
+    AgentSubagentSpawnCandidate, AgentSubagentSpawnCommit, AgentTerminalCompletion, AgentToolCall,
+    AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
     AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe,
     DEFAULT_SESSION_AGENT_PROMPT_REVISION, DEFAULT_SESSION_AGENT_SYSTEM_PROMPT,
     KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage, KnowledgeCatalogRevisionSummary,
@@ -485,9 +485,9 @@ impl SqliteStore {
             .await
     }
 
-    /// Returns one direct-child fork page only for an exact catalog or activity
-    /// Agent tool call that has crossed its durable started checkpoint. The
-    /// model supplies no account, actor, parent Session, turn, or Agent identity.
+    /// Returns one direct-child fork page only for the exact catalog Agent tool
+    /// call that has crossed its durable started checkpoint. The model supplies
+    /// no account, actor, parent Session, turn, or Agent identity.
     pub async fn session_fork_page_for_started_agent_tool(
         &self,
         scope: &ExecutionScope,
@@ -530,6 +530,22 @@ impl SqliteStore {
                 &call_id,
                 &child_session_id,
             )
+        })
+        .await
+    }
+
+    /// Returns every direct child that can produce a future Session activity
+    /// edge for one exact started `wait_agent` call. The snapshot includes a
+    /// Running child and a Ready child with queued durable follow-up work.
+    pub async fn agent_subagent_activity_for_started_tool(
+        &self,
+        scope: &ExecutionScope,
+        call_id: &str,
+    ) -> Result<AgentSubagentActivitySnapshot, StorageError> {
+        let scope = scope.clone();
+        let call_id = validated_durable_reference(call_id, "Agent tool call ID")?.to_owned();
+        self.with_connection(move |connection| {
+            query_agent_subagent_activity_for_started_tool(connection, &scope, &call_id)
         })
         .await
     }
@@ -4558,8 +4574,8 @@ fn query_session_fork_page_for_started_agent_tool(
                  AND agent.session_id = ?4
                  AND agent.turn_id = ?5
                  AND call.call_id = ?6
-                 AND ((call.tool_name = ?7 AND call.tool_version = ?8)
-                      OR (call.tool_name = ?9 AND call.tool_version = ?10))
+                 AND call.tool_name = ?7
+                 AND call.tool_version = ?8
                  AND call.status = 'started'
            )"#,
         params![
@@ -4571,8 +4587,6 @@ fn query_session_fork_page_for_started_agent_tool(
             call_id,
             subagents::LIST_AGENTS_TOOL_NAME,
             subagents::LIST_AGENTS_TOOL_VERSION,
-            subagents::WAIT_AGENT_TOOL_NAME,
-            subagents::WAIT_AGENT_TOOL_VERSION,
         ],
         |row| row.get(0),
     )?;
@@ -4823,6 +4837,90 @@ fn query_agent_subagent_result_for_started_tool(
     };
     transaction.commit()?;
     Ok(snapshot)
+}
+
+fn query_agent_subagent_activity_for_started_tool(
+    connection: &mut Connection,
+    scope: &ExecutionScope,
+    call_id: &str,
+) -> Result<AgentSubagentActivitySnapshot, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let authorized: i64 = transaction.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1
+               FROM agent_turns agent
+               JOIN agent_tool_calls call
+                 ON call.agent_id = agent.id
+                AND call.account_id = agent.account_id
+                AND call.session_id = agent.session_id
+                AND call.turn_id = agent.turn_id
+               WHERE agent.id = ?1
+                 AND agent.account_id = ?2
+                 AND agent.actor_user_id = ?3
+                 AND agent.session_id = ?4
+                 AND agent.turn_id = ?5
+                 AND call.call_id = ?6
+                 AND call.tool_name = ?7
+                 AND call.tool_version = ?8
+                 AND call.status = 'started'
+           )"#,
+        params![
+            scope.agent_id.as_str(),
+            scope.account_id.as_str(),
+            scope.actor_id.as_str(),
+            scope.session_id.as_str(),
+            scope.turn_id.as_str(),
+            call_id,
+            subagents::WAIT_AGENT_TOOL_NAME,
+            subagents::WAIT_AGENT_TOOL_VERSION,
+        ],
+        |row| row.get(0),
+    )?;
+    if authorized == 0 {
+        return Err(StorageError::AgentToolCallNotFound(call_id.to_owned()));
+    }
+    let limit = i64::try_from(subagents::SPAWN_AGENT_MAX_DIRECT_CHILDREN + 1)
+        .map_err(|_| StorageError::IntegerOutOfRange("subagent direct-child activity limit"))?;
+    let mut statement = transaction.prepare(
+        r#"SELECT child.id
+           FROM agent_subagent_spawns spawn
+           JOIN sessions child ON child.id = spawn.child_session_id
+           WHERE spawn.account_id = ?1
+             AND spawn.actor_user_id = ?2
+             AND spawn.parent_session_id = ?3
+             AND (
+                 child.status = 'running'
+                 OR (
+                     child.status = 'ready'
+                     AND EXISTS (
+                         SELECT 1 FROM session_followups followup
+                         WHERE followup.session_id = child.id
+                           AND followup.status = 'queued'
+                     )
+                 )
+             )
+           ORDER BY spawn.created_at DESC, spawn.child_session_id ASC
+           LIMIT ?4"#,
+    )?;
+    let active_session_ids = statement
+        .query_map(
+            params![
+                scope.account_id.as_str(),
+                scope.actor_id.as_str(),
+                scope.session_id.as_str(),
+                limit,
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    if active_session_ids.len() > subagents::SPAWN_AGENT_MAX_DIRECT_CHILDREN {
+        return Err(StorageError::CorruptData(
+            "wait_agent direct-child snapshot exceeds the durable admission limit".into(),
+        ));
+    }
+    transaction.commit()?;
+    Ok(AgentSubagentActivitySnapshot { active_session_ids })
 }
 
 fn query_subagent_spawn_candidate_for_started_tool(
