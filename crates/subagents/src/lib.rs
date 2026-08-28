@@ -1,9 +1,10 @@
 //! Durable Session-child admission, discovery, and model-facing contracts.
 //!
 //! The runtime resolves the exact started Agent scope. Storage atomically
-//! admits a background child for `spawn_agent` and lists only those bound
-//! children for `list_agents`; message delivery and interruption remain
-//! separate future capabilities.
+//! admits a background child for `spawn_agent`, lists only those bound
+//! children for `list_agents`, and exposes a bounded terminal-result snapshot
+//! for `get_agent_result`; message delivery and interruption remain separate
+//! future capabilities.
 
 use std::collections::BTreeMap;
 
@@ -23,6 +24,11 @@ pub const LIST_AGENTS_DEFAULT_LIMIT: usize = 16;
 pub const LIST_AGENTS_MAX_LIMIT: usize = 32;
 pub const LIST_AGENTS_CURSOR_MAX_BYTES: usize = 4 * 1024;
 pub const LIST_AGENTS_ARGUMENTS_MAX_BYTES: usize = 8 * 1024;
+pub const GET_AGENT_RESULT_TOOL_NAME: &str = "get_agent_result";
+pub const GET_AGENT_RESULT_TOOL_VERSION: &str = "1-direct-child-snapshot";
+pub const GET_AGENT_RESULT_ARGUMENTS_MAX_BYTES: usize = 1024;
+pub const GET_AGENT_RESULT_DEFAULT_MAX_BYTES: usize = 8 * 1024;
+pub const GET_AGENT_RESULT_MAX_BYTES: usize = 8 * 1024;
 pub const SPAWN_AGENT_TOOL_NAME: &str = "spawn_agent";
 pub const SPAWN_AGENT_TOOL_VERSION: &str = "1-durable-session-fork";
 pub const SPAWN_AGENT_DESCRIPTION_MAX_BYTES: usize = 256;
@@ -32,6 +38,7 @@ pub const SPAWN_AGENT_MAX_DEPTH: usize = 3;
 pub const SPAWN_AGENT_MAX_DIRECT_CHILDREN: usize = 8;
 
 const LIST_AGENTS_DESCRIPTION: &str = "List this Session's durable direct child branches by stable child Session ID and immutable fork boundary. This is a bounded read, not completion polling: use the opaque next_cursor to continue when present. A returned child is independently continuable, but this tool does not send it work, interrupt it, or claim that it is currently executing.";
+const GET_AGENT_RESULT_DESCRIPTION: &str = "Read one durable direct child's current status and, after successful completion, a bounded page of its final assistant output. The child must have been created by this parent Session's spawn_agent call. Failed or indeterminate children never expose partial output. Continue a large successful result with next_after_byte.";
 const SPAWN_AGENT_DESCRIPTION: &str = "Start one durable background child Agent that inherits this Session's completed turns before the current in-flight turn. The call returns after the child Session, initial prompt, and first model job are atomically admitted; it does not wait for the child result. Use list_agents to rediscover the stable child ID. This stage does not provide send or interrupt controls.";
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
@@ -44,6 +51,14 @@ pub enum SubagentError {
     InvalidCursor,
     #[error("list_agents result exceeds its bounded output contract")]
     InvalidResult,
+    #[error("get_agent_result arguments are not a strict bounded object")]
+    InvalidResultArguments,
+    #[error("get_agent_result subagent_id is not a canonical bounded identifier")]
+    InvalidResultSubagentId,
+    #[error("get_agent_result byte range is outside the bounded result contract")]
+    InvalidResultRange,
+    #[error("get_agent_result result exceeds its bounded output contract")]
+    InvalidAgentResult,
     #[error("spawn_agent arguments are not a strict bounded object")]
     InvalidSpawnArguments,
     #[error("spawn_agent description is not a non-empty bounded display label")]
@@ -85,6 +100,150 @@ pub struct ListAgentsResult {
     pub agents: Vec<SessionForkSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGetAgentResultRequest {
+    subagent_id: String,
+    #[serde(default)]
+    after_byte: Option<usize>,
+    #[serde(default)]
+    max_bytes: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GetAgentResultRequest {
+    subagent_id: String,
+    after_byte: usize,
+    max_bytes: usize,
+}
+
+impl GetAgentResultRequest {
+    pub fn subagent_id(&self) -> &str {
+        &self.subagent_id
+    }
+
+    pub const fn after_byte(&self) -> usize {
+        self.after_byte
+    }
+
+    pub const fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GetAgentResultStatus {
+    Running,
+    Completed,
+    Failed,
+    NeedsAttention,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GetAgentResult {
+    pub subagent_id: String,
+    pub status: GetAgentResultStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_start_byte: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_end_byte: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_total_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_after_byte: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+}
+
+impl GetAgentResult {
+    pub fn running(subagent_id: String) -> Result<Self, SubagentError> {
+        Self::validated(Self {
+            subagent_id,
+            status: GetAgentResultStatus::Running,
+            output: None,
+            output_start_byte: None,
+            output_end_byte: None,
+            output_total_bytes: None,
+            next_after_byte: None,
+            completed_at: None,
+        })
+    }
+
+    pub fn failed(
+        subagent_id: String,
+        status: GetAgentResultStatus,
+        completed_at: String,
+    ) -> Result<Self, SubagentError> {
+        if !matches!(
+            status,
+            GetAgentResultStatus::Failed | GetAgentResultStatus::NeedsAttention
+        ) {
+            return Err(SubagentError::InvalidAgentResult);
+        }
+        Self::validated(Self {
+            subagent_id,
+            status,
+            output: None,
+            output_start_byte: None,
+            output_end_byte: None,
+            output_total_bytes: None,
+            next_after_byte: None,
+            completed_at: Some(completed_at),
+        })
+    }
+
+    pub fn completed(
+        subagent_id: String,
+        output: &str,
+        completed_at: String,
+        after_byte: usize,
+        max_bytes: usize,
+    ) -> Result<Self, SubagentError> {
+        if max_bytes == 0
+            || max_bytes > GET_AGENT_RESULT_MAX_BYTES
+            || after_byte > output.len()
+            || !output.is_char_boundary(after_byte)
+        {
+            return Err(SubagentError::InvalidResultRange);
+        }
+        let mut end = output.len().min(after_byte.saturating_add(max_bytes));
+        while end > after_byte && !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        let next_after_byte = (end < output.len()).then_some(end);
+        Self::validated(Self {
+            subagent_id,
+            status: GetAgentResultStatus::Completed,
+            output: Some(output[after_byte..end].to_owned()),
+            output_start_byte: Some(after_byte),
+            output_end_byte: Some(end),
+            output_total_bytes: Some(output.len()),
+            next_after_byte,
+            completed_at: Some(completed_at),
+        })
+    }
+
+    fn validated(result: Self) -> Result<Self, SubagentError> {
+        if protocol::validate_session_id(&result.subagent_id).is_err()
+            || result
+                .completed_at
+                .as_deref()
+                .is_some_and(|value| value.is_empty() || value.len() > 128 || value.trim() != value)
+        {
+            return Err(SubagentError::InvalidAgentResult);
+        }
+        let encoded = serde_json::to_vec(&result).map_err(|_| SubagentError::InvalidAgentResult)?;
+        if encoded.len() > TOOL_OUTPUT_MAX_SERIALIZED_BYTES {
+            return Err(SubagentError::InvalidAgentResult);
+        }
+        Ok(result)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -169,6 +328,31 @@ pub fn prepare_list_agents(arguments: &Value) -> Result<ListAgentsRequest, Subag
     Ok(ListAgentsRequest {
         cursor: raw.cursor,
         limit,
+    })
+}
+
+pub fn prepare_get_agent_result(arguments: &Value) -> Result<GetAgentResultRequest, SubagentError> {
+    let encoded =
+        serde_json::to_vec(arguments).map_err(|_| SubagentError::InvalidResultArguments)?;
+    if encoded.len() > GET_AGENT_RESULT_ARGUMENTS_MAX_BYTES {
+        return Err(SubagentError::InvalidResultArguments);
+    }
+    let raw: RawGetAgentResultRequest = serde_json::from_value(arguments.clone())
+        .map_err(|_| SubagentError::InvalidResultArguments)?;
+    if protocol::validate_session_id(&raw.subagent_id).is_err() {
+        return Err(SubagentError::InvalidResultSubagentId);
+    }
+    let after_byte = raw.after_byte.unwrap_or(0);
+    let max_bytes = raw.max_bytes.unwrap_or(GET_AGENT_RESULT_DEFAULT_MAX_BYTES);
+    if after_byte > protocol::ASSISTANT_MESSAGE_MAX_BYTES
+        || !(1..=GET_AGENT_RESULT_MAX_BYTES).contains(&max_bytes)
+    {
+        return Err(SubagentError::InvalidResultRange);
+    }
+    Ok(GetAgentResultRequest {
+        subagent_id: raw.subagent_id,
+        after_byte,
+        max_bytes,
     })
 }
 
@@ -287,6 +471,43 @@ pub fn list_agents_descriptor() -> ToolDescriptor {
     }
 }
 
+pub fn get_agent_result_descriptor() -> ToolDescriptor {
+    ToolDescriptor {
+        name: GET_AGENT_RESULT_TOOL_NAME.into(),
+        version: GET_AGENT_RESULT_TOOL_VERSION.into(),
+        description: GET_AGENT_RESULT_DESCRIPTION.into(),
+        effect: ToolEffect::ReadOnly,
+        sandbox_profile: SandboxProfile::ReadOnly,
+        input_schema: ObjectSchema {
+            max_serialized_bytes: GET_AGENT_RESULT_ARGUMENTS_MAX_BYTES,
+            properties: BTreeMap::from([
+                (
+                    "subagent_id".into(),
+                    ParameterSpec::required_string(protocol::SESSION_ID_MAX_BYTES),
+                ),
+                (
+                    "after_byte".into(),
+                    ParameterSpec {
+                        parameter_type: ParameterType::Integer,
+                        required: false,
+                        min_length: None,
+                        max_length: None,
+                    },
+                ),
+                (
+                    "max_bytes".into(),
+                    ParameterSpec {
+                        parameter_type: ParameterType::Integer,
+                        required: false,
+                        min_length: None,
+                        max_length: None,
+                    },
+                ),
+            ]),
+        },
+    }
+}
+
 pub fn spawn_agent_descriptor() -> ToolDescriptor {
     ToolDescriptor {
         name: SPAWN_AGENT_TOOL_NAME.into(),
@@ -311,6 +532,7 @@ pub fn spawn_agent_descriptor() -> ToolDescriptor {
 }
 
 pub fn register_subagent_tools(registry: &mut ToolRegistry) -> Result<(), RegistryError> {
+    registry.register(get_agent_result_descriptor(), RuntimeSubagentExecutor)?;
     registry.register(list_agents_descriptor(), RuntimeSubagentExecutor)?;
     registry.register(spawn_agent_descriptor(), RuntimeSubagentExecutor)
 }
@@ -389,6 +611,84 @@ mod tests {
         let mut registry = ToolRegistry::new();
         register_subagent_tools(&mut registry).unwrap();
         assert!(registry.descriptor(LIST_AGENTS_TOOL_NAME).is_some());
+        assert!(registry.descriptor(GET_AGENT_RESULT_TOOL_NAME).is_some());
+    }
+
+    #[test]
+    fn get_result_request_is_strict_defaulted_and_bounded() {
+        let request = prepare_get_agent_result(&serde_json::json!({
+            "subagent_id": "subagent-child",
+        }))
+        .unwrap();
+        assert_eq!(request.subagent_id(), "subagent-child");
+        assert_eq!(request.after_byte(), 0);
+        assert_eq!(request.max_bytes(), GET_AGENT_RESULT_DEFAULT_MAX_BYTES);
+
+        let request = prepare_get_agent_result(&serde_json::json!({
+            "subagent_id": "subagent-child",
+            "after_byte": 12,
+            "max_bytes": 1024,
+        }))
+        .unwrap();
+        assert_eq!(request.after_byte(), 12);
+        assert_eq!(request.max_bytes(), 1024);
+
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"subagent_id": " bad"}),
+            serde_json::json!({"subagent_id": "child", "max_bytes": 0}),
+            serde_json::json!({"subagent_id": "child", "max_bytes": GET_AGENT_RESULT_MAX_BYTES + 1}),
+            serde_json::json!({"subagent_id": "child", "unknown": true}),
+        ] {
+            assert!(prepare_get_agent_result(&invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn get_result_is_terminal_safe_utf8_paged_and_output_bounded() {
+        let output = format!("{}tail", "🙂".repeat(GET_AGENT_RESULT_MAX_BYTES / 4));
+        let first = GetAgentResult::completed(
+            "subagent-child".into(),
+            &output,
+            "2026-08-28T00:00:00.000Z".into(),
+            0,
+            GET_AGENT_RESULT_MAX_BYTES - 1,
+        )
+        .unwrap();
+        assert_eq!(first.status, GetAgentResultStatus::Completed);
+        assert_eq!(first.output_start_byte, Some(0));
+        assert_eq!(first.output_end_byte, Some(GET_AGENT_RESULT_MAX_BYTES - 4));
+        assert_eq!(first.next_after_byte, first.output_end_byte);
+        assert!(serde_json::to_vec(&first).unwrap().len() <= TOOL_OUTPUT_MAX_SERIALIZED_BYTES);
+
+        assert!(
+            GetAgentResult::completed(
+                "subagent-child".into(),
+                &output,
+                "2026-08-28T00:00:00.000Z".into(),
+                1,
+                1024,
+            )
+            .is_err()
+        );
+        let escaped = GetAgentResult::completed(
+            "subagent-child".into(),
+            &"\0".repeat(GET_AGENT_RESULT_MAX_BYTES),
+            "2026-08-28T00:00:00.000Z".into(),
+            0,
+            GET_AGENT_RESULT_MAX_BYTES,
+        )
+        .unwrap();
+        assert!(serde_json::to_vec(&escaped).unwrap().len() <= TOOL_OUTPUT_MAX_SERIALIZED_BYTES);
+
+        let failed = GetAgentResult::failed(
+            "subagent-child".into(),
+            GetAgentResultStatus::Failed,
+            "2026-08-28T00:00:00.000Z".into(),
+        )
+        .unwrap();
+        assert!(failed.output.is_none());
+        assert!(failed.next_after_byte.is_none());
     }
 
     #[test]

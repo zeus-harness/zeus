@@ -677,6 +677,18 @@ pub struct AgentSubagentSpawnCandidate {
     pub manifest: ManifestEnvelope,
 }
 
+/// Terminal-result source for one direct child authorized by an exact started
+/// `get_agent_result` call. Failure details intentionally remain outside this
+/// projection so partial or provider-internal output cannot cross the tool
+/// boundary as a successful child result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentSubagentResultSnapshot {
+    pub subagent_id: String,
+    pub status: AgentTurnStatus,
+    pub assistant_message: Option<String>,
+    pub completed_at: Option<String>,
+}
+
 /// Read-only scheduling candidate for the first queued follow-up of one Ready
 /// Session. The synthetic auth-session ID is internal; durable admission
 /// rechecks the captured membership revision without trusting a browser login.

@@ -94,12 +94,15 @@ turn. Admission is bounded to eight direct children and three ancestry levels;
 capacity rejection rolls the whole child transaction back and becomes a known
 parent tool failure.
 
-Every Agent profile exposes `spawn_agent` plus the read-only `list_agents`
-tool. Both require the exact persisted `started` Agent tool scope and derive
-account, actor, parent Session, turn, and Agent identity server-side.
-`list_agents` returns only children admitted by `spawn_agent`, not arbitrary
-manual Session forks, in opaque-cursor pages (default 16, maximum 32). This
-stage starts background children but does not yet expose send or interrupt.
+Every Agent profile exposes `spawn_agent` plus the read-only `list_agents` and
+`get_agent_result` tools. All require the exact persisted `started` Agent tool
+scope and derive account, actor, parent Session, turn, and Agent identity
+server-side. `list_agents` returns only children admitted by `spawn_agent`, not
+arbitrary manual Session forks, in opaque-cursor pages (default 16, maximum
+32). `get_agent_result` can read only a child created by that direct parent;
+successful final output uses UTF-8-safe pages of at most 8 KiB, while failed
+or indeterminate children never expose partial output as success. This stage
+does not yet expose send or interrupt.
 
 Alpha+ bootstraps a local `acc_local` root and now supports a bounded local
 multi-account control plane. An owner can create accounts idempotently; one
@@ -1379,19 +1382,20 @@ cancellation, schema v28 durable Agent planning, schema v29 durable Session
 Goals, schema v30 same-Session Goal rounds, schema v31 durable Session
 follow-ups, schema v32 durable Agent model output, schema v33 running-model
 cancellation, schema v34 durable Session forks, schema v35 durable fork catalog,
-schema v36 durable `spawn_agent` admission and Agent-scoped `list_agents`,
+schema v36 durable `spawn_agent` admission, Agent-scoped `list_agents`, and
+direct-child `get_agent_result`,
 Trusted Single-Node Ingress,
 Per-Operation SecretRef Resolution, the startup-bound Skill Catalog, and the
 bounded multi-account control plane:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 693 tests passed
+- `cargo test --workspace --all-targets --locked`: 696 tests passed
   across the top-level test targets, including 22 connector tests,
   8 deployment tests, 29 knowledge tests, 30 LLM unit and 18 provider-contract
-  tests, 4 Goal tests, 5 Skill Catalog tests, 6 Subagent tests,
+  tests, 4 Goal tests, 5 Skill Catalog tests, 8 Subagent tests,
   286 storage tests, 21 workflow tests, 52 runtime tests, 21 protocol tests,
-  94 API library tests, 18 API main/config
+  95 API library tests, 18 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,

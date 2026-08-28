@@ -9755,6 +9755,11 @@ mod tests {
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
     }
 
+    struct SpawnReadResultThenFinalProvider {
+        metadata: ProviderMetadata,
+        requests: Arc<StdMutex<Vec<ReplyRequest>>>,
+    }
+
     struct GoalReadCreateThenFinalProvider {
         metadata: ProviderMetadata,
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
@@ -10152,6 +10157,19 @@ mod tests {
         }
     }
 
+    impl SpawnReadResultThenFinalProvider {
+        fn new(requests: Arc<StdMutex<Vec<ReplyRequest>>>) -> Self {
+            Self {
+                metadata: ProviderMetadata {
+                    provider_id: "test-spawn-read-result-provider".into(),
+                    model: Some("test-model".into()),
+                    reply_kind: ReplyKind::Model,
+                },
+                requests,
+            }
+        }
+    }
+
     impl ReplyProvider for SpawnListThenFinalProvider {
         fn metadata(&self) -> &ProviderMetadata {
             &self.metadata
@@ -10250,6 +10268,103 @@ mod tests {
                         }
                     }
                 };
+            let provider = self.metadata.clone();
+            Box::pin(async move {
+                Ok(ReplyResponse {
+                    output,
+                    finish_reason: Some("stop".into()),
+                    provider,
+                })
+            })
+        }
+    }
+
+    impl ReplyProvider for SpawnReadResultThenFinalProvider {
+        fn metadata(&self) -> &ProviderMetadata {
+            &self.metadata
+        }
+
+        fn reply(&self, request: ReplyRequest) -> ReplyFuture<'_> {
+            let output = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(request.clone());
+                let current_user = request
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == ReplyRole::User)
+                    .map(|message| message.content.as_str());
+                if current_user == Some("produce the durable child result") {
+                    ReplyOutput::Final {
+                        content: "durable child result".into(),
+                    }
+                } else {
+                    let tool_results = request
+                        .messages
+                        .iter()
+                        .filter(|message| message.role == ReplyRole::Tool)
+                        .map(|message| {
+                            serde_json::from_str::<serde_json::Value>(&message.content).unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    match tool_results.as_slice() {
+                        [] => ReplyOutput::ToolCall {
+                            call: ReplyToolCall::new(
+                                "provider-call-spawn-result-child",
+                                subagents::SPAWN_AGENT_TOOL_NAME,
+                                serde_json::json!({
+                                    "description": "Result child",
+                                    "prompt": "produce the durable child result",
+                                }),
+                            ),
+                        },
+                        [spawned] => {
+                            assert!(spawned["subagent_id"].is_string());
+                            ReplyOutput::ToolCall {
+                                call: ReplyToolCall::new(
+                                    "provider-call-list-before-result",
+                                    subagents::LIST_AGENTS_TOOL_NAME,
+                                    serde_json::json!({"limit": 8}),
+                                ),
+                            }
+                        }
+                        [spawned, listed] => {
+                            let subagent_id = spawned["subagent_id"]
+                                .as_str()
+                                .expect("spawn_agent must return its child ID");
+                            assert_eq!(listed["agents"][0]["session"]["id"], subagent_id);
+                            let tool = request
+                                .tools
+                                .iter()
+                                .find(|tool| tool.name == subagents::GET_AGENT_RESULT_TOOL_NAME)
+                                .expect("every parent Agent request must expose get_agent_result");
+                            assert_eq!(
+                                tool.parameters["properties"]["subagent_id"]["maxLength"],
+                                protocol::SESSION_ID_MAX_BYTES
+                            );
+                            ReplyOutput::ToolCall {
+                                call: ReplyToolCall::new(
+                                    "provider-call-get-agent-result",
+                                    subagents::GET_AGENT_RESULT_TOOL_NAME,
+                                    serde_json::json!({"subagent_id": subagent_id}),
+                                ),
+                            }
+                        }
+                        [_, _, result] => {
+                            assert_eq!(result["status"], "completed");
+                            assert_eq!(result["output"], "durable child result");
+                            assert_eq!(result["output_start_byte"], 0);
+                            assert_eq!(result["output_end_byte"], 20);
+                            assert_eq!(result["output_total_bytes"], 20);
+                            assert!(result.get("next_after_byte").is_none());
+                            ReplyOutput::Final {
+                                content: "parent consumed the durable child result".into(),
+                            }
+                        }
+                        results => panic!("unexpected parent tool-result count {}", results.len()),
+                    }
+                }
+            };
             let provider = self.metadata.clone();
             Box::pin(async move {
                 Ok(ReplyResponse {
@@ -12958,6 +13073,104 @@ mod tests {
                 "inspect child alpha" | "inspect child beta"
             ));
         }
+        store.verify_integrity().await.unwrap();
+        drop(app);
+    }
+
+    #[tokio::test]
+    async fn agent_reads_only_its_durable_direct_child_terminal_result() {
+        let store = DemoStore::seeded().await.unwrap();
+        let owner = provision_test_owner(
+            &store,
+            "user-agent-child-result",
+            "agent-child-result-owner",
+        )
+        .await;
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: "session-agent-child-result".into(),
+                    title: "Durable child result".into(),
+                },
+                "create-agent-child-result",
+            )
+            .await
+            .unwrap();
+
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(SpawnReadResultThenFinalProvider::new(Arc::clone(&requests))),
+        )
+        .unwrap();
+        let started = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-agent-child-result/turns")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "start-agent-child-result")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-agent-child-result",
+                            "user_message": "delegate and consume one child result",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+
+        let session =
+            wait_for_ready_session(&store, &owner.authz, "session-agent-child-result").await;
+        assert_eq!(
+            session.turns[0].assistant_message.as_deref(),
+            Some("parent consumed the durable child result")
+        );
+        let agent = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            "session-agent-child-result",
+            "turn-agent-child-result",
+            protocol::AgentTurnStatus::Succeeded,
+        )
+        .await;
+        assert_eq!(agent.model_steps, 4);
+        assert_eq!(agent.tool_calls, 3);
+        assert_eq!(agent.calls[0].tool, subagents::SPAWN_AGENT_TOOL_NAME);
+        assert_eq!(agent.calls[1].tool, subagents::LIST_AGENTS_TOOL_NAME);
+        assert_eq!(agent.calls[2].tool, subagents::GET_AGENT_RESULT_TOOL_NAME);
+        assert!(agent.calls.iter().all(|call| {
+            call.status == AgentToolCallStatus::Succeeded && !call.approval_required
+        }));
+        let result: subagents::GetAgentResult =
+            serde_json::from_value(agent.calls[2].output.clone().unwrap()).unwrap();
+        assert_eq!(result.status, subagents::GetAgentResultStatus::Completed);
+        assert_eq!(result.output.as_deref(), Some("durable child result"));
+        assert_eq!(result.next_after_byte, None);
+
+        let recorded = requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 5);
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|request| {
+                    request.messages.iter().any(|message| {
+                        message.role == ReplyRole::User
+                            && message.content == "produce the durable child result"
+                    })
+                })
+                .count(),
+            1
+        );
         store.verify_integrity().await.unwrap();
         drop(app);
     }

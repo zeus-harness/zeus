@@ -441,11 +441,13 @@ schema v35 的 `GET /api/v1/sessions/{parent_id}/forks` 返回 direct-child summ
 默认 50、上限 100，下一页使用绑定 cursor kind/account/actor/parent 的 opaque cursor。授权先于
 query/cursor 解析，foreign parent 不会泄露游标是否合法。
 每个 Agent profile 注册 `spawn_agent@1-durable-session-fork` 与只读
-`list_agents@1-direct-session-forks`。Spawn 只继承 parent 当前 in-flight turn 之前的完整历史，
+`list_agents@1-direct-session-forks`、`get_agent_result@1-direct-child-snapshot`。Spawn 只继承 parent 当前 in-flight turn 之前的完整历史，
 原子排入后台 child model job，并限制最多 8 个直属 child、最多 3 层 ancestry。List 只接受严格的可选 cursor
 与 `1..=32` limit（默认 16），并且必须绑定 exact durable `started` Agent tool call；parent Session、
 account 和 actor 均从 server scope 派生。结果只含由 `spawn_agent` 创建的直接 child，不把普通
-Session fork 冒充 Agent；当前阶段尚不提供 send、interrupt 或递归全图加载。
+Session fork 冒充 Agent。Result read 只能命中同一 parent 的直属 child：running 只返回状态，
+successful output 按最多 8 KiB 的 UTF-8-safe page 返回，failed/needs_attention 不泄露 partial output；
+当前阶段尚不提供 send、interrupt 或递归全图加载。
 Knowledge v1 生成独立、受治理、带完整 digest 的 canonical context
 snapshot，不修改 system prompt。schema v22 已完成数据库绑定、
 Agent request 注入和 exact replay；LLM 协议层使用独立 durable `context` role，并只在
@@ -524,7 +526,8 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
   隔离、limit 边界、索引 query plan、API continuation header，以及历史 migration。
   schema v36 覆盖 parent result 与 child admission 原子提交、容量拒绝全量回滚、确定性 ID、重启
   deep integrity、same-name weakened trigger，以及真实 Agent 连续 spawn 两个后台 child 后通过
-  两页 `list_agents` 发现；普通 Session fork 不会进入 Agent catalog。
+  两页 `list_agents` 发现；普通 Session fork 不会进入 Agent catalog。另覆盖 direct-child-only
+  `get_agent_result` scope、成功终态读取与真实 parent 消费 child final output。
 - Session/Run detail 只返回最新 bounded tail；opaque cursor 的 kind、resource scope、canonical
   encoding、future-head 和跨资源使用均有自动测试，返回页保持连续且升序。
 - disabled/降权/owner mismatch 的 reply 与 dispatch claim 不触达外部执行，并留下
@@ -533,10 +536,10 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 按项目既有统计口径通过 687 个 Rust 测试（authz 7、connectors 22、deployment 8、
+- host 按项目既有统计口径通过 696 个 Rust 测试（authz 7、connectors 22、deployment 8、
   execution 16、goals 4、kernel 10、knowledge 29、LLM unit 30、provider contract 18、planning 4、
-  protocol 21、runtime 52、skills 5、subagents 3、storage 283、tenancy 15、terminal 10、tools 16、
-  workflows 21、API library 94、API main/config 18、graceful shutdown 1）与 28 个 Web Node 测试。
+  protocol 21、runtime 52、skills 5、subagents 8、storage 286、tenancy 15、terminal 10、tools 16、
+  workflows 21、API library 95、API main/config 18、graceful shutdown 1）与 28 个 Web Node 测试。
 - `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 
 ## 8. 容器与 OOM 验收边界

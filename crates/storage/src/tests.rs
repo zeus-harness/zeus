@@ -15835,6 +15835,132 @@ async fn list_agents_catalog_requires_the_exact_started_agent_tool_scope() {
             .await,
         Err(StorageError::AgentToolCallNotFound(_))
     ));
+
+    let list_terminal = match store
+        .complete_agent_tool(AgentToolCompletionCommit {
+            call_id: list_call.call_id,
+            status: AgentToolCallStatus::Succeeded,
+            result_json: serde_json::to_value(
+                subagents::ListAgentsResult::new(first.items.clone(), None).unwrap(),
+            )
+            .unwrap(),
+            provider_request_id: None,
+            next_request_json: None,
+        })
+        .await
+        .unwrap()
+    {
+        AgentToolCompletion::Terminal(completion) => completion,
+        AgentToolCompletion::ModelQueued { .. } => {
+            panic!("list result without continuation must end")
+        }
+    };
+    let resumed = store
+        .resume_session_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            ResumeSessionRequest {
+                expected_sequence: list_terminal.session.sequence,
+            },
+            "resume-for-child-result",
+        )
+        .await
+        .unwrap();
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-get-agent-result".into(),
+                user_message: "read the completed direct child".into(),
+                expected_sequence: resumed.session.sequence,
+            },
+            "start-get-agent-result",
+            agent_turn_spec_with_manifest(
+                "agent-get-agent-result",
+                "turn-get-agent-result",
+                manifest.clone(),
+                "read the completed direct child",
+            ),
+        )
+        .await
+        .unwrap();
+    let AgentModelClaimOutcome::Claimed(model) =
+        store.claim_next_agent_model(&manifest).await.unwrap()
+    else {
+        panic!("the get_agent_result model proposal must start");
+    };
+    let result_call = get_agent_result_tool_call_spec(
+        "call-get-agent-result",
+        json!({"subagent_id": identity.session_id}),
+    );
+    store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: model.id,
+            response_json: agent_tool_response_json(&result_call),
+            resolution: AgentModelResolution::ToolCall {
+                call: result_call.clone(),
+            },
+        })
+        .await
+        .unwrap();
+    let AgentToolClaimOutcome::Claimed(result_work) =
+        store.claim_next_agent_tool(&manifest).await.unwrap()
+    else {
+        panic!("the get_agent_result tool must cross its started checkpoint");
+    };
+    let result_scope = tools::ExecutionScope::new(
+        result_work.call.account_id.as_str(),
+        result_work.model_job.actor_user_id.as_str(),
+        result_work.call.session_id.as_str(),
+        result_work.call.turn_id.as_str(),
+        result_work.call.agent_id.as_str(),
+    )
+    .unwrap();
+    let snapshot = store
+        .agent_subagent_result_for_started_tool(
+            &result_scope,
+            &result_work.call.call_id,
+            &identity.session_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(snapshot.status, AgentTurnStatus::Succeeded);
+    assert_eq!(
+        snapshot.assistant_message.as_deref(),
+        Some("child complete")
+    );
+    assert!(snapshot.completed_at.is_some());
+    assert!(matches!(
+        store
+            .agent_subagent_result_for_started_tool(
+                &result_scope,
+                &result_work.call.call_id,
+                "session-manual-child",
+            )
+            .await,
+        Err(StorageError::AgentToolCallNotFound(_))
+    ));
+    assert!(matches!(
+        store
+            .agent_subagent_result_for_started_tool(
+                &foreign_scope,
+                &result_work.call.call_id,
+                &identity.session_id,
+            )
+            .await,
+        Err(StorageError::AgentToolCallNotFound(_))
+    ));
+    store
+        .complete_agent_tool(AgentToolCompletionCommit {
+            call_id: result_call.call_id,
+            status: AgentToolCallStatus::Succeeded,
+            result_json: json!({"status": "completed"}),
+            provider_request_id: None,
+            next_request_json: None,
+        })
+        .await
+        .unwrap();
     store.verify_integrity().await.unwrap();
     drop(store);
 
@@ -22901,6 +23027,7 @@ fn todo_test_agent_manifest() -> ManifestEnvelope {
 fn list_agents_test_agent_manifest() -> ManifestEnvelope {
     let mut manifest = test_agent_manifest().manifest;
     for descriptor in [
+        subagents::get_agent_result_descriptor(),
         subagents::list_agents_descriptor(),
         subagents::spawn_agent_descriptor(),
     ] {
@@ -23230,6 +23357,23 @@ fn todo_agent_tool_call_spec(call_id: &str, expected_revision: u64) -> AgentTool
 
 fn list_agents_tool_call_spec(call_id: &str, arguments_json: Value) -> AgentToolCallSpec {
     let descriptor = subagents::list_agents_descriptor();
+    AgentToolCallSpec {
+        call_id: call_id.into(),
+        provider_call_id: format!("provider-call-{call_id}"),
+        tool_name: descriptor.name,
+        tool_version: descriptor.version,
+        arguments_digest: tools::arguments_digest(&arguments_json),
+        arguments_json,
+        effect: descriptor.effect,
+        sandbox_profile: descriptor.sandbox_profile,
+        executor_status: ToolExecutorStatus::Available,
+        policy_decision: PolicyDecision::Allow,
+        policy_revision: "local/v1".into(),
+    }
+}
+
+fn get_agent_result_tool_call_spec(call_id: &str, arguments_json: Value) -> AgentToolCallSpec {
+    let descriptor = subagents::get_agent_result_descriptor();
     AgentToolCallSpec {
         call_id: call_id.into(),
         provider_call_id: format!("provider-call-{call_id}"),

@@ -12,9 +12,9 @@ use crate::{
     AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit, AgentOperationClaim,
     AgentOperationKind, AgentPreparedModel, AgentPreparedTool, AgentPromptCommit,
     AgentPromptRevisionPage, AgentPromptRevisionSummary, AgentPromptState, AgentPromptUpdateResult,
-    AgentReviewCommit, AgentReviewContext, AgentReviewResult, AgentSubagentSpawnCandidate,
-    AgentSubagentSpawnCommit, AgentTerminalCompletion, AgentToolCall, AgentToolCallSpec,
-    AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
+    AgentReviewCommit, AgentReviewContext, AgentReviewResult, AgentSubagentResultSnapshot,
+    AgentSubagentSpawnCandidate, AgentSubagentSpawnCommit, AgentTerminalCompletion, AgentToolCall,
+    AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
     AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe,
     DEFAULT_SESSION_AGENT_PROMPT_REVISION, DEFAULT_SESSION_AGENT_SYSTEM_PROMPT,
     KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage, KnowledgeCatalogRevisionSummary,
@@ -504,6 +504,30 @@ impl SqliteStore {
                 &call_id,
                 cursor.as_deref(),
                 limit,
+            )
+        })
+        .await
+    }
+
+    /// Returns one direct child's current state and trustworthy terminal
+    /// assistant output only for an exact durably started `get_agent_result`
+    /// call in its parent Agent scope.
+    pub async fn agent_subagent_result_for_started_tool(
+        &self,
+        scope: &ExecutionScope,
+        call_id: &str,
+        child_session_id: &str,
+    ) -> Result<AgentSubagentResultSnapshot, StorageError> {
+        let scope = scope.clone();
+        let call_id = validated_durable_reference(call_id, "Agent tool call ID")?.to_owned();
+        let child_session_id =
+            validated_durable_reference(child_session_id, "subagent Session ID")?.to_owned();
+        self.with_connection(move |connection| {
+            query_agent_subagent_result_for_started_tool(
+                connection,
+                &scope,
+                &call_id,
+                &child_session_id,
             )
         })
         .await
@@ -4584,6 +4608,115 @@ fn query_agent_subagent_page(
         None
     };
     Ok(SessionForkPage { items, next_cursor })
+}
+
+fn query_agent_subagent_result_for_started_tool(
+    connection: &mut Connection,
+    scope: &ExecutionScope,
+    call_id: &str,
+    child_session_id: &str,
+) -> Result<AgentSubagentResultSnapshot, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let child_binding = transaction
+        .query_row(
+            r#"SELECT spawn.child_session_id, spawn.child_turn_id, spawn.child_agent_id
+               FROM agent_turns parent
+               JOIN agent_tool_calls call
+                 ON call.agent_id = parent.id
+                AND call.account_id = parent.account_id
+                AND call.session_id = parent.session_id
+                AND call.turn_id = parent.turn_id
+               JOIN agent_subagent_spawns spawn
+                 ON spawn.account_id = parent.account_id
+                AND spawn.actor_user_id = parent.actor_user_id
+                AND spawn.parent_session_id = parent.session_id
+               WHERE parent.id = ?1
+                 AND parent.account_id = ?2
+                 AND parent.actor_user_id = ?3
+                 AND parent.session_id = ?4
+                 AND parent.turn_id = ?5
+                 AND call.call_id = ?6
+                 AND call.tool_name = ?7
+                 AND call.tool_version = ?8
+                 AND call.status = 'started'
+                 AND spawn.child_session_id = ?9"#,
+            params![
+                scope.agent_id.as_str(),
+                scope.account_id.as_str(),
+                scope.actor_id.as_str(),
+                scope.session_id.as_str(),
+                scope.turn_id.as_str(),
+                call_id,
+                subagents::GET_AGENT_RESULT_TOOL_NAME,
+                subagents::GET_AGENT_RESULT_TOOL_VERSION,
+                child_session_id,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| StorageError::AgentToolCallNotFound(call_id.to_owned()))?;
+    let (stored_child_session_id, child_turn_id, child_agent_id) = child_binding;
+    let child_agent = query_agent_turn(&transaction, &child_agent_id)?;
+    if child_agent.account_id.as_str() != scope.account_id
+        || child_agent.actor_user_id != scope.actor_id
+        || child_agent.session_id != stored_child_session_id
+        || child_agent.turn_id != child_turn_id
+    {
+        return Err(StorageError::CorruptData(
+            "direct subagent result binding is inconsistent".into(),
+        ));
+    }
+    let snapshot = match child_agent.status {
+        AgentTurnStatus::Succeeded => {
+            let completion = query_agent_final_completion(&transaction, &child_agent)?;
+            AgentSubagentResultSnapshot {
+                subagent_id: stored_child_session_id,
+                status: child_agent.status,
+                assistant_message: completion.turn.assistant_message,
+                completed_at: completion.turn.completed_at,
+            }
+        }
+        AgentTurnStatus::Failed | AgentTurnStatus::NeedsAttention => {
+            let completion = query_agent_terminal_completion(&transaction, &child_agent)?;
+            AgentSubagentResultSnapshot {
+                subagent_id: stored_child_session_id,
+                status: child_agent.status,
+                assistant_message: None,
+                completed_at: completion.turn.completed_at,
+            }
+        }
+        _ => {
+            let child_session = query_session_summary(&transaction, &stored_child_session_id)?;
+            let child_turn =
+                query_session_turn(&transaction, &stored_child_session_id, &child_turn_id)?;
+            validate_session_event_tail(&transaction, &child_session)?;
+            if child_session.status != SessionStatus::Running
+                || child_session.active_turn_id.as_deref() != Some(child_turn_id.as_str())
+                || child_turn.status != SessionTurnStatus::Open
+                || child_turn.assistant_message.is_some()
+                || child_turn.completed_at.is_some()
+                || child_agent.completed_at.is_some()
+            {
+                return Err(StorageError::CorruptData(
+                    "running direct subagent result disagrees with its Session projection".into(),
+                ));
+            }
+            AgentSubagentResultSnapshot {
+                subagent_id: stored_child_session_id,
+                status: child_agent.status,
+                assistant_message: None,
+                completed_at: None,
+            }
+        }
+    };
+    transaction.commit()?;
+    Ok(snapshot)
 }
 
 fn query_subagent_spawn_candidate_for_started_tool(

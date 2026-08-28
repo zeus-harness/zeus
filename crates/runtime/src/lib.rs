@@ -105,8 +105,10 @@ use storage::{
     SqliteStore, StorageError,
 };
 use subagents::{
-    LIST_AGENTS_TOOL_NAME, LIST_AGENTS_TOOL_VERSION, ListAgentsResult, SPAWN_AGENT_TOOL_NAME,
-    SPAWN_AGENT_TOOL_VERSION, SpawnAgentResult, SubagentError, list_agents_descriptor,
+    GET_AGENT_RESULT_TOOL_NAME, GET_AGENT_RESULT_TOOL_VERSION, GetAgentResult,
+    GetAgentResultStatus, LIST_AGENTS_TOOL_NAME, LIST_AGENTS_TOOL_VERSION, ListAgentsResult,
+    SPAWN_AGENT_TOOL_NAME, SPAWN_AGENT_TOOL_VERSION, SpawnAgentResult, SubagentError,
+    get_agent_result_descriptor, list_agents_descriptor, prepare_get_agent_result,
     prepare_list_agents, prepare_spawn_agent, register_subagent_tools, spawn_agent_descriptor,
     spawn_agent_identity,
 };
@@ -1769,6 +1771,68 @@ impl DemoStore {
                     StoreError::Registry(RegistryError::Executor(ExecutorError::Failed {
                         code: "list_agents_result_encoding_failed".into(),
                         message: "The durable child catalog could not be encoded".into(),
+                        retryable: false,
+                    }))
+                })?,
+                replayed: false,
+                provider_request_id: None,
+            });
+        }
+        if resolved.call.tool == GET_AGENT_RESULT_TOOL_NAME
+            && resolved.call.tool_version == GET_AGENT_RESULT_TOOL_VERSION
+        {
+            let request = prepare_get_agent_result(&resolved.call.arguments)
+                .map_err(subagent_executor_error)?;
+            let snapshot = self
+                .storage
+                .agent_subagent_result_for_started_tool(
+                    &scope,
+                    &resolved.call.call_id,
+                    request.subagent_id(),
+                )
+                .await?;
+            let result = match snapshot.status {
+                protocol::AgentTurnStatus::Succeeded => GetAgentResult::completed(
+                    snapshot.subagent_id,
+                    snapshot.assistant_message.as_deref().ok_or_else(|| {
+                        StoreError::ExecutionInvariant(
+                            "a successful child Agent has no final assistant result".into(),
+                        )
+                    })?,
+                    snapshot.completed_at.ok_or_else(|| {
+                        StoreError::ExecutionInvariant(
+                            "a successful child Agent has no completion timestamp".into(),
+                        )
+                    })?,
+                    request.after_byte(),
+                    request.max_bytes(),
+                ),
+                protocol::AgentTurnStatus::Failed => GetAgentResult::failed(
+                    snapshot.subagent_id,
+                    GetAgentResultStatus::Failed,
+                    snapshot.completed_at.ok_or_else(|| {
+                        StoreError::ExecutionInvariant(
+                            "a failed child Agent has no completion timestamp".into(),
+                        )
+                    })?,
+                ),
+                protocol::AgentTurnStatus::NeedsAttention => GetAgentResult::failed(
+                    snapshot.subagent_id,
+                    GetAgentResultStatus::NeedsAttention,
+                    snapshot.completed_at.ok_or_else(|| {
+                        StoreError::ExecutionInvariant(
+                            "an indeterminate child Agent has no completion timestamp".into(),
+                        )
+                    })?,
+                ),
+                _ => GetAgentResult::running(snapshot.subagent_id),
+            }
+            .map_err(subagent_executor_error)?;
+            return Ok(ToolOutput {
+                value: serde_json::to_value(result).map_err(|_| {
+                    StoreError::Registry(RegistryError::Executor(ExecutorError::Failed {
+                        code: "get_agent_result_encoding_failed".into(),
+                        message: "The durable child result could not be encoded".into(),
                         retryable: false,
                     }))
                 })?,
@@ -4650,7 +4714,11 @@ fn register_runtime_subagent_tools(
     environment: &str,
     policy_revision: &str,
 ) -> Result<(), StoreError> {
-    for descriptor in [list_agents_descriptor(), spawn_agent_descriptor()] {
+    for descriptor in [
+        get_agent_result_descriptor(),
+        list_agents_descriptor(),
+        spawn_agent_descriptor(),
+    ] {
         policy_rules.push(PolicyRule {
             revision: policy_revision.into(),
             tool: descriptor.name,
@@ -4670,6 +4738,10 @@ fn subagent_executor_error(error: SubagentError) -> StoreError {
         SubagentError::InvalidLimit => "list_agents_invalid_limit",
         SubagentError::InvalidCursor => "list_agents_invalid_cursor",
         SubagentError::InvalidResult => "list_agents_invalid_result",
+        SubagentError::InvalidResultArguments => "get_agent_result_invalid_arguments",
+        SubagentError::InvalidResultSubagentId => "get_agent_result_invalid_subagent_id",
+        SubagentError::InvalidResultRange => "get_agent_result_invalid_range",
+        SubagentError::InvalidAgentResult => "get_agent_result_invalid_result",
         SubagentError::InvalidSpawnArguments => "spawn_agent_invalid_arguments",
         SubagentError::InvalidSpawnDescription => "spawn_agent_invalid_description",
         SubagentError::InvalidSpawnPrompt => "spawn_agent_invalid_prompt",
@@ -5189,7 +5261,7 @@ mod tests {
         let store = local_store(&paths, false).await;
 
         let definitions = store.session_agent_tool_definitions().unwrap();
-        assert_eq!(definitions.len(), 7);
+        assert_eq!(definitions.len(), 8);
         assert_eq!(definitions[0].name, goals::CREATE_GOAL_TOOL_NAME);
         assert_eq!(definitions[1].name, connectors::DEV_MARKER_TOOL_NAME);
         assert_eq!(
@@ -5208,27 +5280,32 @@ mod tests {
                 "x-zeus-max-serialized-bytes": 160
             })
         );
-        assert_eq!(definitions[2].name, goals::GET_GOAL_TOOL_NAME);
-        assert_eq!(definitions[3].name, subagents::LIST_AGENTS_TOOL_NAME);
+        assert_eq!(definitions[2].name, subagents::GET_AGENT_RESULT_TOOL_NAME);
         assert_eq!(
-            definitions[3].input_schema["properties"]["cursor"]["maxLength"],
+            definitions[2].input_schema["properties"]["subagent_id"]["maxLength"],
+            protocol::SESSION_ID_MAX_BYTES
+        );
+        assert_eq!(definitions[3].name, goals::GET_GOAL_TOOL_NAME);
+        assert_eq!(definitions[4].name, subagents::LIST_AGENTS_TOOL_NAME);
+        assert_eq!(
+            definitions[4].input_schema["properties"]["cursor"]["maxLength"],
             subagents::LIST_AGENTS_CURSOR_MAX_BYTES
         );
-        assert_eq!(definitions[4].name, subagents::SPAWN_AGENT_TOOL_NAME);
+        assert_eq!(definitions[5].name, subagents::SPAWN_AGENT_TOOL_NAME);
         assert_eq!(
-            definitions[4].input_schema["properties"]["prompt"]["maxLength"],
+            definitions[5].input_schema["properties"]["prompt"]["maxLength"],
             subagents::SPAWN_AGENT_PROMPT_MAX_BYTES
         );
-        assert_eq!(definitions[5].name, planning::TODO_WRITE_TOOL_NAME);
+        assert_eq!(definitions[6].name, planning::TODO_WRITE_TOOL_NAME);
         assert_eq!(
-            definitions[5].input_schema["properties"]["todos"]["maxItems"],
+            definitions[6].input_schema["properties"]["todos"]["maxItems"],
             planning::TODO_MAX_ITEMS
         );
         assert_eq!(
-            definitions[5].input_schema["properties"]["todos"]["items"]["properties"]["status"]["enum"],
+            definitions[6].input_schema["properties"]["todos"]["items"]["properties"]["status"]["enum"],
             serde_json::json!(["pending", "in_progress", "completed"])
         );
-        assert_eq!(definitions[6].name, goals::UPDATE_GOAL_TOOL_NAME);
+        assert_eq!(definitions[7].name, goals::UPDATE_GOAL_TOOL_NAME);
 
         let production = DemoStore::seeded().await.unwrap();
         assert_eq!(
@@ -5240,6 +5317,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 goals::CREATE_GOAL_TOOL_NAME,
+                subagents::GET_AGENT_RESULT_TOOL_NAME,
                 goals::GET_GOAL_TOOL_NAME,
                 subagents::LIST_AGENTS_TOOL_NAME,
                 subagents::SPAWN_AGENT_TOOL_NAME,
@@ -5466,6 +5544,7 @@ mod tests {
             [
                 goals::CREATE_GOAL_TOOL_NAME,
                 connectors::DEV_MARKER_TOOL_NAME,
+                subagents::GET_AGENT_RESULT_TOOL_NAME,
                 goals::GET_GOAL_TOOL_NAME,
                 subagents::LIST_AGENTS_TOOL_NAME,
                 skills::SKILL_LIST_TOOL_NAME,
