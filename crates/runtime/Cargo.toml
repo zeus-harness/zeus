@@ -17,6 +17,7 @@ deployment.workspace = true
 execution.workspace = true
 kernel.workspace = true
 knowledge.workspace = true
+planning.workspace = true
 protocol.workspace = true
 serde_json.workspace = true
 skills.workspace = true

@@ -6,7 +6,7 @@ Physical/Operation Capacity、Bootstrap Audit Retention、schema v13 Account Mem
 Foundation、schema v14 Account-scoped Durable Authorization、schema v15 Member Lifecycle /
 Account Audit、schema v16 Session Reply Context Index 至 schema v25 Durable Session Context
 Compaction、schema v26 Account-scoped Reply Provider Selection、schema v27 Safe Agent
-Cancellation、Trusted Single-Node Ingress、
+Cancellation、schema v28 Durable Agent Planning、Trusted Single-Node Ingress、
 Per-Operation SecretRef Resolution、启动绑定的 Skill Catalog 与有界多账户控制面主机代码已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
 v11→v12→v13→v14 迁移证据，current-image 证据见本节验收结果，Linux Docker PID/OOM
 authoritative gate 待完成。
@@ -364,6 +364,10 @@ POST /sessions/{id}/turns
 - `0027_agent_safe_cancellation.sql`：扩展 tool-call durability trigger，只允许没有 RunEpoch 的
   queued/waiting-approval call 在匹配当前 `user_cancelled` execution fact 时进入 `cancelled`；既有
   approval、dispatch、known-result 与 outcome-unknown 单向迁移规则保持不变。
+- `0028_agent_todo_snapshots.sql`：增加 Agent-owned whole-list plan snapshot。每次成功
+  `todo_write@1-single-active` 必须从当前 revision 连续前进，snapshot 与 exact started call、规范化
+  result、三态 counters、SHA-256 digest 和完成时间同事务绑定；update/delete、缺失成功 snapshot、
+  非成功 call 携带 snapshot 以及 same-name weakened trigger 都会 fail closed。
 
 schema v24 的 system prompt governance 复用 `0019` 的 prompt binding，并增加 durable
 head/revision/receipt。Owner-only `GET/PUT /api/v1/agent/prompt` 通过 expected-revision CAS 和
@@ -458,8 +462,10 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 按项目既有统计口径通过 636 个 Rust 测试（connectors 22、deployment 8、knowledge 29、
-  LLM unit 30、provider contract 15、skills 5、storage 261、workflows 21、runtime 50、API library 83、API main/config 18）与 28 个 Web Node 测试。
+- host 按项目既有统计口径通过 645 个 Rust 测试（authz 7、connectors 22、deployment 8、
+  execution 16、kernel 10、knowledge 29、LLM unit 30、provider contract 15、planning 4、
+  protocol 20、runtime 51、skills 5、storage 263、tenancy 15、terminal 10、tools 16、
+  workflows 21、API library 84、API main/config 18、graceful shutdown 1）与 28 个 Web Node 测试。
 - `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 
 ## 8. 容器与 OOM 验收边界

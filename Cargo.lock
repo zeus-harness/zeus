@@ -961,6 +961,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
+name = "planning"
+version = "0.1.0"
+dependencies = [
+ "protocol",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tools",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1172,6 +1185,7 @@ dependencies = [
  "execution",
  "kernel",
  "knowledge",
+ "planning",
  "protocol",
  "rusqlite",
  "serde_json",
@@ -1421,6 +1435,7 @@ dependencies = [
  "kernel",
  "knowledge",
  "llm",
+ "planning",
  "protocol",
  "rusqlite",
  "serde",
@@ -2103,6 +2118,7 @@ dependencies = [
  "kernel",
  "libc",
  "llm",
+ "planning",
  "protocol",
  "runtime",
  "rusqlite",

@@ -1770,7 +1770,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         versions,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27,
+            25, 26, 27, 28,
         ]
     );
     let owner: Option<String> = connection
@@ -1912,7 +1912,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
     assert_eq!(
         run_event_payloads(database.path(), &long_run_id),
         payloads_before,
-        "v9-v27 migrations must not rewrite immutable event payloads"
+        "v9-v28 migrations must not rewrite immutable event payloads"
     );
     let connection = rusqlite::Connection::open(database.path()).unwrap();
     let version: i64 = connection
@@ -1920,7 +1920,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 27);
+    assert_eq!(version, 28);
     let configured_account: (String, String, String, i64) = connection
         .query_row(
             r#"SELECT
@@ -2638,7 +2638,7 @@ async fn v12_identity_and_run_crash_prefix_migrates_then_recovers_the_primary_se
     assert_eq!(
         recovered,
         (
-            27,
+            28,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into()
@@ -4385,7 +4385,7 @@ async fn v5_configured_database_migrates_to_the_local_owner_membership() {
     assert_eq!(
         migrated,
         (
-            27,
+            28,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into(),
@@ -4511,7 +4511,7 @@ async fn v13_configured_active_work_migrates_with_account_authority_and_exact_vo
             },
         )
         .unwrap();
-    assert_eq!(migrated_counts, (27, 1, 1, 2, 1));
+    assert_eq!(migrated_counts, (28, 1, 1, 2, 1));
 }
 
 #[tokio::test]
@@ -4873,7 +4873,7 @@ async fn v14_database_migrates_through_v19_with_member_and_audit_roots() {
             },
         )
         .unwrap();
-    assert_eq!(state, (27, 1, 1, 1, 19));
+    assert_eq!(state, (28, 1, 1, 1, 19));
 }
 
 #[tokio::test]
@@ -4912,7 +4912,7 @@ async fn v15_migration_seeds_the_configured_audit_detail_limit() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (27, 2));
+    assert_eq!(state, (28, 2));
 }
 
 #[tokio::test]
@@ -4957,7 +4957,7 @@ async fn v15_reopen_rejects_a_lower_audit_detail_limit_without_mutating_policy()
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (27, 4));
+    assert_eq!(state, (28, 4));
     drop(connection);
 
     let reopened = SqliteStore::open_with_limits(database.path(), original_limits)
@@ -5147,6 +5147,38 @@ async fn readiness_rejects_a_weakened_v27_cancellation_trigger_definition() {
     assert!(
         matches!(&error, StorageError::CorruptData(message)
             if message == "durability trigger `agent_tool_calls_enforce_forward_transition` differs from the authoritative migration"),
+        "unexpected weakened-trigger error: {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn readiness_rejects_a_weakened_v28_todo_binding_trigger_definition() {
+    let database = TestDatabase::new();
+    {
+        let store = SqliteStore::open(database.path()).await.unwrap();
+        store.readiness().await.unwrap();
+    }
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER agent_tool_calls_bind_todo_snapshot;
+               CREATE TRIGGER agent_tool_calls_bind_todo_snapshot
+               BEFORE UPDATE ON agent_tool_calls
+               WHEN 0
+               BEGIN
+                   SELECT 1;
+               END;"#,
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("a same-name weakened todo binding trigger must fail readiness"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(&error, StorageError::CorruptData(message)
+            if message == "durability trigger `agent_tool_calls_bind_todo_snapshot` differs from the authoritative migration"),
         "unexpected weakened-trigger error: {error:?}"
     );
 }
@@ -7095,7 +7127,7 @@ async fn v19_agent_manifest_is_canonical_actor_scoped_reused_and_secret_free() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(version, 27);
+    assert_eq!(version, 28);
     assert_eq!(
         manifest_rows, 1,
         "the identical manifest must be deduplicated"
@@ -8949,6 +8981,243 @@ async fn agent_tool_result_and_continuation_are_atomic_and_idempotent() {
     };
     assert_eq!(continuation.id, job.id);
     assert_eq!(continuation.step, 2);
+}
+
+#[tokio::test]
+async fn agent_todo_snapshots_are_atomic_cas_bound_and_restart_durable() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    let manifest = todo_test_agent_manifest();
+    let turn_id = "turn-agent-todo";
+    let agent_id = "agent-todo";
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: turn_id.into(),
+                user_message: "Track and advance the durable plan".into(),
+                expected_sequence: 1,
+            },
+            "agent-todo-start",
+            agent_turn_spec_with_manifest(
+                agent_id,
+                turn_id,
+                manifest.clone(),
+                "Track and advance the durable plan",
+            ),
+        )
+        .await
+        .unwrap();
+
+    let scope = tools::ExecutionScope::new(
+        AccountId::local().as_str(),
+        "user-owner",
+        "session-alpha",
+        turn_id,
+        agent_id,
+    )
+    .unwrap();
+    assert_eq!(store.current_agent_todo_revision(&scope).await.unwrap(), 0);
+    let foreign_scope = tools::ExecutionScope::new(
+        AccountId::local().as_str(),
+        "foreign-user",
+        "session-alpha",
+        turn_id,
+        agent_id,
+    )
+    .unwrap();
+    assert!(matches!(
+        store.current_agent_todo_revision(&foreign_scope).await,
+        Err(StorageError::AgentTurnNotFound(id)) if id == agent_id
+    ));
+
+    let AgentModelClaimOutcome::Claimed(first_job) =
+        store.claim_next_agent_model(&manifest).await.unwrap()
+    else {
+        panic!("the todo Agent model step must be claimable");
+    };
+    let first_call = todo_agent_tool_call_spec("agent-call-todo-1", 0);
+    let first_result = serde_json::to_value(
+        planning::prepare_todo_write(&first_call.arguments_json)
+            .unwrap()
+            .result(),
+    )
+    .unwrap();
+    let first_next = exact_agent_continuation_request(&first_job, &first_call, &first_result);
+    store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: first_job.id,
+            response_json: agent_tool_response_json(&first_call),
+            resolution: AgentModelResolution::ToolCall {
+                call: first_call.clone(),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.claim_next_agent_tool(&manifest).await.unwrap(),
+        AgentToolClaimOutcome::Claimed(_)
+    ));
+    let first_commit = AgentToolCompletionCommit {
+        call_id: first_call.call_id.clone(),
+        status: AgentToolCallStatus::Succeeded,
+        result_json: first_result.clone(),
+        provider_request_id: None,
+        next_request_json: Some(first_next),
+    };
+    assert!(matches!(
+        store
+            .complete_agent_tool(first_commit.clone())
+            .await
+            .unwrap(),
+        AgentToolCompletion::ModelQueued { .. }
+    ));
+    assert!(matches!(
+        store.complete_agent_tool(first_commit).await.unwrap(),
+        AgentToolCompletion::ModelQueued { .. }
+    ));
+    assert_eq!(store.current_agent_todo_revision(&scope).await.unwrap(), 1);
+
+    let first_detail = store
+        .agent_turn_detail_for_actor(&owner_authz(), "session-alpha", turn_id)
+        .await
+        .unwrap();
+    let first_todo = first_detail.todo.unwrap();
+    assert_eq!(first_todo.revision, 1);
+    assert_eq!(first_todo.call_id, first_call.call_id);
+    assert_eq!(first_todo.todos.len(), 2);
+
+    let AgentModelClaimOutcome::Claimed(second_job) =
+        store.claim_next_agent_model(&manifest).await.unwrap()
+    else {
+        panic!("the todo continuation must be claimable");
+    };
+    let second_call = todo_agent_tool_call_spec("agent-call-todo-2", 1);
+    let second_result = serde_json::to_value(
+        planning::prepare_todo_write(&second_call.arguments_json)
+            .unwrap()
+            .result(),
+    )
+    .unwrap();
+    let second_next = exact_agent_continuation_request(&second_job, &second_call, &second_result);
+    store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: second_job.id,
+            response_json: agent_tool_response_json(&second_call),
+            resolution: AgentModelResolution::ToolCall {
+                call: second_call.clone(),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.claim_next_agent_tool(&manifest).await.unwrap(),
+        AgentToolClaimOutcome::Claimed(_)
+    ));
+    let second_commit = AgentToolCompletionCommit {
+        call_id: second_call.call_id.clone(),
+        status: AgentToolCallStatus::Succeeded,
+        result_json: second_result.clone(),
+        provider_request_id: None,
+        next_request_json: Some(second_next),
+    };
+    assert!(matches!(
+        store
+            .complete_agent_tool(second_commit.clone())
+            .await
+            .unwrap(),
+        AgentToolCompletion::ModelQueued { .. }
+    ));
+    assert!(matches!(
+        store.complete_agent_tool(second_commit).await.unwrap(),
+        AgentToolCompletion::ModelQueued { .. }
+    ));
+    assert_eq!(store.current_agent_todo_revision(&scope).await.unwrap(), 2);
+
+    let AgentModelClaimOutcome::Claimed(third_job) =
+        store.claim_next_agent_model(&manifest).await.unwrap()
+    else {
+        panic!("the second todo continuation must be claimable");
+    };
+    let stale_call = todo_agent_tool_call_spec("agent-call-todo-stale", 0);
+    let stale_result = serde_json::to_value(
+        planning::prepare_todo_write(&stale_call.arguments_json)
+            .unwrap()
+            .result(),
+    )
+    .unwrap();
+    let stale_next = exact_agent_continuation_request(&third_job, &stale_call, &stale_result);
+    store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: third_job.id,
+            response_json: agent_tool_response_json(&stale_call),
+            resolution: AgentModelResolution::ToolCall {
+                call: stale_call.clone(),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.claim_next_agent_tool(&manifest).await.unwrap(),
+        AgentToolClaimOutcome::Claimed(_)
+    ));
+    assert!(matches!(
+        store
+            .complete_agent_tool(AgentToolCompletionCommit {
+                call_id: stale_call.call_id,
+                status: AgentToolCallStatus::Succeeded,
+                result_json: stale_result,
+                provider_request_id: None,
+                next_request_json: Some(stale_next),
+            })
+            .await,
+        Err(StorageError::AgentTodoRevisionConflict {
+            expected: 0,
+            current: 2,
+        })
+    ));
+    assert_eq!(store.current_agent_todo_revision(&scope).await.unwrap(), 2);
+    store.verify_integrity().await.unwrap();
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM agent_todo_snapshots", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        2
+    );
+    assert!(
+        connection
+            .execute(
+                "UPDATE agent_todo_snapshots SET digest = ?1 WHERE agent_id = ?2 AND revision = 2",
+                params![format!("sha256:{}", "0".repeat(64)), agent_id],
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute(
+                "DELETE FROM agent_todo_snapshots WHERE agent_id = ?1 AND revision = 2",
+                [agent_id],
+            )
+            .is_err()
+    );
+    drop(connection);
+    drop(store);
+
+    let reopened = SqliteStore::open(database.path()).await.unwrap();
+    reopened.verify_integrity().await.unwrap();
+    let detail = reopened
+        .agent_turn_detail_for_actor(&owner_authz(), "session-alpha", turn_id)
+        .await
+        .unwrap();
+    let todo = detail.todo.unwrap();
+    assert_eq!(todo.revision, 2);
+    assert_eq!(todo.call_id, second_call.call_id);
+    assert_eq!(todo.todos.len(), 2);
 }
 
 #[tokio::test]
@@ -17795,7 +18064,7 @@ async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempot
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, (1_i64..=27).collect::<Vec<_>>());
+    assert_eq!(versions, (1_i64..=28).collect::<Vec<_>>());
     assert_eq!(
         connection
             .query_row(
@@ -20197,6 +20466,29 @@ fn test_agent_manifest() -> ManifestEnvelope {
     .unwrap()
 }
 
+fn todo_test_agent_manifest() -> ManifestEnvelope {
+    let mut manifest = test_agent_manifest().manifest;
+    let descriptor = planning::todo_write_descriptor();
+    manifest.deployment.spec.tools.push(
+        ManifestTool::new(
+            descriptor.name,
+            descriptor.version,
+            descriptor.description,
+            descriptor.input_schema.provider_json_schema().unwrap(),
+            descriptor.effect,
+            descriptor.sandbox_profile,
+            ToolExecutorStatus::Available,
+        )
+        .unwrap(),
+    );
+    manifest
+        .deployment
+        .spec
+        .tools
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    ManifestEnvelope::new(manifest).unwrap()
+}
+
 fn mutate_test_agent_manifest(mutate: impl FnOnce(&mut deployment::AgentSpec)) -> ManifestEnvelope {
     let mut manifest = test_agent_manifest().manifest;
     mutate(&mut manifest.deployment.spec);
@@ -20448,6 +20740,30 @@ fn agent_tool_call_spec(call_id: &str, policy_decision: PolicyDecision) -> Agent
         sandbox_profile: SandboxProfile::ReadOnly,
         executor_status: ToolExecutorStatus::Available,
         policy_decision,
+        policy_revision: "local/v1".into(),
+    }
+}
+
+fn todo_agent_tool_call_spec(call_id: &str, expected_revision: u64) -> AgentToolCallSpec {
+    let arguments_json = json!({
+        "expected_revision": expected_revision,
+        "todos": [
+            {"content": format!("complete revision {expected_revision}"), "status": "completed"},
+            {"content": format!("advance revision {}", expected_revision + 1), "status": "in_progress"}
+        ]
+    });
+    let descriptor = planning::todo_write_descriptor();
+    AgentToolCallSpec {
+        call_id: call_id.into(),
+        provider_call_id: format!("provider-call-{call_id}"),
+        tool_name: descriptor.name,
+        tool_version: descriptor.version,
+        arguments_digest: tools::arguments_digest(&arguments_json),
+        arguments_json,
+        effect: descriptor.effect,
+        sandbox_profile: descriptor.sandbox_profile,
+        executor_status: ToolExecutorStatus::Available,
+        policy_decision: PolicyDecision::Allow,
         policy_revision: "local/v1".into(),
     }
 }
@@ -21112,6 +21428,14 @@ fn drop_v26_fixture_objects(connection: &rusqlite::Connection) {
 }
 
 fn drop_v27_fixture_objects(connection: &rusqlite::Connection) {
+    let version: i64 = connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    if version >= 28 {
+        drop_v28_fixture_objects(connection);
+    }
     let schema_reject_update = migration_trigger_sql(
         include_str!("../migrations/0020_agent_execution_ledger.sql"),
         "schema_migrations_reject_update",
@@ -21133,6 +21457,32 @@ fn drop_v27_fixture_objects(connection: &rusqlite::Connection) {
         )
         .unwrap();
     connection.execute_batch(legacy_tool_transition).unwrap();
+    connection.execute_batch(schema_reject_update).unwrap();
+    connection.execute_batch(schema_reject_delete).unwrap();
+}
+
+fn drop_v28_fixture_objects(connection: &rusqlite::Connection) {
+    let schema_reject_update = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_update",
+    );
+    let schema_reject_delete = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_delete",
+    );
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER schema_migrations_reject_update;
+               DROP TRIGGER schema_migrations_reject_delete;
+               DROP TRIGGER agent_todo_snapshots_validate_insert;
+               DROP TRIGGER agent_todo_snapshots_reject_update;
+               DROP TRIGGER agent_todo_snapshots_reject_delete;
+               DROP TRIGGER agent_tool_calls_bind_todo_snapshot;
+               DROP INDEX agent_todo_snapshots_latest_idx;
+               DROP TABLE agent_todo_snapshots;
+               DELETE FROM schema_migrations WHERE version = 28;"#,
+        )
+        .unwrap();
     connection.execute_batch(schema_reject_update).unwrap();
     connection.execute_batch(schema_reject_delete).unwrap();
 }

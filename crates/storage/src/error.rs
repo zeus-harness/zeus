@@ -126,6 +126,8 @@ pub enum StorageError {
     AgentToolCallNotFound(String),
     #[error("the Agent revision changed before cancellation")]
     AgentRevisionConflict,
+    #[error("the Agent todo revision changed: expected {expected}, current {current}")]
+    AgentTodoRevisionConflict { expected: u64, current: u64 },
     #[error("the Agent external operation has already started")]
     AgentOperationInFlight,
     #[error("the Agent turn is already terminal and was not cancelled by this request")]

@@ -59,7 +59,7 @@ use crate::{
     UpdateAccountAuditPolicyCommit,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 27;
+const CURRENT_SCHEMA_VERSION: i64 = 28;
 const LOCAL_ACCOUNT_ID: &str = "acc_local";
 const MAX_ACCOUNTS_PER_USER: i64 = 16;
 const MAX_ACCOUNTS_GLOBAL: i64 = 64;
@@ -95,6 +95,7 @@ const MIGRATION_0024: &str = include_str!("../migrations/0024_account_agent_prom
 const MIGRATION_0025: &str = include_str!("../migrations/0025_session_context_compaction.sql");
 const MIGRATION_0026: &str = include_str!("../migrations/0026_account_reply_provider.sql");
 const MIGRATION_0027: &str = include_str!("../migrations/0027_agent_safe_cancellation.sql");
+const MIGRATION_0028: &str = include_str!("../migrations/0028_agent_todo_snapshots.sql");
 const MIGRATION_0022_TRIGGER_NAMES: &[&str] = &[
     "knowledge_corpus_revisions_reject_update",
     "knowledge_corpus_revisions_reject_delete",
@@ -144,6 +145,12 @@ const MIGRATION_0026_TRIGGER_NAMES: &[&str] = &[
     "account_reply_provider_receipts_reject_delete",
 ];
 const MIGRATION_0027_TRIGGER_NAMES: &[&str] = &["agent_tool_calls_enforce_forward_transition"];
+const MIGRATION_0028_TRIGGER_NAMES: &[&str] = &[
+    "agent_todo_snapshots_validate_insert",
+    "agent_todo_snapshots_reject_update",
+    "agent_todo_snapshots_reject_delete",
+    "agent_tool_calls_bind_todo_snapshot",
+];
 const RECOVERY_BATCH_LIMIT: i64 = 64;
 const AUTH_SESSION_CLEANUP_BATCH_LIMIT: i64 = 64;
 const BOOTSTRAP_AUDIT_ROLLUP_BATCH_LIMIT: i64 = 64;
@@ -3330,6 +3337,13 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
             params![27, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 28 {
+        transaction.execute_batch(MIGRATION_0028)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![28, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
     // The execution verifier now understands the v22 knowledge binding. Run
     // it only after every missing schema step has been installed so upgrades
     // from v19 and older never query a column that does not exist yet. This
@@ -3339,6 +3353,7 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
         agent::verify_agent_knowledge_context_integrity(&transaction)?;
         agent::verify_account_knowledge_catalog_integrity(&transaction)?;
         agent::verify_account_agent_prompt_integrity(&transaction)?;
+        agent::verify_agent_todo_integrity(&transaction)?;
         provider::verify_account_reply_provider_integrity(&transaction)?;
         execution::verify_agent_execution_integrity(&transaction)?;
     }
@@ -3994,12 +4009,13 @@ fn readiness(
                'agent_operation_claims', 'knowledge_corpus_revisions',
                'agent_knowledge_contexts', 'agent_knowledge_legacy_boundary',
                'agent_knowledge_legacy_agents', 'account_knowledge_catalogs',
-               'knowledge_catalog_receipts', 'session_compaction_jobs'
+               'knowledge_catalog_receipts', 'session_compaction_jobs',
+               'agent_todo_snapshots'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if table_count != 43 {
+    if table_count != 44 {
         return Err(StorageError::CorruptData(
             "one or more required tables are missing".into(),
         ));
@@ -4064,6 +4080,22 @@ fn readiness(
     if agent_tool_completion_columns != 1 {
         return Err(StorageError::CorruptData(
             "Agent tool completion replay column is missing".into(),
+        ));
+    }
+
+    let agent_todo_columns: i64 = connection.query_row(
+        r#"SELECT COUNT(*) FROM pragma_table_info('agent_todo_snapshots')
+           WHERE name IN (
+               'account_id', 'session_id', 'turn_id', 'agent_id', 'revision',
+               'call_id', 'todos_json', 'digest', 'item_count', 'pending_count',
+               'in_progress_count', 'completed_count', 'created_at'
+           )"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if agent_todo_columns != 13 {
+        return Err(StorageError::CorruptData(
+            "Agent todo snapshot schema is missing".into(),
         ));
     }
 
@@ -4517,13 +4549,17 @@ fn readiness(
                'session_compaction_jobs_reject_identity_update',
                'session_compaction_jobs_enforce_transition',
                'session_compaction_jobs_reject_delete',
+               'agent_todo_snapshots_validate_insert',
+               'agent_todo_snapshots_reject_update',
+               'agent_todo_snapshots_reject_delete',
+               'agent_tool_calls_bind_todo_snapshot',
                'schema_migrations_reject_update',
                'schema_migrations_reject_delete'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 153 {
+    if trigger_count != 157 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
         ));
@@ -4534,6 +4570,7 @@ fn readiness(
     verify_migration_trigger_definitions(connection, MIGRATION_0025, MIGRATION_0025_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0026, MIGRATION_0026_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0027, MIGRATION_0027_TRIGGER_NAMES)?;
+    verify_migration_trigger_definitions(connection, MIGRATION_0028, MIGRATION_0028_TRIGGER_NAMES)?;
 
     let agent_pending_call_fk: i64 = connection.query_row(
         r#"SELECT COUNT(*)
@@ -4701,6 +4738,22 @@ fn readiness(
     if agent_operation_claim_fks != 3 {
         return Err(StorageError::CorruptData(
             "one or more Agent operation claim foreign keys are missing".into(),
+        ));
+    }
+
+    let agent_todo_fks: i64 = connection.query_row(
+        r#"SELECT COUNT(DISTINCT "table" || ':' || "from" || ':' || "to")
+           FROM pragma_foreign_key_list('agent_todo_snapshots')
+           WHERE ("table" = 'agent_turns' AND "from" = 'agent_id'
+                  AND "to" = 'id' AND on_delete = 'RESTRICT')
+              OR ("table" = 'agent_tool_calls' AND "from" = 'call_id'
+                  AND "to" = 'call_id' AND on_delete = 'RESTRICT')"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if agent_todo_fks != 2 {
+        return Err(StorageError::CorruptData(
+            "one or more Agent todo snapshot foreign keys are missing".into(),
         ));
     }
 
@@ -5117,6 +5170,7 @@ fn readiness(
     agent::verify_agent_knowledge_context_integrity(connection)?;
     agent::verify_account_knowledge_catalog_integrity(connection)?;
     agent::verify_account_agent_prompt_integrity(connection)?;
+    agent::verify_agent_todo_integrity(connection)?;
     provider::verify_account_reply_provider_integrity(connection)?;
     compaction::verify_integrity(connection)?;
     execution::verify_agent_execution_integrity(connection)?;

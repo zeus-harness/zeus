@@ -26,6 +26,15 @@ capabilities to either runtime profile. The exact catalog digest is the tool
 contract version inside each Agent deployment manifest, so queued work cannot
 silently observe changed skill instructions after a restart.
 
+Every Agent profile also exposes the internal `todo_write` planning tool. It
+replaces the Agent turn's complete structured plan using an
+`expected_revision` CAS token, permits at most 24 items and one
+`in_progress` item, and needs no owner approval because it cannot mutate the
+workspace or an external system. A successful result, its append-only SQLite
+snapshot, exact tool call, continuation request, and execution ledger commit
+atomically; `AgentTurnDetail.todo` returns the latest durable projection after
+restart.
+
 Alpha+ bootstraps a local `acc_local` root and now supports a bounded local
 multi-account control plane. An owner can create accounts idempotently; one
 user may belong to at most 16 accounts and one database may contain at most 64.
@@ -716,6 +725,13 @@ and bounded memory, CPU, and PID resources.
   continuation cannot be represented, the known result remains known and the
   Agent fails as `continuation_unavailable`; it is never rewritten as
   `outcome_unknown`.
+- `todo_write` is a whole-list Agent planning update, not a general connector.
+  The runtime compares its model-supplied `expected_revision` with the exact
+  server-derived Agent scope before execution, while SQLite repeats the CAS in
+  the completion transaction. Semantic failures and stale revisions become
+  known tool results so the next model step can correct them. Successful
+  revisions are append-only, call-bound, digest-checked, and limited by the
+  existing four-tool-call Agent ceiling.
 - Queued Agent jobs survive restart and remain claimable. Startup expires
   prepared-only claims without writing `outcome_unknown`, because they never
   authorized external I/O. A model or tool already marked `started` moves to
@@ -853,6 +869,11 @@ and bounded memory, CPU, and PID resources.
   epochless `user_cancelled` fact, no tool RunEpoch exists, and the persisted
   result carries the fixed cancellation code. All older tool transitions keep
   their existing fail-closed rules.
+  Schema v28 adds append-only Agent todo snapshots. Each row is scoped to one
+  account/Session/turn/Agent, advances a contiguous revision, and is bound to
+  one exact successful `todo_write@1-single-active` call. SQLite triggers bind
+  the canonical result and counters to that row; deep readiness recomputes the
+  domain-separated digest and verifies the complete call/result chain.
   Existing Runs and events are decoded, validated, and migrated in place without
   rewriting their payloads. Runtime identity still binds profile, environment,
   primary Session and Run, policy ID, and policy revision; a mismatch fails
@@ -1076,7 +1097,7 @@ directly.
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Current schema v27 retains durable Run attachment during migration and demo
+Current schema v28 retains durable Run attachment during migration and demo
 seeding, but Alpha+ does not expose a public attach-Run HTTP route.
 
 The application boundary now caps auth JSON at 8 KiB, command JSON at 512 KiB,
@@ -1101,7 +1122,7 @@ approval, dispatch, reply completion, attachment checks, and startup recovery
 use typed point queries or fixed 64-row batches. Production Session list/detail,
 Run detail, and overview reads now use indexed `LIMIT + 1` keyset pages inside
 actor-authorized SQLite snapshots; no production HTTP read loads a complete
-ledger or collection. Current schema v27 retains bounded Session, open-turn,
+ledger or collection. Current schema v28 retains bounded Session, open-turn,
 active reply/dispatch, auth-session, bootstrap-audit, event-slot, and logical
 event-payload-byte admission. Exact idempotent replay is checked before capacity,
 while accepted work consumes its reserved terminal slots and payload bytes
@@ -1186,13 +1207,13 @@ schema v21 prepared claims, schema v22 durable knowledge-context binding, and
 schema v23 account knowledge catalog ingestion, schema v24 account Agent prompt
 governance, schema v25 durable Session context compaction, schema v26
 account-scoped reply provider selection, schema v27 safe pre-start Agent
-cancellation, Trusted Single-Node Ingress,
+cancellation, schema v28 durable Agent planning, Trusted Single-Node Ingress,
 Per-Operation SecretRef Resolution, the startup-bound Skill Catalog, and the
 bounded multi-account control plane:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 636 tests passed
+- `cargo test --workspace --all-targets --locked`: 645 tests passed
   across the top-level test targets, including 22 connector tests,
   8 deployment tests, 29 knowledge tests, 30 LLM unit and 15 provider-contract
   tests, 5 Skill Catalog tests, 261 storage tests, 21 workflow tests, 50 runtime
@@ -1242,6 +1263,9 @@ bounded multi-account control plane:
   canonical secret-free manifests, actor-scoped explainability, exact
   provider-visible tools, completion replay binding, and fail-closed
   provider/tool/policy/profile drift, prepared-claim exact recovery and expiry,
+  whole-list todo canonicalization, single-active enforcement, revision
+  preflight/CAS, append-only snapshot/result binding, exact replay, account
+  isolation, restart projection, and weakened-trigger detection,
   one RunEpoch per external start, no replay of started work, and exact replay
   or conflict detection for a committed dispatch terminal acknowledgement. The
   rooted workspace connectors additionally cover traversal, symlink, UTF-8,

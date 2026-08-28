@@ -41,6 +41,7 @@ kernel = { path = "crates/kernel" }
 knowledge = { path = "crates/knowledge" }
 libc = "0.2.189"
 llm = { path = "crates/llm" }
+planning = { path = "crates/planning" }
 protocol = { path = "crates/protocol" }
 runtime = { path = "crates/runtime" }
 skills = { path = "crates/skills" }

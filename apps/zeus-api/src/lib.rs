@@ -4319,23 +4319,37 @@ async fn process_agent_tool_work(state: &ApiState, work: AgentToolWork) -> Resul
         }
         Ok(Err(error)) => {
             eprintln!("zeus Agent tool returned a known failure: {error}");
-            let (status, result) = match error {
-                StoreError::PolicyDenied(_) | StoreError::PolicyChanged(_) => (
-                    AgentToolCallStatus::NotDispatched,
-                    serde_json::json!({
-                        "code": "tool_not_dispatched",
-                        "message": "The tool was not dispatched because its execution contract changed",
-                        "status": "not_dispatched"
-                    }),
-                ),
-                _ => (
+            let (status, result) = if let Some((code, message, retryable)) =
+                error.known_executor_failure()
+            {
+                (
                     AgentToolCallStatus::Failed,
                     serde_json::json!({
-                        "code": "tool_execution_failed",
-                        "message": "The tool returned a known failure",
+                        "code": code,
+                        "message": message,
+                        "retryable": retryable,
                         "status": "failed"
                     }),
-                ),
+                )
+            } else {
+                match error {
+                    StoreError::PolicyDenied(_) | StoreError::PolicyChanged(_) => (
+                        AgentToolCallStatus::NotDispatched,
+                        serde_json::json!({
+                            "code": "tool_not_dispatched",
+                            "message": "The tool was not dispatched because its execution contract changed",
+                            "status": "not_dispatched"
+                        }),
+                    ),
+                    _ => (
+                        AgentToolCallStatus::Failed,
+                        serde_json::json!({
+                            "code": "tool_execution_failed",
+                            "message": "The tool returned a known failure",
+                            "status": "failed"
+                        }),
+                    ),
+                }
             };
             settle_known_agent_tool(state, &work, status, result, None).await
         }
@@ -6173,6 +6187,13 @@ impl From<StoreError> for ApiError {
                 "agent_revision_conflict",
                 "Agent revision conflict",
                 "The Agent turn changed; refresh it and retry",
+            )
+            .with_no_store(),
+            StoreError::AgentTodoRevisionConflict { expected, current } => Self::new(
+                StatusCode::CONFLICT,
+                "agent_todo_revision_conflict",
+                "Agent todo revision conflict",
+                format!("The todo list changed from expected revision {expected} to {current}"),
             )
             .with_no_store(),
             StoreError::AgentOperationInFlight => Self::new(
@@ -8618,6 +8639,11 @@ mod tests {
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
     }
 
+    struct TodoThenFinalProvider {
+        metadata: ProviderMetadata,
+        requests: Arc<StdMutex<Vec<ReplyRequest>>>,
+    }
+
     struct WorkspaceSearchThenFinalProvider {
         metadata: ProviderMetadata,
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
@@ -8844,6 +8870,70 @@ mod tests {
                         content: "tool completed".into(),
                     },
                     call => panic!("unexpected Agent provider call {call}"),
+                }
+            };
+            let provider = self.metadata.clone();
+            Box::pin(async move {
+                Ok(ReplyResponse {
+                    output,
+                    finish_reason: Some("stop".into()),
+                    provider,
+                })
+            })
+        }
+    }
+
+    impl TodoThenFinalProvider {
+        fn new(requests: Arc<StdMutex<Vec<ReplyRequest>>>) -> Self {
+            Self {
+                metadata: ProviderMetadata {
+                    provider_id: "test-todo-then-final-provider".into(),
+                    model: Some("test-model".into()),
+                    reply_kind: ReplyKind::Model,
+                },
+                requests,
+            }
+        }
+    }
+
+    impl ReplyProvider for TodoThenFinalProvider {
+        fn metadata(&self) -> &ProviderMetadata {
+            &self.metadata
+        }
+
+        fn reply(&self, request: ReplyRequest) -> ReplyFuture<'_> {
+            let output = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(request.clone());
+                match requests.len() {
+                    1 => {
+                        let todo = request
+                            .tools
+                            .iter()
+                            .find(|tool| tool.name == planning::TODO_WRITE_TOOL_NAME)
+                            .expect("every Agent request must expose todo_write");
+                        assert_eq!(
+                            todo.parameters["properties"]["todos"]["maxItems"],
+                            planning::TODO_MAX_ITEMS
+                        );
+                        ReplyOutput::ToolCall {
+                            call: ReplyToolCall::new(
+                                "provider-call-todo-1",
+                                planning::TODO_WRITE_TOOL_NAME,
+                                serde_json::json!({
+                                    "expected_revision": 0,
+                                    "todos": [
+                                        {"content": "inspect durable state", "status": "completed"},
+                                        {"content": "return the answer", "status": "in_progress"}
+                                    ]
+                                }),
+                            ),
+                        }
+                    }
+                    2 => ReplyOutput::Final {
+                        content: "durable plan completed".into(),
+                    },
+                    call => panic!("unexpected todo provider call {call}"),
                 }
             };
             let provider = self.metadata.clone();
@@ -10501,6 +10591,93 @@ mod tests {
         tokio::task::yield_now().await;
         cleanup_test_database(&path);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_todo_write_persists_and_continues_without_approval() {
+        let store = DemoStore::seeded().await.unwrap();
+        let owner = provision_test_owner(&store, "user-agent-todo", "agent-todo-owner").await;
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: "session-agent-todo".into(),
+                    title: "Durable Agent plan".into(),
+                },
+                "create-agent-todo",
+            )
+            .await
+            .unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(TodoThenFinalProvider::new(Arc::clone(&requests))),
+        )
+        .unwrap();
+
+        let started = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-agent-todo/turns")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "start-agent-todo")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-agent-todo",
+                            "user_message": "make and execute a durable plan",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+
+        let session = wait_for_ready_session(&store, &owner.authz, "session-agent-todo").await;
+        assert_eq!(session.session.sequence, 4);
+        let agent = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            "session-agent-todo",
+            "turn-agent-todo",
+            protocol::AgentTurnStatus::Succeeded,
+        )
+        .await;
+        assert_eq!(agent.model_steps, 2);
+        assert_eq!(agent.tool_calls, 1);
+        assert_eq!(agent.calls.len(), 1);
+        assert_eq!(agent.calls[0].tool, planning::TODO_WRITE_TOOL_NAME);
+        assert_eq!(agent.calls[0].status, AgentToolCallStatus::Succeeded);
+        assert!(!agent.calls[0].approval_required);
+        let todo = agent
+            .todo
+            .expect("todo_write must publish its durable projection");
+        assert_eq!(todo.revision, 1);
+        assert_eq!(todo.call_id, agent.calls[0].call_id);
+        assert_eq!(todo.todos.len(), 2);
+        assert_eq!(todo.todos[0].content, "inspect durable state");
+        assert_eq!(todo.todos[0].status, protocol::AgentTodoStatus::Completed);
+        assert_eq!(todo.todos[1].status, protocol::AgentTodoStatus::InProgress);
+
+        let recorded = requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 2);
+        let tool_result = recorded[1]
+            .messages
+            .iter()
+            .find(|message| message.role == ReplyRole::Tool)
+            .expect("the continuation must contain the exact todo result");
+        let result: serde_json::Value = serde_json::from_str(&tool_result.content).unwrap();
+        assert_eq!(result["revision"], 1);
+        assert_eq!(result["digest"], todo.digest);
+        assert_eq!(result["todos"][1]["status"], "in_progress");
+        drop(app);
     }
 
     #[tokio::test]

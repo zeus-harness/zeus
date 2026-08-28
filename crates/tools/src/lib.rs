@@ -33,11 +33,19 @@ pub const PROVIDER_REQUEST_ID_MAX_BYTES: usize = 128;
 #[serde(rename_all = "snake_case")]
 pub enum ParameterType {
     String,
+    StringEnum {
+        values: Vec<String>,
+    },
     Boolean,
     Integer,
     Number,
     Object,
     Array,
+    ArrayOfObjects {
+        min_items: usize,
+        max_items: usize,
+        properties: BTreeMap<String, ParameterSpec>,
+    },
 }
 
 /// A single, closed-schema tool parameter.
@@ -86,20 +94,7 @@ impl ObjectSchema {
 
         for (name, spec) in &self.properties {
             validate_parameter_name(name)?;
-            if let (Some(min), Some(max)) = (spec.min_length, spec.max_length)
-                && min > max
-            {
-                return Err(RegistryError::InvalidDescriptor(format!(
-                    "parameter `{name}` has min_length greater than max_length"
-                )));
-            }
-            if spec.parameter_type != ParameterType::String
-                && (spec.min_length.is_some() || spec.max_length.is_some())
-            {
-                return Err(RegistryError::InvalidDescriptor(format!(
-                    "parameter `{name}` has string length limits but is not a string"
-                )));
-            }
+            validate_parameter_definition(name, spec, 0)?;
         }
         Ok(())
     }
@@ -112,35 +107,11 @@ impl ObjectSchema {
         let mut properties = Map::new();
         let mut required = Vec::new();
         for (name, spec) in &self.properties {
-            let mut property = Map::new();
-            property.insert(
-                "type".into(),
-                Value::String(parameter_type_name(&spec.parameter_type).into()),
-            );
-            if let Some(minimum) = spec.min_length {
-                property.insert(
-                    "minLength".into(),
-                    Value::from(u64::try_from(minimum).map_err(|_| {
-                        RegistryError::InvalidDescriptor(
-                            "parameter min_length cannot be represented in JSON Schema".into(),
-                        )
-                    })?),
-                );
-            }
-            if let Some(maximum) = spec.max_length {
-                property.insert(
-                    "maxLength".into(),
-                    Value::from(u64::try_from(maximum).map_err(|_| {
-                        RegistryError::InvalidDescriptor(
-                            "parameter max_length cannot be represented in JSON Schema".into(),
-                        )
-                    })?),
-                );
-            }
+            let property = provider_parameter_json_schema(spec)?;
             if spec.required {
                 required.push(Value::String(name.clone()));
             }
-            properties.insert(name.clone(), Value::Object(property));
+            properties.insert(name.clone(), property);
         }
 
         let max_serialized_bytes = u64::try_from(self.max_serialized_bytes).map_err(|_| {
@@ -197,13 +168,168 @@ impl ObjectSchema {
 
 fn parameter_type_name(parameter_type: &ParameterType) -> &'static str {
     match parameter_type {
-        ParameterType::String => "string",
+        ParameterType::String | ParameterType::StringEnum { .. } => "string",
         ParameterType::Boolean => "boolean",
         ParameterType::Integer => "integer",
         ParameterType::Number => "number",
         ParameterType::Object => "object",
-        ParameterType::Array => "array",
+        ParameterType::Array | ParameterType::ArrayOfObjects { .. } => "array",
     }
+}
+
+const MAX_PARAMETER_NESTING_DEPTH: usize = 4;
+const MAX_PARAMETER_ENUM_VALUES: usize = 32;
+const MAX_PARAMETER_ENUM_VALUE_BYTES: usize = 64;
+const MAX_ARRAY_OBJECT_PROPERTIES: usize = 16;
+const MAX_ARRAY_OBJECT_ITEMS: usize = 64;
+
+fn validate_parameter_definition(
+    name: &str,
+    spec: &ParameterSpec,
+    depth: usize,
+) -> Result<(), RegistryError> {
+    if depth > MAX_PARAMETER_NESTING_DEPTH {
+        return Err(RegistryError::InvalidDescriptor(format!(
+            "parameter `{name}` exceeds the nested schema depth limit"
+        )));
+    }
+    if let (Some(min), Some(max)) = (spec.min_length, spec.max_length)
+        && min > max
+    {
+        return Err(RegistryError::InvalidDescriptor(format!(
+            "parameter `{name}` has min_length greater than max_length"
+        )));
+    }
+    if !matches!(
+        spec.parameter_type,
+        ParameterType::String | ParameterType::StringEnum { .. }
+    ) && (spec.min_length.is_some() || spec.max_length.is_some())
+    {
+        return Err(RegistryError::InvalidDescriptor(format!(
+            "parameter `{name}` has string length limits but is not a string"
+        )));
+    }
+
+    match &spec.parameter_type {
+        ParameterType::StringEnum { values } => {
+            if values.is_empty() || values.len() > MAX_PARAMETER_ENUM_VALUES {
+                return Err(RegistryError::InvalidDescriptor(format!(
+                    "parameter `{name}` must declare 1..={MAX_PARAMETER_ENUM_VALUES} enum values"
+                )));
+            }
+            let mut unique = std::collections::BTreeSet::new();
+            for value in values {
+                if value.is_empty()
+                    || value.len() > MAX_PARAMETER_ENUM_VALUE_BYTES
+                    || value.chars().any(char::is_control)
+                    || !unique.insert(value)
+                {
+                    return Err(RegistryError::InvalidDescriptor(format!(
+                        "parameter `{name}` has an invalid or duplicate enum value"
+                    )));
+                }
+            }
+        }
+        ParameterType::ArrayOfObjects {
+            min_items,
+            max_items,
+            properties,
+        } => {
+            if min_items > max_items || *max_items == 0 || *max_items > MAX_ARRAY_OBJECT_ITEMS {
+                return Err(RegistryError::InvalidDescriptor(format!(
+                    "parameter `{name}` must allow at most {MAX_ARRAY_OBJECT_ITEMS} array items with min_items <= max_items"
+                )));
+            }
+            if properties.is_empty() || properties.len() > MAX_ARRAY_OBJECT_PROPERTIES {
+                return Err(RegistryError::InvalidDescriptor(format!(
+                    "parameter `{name}` array items must declare 1..={MAX_ARRAY_OBJECT_PROPERTIES} properties"
+                )));
+            }
+            for (child_name, child_spec) in properties {
+                validate_parameter_name(child_name)?;
+                validate_parameter_definition(child_name, child_spec, depth + 1)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn provider_parameter_json_schema(spec: &ParameterSpec) -> Result<Value, RegistryError> {
+    let mut property = Map::new();
+    property.insert(
+        "type".into(),
+        Value::String(parameter_type_name(&spec.parameter_type).into()),
+    );
+    if let Some(minimum) = spec.min_length {
+        property.insert(
+            "minLength".into(),
+            Value::from(u64::try_from(minimum).map_err(|_| {
+                RegistryError::InvalidDescriptor(
+                    "parameter min_length cannot be represented in JSON Schema".into(),
+                )
+            })?),
+        );
+    }
+    if let Some(maximum) = spec.max_length {
+        property.insert(
+            "maxLength".into(),
+            Value::from(u64::try_from(maximum).map_err(|_| {
+                RegistryError::InvalidDescriptor(
+                    "parameter max_length cannot be represented in JSON Schema".into(),
+                )
+            })?),
+        );
+    }
+    match &spec.parameter_type {
+        ParameterType::StringEnum { values } => {
+            property.insert(
+                "enum".into(),
+                Value::Array(values.iter().cloned().map(Value::String).collect()),
+            );
+        }
+        ParameterType::ArrayOfObjects {
+            min_items,
+            max_items,
+            properties,
+        } => {
+            property.insert(
+                "minItems".into(),
+                Value::from(u64::try_from(*min_items).map_err(|_| {
+                    RegistryError::InvalidDescriptor(
+                        "array min_items cannot be represented in provider JSON".into(),
+                    )
+                })?),
+            );
+            property.insert(
+                "maxItems".into(),
+                Value::from(u64::try_from(*max_items).map_err(|_| {
+                    RegistryError::InvalidDescriptor(
+                        "array max_items cannot be represented in provider JSON".into(),
+                    )
+                })?),
+            );
+            let mut item_properties = Map::new();
+            let mut required = Vec::new();
+            for (name, child) in properties {
+                item_properties.insert(name.clone(), provider_parameter_json_schema(child)?);
+                if child.required {
+                    required.push(Value::String(name.clone()));
+                }
+            }
+            property.insert(
+                "items".into(),
+                Value::Object(Map::from_iter([
+                    ("type".into(), Value::String("object".into())),
+                    ("properties".into(), Value::Object(item_properties)),
+                    ("required".into(), Value::Array(required)),
+                    ("additionalProperties".into(), Value::Bool(false)),
+                ])),
+            );
+        }
+        _ => {}
+    }
+    Ok(Value::Object(property))
 }
 
 /// Static metadata for a registered executor.
@@ -828,13 +954,13 @@ fn validate_parameter_value(
     spec: &ParameterSpec,
     value: &Value,
 ) -> Result<(), RegistryError> {
-    let type_matches = match spec.parameter_type {
-        ParameterType::String => value.is_string(),
+    let type_matches = match &spec.parameter_type {
+        ParameterType::String | ParameterType::StringEnum { .. } => value.is_string(),
         ParameterType::Boolean => value.is_boolean(),
         ParameterType::Integer => value.as_i64().is_some() || value.as_u64().is_some(),
         ParameterType::Number => value.is_number(),
         ParameterType::Object => value.is_object(),
-        ParameterType::Array => value.is_array(),
+        ParameterType::Array | ParameterType::ArrayOfObjects { .. } => value.is_array(),
     };
     if !type_matches {
         return Err(RegistryError::InvalidArguments(format!(
@@ -853,6 +979,59 @@ fn validate_parameter_value(
                 "tool argument `{name}` is longer than allowed"
             )));
         }
+    }
+    match &spec.parameter_type {
+        ParameterType::StringEnum { values } => {
+            let string = value
+                .as_str()
+                .expect("the parameter type check accepted a string");
+            if !values.iter().any(|candidate| candidate == string) {
+                return Err(RegistryError::InvalidArguments(format!(
+                    "tool argument `{name}` is not one of the declared enum values"
+                )));
+            }
+        }
+        ParameterType::ArrayOfObjects {
+            min_items,
+            max_items,
+            properties,
+        } => {
+            let values = value
+                .as_array()
+                .expect("the parameter type check accepted an array");
+            if values.len() < *min_items || values.len() > *max_items {
+                return Err(RegistryError::InvalidArguments(format!(
+                    "tool argument `{name}` must contain {min_items}..={max_items} items"
+                )));
+            }
+            for (index, item) in values.iter().enumerate() {
+                let object = item.as_object().ok_or_else(|| {
+                    RegistryError::InvalidArguments(format!(
+                        "tool argument `{name}[{index}]` must be a JSON object"
+                    ))
+                })?;
+                for key in object.keys() {
+                    if !properties.contains_key(key) {
+                        return Err(RegistryError::InvalidArguments(format!(
+                            "unknown tool argument `{name}[{index}].{key}`"
+                        )));
+                    }
+                }
+                for (child_name, child_spec) in properties {
+                    let path = format!("{name}[{index}].{child_name}");
+                    let Some(child) = object.get(child_name) else {
+                        if child_spec.required {
+                            return Err(RegistryError::InvalidArguments(format!(
+                                "missing required tool argument `{path}`"
+                            )));
+                        }
+                        continue;
+                    };
+                    validate_parameter_value(&path, child_spec, child)?;
+                }
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -1098,6 +1277,79 @@ mod tests {
                 .validate_arguments(&json!({"query": "safe", "effect": "destructive"}))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn nested_array_object_schema_is_closed_bounded_and_enum_aware() {
+        let schema = ObjectSchema {
+            max_serialized_bytes: 1024,
+            properties: BTreeMap::from([(
+                "items".into(),
+                ParameterSpec {
+                    parameter_type: ParameterType::ArrayOfObjects {
+                        min_items: 0,
+                        max_items: 2,
+                        properties: BTreeMap::from([
+                            ("content".into(), ParameterSpec::required_string(32)),
+                            (
+                                "status".into(),
+                                ParameterSpec {
+                                    parameter_type: ParameterType::StringEnum {
+                                        values: vec!["pending".into(), "completed".into()],
+                                    },
+                                    required: true,
+                                    min_length: None,
+                                    max_length: None,
+                                },
+                            ),
+                        ]),
+                    },
+                    required: true,
+                    min_length: None,
+                    max_length: None,
+                },
+            )]),
+        };
+
+        assert_eq!(
+            schema.provider_json_schema().unwrap(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "minItems": 0,
+                        "maxItems": 2,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string", "minLength": 1, "maxLength": 32},
+                                "status": {"type": "string", "enum": ["pending", "completed"]}
+                            },
+                            "required": ["content", "status"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["items"],
+                "additionalProperties": false,
+                "x-zeus-max-serialized-bytes": 1024
+            })
+        );
+        assert!(
+            schema
+                .validate_arguments(&json!({"items": [{"content": "ship", "status": "pending"}]}))
+                .is_ok()
+        );
+        for invalid in [
+            json!({"items": [{"content": "ship", "status": "unknown"}]}),
+            json!({"items": [{"content": "ship", "status": "pending", "extra": true}]}),
+            json!({"items": [{"content": "ship"}]}),
+            json!({"items": ["ship"]}),
+            json!({"items": [{"content": "a", "status": "pending"}, {"content": "b", "status": "pending"}, {"content": "c", "status": "pending"}]}),
+        ] {
+            assert!(schema.validate_arguments(&invalid).is_err());
+        }
     }
 
     #[test]

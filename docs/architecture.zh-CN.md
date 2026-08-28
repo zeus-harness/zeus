@@ -28,10 +28,12 @@ Client / SvelteKit Web
 - `kernel`：纯状态转换，不读数据库、不执行外部工具。
 - `authz`：account capability matrix，以及精确工具名规则、策略 revision、环境和 effect guard；没有命中即拒绝。
 - `tools`：工具描述、注册表、参数验证和 object-safe executor 边界。
+- `planning`：Agent turn 自有的结构化计划、`todo_write` whole-list/CAS 语义、规范化 digest 与
+  policy-allow executor；它不直接写数据库。
 - `skills`：启动时一次性加载的 strict version 1 Skill Catalog、确定性 digest，以及只读
   `skill_list` / `skill_load` executor；Skill body 只有通过普通工具结果才对模型可见。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
-- `storage`：schema v27 migration、有界 account/membership 权威、一次性 member setup、用户/偏好、
+- `storage`：schema v28 migration、有界 account/membership 权威、一次性 member setup、用户/偏好、
   account audit/rollup/policy/archive state、独立 Session/Run ledger、typed event lookup、
   account+actor-scoped 回执、durable Agent/model/tool/dispatch queue、不可变 deployment manifest，
   revisioned account knowledge catalog、owner-governed Agent prompt、account-scoped
@@ -103,6 +105,14 @@ schema v27 增加 Agent 安全取消的 SQLite durability boundary。Actor 以 A
 RunEpoch。取消事务写入精确的 epochless `user_cancelled` execution fact、固定错误码与
 `turn_interrupted`。若 model/tool 已有 durable `started` checkpoint，取消返回 conflict，不能把
 可能已经计费或产生副作用的外部调用伪装为已取消。相同旧 revision 只重建第一次终态响应。
+
+schema v28 增加 Agent turn 自有的 durable plan。`todo_write@1-single-active` 每次提交完整列表，
+最多 24 项、每项 256 UTF-8 bytes、至多一个 `in_progress`；首写 `expected_revision=0`，之后严格
+CAS。Runtime 在 executor 前按 server-derived account/actor/Session/turn/Agent scope 预检 revision，
+SQLite 在 known-success 事务内再次校验并写入 append-only snapshot。Snapshot 与 exact call、result、
+counts、domain-separated SHA-256 digest 和 finished timestamp 绑定；重放必须命中同一 snapshot，
+deep readiness 会重算全部链。失败或 stale CAS 是已知 tool result，不写 snapshot，也不会伪装为
+`outcome_unknown`。每个 Agent 的快照数自然受现有四次 tool-call 上限约束。
 
 可选 `ZEUS_SKILLS_FILE` 在 SQLite 打开前加载 immutable Skill Catalog。文件使用 strict version 1
 JSON，regular file 上限 512 KiB，包含 1–64 个唯一的 lowercase provider-safe 名称；description
@@ -254,7 +264,7 @@ connector 在数据库事务和锁之外运行。
 
 API 监听端口之前按固定顺序完成：
 
-1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v27；按当前
+1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v28；按当前
    detailed-row limit 以最多 64 行 batch 压缩 bootstrap terminal audit prefix，再按稳定
    `(priority actor, expires_at, auth-session ID)` 顺序最多清理 64 个过期或绑定
    missing/disabled/suspended/stale-revision authority 的 auth session。
@@ -555,7 +565,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   prepared operation claim，以及 v22 knowledge context binding 与 domain-separated count+digest
   legacy-set commitment、v23 owner-governed knowledge catalog head/ingestion receipt、v24
   owner-governed Agent prompt head/revision/receipt，以及 v25 non-destructive Session context
-  compaction state machine、v26 account-scoped reply provider 与 v27 safe Agent cancellation，
+  compaction state machine、v26 account-scoped reply provider、v27 safe Agent cancellation 与
+  v28 durable Agent planning，
   也覆盖 fresh schema
   和历史原地迁移；畸形 v21 升级会整体回滚，不留下 v22 版本或表，既有 v22 数据库则原地增加
   空的 revision-0 catalog projection，不改写已经固化的 Agent knowledge context。

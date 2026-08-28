@@ -41,6 +41,10 @@ use kernel::{
 };
 pub use knowledge::EntryRevision;
 use knowledge::{CorpusRevisionEnvelope, SelectionSnapshotEnvelope, select_context};
+use planning::{
+    TODO_WRITE_TOOL_NAME, TODO_WRITE_TOOL_VERSION, prepare_todo_write, register_todo_tool,
+    todo_write_descriptor,
+};
 use protocol::{
     Approval, ApprovalStatus, AssistantReplyKind, AttachRunRequest, AttachRunResponse,
     CancelAgentTurnResponse, CreateSessionRequest, CreateSessionResponse, EVENT_PAGE_DEFAULT_LIMIT,
@@ -466,6 +470,8 @@ pub enum StoreError {
     AgentToolCallNotFound(String),
     #[error("the Agent revision changed before cancellation")]
     AgentRevisionConflict,
+    #[error("the Agent todo revision changed: expected {expected}, current {current}")]
+    AgentTodoRevisionConflict { expected: u64, current: u64 },
     #[error("the Agent external operation has already started")]
     AgentOperationInFlight,
     #[error("the Agent turn is already terminal")]
@@ -576,6 +582,9 @@ impl From<StorageError> for StoreError {
             StorageError::AgentModelJobNotFound(id) => Self::AgentModelJobNotFound(id),
             StorageError::AgentToolCallNotFound(id) => Self::AgentToolCallNotFound(id),
             StorageError::AgentRevisionConflict => Self::AgentRevisionConflict,
+            StorageError::AgentTodoRevisionConflict { expected, current } => {
+                Self::AgentTodoRevisionConflict { expected, current }
+            }
             StorageError::AgentOperationInFlight => Self::AgentOperationInFlight,
             StorageError::AgentAlreadyTerminal => Self::AgentAlreadyTerminal,
             StorageError::InvalidAgentTransition(detail) => Self::InvalidAgentTransition(detail),
@@ -623,6 +632,20 @@ impl StoreError {
                 ExecutorError::OutcomeUnknown { .. }
             ))
         )
+    }
+
+    /// Preserve a bounded, known executor diagnostic for the model-visible
+    /// tool result. This includes semantic validation and optimistic revision
+    /// conflicts, but never an indeterminate side-effect outcome.
+    pub fn known_executor_failure(&self) -> Option<(&str, &str, bool)> {
+        match self {
+            Self::Registry(RegistryError::Executor(ExecutorError::Failed {
+                code,
+                message,
+                retryable,
+            })) => Some((code.as_str(), message.as_str(), *retryable)),
+            _ => None,
+        }
     }
 }
 
@@ -1515,6 +1538,24 @@ impl DemoStore {
             return Err(StoreError::PolicyChanged(
                 "the tool policy revision changed after server-side resolution".into(),
             ));
+        }
+        if resolved.call.tool == TODO_WRITE_TOOL_NAME
+            && resolved.call.tool_version == TODO_WRITE_TOOL_VERSION
+            && let Ok(prepared) = prepare_todo_write(&resolved.call.arguments)
+        {
+            let current = self.storage.current_agent_todo_revision(&scope).await?;
+            if prepared.expected_revision() != current {
+                return Err(StoreError::Registry(RegistryError::Executor(
+                    ExecutorError::Failed {
+                        code: "todo_revision_conflict".into(),
+                        message: format!(
+                            "The todo list changed: expected revision {}, current revision {current}",
+                            prepared.expected_revision()
+                        ),
+                        retryable: false,
+                    },
+                )));
+            }
         }
         self.registry
             .dispatch_scoped(resolved.call, &resolved.environment, scope)
@@ -3675,6 +3716,12 @@ impl RuntimeComponents {
                     decision: PolicyDecision::RequireApproval,
                 }];
                 let mut registry = ToolRegistry::new();
+                register_runtime_planning_tool(
+                    &mut policy_rules,
+                    &mut registry,
+                    &scenario.run.environment,
+                    PRODUCTION_POLICY_REVISION,
+                )?;
                 register_runtime_skill_tools(
                     &mut policy_rules,
                     &mut registry,
@@ -3713,6 +3760,12 @@ impl RuntimeComponents {
                     decision: PolicyDecision::RequireApproval,
                 }];
                 let mut registry = ToolRegistry::new();
+                register_runtime_planning_tool(
+                    &mut policy_rules,
+                    &mut registry,
+                    &scenario.run.environment,
+                    LOCAL_POLICY_REVISION,
+                )?;
                 register_local_dev_connectors(
                     &mut registry,
                     &scenario.run.environment,
@@ -3807,6 +3860,25 @@ impl RuntimeComponents {
             }
         }
     }
+}
+
+fn register_runtime_planning_tool(
+    policy_rules: &mut Vec<PolicyRule>,
+    registry: &mut ToolRegistry,
+    environment: &str,
+    policy_revision: &str,
+) -> Result<(), StoreError> {
+    let descriptor = todo_write_descriptor();
+    policy_rules.push(PolicyRule {
+        revision: policy_revision.into(),
+        tool: descriptor.name,
+        environment: environment.into(),
+        effect: descriptor.effect,
+        sandbox_profile: descriptor.sandbox_profile,
+        decision: PolicyDecision::Allow,
+    });
+    register_todo_tool(registry)?;
+    Ok(())
 }
 
 fn register_runtime_skill_tools(
@@ -4316,7 +4388,7 @@ mod tests {
         let store = local_store(&paths, false).await;
 
         let definitions = store.session_agent_tool_definitions().unwrap();
-        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions.len(), 2);
         assert_eq!(definitions[0].name, connectors::DEV_MARKER_TOOL_NAME);
         assert_eq!(
             definitions[0].input_schema,
@@ -4334,14 +4406,131 @@ mod tests {
                 "x-zeus-max-serialized-bytes": 160
             })
         );
+        assert_eq!(definitions[1].name, planning::TODO_WRITE_TOOL_NAME);
+        assert_eq!(
+            definitions[1].input_schema["properties"]["todos"]["maxItems"],
+            planning::TODO_MAX_ITEMS
+        );
+        assert_eq!(
+            definitions[1].input_schema["properties"]["todos"]["items"]["properties"]["status"]["enum"],
+            serde_json::json!(["pending", "in_progress", "completed"])
+        );
 
         let production = DemoStore::seeded().await.unwrap();
-        assert!(
+        assert_eq!(
             production
                 .session_agent_tool_definitions()
                 .unwrap()
-                .is_empty()
+                .iter()
+                .map(|definition| definition.name.as_str())
+                .collect::<Vec<_>>(),
+            [planning::TODO_WRITE_TOOL_NAME]
         );
+    }
+
+    #[tokio::test]
+    async fn todo_dispatch_preflights_the_durable_agent_revision() {
+        let paths = TestPaths::new("agent-todo-revision-preflight");
+        let store = local_store(&paths, false).await;
+        let owner = test_authz(TEST_OWNER_ID);
+        let manifest = store
+            .session_agent_manifest(
+                "test-provider",
+                Some("test-model".into()),
+                AssistantReplyKind::Model,
+            )
+            .unwrap();
+        let agent_id = "agent-todo-revision-preflight";
+        let turn_id = "turn-todo-revision-preflight";
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner,
+                LOCAL_DEMO_SESSION_ID,
+                StartTurnRequest {
+                    turn_id: turn_id.into(),
+                    user_message: "Create a durable plan".into(),
+                    expected_sequence: 2,
+                },
+                "todo-revision-preflight-start",
+                AgentTurnSpec {
+                    id: agent_id.into(),
+                    authz: owner.clone(),
+                    environment: LOCAL_DEV_ENVIRONMENT.into(),
+                    provider_name: "test-provider".into(),
+                    model_name: Some("test-model".into()),
+                    request_json: agent_request_for_manifest(&manifest, "Create a durable plan"),
+                    knowledge: agent_knowledge_for_message("Create a durable plan"),
+                    manifest,
+                },
+            )
+            .await
+            .unwrap();
+
+        let scope = || {
+            ExecutionScope::new(
+                AccountId::local().as_str(),
+                TEST_OWNER_ID,
+                LOCAL_DEMO_SESSION_ID,
+                turn_id,
+                agent_id,
+            )
+            .unwrap()
+        };
+        let stale = store
+            .resolve_session_agent_tool(
+                agent_id,
+                1,
+                1,
+                planning::TODO_WRITE_TOOL_NAME,
+                serde_json::json!({
+                    "expected_revision": 1,
+                    "todos": [{"content": "stale write", "status": "in_progress"}],
+                }),
+            )
+            .unwrap();
+        let error = store
+            .dispatch_session_agent_tool_after_checkpoint(
+                ScopedSessionAgentTool {
+                    resolved: stale,
+                    scope: scope(),
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.known_executor_failure(),
+            Some((
+                "todo_revision_conflict",
+                "The todo list changed: expected revision 1, current revision 0",
+                false,
+            ))
+        );
+
+        let fresh = store
+            .resolve_session_agent_tool(
+                agent_id,
+                1,
+                1,
+                planning::TODO_WRITE_TOOL_NAME,
+                serde_json::json!({
+                    "expected_revision": 0,
+                    "todos": [{"content": "fresh write", "status": "in_progress"}],
+                }),
+            )
+            .unwrap();
+        let output = store
+            .dispatch_session_agent_tool_after_checkpoint(
+                ScopedSessionAgentTool {
+                    resolved: fresh,
+                    scope: scope(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.value["revision"], 1);
+        assert_eq!(output.value["todos"][0]["content"], "fresh write");
     }
 
     #[tokio::test]
@@ -4372,6 +4561,7 @@ mod tests {
                 connectors::DEV_MARKER_TOOL_NAME,
                 skills::SKILL_LIST_TOOL_NAME,
                 skills::SKILL_LOAD_TOOL_NAME,
+                planning::TODO_WRITE_TOOL_NAME,
             ]
         );
         let manifest = store

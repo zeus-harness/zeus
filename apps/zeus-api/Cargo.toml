@@ -18,6 +18,7 @@ execution.workspace = true
 kernel.workspace = true
 libc.workspace = true
 llm.workspace = true
+planning.workspace = true
 protocol.workspace = true
 runtime.workspace = true
 serde.workspace = true

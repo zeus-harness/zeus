@@ -1019,6 +1019,33 @@ pub enum AgentToolCallStatus {
     OutcomeUnknown,
 }
 
+/// Canonical status for one Agent-owned planning item.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// One short, canonical item in a whole-list Agent planning snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentTodoItem {
+    pub content: String,
+    pub status: AgentTodoStatus,
+}
+
+/// Latest durable planning snapshot for one Agent turn.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTodoState {
+    pub revision: u64,
+    pub digest: String,
+    pub todos: Vec<AgentTodoItem>,
+    pub call_id: String,
+    pub updated_at: String,
+}
+
 impl AgentToolCallStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(
@@ -1092,6 +1119,8 @@ pub struct AgentTurnDetail {
     pub pending_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todo: Option<AgentTodoState>,
     pub calls: Vec<AgentToolCallDetail>,
     pub created_at: String,
     pub updated_at: String,

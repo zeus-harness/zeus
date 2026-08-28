@@ -22,10 +22,11 @@ use crate::{
 use ::execution::{DigestDomain, FactSource, OperationRef, Sha256Digest};
 use deployment::{ManifestEnvelope, prompt_content_digest};
 use protocol::{
-    AgentApprovalReview, AgentReviewResponse, AgentToolCallDetail, AgentToolCallStatus,
-    AgentTurnDetail, AgentTurnStatus, AssistantReplyKind, PolicyDecision, ReviewDecision,
-    ToolExecutorStatus,
+    AgentApprovalReview, AgentReviewResponse, AgentTodoState, AgentToolCallDetail,
+    AgentToolCallStatus, AgentTurnDetail, AgentTurnStatus, AssistantReplyKind, PolicyDecision,
+    ReviewDecision, ToolExecutorStatus,
 };
+use tools::ExecutionScope;
 use workflows::{
     AgentStatus as WorkflowStatus, Command as WorkflowCommand, ExternalCall, KnownToolResult,
     ProposalDisposition, State as WorkflowState, TerminalReason, ToolCompletionKind, reduce,
@@ -98,6 +99,23 @@ struct StoredAgentKnowledgeContext {
     canonical_context: String,
     snapshot_envelope_json: String,
     binding_json: String,
+    created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StoredAgentTodoSnapshot {
+    account_id: String,
+    session_id: String,
+    turn_id: String,
+    agent_id: String,
+    revision: i64,
+    call_id: String,
+    todos_json: String,
+    digest: String,
+    item_count: i64,
+    pending_count: i64,
+    in_progress_count: i64,
+    completed_count: i64,
     created_at: String,
 }
 
@@ -339,6 +357,20 @@ impl SqliteStore {
         let physical_limits = self.physical_limits.clone();
         self.with_progress_connection(move |connection| {
             complete_agent_tool(connection, commit, &physical_limits)
+        })
+        .await
+    }
+
+    /// Returns the current whole-list planning revision for one exact
+    /// server-derived Agent execution scope. A fresh Agent starts at revision
+    /// zero and no model-supplied identifier participates in this lookup.
+    pub async fn current_agent_todo_revision(
+        &self,
+        scope: &ExecutionScope,
+    ) -> Result<u64, StorageError> {
+        let scope = scope.clone();
+        self.with_connection(move |connection| {
+            query_agent_todo_revision_for_scope(connection, &scope)
         })
         .await
     }
@@ -2024,9 +2056,11 @@ fn complete_agent_tool(
         .unwrap_or_else(|| "null".into());
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let call = query_agent_tool_call(&transaction, &commit.call_id)?;
+    let prepared_todo = prepare_agent_todo_completion(&call, &commit)?;
     let mut agent = query_agent_turn(&transaction, &call.agent_id)?;
     if call.status != AgentToolCallStatus::Running {
         let replay = replay_agent_tool_completion(&transaction, &call, &agent, &commit)?;
+        verify_replayed_agent_todo_completion(&transaction, &call, prepared_todo.as_ref())?;
         transaction.commit()?;
         return Ok(replay);
     }
@@ -2063,6 +2097,9 @@ fn complete_agent_tool(
     let continuation_unavailable =
         settled.terminal_reason() == Some(TerminalReason::ContinuationUnavailable);
     let timestamp = now();
+    if let Some(prepared) = prepared_todo.as_ref() {
+        insert_agent_todo_snapshot(&transaction, &call, prepared, &timestamp)?;
+    }
     let terminal_error =
         (settled.status() == WorkflowStatus::Failed).then(|| workflow_terminal_error(&settled));
     let epoch_digest =
@@ -3719,6 +3756,164 @@ fn require_agent_review_owner(
     Ok(())
 }
 
+const AGENT_TODO_SNAPSHOT_SELECT: &str = r#"SELECT
+    account_id, session_id, turn_id, agent_id, revision, call_id, todos_json,
+    digest, item_count, pending_count, in_progress_count, completed_count, created_at
+FROM agent_todo_snapshots"#;
+
+fn decode_agent_todo_snapshot_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StoredAgentTodoSnapshot> {
+    Ok(StoredAgentTodoSnapshot {
+        account_id: row.get(0)?,
+        session_id: row.get(1)?,
+        turn_id: row.get(2)?,
+        agent_id: row.get(3)?,
+        revision: row.get(4)?,
+        call_id: row.get(5)?,
+        todos_json: row.get(6)?,
+        digest: row.get(7)?,
+        item_count: row.get(8)?,
+        pending_count: row.get(9)?,
+        in_progress_count: row.get(10)?,
+        completed_count: row.get(11)?,
+        created_at: row.get(12)?,
+    })
+}
+
+fn query_agent_todo_revision(connection: &Connection, agent_id: &str) -> Result<u64, StorageError> {
+    let revision: i64 = connection.query_row(
+        r#"SELECT COALESCE(MAX(revision), 0)
+           FROM agent_todo_snapshots WHERE agent_id = ?1"#,
+        [agent_id],
+        |row| row.get(0),
+    )?;
+    i64_to_u64(revision, "Agent todo revision")
+}
+
+fn query_agent_todo_revision_for_scope(
+    connection: &Connection,
+    scope: &ExecutionScope,
+) -> Result<u64, StorageError> {
+    for (field, value) in [
+        ("account ID", scope.account_id.as_str()),
+        ("actor ID", scope.actor_id.as_str()),
+        ("session ID", scope.session_id.as_str()),
+        ("turn ID", scope.turn_id.as_str()),
+        ("Agent ID", scope.agent_id.as_str()),
+    ] {
+        if value.is_empty()
+            || value.len() > AGENT_ID_MAX_BYTES
+            || value.trim() != value
+            || value.chars().any(char::is_control)
+        {
+            return Err(StorageError::InvalidAgentTransition(format!(
+                "{field} is not a canonical Agent todo scope field"
+            )));
+        }
+    }
+    let found: Option<i64> = connection
+        .query_row(
+            r#"SELECT COALESCE((
+                   SELECT MAX(snapshot.revision)
+                   FROM agent_todo_snapshots snapshot
+                   WHERE snapshot.agent_id = agent.id
+               ), 0)
+               FROM agent_turns agent
+               WHERE agent.id = ?1 AND agent.account_id = ?2
+                 AND agent.actor_user_id = ?3 AND agent.session_id = ?4
+                 AND agent.turn_id = ?5"#,
+            params![
+                scope.agent_id.as_str(),
+                scope.account_id.as_str(),
+                scope.actor_id.as_str(),
+                scope.session_id.as_str(),
+                scope.turn_id.as_str(),
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let revision = found.ok_or_else(|| StorageError::AgentTurnNotFound(scope.agent_id.clone()))?;
+    i64_to_u64(revision, "Agent todo revision")
+}
+
+fn query_agent_todo_snapshot_for_call(
+    connection: &Connection,
+    call_id: &str,
+) -> Result<Option<StoredAgentTodoSnapshot>, StorageError> {
+    let sql = format!("{AGENT_TODO_SNAPSHOT_SELECT} WHERE call_id = ?1");
+    Ok(connection
+        .query_row(&sql, [call_id], decode_agent_todo_snapshot_row)
+        .optional()?)
+}
+
+fn query_latest_agent_todo_snapshot(
+    connection: &Connection,
+    agent_id: &str,
+) -> Result<Option<StoredAgentTodoSnapshot>, StorageError> {
+    let sql =
+        format!("{AGENT_TODO_SNAPSHOT_SELECT} WHERE agent_id = ?1 ORDER BY revision DESC LIMIT 1");
+    Ok(connection
+        .query_row(&sql, [agent_id], decode_agent_todo_snapshot_row)
+        .optional()?)
+}
+
+fn prepared_from_stored_agent_todo(
+    stored: &StoredAgentTodoSnapshot,
+) -> Result<planning::PreparedTodoWrite, StorageError> {
+    let revision = i64_to_u64(stored.revision, "Agent todo revision")?;
+    let expected_revision = revision.checked_sub(1).ok_or(StorageError::CorruptData(
+        "an Agent todo snapshot has revision zero".into(),
+    ))?;
+    let todos: Value = serde_json::from_str(&stored.todos_json)?;
+    planning::prepare_todo_write(&serde_json::json!({
+        "expected_revision": expected_revision,
+        "todos": todos,
+    }))
+    .map_err(|error| {
+        StorageError::CorruptData(format!(
+            "Agent todo snapshot {} is invalid: {error}",
+            stored.call_id
+        ))
+    })
+}
+
+fn stored_matches_prepared(
+    stored: &StoredAgentTodoSnapshot,
+    prepared: &planning::PreparedTodoWrite,
+) -> bool {
+    i64::try_from(prepared.revision()).ok() == Some(stored.revision)
+        && stored.digest == prepared.digest()
+        && serde_json::to_string(prepared.todos()).ok().as_deref()
+            == Some(stored.todos_json.as_str())
+        && i64::try_from(prepared.todos().len()).ok() == Some(stored.item_count)
+        && i64::from(prepared.counts().pending) == stored.pending_count
+        && i64::from(prepared.counts().in_progress) == stored.in_progress_count
+        && i64::from(prepared.counts().completed) == stored.completed_count
+}
+
+fn query_latest_agent_todo_state(
+    connection: &Connection,
+    agent_id: &str,
+) -> Result<Option<AgentTodoState>, StorageError> {
+    let Some(stored) = query_latest_agent_todo_snapshot(connection, agent_id)? else {
+        return Ok(None);
+    };
+    let prepared = prepared_from_stored_agent_todo(&stored)?;
+    if !stored_matches_prepared(&stored, &prepared) {
+        return Err(StorageError::CorruptData(
+            "the latest Agent todo snapshot does not match its canonical digest or counters".into(),
+        ));
+    }
+    Ok(Some(AgentTodoState {
+        revision: prepared.revision(),
+        digest: prepared.digest().to_owned(),
+        todos: prepared.todos().to_vec(),
+        call_id: stored.call_id,
+        updated_at: stored.created_at,
+    }))
+}
+
 pub(super) fn agent_turn_detail(
     connection: &Connection,
     agent: &AgentTurn,
@@ -3739,6 +3934,7 @@ pub(super) fn agent_turn_detail(
         revision: agent.revision,
         pending_call_id: agent.pending_call_id.clone(),
         last_error: agent.last_error_json.clone(),
+        todo: query_latest_agent_todo_state(connection, &agent.id)?,
         calls,
         created_at: agent.created_at.clone(),
         updated_at: agent.updated_at.clone(),
@@ -7923,6 +8119,98 @@ pub(super) fn verify_agent_knowledge_context_integrity(
     Ok(())
 }
 
+pub(super) fn verify_agent_todo_integrity(connection: &Connection) -> Result<(), StorageError> {
+    let missing_or_unexpected_snapshot: i64 = connection.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1
+               FROM agent_tool_calls call
+               WHERE call.tool_name = 'todo_write'
+                 AND call.tool_version = '1-single-active'
+                 AND (
+                     (call.status = 'succeeded' AND NOT EXISTS (
+                         SELECT 1 FROM agent_todo_snapshots snapshot
+                         WHERE snapshot.call_id = call.call_id
+                     ))
+                     OR (call.status <> 'succeeded' AND EXISTS (
+                         SELECT 1 FROM agent_todo_snapshots snapshot
+                         WHERE snapshot.call_id = call.call_id
+                     ))
+                 )
+           )"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if missing_or_unexpected_snapshot != 0 {
+        return Err(StorageError::CorruptData(
+            "one or more todo_write calls are not bound to exactly one successful snapshot".into(),
+        ));
+    }
+
+    let sql = format!("{AGENT_TODO_SNAPSHOT_SELECT} ORDER BY agent_id, revision");
+    let mut statement = connection.prepare(&sql)?;
+    let snapshots = statement
+        .query_map([], decode_agent_todo_snapshot_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    let mut revisions = std::collections::BTreeMap::<String, i64>::new();
+    for stored in snapshots {
+        let expected = revisions
+            .get(&stored.agent_id)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(StorageError::IntegerOutOfRange("Agent todo revision"))?;
+        if stored.revision != expected {
+            return Err(StorageError::CorruptData(format!(
+                "Agent todo revisions are not contiguous for `{}`",
+                stored.agent_id
+            )));
+        }
+        let prepared = prepared_from_stored_agent_todo(&stored)?;
+        if !stored_matches_prepared(&stored, &prepared) {
+            return Err(StorageError::CorruptData(format!(
+                "Agent todo snapshot `{}` has inconsistent canonical fields",
+                stored.call_id
+            )));
+        }
+        let call = query_agent_tool_call(connection, &stored.call_id)?;
+        let result = call
+            .result_json
+            .as_ref()
+            .ok_or_else(|| {
+                StorageError::CorruptData(format!(
+                    "Agent todo snapshot `{}` has no durable tool result",
+                    stored.call_id
+                ))
+            })
+            .and_then(|value| {
+                planning::decode_todo_write_result(value).map_err(|error| {
+                    StorageError::CorruptData(format!(
+                        "Agent todo result `{}` is invalid: {error}",
+                        stored.call_id
+                    ))
+                })
+            })?;
+        if call.status != AgentToolCallStatus::Succeeded
+            || call.tool_name != planning::TODO_WRITE_TOOL_NAME
+            || call.tool_version != planning::TODO_WRITE_TOOL_VERSION
+            || call.account_id.as_str() != stored.account_id
+            || call.session_id != stored.session_id
+            || call.turn_id != stored.turn_id
+            || call.agent_id != stored.agent_id
+            || call.finished_at.as_deref() != Some(stored.created_at.as_str())
+            || result != prepared.result()
+        {
+            return Err(StorageError::CorruptData(format!(
+                "Agent todo snapshot `{}` is not bound to its exact completed call",
+                stored.call_id
+            )));
+        }
+        revisions.insert(stored.agent_id.clone(), stored.revision);
+    }
+    Ok(())
+}
+
 pub(super) fn validate_agent_turn_spec(spec: &AgentTurnSpec) -> Result<(), StorageError> {
     validate_agent_turn_receipt_probe(&spec.receipt_probe())?;
     validate_reply_json(
@@ -8436,6 +8724,95 @@ fn replay_agent_tool_completion(
         Err(StorageError::CorruptData(
             "terminal agent tool result has no continuation model job".into(),
         ))
+    }
+}
+
+fn prepare_agent_todo_completion(
+    call: &AgentToolCall,
+    commit: &AgentToolCompletionCommit,
+) -> Result<Option<planning::PreparedTodoWrite>, StorageError> {
+    if call.tool_name != planning::TODO_WRITE_TOOL_NAME
+        || call.tool_version != planning::TODO_WRITE_TOOL_VERSION
+        || commit.status != AgentToolCallStatus::Succeeded
+    {
+        return Ok(None);
+    }
+    let prepared = planning::prepare_todo_write(&call.arguments_json).map_err(|error| {
+        StorageError::InvalidAgentTransition(format!(
+            "todo_write arguments are not a canonical durable snapshot: {error}"
+        ))
+    })?;
+    let result = planning::decode_todo_write_result(&commit.result_json).map_err(|error| {
+        StorageError::InvalidAgentTransition(format!(
+            "todo_write result is not a canonical durable snapshot: {error}"
+        ))
+    })?;
+    if result != prepared.result() {
+        return Err(StorageError::InvalidAgentTransition(
+            "todo_write result does not match its exact persisted arguments".into(),
+        ));
+    }
+    Ok(Some(prepared))
+}
+
+fn insert_agent_todo_snapshot(
+    connection: &Connection,
+    call: &AgentToolCall,
+    prepared: &planning::PreparedTodoWrite,
+    timestamp: &str,
+) -> Result<(), StorageError> {
+    let current = query_agent_todo_revision(connection, &call.agent_id)?;
+    if current != prepared.expected_revision() {
+        return Err(StorageError::AgentTodoRevisionConflict {
+            expected: prepared.expected_revision(),
+            current,
+        });
+    }
+    let revision = i64::try_from(prepared.revision())
+        .map_err(|_| StorageError::IntegerOutOfRange("Agent todo revision"))?;
+    let item_count = i64::try_from(prepared.todos().len())
+        .map_err(|_| StorageError::IntegerOutOfRange("Agent todo item count"))?;
+    let counts = prepared.counts();
+    let changed = connection.execute(
+        r#"INSERT INTO agent_todo_snapshots(
+               account_id, session_id, turn_id, agent_id, revision, call_id,
+               todos_json, digest, item_count, pending_count,
+               in_progress_count, completed_count, created_at
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
+        params![
+            call.account_id.as_str(),
+            call.session_id,
+            call.turn_id,
+            call.agent_id,
+            revision,
+            call.call_id,
+            serde_json::to_string(prepared.todos())?,
+            prepared.digest(),
+            item_count,
+            i64::from(counts.pending),
+            i64::from(counts.in_progress),
+            i64::from(counts.completed),
+            timestamp,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::ConcurrentModification);
+    }
+    Ok(())
+}
+
+fn verify_replayed_agent_todo_completion(
+    connection: &Connection,
+    call: &AgentToolCall,
+    prepared: Option<&planning::PreparedTodoWrite>,
+) -> Result<(), StorageError> {
+    let stored = query_agent_todo_snapshot_for_call(connection, &call.call_id)?;
+    match (prepared, stored) {
+        (Some(prepared), Some(stored)) if stored_matches_prepared(&stored, prepared) => Ok(()),
+        (None, None) => Ok(()),
+        _ => Err(StorageError::InvalidAgentTransition(
+            "Agent todo replay conflicts with its durable snapshot".into(),
+        )),
     }
 }
 
