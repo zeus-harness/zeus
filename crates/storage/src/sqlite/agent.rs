@@ -356,6 +356,36 @@ impl SqliteStore {
         .await
     }
 
+    /// Cancel one authenticated Agent turn only while its current operation
+    /// remains queued or waiting for approval. A durable started checkpoint
+    /// wins the race and is never represented as a successful cancellation.
+    pub async fn cancel_agent_turn_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        turn_id: &str,
+        expected_revision: u64,
+    ) -> Result<AgentTerminalCompletion, StorageError> {
+        if expected_revision == 0 || expected_revision > i64::MAX as u64 {
+            return Err(StorageError::AgentRevisionConflict);
+        }
+        let context = validated_authz_context(context)?;
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        let turn_id = validated_durable_reference(turn_id, "turn ID")?.to_owned();
+        let physical_limits = self.physical_limits.clone();
+        self.with_progress_connection(move |connection| {
+            cancel_agent_turn_for_actor(
+                connection,
+                &context,
+                &session_id,
+                &turn_id,
+                expected_revision,
+                &physical_limits,
+            )
+        })
+        .await
+    }
+
     /// Returns one account-scoped Agent projection for an authenticated actor.
     pub async fn agent_turn_detail_for_actor(
         &self,
@@ -778,6 +808,16 @@ fn start_prepared_agent_model(
     let job = query_agent_model_job_by_id(&transaction, &claim.operation_id)?;
     if job.agent_id != claim.agent_id {
         return Err(StorageError::ConcurrentModification);
+    }
+    if stored_claim.phase == AgentOperationClaimPhase::Released
+        && job.status == AgentModelJobStatus::Failed
+        && job.error_json.as_ref().is_some_and(is_user_cancelled_error)
+    {
+        let agent = query_agent_turn(&transaction, &job.agent_id)?;
+        let completion = query_agent_terminal_completion(&transaction, &agent)?;
+        require_user_cancelled_completion(&completion)?;
+        transaction.commit()?;
+        return Ok(AgentModelStartOutcome::Rejected(Box::new(completion)));
     }
     if stored_claim.phase == AgentOperationClaimPhase::Started {
         if job.status != AgentModelJobStatus::Started || job.attempt != 1 {
@@ -1734,6 +1774,19 @@ fn start_prepared_agent_tool(
         return Err(StorageError::ConcurrentModification);
     }
     let model_job = query_agent_model_job(&transaction, &call.agent_id, call.model_step)?;
+    if stored_claim.phase == AgentOperationClaimPhase::Released
+        && call.status == AgentToolCallStatus::Cancelled
+        && call
+            .result_json
+            .as_ref()
+            .is_some_and(is_user_cancelled_error)
+    {
+        let agent = query_agent_turn(&transaction, &call.agent_id)?;
+        let completion = query_agent_terminal_completion(&transaction, &agent)?;
+        require_user_cancelled_completion(&completion)?;
+        transaction.commit()?;
+        return Ok(AgentToolStartOutcome::Rejected(Box::new(completion)));
+    }
     if stored_claim.phase == AgentOperationClaimPhase::Started {
         if call.status != AgentToolCallStatus::Running {
             return Err(StorageError::CorruptData(
@@ -3297,6 +3350,243 @@ fn query_bounded_agent_turn_events(
         })?
         .map(|row| row?.decode())
         .collect()
+}
+
+const USER_CANCELLED_CODE: &str = "user_cancelled";
+const USER_CANCELLED_INTERRUPTION_REASON: &str =
+    "agent turn was cancelled before external execution started";
+
+enum AgentCancelOperation {
+    Model(AgentModelJob),
+    Tool(AgentToolCall),
+}
+
+fn cancel_agent_turn_for_actor(
+    connection: &mut Connection,
+    context: &AuthzContext,
+    session_id: &str,
+    turn_id: &str,
+    expected_revision: u64,
+    physical_limits: &SqlitePhysicalLimits,
+) -> Result<AgentTerminalCompletion, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_active_session_actor(&transaction, session_id, context)?;
+    let mut agent = query_agent_turn_for_session_turn(&transaction, session_id, turn_id)?;
+    if agent.account_id != context.account_id {
+        return Err(StorageError::AgentTurnNotFound(turn_id.to_owned()));
+    }
+
+    if expected_revision.checked_add(1) == Some(agent.revision) && agent_was_user_cancelled(&agent)
+    {
+        let completion = query_agent_terminal_completion(&transaction, &agent)?;
+        require_user_cancelled_completion(&completion)?;
+        transaction.commit()?;
+        return Ok(completion);
+    }
+    if agent.revision != expected_revision {
+        return Err(StorageError::AgentRevisionConflict);
+    }
+    let operation = match agent.status {
+        AgentTurnStatus::WaitingModel => {
+            AgentCancelOperation::Model(query_one_queued_agent_model_job(&transaction, &agent.id)?)
+        }
+        AgentTurnStatus::WaitingApproval | AgentTurnStatus::ToolQueued => {
+            let call_id = agent.pending_call_id.as_deref().ok_or_else(|| {
+                StorageError::CorruptData(
+                    "cancellable Agent tool phase has no pending call identity".into(),
+                )
+            })?;
+            let call = query_agent_tool_call(&transaction, call_id)?;
+            let expected_status = if agent.status == AgentTurnStatus::WaitingApproval {
+                AgentToolCallStatus::WaitingApproval
+            } else {
+                AgentToolCallStatus::Queued
+            };
+            if call.agent_id != agent.id || call.status != expected_status {
+                return Err(StorageError::CorruptData(
+                    "cancellable Agent tool phase disagrees with its pending call".into(),
+                ));
+            }
+            AgentCancelOperation::Tool(call)
+        }
+        AgentTurnStatus::ModelRunning | AgentTurnStatus::ToolRunning => {
+            return Err(StorageError::AgentOperationInFlight);
+        }
+        AgentTurnStatus::Succeeded | AgentTurnStatus::Failed | AgentTurnStatus::NeedsAttention => {
+            return Err(StorageError::AgentAlreadyTerminal);
+        }
+    };
+
+    require_open_agent_turn(&transaction, &agent)?;
+    require_agent_finalization_capacity(&transaction, &agent)?;
+    require_connection_physical_capacity(
+        &transaction,
+        physical_limits,
+        PhysicalCapacityGate::Finalization,
+    )?;
+    let timestamp = now();
+    let error_json = user_cancelled_error();
+    let command = WorkflowCommand::UserCancelled;
+    let transition = reduce(&agent.workflow_state, command.clone())
+        .map_err(|error| StorageError::InvalidAgentTransition(error.to_string()))?;
+    let (subject, input_digest) = match &operation {
+        AgentCancelOperation::Model(job) => (model_subject(job), model_request_digest(job)?),
+        AgentCancelOperation::Tool(call) => (tool_subject(call), tool_input_digest(call)?),
+    };
+    persist_agent_workflow_transition(
+        &transaction,
+        &mut agent,
+        transition.state().clone(),
+        None,
+        Some(&error_json),
+        Some(&timestamp),
+        AgentTransitionFact {
+            command,
+            external_call: None,
+            emitted_result: None,
+            emitted_result_digest: None,
+            epoch_digest: None,
+            source: FactSource::Live,
+            subject: Some(subject),
+            input_digest: Some(input_digest),
+            output_digest: Some(super::execution::digest_json(
+                DigestDomain::ExecutionError,
+                &error_json,
+            )?),
+            next_request_digest: None,
+        },
+        &timestamp,
+    )?;
+
+    match operation {
+        AgentCancelOperation::Model(job) => {
+            let changed = transaction.execute(
+                r#"UPDATE agent_model_jobs
+                   SET status = 'failed', attempt = 1, error_json = ?1,
+                       started_at = ?2, finished_at = ?2
+                   WHERE id = ?3 AND status = 'queued' AND attempt = 0"#,
+                params![serde_json::to_string(&error_json)?, timestamp, job.id],
+            )?;
+            if changed != 1 {
+                return Err(StorageError::ConcurrentModification);
+            }
+            release_prepared_claim_for_cancel(
+                &transaction,
+                AgentOperationKind::Model,
+                &job.id,
+                &timestamp,
+            )?;
+        }
+        AgentCancelOperation::Tool(call) => {
+            let changed = transaction.execute(
+                r#"UPDATE agent_tool_calls
+                   SET status = 'cancelled', result_json = ?1, finished_at = ?2
+                   WHERE call_id = ?3 AND status IN ('waiting_approval', 'queued')"#,
+                params![serde_json::to_string(&error_json)?, timestamp, call.call_id],
+            )?;
+            if changed != 1 {
+                return Err(StorageError::ConcurrentModification);
+            }
+            release_prepared_claim_for_cancel(
+                &transaction,
+                AgentOperationKind::Tool,
+                &call.call_id,
+                &timestamp,
+            )?;
+        }
+    }
+    let completion =
+        interrupt_agent_turn(&transaction, &agent, USER_CANCELLED_INTERRUPTION_REASON)?;
+    transaction.commit()?;
+    Ok(completion)
+}
+
+fn query_one_queued_agent_model_job(
+    connection: &Connection,
+    agent_id: &str,
+) -> Result<AgentModelJob, StorageError> {
+    let mut statement = connection.prepare(&format!(
+        "{} WHERE agent_id = ?1 AND status = 'queued' ORDER BY step LIMIT 2",
+        model_job_select()
+    ))?;
+    let mut jobs = statement
+        .query_map([agent_id], decode_agent_model_job_row)?
+        .map(|row| row?.decode())
+        .collect::<Result<Vec<_>, StorageError>>()?;
+    if jobs.len() != 1 {
+        return Err(StorageError::CorruptData(
+            "cancellable Agent model phase must own exactly one queued job".into(),
+        ));
+    }
+    Ok(jobs.remove(0))
+}
+
+fn release_prepared_claim_for_cancel(
+    connection: &Connection,
+    kind: AgentOperationKind,
+    operation_id: &str,
+    timestamp: &str,
+) -> Result<(), StorageError> {
+    let started: i64 = connection.query_row(
+        r#"SELECT COUNT(*) FROM agent_operation_claims
+           WHERE operation_kind = ?1 AND operation_id = ?2 AND phase = 'started'"#,
+        params![agent_operation_kind_to_db(kind), operation_id],
+        |row| row.get(0),
+    )?;
+    if started != 0 {
+        return Err(StorageError::CorruptData(
+            "queued Agent operation has a durable started claim".into(),
+        ));
+    }
+    let changed = connection.execute(
+        r#"UPDATE agent_operation_claims
+           SET phase = 'released', released_at = ?1
+           WHERE operation_kind = ?2 AND operation_id = ?3 AND phase = 'prepared'"#,
+        params![timestamp, agent_operation_kind_to_db(kind), operation_id],
+    )?;
+    if changed > 1 {
+        return Err(StorageError::CorruptData(
+            "Agent operation has more than one prepared claim".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn user_cancelled_error() -> Value {
+    json!({
+        "code": USER_CANCELLED_CODE,
+        "message": "the actor cancelled the Agent before external execution started"
+    })
+}
+
+fn is_user_cancelled_error(error: &Value) -> bool {
+    error.get("code").and_then(Value::as_str) == Some(USER_CANCELLED_CODE)
+}
+
+fn agent_was_user_cancelled(agent: &AgentTurn) -> bool {
+    agent.status == AgentTurnStatus::Failed
+        && agent
+            .last_error_json
+            .as_ref()
+            .is_some_and(is_user_cancelled_error)
+}
+
+fn require_user_cancelled_completion(
+    completion: &AgentTerminalCompletion,
+) -> Result<(), StorageError> {
+    if !agent_was_user_cancelled(&completion.agent)
+        || !matches!(
+            &completion.event.data,
+            SessionEventData::TurnInterrupted { turn_id, reason }
+                if turn_id == &completion.agent.turn_id
+                    && reason == USER_CANCELLED_INTERRUPTION_REASON
+        )
+    {
+        return Err(StorageError::CorruptData(
+            "replayed Agent cancellation does not match its durable terminal evidence".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn query_agent_turn_detail_for_actor(

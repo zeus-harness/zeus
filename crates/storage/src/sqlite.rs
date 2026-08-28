@@ -59,7 +59,7 @@ use crate::{
     UpdateAccountAuditPolicyCommit,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 26;
+const CURRENT_SCHEMA_VERSION: i64 = 27;
 const LOCAL_ACCOUNT_ID: &str = "acc_local";
 const MAX_ACCOUNTS_PER_USER: i64 = 16;
 const MAX_ACCOUNTS_GLOBAL: i64 = 64;
@@ -94,6 +94,7 @@ const MIGRATION_0023: &str = include_str!("../migrations/0023_account_knowledge_
 const MIGRATION_0024: &str = include_str!("../migrations/0024_account_agent_prompt.sql");
 const MIGRATION_0025: &str = include_str!("../migrations/0025_session_context_compaction.sql");
 const MIGRATION_0026: &str = include_str!("../migrations/0026_account_reply_provider.sql");
+const MIGRATION_0027: &str = include_str!("../migrations/0027_agent_safe_cancellation.sql");
 const MIGRATION_0022_TRIGGER_NAMES: &[&str] = &[
     "knowledge_corpus_revisions_reject_update",
     "knowledge_corpus_revisions_reject_delete",
@@ -142,6 +143,7 @@ const MIGRATION_0026_TRIGGER_NAMES: &[&str] = &[
     "account_reply_provider_receipts_reject_update",
     "account_reply_provider_receipts_reject_delete",
 ];
+const MIGRATION_0027_TRIGGER_NAMES: &[&str] = &["agent_tool_calls_enforce_forward_transition"];
 const RECOVERY_BATCH_LIMIT: i64 = 64;
 const AUTH_SESSION_CLEANUP_BATCH_LIMIT: i64 = 64;
 const BOOTSTRAP_AUDIT_ROLLUP_BATCH_LIMIT: i64 = 64;
@@ -3321,6 +3323,13 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
             params![26, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 27 {
+        transaction.execute_batch(MIGRATION_0027)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![27, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
     // The execution verifier now understands the v22 knowledge binding. Run
     // it only after every missing schema step has been installed so upgrades
     // from v19 and older never query a column that does not exist yet. This
@@ -4524,6 +4533,7 @@ fn readiness(
     verify_migration_trigger_definitions(connection, MIGRATION_0024, MIGRATION_0024_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0025, MIGRATION_0025_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0026, MIGRATION_0026_TRIGGER_NAMES)?;
+    verify_migration_trigger_definitions(connection, MIGRATION_0027, MIGRATION_0027_TRIGGER_NAMES)?;
 
     let agent_pending_call_fk: i64 = connection.query_row(
         r#"SELECT COUNT(*)

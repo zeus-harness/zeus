@@ -1678,6 +1678,7 @@ fn validate_epochless_operation_fact(
     if !matches!(
         command,
         Command::AuthorizationRevoked
+            | Command::UserCancelled
             | Command::DeploymentUnavailable
             | Command::KnowledgeUnavailable
             | Command::ApprovalApproved
@@ -1694,6 +1695,7 @@ fn validate_epochless_operation_fact(
     };
     let rejection_error_code = match command {
         Command::AuthorizationRevoked => Some("authorization_revoked"),
+        Command::UserCancelled => Some("user_cancelled"),
         Command::DeploymentUnavailable => Some("deployment_unavailable"),
         Command::KnowledgeUnavailable => Some("knowledge_unavailable"),
         _ => None,
@@ -1701,6 +1703,7 @@ fn validate_epochless_operation_fact(
     let matches_durable = match (command, subject) {
         (
             Command::AuthorizationRevoked
+            | Command::UserCancelled
             | Command::DeploymentUnavailable
             | Command::KnowledgeUnavailable,
             OperationRef::Model { job_id, step },
@@ -1720,6 +1723,7 @@ fn validate_epochless_operation_fact(
         }
         (
             Command::AuthorizationRevoked
+            | Command::UserCancelled
             | Command::DeploymentUnavailable
             | Command::KnowledgeUnavailable,
             OperationRef::Tool {
@@ -1735,7 +1739,12 @@ fn validate_epochless_operation_fact(
             call.agent_id == envelope.fact.agent_id
                 && call.ordinal == *ordinal
                 && call.model_step == *model_step
-                && call.status == AgentToolCallStatus::NotDispatched
+                && call.status
+                    == if matches!(command, Command::UserCancelled) {
+                        AgentToolCallStatus::Cancelled
+                    } else {
+                        AgentToolCallStatus::NotDispatched
+                    }
                 && call.started_at.is_none()
                 && call.finished_at.as_deref() == Some(envelope.fact.recorded_at.as_str())
                 && expected_input == *input_digest

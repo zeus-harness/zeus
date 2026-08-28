@@ -1823,6 +1823,7 @@ fn validate_non_release_material(
     }
     let valid = match command {
         Command::AuthorizationRevoked
+        | Command::UserCancelled
         | Command::DeploymentUnavailable
         | Command::KnowledgeUnavailable => {
             subject.is_some()

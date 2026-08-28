@@ -29,7 +29,7 @@ Client / SvelteKit Web
 - `authz`：account capability matrix，以及精确工具名规则、策略 revision、环境和 effect guard；没有命中即拒绝。
 - `tools`：工具描述、注册表、参数验证和 object-safe executor 边界。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
-- `storage`：schema v26 migration、有界 account/membership 权威、一次性 member setup、用户/偏好、
+- `storage`：schema v27 migration、有界 account/membership 权威、一次性 member setup、用户/偏好、
   account audit/rollup/policy/archive state、独立 Session/Run ledger、typed event lookup、
   account+actor-scoped 回执、durable Agent/model/tool/dispatch queue、不可变 deployment manifest，
   revisioned account knowledge catalog、owner-governed Agent prompt、account-scoped
@@ -95,6 +95,12 @@ model 与 tool work 保留 admission 时的精确 Provider binding，并由 work
 解析会拒绝 inline key。该文件不能与旧单 Provider 环境变量混用。Zeus 在打开 SQLite 前构造全部
 Provider、拒绝重复 durable identity 并预检全部 SecretRef；任一失败都会终止启动。逻辑名称仅用于
 选择启动默认项，不进入持久身份；账户与 queued work 仍绑定计算出的 secret-free `provider_id`。
+
+schema v27 增加 Agent 安全取消的 SQLite durability boundary。Actor 以 Agent revision 做 CAS，
+只能取消 `waiting_model`、`waiting_approval` 或 `tool_queued`；prepared claim 被原子释放，且不生成
+RunEpoch。取消事务写入精确的 epochless `user_cancelled` execution fact、固定错误码与
+`turn_interrupted`。若 model/tool 已有 durable `started` checkpoint，取消返回 conflict，不能把
+可能已经计费或产生副作用的外部调用伪装为已取消。相同旧 revision 只重建第一次终态响应。
 
 ## 事件与状态
 
@@ -195,6 +201,10 @@ Session ledger 记录 `session_created`、`run_attached`、`user_message`、可�
   与 model-visible JSON `null` 不得混淆。continuation 再次校验同一 prompt 绑定，并原样保留已
   持久化的 system message 与 transcript；重启恢复只重放该 exact request，不从当前 prompt 或
   Session 状态重新拼接输入。
+- Agent cancel：`PUT .../agent/cancel` 接收 `expected_revision`。queued、prepared 或
+  waiting-approval 状态可安全终止；model/tool running 返回 `agent_operation_in_flight`。成功取消后
+  Session 进入 `needs_attention`，由显式 resume 回到 `ready`；取消、重放和 started-race 都不触发
+  provider 或 connector I/O。
 - flush：仅保留在不带认证的 storage/runtime 合约测试 router；真实 authenticated server 不注册
   此路由，浏览器不能上传 assistant content。
 - resume：只允许没有 active turn 的 `needs_attention` Session；追加
@@ -232,7 +242,7 @@ connector 在数据库事务和锁之外运行。
 
 API 监听端口之前按固定顺序完成：
 
-1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v26；按当前
+1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v27；按当前
    detailed-row limit 以最多 64 行 batch 压缩 bootstrap terminal audit prefix，再按稳定
    `(priority actor, expires_at, auth-session ID)` 顺序最多清理 64 个过期或绑定
    missing/disabled/suspended/stale-revision authority 的 auth session。
@@ -533,7 +543,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   prepared operation claim，以及 v22 knowledge context binding 与 domain-separated count+digest
   legacy-set commitment、v23 owner-governed knowledge catalog head/ingestion receipt、v24
   owner-governed Agent prompt head/revision/receipt，以及 v25 non-destructive Session context
-  compaction state machine，也覆盖 fresh schema
+  compaction state machine、v26 account-scoped reply provider 与 v27 safe Agent cancellation，
+  也覆盖 fresh schema
   和历史原地迁移；畸形 v21 升级会整体回滚，不留下 v22 版本或表，既有 v22 数据库则原地增加
   空的 revision-0 catalog projection，不改写已经固化的 Agent knowledge context。
 - 重启后用户/偏好、Session/turn/event、Agent/model/tool job、deployment manifest、Run/Event、
@@ -621,8 +632,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   刷新恢复、owner/member setup/登录、owner 成员与 audit 管理、设置/退出和
   system/light/dark。member 的审批卡只读。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化按项目既有统计口径是 620 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
-  provider contract 15、storage 256、runtime 48、API library 82、API main/config 16）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化按项目既有统计口径是 627 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
+  provider contract 15、storage 261、workflows 21、runtime 48、API library 83、API main/config 16）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
 提交 `af29089` 曾构建并运行在独立 `zeus-operation-acceptance` project（端口 `18089`）；既有

@@ -43,13 +43,13 @@ pub use knowledge::EntryRevision;
 use knowledge::{CorpusRevisionEnvelope, SelectionSnapshotEnvelope, select_context};
 use protocol::{
     Approval, ApprovalStatus, AssistantReplyKind, AttachRunRequest, AttachRunResponse,
-    CreateSessionRequest, CreateSessionResponse, EVENT_PAGE_DEFAULT_LIMIT, FlushSessionRequest,
-    FlushSessionResponse, NotDispatchedReason, OverviewResponse, PolicyDecision,
-    ResourceEnvelopeError, ResumeSessionRequest, ResumeSessionResponse, ReviewDecision,
-    ReviewRequest, ReviewResponse, RunDetail, RunDetailPagination, RunEvent, RunEventData,
-    RunEventPage, RunSummary, SessionDetail, SessionEvent, SessionEventData, SessionEventPage,
-    SessionSummary, SessionTurn, StartTurnRequest, StartTurnResponse, ToolCall, ToolExecutorStatus,
-    ToolOutcome,
+    CancelAgentTurnResponse, CreateSessionRequest, CreateSessionResponse, EVENT_PAGE_DEFAULT_LIMIT,
+    FlushSessionRequest, FlushSessionResponse, NotDispatchedReason, OverviewResponse,
+    PolicyDecision, ResourceEnvelopeError, ResumeSessionRequest, ResumeSessionResponse,
+    ReviewDecision, ReviewRequest, ReviewResponse, RunDetail, RunDetailPagination, RunEvent,
+    RunEventData, RunEventPage, RunSummary, SessionDetail, SessionEvent, SessionEventData,
+    SessionEventPage, SessionSummary, SessionTurn, StartTurnRequest, StartTurnResponse, ToolCall,
+    ToolExecutorStatus, ToolOutcome,
 };
 use serde_json::Value;
 pub use storage::{
@@ -463,6 +463,12 @@ pub enum StoreError {
     AgentModelJobNotFound(String),
     #[error("agent tool call {0} was not found")]
     AgentToolCallNotFound(String),
+    #[error("the Agent revision changed before cancellation")]
+    AgentRevisionConflict,
+    #[error("the Agent external operation has already started")]
+    AgentOperationInFlight,
+    #[error("the Agent turn is already terminal")]
+    AgentAlreadyTerminal,
     #[error("invalid agent state transition: {0}")]
     InvalidAgentTransition(String),
     #[error("approval {approval_id} was not found or is no longer pending for run {run_id}")]
@@ -568,6 +574,9 @@ impl From<StorageError> for StoreError {
             StorageError::AgentTurnNotFound(id) => Self::AgentTurnNotFound(id),
             StorageError::AgentModelJobNotFound(id) => Self::AgentModelJobNotFound(id),
             StorageError::AgentToolCallNotFound(id) => Self::AgentToolCallNotFound(id),
+            StorageError::AgentRevisionConflict => Self::AgentRevisionConflict,
+            StorageError::AgentOperationInFlight => Self::AgentOperationInFlight,
+            StorageError::AgentAlreadyTerminal => Self::AgentAlreadyTerminal,
             StorageError::InvalidAgentTransition(detail) => Self::InvalidAgentTransition(detail),
             StorageError::InvalidResourceEnvelope(detail) => Self::InvalidSessionRequest(detail),
             StorageError::EmptyIdempotencyKey => Self::EmptyIdempotencyKey,
@@ -2600,6 +2609,40 @@ impl DemoStore {
         self.cleanup_agent_terminal_resources(&completion.agent)
             .await;
         Ok(completion)
+    }
+
+    /// Cancel an Agent turn only while no provider or connector operation has
+    /// crossed its durable started checkpoint. The revision CAS makes an
+    /// ambiguous successful response reconstructable without a second state
+    /// transition.
+    pub async fn cancel_agent_turn_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        turn_id: &str,
+        expected_revision: u64,
+    ) -> Result<CancelAgentTurnResponse, StoreError> {
+        validate_durable_reference(session_id, "session ID")?;
+        validate_durable_reference(turn_id, "turn ID")?;
+        let completion = self
+            .storage
+            .cancel_agent_turn_for_actor(context, session_id, turn_id, expected_revision)
+            .await?;
+        let detail = self
+            .storage
+            .agent_turn_detail_for_actor(context, session_id, turn_id)
+            .await?;
+        if !completion.replayed {
+            self.publish_session_event(&completion.session.id, completion.event.clone());
+        }
+        self.cleanup_agent_terminal_resources(&completion.agent)
+            .await;
+        Ok(CancelAgentTurnResponse {
+            agent: detail,
+            turn: completion.turn,
+            event: completion.event,
+            replayed: completion.replayed,
+        })
     }
 
     /// Return one authenticated, account-scoped Session Agent projection.

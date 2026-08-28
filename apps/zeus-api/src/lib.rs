@@ -26,7 +26,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use deployment::{ManifestDiff, ManifestEnvelope};
 use execution::{AgentExecutionExplain, AgentRunEpochExplain};
@@ -52,15 +52,16 @@ use protocol::{
     AgentReviewResponse, AgentToolCallStatus, AgentTurnDetail, Approval, ApprovalScope,
     ApprovalStatus, AssistantReplyKind, AssistantReplyProvenance, AuthStatusResponse,
     AuthenticationResponse, BootstrapRequest, COLLECTION_PAGE_DEFAULT_LIMIT,
-    CreateAccountAuditCheckpointRequest, CreateAccountRequest, CreateAccountResponse,
-    CreateMemberRequest, CreateSessionRequest, CreateSessionResponse, EVENT_PAGE_DEFAULT_LIMIT,
-    HealthResponse, InFlightWorkSummary, LoginRequest, LogoutResponse, MemberSetupRequest,
-    MemberSetupTokenResponse, PolicyDecision, ProblemDetails, ReplyProviderCatalogResponse,
-    ReplyProviderDescriptor, ResumeSessionRequest, ResumeSessionResponse, ReviewDecision,
-    ReviewRequest, ReviewResponse, RotateMemberSetupTokenRequest, RunDetail, SessionDetail,
-    SessionEvent, SessionTurn, StartTurnRequest, SwitchAccountRequest, ThemePreference,
-    UpdateAccountAuditPolicyRequest, UpdateAccountReplyProviderRequest, UpdateMemberRequest,
-    UpdateMemberResponse, UpdatePreferencesRequest, UserPreferences,
+    CancelAgentTurnRequest, CancelAgentTurnResponse, CreateAccountAuditCheckpointRequest,
+    CreateAccountRequest, CreateAccountResponse, CreateMemberRequest, CreateSessionRequest,
+    CreateSessionResponse, EVENT_PAGE_DEFAULT_LIMIT, HealthResponse, InFlightWorkSummary,
+    LoginRequest, LogoutResponse, MemberSetupRequest, MemberSetupTokenResponse, PolicyDecision,
+    ProblemDetails, ReplyProviderCatalogResponse, ReplyProviderDescriptor, ResumeSessionRequest,
+    ResumeSessionResponse, ReviewDecision, ReviewRequest, ReviewResponse,
+    RotateMemberSetupTokenRequest, RunDetail, SessionDetail, SessionEvent, SessionTurn,
+    StartTurnRequest, SwitchAccountRequest, ThemePreference, UpdateAccountAuditPolicyRequest,
+    UpdateAccountReplyProviderRequest, UpdateMemberRequest, UpdateMemberResponse,
+    UpdatePreferencesRequest, UserPreferences,
 };
 #[cfg(test)]
 use runtime::ReplyJobSpec;
@@ -1249,6 +1250,10 @@ fn build_authenticated_app(state: ApiState) -> Router {
             get(agent_turn_detail),
         )
         .route(
+            "/api/v1/sessions/{id}/turns/{turn_id}/agent/cancel",
+            put(cancel_agent_turn),
+        )
+        .route(
             "/api/v1/sessions/{id}/turns/{turn_id}/agent/explain",
             get(agent_deployment_explain),
         )
@@ -1478,6 +1483,10 @@ fn build_test_app(state: ApiState, request_auth: TestRequestAuth) -> Router {
         .route(
             "/api/v1/sessions/{id}/turns/{turn_id}/agent",
             get(agent_turn_detail),
+        )
+        .route(
+            "/api/v1/sessions/{id}/turns/{turn_id}/agent/cancel",
+            put(cancel_agent_turn),
         )
         .route(
             "/api/v1/sessions/{id}/turns/{turn_id}/agent/explain",
@@ -4613,6 +4622,36 @@ async fn agent_turn_detail(
     ))
 }
 
+async fn cancel_agent_turn(
+    State(state): State<ApiState>,
+    Extension(current): Extension<CurrentAuth>,
+    Path((id, turn_id)): Path<(String, String)>,
+    payload: Result<Json<CancelAgentTurnRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(request) = payload
+        .map_err(ApiError::invalid_json)
+        .map_err(ApiError::with_no_store)?;
+    if request.expected_revision == 0 {
+        return Err(ApiError::bad_request(
+            "invalid_agent_revision",
+            "Agent revision must be a positive integer",
+        )
+        .with_no_store());
+    }
+    let response: CancelAgentTurnResponse = state
+        .store
+        .cancel_agent_turn_for_actor(
+            &current.principal.authz,
+            &id,
+            &turn_id,
+            request.expected_revision,
+        )
+        .await
+        .map_err(ApiError::from)
+        .map_err(ApiError::with_no_store)?;
+    json_no_store(response)
+}
+
 async fn agent_deployment_explain(
     State(state): State<ApiState>,
     Extension(current): Extension<CurrentAuth>,
@@ -6129,6 +6168,27 @@ impl From<StoreError> for ApiError {
                     "The Agent state does not allow this command",
                 )
             }
+            StoreError::AgentRevisionConflict => Self::new(
+                StatusCode::CONFLICT,
+                "agent_revision_conflict",
+                "Agent revision conflict",
+                "The Agent turn changed; refresh it and retry",
+            )
+            .with_no_store(),
+            StoreError::AgentOperationInFlight => Self::new(
+                StatusCode::CONFLICT,
+                "agent_operation_in_flight",
+                "Agent operation is already in flight",
+                "The Agent turn cannot be cancelled after external execution has started",
+            )
+            .with_no_store(),
+            StoreError::AgentAlreadyTerminal => Self::new(
+                StatusCode::CONFLICT,
+                "agent_already_terminal",
+                "Agent turn is already terminal",
+                "The Agent turn already completed without this cancellation",
+            )
+            .with_no_store(),
             StoreError::ApprovalNotPending {
                 run_id,
                 approval_id,
@@ -10003,6 +10063,191 @@ mod tests {
             explanation.persisted_manifest.unwrap().digest,
             queued_manifest.digest
         );
+    }
+
+    #[tokio::test]
+    async fn agent_cancel_endpoint_is_cas_replayable_and_rejects_started_work() {
+        let store = DemoStore::seeded().await.unwrap();
+        let (app, request_auth) = app_with_auth(store.clone()).await;
+        let session_id = "session-agent-cancel-api";
+        store
+            .create_session_for_actor(
+                &request_auth.authz,
+                CreateSessionRequest {
+                    id: session_id.into(),
+                    title: "Agent cancellation API".into(),
+                },
+                "create-agent-cancel-api",
+            )
+            .await
+            .unwrap();
+        let manifest = store
+            .session_agent_manifest(
+                "test-provider",
+                Some("test-model".into()),
+                AssistantReplyKind::Model,
+            )
+            .unwrap();
+
+        let enqueue = |turn_id: &str, message: &str, expected_sequence: u64| {
+            let store = store.clone();
+            let authz = request_auth.authz.clone();
+            let manifest = manifest.clone();
+            let turn_id = turn_id.to_owned();
+            let message = message.to_owned();
+            async move {
+                let knowledge = store
+                    .session_agent_knowledge_context(&authz, &message)
+                    .await
+                    .unwrap();
+                let request = ReplyRequest::with_tools(
+                    [
+                        ReplyMessage::new(ReplyRole::System, store.session_agent_system_prompt()),
+                        ReplyMessage::new(ReplyRole::User, message.clone()),
+                        ReplyMessage::new(
+                            ReplyRole::Context,
+                            knowledge.snapshot.snapshot().canonical_context(),
+                        ),
+                    ],
+                    agent_tools_from_manifest(&manifest),
+                );
+                store
+                    .start_turn_and_enqueue_agent_for_actor(
+                        &authz,
+                        session_id,
+                        StartTurnRequest {
+                            turn_id: turn_id.clone(),
+                            user_message: message,
+                            expected_sequence,
+                        },
+                        &format!("start-{turn_id}"),
+                        AgentTurnSpec {
+                            id: durable_agent_id(session_id, &turn_id),
+                            authz: authz.clone(),
+                            environment: store.session_agent_environment().to_owned(),
+                            provider_name: "test-provider".into(),
+                            model_name: Some("test-model".into()),
+                            request_json: persisted_agent_reply_request(&request).unwrap(),
+                            manifest,
+                            knowledge,
+                        },
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let queued = enqueue("turn-agent-cancel-api", "cancel before provider start", 1).await;
+        let cancel_uri =
+            format!("/api/v1/sessions/{session_id}/turns/turn-agent-cancel-api/agent/cancel");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::put(&cancel_uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"expected_revision": queued.agent.revision}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        let cancelled: CancelAgentTurnResponse = response_json(response).await;
+        assert!(!cancelled.replayed);
+        assert_eq!(cancelled.agent.status, protocol::AgentTurnStatus::Failed);
+        assert_eq!(
+            cancelled.turn.status,
+            protocol::SessionTurnStatus::Interrupted
+        );
+
+        let replay = app
+            .clone()
+            .oneshot(
+                Request::put(&cancel_uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"expected_revision": queued.agent.revision}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay: CancelAgentTurnResponse = response_json(replay).await;
+        assert!(replay.replayed);
+        assert_eq!(replay.agent, cancelled.agent);
+        assert_eq!(replay.event, cancelled.event);
+
+        let invalid = app
+            .clone()
+            .oneshot(
+                Request::put(&cancel_uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"expected_revision":0}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json::<ProblemDetails>(invalid).await.code,
+            "invalid_agent_revision"
+        );
+
+        let resumed = store
+            .resume_session_for_actor(
+                &request_auth.authz,
+                session_id,
+                ResumeSessionRequest {
+                    expected_sequence: cancelled.event.sequence,
+                },
+                "resume-after-agent-cancel-api",
+            )
+            .await
+            .unwrap();
+        let started = enqueue(
+            "turn-agent-cancel-started-api",
+            "reject cancellation after provider start",
+            resumed.session.sequence,
+        )
+        .await;
+        assert!(matches!(
+            store.claim_next_agent_model(&manifest).await.unwrap(),
+            AgentModelClaimOutcome::Claimed(_)
+        ));
+        let started_detail = store
+            .agent_turn_detail_for_actor(
+                &request_auth.authz,
+                session_id,
+                "turn-agent-cancel-started-api",
+            )
+            .await
+            .unwrap();
+        assert!(started_detail.revision > started.agent.revision);
+        let in_flight = app
+            .oneshot(
+                Request::put(format!(
+                    "/api/v1/sessions/{session_id}/turns/turn-agent-cancel-started-api/agent/cancel"
+                ))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"expected_revision": started_detail.revision}).to_string(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(in_flight.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json::<ProblemDetails>(in_flight).await.code,
+            "agent_operation_in_flight"
+        );
+        store.readiness().await.unwrap();
     }
 
     #[tokio::test]

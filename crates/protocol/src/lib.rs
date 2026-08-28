@@ -1099,6 +1099,24 @@ pub struct AgentTurnDetail {
     pub completed_at: Option<String>,
 }
 
+/// Compare-and-set request to cancel one Agent turn before external I/O has
+/// crossed its durable started checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancelAgentTurnRequest {
+    pub expected_revision: u64,
+}
+
+/// Durable cancellation result. Replays reconstruct the same terminal turn
+/// and interruption event while marking only the transport response replayed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CancelAgentTurnResponse {
+    pub agent: AgentTurnDetail,
+    pub turn: SessionTurn,
+    pub event: SessionEvent,
+    pub replayed: bool,
+}
+
 /// Result of an idempotent owner approval decision for an agent tool call.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentReviewResponse {

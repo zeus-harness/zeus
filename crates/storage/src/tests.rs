@@ -35,18 +35,19 @@ use crate::{
     AgentKnowledgeContextSpec, AgentModelClaimOutcome, AgentModelCompletion,
     AgentModelFailureCommit, AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit,
     AgentPromptCommit, AgentPromptState, AgentReviewCommit, AgentToolCallSpec,
-    AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit, AgentTurnSpec,
-    AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit, ClaimOutcome,
-    CommitOutcome, CreateAccountCommit, CreateMemberCommit, DEFAULT_SESSION_AGENT_PROMPT_REVISION,
-    DEFAULT_SESSION_AGENT_SYSTEM_PROMPT, DispatchCompleteCommit, DispatchJobSpec,
-    DispatchRecoveryCommit, DispatchStartCommit, DispatchStatus, KnowledgeCatalogCommit,
-    MemberSetupCommit, MemberSetupToken, MembershipRevision, MembershipRole, ReplyClaimOutcome,
-    ReplyFailureCommit, ReplyJobSpec, ReplyJobStatus, ReplyOutcomeUnknownCommit,
-    ReplySuccessCommit, ReviewCommit, RotateMemberSetupTokenCommit, RunSnapshot, RuntimeIdentity,
-    SESSION_AGENT_PROMPT_ID, SessionCompactionClaimOutcome, SessionCompactionJobStatus,
-    SessionCompactionSuccessCommit, SqliteOperationLimits, SqlitePhysicalLimits, SqliteStore,
-    StorageError, StorageLimits, StoredMembershipStatus, StoredUserRole, StoredUserStatus,
-    SwitchAuthSessionCommit, TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
+    AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit, AgentToolStartOutcome,
+    AgentTurnSpec, AuthSessionCommit, AuthSessionId, AuthzContext, BootstrapOwnerCommit,
+    ClaimOutcome, CommitOutcome, CreateAccountCommit, CreateMemberCommit,
+    DEFAULT_SESSION_AGENT_PROMPT_REVISION, DEFAULT_SESSION_AGENT_SYSTEM_PROMPT,
+    DispatchCompleteCommit, DispatchJobSpec, DispatchRecoveryCommit, DispatchStartCommit,
+    DispatchStatus, KnowledgeCatalogCommit, MemberSetupCommit, MemberSetupToken,
+    MembershipRevision, MembershipRole, ReplyClaimOutcome, ReplyFailureCommit, ReplyJobSpec,
+    ReplyJobStatus, ReplyOutcomeUnknownCommit, ReplySuccessCommit, ReviewCommit,
+    RotateMemberSetupTokenCommit, RunSnapshot, RuntimeIdentity, SESSION_AGENT_PROMPT_ID,
+    SessionCompactionClaimOutcome, SessionCompactionJobStatus, SessionCompactionSuccessCommit,
+    SqliteOperationLimits, SqlitePhysicalLimits, SqliteStore, StorageError, StorageLimits,
+    StoredMembershipStatus, StoredUserRole, StoredUserStatus, SwitchAuthSessionCommit,
+    TransitionMemberCommit, UpdateAccountAuditPolicyCommit,
 };
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
@@ -1769,7 +1770,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         versions,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26,
+            25, 26, 27,
         ]
     );
     let owner: Option<String> = connection
@@ -1911,7 +1912,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
     assert_eq!(
         run_event_payloads(database.path(), &long_run_id),
         payloads_before,
-        "v9-v26 migrations must not rewrite immutable event payloads"
+        "v9-v27 migrations must not rewrite immutable event payloads"
     );
     let connection = rusqlite::Connection::open(database.path()).unwrap();
     let version: i64 = connection
@@ -1919,7 +1920,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 26);
+    assert_eq!(version, 27);
     let configured_account: (String, String, String, i64) = connection
         .query_row(
             r#"SELECT
@@ -2637,7 +2638,7 @@ async fn v12_identity_and_run_crash_prefix_migrates_then_recovers_the_primary_se
     assert_eq!(
         recovered,
         (
-            26,
+            27,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into()
@@ -4384,7 +4385,7 @@ async fn v5_configured_database_migrates_to_the_local_owner_membership() {
     assert_eq!(
         migrated,
         (
-            26,
+            27,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into(),
@@ -4510,7 +4511,7 @@ async fn v13_configured_active_work_migrates_with_account_authority_and_exact_vo
             },
         )
         .unwrap();
-    assert_eq!(migrated_counts, (26, 1, 1, 2, 1));
+    assert_eq!(migrated_counts, (27, 1, 1, 2, 1));
 }
 
 #[tokio::test]
@@ -4872,7 +4873,7 @@ async fn v14_database_migrates_through_v19_with_member_and_audit_roots() {
             },
         )
         .unwrap();
-    assert_eq!(state, (26, 1, 1, 1, 19));
+    assert_eq!(state, (27, 1, 1, 1, 19));
 }
 
 #[tokio::test]
@@ -4911,7 +4912,7 @@ async fn v15_migration_seeds_the_configured_audit_detail_limit() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (26, 2));
+    assert_eq!(state, (27, 2));
 }
 
 #[tokio::test]
@@ -4956,7 +4957,7 @@ async fn v15_reopen_rejects_a_lower_audit_detail_limit_without_mutating_policy()
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (26, 4));
+    assert_eq!(state, (27, 4));
     drop(connection);
 
     let reopened = SqliteStore::open_with_limits(database.path(), original_limits)
@@ -5114,6 +5115,38 @@ async fn readiness_rejects_a_weakened_v22_knowledge_trigger_definition() {
     assert!(
         matches!(&error, StorageError::CorruptData(message)
             if message == "durability trigger `agent_turns_require_knowledge_context` differs from the authoritative migration"),
+        "unexpected weakened-trigger error: {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn readiness_rejects_a_weakened_v27_cancellation_trigger_definition() {
+    let database = TestDatabase::new();
+    {
+        let store = SqliteStore::open(database.path()).await.unwrap();
+        store.readiness().await.unwrap();
+    }
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER agent_tool_calls_enforce_forward_transition;
+               CREATE TRIGGER agent_tool_calls_enforce_forward_transition
+               BEFORE UPDATE ON agent_tool_calls
+               WHEN 0
+               BEGIN
+                   SELECT 1;
+               END;"#,
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("a same-name weakened cancellation trigger must fail readiness"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(&error, StorageError::CorruptData(message)
+            if message == "durability trigger `agent_tool_calls_enforce_forward_transition` differs from the authoritative migration"),
         "unexpected weakened-trigger error: {error:?}"
     );
 }
@@ -7062,7 +7095,7 @@ async fn v19_agent_manifest_is_canonical_actor_scoped_reused_and_secret_free() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(version, 26);
+    assert_eq!(version, 27);
     assert_eq!(
         manifest_rows, 1,
         "the identical manifest must be deduplicated"
@@ -10915,6 +10948,350 @@ async fn prepared_model_claim_keeps_work_queued_until_one_exact_start() {
     );
     drop(connection);
     store.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn queued_agent_cancellation_is_durable_replayable_and_restart_safe() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    let enqueued = store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-agent-cancel-queued".into(),
+                user_message: "Cancel this before the provider starts".into(),
+                expected_sequence: 1,
+            },
+            "agent-cancel-queued-start",
+            agent_turn_spec(
+                "agent-cancel-queued",
+                "turn-agent-cancel-queued",
+                "Cancel this before the provider starts",
+            ),
+        )
+        .await
+        .unwrap();
+    let expected_revision = enqueued.agent.revision;
+
+    let cancelled = store
+        .cancel_agent_turn_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            "turn-agent-cancel-queued",
+            expected_revision,
+        )
+        .await
+        .unwrap();
+    assert!(!cancelled.replayed);
+    assert_eq!(cancelled.agent.status, AgentTurnStatus::Failed);
+    assert_eq!(cancelled.agent.revision, expected_revision + 1);
+    assert_eq!(cancelled.session.status, SessionStatus::NeedsAttention);
+    assert_eq!(cancelled.turn.status, SessionTurnStatus::Interrupted);
+    assert_eq!(
+        cancelled
+            .agent
+            .last_error_json
+            .as_ref()
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_str),
+        Some("user_cancelled")
+    );
+    assert!(matches!(
+        &cancelled.event.data,
+        SessionEventData::TurnInterrupted { turn_id, reason }
+            if turn_id == "turn-agent-cancel-queued"
+                && reason == "agent turn was cancelled before external execution started"
+    ));
+
+    let replay = store
+        .cancel_agent_turn_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            "turn-agent-cancel-queued",
+            expected_revision,
+        )
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.agent, cancelled.agent);
+    assert_eq!(replay.turn, cancelled.turn);
+    assert_eq!(replay.event, cancelled.event);
+    assert!(matches!(
+        store
+            .cancel_agent_turn_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                "turn-agent-cancel-queued",
+                expected_revision + 2,
+            )
+            .await,
+        Err(StorageError::AgentRevisionConflict)
+    ));
+    store.verify_integrity().await.unwrap();
+    drop(store);
+
+    let reopened = SqliteStore::open(database.path()).await.unwrap();
+    let restart_replay = reopened
+        .cancel_agent_turn_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            "turn-agent-cancel-queued",
+            expected_revision,
+        )
+        .await
+        .unwrap();
+    assert!(restart_replay.replayed);
+    assert_eq!(restart_replay.agent, cancelled.agent);
+    reopened.verify_integrity().await.unwrap();
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let persisted: (String, i64, String, i64) = connection
+        .query_row(
+            r#"SELECT job.status, job.attempt, job.error_json,
+                      (SELECT COUNT(*) FROM agent_run_epochs epoch
+                       WHERE epoch.agent_id = job.agent_id)
+               FROM agent_model_jobs job WHERE job.id = ?1"#,
+            [&enqueued.job.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(persisted.0, "failed");
+    assert_eq!(persisted.1, 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&persisted.2).unwrap()["code"],
+        "user_cancelled"
+    );
+    assert_eq!(persisted.3, 0, "cancellation must not create a RunEpoch");
+}
+
+#[tokio::test]
+async fn prepared_model_cancellation_wins_without_authorizing_provider_io() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    let enqueued = store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-agent-cancel-prepared-model".into(),
+                user_message: "Cancel between prepare and start".into(),
+                expected_sequence: 1,
+            },
+            "agent-cancel-prepared-model-start",
+            agent_turn_spec(
+                "agent-cancel-prepared-model",
+                "turn-agent-cancel-prepared-model",
+                "Cancel between prepare and start",
+            ),
+        )
+        .await
+        .unwrap();
+    let AgentModelClaimOutcome::Prepared(prepared) = store
+        .prepare_next_agent_model(&test_agent_manifest(), "cancel-race-model-worker")
+        .await
+        .unwrap()
+    else {
+        panic!("the queued model job must be prepared");
+    };
+
+    store
+        .cancel_agent_turn_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            "turn-agent-cancel-prepared-model",
+            enqueued.agent.revision,
+        )
+        .await
+        .unwrap();
+    let AgentModelStartOutcome::Rejected(rejected) = store
+        .start_prepared_agent_model(&prepared.claim, &test_agent_manifest())
+        .await
+        .unwrap()
+    else {
+        panic!("a released prepared claim must replay the cancellation");
+    };
+    assert!(rejected.replayed);
+    assert_eq!(rejected.agent.status, AgentTurnStatus::Failed);
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let persisted: (String, i64) = connection
+        .query_row(
+            r#"SELECT claim.phase,
+                      (SELECT COUNT(*) FROM agent_run_epochs epoch
+                       WHERE epoch.agent_id = claim.agent_id)
+               FROM agent_operation_claims claim
+               WHERE claim.operation_kind = 'model'
+                 AND claim.operation_id = ?1
+                 AND claim.generation = ?2"#,
+            params![prepared.claim.operation_id, prepared.claim.generation],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(persisted, ("released".into(), 0));
+    drop(connection);
+    store.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn started_model_checkpoint_wins_the_cancellation_race() {
+    let store = created_owned_session_store().await;
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-agent-cancel-started-model".into(),
+                user_message: "Do not misreport an in-flight provider call".into(),
+                expected_sequence: 1,
+            },
+            "agent-cancel-started-model-start",
+            agent_turn_spec(
+                "agent-cancel-started-model",
+                "turn-agent-cancel-started-model",
+                "Do not misreport an in-flight provider call",
+            ),
+        )
+        .await
+        .unwrap();
+    let AgentModelClaimOutcome::Claimed(_) = store
+        .claim_next_agent_model(&test_agent_manifest())
+        .await
+        .unwrap()
+    else {
+        panic!("the model operation must cross its durable start checkpoint");
+    };
+    let detail = store
+        .agent_turn_detail_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            "turn-agent-cancel-started-model",
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail.status, AgentTurnStatus::ModelRunning);
+    assert!(matches!(
+        store
+            .cancel_agent_turn_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                "turn-agent-cancel-started-model",
+                detail.revision,
+            )
+            .await,
+        Err(StorageError::AgentOperationInFlight)
+    ));
+    let after = store
+        .agent_turn_detail_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            "turn-agent-cancel-started-model",
+        )
+        .await
+        .unwrap();
+    assert_eq!(after, detail);
+    store.verify_integrity().await.unwrap();
+}
+
+#[tokio::test]
+async fn prepared_tool_and_waiting_approval_can_cancel_before_dispatch() {
+    for (case, decision) in [
+        ("prepared", PolicyDecision::Allow),
+        ("approval", PolicyDecision::RequireApproval),
+    ] {
+        let store = created_owned_session_store().await;
+        let turn_id = format!("turn-agent-cancel-tool-{case}");
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner_authz(),
+                "session-alpha",
+                StartTurnRequest {
+                    turn_id: turn_id.clone(),
+                    user_message: "Cancel the tool before connector dispatch".into(),
+                    expected_sequence: 1,
+                },
+                &format!("agent-cancel-tool-{case}-start"),
+                agent_turn_spec(
+                    &format!("agent-cancel-tool-{case}"),
+                    &turn_id,
+                    "Cancel the tool before connector dispatch",
+                ),
+            )
+            .await
+            .unwrap();
+        let AgentModelClaimOutcome::Claimed(model_job) = store
+            .claim_next_agent_model(&test_agent_manifest())
+            .await
+            .unwrap()
+        else {
+            panic!("the model proposal must start");
+        };
+        let call = agent_tool_call_spec(&format!("agent-call-cancel-{case}"), decision);
+        let AgentModelCompletion::ToolCall { agent, .. } = store
+            .complete_agent_model_success(AgentModelSuccessCommit {
+                job_id: model_job.id.clone(),
+                response_json: agent_tool_response_json(&call),
+                resolution: AgentModelResolution::ToolCall { call: call.clone() },
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("the provider proposal must create a durable tool call");
+        };
+
+        let prepared_claim = if case == "prepared" {
+            let AgentToolClaimOutcome::Prepared(prepared) = store
+                .prepare_next_agent_tool(&test_agent_manifest(), "cancel-race-tool-worker")
+                .await
+                .unwrap()
+            else {
+                panic!("the queued tool must be prepared");
+            };
+            Some(prepared.claim.clone())
+        } else {
+            assert_eq!(agent.status, AgentTurnStatus::WaitingApproval);
+            None
+        };
+        let cancelled = store
+            .cancel_agent_turn_for_actor(&owner_authz(), "session-alpha", &turn_id, agent.revision)
+            .await
+            .unwrap();
+        assert_eq!(cancelled.agent.status, AgentTurnStatus::Failed);
+        let detail = store
+            .agent_turn_detail_for_actor(&owner_authz(), "session-alpha", &turn_id)
+            .await
+            .unwrap();
+        assert_eq!(detail.calls.len(), 1);
+        assert_eq!(detail.calls[0].status, AgentToolCallStatus::Cancelled);
+        assert_eq!(
+            detail.calls[0]
+                .error
+                .as_ref()
+                .and_then(|output| output.get("code"))
+                .and_then(Value::as_str),
+            Some("user_cancelled")
+        );
+        if let Some(claim) = prepared_claim {
+            let AgentToolStartOutcome::Rejected(rejected) = store
+                .start_prepared_agent_tool(&claim, &test_agent_manifest())
+                .await
+                .unwrap()
+            else {
+                panic!("the released tool claim must replay the cancellation");
+            };
+            assert!(rejected.replayed);
+        }
+        let execution = store
+            .agent_execution_explain_for_actor(&owner_authz(), "session-alpha", &turn_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            execution.epochs.len(),
+            1,
+            "only the provider step may own a started RunEpoch"
+        );
+        store.verify_integrity().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -17418,7 +17795,7 @@ async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempot
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, (1_i64..=26).collect::<Vec<_>>());
+    assert_eq!(versions, (1_i64..=27).collect::<Vec<_>>());
     assert_eq!(
         connection
             .query_row(
@@ -20697,6 +21074,14 @@ fn drop_v25_fixture_objects(connection: &rusqlite::Connection) {
 }
 
 fn drop_v26_fixture_objects(connection: &rusqlite::Connection) {
+    let version: i64 = connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    if version >= 27 {
+        drop_v27_fixture_objects(connection);
+    }
     let schema_reject_update = migration_trigger_sql(
         include_str!("../migrations/0020_agent_execution_ledger.sql"),
         "schema_migrations_reject_update",
@@ -20722,6 +21107,32 @@ fn drop_v26_fixture_objects(connection: &rusqlite::Connection) {
                DELETE FROM schema_migrations WHERE version = 26;"#,
         )
         .unwrap();
+    connection.execute_batch(schema_reject_update).unwrap();
+    connection.execute_batch(schema_reject_delete).unwrap();
+}
+
+fn drop_v27_fixture_objects(connection: &rusqlite::Connection) {
+    let schema_reject_update = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_update",
+    );
+    let schema_reject_delete = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_delete",
+    );
+    let legacy_tool_transition = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "agent_tool_calls_enforce_forward_transition",
+    );
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER schema_migrations_reject_update;
+               DROP TRIGGER schema_migrations_reject_delete;
+               DROP TRIGGER agent_tool_calls_enforce_forward_transition;
+               DELETE FROM schema_migrations WHERE version = 27;"#,
+        )
+        .unwrap();
+    connection.execute_batch(legacy_tool_transition).unwrap();
     connection.execute_batch(schema_reject_update).unwrap();
     connection.execute_batch(schema_reject_delete).unwrap();
 }

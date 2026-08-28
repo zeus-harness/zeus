@@ -679,6 +679,14 @@ and bounded memory, CPU, and PID resources.
   `needs_attention` exactly once and is never automatically replayed because
   the external call may have taken effect.
   Other open turns follow the same interruption/resume contract.
+- An authenticated actor may cancel its own Agent turn only while the current
+  model/tool operation is queued, prepared, or waiting for approval. The
+  command uses the Agent revision as a compare-and-set token, commits one
+  `user_cancelled` workflow fact and `turn_interrupted` event, and releases any
+  prepared claim without creating a RunEpoch. Repeating the original revision
+  reconstructs the exact response. A durable model/tool `started` checkpoint
+  wins the race and returns a conflict; Zeus never reports an in-flight
+  provider or connector call as cancelled.
 - Session commands do not change the Run ledger or wake the dispatch worker.
   Session and Run are joined by durable ownership, not by sharing an event
   sequence or transaction stream.
@@ -796,6 +804,12 @@ and bounded memory, CPU, and PID resources.
   the running service's implicit startup default. Provider endpoints,
   credentials, and SecretRefs remain process-owned, and queued work retains its
   immutable provider identity across later account selection changes.
+  Schema v27 extends the durable Agent tool transition trigger for explicit
+  pre-dispatch cancellation. A queued or waiting-approval call may become
+  `cancelled` only when the current Agent execution head is the matching
+  epochless `user_cancelled` fact, no tool RunEpoch exists, and the persisted
+  result carries the fixed cancellation code. All older tool transitions keep
+  their existing fail-closed rules.
   Existing Runs and events are decoded, validated, and migrated in place without
   rewriting their payloads. Runtime identity still binds profile, environment,
   primary Session and Run, policy ID, and policy revision; a mismatch fails
@@ -940,6 +954,14 @@ directly.
 - `GET /api/v1/sessions/{session_id}/turns/{turn_id}/agent` returns the
   actor-scoped durable Agent state, deployment-manifest digest, and ordered
   tool calls.
+- `PUT /api/v1/sessions/{session_id}/turns/{turn_id}/agent/cancel` accepts
+  `{"expected_revision":...}` and uses that revision as a replayable CAS.
+  Cancellation succeeds only before the active provider/connector operation
+  crosses its durable `started` checkpoint. A stale revision returns
+  `409 agent_revision_conflict`, an already-started operation returns
+  `409 agent_operation_in_flight`, and another terminal result returns
+  `409 agent_already_terminal`. Success and error responses use
+  `Cache-Control: no-store`.
 - `GET /api/v1/sessions/{session_id}/turns/{turn_id}/agent/explain` returns the
   actor-scoped persisted and current secret-free manifests plus a deterministic
   JSON-pointer diff. It explicitly marks pre-v19 unbound history and whether
@@ -1011,7 +1033,7 @@ directly.
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Current schema v26 retains durable Run attachment during migration and demo
+Current schema v27 retains durable Run attachment during migration and demo
 seeding, but Alpha+ does not expose a public attach-Run HTTP route.
 
 The application boundary now caps auth JSON at 8 KiB, command JSON at 512 KiB,
@@ -1036,7 +1058,7 @@ approval, dispatch, reply completion, attachment checks, and startup recovery
 use typed point queries or fixed 64-row batches. Production Session list/detail,
 Run detail, and overview reads now use indexed `LIMIT + 1` keyset pages inside
 actor-authorized SQLite snapshots; no production HTTP read loads a complete
-ledger or collection. Current schema v26 retains bounded Session, open-turn,
+ledger or collection. Current schema v27 retains bounded Session, open-turn,
 active reply/dispatch, auth-session, bootstrap-audit, event-slot, and logical
 event-payload-byte admission. Exact idempotent replay is checked before capacity,
 while accepted work consumes its reserved terminal slots and payload bytes
@@ -1120,15 +1142,16 @@ replay, schema v19 deployment-manifest binding, schema v20 execution-ledger,
 schema v21 prepared claims, schema v22 durable knowledge-context binding, and
 schema v23 account knowledge catalog ingestion, schema v24 account Agent prompt
 governance, schema v25 durable Session context compaction, schema v26
-account-scoped reply provider selection, Trusted Single-Node Ingress,
+account-scoped reply provider selection, schema v27 safe pre-start Agent
+cancellation, Trusted Single-Node Ingress,
 Per-Operation SecretRef Resolution, and the bounded multi-account control plane:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 620 tests passed
+- `cargo test --workspace --all-targets --locked`: 627 tests passed
   across the top-level test targets, including 22 connector tests,
   8 deployment tests, 29 knowledge tests, 30 LLM unit and 15 provider-contract
-  tests, 256 storage tests, 48 runtime tests, 82 API library tests, 16 API main/config
+  tests, 261 storage tests, 21 workflow tests, 48 runtime tests, 83 API library tests, 16 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,

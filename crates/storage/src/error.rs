@@ -124,6 +124,12 @@ pub enum StorageError {
     AgentModelJobNotFound(String),
     #[error("agent tool call `{0}` was not found")]
     AgentToolCallNotFound(String),
+    #[error("the Agent revision changed before cancellation")]
+    AgentRevisionConflict,
+    #[error("the Agent external operation has already started")]
+    AgentOperationInFlight,
+    #[error("the Agent turn is already terminal and was not cancelled by this request")]
+    AgentAlreadyTerminal,
     #[error("invalid dispatch state transition: {0}")]
     InvalidDispatchTransition(String),
     #[error("invalid reply state transition: {0}")]

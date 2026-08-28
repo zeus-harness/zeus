@@ -159,6 +159,9 @@ pub enum Command {
     /// Current Session authority disappeared after work was queued but before
     /// any external model/tool operation was invoked.
     AuthorizationRevoked,
+    /// The initiating actor cancelled work before its external operation
+    /// crossed the durable started checkpoint.
+    UserCancelled,
     /// The immutable deployment manifest is missing or no longer matches the
     /// executable runtime. Callers may use this only before invoking the
     /// external operation authorized by the current durable phase.
@@ -194,6 +197,7 @@ impl Command {
             Self::ModelFailed => CommandKind::ModelFailed,
             Self::ModelOutcomeUnknown => CommandKind::ModelOutcomeUnknown,
             Self::AuthorizationRevoked => CommandKind::AuthorizationRevoked,
+            Self::UserCancelled => CommandKind::UserCancelled,
             Self::DeploymentUnavailable => CommandKind::DeploymentUnavailable,
             Self::KnowledgeUnavailable => CommandKind::KnowledgeUnavailable,
             Self::ApprovalApproved => CommandKind::ApprovalApproved,
@@ -473,6 +477,29 @@ pub fn reduce(state: &State, command: Command) -> Result<Transition, Error> {
                 AgentStatus::Failed,
                 Some(TerminalReason::AuthorizationRevoked),
                 None,
+                None,
+                None,
+            )
+        }
+        Command::UserCancelled => {
+            require_one_of(
+                state,
+                &[
+                    AgentStatus::ModelQueued,
+                    AgentStatus::WaitingApproval,
+                    AgentStatus::ToolQueued,
+                    AgentStatus::ContinuationQueued,
+                ],
+                command_kind,
+            )?;
+            next_transition(
+                state,
+                AgentStatus::Failed,
+                // Keep the persisted workflow schema compatible with the
+                // existing v17 terminal-reason CHECK. The durable error and
+                // execution fact retain the precise user_cancelled cause.
+                Some(TerminalReason::AuthorizationRevoked),
+                Some(0),
                 None,
                 None,
             )
@@ -829,6 +856,7 @@ pub enum CommandKind {
     ModelFailed,
     ModelOutcomeUnknown,
     AuthorizationRevoked,
+    UserCancelled,
     DeploymentUnavailable,
     KnowledgeUnavailable,
     ApprovalApproved,
@@ -1176,6 +1204,45 @@ mod tests {
                 Some(TerminalReason::AuthorizationRevoked)
             );
             assert_eq!(revoked.external_call(), None);
+        }
+    }
+
+    #[test]
+    fn user_cancellation_is_terminal_only_before_an_external_start() {
+        let continuation = apply(
+            started_tool(),
+            Command::ToolResultKnown {
+                kind: ToolCompletionKind::Succeeded,
+                result_bytes: 17,
+            },
+        )
+        .into_state();
+        for state in [
+            State::default(),
+            waiting_approval(),
+            queued_tool(),
+            continuation,
+        ] {
+            let cancelled = apply(state, Command::UserCancelled);
+            assert_eq!(cancelled.state().status(), AgentStatus::Failed);
+            assert_eq!(
+                cancelled.state().terminal_reason(),
+                Some(TerminalReason::AuthorizationRevoked)
+            );
+            assert_eq!(cancelled.state().pending_approvals(), 0);
+            assert_eq!(cancelled.external_call(), None);
+            assert_eq!(cancelled.emitted_result(), None);
+        }
+
+        for state in [started_model(), started_tool()] {
+            let status = state.status();
+            assert_eq!(
+                reduce(&state, Command::UserCancelled).unwrap_err(),
+                Error::InvalidTransition {
+                    status,
+                    command: CommandKind::UserCancelled,
+                }
+            );
         }
     }
 

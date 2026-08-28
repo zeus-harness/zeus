@@ -5,7 +5,8 @@ Event Feed、Point-query Durable Context、Bounded Read Models、SQLite Capacity
 Physical/Operation Capacity、Bootstrap Audit Retention、schema v13 Account Membership
 Foundation、schema v14 Account-scoped Durable Authorization、schema v15 Member Lifecycle /
 Account Audit、schema v16 Session Reply Context Index 至 schema v25 Durable Session Context
-Compaction、schema v26 Account-scoped Reply Provider Selection、Trusted Single-Node Ingress、
+Compaction、schema v26 Account-scoped Reply Provider Selection、schema v27 Safe Agent
+Cancellation、Trusted Single-Node Ingress、
 Per-Operation SecretRef Resolution 与有界多账户控制面主机代码已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
 v11→v12→v13→v14 迁移证据，current-image 证据见本节验收结果，Linux Docker PID/OOM
 authoritative gate 待完成。
@@ -351,6 +352,9 @@ POST /sessions/{id}/turns
 - `0026_account_reply_provider.sql`：增加 account-scoped secret-free Provider head、单调 revision、
   immutable idempotency receipt、current-owner trigger 和 account audit 绑定。revision 0 保持为进程
   startup default；endpoint、credential、SecretRef 不进入 HTTP 或 SQLite。
+- `0027_agent_safe_cancellation.sql`：扩展 tool-call durability trigger，只允许没有 RunEpoch 的
+  queued/waiting-approval call 在匹配当前 `user_cancelled` execution fact 时进入 `cancelled`；既有
+  approval、dispatch、known-result 与 outcome-unknown 单向迁移规则保持不变。
 
 schema v24 的 system prompt governance 复用 `0019` 的 prompt binding，并增加 durable
 head/revision/receipt。Owner-only `GET/PUT /api/v1/agent/prompt` 通过 expected-revision CAS 和
@@ -369,6 +373,11 @@ compaction、Agent model/tool work 继续按 immutable job binding 解析 Provid
 binding 在重启后不再注册时 fail closed，不回退到另一个默认模型。
 startup registry 既支持兼容的单远端环境变量，也支持上述 bounded 多 Provider 文件；有远端项时
 始终额外注册显式 `local-fallback`，但不会在选中远端失败时自动切换。
+schema v27 的取消命令由 authenticated actor 通过 `PUT .../agent/cancel` 发起，并以
+`expected_revision` 做 CAS。仅 `waiting_model`、`waiting_approval`、`tool_queued` 可成功；prepared
+operation claim 与取消终态在同一事务释放/提交，不写 RunEpoch。若 durable started checkpoint 已
+存在则返回 `agent_operation_in_flight`，不能声称 provider/connector 已被取消。相同旧 revision
+重放第一次响应，终态 Session 按既有 interrupted contract 进入 `needs_attention`，需要显式 resume。
 Knowledge v1 生成独立、受治理、带完整 digest 的 canonical context
 snapshot，不修改 system prompt。schema v22 已完成数据库绑定、
 Agent request 注入和 exact replay；LLM 协议层使用独立 durable `context` role，并只在
@@ -440,8 +449,8 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 按项目既有统计口径通过 620 个 Rust 测试（connectors 22、deployment 8、knowledge 29、
-  LLM unit 30、provider contract 15、storage 256、runtime 48、API library 82、API main/config 16）与 28 个 Web Node 测试。
+- host 按项目既有统计口径通过 627 个 Rust 测试（connectors 22、deployment 8、knowledge 29、
+  LLM unit 30、provider contract 15、storage 261、workflows 21、runtime 48、API library 83、API main/config 16）与 28 个 Web Node 测试。
 - `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 
 ## 8. 容器与 OOM 验收边界
