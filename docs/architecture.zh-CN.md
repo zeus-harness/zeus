@@ -89,6 +89,12 @@ expected-revision CAS、`Idempotency-Key` receipt 与 account audit 单事务提
 接收 endpoint、credential 或 SecretRef。选择只影响新 turn；已排队的 reply、compaction、Agent
 model 与 tool work 保留 admission 时的精确 Provider binding，并由 worker 按该 binding 从注册表
 解析。重启后若显式选择或 queued binding 已不在注册表，执行 fail closed，不静默切换默认 Provider。
+启动注册表由 `ZEUS_LLM_PROVIDERS_FILE` 指向的 version 1 JSON 定义：regular file 上限 64 KiB，
+只允许 1–16 个远端 Provider，逻辑名称唯一且限制为 64-byte ASCII，`default` 必须命名其中一项或
+保留的 `local-fallback`。每项只接收 endpoint、model 与 `api_key_ref`；strict unknown-field
+解析会拒绝 inline key。该文件不能与旧单 Provider 环境变量混用。Zeus 在打开 SQLite 前构造全部
+Provider、拒绝重复 durable identity 并预检全部 SecretRef；任一失败都会终止启动。逻辑名称仅用于
+选择启动默认项，不进入持久身份；账户与 queued work 仍绑定计算出的 secret-free `provider_id`。
 
 ## 事件与状态
 
@@ -417,6 +423,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   adapter 对 final path component 使用 `O_NOFOLLOW`、regular-file 检查、16 KiB read cap，并允许同路径原子换值。启动在
   打开 SQLite 前预检当前值；运行期 unavailable 在任何 provider I/O 前以脱敏
   `provider_secret_unavailable` 已知失败结算，不进入 `outcome_unknown`。
+  多 Provider 启动注册表采用 strict versioned JSON、64 KiB 文件上限和 16 个远端 Provider 上限；
+  只接受 SecretRef，不接受明文 key，并在 SQLite 打开前完成全部身份冲突检查与 credential preflight。
 - provider assistant 或 executor output/diagnostic 超过终端字段边界时，runtime 使用固定、脱敏、
   有界 failure 一次性结算；原始超限载荷不进入 event、reply/dispatch job，也不会自动重试。
 - sandbox 或 executor 不可用：写入 `NotDispatched`，禁止回退到宿主机裸执行。
@@ -613,8 +621,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   刷新恢复、owner/member setup/登录、owner 成员与 audit 管理、设置/退出和
   system/light/dark。member 的审批卡只读。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化按项目既有统计口径是 615 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
-  provider contract 15、storage 256、runtime 48、API library 82、API main/config 11）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化按项目既有统计口径是 620 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
+  provider contract 15、storage 256、runtime 48、API library 82、API main/config 16）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
 提交 `af29089` 曾构建并运行在独立 `zeus-operation-acceptance` project（端口 `18089`）；既有

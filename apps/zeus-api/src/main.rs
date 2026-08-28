@@ -1,18 +1,25 @@
-use std::{future::IntoFuture, io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    fs::File,
+    future::IntoFuture,
+    io::{self, Read},
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
+};
 
+use serde::Deserialize;
 #[cfg(unix)]
 use std::{
     fs::OpenOptions,
-    io::Read,
     os::unix::fs::OpenOptionsExt,
     path::{Component, Path, PathBuf},
 };
-#[cfg(unix)]
 use zeroize::Zeroizing;
 
 use llm::{
-    LocalFallbackProvider, OpenAiCompatibleProvider, ReplyKind, ReplyProvider, ResolvedSecret,
-    SecretRef, SecretResolveError, SecretResolveFuture, SecretResolver,
+    LocalFallbackProvider, OpenAiCompatibleProvider, ReplyProvider, ResolvedSecret, SecretRef,
+    SecretResolveError, SecretResolveFuture, SecretResolver,
 };
 use runtime::{DemoStore, SqliteOperationLimits, SqlitePhysicalLimits, StorageLimits};
 use tenancy::BootstrapToken;
@@ -21,6 +28,11 @@ use zeus_api::IngressPolicy;
 
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const BOOTSTRAP_TOKEN_TTL: chrono::Duration = chrono::Duration::minutes(15);
+const REPLY_PROVIDER_REGISTRY_VERSION: u32 = 1;
+const REPLY_PROVIDER_REGISTRY_FILE_MAX_BYTES: usize = 64 * 1024;
+const REPLY_PROVIDER_REGISTRY_MAX_REMOTE_PROVIDERS: usize = 16;
+const REPLY_PROVIDER_CONFIG_NAME_MAX_BYTES: usize = 64;
+const LOCAL_FALLBACK_CONFIG_NAME: &str = "local-fallback";
 #[cfg(unix)]
 const SECRET_FILE_MAX_BYTES: usize = 16 * 1024;
 
@@ -36,14 +48,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ingress = configured_ingress_policy()?;
     let ingress_mode = ingress.mode_name();
     let public_origin = ingress.public_origin().unwrap_or("direct peer").to_owned();
-    let reply_provider = configured_reply_provider().await?;
-    let reply_provider_id = reply_provider.metadata().provider_id.clone();
-    let additional_reply_providers: Vec<Arc<dyn ReplyProvider>> =
-        if reply_provider.metadata().reply_kind == ReplyKind::Model {
-            vec![Arc::new(LocalFallbackProvider::new())]
-        } else {
-            Vec::new()
-        };
+    let reply_providers = configured_reply_providers().await?;
+    let reply_provider_id = reply_providers.default.metadata().provider_id.clone();
     let store = match profile.as_str() {
         "production-guarded" => {
             DemoStore::open_with_limits_and_physical_and_operations(
@@ -110,8 +116,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = zeus_api::authenticated_app_with_provider_registry_and_ingress(
         store,
         ingress,
-        reply_provider,
-        additional_reply_providers,
+        reply_providers.default,
+        reply_providers.additional,
     )?;
 
     println!(
@@ -365,23 +371,43 @@ fn parse_environment_capacity_with_legacy_alias(
     }
 }
 
-async fn configured_reply_provider() -> Result<Arc<dyn ReplyProvider>, io::Error> {
-    let settings = parse_reply_provider_settings(
+async fn configured_reply_providers() -> Result<ConfiguredReplyProviders, io::Error> {
+    let configuration = select_reply_provider_configuration(
+        optional_environment("ZEUS_LLM_PROVIDERS_FILE")?,
         optional_environment("ZEUS_LLM_ENDPOINT")?,
         optional_environment("ZEUS_LLM_MODEL")?,
         optional_environment("ZEUS_LLM_API_KEY")?,
         optional_environment("ZEUS_LLM_API_KEY_REF")?,
     )?;
+    match configuration {
+        ReplyProviderConfiguration::Legacy(settings) => {
+            configured_legacy_reply_providers(settings).await
+        }
+        ReplyProviderConfiguration::RegistryFile(path) => {
+            let bytes = read_bounded_reply_provider_registry_file(&path)?;
+            let settings = parse_reply_provider_registry(&bytes)?;
+            build_reply_provider_registry(settings).await
+        }
+    }
+}
+
+async fn configured_legacy_reply_providers(
+    settings: ReplyProviderSettings,
+) -> Result<ConfiguredReplyProviders, io::Error> {
     match settings {
-        ReplyProviderSettings::LocalFallback => Ok(Arc::new(LocalFallbackProvider::new())),
+        ReplyProviderSettings::LocalFallback => Ok(ConfiguredReplyProviders {
+            default: Arc::new(LocalFallbackProvider::new()),
+            additional: Vec::new(),
+        }),
         ReplyProviderSettings::Inline {
             endpoint,
             model,
             api_key,
-        } => Ok(Arc::new(
-            OpenAiCompatibleProvider::new(endpoint, model, api_key)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?,
-        )),
+        } => {
+            let provider = OpenAiCompatibleProvider::new(endpoint, model, api_key)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            Ok(remote_default_with_local_fallback(Arc::new(provider)))
+        }
         ReplyProviderSettings::SecretRef {
             endpoint,
             model,
@@ -396,9 +422,301 @@ async fn configured_reply_provider() -> Result<Arc<dyn ReplyProvider>, io::Error
                 .validate_secret_source()
                 .await
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-            Ok(Arc::new(provider))
+            Ok(remote_default_with_local_fallback(Arc::new(provider)))
         }
     }
+}
+
+fn remote_default_with_local_fallback(default: Arc<dyn ReplyProvider>) -> ConfiguredReplyProviders {
+    ConfiguredReplyProviders {
+        default,
+        additional: vec![Arc::new(LocalFallbackProvider::new())],
+    }
+}
+
+async fn build_reply_provider_registry(
+    settings: ReplyProviderRegistrySettings,
+) -> Result<ConfiguredReplyProviders, io::Error> {
+    let mut provider_ids = HashSet::with_capacity(settings.providers.len() + 1);
+    let fallback: Arc<dyn ReplyProvider> = Arc::new(LocalFallbackProvider::new());
+    provider_ids.insert(fallback.metadata().provider_id.clone());
+    let mut providers = Vec::with_capacity(settings.providers.len());
+
+    for settings in settings.providers {
+        let resolver = configured_secret_resolver(settings.secret_ref.clone())?;
+        let provider = OpenAiCompatibleProvider::with_secret_resolver(
+            settings.endpoint,
+            settings.model,
+            settings.secret_ref,
+            resolver,
+        )
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("reply provider `{}` is invalid: {error}", settings.name),
+            )
+        })?;
+        let provider_id = provider.metadata().provider_id.clone();
+        if !provider_ids.insert(provider_id.clone()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("duplicate durable reply provider identity `{provider_id}`"),
+            ));
+        }
+        providers.push((settings.name, provider));
+    }
+
+    for (name, provider) in &providers {
+        provider.validate_secret_source().await.map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("reply provider `{name}` failed credential preflight: {error}"),
+            )
+        })?;
+    }
+    let mut providers = providers
+        .into_iter()
+        .map(|(name, provider)| (name, Arc::new(provider) as Arc<dyn ReplyProvider>))
+        .collect::<Vec<_>>();
+
+    if settings.default == LOCAL_FALLBACK_CONFIG_NAME {
+        return Ok(ConfiguredReplyProviders {
+            default: fallback,
+            additional: providers
+                .into_iter()
+                .map(|(_, provider)| provider)
+                .collect(),
+        });
+    }
+
+    let default_index = providers
+        .iter()
+        .position(|(name, _)| name == &settings.default)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "reply provider registry default must name one configured provider or local-fallback",
+            )
+        })?;
+    let (_, default) = providers.remove(default_index);
+    let mut additional = providers
+        .into_iter()
+        .map(|(_, provider)| provider)
+        .collect::<Vec<_>>();
+    additional.push(fallback);
+    Ok(ConfiguredReplyProviders {
+        default,
+        additional,
+    })
+}
+
+fn read_bounded_reply_provider_registry_file(path: &str) -> Result<Zeroizing<Vec<u8>>, io::Error> {
+    let file = open_reply_provider_registry_file(path)?;
+    let metadata = file.metadata().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ZEUS_LLM_PROVIDERS_FILE metadata could not be read",
+        )
+    })?;
+    if !metadata.is_file() || metadata.len() > REPLY_PROVIDER_REGISTRY_FILE_MAX_BYTES as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "ZEUS_LLM_PROVIDERS_FILE must be a regular file no larger than {} bytes",
+                REPLY_PROVIDER_REGISTRY_FILE_MAX_BYTES
+            ),
+        ));
+    }
+    let mut bytes = Zeroizing::new(Vec::with_capacity(
+        usize::try_from(metadata.len()).unwrap_or(REPLY_PROVIDER_REGISTRY_FILE_MAX_BYTES),
+    ));
+    file.take(REPLY_PROVIDER_REGISTRY_FILE_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ZEUS_LLM_PROVIDERS_FILE could not be read",
+            )
+        })?;
+    if bytes.len() > REPLY_PROVIDER_REGISTRY_FILE_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "ZEUS_LLM_PROVIDERS_FILE must be no larger than {} bytes",
+                REPLY_PROVIDER_REGISTRY_FILE_MAX_BYTES
+            ),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn open_reply_provider_registry_file(path: &str) -> Result<File, io::Error> {
+    #[cfg(unix)]
+    let result = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path);
+    #[cfg(not(unix))]
+    let result = File::open(path);
+    result.map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ZEUS_LLM_PROVIDERS_FILE could not be opened",
+        )
+    })
+}
+
+fn parse_reply_provider_registry(bytes: &[u8]) -> Result<ReplyProviderRegistrySettings, io::Error> {
+    if bytes.len() > REPLY_PROVIDER_REGISTRY_FILE_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "ZEUS_LLM_PROVIDERS_FILE must be no larger than {} bytes",
+                REPLY_PROVIDER_REGISTRY_FILE_MAX_BYTES
+            ),
+        ));
+    }
+    let document: ReplyProviderRegistryDocument =
+        serde_json::from_slice(bytes).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("ZEUS_LLM_PROVIDERS_FILE is not valid registry JSON: {error}"),
+            )
+        })?;
+    if document.version != REPLY_PROVIDER_REGISTRY_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "ZEUS_LLM_PROVIDERS_FILE version must be {}",
+                REPLY_PROVIDER_REGISTRY_VERSION
+            ),
+        ));
+    }
+    if document.providers.is_empty()
+        || document.providers.len() > REPLY_PROVIDER_REGISTRY_MAX_REMOTE_PROVIDERS
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "ZEUS_LLM_PROVIDERS_FILE must contain between 1 and {} remote providers",
+                REPLY_PROVIDER_REGISTRY_MAX_REMOTE_PROVIDERS
+            ),
+        ));
+    }
+    validate_reply_provider_config_name(&document.default)?;
+
+    let mut names = HashSet::with_capacity(document.providers.len());
+    let mut providers = Vec::with_capacity(document.providers.len());
+    for provider in document.providers {
+        validate_reply_provider_config_name(&provider.name)?;
+        if provider.name == LOCAL_FALLBACK_CONFIG_NAME {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("reply provider name `{LOCAL_FALLBACK_CONFIG_NAME}` is reserved by Zeus"),
+            ));
+        }
+        if !names.insert(provider.name.clone()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("duplicate reply provider name `{}`", provider.name),
+            ));
+        }
+        let secret_ref = SecretRef::parse(provider.api_key_ref)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        providers.push(RemoteReplyProviderSettings {
+            name: provider.name,
+            endpoint: provider.endpoint,
+            model: provider.model,
+            secret_ref,
+        });
+    }
+    if document.default != LOCAL_FALLBACK_CONFIG_NAME && !names.contains(&document.default) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ZEUS_LLM_PROVIDERS_FILE default must name one configured provider or local-fallback",
+        ));
+    }
+    Ok(ReplyProviderRegistrySettings {
+        default: document.default,
+        providers,
+    })
+}
+
+fn validate_reply_provider_config_name(name: &str) -> Result<(), io::Error> {
+    let mut bytes = name.bytes();
+    if name.len() > REPLY_PROVIDER_CONFIG_NAME_MAX_BYTES
+        || !bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "reply provider names must start with an ASCII letter and contain at most {} ASCII letters, digits, underscores, or hyphens",
+                REPLY_PROVIDER_CONFIG_NAME_MAX_BYTES
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn select_reply_provider_configuration(
+    registry_file: Option<String>,
+    endpoint: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+    api_key_ref: Option<String>,
+) -> Result<ReplyProviderConfiguration, io::Error> {
+    if let Some(path) = registry_file {
+        if endpoint.is_some() || model.is_some() || api_key.is_some() || api_key_ref.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ZEUS_LLM_PROVIDERS_FILE cannot be combined with legacy ZEUS_LLM_ENDPOINT, ZEUS_LLM_MODEL, ZEUS_LLM_API_KEY, or ZEUS_LLM_API_KEY_REF",
+            ));
+        }
+        return Ok(ReplyProviderConfiguration::RegistryFile(path));
+    }
+    Ok(ReplyProviderConfiguration::Legacy(
+        parse_reply_provider_settings(endpoint, model, api_key, api_key_ref)?,
+    ))
+}
+
+struct ConfiguredReplyProviders {
+    default: Arc<dyn ReplyProvider>,
+    additional: Vec<Arc<dyn ReplyProvider>>,
+}
+
+enum ReplyProviderConfiguration {
+    Legacy(ReplyProviderSettings),
+    RegistryFile(String),
+}
+
+struct ReplyProviderRegistrySettings {
+    default: String,
+    providers: Vec<RemoteReplyProviderSettings>,
+}
+
+struct RemoteReplyProviderSettings {
+    name: String,
+    endpoint: String,
+    model: String,
+    secret_ref: SecretRef,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplyProviderRegistryDocument {
+    version: u32,
+    default: String,
+    providers: Vec<ReplyProviderRegistryEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplyProviderRegistryEntry {
+    name: String,
+    endpoint: String,
+    model: String,
+    api_key_ref: String,
 }
 
 fn configured_secret_resolver(reference: SecretRef) -> Result<Arc<dyn SecretResolver>, io::Error> {
@@ -755,13 +1073,18 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        EnvironmentSecretResolver, ReplyProviderSettings, parse_environment_capacity,
+        EnvironmentSecretResolver, LOCAL_FALLBACK_CONFIG_NAME,
+        REPLY_PROVIDER_REGISTRY_FILE_MAX_BYTES, REPLY_PROVIDER_REGISTRY_MAX_REMOTE_PROVIDERS,
+        RemoteReplyProviderSettings, ReplyProviderConfiguration, ReplyProviderRegistrySettings,
+        ReplyProviderSettings, build_reply_provider_registry, parse_environment_capacity,
         parse_environment_capacity_with_legacy_alias, parse_environment_flag,
-        parse_environment_u64, parse_ingress_policy, parse_reply_provider_settings,
+        parse_environment_u64, parse_ingress_policy, parse_reply_provider_registry,
+        parse_reply_provider_settings, read_bounded_reply_provider_registry_file,
+        select_reply_provider_configuration,
     };
     #[cfg(unix)]
     use super::{FileSecretResolver, SECRET_FILE_MAX_BYTES};
-    use llm::{SecretRef, SecretResolveError, SecretResolver};
+    use llm::{ReplyKind, SecretRef, SecretResolveError, SecretResolver};
     use std::{env::VarError, io};
 
     #[test]
@@ -898,6 +1221,319 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn provider_registry_source_is_exclusive_and_preserves_legacy_configuration() {
+        assert!(matches!(
+            select_reply_provider_configuration(
+                Some("/etc/zeus/providers.json".into()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+            ReplyProviderConfiguration::RegistryFile(path)
+                if path == "/etc/zeus/providers.json"
+        ));
+        assert!(matches!(
+            select_reply_provider_configuration(None, None, None, None, None).unwrap(),
+            ReplyProviderConfiguration::Legacy(ReplyProviderSettings::LocalFallback)
+        ));
+        assert!(matches!(
+            select_reply_provider_configuration(
+                None,
+                Some("https://provider.example/v1/chat/completions".into()),
+                Some("model-a".into()),
+                Some("inline-key".into()),
+                None,
+            )
+            .unwrap(),
+            ReplyProviderConfiguration::Legacy(ReplyProviderSettings::Inline { .. })
+        ));
+        let conflict = select_reply_provider_configuration(
+            Some("/etc/zeus/providers.json".into()),
+            Some("https://provider.example/v1/chat/completions".into()),
+            None,
+            None,
+            None,
+        )
+        .err()
+        .expect("mixed provider configuration must be rejected");
+        assert_eq!(conflict.kind(), io::ErrorKind::InvalidInput);
+        assert!(conflict.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn provider_registry_json_is_versioned_bounded_and_secret_ref_only() {
+        let valid = parse_reply_provider_registry(
+            br#"{
+                "version": 1,
+                "default": "primary",
+                "providers": [{
+                    "name": "primary",
+                    "endpoint": "https://provider.example/v1/chat/completions",
+                    "model": "model-a",
+                    "api_key_ref": "env:ZEUS_PRIMARY_KEY"
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(valid.default, "primary");
+        assert_eq!(valid.providers.len(), 1);
+        assert_eq!(valid.providers[0].name, "primary");
+        assert_eq!(
+            valid.providers[0].secret_ref.as_str(),
+            "env:ZEUS_PRIMARY_KEY"
+        );
+
+        let inline_secret = parse_reply_provider_registry(
+            br#"{
+                "version": 1,
+                "default": "primary",
+                "providers": [{
+                    "name": "primary",
+                    "endpoint": "https://provider.example/v1/chat/completions",
+                    "model": "model-a",
+                    "api_key": "must-not-leak"
+                }]
+            }"#,
+        )
+        .err()
+        .expect("inline provider secrets must be rejected");
+        assert_eq!(inline_secret.kind(), io::ErrorKind::InvalidInput);
+        assert!(!inline_secret.to_string().contains("must-not-leak"));
+
+        assert!(
+            parse_reply_provider_registry(
+                br#"{"version":2,"default":"primary","providers":[{"name":"primary","endpoint":"https://provider.example/v1/chat/completions","model":"model-a","api_key_ref":"env:KEY"}]}"#,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_reply_provider_registry(
+                br#"{"version":1,"default":"local-fallback","providers":[],"extra":true}"#,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_reply_provider_registry(&vec![b' '; REPLY_PROVIDER_REGISTRY_FILE_MAX_BYTES + 1])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn provider_registry_rejects_ambiguous_names_defaults_and_capacity() {
+        for invalid in [
+            br#"{"version":1,"default":"missing","providers":[{"name":"primary","endpoint":"https://provider.example/v1/chat/completions","model":"model-a","api_key_ref":"env:KEY"}]}"#.as_slice(),
+            br#"{"version":1,"default":"primary","providers":[{"name":"primary","endpoint":"https://provider.example/v1/chat/completions","model":"model-a","api_key_ref":"env:KEY"},{"name":"primary","endpoint":"https://other.example/v1/chat/completions","model":"model-b","api_key_ref":"env:OTHER_KEY"}]}"#.as_slice(),
+            br#"{"version":1,"default":"local-fallback","providers":[{"name":"local-fallback","endpoint":"https://provider.example/v1/chat/completions","model":"model-a","api_key_ref":"env:KEY"}]}"#.as_slice(),
+            br#"{"version":1,"default":"1primary","providers":[{"name":"1primary","endpoint":"https://provider.example/v1/chat/completions","model":"model-a","api_key_ref":"env:KEY"}]}"#.as_slice(),
+        ] {
+            assert!(parse_reply_provider_registry(invalid).is_err());
+        }
+
+        let providers = (0..=REPLY_PROVIDER_REGISTRY_MAX_REMOTE_PROVIDERS)
+            .map(|index| {
+                serde_json::json!({
+                    "name": format!("provider{index}"),
+                    "endpoint": format!("https://provider{index}.example/v1/chat/completions"),
+                    "model": format!("model-{index}"),
+                    "api_key_ref": format!("env:ZEUS_KEY_{index}")
+                })
+            })
+            .collect::<Vec<_>>();
+        let oversized = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "default": "provider0",
+            "providers": providers
+        }))
+        .unwrap();
+        assert!(parse_reply_provider_registry(&oversized).is_err());
+
+        let local_default = parse_reply_provider_registry(
+            br#"{"version":1,"default":"local-fallback","providers":[{"name":"primary","endpoint":"https://provider.example/v1/chat/completions","model":"model-a","api_key_ref":"env:KEY"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(local_default.default, LOCAL_FALLBACK_CONFIG_NAME);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_registry_preflights_all_secrets_and_routes_the_named_default() {
+        use std::{
+            fs,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let primary_path = std::env::temp_dir().join(format!(
+            "zeus-provider-primary-{}-{nonce}",
+            std::process::id()
+        ));
+        let secondary_path = std::env::temp_dir().join(format!(
+            "zeus-provider-secondary-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::write(&primary_path, b"primary-key\n").unwrap();
+        fs::write(&secondary_path, b"secondary-key\n").unwrap();
+
+        let primary_ref = SecretRef::parse(format!("file:{}", primary_path.display())).unwrap();
+        let secondary_ref = SecretRef::parse(format!("file:{}", secondary_path.display())).unwrap();
+        let registry = build_reply_provider_registry(ReplyProviderRegistrySettings {
+            default: "secondary".into(),
+            providers: vec![
+                RemoteReplyProviderSettings {
+                    name: "primary".into(),
+                    endpoint: "https://primary.example/v1/chat/completions".into(),
+                    model: "model-primary".into(),
+                    secret_ref: primary_ref.clone(),
+                },
+                RemoteReplyProviderSettings {
+                    name: "secondary".into(),
+                    endpoint: "https://secondary.example/v1/chat/completions".into(),
+                    model: "model-secondary".into(),
+                    secret_ref: secondary_ref,
+                },
+            ],
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            registry.default.metadata().model.as_deref(),
+            Some("model-secondary")
+        );
+        assert_eq!(registry.default.metadata().reply_kind, ReplyKind::Model);
+        assert_eq!(registry.additional.len(), 2);
+        assert!(
+            registry
+                .additional
+                .iter()
+                .any(|provider| { provider.metadata().model.as_deref() == Some("model-primary") })
+        );
+        assert!(
+            registry
+                .additional
+                .iter()
+                .any(|provider| { provider.metadata().reply_kind == ReplyKind::NonModelFallback })
+        );
+
+        let duplicate = build_reply_provider_registry(ReplyProviderRegistrySettings {
+            default: "first".into(),
+            providers: vec![
+                RemoteReplyProviderSettings {
+                    name: "first".into(),
+                    endpoint: "https://duplicate.example/v1/chat/completions".into(),
+                    model: "same-model".into(),
+                    secret_ref: primary_ref.clone(),
+                },
+                RemoteReplyProviderSettings {
+                    name: "second".into(),
+                    endpoint: "https://duplicate.example/v1/chat/completions".into(),
+                    model: "same-model".into(),
+                    secret_ref: primary_ref.clone(),
+                },
+            ],
+        })
+        .await
+        .err()
+        .expect("duplicate durable provider identities must be rejected");
+        assert!(duplicate.to_string().contains("duplicate durable"));
+
+        let local_default = build_reply_provider_registry(ReplyProviderRegistrySettings {
+            default: LOCAL_FALLBACK_CONFIG_NAME.into(),
+            providers: vec![RemoteReplyProviderSettings {
+                name: "primary".into(),
+                endpoint: "https://primary.example/v1/chat/completions".into(),
+                model: "model-primary".into(),
+                secret_ref: primary_ref.clone(),
+            }],
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            local_default.default.metadata().reply_kind,
+            ReplyKind::NonModelFallback
+        );
+        assert_eq!(local_default.additional.len(), 1);
+        assert_eq!(
+            local_default.additional[0].metadata().model.as_deref(),
+            Some("model-primary")
+        );
+
+        let missing_ref = SecretRef::parse(format!(
+            "file:{}",
+            primary_path.with_extension("missing").display()
+        ))
+        .unwrap();
+        let missing = build_reply_provider_registry(ReplyProviderRegistrySettings {
+            default: "missing".into(),
+            providers: vec![
+                RemoteReplyProviderSettings {
+                    name: "primary".into(),
+                    endpoint: "https://primary.example/v1/chat/completions".into(),
+                    model: "model-primary".into(),
+                    secret_ref: primary_ref,
+                },
+                RemoteReplyProviderSettings {
+                    name: "missing".into(),
+                    endpoint: "https://missing.example/v1/chat/completions".into(),
+                    model: "missing-model".into(),
+                    secret_ref: missing_ref,
+                },
+            ],
+        })
+        .await
+        .err()
+        .expect("missing provider credentials must fail preflight");
+        assert!(missing.to_string().contains("failed credential preflight"));
+
+        fs::remove_file(&primary_path).unwrap();
+        fs::remove_file(&secondary_path).unwrap();
+    }
+
+    #[test]
+    fn provider_registry_file_reader_accepts_only_bounded_regular_files() {
+        use std::{
+            fs,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "zeus-provider-registry-{}-{nonce}.json",
+            std::process::id()
+        ));
+        fs::write(&path, b"{}").unwrap();
+        assert_eq!(
+            read_bounded_reply_provider_registry_file(path.to_str().unwrap())
+                .unwrap()
+                .as_slice(),
+            b"{}"
+        );
+        fs::write(
+            &path,
+            vec![b'x'; REPLY_PROVIDER_REGISTRY_FILE_MAX_BYTES + 1],
+        )
+        .unwrap();
+        assert!(read_bounded_reply_provider_registry_file(path.to_str().unwrap()).is_err());
+        assert!(
+            read_bounded_reply_provider_registry_file(
+                std::env::temp_dir()
+                    .to_str()
+                    .expect("temporary path is UTF-8")
+            )
+            .is_err()
+        );
+        fs::remove_file(&path).unwrap();
+        assert!(read_bounded_reply_provider_registry_file(path.to_str().unwrap()).is_err());
     }
 
     #[test]

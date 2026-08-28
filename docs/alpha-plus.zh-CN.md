@@ -203,6 +203,10 @@ Provider endpoint 只来自服务端配置，API key 可用兼容的 inline 环�
 `file:/absolute/normalized/path`。启动会在打开 SQLite 前预检一次；运行时仍逐次解析。reference
 身份进入 provider config digest，plaintext 不进入 metadata/manifest/ledger；同 reference 换值
 允许轮换，换 reference 会让不兼容 queued work fail closed。
+多远端模型由 `ZEUS_LLM_PROVIDERS_FILE` 的 strict version 1 JSON 注册：文件上限 64 KiB，包含
+1–16 个唯一逻辑名称，只接受 endpoint、model 与 `api_key_ref`，明确拒绝 inline key 和未知字段。
+`default` 可命名一个远端项或 `local-fallback`；逻辑名称不持久化。该模式不能与旧单 Provider 环境
+变量混用，且必须在 SQLite 打开前完成全部 Provider 构造、durable identity 去重与 SecretRef 预检。
 
 ## 5. 回复执行链
 
@@ -363,6 +367,8 @@ schema v26 由 startup Provider registry 与 durable account selection 组成。
 `GET|PUT /api/v1/account/reply-provider` 选择已注册 Provider。选择只影响新 turn；queued reply、
 compaction、Agent model/tool work 继续按 immutable job binding 解析 Provider。显式选择或 queued
 binding 在重启后不再注册时 fail closed，不回退到另一个默认模型。
+startup registry 既支持兼容的单远端环境变量，也支持上述 bounded 多 Provider 文件；有远端项时
+始终额外注册显式 `local-fallback`，但不会在选中远端失败时自动切换。
 Knowledge v1 生成独立、受治理、带完整 digest 的 canonical context
 snapshot，不修改 system prompt。schema v22 已完成数据库绑定、
 Agent request 注入和 exact replay；LLM 协议层使用独立 durable `context` role，并只在
@@ -434,8 +440,8 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 按项目既有统计口径通过 615 个 Rust 测试（connectors 22、deployment 8、knowledge 29、
-  LLM unit 30、provider contract 15、storage 256、runtime 48、API library 82、API main/config 11）与 28 个 Web Node 测试。
+- host 按项目既有统计口径通过 620 个 Rust 测试（connectors 22、deployment 8、knowledge 29、
+  LLM unit 30、provider contract 15、storage 256、runtime 48、API library 82、API main/config 16）与 28 个 Web Node 测试。
 - `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 
 ## 8. 容器与 OOM 验收边界

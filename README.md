@@ -140,6 +140,43 @@ ZEUS_LLM_API_KEY_REF=env:ZEUS_LLM_RUNTIME_KEY
 ZEUS_LLM_RUNTIME_KEY=your-secret
 ```
 
+To register more than one remote model, point Zeus at one startup-owned JSON
+registry. The document carries references only, never resolved credentials:
+
+```json
+{
+  "version": 1,
+  "default": "primary",
+  "providers": [
+    {
+      "name": "primary",
+      "endpoint": "https://primary.example/v1/chat/completions",
+      "model": "model-a",
+      "api_key_ref": "env:ZEUS_PRIMARY_KEY"
+    },
+    {
+      "name": "reasoning",
+      "endpoint": "https://reasoning.example/v1/chat/completions",
+      "model": "model-r",
+      "api_key_ref": "file:/run/secrets/zeus-reasoning-key"
+    }
+  ]
+}
+```
+
+```sh
+ZEUS_LLM_PROVIDERS_FILE=/etc/zeus/providers.json
+ZEUS_PRIMARY_KEY=your-secret
+```
+
+The registry must be a regular file no larger than 64 KiB, use exact version
+`1`, contain 1–16 remote providers, and use unique 64-byte ASCII logical names.
+`default` names one entry or the reserved `local-fallback`. Unknown fields and
+inline `api_key` values are rejected. `ZEUS_LLM_PROVIDERS_FILE` is mutually
+exclusive with all four legacy `ZEUS_LLM_*` single-provider variables. Zeus
+constructs every provider, rejects duplicate durable provider identities, and
+preflights every referenced credential before opening SQLite.
+
 The `env:` adapter re-reads only the exact referenced process variable for
 every model operation. On Unix, `file:/absolute/normalized/path` reopens a
 regular file for every operation without following a symlink in the final path
@@ -160,9 +197,10 @@ ledger, provider metadata, or application logs.
 Partial provider configuration fails startup. The endpoint and key are never
 writable through the browser Settings API.
 
-When a remote model is configured, Zeus registers that model as the startup
-default and also registers the explicit `local-fallback` provider. Authenticated
-actors can read the secret-free catalog at `GET /api/v1/providers`; account
+The legacy single-provider form makes that remote model the startup default. A
+registry uses its explicit `default`; whenever at least one remote model is
+configured, Zeus also registers the explicit `local-fallback` provider.
+Authenticated actors can read the secret-free catalog at `GET /api/v1/providers`; account
 owners can read or change the effective selection with
 `GET|PUT /api/v1/account/reply-provider`. The `PUT` body contains only
 `provider_id` and `expected_revision` and requires `Idempotency-Key`; endpoint,
@@ -1087,10 +1125,10 @@ Per-Operation SecretRef Resolution, and the bounded multi-account control plane:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 615 tests passed
+- `cargo test --workspace --all-targets --locked`: 620 tests passed
   across the top-level test targets, including 22 connector tests,
   8 deployment tests, 29 knowledge tests, 30 LLM unit and 15 provider-contract
-  tests, 256 storage tests, 48 runtime tests, 82 API library tests, 11 API main/config
+  tests, 256 storage tests, 48 runtime tests, 82 API library tests, 16 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,
   actor-scoped REST/SSE/receipt isolation, authorization-revoked queue claims,
