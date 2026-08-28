@@ -689,6 +689,15 @@ pub struct AgentSubagentResultSnapshot {
     pub completed_at: Option<String>,
 }
 
+/// Current authority and child sequence captured for one exact started
+/// `send_message` call. The immutable direct-parent binding is re-derived from
+/// storage; no model-supplied account, actor, or parent identity is trusted.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentSubagentMessageCandidate {
+    pub authz: AuthzContext,
+    pub child_session: SessionSummary,
+}
+
 /// Read-only scheduling candidate for the first queued follow-up of one Ready
 /// Session. The synthetic auth-session ID is internal; durable admission
 /// rechecks the captured membership revision without trusting a browser login.

@@ -29,6 +29,10 @@ pub const GET_AGENT_RESULT_TOOL_VERSION: &str = "1-direct-child-snapshot";
 pub const GET_AGENT_RESULT_ARGUMENTS_MAX_BYTES: usize = 1024;
 pub const GET_AGENT_RESULT_DEFAULT_MAX_BYTES: usize = 8 * 1024;
 pub const GET_AGENT_RESULT_MAX_BYTES: usize = 8 * 1024;
+pub const SEND_MESSAGE_TOOL_NAME: &str = "send_message";
+pub const SEND_MESSAGE_TOOL_VERSION: &str = "1-direct-child-followup";
+pub const SEND_MESSAGE_MAX_BYTES: usize = 12 * 1024;
+pub const SEND_MESSAGE_ARGUMENTS_MAX_BYTES: usize = 16 * 1024;
 pub const SPAWN_AGENT_TOOL_NAME: &str = "spawn_agent";
 pub const SPAWN_AGENT_TOOL_VERSION: &str = "1-durable-session-fork";
 pub const SPAWN_AGENT_DESCRIPTION_MAX_BYTES: usize = 256;
@@ -39,7 +43,8 @@ pub const SPAWN_AGENT_MAX_DIRECT_CHILDREN: usize = 8;
 
 const LIST_AGENTS_DESCRIPTION: &str = "List this Session's durable direct child branches by stable child Session ID and immutable fork boundary. This is a bounded read, not completion polling: use the opaque next_cursor to continue when present. A returned child is independently continuable, but this tool does not send it work, interrupt it, or claim that it is currently executing.";
 const GET_AGENT_RESULT_DESCRIPTION: &str = "Read one durable direct child's current status and, after successful completion, a bounded page of its final assistant output. The child must have been created by this parent Session's spawn_agent call. Failed or indeterminate children never expose partial output. Continue a large successful result with next_after_byte.";
-const SPAWN_AGENT_DESCRIPTION: &str = "Start one durable background child Agent that inherits this Session's completed turns before the current in-flight turn. The call returns after the child Session, initial prompt, and first model job are atomically admitted; it does not wait for the child result. Use list_agents to rediscover the stable child ID. This stage does not provide send or interrupt controls.";
+const SEND_MESSAGE_DESCRIPTION: &str = "Durably enqueue one follow-up message for a direct child created by this parent Session's spawn_agent call. The stable message_id acknowledges FIFO admission, not child completion. A ready child is scheduled and a running child consumes the message after its current turn; use get_agent_result to read completed output.";
+const SPAWN_AGENT_DESCRIPTION: &str = "Start one durable background child Agent that inherits this Session's completed turns before the current in-flight turn. The call returns after the child Session, initial prompt, and first model job are atomically admitted; it does not wait for the child result. Use list_agents to rediscover the stable child ID, send_message to continue it, and get_agent_result to read terminal output. This stage does not provide interrupt control.";
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum SubagentError {
@@ -59,6 +64,16 @@ pub enum SubagentError {
     InvalidResultRange,
     #[error("get_agent_result result exceeds its bounded output contract")]
     InvalidAgentResult,
+    #[error("send_message arguments are not a strict bounded object")]
+    InvalidSendArguments,
+    #[error("send_message subagent_id is not a canonical bounded identifier")]
+    InvalidSendSubagentId,
+    #[error("send_message message is not a non-empty bounded user message")]
+    InvalidSendMessage,
+    #[error("send_message durable identity input is invalid")]
+    InvalidSendIdentity,
+    #[error("send_message result exceeds its bounded output contract")]
+    InvalidSendResult,
     #[error("spawn_agent arguments are not a strict bounded object")]
     InvalidSpawnArguments,
     #[error("spawn_agent description is not a non-empty bounded display label")]
@@ -159,6 +174,61 @@ pub struct GetAgentResult {
     pub next_after_byte: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSendMessageRequest {
+    subagent_id: String,
+    message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SendMessageRequest {
+    subagent_id: String,
+    message: String,
+}
+
+impl SendMessageRequest {
+    pub fn subagent_id(&self) -> &str {
+        &self.subagent_id
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SendMessageResult {
+    pub subagent_id: String,
+    pub message_id: String,
+}
+
+impl SendMessageResult {
+    pub fn new(subagent_id: String, message_id: String) -> Result<Self, SubagentError> {
+        if protocol::validate_session_id(&subagent_id).is_err()
+            || protocol::validate_turn_id(&message_id).is_err()
+        {
+            return Err(SubagentError::InvalidSendResult);
+        }
+        let result = Self {
+            subagent_id,
+            message_id,
+        };
+        let encoded = serde_json::to_vec(&result).map_err(|_| SubagentError::InvalidSendResult)?;
+        if encoded.len() > TOOL_OUTPUT_MAX_SERIALIZED_BYTES {
+            return Err(SubagentError::InvalidSendResult);
+        }
+        Ok(result)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SendMessageIdentity {
+    pub turn_id: String,
+    pub idempotency_key: String,
 }
 
 impl GetAgentResult {
@@ -383,6 +453,50 @@ pub fn prepare_spawn_agent(arguments: &Value) -> Result<SpawnAgentRequest, Subag
     })
 }
 
+pub fn prepare_send_message(arguments: &Value) -> Result<SendMessageRequest, SubagentError> {
+    let encoded = serde_json::to_vec(arguments).map_err(|_| SubagentError::InvalidSendArguments)?;
+    if encoded.len() > SEND_MESSAGE_ARGUMENTS_MAX_BYTES {
+        return Err(SubagentError::InvalidSendArguments);
+    }
+    let raw: RawSendMessageRequest = serde_json::from_value(arguments.clone())
+        .map_err(|_| SubagentError::InvalidSendArguments)?;
+    if protocol::validate_session_id(&raw.subagent_id).is_err() {
+        return Err(SubagentError::InvalidSendSubagentId);
+    }
+    if raw.message.len() > SEND_MESSAGE_MAX_BYTES
+        || protocol::validate_user_message(&raw.message).is_err()
+    {
+        return Err(SubagentError::InvalidSendMessage);
+    }
+    Ok(SendMessageRequest {
+        subagent_id: raw.subagent_id,
+        message: raw.message,
+    })
+}
+
+pub fn send_message_identity(
+    parent_session_id: &str,
+    call_id: &str,
+    child_session_id: &str,
+) -> Result<SendMessageIdentity, SubagentError> {
+    if !valid_identity_input(parent_session_id)
+        || !valid_identity_input(call_id)
+        || protocol::validate_session_id(child_session_id).is_err()
+    {
+        return Err(SubagentError::InvalidSendIdentity);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"zeus.subagent-message.v1\0");
+    hash_field(&mut hasher, parent_session_id.as_bytes());
+    hash_field(&mut hasher, call_id.as_bytes());
+    hash_field(&mut hasher, child_session_id.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    Ok(SendMessageIdentity {
+        turn_id: format!("subagent-message-{digest}"),
+        idempotency_key: format!("subagent-message-{digest}"),
+    })
+}
+
 pub fn spawn_agent_identity(
     parent_session_id: &str,
     call_id: &str,
@@ -531,9 +645,33 @@ pub fn spawn_agent_descriptor() -> ToolDescriptor {
     }
 }
 
+pub fn send_message_descriptor() -> ToolDescriptor {
+    ToolDescriptor {
+        name: SEND_MESSAGE_TOOL_NAME.into(),
+        version: SEND_MESSAGE_TOOL_VERSION.into(),
+        description: SEND_MESSAGE_DESCRIPTION.into(),
+        effect: ToolEffect::LocalWrite,
+        sandbox_profile: SandboxProfile::ReadOnly,
+        input_schema: ObjectSchema {
+            max_serialized_bytes: SEND_MESSAGE_ARGUMENTS_MAX_BYTES,
+            properties: BTreeMap::from([
+                (
+                    "subagent_id".into(),
+                    ParameterSpec::required_string(protocol::SESSION_ID_MAX_BYTES),
+                ),
+                (
+                    "message".into(),
+                    ParameterSpec::required_string(SEND_MESSAGE_MAX_BYTES),
+                ),
+            ]),
+        },
+    }
+}
+
 pub fn register_subagent_tools(registry: &mut ToolRegistry) -> Result<(), RegistryError> {
     registry.register(get_agent_result_descriptor(), RuntimeSubagentExecutor)?;
     registry.register(list_agents_descriptor(), RuntimeSubagentExecutor)?;
+    registry.register(send_message_descriptor(), RuntimeSubagentExecutor)?;
     registry.register(spawn_agent_descriptor(), RuntimeSubagentExecutor)
 }
 
@@ -612,6 +750,7 @@ mod tests {
         register_subagent_tools(&mut registry).unwrap();
         assert!(registry.descriptor(LIST_AGENTS_TOOL_NAME).is_some());
         assert!(registry.descriptor(GET_AGENT_RESULT_TOOL_NAME).is_some());
+        assert!(registry.descriptor(SEND_MESSAGE_TOOL_NAME).is_some());
     }
 
     #[test]
@@ -719,6 +858,56 @@ mod tests {
         ] {
             assert!(prepare_spawn_agent(&invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn send_message_request_and_identity_are_strict_bounded_and_scope_bound() {
+        let request = prepare_send_message(&serde_json::json!({
+            "subagent_id": "subagent-child",
+            "message": "Continue with the second bounded task.",
+        }))
+        .unwrap();
+        assert_eq!(request.subagent_id(), "subagent-child");
+        assert!(request.message().contains("second"));
+        for invalid in [
+            serde_json::json!({"subagent_id": " bad", "message": "work"}),
+            serde_json::json!({"subagent_id": "child", "message": "  "}),
+            serde_json::json!({"subagent_id": "child", "message": "work", "extra": true}),
+        ] {
+            assert!(prepare_send_message(&invalid).is_err(), "{invalid}");
+        }
+
+        let first = send_message_identity("parent", "call-1", "subagent-child").unwrap();
+        assert_eq!(
+            first,
+            send_message_identity("parent", "call-1", "subagent-child").unwrap()
+        );
+        assert_ne!(
+            first,
+            send_message_identity("parent", "call-2", "subagent-child").unwrap()
+        );
+        assert_ne!(
+            first,
+            send_message_identity("parent", "call-1", "subagent-other").unwrap()
+        );
+        protocol::validate_turn_id(&first.turn_id).unwrap();
+        protocol::validate_idempotency_key(&first.idempotency_key).unwrap();
+    }
+
+    #[test]
+    fn send_message_descriptor_and_result_are_closed_and_bounded() {
+        let descriptor = send_message_descriptor();
+        assert_eq!(descriptor.effect, ToolEffect::LocalWrite);
+        assert_eq!(descriptor.sandbox_profile, SandboxProfile::ReadOnly);
+        let schema = descriptor.input_schema.provider_json_schema().unwrap();
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            schema["properties"]["message"]["maxLength"],
+            SEND_MESSAGE_MAX_BYTES
+        );
+        let result =
+            SendMessageResult::new("subagent-child".into(), "subagent-message-1".into()).unwrap();
+        assert!(serde_json::to_vec(&result).unwrap().len() <= TOOL_OUTPUT_MAX_SERIALIZED_BYTES);
     }
 
     #[test]

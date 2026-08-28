@@ -1314,8 +1314,44 @@ impl SqliteStore {
                 &session_id,
                 request,
                 &key,
-                &limits,
-                &physical_limits,
+                EnqueueSessionFollowupOptions {
+                    limits: &limits,
+                    physical_limits: &physical_limits,
+                    authority: SessionFollowupAuthority::UserAuthSession,
+                },
+            )
+        })
+        .await
+    }
+
+    /// Durably enqueue one follow-up on behalf of an already-authorized Agent
+    /// tool call. The caller's exact durable membership is revalidated, while
+    /// a short-lived browser authentication session is deliberately not used
+    /// as authority for process-owned continuation work.
+    pub async fn enqueue_subagent_followup_for_actor(
+        &self,
+        context: &AuthzContext,
+        session_id: &str,
+        request: EnqueueSessionFollowupRequest,
+        idempotency_key: &str,
+    ) -> Result<EnqueueSessionFollowupResponse, StorageError> {
+        let context = validated_authz_context(context)?;
+        let session_id = validated_durable_reference(session_id, "session ID")?.to_owned();
+        let key = normalized_key(idempotency_key)?.to_owned();
+        let limits = self.limits.clone();
+        let physical_limits = self.physical_limits.clone();
+        self.with_connection(move |connection| {
+            enqueue_session_followup(
+                connection,
+                &context,
+                &session_id,
+                request,
+                &key,
+                EnqueueSessionFollowupOptions {
+                    limits: &limits,
+                    physical_limits: &physical_limits,
+                    authority: SessionFollowupAuthority::AgentProcess,
+                },
             )
         })
         .await
@@ -11314,7 +11350,7 @@ fn fork_session(
     normalized_key(idempotency_key)?;
     let transaction = connection;
     if internal_authority {
-        require_goal_round_authority(transaction, parent_session_id, context)?;
+        require_process_owned_session_authority(transaction, parent_session_id, context)?;
         require_session_account(transaction, parent_session_id, &context.account_id)?;
     } else {
         require_current_authority(transaction, context, AccountCapability::SessionWrite)?;
@@ -12570,19 +12606,43 @@ fn observe_session_flush_barrier(
     Ok(barrier)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionFollowupAuthority {
+    UserAuthSession,
+    AgentProcess,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EnqueueSessionFollowupOptions<'a> {
+    limits: &'a StorageLimits,
+    physical_limits: &'a SqlitePhysicalLimits,
+    authority: SessionFollowupAuthority,
+}
+
 fn enqueue_session_followup(
     connection: &mut Connection,
     context: &AuthzContext,
     session_id: &str,
     request: EnqueueSessionFollowupRequest,
     idempotency_key: &str,
-    limits: &StorageLimits,
-    physical_limits: &SqlitePhysicalLimits,
+    options: EnqueueSessionFollowupOptions<'_>,
 ) -> Result<EnqueueSessionFollowupResponse, StorageError> {
+    let EnqueueSessionFollowupOptions {
+        limits,
+        physical_limits,
+        authority,
+    } = options;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    require_current_authority(&transaction, context, AccountCapability::SessionWrite)?;
-    require_current_authority(&transaction, context, AccountCapability::Reply)?;
-    require_active_session_actor(&transaction, session_id, context)?;
+    match authority {
+        SessionFollowupAuthority::UserAuthSession => {
+            require_current_authority(&transaction, context, AccountCapability::SessionWrite)?;
+            require_current_authority(&transaction, context, AccountCapability::Reply)?;
+            require_active_session_actor(&transaction, session_id, context)?;
+        }
+        SessionFollowupAuthority::AgentProcess => {
+            require_process_owned_session_authority(&transaction, session_id, context)?;
+        }
+    }
     let start_request = StartTurnRequest {
         turn_id: request.turn_id.clone(),
         user_message: request.user_message.clone(),
@@ -12978,7 +13038,7 @@ fn start_turn(
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if let Some(context) = authz {
         if goal_round.is_some() || followup.is_some() {
-            require_goal_round_authority(&transaction, session_id, context)?;
+            require_process_owned_session_authority(&transaction, session_id, context)?;
         } else {
             require_current_authority(&transaction, context, AccountCapability::SessionWrite)?;
             require_active_session_actor(&transaction, session_id, context)?;
@@ -13334,7 +13394,7 @@ pub(super) fn insert_subagent_initial_turn(
     validated_durable_reference(child_session_id, "child session ID")?;
     validate_start_turn_request(request)?;
     agent::validate_agent_turn_spec(agent_spec)?;
-    require_goal_round_authority(connection, child_session_id, &agent_spec.authz)?;
+    require_process_owned_session_authority(connection, child_session_id, &agent_spec.authz)?;
     require_connection_physical_capacity(
         connection,
         physical_limits,
@@ -14820,10 +14880,10 @@ fn require_current_authority(
     Ok(())
 }
 
-/// Revalidates the exact membership captured when a Goal was armed. Automatic
-/// rounds are process-owned work, so the original browser authentication
-/// session is deliberately neither required nor accepted as durable authority.
-fn require_goal_round_authority(
+/// Revalidates the exact durable membership captured when process-owned work
+/// was admitted. The original browser authentication session is deliberately
+/// neither required nor accepted as authority for later automatic execution.
+fn require_process_owned_session_authority(
     connection: &Connection,
     session_id: &str,
     context: &AuthzContext,

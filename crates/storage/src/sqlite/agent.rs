@@ -12,10 +12,11 @@ use crate::{
     AgentModelResolution, AgentModelStartOutcome, AgentModelSuccessCommit, AgentOperationClaim,
     AgentOperationKind, AgentPreparedModel, AgentPreparedTool, AgentPromptCommit,
     AgentPromptRevisionPage, AgentPromptRevisionSummary, AgentPromptState, AgentPromptUpdateResult,
-    AgentReviewCommit, AgentReviewContext, AgentReviewResult, AgentSubagentResultSnapshot,
-    AgentSubagentSpawnCandidate, AgentSubagentSpawnCommit, AgentTerminalCompletion, AgentToolCall,
-    AgentToolCallSpec, AgentToolClaimOutcome, AgentToolCompletion, AgentToolCompletionCommit,
-    AgentToolOutcomeUnknownCommit, AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe,
+    AgentReviewCommit, AgentReviewContext, AgentReviewResult, AgentSubagentMessageCandidate,
+    AgentSubagentResultSnapshot, AgentSubagentSpawnCandidate, AgentSubagentSpawnCommit,
+    AgentTerminalCompletion, AgentToolCall, AgentToolCallSpec, AgentToolClaimOutcome,
+    AgentToolCompletion, AgentToolCompletionCommit, AgentToolOutcomeUnknownCommit,
+    AgentToolStartOutcome, AgentToolWork, AgentTurnReceiptProbe,
     DEFAULT_SESSION_AGENT_PROMPT_REVISION, DEFAULT_SESSION_AGENT_SYSTEM_PROMPT,
     KnowledgeCatalogCommit, KnowledgeCatalogRevisionPage, KnowledgeCatalogRevisionSummary,
     KnowledgeCatalogState, KnowledgeCatalogUpdateResult, SESSION_AGENT_PROMPT_ID,
@@ -524,6 +525,30 @@ impl SqliteStore {
             validated_durable_reference(child_session_id, "subagent Session ID")?.to_owned();
         self.with_connection(move |connection| {
             query_agent_subagent_result_for_started_tool(
+                connection,
+                &scope,
+                &call_id,
+                &child_session_id,
+            )
+        })
+        .await
+    }
+
+    /// Resolves one direct child and the exact current parent authority for a
+    /// durably started `send_message` call. The subsequent follow-up admission
+    /// rechecks membership and child sequence in its own write transaction.
+    pub async fn subagent_message_candidate_for_started_tool(
+        &self,
+        scope: &ExecutionScope,
+        call_id: &str,
+        child_session_id: &str,
+    ) -> Result<AgentSubagentMessageCandidate, StorageError> {
+        let scope = scope.clone();
+        let call_id = validated_durable_reference(call_id, "Agent tool call ID")?.to_owned();
+        let child_session_id =
+            validated_durable_reference(child_session_id, "subagent Session ID")?.to_owned();
+        self.with_connection(move |connection| {
+            query_subagent_message_candidate_for_started_tool(
                 connection,
                 &scope,
                 &call_id,
@@ -4836,6 +4861,109 @@ fn query_subagent_spawn_candidate_for_started_tool(
     Ok(candidate)
 }
 
+fn query_subagent_message_candidate_for_started_tool(
+    connection: &mut Connection,
+    scope: &ExecutionScope,
+    call_id: &str,
+    child_session_id: &str,
+) -> Result<AgentSubagentMessageCandidate, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let call = query_agent_tool_call(&transaction, call_id)?;
+    let agent = query_agent_turn(&transaction, &call.agent_id)?;
+    if call.status != AgentToolCallStatus::Running
+        || call.tool_name != subagents::SEND_MESSAGE_TOOL_NAME
+        || call.tool_version != subagents::SEND_MESSAGE_TOOL_VERSION
+        || call.account_id.as_str() != scope.account_id
+        || call.session_id != scope.session_id
+        || call.turn_id != scope.turn_id
+        || call.agent_id != scope.agent_id
+        || agent.account_id.as_str() != scope.account_id
+        || agent.actor_user_id != scope.actor_id
+        || agent.session_id != scope.session_id
+        || agent.turn_id != scope.turn_id
+    {
+        return Err(StorageError::AgentToolCallNotFound(call_id.to_owned()));
+    }
+    let direct_child: i64 = transaction.query_row(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM agent_subagent_spawns spawn
+               WHERE spawn.account_id = ?1
+                 AND spawn.actor_user_id = ?2
+                 AND spawn.parent_session_id = ?3
+                 AND spawn.child_session_id = ?4
+           )"#,
+        params![
+            agent.account_id.as_str(),
+            agent.actor_user_id,
+            agent.session_id,
+            child_session_id,
+        ],
+        |row| row.get(0),
+    )?;
+    if direct_child == 0 {
+        return Err(StorageError::AgentToolCallNotFound(call_id.to_owned()));
+    }
+    let role = transaction
+        .query_row(
+            r#"SELECT membership.role
+               FROM accounts account
+               JOIN account_memberships membership
+                 ON membership.account_id = account.id
+               JOIN users user ON user.id = membership.user_id
+               JOIN sessions parent ON parent.account_id = account.id
+               JOIN sessions child ON child.account_id = account.id
+               WHERE account.id = ?1
+                 AND account.status = 'active'
+                 AND membership.user_id = ?2
+                 AND membership.status = 'active'
+                 AND membership.revision = ?3
+                 AND user.status = 'active'
+                 AND parent.id = ?4
+                 AND child.id = ?5"#,
+            params![
+                agent.account_id.as_str(),
+                agent.actor_user_id,
+                u64_to_i64(
+                    agent.actor_membership_revision.get(),
+                    "subagent message membership revision"
+                )?,
+                agent.session_id,
+                child_session_id,
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|role| decode_membership_role(&role))
+        .transpose()?
+        .filter(|role| membership_allows(*role, AccountCapability::Reply))
+        .ok_or(StorageError::PermissionDenied)?;
+    let child_session = query_session_summary(&transaction, child_session_id)?;
+    validate_session_event_tail(&transaction, &child_session)?;
+    if child_session.status == SessionStatus::NeedsAttention {
+        return Err(StorageError::InvalidSessionTransition(
+            "send_message cannot continue a child Session that needs attention".into(),
+        ));
+    }
+    let auth_session_id =
+        AuthSessionId::from_persistence("subagent-message-driver-v1").map_err(|error| {
+            StorageError::CorruptData(format!(
+                "invalid internal subagent message authority ID: {error}"
+            ))
+        })?;
+    let candidate = AgentSubagentMessageCandidate {
+        authz: AuthzContext {
+            account_id: agent.account_id,
+            user_id: agent.actor_user_id,
+            membership_role: role,
+            membership_revision: agent.actor_membership_revision,
+            auth_session_id,
+        },
+        child_session,
+    };
+    transaction.commit()?;
+    Ok(candidate)
+}
+
 fn query_agent_todo_snapshot_for_call(
     connection: &Connection,
     call_id: &str,
@@ -7514,6 +7642,118 @@ pub(super) fn verify_agent_subagent_spawn_integrity(
         {
             return Err(StorageError::CorruptData(format!(
                 "spawn_agent call `{call_id}` has inconsistent durable child evidence"
+            )));
+        }
+    }
+
+    let mut statement = connection.prepare(
+        r#"SELECT call_id FROM agent_tool_calls
+           WHERE tool_name = ?1 AND tool_version = ?2 AND status = 'succeeded'
+           ORDER BY call_id"#,
+    )?;
+    let message_call_ids = statement
+        .query_map(
+            params![
+                subagents::SEND_MESSAGE_TOOL_NAME,
+                subagents::SEND_MESSAGE_TOOL_VERSION,
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for call_id in message_call_ids {
+        let call = query_agent_tool_call(connection, &call_id)?;
+        let parent_agent = query_agent_turn(connection, &call.agent_id)?;
+        let request = subagents::prepare_send_message(&call.arguments_json).map_err(|error| {
+            StorageError::CorruptData(format!(
+                "send_message call `{call_id}` has invalid durable arguments: {error}"
+            ))
+        })?;
+        let result: subagents::SendMessageResult =
+            serde_json::from_value(call.result_json.clone().ok_or_else(|| {
+                StorageError::CorruptData(format!(
+                    "send_message call `{call_id}` has no successful durable result"
+                ))
+            })?)
+            .map_err(|error| {
+                StorageError::CorruptData(format!(
+                    "send_message call `{call_id}` has an invalid durable result: {error}"
+                ))
+            })?;
+        let identity = subagents::send_message_identity(
+            &call.session_id,
+            &call.call_id,
+            request.subagent_id(),
+        )
+        .map_err(|error| {
+            StorageError::CorruptData(format!(
+                "send_message call `{call_id}` has invalid identity material: {error}"
+            ))
+        })?;
+        let direct_child: i64 = connection.query_row(
+            r#"SELECT EXISTS(
+                   SELECT 1 FROM agent_subagent_spawns spawn
+                   WHERE spawn.account_id = ?1
+                     AND spawn.actor_user_id = ?2
+                     AND spawn.parent_session_id = ?3
+                     AND spawn.child_session_id = ?4
+               )"#,
+            params![
+                call.account_id.as_str(),
+                parent_agent.actor_user_id,
+                call.session_id,
+                request.subagent_id(),
+            ],
+            |row| row.get(0),
+        )?;
+        let followup =
+            query_session_followup(connection, request.subagent_id(), &identity.turn_id)?;
+        let (followup_account_id, followup_actor_user_id, followup_membership_revision): (
+            String,
+            String,
+            i64,
+        ) = connection.query_row(
+            r#"SELECT account_id, actor_user_id, actor_membership_revision
+               FROM session_followups WHERE session_id = ?1 AND turn_id = ?2"#,
+            params![request.subagent_id(), identity.turn_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let receipt_response: String = connection.query_row(
+            r#"SELECT response_json FROM session_followup_receipts
+               WHERE account_id = ?1 AND actor_user_id = ?2 AND idempotency_key = ?3"#,
+            params![
+                call.account_id.as_str(),
+                parent_agent.actor_user_id,
+                identity.idempotency_key,
+            ],
+            |row| row.get(0),
+        )?;
+        let receipt: EnqueueSessionFollowupResponse = serde_json::from_str(&receipt_response)?;
+        if call.status != AgentToolCallStatus::Succeeded
+            || call.account_id != parent_agent.account_id
+            || call.session_id != parent_agent.session_id
+            || call.turn_id != parent_agent.turn_id
+            || result.subagent_id != request.subagent_id()
+            || result.message_id != identity.turn_id
+            || direct_child == 0
+            || followup.session_id != request.subagent_id()
+            || followup.turn_id != identity.turn_id
+            || followup.user_message != request.message()
+            || followup_account_id != call.account_id.as_str()
+            || followup_actor_user_id != parent_agent.actor_user_id
+            || i64_to_u64(
+                followup_membership_revision,
+                "subagent message membership revision",
+            )? != parent_agent.actor_membership_revision.get()
+            || receipt.replayed
+            || receipt.followup.session_id != followup.session_id
+            || receipt.followup.turn_id != followup.turn_id
+            || receipt.followup.ordinal != followup.ordinal
+            || receipt.followup.user_message != followup.user_message
+            || receipt.followup.enqueued_at != followup.enqueued_at
+        {
+            return Err(StorageError::CorruptData(format!(
+                "send_message call `{call_id}` has inconsistent durable follow-up evidence"
             )));
         }
     }

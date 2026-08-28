@@ -5164,6 +5164,12 @@ async fn settle_known_agent_tool(
     if subagent_spawn.is_some() && committed_status == AgentToolCallStatus::Succeeded {
         kick_agent_model_worker(state);
     }
+    if work.call.tool_name == subagents::SEND_MESSAGE_TOOL_NAME
+        && work.call.tool_version == subagents::SEND_MESSAGE_TOOL_VERSION
+        && committed_status == AgentToolCallStatus::Succeeded
+    {
+        kick_followup_worker(state);
+    }
     if matches!(completion, AgentToolCompletion::ModelQueued { .. }) {
         kick_agent_model_worker(state);
     } else {
@@ -9760,6 +9766,11 @@ mod tests {
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
     }
 
+    struct SpawnSendThenFinalProvider {
+        metadata: ProviderMetadata,
+        requests: Arc<StdMutex<Vec<ReplyRequest>>>,
+    }
+
     struct GoalReadCreateThenFinalProvider {
         metadata: ProviderMetadata,
         requests: Arc<StdMutex<Vec<ReplyRequest>>>,
@@ -10170,6 +10181,19 @@ mod tests {
         }
     }
 
+    impl SpawnSendThenFinalProvider {
+        fn new(requests: Arc<StdMutex<Vec<ReplyRequest>>>) -> Self {
+            Self {
+                metadata: ProviderMetadata {
+                    provider_id: "test-spawn-send-provider".into(),
+                    model: Some("test-model".into()),
+                    reply_kind: ReplyKind::Model,
+                },
+                requests,
+            }
+        }
+    }
+
     impl ReplyProvider for SpawnListThenFinalProvider {
         fn metadata(&self) -> &ProviderMetadata {
             &self.metadata
@@ -10362,6 +10386,110 @@ mod tests {
                             }
                         }
                         results => panic!("unexpected parent tool-result count {}", results.len()),
+                    }
+                }
+            };
+            let provider = self.metadata.clone();
+            Box::pin(async move {
+                Ok(ReplyResponse {
+                    output,
+                    finish_reason: Some("stop".into()),
+                    provider,
+                })
+            })
+        }
+    }
+
+    impl ReplyProvider for SpawnSendThenFinalProvider {
+        fn metadata(&self) -> &ProviderMetadata {
+            &self.metadata
+        }
+
+        fn reply(&self, request: ReplyRequest) -> ReplyFuture<'_> {
+            let output = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(request.clone());
+                let current_user = request
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == ReplyRole::User)
+                    .map(|message| message.content.as_str());
+                match current_user {
+                    Some("child initial message") => ReplyOutput::Final {
+                        content: "child initial complete".into(),
+                    },
+                    Some("child follow-up message") => ReplyOutput::Final {
+                        content: "child follow-up complete".into(),
+                    },
+                    _ => {
+                        let tool_results = request
+                            .messages
+                            .iter()
+                            .filter(|message| message.role == ReplyRole::Tool)
+                            .map(|message| {
+                                serde_json::from_str::<serde_json::Value>(&message.content).unwrap()
+                            })
+                            .collect::<Vec<_>>();
+                        match tool_results.as_slice() {
+                            [] => ReplyOutput::ToolCall {
+                                call: ReplyToolCall::new(
+                                    "provider-call-spawn-send-child",
+                                    subagents::SPAWN_AGENT_TOOL_NAME,
+                                    serde_json::json!({
+                                        "description": "Continuable child",
+                                        "prompt": "child initial message",
+                                    }),
+                                ),
+                            },
+                            [spawned] => {
+                                assert!(spawned["subagent_id"].is_string());
+                                ReplyOutput::ToolCall {
+                                    call: ReplyToolCall::new(
+                                        "provider-call-list-before-send",
+                                        subagents::LIST_AGENTS_TOOL_NAME,
+                                        serde_json::json!({"limit": 8}),
+                                    ),
+                                }
+                            }
+                            [spawned, listed] => {
+                                let subagent_id = spawned["subagent_id"]
+                                    .as_str()
+                                    .expect("spawn_agent must return its child ID");
+                                assert_eq!(listed["agents"][0]["session"]["id"], subagent_id);
+                                let tool = request
+                                    .tools
+                                    .iter()
+                                    .find(|tool| tool.name == subagents::SEND_MESSAGE_TOOL_NAME)
+                                    .expect("every parent Agent request must expose send_message");
+                                assert_eq!(
+                                    tool.parameters["properties"]["message"]["maxLength"],
+                                    subagents::SEND_MESSAGE_MAX_BYTES
+                                );
+                                ReplyOutput::ToolCall {
+                                    call: ReplyToolCall::new(
+                                        "provider-call-send-message",
+                                        subagents::SEND_MESSAGE_TOOL_NAME,
+                                        serde_json::json!({
+                                            "subagent_id": subagent_id,
+                                            "message": "child follow-up message",
+                                        }),
+                                    ),
+                                }
+                            }
+                            [spawned, _, sent] => {
+                                assert_eq!(sent["subagent_id"], spawned["subagent_id"]);
+                                assert!(sent["message_id"].as_str().is_some_and(|message_id| {
+                                    message_id.starts_with("subagent-message-")
+                                }));
+                                ReplyOutput::Final {
+                                    content: "parent durably continued the child".into(),
+                                }
+                            }
+                            results => {
+                                panic!("unexpected parent tool-result count {}", results.len())
+                            }
+                        }
                     }
                 }
             };
@@ -13171,6 +13299,135 @@ mod tests {
                 .count(),
             1
         );
+        store.verify_integrity().await.unwrap();
+        drop(app);
+    }
+
+    #[tokio::test]
+    async fn agent_send_message_durably_continues_only_its_direct_child() {
+        let store = DemoStore::seeded().await.unwrap();
+        let owner = provision_test_owner(
+            &store,
+            "user-agent-send-message",
+            "agent-send-message-owner",
+        )
+        .await;
+        store
+            .create_session_for_actor(
+                &owner.authz,
+                CreateSessionRequest {
+                    id: "session-agent-send-message".into(),
+                    title: "Durable child continuation".into(),
+                },
+                "create-agent-send-message",
+            )
+            .await
+            .unwrap();
+
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let app = authenticated_app_with_provider(
+            store.clone(),
+            false,
+            Arc::new(SpawnSendThenFinalProvider::new(Arc::clone(&requests))),
+        )
+        .unwrap();
+        let started = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/sessions/session-agent-send-message/turns")
+                    .header(header::HOST, "zeus.test")
+                    .header(header::ORIGIN, "http://zeus.test")
+                    .header(header::COOKIE, &owner.cookie_header)
+                    .header(CSRF_HEADER, &owner.csrf_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", "start-agent-send-message")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "turn_id": "turn-agent-send-message",
+                            "user_message": "continue one durable child",
+                            "expected_sequence": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+
+        let parent =
+            wait_for_ready_session(&store, &owner.authz, "session-agent-send-message").await;
+        assert_eq!(
+            parent.turns[0].assistant_message.as_deref(),
+            Some("parent durably continued the child")
+        );
+        let agent = wait_for_agent_status(
+            &store,
+            &owner.authz,
+            "session-agent-send-message",
+            "turn-agent-send-message",
+            protocol::AgentTurnStatus::Succeeded,
+        )
+        .await;
+        assert_eq!(agent.model_steps, 4);
+        assert_eq!(agent.tool_calls, 3);
+        assert_eq!(agent.calls[0].tool, subagents::SPAWN_AGENT_TOOL_NAME);
+        assert_eq!(agent.calls[1].tool, subagents::LIST_AGENTS_TOOL_NAME);
+        assert_eq!(agent.calls[2].tool, subagents::SEND_MESSAGE_TOOL_NAME);
+        assert!(agent.calls.iter().all(|call| {
+            call.status == AgentToolCallStatus::Succeeded && !call.approval_required
+        }));
+        let spawned: subagents::SpawnAgentResult =
+            serde_json::from_value(agent.calls[0].output.clone().unwrap()).unwrap();
+        let sent: subagents::SendMessageResult =
+            serde_json::from_value(agent.calls[2].output.clone().unwrap()).unwrap();
+        assert_eq!(sent.subagent_id, spawned.subagent_id);
+
+        let child = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let child = store
+                    .get_session_for_actor(
+                        &owner.authz,
+                        &spawned.subagent_id,
+                        None,
+                        50,
+                        None,
+                        50,
+                        None,
+                        50,
+                    )
+                    .await
+                    .unwrap();
+                if child.session.status == SessionStatus::Ready && child.turns.len() == 2 {
+                    break child;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the direct child follow-up must run to completion");
+        assert_eq!(child.turns[0].user_message, "child initial message");
+        assert_eq!(
+            child.turns[0].assistant_message.as_deref(),
+            Some("child initial complete")
+        );
+        assert_eq!(child.turns[1].id, sent.message_id);
+        assert_eq!(child.turns[1].user_message, "child follow-up message");
+        assert_eq!(
+            child.turns[1].assistant_message.as_deref(),
+            Some("child follow-up complete")
+        );
+        let followups = store
+            .session_followups_for_actor(&owner.authz, &spawned.subagent_id)
+            .await
+            .unwrap();
+        assert_eq!(followups.len(), 1);
+        assert_eq!(followups[0].turn_id, sent.message_id);
+        assert_eq!(
+            followups[0].status,
+            protocol::SessionFollowupStatus::Claimed
+        );
+        assert_eq!(requests.lock().unwrap().len(), 6);
         store.verify_integrity().await.unwrap();
         drop(app);
     }

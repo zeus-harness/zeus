@@ -15951,11 +15951,153 @@ async fn list_agents_catalog_requires_the_exact_started_agent_tool_scope() {
             .await,
         Err(StorageError::AgentToolCallNotFound(_))
     ));
-    store
+    let result_terminal = match store
         .complete_agent_tool(AgentToolCompletionCommit {
             call_id: result_call.call_id,
             status: AgentToolCallStatus::Succeeded,
             result_json: json!({"status": "completed"}),
+            provider_request_id: None,
+            next_request_json: None,
+        })
+        .await
+        .unwrap()
+    {
+        AgentToolCompletion::Terminal(completion) => completion,
+        AgentToolCompletion::ModelQueued { .. } => {
+            panic!("get result without continuation must end")
+        }
+    };
+    let resumed = store
+        .resume_session_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            ResumeSessionRequest {
+                expected_sequence: result_terminal.session.sequence,
+            },
+            "resume-for-send-message",
+        )
+        .await
+        .unwrap();
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: "turn-send-message".into(),
+                user_message: "continue the direct child".into(),
+                expected_sequence: resumed.session.sequence,
+            },
+            "start-send-message",
+            agent_turn_spec_with_manifest(
+                "agent-send-message",
+                "turn-send-message",
+                manifest.clone(),
+                "continue the direct child",
+            ),
+        )
+        .await
+        .unwrap();
+    let AgentModelClaimOutcome::Claimed(model) =
+        store.claim_next_agent_model(&manifest).await.unwrap()
+    else {
+        panic!("the send_message model proposal must start");
+    };
+    let send_call = send_message_tool_call_spec(
+        "call-send-message",
+        json!({
+            "subagent_id": identity.session_id,
+            "message": "inspect one more durable boundary",
+        }),
+    );
+    store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: model.id,
+            response_json: agent_tool_response_json(&send_call),
+            resolution: AgentModelResolution::ToolCall {
+                call: send_call.clone(),
+            },
+        })
+        .await
+        .unwrap();
+    let AgentToolClaimOutcome::Claimed(send_work) =
+        store.claim_next_agent_tool(&manifest).await.unwrap()
+    else {
+        panic!("the send_message tool must cross its started checkpoint");
+    };
+    let send_scope = tools::ExecutionScope::new(
+        send_work.call.account_id.as_str(),
+        send_work.model_job.actor_user_id.as_str(),
+        send_work.call.session_id.as_str(),
+        send_work.call.turn_id.as_str(),
+        send_work.call.agent_id.as_str(),
+    )
+    .unwrap();
+    let candidate = store
+        .subagent_message_candidate_for_started_tool(
+            &send_scope,
+            &send_work.call.call_id,
+            &identity.session_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(candidate.child_session.id, identity.session_id);
+    assert_eq!(
+        candidate.authz.auth_session_id.as_str(),
+        "subagent-message-driver-v1"
+    );
+    assert!(matches!(
+        store
+            .subagent_message_candidate_for_started_tool(
+                &send_scope,
+                &send_work.call.call_id,
+                "session-manual-child",
+            )
+            .await,
+        Err(StorageError::AgentToolCallNotFound(_))
+    ));
+    assert!(matches!(
+        store
+            .subagent_message_candidate_for_started_tool(
+                &foreign_scope,
+                &send_work.call.call_id,
+                &identity.session_id,
+            )
+            .await,
+        Err(StorageError::AgentToolCallNotFound(_))
+    ));
+    let send_request = subagents::prepare_send_message(&send_call.arguments_json).unwrap();
+    let send_identity = subagents::send_message_identity(
+        "session-alpha",
+        &send_call.call_id,
+        send_request.subagent_id(),
+    )
+    .unwrap();
+    let receipt = store
+        .enqueue_subagent_followup_for_actor(
+            &candidate.authz,
+            &candidate.child_session.id,
+            EnqueueSessionFollowupRequest {
+                turn_id: send_identity.turn_id.clone(),
+                user_message: send_request.message().to_owned(),
+                expected_sequence: candidate.child_session.sequence,
+            },
+            &send_identity.idempotency_key,
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt.followup.turn_id, send_identity.turn_id);
+    store
+        .complete_agent_tool(AgentToolCompletionCommit {
+            call_id: send_call.call_id,
+            status: AgentToolCallStatus::Succeeded,
+            result_json: serde_json::to_value(
+                subagents::SendMessageResult::new(
+                    candidate.child_session.id,
+                    receipt.followup.turn_id,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
             provider_request_id: None,
             next_request_json: None,
         })
@@ -23029,6 +23171,7 @@ fn list_agents_test_agent_manifest() -> ManifestEnvelope {
     for descriptor in [
         subagents::get_agent_result_descriptor(),
         subagents::list_agents_descriptor(),
+        subagents::send_message_descriptor(),
         subagents::spawn_agent_descriptor(),
     ] {
         manifest.deployment.spec.tools.push(
@@ -23374,6 +23517,23 @@ fn list_agents_tool_call_spec(call_id: &str, arguments_json: Value) -> AgentTool
 
 fn get_agent_result_tool_call_spec(call_id: &str, arguments_json: Value) -> AgentToolCallSpec {
     let descriptor = subagents::get_agent_result_descriptor();
+    AgentToolCallSpec {
+        call_id: call_id.into(),
+        provider_call_id: format!("provider-call-{call_id}"),
+        tool_name: descriptor.name,
+        tool_version: descriptor.version,
+        arguments_digest: tools::arguments_digest(&arguments_json),
+        arguments_json,
+        effect: descriptor.effect,
+        sandbox_profile: descriptor.sandbox_profile,
+        executor_status: ToolExecutorStatus::Available,
+        policy_decision: PolicyDecision::Allow,
+        policy_revision: "local/v1".into(),
+    }
+}
+
+fn send_message_tool_call_spec(call_id: &str, arguments_json: Value) -> AgentToolCallSpec {
+    let descriptor = subagents::send_message_descriptor();
     AgentToolCallSpec {
         call_id: call_id.into(),
         provider_call_id: format!("provider-call-{call_id}"),
