@@ -27,6 +27,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 subagents.workspace = true
+teams.workspace = true
 thiserror.workspace = true
 tenancy.workspace = true
 tokio.workspace = true

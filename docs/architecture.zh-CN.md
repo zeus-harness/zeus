@@ -37,8 +37,11 @@ Client / SvelteKit Web
 - `subagents`：`spawn_agent` / `list_agents` / `get_agent_result` / `send_message` / `report` / `interrupt_agent` / `wait_agent` 工具契约、
   严格参数边界、确定性 child/message identity 与有界结果；durable scope、原子 admission、目录分页、
   终态结果读取和 follow-up 入队由 runtime/storage 掌握，不由通用 executor 接受调用方自报身份。
+- `teams`：root Session 与全部 durable subagent 共享的 `team_task_create` / `team_task_get` /
+  `team_task_list` / `team_task_update` 契约，负责有界 task DAG、revision CAS、owner/Lead 权限、
+  readiness 和 advisory write-scope overlap；SQLite 仍是唯一 mutation authority。
 - `connectors`：具体工具适配器。生产 RDS executor 在 Alpha 中不存在。
-- `storage`：schema v37 migration、有界 account/membership 权威、一次性 member setup、用户/偏好、
+- `storage`：schema v38 migration、有界 account/membership 权威、一次性 member setup、用户/偏好、
   account audit/rollup/policy/archive state、独立 Session/Run ledger、typed event lookup、
   account+actor-scoped 回执、durable Agent/model/tool/dispatch queue、不可变 model output、
   不可变 deployment manifest，
@@ -178,9 +181,16 @@ scope 下生成确定性 turn/idempotency identity；parent 消息封装为
 schema v37 为 Agent-to-Agent follow-up 增加 immutable `session_followup_sources`。记录保存
 `subagent_message` / `subagent_report` 类型、source Session/Agent/call，并由 SQLite trigger 绑定 exact
 started tool 与直属谱系；FIFO claim 后仍保留，重启查询无需从文本前缀猜测来源。Session Agent
-manifest revision 3 同样由 durable `agent_subagent_spawns` 决定能力：root 不暴露 `report`，真实 child
+manifest revision 4 同样由 durable `agent_subagent_spawns` 决定能力：root 不暴露 `report`，真实 child
 才增加该工具；worker claim、普通 follow-up、Goal round 与 child spawn 复用同一 lineage 判定，
 storage admission 再次 fail closed 复验。
+
+schema v38 增加 root Team 共享的 append-only task snapshot。每次 mutation 绑定 exact started
+Agent call、root-wide `board_sequence` 与 task-local revision；create/get/list/update 均从 server-derived
+Session 谱系读取同一 board。依赖必须指向现存非 deleted task 且全图无环，claim 仅允许 ready/unowned
+task，普通成员只能修改自己拥有的 task，只有 root Lead 能 reassign。成功 result 与 snapshot 在同一
+SQLite 事务提交；stale CAS 会转成已知失败而不是 `outcome_unknown`。最多 256 个 task identity、4096
+个 lifetime snapshot，启动 deep integrity 会按 board sequence 重放完整历史并核对模型可见结果。
 Process-owned 中断复验原 membership revision 与 SessionWrite/Reply 权限，不依赖短期登录 session；
 成功 parent tool result 的 deep integrity 还必须能还原直属 child 的 exact user-cancelled terminal evidence。
 当前阶段不递归加载完整 child graph。
@@ -408,7 +418,7 @@ connector 在数据库事务和锁之外运行。
 
 API 监听端口之前按固定顺序完成：
 
-1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v37；按当前
+1. 取得数据库相邻 `.zeus.lock` 的 OS 排他锁，配置 SQLite 并迁移到 schema v38；按当前
    detailed-row limit 以最多 64 行 batch 压缩 bootstrap terminal audit prefix，再按稳定
    `(priority actor, expires_at, auth-session ID)` 顺序最多清理 64 个过期或绑定
    missing/disabled/suspended/stale-revision authority 的 auth session。
@@ -799,8 +809,8 @@ reserve < max main`，并用 checked addition 保证 `min free + admission reser
   刷新恢复、owner/member setup/登录、owner 成员与 audit 管理、设置/退出和
   system/light/dark。member 的审批卡只读。持久 command identity 在刷新后恢复，丢失
   start 响应不会生成重复 turn；浏览器等待 server worker/SSE，不自行 flush。
-- 当前自动化按项目既有统计口径是 708 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
-  provider contract 18、skills 5、subagents 13、storage 288、workflows 21、runtime 52、API library 100、API main/config 18）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
+- 当前自动化串行通过 717 个 Rust 测试（其中 connectors 22、deployment 8、knowledge 29、LLM unit 30、
+  provider contract 18、skills 5、subagents 13、teams 5、storage 291、workflows 21、runtime 53、API library 100、API main/config 18）和 28 个 Web Node 测试全部通过；Rust fmt/clippy、Svelte
   check/autofixer、lint 和 production build 也通过。
 
 提交 `af29089` 曾构建并运行在独立 `zeus-operation-acceptance` project（端口 `18089`）；既有

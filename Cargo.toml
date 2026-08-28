@@ -50,6 +50,7 @@ runtime = { path = "crates/runtime" }
 skills = { path = "crates/skills" }
 storage = { path = "crates/storage" }
 subagents = { path = "crates/subagents" }
+teams = { path = "crates/teams" }
 tenancy = { path = "crates/tenancy" }
 terminal = { path = "crates/terminal" }
 tools = { path = "crates/tools" }

@@ -29,6 +29,7 @@ use protocol::{
     AgentReviewResponse, AgentTodoState, AgentToolCallDetail, AgentToolCallStatus, AgentTurnDetail,
     AgentTurnStatus, AssistantReplyKind, PolicyDecision, ReviewDecision, ToolExecutorStatus,
 };
+use std::collections::BTreeSet;
 use tools::ExecutionScope;
 use workflows::{
     AgentStatus as WorkflowStatus, Command as WorkflowCommand, ExternalCall, KnownToolResult,
@@ -156,6 +157,26 @@ struct StoredAgentGoalRound {
     agent_id: String,
     prompt_digest: String,
     admitted_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreparedAgentTeamTaskCompletion {
+    root_session_id: String,
+    board_sequence: u64,
+    snapshot: teams::TeamTaskSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StoredAgentTeamTaskSnapshot {
+    account_id: String,
+    root_session_id: String,
+    board_sequence: i64,
+    task_number: i64,
+    source_session_id: String,
+    source_turn_id: String,
+    source_agent_id: String,
+    call_id: String,
+    snapshot: teams::TeamTaskSnapshot,
 }
 
 struct StoredLegacyAgentKnowledgeBoundary {
@@ -484,6 +505,21 @@ impl SqliteStore {
         let scope = scope.clone();
         self.with_connection(move |connection| query_session_goal_for_scope(connection, &scope))
             .await
+    }
+
+    /// Returns the shared durable task board only for the exact Team task tool
+    /// call that has crossed its started checkpoint in this Agent scope.
+    pub async fn agent_team_task_board_for_started_tool(
+        &self,
+        scope: &ExecutionScope,
+        call_id: &str,
+    ) -> Result<teams::TeamTaskBoard, StorageError> {
+        let scope = scope.clone();
+        let call_id = validated_durable_reference(call_id, "Agent tool call ID")?.to_owned();
+        self.with_connection(move |connection| {
+            query_agent_team_task_board_for_started_tool(connection, &scope, &call_id)
+        })
+        .await
     }
 
     /// Returns one direct-child fork page only for the exact catalog Agent tool
@@ -2642,12 +2678,19 @@ fn complete_agent_tool(
     )?;
     let prepared_subagent =
         prepare_agent_subagent_completion(&call, &commit, subagent_spawn.map(|(spawn, _)| spawn))?;
+    let prepared_team_task = prepare_agent_team_task_completion(
+        &transaction,
+        &call,
+        &commit,
+        call.status != AgentToolCallStatus::Running,
+    )?;
     let mut agent = query_agent_turn(&transaction, &call.agent_id)?;
     if call.status != AgentToolCallStatus::Running {
         let replay = replay_agent_tool_completion(&transaction, &call, &agent, &commit)?;
         verify_replayed_agent_todo_completion(&transaction, &call, prepared_todo.as_ref())?;
         verify_replayed_agent_goal_completion(&transaction, &call, prepared_goal.as_ref())?;
         verify_replayed_agent_subagent_completion(&transaction, &call, prepared_subagent.as_ref())?;
+        verify_replayed_agent_team_task_completion(&transaction, &call, &commit)?;
         transaction.commit()?;
         return Ok(replay);
     }
@@ -2705,6 +2748,9 @@ fn complete_agent_tool(
             physical_limits,
             &timestamp,
         )?;
+    }
+    if let Some(prepared) = prepared_team_task.as_ref() {
+        insert_agent_team_task_snapshot(&transaction, &call, prepared, &timestamp)?;
     }
     let terminal_error =
         (settled.status() == WorkflowStatus::Failed).then(|| workflow_terminal_error(&settled));
@@ -4566,6 +4612,209 @@ fn query_agent_todo_revision_for_scope(
         .optional()?;
     let revision = found.ok_or_else(|| StorageError::AgentTurnNotFound(scope.agent_id.clone()))?;
     i64_to_u64(revision, "Agent todo revision")
+}
+
+fn is_agent_team_task_tool(call: &AgentToolCall) -> bool {
+    call.tool_version == teams::TEAM_TASK_TOOL_VERSION
+        && matches!(
+            call.tool_name.as_str(),
+            teams::TEAM_TASK_CREATE_TOOL_NAME
+                | teams::TEAM_TASK_GET_TOOL_NAME
+                | teams::TEAM_TASK_LIST_TOOL_NAME
+                | teams::TEAM_TASK_UPDATE_TOOL_NAME
+        )
+}
+
+fn is_agent_team_task_mutation(call: &AgentToolCall) -> bool {
+    call.tool_version == teams::TEAM_TASK_TOOL_VERSION
+        && matches!(
+            call.tool_name.as_str(),
+            teams::TEAM_TASK_CREATE_TOOL_NAME | teams::TEAM_TASK_UPDATE_TOOL_NAME
+        )
+}
+
+fn query_agent_team_task_board_for_started_tool(
+    connection: &mut Connection,
+    scope: &ExecutionScope,
+    call_id: &str,
+) -> Result<teams::TeamTaskBoard, StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let call = query_agent_tool_call(&transaction, call_id)?;
+    let agent = query_agent_turn(&transaction, &call.agent_id)?;
+    if call.status != AgentToolCallStatus::Running
+        || !is_agent_team_task_tool(&call)
+        || call.account_id.as_str() != scope.account_id
+        || call.session_id != scope.session_id
+        || call.turn_id != scope.turn_id
+        || call.agent_id != scope.agent_id
+        || agent.actor_user_id != scope.actor_id
+        || agent.account_id != call.account_id
+        || agent.session_id != call.session_id
+        || agent.turn_id != call.turn_id
+    {
+        return Err(StorageError::AgentToolCallNotFound(call_id.to_owned()));
+    }
+    let board = query_agent_team_task_board(&transaction, &call)?;
+    transaction.commit()?;
+    Ok(board)
+}
+
+fn query_agent_team_task_board(
+    connection: &Connection,
+    call: &AgentToolCall,
+) -> Result<teams::TeamTaskBoard, StorageError> {
+    let mut root_session_id = call.session_id.clone();
+    let mut ancestors = BTreeSet::from([root_session_id.clone()]);
+    for depth in 0..=3 {
+        let parent = connection
+            .query_row(
+                r#"SELECT parent_session_id
+                   FROM agent_subagent_spawns
+                   WHERE account_id = ?1 AND child_session_id = ?2"#,
+                params![call.account_id.as_str(), root_session_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(parent) = parent else {
+            break;
+        };
+        if depth == 3 || !ancestors.insert(parent.clone()) {
+            return Err(StorageError::CorruptData(
+                "Agent Team ancestry exceeds depth three or contains a cycle".into(),
+            ));
+        }
+        root_session_id = parent;
+    }
+
+    let mut member_statement = connection.prepare(
+        r#"WITH RECURSIVE team(session_id, depth) AS (
+               SELECT ?2, 0
+               UNION ALL
+               SELECT spawn.child_session_id, team.depth + 1
+               FROM team
+               JOIN agent_subagent_spawns spawn
+                 ON spawn.account_id = ?1
+                AND spawn.parent_session_id = team.session_id
+               WHERE team.depth < 3
+           )
+           SELECT team.session_id, session.status, team.depth
+           FROM team
+           JOIN sessions session
+             ON session.id = team.session_id
+            AND session.account_id = ?1
+           ORDER BY team.depth, team.session_id"#,
+    )?;
+    let member_rows = member_statement
+        .query_map(
+            params![call.account_id.as_str(), root_session_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(member_statement);
+    if member_rows.is_empty()
+        || member_rows.len() > teams::TEAM_TASK_MAX_MEMBERS
+        || member_rows.iter().any(|(_, _, depth)| *depth > 3)
+    {
+        return Err(StorageError::CorruptData(
+            "Agent Team membership is outside its bounded topology".into(),
+        ));
+    }
+    let members = member_rows
+        .into_iter()
+        .map(|(session_id, status, _)| {
+            if !matches!(status.as_str(), "ready" | "running" | "needs_attention") {
+                return Err(StorageError::CorruptData(format!(
+                    "Agent Team Session `{session_id}` has invalid status `{status}`"
+                )));
+            }
+            Ok(teams::TeamMember {
+                session_id,
+                assignable: matches!(status.as_str(), "ready" | "running"),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut task_statement = connection.prepare(
+        r#"SELECT snapshot.task_id, snapshot.revision, snapshot.subject,
+                  snapshot.description, snapshot.status, snapshot.owner_session_id,
+                  snapshot.blocked_by_json, snapshot.write_scopes_json
+           FROM agent_team_task_snapshots snapshot
+           WHERE snapshot.account_id = ?1
+             AND snapshot.root_session_id = ?2
+             AND NOT EXISTS (
+                 SELECT 1 FROM agent_team_task_snapshots newer
+                 WHERE newer.root_session_id = snapshot.root_session_id
+                   AND newer.task_number = snapshot.task_number
+                   AND newer.revision > snapshot.revision
+             )
+           ORDER BY snapshot.task_number"#,
+    )?;
+    let task_rows = task_statement
+        .query_map(
+            params![call.account_id.as_str(), root_session_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(task_statement);
+    let tasks = task_rows
+        .into_iter()
+        .map(
+            |(id, revision, subject, description, status, owner_session_id, blocked, scopes)| {
+                let status = match status.as_str() {
+                    "pending" => teams::TeamTaskStatus::Pending,
+                    "in_progress" => teams::TeamTaskStatus::InProgress,
+                    "completed" => teams::TeamTaskStatus::Completed,
+                    "deleted" => teams::TeamTaskStatus::Deleted,
+                    _ => {
+                        return Err(StorageError::CorruptData(format!(
+                            "Agent Team task `{id}` has invalid status `{status}`"
+                        )));
+                    }
+                };
+                Ok(teams::TeamTaskSnapshot {
+                    id,
+                    revision: i64_to_u64(revision, "Agent Team task revision")?,
+                    subject,
+                    description,
+                    status,
+                    owner_session_id,
+                    blocked_by: serde_json::from_str(&blocked)?,
+                    write_scopes: serde_json::from_str(&scopes)?,
+                })
+            },
+        )
+        .collect::<Result<Vec<_>, StorageError>>()?;
+    let board = teams::TeamTaskBoard {
+        root_session_id,
+        members,
+        tasks,
+    };
+    board.validate().map_err(|error| {
+        StorageError::CorruptData(format!("invalid durable Agent Team task board: {error}"))
+    })?;
+    if !board.contains_member(&call.session_id) {
+        return Err(StorageError::CorruptData(
+            "Agent Team tool caller is outside its derived root Team".into(),
+        ));
+    }
+    Ok(board)
 }
 
 fn query_session_fork_page_for_started_agent_tool(
@@ -7814,6 +8063,252 @@ pub(super) fn verify_agent_model_output_integrity(
                 )));
             }
         }
+    }
+    Ok(())
+}
+
+pub(super) fn verify_agent_team_task_integrity(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    let invalid_completion = connection
+        .query_row(
+            r#"SELECT call.call_id
+               FROM agent_tool_calls call
+               WHERE call.tool_version = ?1
+                 AND call.tool_name IN (?2, ?3)
+                 AND (
+                     (call.status = 'succeeded' AND (
+                         SELECT COUNT(*) FROM agent_team_task_snapshots snapshot
+                         WHERE snapshot.call_id = call.call_id
+                     ) <> 1)
+                     OR
+                     (call.status <> 'succeeded' AND EXISTS (
+                         SELECT 1 FROM agent_team_task_snapshots snapshot
+                         WHERE snapshot.call_id = call.call_id
+                     ))
+                 )
+               LIMIT 1"#,
+            params![
+                teams::TEAM_TASK_TOOL_VERSION,
+                teams::TEAM_TASK_CREATE_TOOL_NAME,
+                teams::TEAM_TASK_UPDATE_TOOL_NAME,
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(call_id) = invalid_completion {
+        return Err(StorageError::CorruptData(format!(
+            "Agent Team task call `{call_id}` is not bound to exactly one successful snapshot"
+        )));
+    }
+
+    let mut statement = connection.prepare(
+        r#"SELECT account_id, root_session_id, board_sequence, task_id,
+                  task_number, revision, source_session_id, source_turn_id,
+                  source_agent_id, call_id, subject, description, status,
+                  owner_session_id, blocked_by_json, write_scopes_json
+           FROM agent_team_task_snapshots
+           ORDER BY root_session_id, board_sequence"#,
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, String>(12)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, String>(14)?,
+                row.get::<_, String>(15)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    let mut stored = Vec::with_capacity(rows.len());
+    for (
+        account_id,
+        root_session_id,
+        board_sequence,
+        task_id,
+        task_number,
+        revision,
+        source_session_id,
+        source_turn_id,
+        source_agent_id,
+        call_id,
+        subject,
+        description,
+        status,
+        owner_session_id,
+        blocked_by_json,
+        write_scopes_json,
+    ) in rows
+    {
+        let status = match status.as_str() {
+            "pending" => teams::TeamTaskStatus::Pending,
+            "in_progress" => teams::TeamTaskStatus::InProgress,
+            "completed" => teams::TeamTaskStatus::Completed,
+            "deleted" => teams::TeamTaskStatus::Deleted,
+            _ => {
+                return Err(StorageError::CorruptData(format!(
+                    "Agent Team task `{task_id}` has invalid status `{status}`"
+                )));
+            }
+        };
+        stored.push(StoredAgentTeamTaskSnapshot {
+            account_id,
+            root_session_id,
+            board_sequence,
+            task_number,
+            source_session_id,
+            source_turn_id,
+            source_agent_id,
+            call_id,
+            snapshot: teams::TeamTaskSnapshot {
+                id: task_id,
+                revision: i64_to_u64(revision, "Agent Team task revision")?,
+                subject,
+                description,
+                status,
+                owner_session_id,
+                blocked_by: serde_json::from_str(&blocked_by_json)?,
+                write_scopes: serde_json::from_str(&write_scopes_json)?,
+            },
+        });
+    }
+
+    let mut current_root = None::<String>;
+    let mut expected_sequence = 0_u64;
+    let mut board = None::<teams::TeamTaskBoard>;
+    for stored in stored {
+        if current_root.as_deref() != Some(stored.root_session_id.as_str()) {
+            current_root = Some(stored.root_session_id.clone());
+            expected_sequence = 0;
+            let call = query_agent_tool_call(connection, &stored.call_id)?;
+            let current = query_agent_team_task_board(connection, &call)?;
+            if current.root_session_id != stored.root_session_id {
+                return Err(StorageError::CorruptData(format!(
+                    "Agent Team task root `{}` disagrees with call `{}` lineage",
+                    stored.root_session_id, stored.call_id
+                )));
+            }
+            board = Some(teams::TeamTaskBoard {
+                root_session_id: current.root_session_id,
+                members: current
+                    .members
+                    .into_iter()
+                    .map(|member| teams::TeamMember {
+                        session_id: member.session_id,
+                        assignable: true,
+                    })
+                    .collect(),
+                tasks: Vec::new(),
+            });
+        }
+        expected_sequence =
+            expected_sequence
+                .checked_add(1)
+                .ok_or(StorageError::IntegerOutOfRange(
+                    "Agent Team task board sequence",
+                ))?;
+        if i64_to_u64(stored.board_sequence, "Agent Team task board sequence")? != expected_sequence
+            || teams::team_task_number(&stored.snapshot.id).map_err(|error| {
+                StorageError::CorruptData(format!(
+                    "Agent Team task `{}` has invalid identity: {error}",
+                    stored.snapshot.id
+                ))
+            })? != i64_to_u64(stored.task_number, "Agent Team task number")?
+        {
+            return Err(StorageError::CorruptData(format!(
+                "Agent Team task `{}` has a non-contiguous board identity",
+                stored.snapshot.id
+            )));
+        }
+        let call = query_agent_tool_call(connection, &stored.call_id)?;
+        if call.status != AgentToolCallStatus::Succeeded
+            || !is_agent_team_task_mutation(&call)
+            || call.account_id.as_str() != stored.account_id
+            || call.session_id != stored.source_session_id
+            || call.turn_id != stored.source_turn_id
+            || call.agent_id != stored.source_agent_id
+        {
+            return Err(StorageError::CorruptData(format!(
+                "Agent Team task call `{}` has inconsistent durable scope",
+                stored.call_id
+            )));
+        }
+        let board = board.as_mut().ok_or_else(|| {
+            StorageError::CorruptData("Agent Team task replay lost its root board".into())
+        })?;
+        let prepared = match call.tool_name.as_str() {
+            teams::TEAM_TASK_CREATE_TOOL_NAME => {
+                teams::prepare_create(&call.arguments_json, board, &call.session_id)
+            }
+            teams::TEAM_TASK_UPDATE_TOOL_NAME => {
+                teams::prepare_update(&call.arguments_json, board, &call.session_id)
+            }
+            _ => unreachable!("Team task mutation checked above"),
+        }
+        .map_err(|error| {
+            StorageError::CorruptData(format!(
+                "Agent Team task call `{}` cannot replay: {error}",
+                stored.call_id
+            ))
+        })?;
+        let result = call
+            .result_json
+            .as_ref()
+            .ok_or_else(|| {
+                StorageError::CorruptData(format!(
+                    "Agent Team task call `{}` has no successful result",
+                    stored.call_id
+                ))
+            })
+            .and_then(|value| {
+                teams::decode_tool_result(value).map_err(|error| {
+                    StorageError::CorruptData(format!(
+                        "Agent Team task call `{}` has invalid result: {error}",
+                        stored.call_id
+                    ))
+                })
+            })?;
+        let expected_result = prepared.result(board).map_err(|error| {
+            StorageError::CorruptData(format!(
+                "Agent Team task call `{}` cannot derive its result: {error}",
+                stored.call_id
+            ))
+        })?;
+        if prepared.snapshot() != &stored.snapshot || result != expected_result {
+            return Err(StorageError::CorruptData(format!(
+                "Agent Team task call `{}` disagrees with its replayed state",
+                stored.call_id
+            )));
+        }
+        if let Some(current) = board
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == stored.snapshot.id)
+        {
+            *current = stored.snapshot;
+        } else {
+            board.tasks.push(stored.snapshot);
+        }
+        board.validate().map_err(|error| {
+            StorageError::CorruptData(format!(
+                "Agent Team task board `{}` became invalid: {error}",
+                board.root_session_id
+            ))
+        })?;
     }
     Ok(())
 }
@@ -12070,6 +12565,191 @@ fn subagent_admission_error(error: StorageError) -> StorageError {
             StorageError::SubagentAdmissionRejected
         }
         other => other,
+    }
+}
+
+fn prepare_agent_team_task_completion(
+    connection: &Connection,
+    call: &AgentToolCall,
+    commit: &AgentToolCompletionCommit,
+    replay: bool,
+) -> Result<Option<PreparedAgentTeamTaskCompletion>, StorageError> {
+    if !is_agent_team_task_mutation(call) || commit.status != AgentToolCallStatus::Succeeded {
+        return Ok(None);
+    }
+    let result = teams::decode_tool_result(&commit.result_json).map_err(|error| {
+        StorageError::InvalidAgentTransition(format!(
+            "Agent Team task result is not canonical: {error}"
+        ))
+    })?;
+    if replay {
+        return Ok(None);
+    }
+    let board = query_agent_team_task_board(connection, call)?;
+    let prepared = match call.tool_name.as_str() {
+        teams::TEAM_TASK_CREATE_TOOL_NAME => {
+            teams::prepare_create(&call.arguments_json, &board, &call.session_id)
+        }
+        teams::TEAM_TASK_UPDATE_TOOL_NAME => {
+            teams::prepare_update(&call.arguments_json, &board, &call.session_id)
+        }
+        _ => unreachable!("Team task mutation checked above"),
+    }
+    .map_err(agent_team_task_conflict)?;
+    let expected = prepared.result(&board).map_err(|error| {
+        StorageError::InvalidAgentTransition(format!(
+            "Agent Team task result cannot be derived: {error}"
+        ))
+    })?;
+    if result != expected {
+        return Err(StorageError::InvalidAgentTransition(
+            "Agent Team task result does not match its exact durable mutation".into(),
+        ));
+    }
+    let board_sequence = connection.query_row(
+        r#"SELECT COUNT(*) + 1 FROM agent_team_task_snapshots
+           WHERE root_session_id = ?1"#,
+        [&board.root_session_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let board_sequence = i64_to_u64(board_sequence, "Agent Team task board sequence")?;
+    if board_sequence > teams::TEAM_TASK_MAX_SNAPSHOTS as u64 {
+        return Err(agent_team_task_conflict(
+            teams::TeamTaskError::CapacityExceeded,
+        ));
+    }
+    Ok(Some(PreparedAgentTeamTaskCompletion {
+        root_session_id: board.root_session_id,
+        board_sequence,
+        snapshot: prepared.snapshot().clone(),
+    }))
+}
+
+fn agent_team_task_conflict(error: teams::TeamTaskError) -> StorageError {
+    StorageError::AgentTeamTaskConflict {
+        code: teams::error_code(&error).into(),
+        message: error.to_string(),
+    }
+}
+
+fn insert_agent_team_task_snapshot(
+    connection: &Connection,
+    call: &AgentToolCall,
+    prepared: &PreparedAgentTeamTaskCompletion,
+    timestamp: &str,
+) -> Result<(), StorageError> {
+    let snapshot = &prepared.snapshot;
+    let task_number = u64_to_i64(
+        teams::team_task_number(&snapshot.id).map_err(agent_team_task_conflict)?,
+        "Agent Team task number",
+    )?;
+    let revision = u64_to_i64(snapshot.revision, "Agent Team task revision")?;
+    let board_sequence = u64_to_i64(prepared.board_sequence, "Agent Team task board sequence")?;
+    let status = match snapshot.status {
+        teams::TeamTaskStatus::Pending => "pending",
+        teams::TeamTaskStatus::InProgress => "in_progress",
+        teams::TeamTaskStatus::Completed => "completed",
+        teams::TeamTaskStatus::Deleted => "deleted",
+    };
+    let changed = connection.execute(
+        r#"INSERT INTO agent_team_task_snapshots(
+               account_id, root_session_id, board_sequence, task_id, task_number, revision,
+               source_session_id, source_turn_id, source_agent_id, call_id,
+               subject, description, status, owner_session_id,
+               blocked_by_json, write_scopes_json, created_at
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                     ?13, ?14, ?15, ?16, ?17)"#,
+        params![
+            call.account_id.as_str(),
+            prepared.root_session_id,
+            board_sequence,
+            snapshot.id,
+            task_number,
+            revision,
+            call.session_id,
+            call.turn_id,
+            call.agent_id,
+            call.call_id,
+            snapshot.subject,
+            snapshot.description,
+            status,
+            snapshot.owner_session_id,
+            serde_json::to_string(&snapshot.blocked_by)?,
+            serde_json::to_string(&snapshot.write_scopes)?,
+            timestamp,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::ConcurrentModification);
+    }
+    Ok(())
+}
+
+fn verify_replayed_agent_team_task_completion(
+    connection: &Connection,
+    call: &AgentToolCall,
+    commit: &AgentToolCompletionCommit,
+) -> Result<(), StorageError> {
+    let stored = connection
+        .query_row(
+            r#"SELECT root_session_id, task_id, revision, subject, description,
+                      status, owner_session_id, blocked_by_json, write_scopes_json
+               FROM agent_team_task_snapshots WHERE call_id = ?1"#,
+            [&call.call_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    if !is_agent_team_task_mutation(call) || commit.status != AgentToolCallStatus::Succeeded {
+        return stored.is_none().then_some(()).ok_or_else(|| {
+            StorageError::InvalidAgentTransition(
+                "non-successful Agent Team task replay owns a durable snapshot".into(),
+            )
+        });
+    }
+    let result = teams::decode_tool_result(&commit.result_json).map_err(|error| {
+        StorageError::InvalidAgentTransition(format!(
+            "Agent Team task replay result is not canonical: {error}"
+        ))
+    })?;
+    let stored = stored.ok_or_else(|| {
+        StorageError::InvalidAgentTransition(
+            "successful Agent Team task replay is missing its durable snapshot".into(),
+        )
+    })?;
+    let expected_status = match result.task.status {
+        teams::TeamTaskStatus::Pending => "pending",
+        teams::TeamTaskStatus::InProgress => "in_progress",
+        teams::TeamTaskStatus::Completed => "completed",
+        teams::TeamTaskStatus::Deleted => "deleted",
+    };
+    let blocked_by: Vec<String> = serde_json::from_str(&stored.7)?;
+    let write_scopes: Vec<String> = serde_json::from_str(&stored.8)?;
+    if stored.1 == result.task.id
+        && i64_to_u64(stored.2, "Agent Team task revision")? == result.task.revision
+        && stored.3 == result.task.subject
+        && stored.4 == result.task.description
+        && stored.5 == expected_status
+        && stored.6 == result.task.owner_session_id
+        && blocked_by == result.task.blocked_by
+        && write_scopes == result.task.write_scopes
+    {
+        Ok(())
+    } else {
+        Err(StorageError::InvalidAgentTransition(
+            "Agent Team task replay conflicts with its durable snapshot".into(),
+        ))
     }
 }
 

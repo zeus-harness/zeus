@@ -121,6 +121,12 @@ use subagents::{
     send_message_descriptor, send_message_identity, spawn_agent_descriptor, spawn_agent_identity,
     wait_agent_descriptor,
 };
+use teams::{
+    TEAM_TASK_CREATE_TOOL_NAME, TEAM_TASK_GET_TOOL_NAME, TEAM_TASK_LIST_TOOL_NAME,
+    TEAM_TASK_TOOL_VERSION, TEAM_TASK_UPDATE_TOOL_NAME, TeamTaskError, get_task, list_tasks,
+    prepare_create, prepare_get, prepare_list, prepare_update, register_team_task_tools,
+    team_task_descriptors,
+};
 use terminal::TerminalService;
 use thiserror::Error;
 use tokio::sync::{Mutex, Notify, broadcast};
@@ -130,7 +136,7 @@ use tools::{ExecutorError, RegistryError, ToolRegistry, arguments_digest, stable
 const PRODUCTION_POLICY_ID: &str = "production-guarded";
 const LOCAL_POLICY_ID: &str = "local-development";
 const SESSION_AGENT_DEPLOYMENT_ID_PREFIX: &str = "zeus-session-agent";
-const SESSION_AGENT_DEPLOYMENT_REVISION: &str = "3";
+const SESSION_AGENT_DEPLOYMENT_REVISION: &str = "4";
 const INTERNAL_PROGRESS_RETRY_DELAY: Duration = Duration::from_millis(25);
 const INTERNAL_PROGRESS_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 const WORKER_IDLE: u8 = 0;
@@ -673,6 +679,8 @@ pub enum StoreError {
     AgentTodoRevisionConflict { expected: u64, current: u64 },
     #[error("the Session goal revision changed: expected {expected}, current {current}")]
     AgentGoalRevisionConflict { expected: u64, current: u64 },
+    #[error("Agent Team task mutation failed with `{code}`: {message}")]
+    AgentTeamTaskConflict { code: String, message: String },
     #[error("the Agent external operation has already started")]
     AgentOperationInFlight,
     #[error("the Agent turn is already terminal")]
@@ -789,6 +797,9 @@ impl From<StorageError> for StoreError {
             }
             StorageError::AgentGoalRevisionConflict { expected, current } => {
                 Self::AgentGoalRevisionConflict { expected, current }
+            }
+            StorageError::AgentTeamTaskConflict { code, message } => {
+                Self::AgentTeamTaskConflict { code, message }
             }
             StorageError::AgentOperationInFlight => Self::AgentOperationInFlight,
             StorageError::AgentAlreadyTerminal => Self::AgentAlreadyTerminal,
@@ -2228,6 +2239,63 @@ impl DemoStore {
                     }))
                 })?,
                 replayed: response.replayed,
+                provider_request_id: None,
+            });
+        }
+        if resolved.call.tool_version == TEAM_TASK_TOOL_VERSION
+            && matches!(
+                resolved.call.tool.as_str(),
+                TEAM_TASK_CREATE_TOOL_NAME
+                    | TEAM_TASK_GET_TOOL_NAME
+                    | TEAM_TASK_LIST_TOOL_NAME
+                    | TEAM_TASK_UPDATE_TOOL_NAME
+            )
+        {
+            let board = self
+                .storage
+                .agent_team_task_board_for_started_tool(&scope, &resolved.call.call_id)
+                .await?;
+            let value = match resolved.call.tool.as_str() {
+                TEAM_TASK_CREATE_TOOL_NAME => {
+                    let prepared =
+                        prepare_create(&resolved.call.arguments, &board, &scope.session_id)
+                            .map_err(team_task_executor_error)?;
+                    serde_json::to_value(prepared.result(&board).map_err(team_task_executor_error)?)
+                }
+                TEAM_TASK_UPDATE_TOOL_NAME => {
+                    let prepared =
+                        prepare_update(&resolved.call.arguments, &board, &scope.session_id)
+                            .map_err(team_task_executor_error)?;
+                    serde_json::to_value(prepared.result(&board).map_err(team_task_executor_error)?)
+                }
+                TEAM_TASK_GET_TOOL_NAME => {
+                    let task_id =
+                        prepare_get(&resolved.call.arguments).map_err(team_task_executor_error)?;
+                    serde_json::to_value(
+                        get_task(&board, &scope.session_id, &task_id)
+                            .map_err(team_task_executor_error)?,
+                    )
+                }
+                TEAM_TASK_LIST_TOOL_NAME => {
+                    let request =
+                        prepare_list(&resolved.call.arguments).map_err(team_task_executor_error)?;
+                    serde_json::to_value(
+                        list_tasks(&board, &scope.session_id, &request)
+                            .map_err(team_task_executor_error)?,
+                    )
+                }
+                _ => unreachable!("Team task tool name checked above"),
+            }
+            .map_err(|_| {
+                StoreError::Registry(RegistryError::Executor(ExecutorError::Failed {
+                    code: "team_task_result_encoding_failed".into(),
+                    message: "The durable Agent Team task result could not be encoded".into(),
+                    retryable: false,
+                }))
+            })?;
+            return Ok(ToolOutput {
+                value,
+                replayed: false,
                 provider_request_id: None,
             });
         }
@@ -4919,6 +4987,12 @@ impl RuntimeComponents {
                     &scenario.run.environment,
                     PRODUCTION_POLICY_REVISION,
                 )?;
+                register_runtime_team_task_tools(
+                    &mut policy_rules,
+                    &mut registry,
+                    &scenario.run.environment,
+                    PRODUCTION_POLICY_REVISION,
+                )?;
                 register_runtime_skill_tools(
                     &mut policy_rules,
                     &mut registry,
@@ -4970,6 +5044,12 @@ impl RuntimeComponents {
                     LOCAL_POLICY_REVISION,
                 )?;
                 register_runtime_subagent_tools(
+                    &mut policy_rules,
+                    &mut registry,
+                    &scenario.run.environment,
+                    LOCAL_POLICY_REVISION,
+                )?;
+                register_runtime_team_task_tools(
                     &mut policy_rules,
                     &mut registry,
                     &scenario.run.environment,
@@ -5191,6 +5271,34 @@ fn subagent_executor_error(error: SubagentError) -> StoreError {
     };
     StoreError::Registry(RegistryError::Executor(ExecutorError::Failed {
         code: code.into(),
+        message: error.to_string(),
+        retryable: false,
+    }))
+}
+
+fn register_runtime_team_task_tools(
+    policy_rules: &mut Vec<PolicyRule>,
+    registry: &mut ToolRegistry,
+    environment: &str,
+    policy_revision: &str,
+) -> Result<(), StoreError> {
+    for descriptor in team_task_descriptors() {
+        policy_rules.push(PolicyRule {
+            revision: policy_revision.into(),
+            tool: descriptor.name,
+            environment: environment.into(),
+            effect: descriptor.effect,
+            sandbox_profile: descriptor.sandbox_profile,
+            decision: PolicyDecision::Allow,
+        });
+    }
+    register_team_task_tools(registry)?;
+    Ok(())
+}
+
+fn team_task_executor_error(error: TeamTaskError) -> StoreError {
+    StoreError::Registry(RegistryError::Executor(ExecutorError::Failed {
+        code: teams::error_code(&error).into(),
         message: error.to_string(),
         retryable: false,
     }))
@@ -5730,7 +5838,7 @@ mod tests {
         let store = local_store(&paths, false).await;
 
         let definitions = store.session_agent_tool_definitions().unwrap();
-        assert_eq!(definitions.len(), 11);
+        assert_eq!(definitions.len(), 15);
         assert_eq!(definitions[0].name, goals::CREATE_GOAL_TOOL_NAME);
         assert_eq!(definitions[1].name, connectors::DEV_MARKER_TOOL_NAME);
         assert_eq!(
@@ -5775,17 +5883,21 @@ mod tests {
             definitions[7].input_schema["properties"]["prompt"]["maxLength"],
             subagents::SPAWN_AGENT_PROMPT_MAX_BYTES
         );
-        assert_eq!(definitions[8].name, planning::TODO_WRITE_TOOL_NAME);
+        assert_eq!(definitions[8].name, teams::TEAM_TASK_CREATE_TOOL_NAME);
+        assert_eq!(definitions[9].name, teams::TEAM_TASK_GET_TOOL_NAME);
+        assert_eq!(definitions[10].name, teams::TEAM_TASK_LIST_TOOL_NAME);
+        assert_eq!(definitions[11].name, teams::TEAM_TASK_UPDATE_TOOL_NAME);
+        assert_eq!(definitions[12].name, planning::TODO_WRITE_TOOL_NAME);
         assert_eq!(
-            definitions[8].input_schema["properties"]["todos"]["maxItems"],
+            definitions[12].input_schema["properties"]["todos"]["maxItems"],
             planning::TODO_MAX_ITEMS
         );
         assert_eq!(
-            definitions[8].input_schema["properties"]["todos"]["items"]["properties"]["status"]["enum"],
+            definitions[12].input_schema["properties"]["todos"]["items"]["properties"]["status"]["enum"],
             serde_json::json!(["pending", "in_progress", "completed"])
         );
-        assert_eq!(definitions[9].name, goals::UPDATE_GOAL_TOOL_NAME);
-        assert_eq!(definitions[10].name, subagents::WAIT_AGENT_TOOL_NAME);
+        assert_eq!(definitions[13].name, goals::UPDATE_GOAL_TOOL_NAME);
+        assert_eq!(definitions[14].name, subagents::WAIT_AGENT_TOOL_NAME);
 
         let production = DemoStore::seeded().await.unwrap();
         assert_eq!(
@@ -5803,6 +5915,10 @@ mod tests {
                 subagents::LIST_AGENTS_TOOL_NAME,
                 subagents::SEND_MESSAGE_TOOL_NAME,
                 subagents::SPAWN_AGENT_TOOL_NAME,
+                teams::TEAM_TASK_CREATE_TOOL_NAME,
+                teams::TEAM_TASK_GET_TOOL_NAME,
+                teams::TEAM_TASK_LIST_TOOL_NAME,
+                teams::TEAM_TASK_UPDATE_TOOL_NAME,
                 planning::TODO_WRITE_TOOL_NAME,
                 goals::UPDATE_GOAL_TOOL_NAME,
                 subagents::WAIT_AGENT_TOOL_NAME,
@@ -6001,6 +6117,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn team_task_dispatch_uses_the_started_scope_and_commits_one_snapshot() {
+        let paths = TestPaths::new("agent-team-task-dispatch");
+        let store = local_store(&paths, false).await;
+        let owner = test_authz(TEST_OWNER_ID);
+        let manifest = store
+            .session_agent_manifest(
+                "test-provider",
+                Some("test-model".into()),
+                AssistantReplyKind::Model,
+            )
+            .unwrap();
+        let turn_id = "turn-team-task-dispatch";
+        let agent_id = "agent-team-task-dispatch";
+        store
+            .start_turn_and_enqueue_agent_for_actor(
+                &owner,
+                LOCAL_DEMO_SESSION_ID,
+                StartTurnRequest {
+                    turn_id: turn_id.into(),
+                    user_message: "Create shared Team work".into(),
+                    expected_sequence: 2,
+                },
+                "team-task-dispatch-start",
+                AgentTurnSpec {
+                    id: agent_id.into(),
+                    authz: owner.clone(),
+                    environment: LOCAL_DEV_ENVIRONMENT.into(),
+                    provider_name: "test-provider".into(),
+                    model_name: Some("test-model".into()),
+                    request_json: agent_request_for_manifest(&manifest, "Create shared Team work"),
+                    knowledge: agent_knowledge_for_message("Create shared Team work"),
+                    manifest: manifest.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let AgentModelClaimOutcome::Claimed(model_job) =
+            store.claim_next_agent_model(&manifest).await.unwrap()
+        else {
+            panic!("the Team task model step must be claimable");
+        };
+        let arguments = serde_json::json!({
+            "subject": "runtime wiring",
+            "description": "Connect the durable Team task runtime",
+            "write_scopes": ["crates/runtime"]
+        });
+        let resolved = store
+            .resolve_session_agent_tool(
+                agent_id,
+                1,
+                1,
+                teams::TEAM_TASK_CREATE_TOOL_NAME,
+                arguments.clone(),
+            )
+            .unwrap();
+        let call = resolved.call();
+        let call_spec = AgentToolCallSpec {
+            call_id: call.call_id.clone(),
+            provider_call_id: "provider-call-team-task".into(),
+            tool_name: call.tool.clone(),
+            tool_version: call.tool_version.clone(),
+            arguments_json: call.arguments.clone(),
+            arguments_digest: call.arguments_digest.clone(),
+            effect: call.effect.clone(),
+            sandbox_profile: call.sandbox_profile.clone(),
+            executor_status: call.executor_status.clone(),
+            policy_decision: resolved.policy_evaluation().decision.clone(),
+            policy_revision: resolved.policy_evaluation().policy_revision.clone(),
+        };
+        store
+            .complete_agent_model_success(AgentModelSuccessCommit {
+                job_id: model_job.id,
+                response_json: serde_json::json!({
+                    "output": {
+                        "type": "tool_call",
+                        "call": {
+                            "id": call_spec.provider_call_id,
+                            "name": call_spec.tool_name,
+                            "arguments": arguments,
+                        }
+                    },
+                    "finish_reason": "tool_calls",
+                    "provider": {
+                        "provider_id": "test-provider",
+                        "model": "test-model",
+                        "reply_kind": "model"
+                    }
+                }),
+                resolution: AgentModelResolution::ToolCall {
+                    call: call_spec.clone(),
+                },
+            })
+            .await
+            .unwrap();
+        let AgentToolClaimOutcome::Prepared(prepared) = store
+            .prepare_next_agent_tool(&manifest, "runtime-team-task-holder")
+            .await
+            .unwrap()
+        else {
+            panic!("the Team task tool must prepare before start");
+        };
+        let AgentToolStartOutcome::Started(work) = store
+            .start_prepared_agent_tool(&prepared.claim, &manifest)
+            .await
+            .unwrap()
+        else {
+            panic!("the Team task tool must cross its started checkpoint");
+        };
+        let scoped = store
+            .verify_persisted_session_agent_tool_work(&work)
+            .unwrap();
+        let output = store
+            .dispatch_session_agent_tool_after_checkpoint(scoped, None)
+            .await
+            .unwrap();
+        assert_eq!(output.value["task"]["id"], "task-1");
+        assert_eq!(output.value["task"]["revision"], 1);
+        assert_eq!(output.value["task"]["status"], "pending");
+        assert!(matches!(
+            store
+                .complete_agent_tool(AgentToolCompletionCommit {
+                    call_id: call_spec.call_id,
+                    status: AgentToolCallStatus::Succeeded,
+                    result_json: output.value,
+                    provider_request_id: None,
+                    next_request_json: None,
+                })
+                .await
+                .unwrap(),
+            AgentToolCompletion::Terminal(_)
+        ));
+        store.verify_integrity().await.unwrap();
+        let connection = Connection::open(&paths.database).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_team_task_snapshots",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn startup_skill_catalog_is_manifest_bound_and_policy_allowed() {
         let paths = TestPaths::new("agent-skill-catalog");
         let catalog = test_skill_catalog("# Incident triage\nInspect evidence before acting.");
@@ -6035,6 +6297,10 @@ mod tests {
                 skills::SKILL_LIST_TOOL_NAME,
                 skills::SKILL_LOAD_TOOL_NAME,
                 subagents::SPAWN_AGENT_TOOL_NAME,
+                teams::TEAM_TASK_CREATE_TOOL_NAME,
+                teams::TEAM_TASK_GET_TOOL_NAME,
+                teams::TEAM_TASK_LIST_TOOL_NAME,
+                teams::TEAM_TASK_UPDATE_TOOL_NAME,
                 planning::TODO_WRITE_TOOL_NAME,
                 goals::UPDATE_GOAL_TOOL_NAME,
                 subagents::WAIT_AGENT_TOOL_NAME,
@@ -6197,9 +6463,9 @@ mod tests {
             first.manifest.deployment.deployment_id,
             "zeus-session-agent-local-development"
         );
-        assert_eq!(first.manifest.deployment.revision, "3");
+        assert_eq!(first.manifest.deployment.revision, "4");
         assert_eq!(first.manifest.deployment.spec.spec_id, "zeus-session-agent");
-        assert_eq!(first.manifest.deployment.spec.revision, "3");
+        assert_eq!(first.manifest.deployment.spec.revision, "4");
         assert_eq!(first.manifest.deployment.spec.profile, "local-development");
         let prompt = first
             .manifest

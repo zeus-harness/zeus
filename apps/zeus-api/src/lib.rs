@@ -5162,6 +5162,32 @@ async fn settle_known_agent_tool(
             })
             .await?
         }
+        Err(StoreError::AgentTeamTaskConflict { code, message })
+            if work.call.tool_version == teams::TEAM_TASK_TOOL_VERSION
+                && matches!(
+                    work.call.tool_name.as_str(),
+                    teams::TEAM_TASK_CREATE_TOOL_NAME | teams::TEAM_TASK_UPDATE_TOOL_NAME
+                ) =>
+        {
+            committed_status = AgentToolCallStatus::Failed;
+            committed_result = serde_json::json!({
+                "code": code,
+                "message": message,
+                "retryable": false,
+                "status": "failed"
+            });
+            let failed = AgentToolCompletionCommit {
+                call_id: work.call.call_id.clone(),
+                status: committed_status.clone(),
+                result_json: committed_result.clone(),
+                provider_request_id: None,
+                next_request_json: continuation_request_json_for_work(work, &committed_result),
+            };
+            retry_agent_durable_progress("Agent Team task conflict", || {
+                state.store.complete_agent_tool(failed.clone())
+            })
+            .await?
+        }
         Err(error) if commit.next_request_json.is_some() => {
             eprintln!(
                 "zeus could not persist an Agent tool continuation; terminalizing the same known result: {error}"
@@ -7308,6 +7334,13 @@ impl From<StoreError> for ApiError {
                 "agent_goal_revision_conflict",
                 "Agent goal revision conflict",
                 format!("The Goal changed from expected revision {expected} to {current}"),
+            )
+            .with_no_store(),
+            StoreError::AgentTeamTaskConflict { code, message } => Self::new(
+                StatusCode::CONFLICT,
+                code.clone(),
+                "Agent Team task conflict",
+                message.clone(),
             )
             .with_no_store(),
             StoreError::AgentOperationInFlight => Self::new(

@@ -101,6 +101,15 @@ Session/Agent, and keeps that evidence after FIFO claim and restart. Manifest
 revision 3 exposes `report` only when durable spawn lineage proves that the
 current Session is a subagent.
 
+Schema v38 adds the durable Agent Team task board shared by one root Session
+and all descendants admitted through `spawn_agent`. `team_task_create`,
+`team_task_get`, `team_task_list`, and `team_task_update` use immutable full
+snapshots, a root-wide monotonic sequence, revision CAS, dependency-DAG
+validation, owner/root-Lead authority, and advisory workspace write scopes.
+Successful mutations and their exact model-visible results commit atomically;
+startup integrity replays the complete bounded history. The board is capped at
+256 task identities and 4096 lifetime snapshots per Team.
+
 Every root Agent profile exposes `spawn_agent`, `send_message`, `interrupt_agent`,
 and the read-only `list_agents` / `get_agent_result` / `wait_agent` tools. A
 Session admitted through `spawn_agent` receives the same catalog plus `report`.
@@ -1302,7 +1311,7 @@ directly.
   registry unavailability returns a redacted `503 runtime_unavailable`.
   Internal details remain in server logs.
 
-Current schema v37 retains durable Run attachment during migration and demo
+Current schema v38 retains durable Run attachment during migration and demo
 seeding, but Alpha+ does not expose a public attach-Run HTTP route.
 
 The application boundary now caps auth JSON at 8 KiB, command JSON at 512 KiB,
@@ -1327,7 +1336,7 @@ approval, dispatch, reply completion, attachment checks, and startup recovery
 use typed point queries or fixed 64-row batches. Production Session list/detail,
 Run detail, and overview reads now use indexed `LIMIT + 1` keyset pages inside
 actor-authorized SQLite snapshots; no production HTTP read loads a complete
-ledger or collection. Current schema v37 retains bounded Session, open-turn,
+ledger or collection. Current schema v38 retains bounded Session, open-turn,
 active reply/dispatch, auth-session, bootstrap-audit, event-slot, and logical
 event-payload-byte admission. Exact idempotent replay is checked before capacity,
 while accepted work consumes its reserved terminal slots and payload bytes
@@ -1417,7 +1426,8 @@ Goals, schema v30 same-Session Goal rounds, schema v31 durable Session
 follow-ups, schema v32 durable Agent model output, schema v33 running-model
 cancellation, schema v34 durable Session forks, schema v35 durable fork catalog,
 schema v36 durable `spawn_agent` admission, schema v37 immutable Agent follow-up
-provenance and subagent-only `report` manifest binding, Agent-scoped `list_agents`,
+provenance and subagent-only `report` manifest binding, schema v38 durable
+Agent Team task DAG/CAS, Agent-scoped `list_agents`,
 direct-child `get_agent_result`, durable `send_message`, and fail-closed
 direct-child `interrupt_agent`, event-driven `wait_agent`, and durable
 child-to-parent `report`,
@@ -1427,11 +1437,12 @@ bounded multi-account control plane:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-targets --locked`: 708 tests passed
+- `cargo test --workspace --all-targets --locked -- --test-threads=1`: 717 tests passed
   across the top-level test targets, including 22 connector tests,
   8 deployment tests, 29 knowledge tests, 30 LLM unit and 18 provider-contract
   tests, 4 Goal tests, 5 Skill Catalog tests, 13 Subagent tests,
-  288 storage tests, 21 workflow tests, 52 runtime tests, 21 protocol tests,
+  291 storage tests, 21 workflow tests, 53 runtime tests, 5 Agent Team tests,
+  21 protocol tests,
   100 API library tests, 18 API main/config
   tests, and the real
   child-process database lease and active-SSE SIGTERM checks, authentication,

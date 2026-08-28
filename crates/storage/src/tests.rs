@@ -1772,7 +1772,7 @@ async fn v1_database_migrates_in_place_and_preserves_event_foreign_keys() {
         versions,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37,
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38,
         ]
     );
     let owner: Option<String> = connection
@@ -1922,7 +1922,7 @@ async fn v8_point_fixture_migrates_without_rewriting_oversized_durable_ids() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 37);
+    assert_eq!(version, 38);
     let configured_account: (String, String, String, i64) = connection
         .query_row(
             r#"SELECT
@@ -2640,7 +2640,7 @@ async fn v12_identity_and_run_crash_prefix_migrates_then_recovers_the_primary_se
     assert_eq!(
         recovered,
         (
-            37,
+            38,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into()
@@ -4387,7 +4387,7 @@ async fn v5_configured_database_migrates_to_the_local_owner_membership() {
     assert_eq!(
         migrated,
         (
-            37,
+            38,
             "acc_local".into(),
             "acc_local".into(),
             "acc_local".into(),
@@ -4513,7 +4513,7 @@ async fn v13_configured_active_work_migrates_with_account_authority_and_exact_vo
             },
         )
         .unwrap();
-    assert_eq!(migrated_counts, (37, 1, 1, 2, 1));
+    assert_eq!(migrated_counts, (38, 1, 1, 2, 1));
 }
 
 #[tokio::test]
@@ -4875,7 +4875,7 @@ async fn v14_database_migrates_through_v19_with_member_and_audit_roots() {
             },
         )
         .unwrap();
-    assert_eq!(state, (37, 1, 1, 1, 19));
+    assert_eq!(state, (38, 1, 1, 1, 19));
 }
 
 #[tokio::test]
@@ -4914,7 +4914,7 @@ async fn v15_migration_seeds_the_configured_audit_detail_limit() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (37, 2));
+    assert_eq!(state, (38, 2));
 }
 
 #[tokio::test]
@@ -4959,7 +4959,7 @@ async fn v15_reopen_rejects_a_lower_audit_detail_limit_without_mutating_policy()
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, (37, 4));
+    assert_eq!(state, (38, 4));
     drop(connection);
 
     let reopened = SqliteStore::open_with_limits(database.path(), original_limits)
@@ -5442,6 +5442,87 @@ async fn readiness_rejects_a_weakened_v37_followup_source_binding_trigger() {
 }
 
 #[tokio::test]
+async fn readiness_rejects_a_weakened_v38_team_task_binding_trigger() {
+    let database = TestDatabase::new();
+    {
+        let store = SqliteStore::open(database.path()).await.unwrap();
+        store.readiness().await.unwrap();
+    }
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER agent_tool_calls_bind_team_task_snapshot;
+               CREATE TRIGGER agent_tool_calls_bind_team_task_snapshot
+               BEFORE UPDATE OF status, result_json ON agent_tool_calls
+               WHEN 0
+               BEGIN
+                   SELECT 1;
+               END;"#,
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = match SqliteStore::open(database.path()).await {
+        Ok(_) => panic!("a same-name weakened Team task binding trigger must fail"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(&error, StorageError::CorruptData(message)
+            if message == "durability trigger `agent_tool_calls_bind_team_task_snapshot` differs from the authoritative migration"),
+        "unexpected weakened-trigger error: {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn v37_database_migrates_to_the_durable_agent_team_task_board() {
+    let database = TestDatabase::new();
+    drop(SqliteStore::open(database.path()).await.unwrap());
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    drop_v38_fixture_objects(&connection);
+    assert_eq!(
+        connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        37
+    );
+    drop(connection);
+
+    let migrated = SqliteStore::open(database.path()).await.unwrap();
+    migrated.readiness().await.unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let state = connection
+        .query_row(
+            r#"SELECT
+                   (SELECT MAX(version) FROM schema_migrations),
+                   (SELECT COUNT(*) FROM sqlite_schema
+                    WHERE type = 'table' AND name = 'agent_team_task_snapshots'),
+                   (SELECT COUNT(*) FROM sqlite_schema
+                    WHERE type = 'index'
+                      AND name = 'agent_team_task_snapshots_current_idx'),
+                   (SELECT COUNT(*) FROM sqlite_schema
+                    WHERE type = 'trigger' AND name IN (
+                        'agent_team_task_snapshots_validate_insert',
+                        'agent_team_task_snapshots_reject_update',
+                        'agent_team_task_snapshots_reject_delete',
+                        'agent_tool_calls_bind_team_task_snapshot'
+                    ))"#,
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(state, (38, 1, 1, 4));
+}
+
+#[tokio::test]
 async fn v36_database_migrates_to_durable_followup_sources() {
     let database = TestDatabase::new();
     drop(SqliteStore::open(database.path()).await.unwrap());
@@ -5483,7 +5564,7 @@ async fn v36_database_migrates_to_durable_followup_sources() {
             },
         )
         .unwrap();
-    assert_eq!(state, (37, 1, 4));
+    assert_eq!(state, (38, 1, 4));
 }
 
 #[tokio::test]
@@ -5531,7 +5612,7 @@ async fn v35_database_migrates_to_the_durable_subagent_catalog() {
             },
         )
         .unwrap();
-    assert_eq!(state, (37, 1, 1, 4));
+    assert_eq!(state, (38, 1, 1, 4));
 }
 
 #[tokio::test]
@@ -7478,7 +7559,7 @@ async fn v19_agent_manifest_is_canonical_actor_scoped_reused_and_secret_free() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(version, 37);
+    assert_eq!(version, 38);
     assert_eq!(
         manifest_rows, 1,
         "the identical manifest must be deduplicated"
@@ -9723,6 +9804,260 @@ async fn agent_todo_snapshots_are_atomic_cas_bound_and_restart_durable() {
     assert_eq!(todo.revision, 2);
     assert_eq!(todo.call_id, second_call.call_id);
     assert_eq!(todo.todos.len(), 2);
+}
+
+#[tokio::test]
+async fn agent_team_tasks_are_atomic_shared_cas_bound_and_restart_durable() {
+    let database = TestDatabase::new();
+    let store = created_owned_file_session_store(database.path()).await;
+    let manifest = team_task_test_agent_manifest();
+    let turn_id = "turn-agent-team-task";
+    let agent_id = "agent-team-task";
+    store
+        .start_turn_and_enqueue_agent_for_actor(
+            &owner_authz(),
+            "session-alpha",
+            StartTurnRequest {
+                turn_id: turn_id.into(),
+                user_message: "Coordinate durable Team work".into(),
+                expected_sequence: 1,
+            },
+            "agent-team-task-start",
+            agent_turn_spec_with_manifest(
+                agent_id,
+                turn_id,
+                manifest.clone(),
+                "Coordinate durable Team work",
+            ),
+        )
+        .await
+        .unwrap();
+    let scope = tools::ExecutionScope::new(
+        AccountId::local().as_str(),
+        "user-owner",
+        "session-alpha",
+        turn_id,
+        agent_id,
+    )
+    .unwrap();
+
+    let AgentModelClaimOutcome::Claimed(first_job) =
+        store.claim_next_agent_model(&manifest).await.unwrap()
+    else {
+        panic!("the Team task Agent model step must be claimable");
+    };
+    let create_call = team_task_agent_tool_call_spec(
+        "agent-call-team-task-create",
+        teams::TEAM_TASK_CREATE_TOOL_NAME,
+        json!({
+            "subject": "storage foundation",
+            "description": "Persist the shared task board",
+            "write_scopes": ["crates/storage"]
+        }),
+    );
+    store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: first_job.id.clone(),
+            response_json: agent_tool_response_json(&create_call),
+            resolution: AgentModelResolution::ToolCall {
+                call: create_call.clone(),
+            },
+        })
+        .await
+        .unwrap();
+    let AgentToolClaimOutcome::Claimed(first_work) =
+        store.claim_next_agent_tool(&manifest).await.unwrap()
+    else {
+        panic!("the Team task create call must be claimable");
+    };
+    let empty = store
+        .agent_team_task_board_for_started_tool(&scope, &first_work.call.call_id)
+        .await
+        .unwrap();
+    assert!(empty.tasks.is_empty());
+    let created =
+        teams::prepare_create(&create_call.arguments_json, &empty, "session-alpha").unwrap();
+    let create_result = serde_json::to_value(created.result(&empty).unwrap()).unwrap();
+    let create_next = exact_agent_continuation_request(&first_job, &create_call, &create_result);
+    let create_commit = AgentToolCompletionCommit {
+        call_id: create_call.call_id.clone(),
+        status: AgentToolCallStatus::Succeeded,
+        result_json: create_result.clone(),
+        provider_request_id: None,
+        next_request_json: Some(create_next),
+    };
+    assert!(matches!(
+        store
+            .complete_agent_tool(create_commit.clone())
+            .await
+            .unwrap(),
+        AgentToolCompletion::ModelQueued { .. }
+    ));
+    assert!(matches!(
+        store.complete_agent_tool(create_commit).await.unwrap(),
+        AgentToolCompletion::ModelQueued { .. }
+    ));
+
+    let AgentModelClaimOutcome::Claimed(second_job) =
+        store.claim_next_agent_model(&manifest).await.unwrap()
+    else {
+        panic!("the Team task continuation must be claimable");
+    };
+    let claim_call = team_task_agent_tool_call_spec(
+        "agent-call-team-task-claim",
+        teams::TEAM_TASK_UPDATE_TOOL_NAME,
+        json!({"task_id":"task-1", "expected_revision":1, "action":"claim"}),
+    );
+    store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: second_job.id.clone(),
+            response_json: agent_tool_response_json(&claim_call),
+            resolution: AgentModelResolution::ToolCall {
+                call: claim_call.clone(),
+            },
+        })
+        .await
+        .unwrap();
+    let AgentToolClaimOutcome::Claimed(second_work) =
+        store.claim_next_agent_tool(&manifest).await.unwrap()
+    else {
+        panic!("the Team task claim call must be claimable");
+    };
+    let pending = store
+        .agent_team_task_board_for_started_tool(&scope, &second_work.call.call_id)
+        .await
+        .unwrap();
+    assert_eq!(pending.tasks, vec![created.snapshot().clone()]);
+    let claimed =
+        teams::prepare_update(&claim_call.arguments_json, &pending, "session-alpha").unwrap();
+    let claim_result = serde_json::to_value(claimed.result(&pending).unwrap()).unwrap();
+    let claim_next = exact_agent_continuation_request(&second_job, &claim_call, &claim_result);
+    assert!(matches!(
+        store
+            .complete_agent_tool(AgentToolCompletionCommit {
+                call_id: claim_call.call_id.clone(),
+                status: AgentToolCallStatus::Succeeded,
+                result_json: claim_result.clone(),
+                provider_request_id: None,
+                next_request_json: Some(claim_next),
+            })
+            .await
+            .unwrap(),
+        AgentToolCompletion::ModelQueued { .. }
+    ));
+
+    let AgentModelClaimOutcome::Claimed(third_job) =
+        store.claim_next_agent_model(&manifest).await.unwrap()
+    else {
+        panic!("the claimed Team task continuation must be claimable");
+    };
+    let stale_call = team_task_agent_tool_call_spec(
+        "agent-call-team-task-stale",
+        teams::TEAM_TASK_UPDATE_TOOL_NAME,
+        json!({"task_id":"task-1", "expected_revision":1, "action":"claim"}),
+    );
+    store
+        .complete_agent_model_success(AgentModelSuccessCommit {
+            job_id: third_job.id.clone(),
+            response_json: agent_tool_response_json(&stale_call),
+            resolution: AgentModelResolution::ToolCall {
+                call: stale_call.clone(),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.claim_next_agent_tool(&manifest).await.unwrap(),
+        AgentToolClaimOutcome::Claimed(_)
+    ));
+    let stale_next = exact_agent_continuation_request(&third_job, &stale_call, &claim_result);
+    assert!(matches!(
+        store
+            .complete_agent_tool(AgentToolCompletionCommit {
+                call_id: stale_call.call_id.clone(),
+                status: AgentToolCallStatus::Succeeded,
+                result_json: claim_result,
+                provider_request_id: None,
+                next_request_json: Some(stale_next),
+            })
+            .await,
+        Err(StorageError::AgentTeamTaskConflict { code, .. })
+            if code == "team_task_revision_conflict"
+    ));
+    let failure = json!({
+        "code":"team_task_revision_conflict",
+        "message":"The Team task changed",
+        "retryable":false,
+        "status":"failed"
+    });
+    let failure_next = exact_agent_continuation_request(&third_job, &stale_call, &failure);
+    assert!(matches!(
+        store
+            .complete_agent_tool(AgentToolCompletionCommit {
+                call_id: stale_call.call_id,
+                status: AgentToolCallStatus::Failed,
+                result_json: failure,
+                provider_request_id: None,
+                next_request_json: Some(failure_next),
+            })
+            .await
+            .unwrap(),
+        AgentToolCompletion::ModelQueued { .. }
+    ));
+    store.verify_integrity().await.unwrap();
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let snapshot_state: (i64, i64, String, Option<String>) = connection
+        .query_row(
+            r#"SELECT COUNT(*), MAX(board_sequence),
+                      (SELECT status FROM agent_team_task_snapshots latest
+                       WHERE latest.root_session_id = 'session-alpha'
+                         AND latest.task_id = 'task-1'
+                       ORDER BY latest.revision DESC LIMIT 1),
+                      (SELECT owner_session_id FROM agent_team_task_snapshots latest
+                       WHERE latest.root_session_id = 'session-alpha'
+                         AND latest.task_id = 'task-1'
+                       ORDER BY latest.revision DESC LIMIT 1)
+               FROM agent_team_task_snapshots
+               WHERE root_session_id = 'session-alpha' AND task_id = 'task-1'"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        snapshot_state,
+        (2, 2, "in_progress".into(), Some("session-alpha".into()))
+    );
+    assert!(
+        connection
+            .execute(
+                "DELETE FROM agent_team_task_snapshots WHERE call_id = ?1",
+                [&claim_call.call_id],
+            )
+            .is_err()
+    );
+    drop(connection);
+    drop(store);
+
+    let reopened = SqliteStore::open(database.path()).await.unwrap();
+    reopened.verify_integrity().await.unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let reject_update = stored_trigger_sql(&connection, "agent_team_task_snapshots_reject_update");
+    connection
+        .execute_batch("DROP TRIGGER agent_team_task_snapshots_reject_update;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE agent_team_task_snapshots SET subject = 'tampered' WHERE call_id = ?1",
+            [&claim_call.call_id],
+        )
+        .unwrap();
+    connection.execute_batch(&reject_update).unwrap();
+    drop(connection);
+    assert!(matches!(
+        reopened.verify_integrity().await,
+        Err(StorageError::CorruptData(message)) if message.contains("Agent Team task")
+    ));
 }
 
 #[tokio::test]
@@ -21019,7 +21354,7 @@ async fn v10_event_payload_migration_backfills_utf8_bytes_exactly_and_is_idempot
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, (1_i64..=37).collect::<Vec<_>>());
+    assert_eq!(versions, (1_i64..=38).collect::<Vec<_>>());
     assert_eq!(
         connection
             .query_row(
@@ -23485,6 +23820,30 @@ fn todo_test_agent_manifest() -> ManifestEnvelope {
     ManifestEnvelope::new(manifest).unwrap()
 }
 
+fn team_task_test_agent_manifest() -> ManifestEnvelope {
+    let mut manifest = test_agent_manifest().manifest;
+    for descriptor in teams::team_task_descriptors() {
+        manifest.deployment.spec.tools.push(
+            ManifestTool::new(
+                descriptor.name,
+                descriptor.version,
+                descriptor.description,
+                descriptor.input_schema.provider_json_schema().unwrap(),
+                descriptor.effect,
+                descriptor.sandbox_profile,
+                ToolExecutorStatus::Available,
+            )
+            .unwrap(),
+        );
+    }
+    manifest
+        .deployment
+        .spec
+        .tools
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    ManifestEnvelope::new(manifest).unwrap()
+}
+
 fn list_agents_test_agent_manifest() -> ManifestEnvelope {
     let mut manifest = test_agent_manifest().manifest;
     for descriptor in [
@@ -23927,6 +24286,30 @@ fn goal_agent_tool_call_spec(
     arguments_json: Value,
 ) -> AgentToolCallSpec {
     let descriptor = goals::goal_tool_descriptors()
+        .into_iter()
+        .find(|descriptor| descriptor.name == tool_name)
+        .unwrap();
+    AgentToolCallSpec {
+        call_id: call_id.into(),
+        provider_call_id: format!("provider-call-{call_id}"),
+        tool_name: descriptor.name,
+        tool_version: descriptor.version,
+        arguments_digest: tools::arguments_digest(&arguments_json),
+        arguments_json,
+        effect: descriptor.effect,
+        sandbox_profile: descriptor.sandbox_profile,
+        executor_status: ToolExecutorStatus::Available,
+        policy_decision: PolicyDecision::Allow,
+        policy_revision: "local/v1".into(),
+    }
+}
+
+fn team_task_agent_tool_call_spec(
+    call_id: &str,
+    tool_name: &str,
+    arguments_json: Value,
+) -> AgentToolCallSpec {
+    let descriptor = teams::team_task_descriptors()
         .into_iter()
         .find(|descriptor| descriptor.name == tool_name)
         .unwrap();
@@ -25019,6 +25402,14 @@ fn drop_v36_fixture_objects(connection: &rusqlite::Connection) {
 }
 
 fn drop_v37_fixture_objects(connection: &rusqlite::Connection) {
+    let version: i64 = connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    if version >= 38 {
+        drop_v38_fixture_objects(connection);
+    }
     let schema_reject_update = migration_trigger_sql(
         include_str!("../migrations/0020_agent_execution_ledger.sql"),
         "schema_migrations_reject_update",
@@ -25037,6 +25428,32 @@ fn drop_v37_fixture_objects(connection: &rusqlite::Connection) {
                DROP TRIGGER session_followup_sources_reject_delete;
                DROP TABLE session_followup_sources;
                DELETE FROM schema_migrations WHERE version = 37;"#,
+        )
+        .unwrap();
+    connection.execute_batch(schema_reject_update).unwrap();
+    connection.execute_batch(schema_reject_delete).unwrap();
+}
+
+fn drop_v38_fixture_objects(connection: &rusqlite::Connection) {
+    let schema_reject_update = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_update",
+    );
+    let schema_reject_delete = migration_trigger_sql(
+        include_str!("../migrations/0020_agent_execution_ledger.sql"),
+        "schema_migrations_reject_delete",
+    );
+    connection
+        .execute_batch(
+            r#"DROP TRIGGER schema_migrations_reject_update;
+               DROP TRIGGER schema_migrations_reject_delete;
+               DROP TRIGGER agent_tool_calls_bind_team_task_snapshot;
+               DROP TRIGGER agent_team_task_snapshots_validate_insert;
+               DROP TRIGGER agent_team_task_snapshots_reject_update;
+               DROP TRIGGER agent_team_task_snapshots_reject_delete;
+               DROP INDEX agent_team_task_snapshots_current_idx;
+               DROP TABLE agent_team_task_snapshots;
+               DELETE FROM schema_migrations WHERE version = 38;"#,
         )
         .unwrap();
     connection.execute_batch(schema_reject_update).unwrap();

@@ -10,7 +10,7 @@ Cancellation、schema v28 Durable Agent Planning、schema v29 Durable Session Go
 Same-Session Goal Round、schema v31 Durable Session Follow-up、schema v32 Durable Agent
 Model Output、schema v33 Running-model Cancellation、schema v34 Durable Session Fork、schema v35
 Durable Session Fork Catalog、schema v36 Durable Agent Subagent Spawn、schema v37 Durable
-Agent Follow-up Source / Scoped Report Manifest、Agent-scoped
+Agent Follow-up Source / Scoped Report Manifest、schema v38 Durable Agent Team Task DAG / CAS、Agent-scoped
 `spawn_agent` / `list_agents`、Trusted Single-Node Ingress、
 Per-Operation SecretRef Resolution、启动绑定的 Skill Catalog
 与有界多账户控制面主机代码已实现；Apple 保留此前 Operation Capacity 指定压力证据与历史
@@ -560,6 +560,8 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
   `report` 覆盖 exact child scope、持久 parent FIFO 唤醒、确定性 receipt 与成功调用的 deep integrity。
   schema v37 另覆盖 v36 原地迁移、same-name weakened source trigger 拒绝、root/child manifest
   能力分离、双向 structured source 查询，以及 source 在 FIFO claim 和重启后的保持。
+  schema v38 覆盖 v37 原地迁移、same-name weakened task binding trigger 拒绝、create/claim 的 exact
+  started scope、root-wide sequence、stale revision 回收、重启恢复与离线篡改 fail-closed。
 - Session/Run detail 只返回最新 bounded tail；opaque cursor 的 kind、resource scope、canonical
   encoding、future-head 和跨资源使用均有自动测试，返回页保持连续且升序。
 - disabled/降权/owner mismatch 的 reply 与 dispatch claim 不触达外部执行，并留下
@@ -568,9 +570,9 @@ corpus 的 `entries` 作为现有 CAS `PUT` 的新输入，因此生成新 revis
   problem 合约、真实 peer 限流、XFF 不可信与 SSE body-drop 释放 permit 有自动测试。
 - assistant/reply/tool terminal payload 的 exact/+1 边界、非法 provenance、超限
   provider/executor 的单次有界结算，以及不可 claim dispatch 在 admission 前完整回滚有自动测试。
-- host 按项目既有统计口径通过 708 个 Rust 测试（authz 7、connectors 22、deployment 8、
+- host 串行通过 717 个 Rust 测试（authz 7、connectors 22、deployment 8、
   execution 16、goals 4、kernel 10、knowledge 29、LLM unit 30、provider contract 18、planning 4、
-  protocol 21、runtime 52、skills 5、subagents 13、storage 288、tenancy 15、terminal 10、tools 16、
+  protocol 21、runtime 53、skills 5、subagents 13、teams 5、storage 291、tenancy 15、terminal 10、tools 16、
   workflows 21、API library 100、API main/config 18、graceful shutdown 1）与 28 个 Web Node 测试。
 - `cargo fmt --all -- --check`、workspace all-target clippy、Web check/lint/production build 均通过。
 

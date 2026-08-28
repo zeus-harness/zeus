@@ -132,6 +132,8 @@ pub enum StorageError {
     AgentTodoRevisionConflict { expected: u64, current: u64 },
     #[error("the Session goal revision changed: expected {expected}, current {current}")]
     AgentGoalRevisionConflict { expected: u64, current: u64 },
+    #[error("Agent Team task mutation failed with `{code}`: {message}")]
+    AgentTeamTaskConflict { code: String, message: String },
     #[error("the Agent external operation has already started")]
     AgentOperationInFlight,
     #[error("the Agent turn is already terminal and was not cancelled by this request")]

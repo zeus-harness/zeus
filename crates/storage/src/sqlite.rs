@@ -63,7 +63,7 @@ use crate::{
     UpdateAccountAuditPolicyCommit,
 };
 
-const CURRENT_SCHEMA_VERSION: i64 = 37;
+const CURRENT_SCHEMA_VERSION: i64 = 38;
 const LOCAL_ACCOUNT_ID: &str = "acc_local";
 const MAX_ACCOUNTS_PER_USER: i64 = 16;
 const MAX_ACCOUNTS_GLOBAL: i64 = 64;
@@ -110,6 +110,13 @@ const MIGRATION_0034: &str = include_str!("../migrations/0034_session_forks.sql"
 const MIGRATION_0035: &str = include_str!("../migrations/0035_session_fork_catalog.sql");
 const MIGRATION_0036: &str = include_str!("../migrations/0036_agent_subagent_spawns.sql");
 const MIGRATION_0037: &str = include_str!("../migrations/0037_session_followup_sources.sql");
+const MIGRATION_0038: &str = include_str!("../migrations/0038_agent_team_tasks.sql");
+const MIGRATION_0038_TRIGGER_NAMES: &[&str] = &[
+    "agent_team_task_snapshots_validate_insert",
+    "agent_team_task_snapshots_reject_update",
+    "agent_team_task_snapshots_reject_delete",
+    "agent_tool_calls_bind_team_task_snapshot",
+];
 const MIGRATION_0037_TRIGGER_NAMES: &[&str] = &[
     "session_followup_sources_validate_insert",
     "session_followup_sources_reject_update",
@@ -3892,6 +3899,13 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
             params![37, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
         )?;
     }
+    if current < 38 {
+        transaction.execute_batch(MIGRATION_0038)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![38, Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)],
+        )?;
+    }
     // The execution verifier now understands the v22 knowledge binding. Run
     // it only after every missing schema step has been installed so upgrades
     // from v19 and older never query a column that does not exist yet. This
@@ -3908,6 +3922,7 @@ fn migrate(connection: &mut Connection, limits: &StorageLimits) -> Result<(), St
         agent::verify_agent_model_output_integrity(&transaction)?;
         verify_session_fork_integrity(&transaction)?;
         agent::verify_agent_subagent_spawn_integrity(&transaction)?;
+        agent::verify_agent_team_task_integrity(&transaction)?;
         provider::verify_account_reply_provider_integrity(&transaction)?;
         execution::verify_agent_execution_integrity(&transaction)?;
     }
@@ -4565,12 +4580,13 @@ fn readiness(
                'agent_knowledge_legacy_agents', 'account_knowledge_catalogs',
                'knowledge_catalog_receipts', 'session_compaction_jobs',
                'agent_todo_snapshots', 'session_forks', 'session_fork_turns',
-               'agent_subagent_spawns', 'session_followup_sources'
+               'agent_subagent_spawns', 'session_followup_sources',
+               'agent_team_task_snapshots'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if table_count != 48 {
+    if table_count != 49 {
         return Err(StorageError::CorruptData(
             "one or more required tables are missing".into(),
         ));
@@ -4651,6 +4667,24 @@ fn readiness(
     if agent_todo_columns != 13 {
         return Err(StorageError::CorruptData(
             "Agent todo snapshot schema is missing".into(),
+        ));
+    }
+
+    let agent_team_task_columns: i64 = connection.query_row(
+        r#"SELECT COUNT(*) FROM pragma_table_info('agent_team_task_snapshots')
+           WHERE name IN (
+               'account_id', 'root_session_id', 'board_sequence', 'task_id',
+               'task_number', 'revision',
+               'source_session_id', 'source_turn_id', 'source_agent_id', 'call_id',
+               'subject', 'description', 'status', 'owner_session_id',
+               'blocked_by_json', 'write_scopes_json', 'created_at'
+           )"#,
+        [],
+        |row| row.get(0),
+    )?;
+    if agent_team_task_columns != 17 {
+        return Err(StorageError::CorruptData(
+            "Agent Team task snapshot schema is missing".into(),
         ));
     }
 
@@ -4939,12 +4973,13 @@ fn readiness(
                'session_forks_parent_idx',
                'session_fork_turns_parent_idx',
                'session_forks_children_idx',
-               'agent_subagent_spawns_parent_idx'
+               'agent_subagent_spawns_parent_idx',
+               'agent_team_task_snapshots_current_idx'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if point_query_indexes != 81 {
+    if point_query_indexes != 82 {
         return Err(StorageError::CorruptData(
             "one or more point-query indexes are missing".into(),
         ));
@@ -5162,13 +5197,17 @@ fn readiness(
                'session_followup_sources_reject_update',
                'session_followup_sources_reject_delete',
                'agent_tool_calls_bind_followup_source',
+               'agent_team_task_snapshots_validate_insert',
+               'agent_team_task_snapshots_reject_update',
+               'agent_team_task_snapshots_reject_delete',
+               'agent_tool_calls_bind_team_task_snapshot',
                'schema_migrations_reject_update',
                'schema_migrations_reject_delete'
            )"#,
         [],
         |row| row.get(0),
     )?;
-    if trigger_count != 187 {
+    if trigger_count != 191 {
         return Err(StorageError::CorruptData(
             "one or more durability triggers are missing".into(),
         ));
@@ -5188,6 +5227,7 @@ fn readiness(
     verify_migration_trigger_definitions(connection, MIGRATION_0034, MIGRATION_0034_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0036, MIGRATION_0036_TRIGGER_NAMES)?;
     verify_migration_trigger_definitions(connection, MIGRATION_0037, MIGRATION_0037_TRIGGER_NAMES)?;
+    verify_migration_trigger_definitions(connection, MIGRATION_0038, MIGRATION_0038_TRIGGER_NAMES)?;
     verify_session_followup_integrity(connection)?;
     verify_session_fork_integrity(connection)?;
     agent::verify_agent_subagent_spawn_integrity(connection)?;
@@ -5794,6 +5834,7 @@ fn readiness(
     agent::verify_agent_goal_integrity(connection)?;
     agent::verify_agent_goal_round_integrity(connection)?;
     agent::verify_agent_model_output_integrity(connection)?;
+    agent::verify_agent_team_task_integrity(connection)?;
     provider::verify_account_reply_provider_integrity(connection)?;
     compaction::verify_integrity(connection)?;
     execution::verify_agent_execution_integrity(connection)?;
