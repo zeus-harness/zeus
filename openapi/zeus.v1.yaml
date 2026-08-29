@@ -1,0 +1,6672 @@
+openapi: 3.1.0
+info:
+  title: Zeus API
+  description: Enterprise Harness Agent control plane and durable execution API.
+  license:
+    name: MIT
+    identifier: MIT
+  version: 0.1.0
+paths:
+  /api/v1/auth/me:
+    get:
+      tags:
+      - identity
+      operationId: current_user
+      responses:
+        '200':
+          description: Current authenticated principal
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurrentUserResponse'
+        '401':
+          description: Authentication required
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/meta:
+    get:
+      tags:
+      - platform
+      operationId: meta
+      responses:
+        '200':
+          description: Zeus API metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetaResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - {}
+  /api/v1/openapi.json:
+    get:
+      tags:
+      - platform
+      operationId: openapi
+      responses:
+        '200':
+          description: Successful response
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - {}
+  /api/v1/organizations:
+    post:
+      tags:
+      - organization
+      operationId: create_organization
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrganizationRequest'
+        required: true
+      responses:
+        '201':
+          description: Organization and initial workspace
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedOrganizationResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}:
+    get:
+      tags:
+      - organization
+      operationId: get_organization
+      parameters:
+      - name: organization_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Organization
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrganizationResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    patch:
+      tags:
+      - organization
+      operationId: update_organization
+      parameters:
+      - name: organization_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: If-Match
+        in: header
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateOrganizationRequest'
+        required: true
+      responses:
+        '200':
+          description: Updated organization
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrganizationResponse'
+        '412':
+          description: Revision mismatch
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/capability-definitions:
+    get:
+      tags:
+      - models-and-tools
+      operationId: list_capability_definitions
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapabilityDefinitionPageResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - models-and-tools
+      operationId: create_capability_definition
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCapabilityDefinitionRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapabilityDefinitionResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/capability-definitions/{capability_id}:
+    get:
+      tags:
+      - models-and-tools
+      operationId: get_capability_definition
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: capability_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapabilityDefinitionResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    patch:
+      tags:
+      - models-and-tools
+      operationId: update_capability_definition
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: capability_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateCapabilityDefinitionRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapabilityDefinitionResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/capability-definitions/{capability_id}/archive:
+    post:
+      tags:
+      - models-and-tools
+      operationId: archive_capability_definition
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: capability_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapabilityDefinitionResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/members:
+    get:
+      tags:
+      - organization
+      operationId: list_organization_members
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/OrganizationMemberResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    put:
+      tags:
+      - organization
+      operationId: set_organization_member
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetOrganizationMemberRequest'
+        required: true
+      responses:
+        '204':
+          description: Successful response
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/oidc-providers:
+    get:
+      tags:
+      - organization
+      operationId: list_oidc_providers
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/OidcProviderResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - organization
+      operationId: create_oidc_provider
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOidcProviderRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OidcProviderResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/oidc-providers/{provider_id}:
+    patch:
+      tags:
+      - organization
+      operationId: update_oidc_provider
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: provider_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateOidcProviderRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OidcProviderResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/oidc-providers/{provider_id}/group-mappings:
+    get:
+      tags:
+      - organization
+      operationId: list_oidc_group_mappings
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: provider_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/OidcGroupMappingResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - organization
+      operationId: create_oidc_group_mapping
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: provider_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOidcGroupMappingRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OidcGroupMappingResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/service-accounts:
+    get:
+      tags:
+      - identity
+      operationId: list_service_accounts
+      parameters:
+      - name: organization_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Service accounts without token hashes
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ServiceAccountResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - identity
+      operationId: create_service_account
+      parameters:
+      - name: organization_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateServiceAccountRequest'
+        required: true
+      responses:
+        '201':
+          description: Service account and one-time token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedServiceAccountResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/service-accounts/{service_account_id}/revoke:
+    post:
+      tags:
+      - identity
+      operationId: revoke_service_account
+      parameters:
+      - name: organization_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: service_account_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '204':
+          description: Service account revoked
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/workspaces:
+    get:
+      tags:
+      - organization
+      operationId: list_workspaces
+      parameters:
+      - name: organization_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: cursor
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int32
+          minimum: 0
+      responses:
+        '200':
+          description: Organization workspaces
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspacePageResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - organization
+      operationId: create_workspace
+      parameters:
+      - name: organization_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWorkspaceRequest'
+        required: true
+      responses:
+        '201':
+          description: Workspace
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}:
+    get:
+      tags:
+      - organization
+      operationId: get_workspace
+      parameters:
+      - name: workspace_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    patch:
+      tags:
+      - organization
+      operationId: update_workspace
+      parameters:
+      - name: workspace_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: If-Match
+        in: header
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateWorkspaceRequest'
+        required: true
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceResponse'
+        '412':
+          description: Revision mismatch
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/agents:
+    get:
+      tags:
+      - agents
+      operationId: list_agents
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentPageResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - agents
+      operationId: create_agent
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAgentRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/agents/{agent_id}:
+    get:
+      tags:
+      - agents
+      operationId: get_agent
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: agent_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    patch:
+      tags:
+      - agents
+      operationId: update_agent
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: agent_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAgentRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/agents/{agent_id}/active-version:
+    post:
+      tags:
+      - agents
+      operationId: activate_agent_version
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: agent_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ActivateVersionRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/agents/{agent_id}/versions:
+    get:
+      tags:
+      - agents
+      operationId: list_agent_versions
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: agent_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AgentVersionResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - agents
+      operationId: create_agent_version
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: agent_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAgentVersionRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentVersionResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/agents/{agent_id}/versions/{version_id}:
+    get:
+      tags:
+      - agents
+      operationId: get_agent_version
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: agent_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: version_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentVersionResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/approvals:
+    get:
+      tags:
+      - approvals
+      operationId: list_approvals
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ApprovalResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/approvals/{approval_id}/approve:
+    post:
+      tags:
+      - approvals
+      operationId: approve
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: approval_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DecideApprovalRequest'
+        required: true
+      responses:
+        '204':
+          description: Successful response
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/approvals/{approval_id}/reject:
+    post:
+      tags:
+      - approvals
+      operationId: reject
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: approval_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DecideApprovalRequest'
+        required: true
+      responses:
+        '204':
+          description: Successful response
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/capabilities:
+    get:
+      tags:
+      - models-and-tools
+      operationId: list_workspace_capabilities
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceCapabilityPageResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - models-and-tools
+      operationId: create_workspace_capability
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWorkspaceCapabilityRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceCapabilityResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/capabilities/{capability_id}:
+    get:
+      tags:
+      - models-and-tools
+      operationId: get_workspace_capability
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: capability_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceCapabilityResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    patch:
+      tags:
+      - models-and-tools
+      operationId: update_workspace_capability
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: capability_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateWorkspaceCapabilityRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceCapabilityResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/capabilities/{capability_id}/disable:
+    post:
+      tags:
+      - models-and-tools
+      operationId: disable_workspace_capability
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: capability_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceCapabilityResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/capabilities/{capability_id}/enable:
+    post:
+      tags:
+      - models-and-tools
+      operationId: enable_workspace_capability
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: capability_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceCapabilityResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/connections:
+    get:
+      tags:
+      - models-and-tools
+      operationId: list_connections
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionPageResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - models-and-tools
+      operationId: create_connection
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateConnectionRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/connections/{connection_id}:
+    get:
+      tags:
+      - models-and-tools
+      operationId: get_connection
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: connection_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    patch:
+      tags:
+      - models-and-tools
+      operationId: update_connection
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: connection_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateConnectionRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/connections/{connection_id}/archive:
+    post:
+      tags:
+      - models-and-tools
+      operationId: archive_connection
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: connection_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/connections/{connection_id}/secrets:
+    get:
+      tags:
+      - models-and-tools
+      operationId: list_connection_secrets
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: connection_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionSecretPageResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - models-and-tools
+      operationId: create_connection_secret
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: connection_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateConnectionSecretRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionSecretResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/connections/{connection_id}/secrets/{secret_name}:
+    put:
+      tags:
+      - models-and-tools
+      operationId: rotate_connection_secret
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: connection_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: secret_name
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConnectionSecretValueRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionSecretResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - models-and-tools
+      operationId: create_named_connection_secret
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: connection_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: secret_name
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConnectionSecretValueRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionSecretResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/experience-candidates:
+    get:
+      tags:
+      - experience
+      operationId: list_experience_candidates
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExperienceCandidatePageResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - experience
+      operationId: create_experience_candidate
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateExperienceCandidateRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExperienceCandidateResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/experience-candidates/{candidate_id}:
+    get:
+      tags:
+      - experience
+      operationId: get_experience_candidate
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: candidate_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExperienceCandidateResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/experience-candidates/{candidate_id}/publish:
+    post:
+      tags:
+      - experience
+      operationId: publish_experience_candidate
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: candidate_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExperienceEntryResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/experience-candidates/{candidate_id}/review:
+    post:
+      tags:
+      - experience
+      operationId: review_experience_candidate
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: candidate_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReviewExperienceCandidateRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExperienceCandidateResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/experience-entries:
+    get:
+      tags:
+      - experience
+      operationId: list_experience_entries
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExperienceEntryPageResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/experience-entries/search:
+    get:
+      tags:
+      - experience
+      operationId: search_experience_entries
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ExperienceSearchResult'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/experience-entries/{entry_id}:
+    get:
+      tags:
+      - experience
+      operationId: get_experience_entry
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: entry_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExperienceEntryResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/experience-entries/{entry_id}/withdraw:
+    post:
+      tags:
+      - experience
+      operationId: withdraw_experience_entry
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: entry_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WithdrawExperienceRequest'
+        required: true
+      responses:
+        '204':
+          description: Successful response
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/members:
+    get:
+      tags:
+      - organization
+      operationId: list_workspace_members
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/WorkspaceMemberResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    put:
+      tags:
+      - organization
+      operationId: set_workspace_member
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetWorkspaceMemberRequest'
+        required: true
+      responses:
+        '204':
+          description: Successful response
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/model-profiles:
+    get:
+      tags:
+      - models-and-tools
+      operationId: list_model_profiles
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelProfilePageResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - models-and-tools
+      operationId: create_model_profile
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateModelProfileRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelProfileResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/model-profiles/{model_profile_id}:
+    get:
+      tags:
+      - models-and-tools
+      operationId: get_model_profile
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: model_profile_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelProfileResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    patch:
+      tags:
+      - models-and-tools
+      operationId: update_model_profile
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: model_profile_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateModelProfileRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelProfileResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/model-profiles/{model_profile_id}/archive:
+    post:
+      tags:
+      - models-and-tools
+      operationId: archive_model_profile
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: model_profile_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelProfileResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/runs:
+    get:
+      tags:
+      - execution
+      operationId: list_runs
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunPageResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - execution
+      operationId: create_run
+      parameters:
+      - name: workspace_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRunRequest'
+        required: true
+      responses:
+        '201':
+          description: Queued Run
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunResponse'
+        '409':
+          description: Idempotency conflict
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/runs/{run_id}:
+    get:
+      tags:
+      - execution
+      operationId: get_run
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: run_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/runs/{run_id}/cancel:
+    post:
+      tags:
+      - execution
+      operationId: cancel_run
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: run_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelRunRequest'
+        required: true
+      responses:
+        '202':
+          description: Successful response
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/runs/{run_id}/children:
+    get:
+      tags:
+      - execution
+      operationId: list_child_runs
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: run_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ChildRunResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/runs/{run_id}/events:
+    get:
+      tags:
+      - execution
+      operationId: list_run_events
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: run_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RunEventResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/runs/{run_id}/events/stream:
+    get:
+      tags:
+      - execution
+      operationId: stream_run_events
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: run_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/runs/{run_id}/retry:
+    post:
+      tags:
+      - execution
+      operationId: retry_run
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: run_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RetryRunRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/runs/{run_id}/trace:
+    get:
+      tags:
+      - execution
+      operationId: get_run_trace
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: run_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunTraceResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/runs/{run_id}/usage:
+    get:
+      tags:
+      - execution
+      operationId: get_run_usage
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: run_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunUsageSummaryResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/schedules:
+    get:
+      tags:
+      - workflows
+      operationId: list_schedules
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SchedulePageResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - workflows
+      operationId: create_schedule
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateScheduleRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/schedules/{schedule_id}:
+    get:
+      tags:
+      - workflows
+      operationId: get_schedule
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: schedule_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    patch:
+      tags:
+      - workflows
+      operationId: update_schedule
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: schedule_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateScheduleRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/schedules/{schedule_id}/disable:
+    post:
+      tags:
+      - workflows
+      operationId: disable_schedule
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: schedule_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/schedules/{schedule_id}/enable:
+    post:
+      tags:
+      - workflows
+      operationId: enable_schedule
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: schedule_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/select:
+    post:
+      tags:
+      - organization
+      operationId: select_workspace
+      parameters:
+      - name: workspace_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '204':
+          description: Selected workspace stored in web session
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/sessions:
+    get:
+      tags:
+      - collaboration
+      operationId: list_sessions
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionPageResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - collaboration
+      operationId: create_session
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSessionRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/sessions/{session_id}:
+    get:
+      tags:
+      - collaboration
+      operationId: get_session
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: session_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/sessions/{session_id}/events:
+    get:
+      tags:
+      - collaboration
+      operationId: list_session_events
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: session_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SessionEventResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/sessions/{session_id}/messages:
+    post:
+      tags:
+      - collaboration
+      operationId: submit_message
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: session_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitMessageRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppendedEventResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/webhook-endpoints:
+    get:
+      tags:
+      - workflows
+      operationId: list_webhook_endpoints
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookEndpointPageResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - workflows
+      operationId: create_webhook_endpoint
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWebhookEndpointRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedWebhookEndpointResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/webhook-endpoints/{endpoint_id}:
+    get:
+      tags:
+      - workflows
+      operationId: get_webhook_endpoint
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: endpoint_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookEndpointResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    patch:
+      tags:
+      - workflows
+      operationId: update_webhook_endpoint
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: endpoint_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateWebhookEndpointRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookEndpointResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/webhook-endpoints/{endpoint_id}/disable:
+    post:
+      tags:
+      - workflows
+      operationId: disable_webhook_endpoint
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: endpoint_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookEndpointResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/webhook-endpoints/{endpoint_id}/enable:
+    post:
+      tags:
+      - workflows
+      operationId: enable_webhook_endpoint
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: endpoint_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookEndpointResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/work-items:
+    get:
+      tags:
+      - collaboration
+      operationId: list_work_items
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkItemPageResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - collaboration
+      operationId: create_work_item
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWorkItemRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkItemResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/work-items/{work_item_id}:
+    get:
+      tags:
+      - collaboration
+      operationId: get_work_item
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: work_item_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkItemResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    patch:
+      tags:
+      - collaboration
+      operationId: update_work_item
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: work_item_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateWorkItemRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkItemResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/attachments:
+    get:
+      tags:
+      - collaboration
+      operationId: list_work_item_attachments
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: work_item_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AttachmentResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - collaboration
+      operationId: create_work_item_attachment
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: work_item_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAttachmentRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttachmentResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/attachments/{attachment_id}:
+    get:
+      tags:
+      - collaboration
+      operationId: download_work_item_attachment
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: work_item_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: attachment_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/external-references:
+    get:
+      tags:
+      - collaboration
+      operationId: list_work_item_external_references
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: work_item_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ExternalReferenceResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - collaboration
+      operationId: create_work_item_external_reference
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: work_item_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateExternalReferenceRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExternalReferenceResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/workflows:
+    get:
+      tags:
+      - workflows
+      operationId: list_workflows
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkflowPageResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - workflows
+      operationId: create_workflow
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWorkflowRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkflowResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/workflows/{workflow_id}:
+    get:
+      tags:
+      - workflows
+      operationId: get_workflow
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: workflow_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkflowResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    patch:
+      tags:
+      - workflows
+      operationId: update_workflow
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: workflow_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateWorkflowRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkflowResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/workflows/{workflow_id}/active-version:
+    post:
+      tags:
+      - workflows
+      operationId: activate_workflow_version
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: workflow_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ActivateVersionRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkflowResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/workflows/{workflow_id}/versions:
+    get:
+      tags:
+      - workflows
+      operationId: list_workflow_versions
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: workflow_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/WorkflowVersionResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - workflows
+      operationId: create_workflow_version
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: workflow_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWorkflowVersionRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkflowVersionResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/workflows/{workflow_id}/versions/{version_id}:
+    get:
+      tags:
+      - workflows
+      operationId: get_workflow_version
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: workflow_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: version_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkflowVersionResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /auth/callback/{provider_id}:
+    get:
+      tags:
+      - identity
+      operationId: callback
+      parameters:
+      - name: provider_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '302':
+          description: Successful response
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - {}
+  /auth/login/{provider_id}:
+    get:
+      tags:
+      - identity
+      operationId: login
+      parameters:
+      - name: provider_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '302':
+          description: Successful response
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - {}
+  /auth/logout:
+    post:
+      tags:
+      - identity
+      operationId: logout
+      responses:
+        '302':
+          description: Successful response
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - {}
+  /health/live:
+    get:
+      tags:
+      - operations
+      operationId: live
+      responses:
+        '200':
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - {}
+  /health/ready:
+    get:
+      tags:
+      - operations
+      operationId: ready
+      responses:
+        '200':
+          description: Database is ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: Database is unavailable
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - {}
+  /metrics:
+    get:
+      tags:
+      - operations
+      operationId: metrics
+      responses:
+        '200':
+          description: Successful response
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - {}
+components:
+  schemas:
+    ActivateVersionRequest:
+      type: object
+      required:
+      - version_id
+      properties:
+        version_id:
+          type: string
+          format: uuid
+    AgentPageResponse:
+      type: object
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AgentResponse'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+    AgentResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - workspace_id
+      - name
+      - description
+      - revision
+      - created_at
+      - updated_at
+      properties:
+        active_version_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        description:
+          type: string
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        organization_id:
+          type: string
+          format: uuid
+        revision:
+          type: integer
+          format: int64
+        updated_at:
+          type: string
+          format: date-time
+        workspace_id:
+          type: string
+          format: uuid
+    AgentVersionResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - workspace_id
+      - agent_id
+      - version_number
+      - instructions
+      - configuration
+      - created_at
+      properties:
+        agent_id:
+          type: string
+          format: uuid
+        configuration: {}
+        created_at:
+          type: string
+          format: date-time
+        created_by:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        id:
+          type: string
+          format: uuid
+        instructions:
+          type: string
+        organization_id:
+          type: string
+          format: uuid
+        version_number:
+          type: integer
+          format: int32
+        workspace_id:
+          type: string
+          format: uuid
+    AppendedEventResponse:
+      type: object
+      required:
+      - event_id
+      - event_sequence
+      properties:
+        event_id:
+          type: string
+          format: uuid
+        event_sequence:
+          type: integer
+          format: int64
+    ApprovalResponse:
+      type: object
+      required:
+      - id
+      - run_id
+      - tool_call_id
+      - status
+      - requested_at
+      properties:
+        decided_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        decided_by:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        expires_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        id:
+          type: string
+          format: uuid
+        reason:
+          type:
+          - string
+          - 'null'
+        requested_at:
+          type: string
+          format: date-time
+        run_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+        tool_call_id:
+          type: string
+          format: uuid
+    AttachmentResponse:
+      type: object
+      required:
+      - id
+      - file_name
+      - content_type
+      - sha256_hex
+      - size_bytes
+      - created_at
+      properties:
+        content_type:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        created_by:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        file_name:
+          type: string
+        id:
+          type: string
+          format: uuid
+        sha256_hex:
+          type: string
+        size_bytes:
+          type: integer
+          format: int32
+        work_item_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+    CancelRunRequest:
+      type: object
+      properties:
+        reason:
+          type:
+          - string
+          - 'null'
+    CapabilityDefinitionPageResponse:
+      type: object
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/CapabilityDefinitionResponse'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+    CapabilityDefinitionResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - registry_key
+      - display_name
+      - description
+      - input_schema
+      - output_schema
+      - idempotency_mode
+      - risk_level
+      - executor_key
+      - revision
+      - created_at
+      - updated_at
+      properties:
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        description:
+          type: string
+        display_name:
+          type: string
+        executor_key:
+          type: string
+        id:
+          type: string
+          format: uuid
+        idempotency_mode:
+          type: string
+        input_schema: {}
+        organization_id:
+          type: string
+          format: uuid
+        output_schema: {}
+        registry_key:
+          type: string
+        revision:
+          type: integer
+          format: int64
+        risk_level:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+    ChildRunResponse:
+      type: object
+      required:
+      - id
+      - workflow_version_id
+      - session_id
+      - status
+      - depth
+      - token_budget
+      - max_runtime_seconds
+      - created_at
+      properties:
+        created_at:
+          type: string
+          format: date-time
+        depth:
+          type: integer
+          format: int32
+        error_code:
+          type:
+          - string
+          - 'null'
+        error_detail:
+          type:
+          - string
+          - 'null'
+        finished_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        id:
+          type: string
+          format: uuid
+        max_runtime_seconds:
+          type: integer
+          format: int32
+        output: {}
+        session_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+        token_budget:
+          type: integer
+          format: int64
+        workflow_version_id:
+          type: string
+          format: uuid
+    ConnectionPageResponse:
+      type: object
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConnectionResponse'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+    ConnectionResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - workspace_id
+      - name
+      - provider_kind
+      - configuration
+      - revision
+      - created_at
+      - updated_at
+      properties:
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        configuration: {}
+        created_at:
+          type: string
+          format: date-time
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        organization_id:
+          type: string
+          format: uuid
+        provider_kind:
+          type: string
+        revision:
+          type: integer
+          format: int64
+        updated_at:
+          type: string
+          format: date-time
+        workspace_id:
+          type: string
+          format: uuid
+    ConnectionSecretPageResponse:
+      type: object
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConnectionSecretResponse'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+    ConnectionSecretResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - workspace_id
+      - connection_id
+      - secret_name
+      - created_at
+      properties:
+        connection_id:
+          type: string
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+        id:
+          type: string
+          format: uuid
+        organization_id:
+          type: string
+          format: uuid
+        rotated_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        secret_name:
+          type: string
+        workspace_id:
+          type: string
+          format: uuid
+    ConnectionSecretValueRequest:
+      type: object
+      required:
+      - secret
+      properties:
+        secret:
+          type: string
+          writeOnly: true
+    CreateAgentRequest:
+      type: object
+      required:
+      - name
+      properties:
+        description:
+          type: string
+        name:
+          type: string
+    CreateAgentVersionRequest:
+      type: object
+      required:
+      - instructions
+      properties:
+        configuration: {}
+        instructions:
+          type: string
+    CreateAttachmentRequest:
+      type: object
+      required:
+      - file_name
+      - content_type
+      - content_base64
+      properties:
+        content_base64:
+          type: string
+        content_type:
+          type: string
+        file_name:
+          type: string
+    CreateCapabilityDefinitionRequest:
+      type: object
+      required:
+      - registry_key
+      - display_name
+      - idempotency_mode
+      - risk_level
+      - executor_key
+      properties:
+        description:
+          type: string
+        display_name:
+          type: string
+        executor_key:
+          type: string
+        idempotency_mode:
+          type: string
+        input_schema: {}
+        output_schema: {}
+        registry_key:
+          type: string
+        risk_level:
+          type: string
+    CreateConnectionRequest:
+      type: object
+      required:
+      - name
+      - provider_kind
+      properties:
+        configuration: {}
+        name:
+          type: string
+        provider_kind:
+          type: string
+        secrets:
+          type: object
+          description: Secrets are write-only inputs. Their values are never echoed in a response.
+          additionalProperties:
+            type: string
+          propertyNames:
+            type: string
+          writeOnly: true
+    CreateConnectionSecretRequest:
+      type: object
+      required:
+      - secret_name
+      - secret
+      properties:
+        secret:
+          type: string
+          writeOnly: true
+        secret_name:
+          type: string
+    CreateExperienceCandidateRequest:
+      type: object
+      required:
+      - source_run_id
+      - proposed_scope
+      - title
+      - content
+      - evidence
+      properties:
+        content:
+          type: string
+        evidence:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExperienceEvidenceRef'
+        proposed_scope:
+          type: string
+        source_run_id:
+          type: string
+          format: uuid
+        tags:
+          type: array
+          items:
+            type: string
+        title:
+          type: string
+    CreateExternalReferenceRequest:
+      type: object
+      required:
+      - source_kind
+      - external_reference
+      properties:
+        external_reference:
+          type: string
+        metadata: {}
+        source_kind:
+          type: string
+    CreateModelProfileRequest:
+      type: object
+      required:
+      - connection_id
+      - name
+      - base_url
+      - model
+      properties:
+        base_url:
+          type: string
+        configuration: {}
+        connection_id:
+          type: string
+          format: uuid
+        model:
+          type: string
+        name:
+          type: string
+        provider_kind:
+          type: string
+    CreateOidcGroupMappingRequest:
+      type: object
+      required:
+      - group_value
+      properties:
+        group_value:
+          type: string
+        organization_role:
+          type:
+          - string
+          - 'null'
+        workspace_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        workspace_role:
+          type:
+          - string
+          - 'null'
+    CreateOidcProviderRequest:
+      type: object
+      required:
+      - issuer_url
+      - client_id
+      - client_secret
+      properties:
+        client_id:
+          type: string
+        client_secret:
+          type: string
+          writeOnly: true
+        group_claim:
+          type:
+          - string
+          - 'null'
+        issuer_url:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+    CreateOrganizationRequest:
+      type: object
+      required:
+      - slug
+      - name
+      - initial_workspace_slug
+      - initial_workspace_name
+      properties:
+        initial_workspace_name:
+          type: string
+        initial_workspace_slug:
+          type: string
+        name:
+          type: string
+        slug:
+          type: string
+    CreateRunRequest:
+      type: object
+      required:
+      - workflow_version_id
+      - session_id
+      properties:
+        input: {}
+        message:
+          type:
+          - string
+          - 'null'
+        session_id:
+          type: string
+          format: uuid
+        work_item_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        workflow_version_id:
+          type: string
+          format: uuid
+    CreateScheduleRequest:
+      type: object
+      required:
+      - workflow_id
+      - name
+      - cron_expression
+      properties:
+        cron_expression:
+          type: string
+        enabled:
+          type: boolean
+        input: {}
+        name:
+          type: string
+        next_run_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        timezone:
+          type: string
+        workflow_id:
+          type: string
+          format: uuid
+    CreateServiceAccountRequest:
+      type: object
+      required:
+      - name
+      properties:
+        expires_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        name:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+        workspace_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+    CreateSessionRequest:
+      type: object
+      properties:
+        title:
+          type: string
+        work_item_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+    CreateWebhookEndpointRequest:
+      type: object
+      required:
+      - workflow_id
+      properties:
+        enabled:
+          type: boolean
+        public_key:
+          type:
+          - string
+          - 'null'
+        workflow_id:
+          type: string
+          format: uuid
+    CreateWorkItemRequest:
+      type: object
+      required:
+      - title
+      properties:
+        assignee_user_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        description:
+          type: string
+        external_reference:
+          type:
+          - string
+          - 'null'
+        input: {}
+        priority:
+          type: string
+        source_kind:
+          type:
+          - string
+          - 'null'
+        title:
+          type: string
+    CreateWorkflowRequest:
+      type: object
+      required:
+      - name
+      properties:
+        description:
+          type: string
+        name:
+          type: string
+    CreateWorkflowVersionRequest:
+      type: object
+      required:
+      - agent_version_id
+      - model_profile_id
+      properties:
+        agent_version_id:
+          type: string
+          format: uuid
+        approval_policy: {}
+        capability_policy: {}
+        experience_policy: {}
+        input_schema: {}
+        max_runtime_seconds:
+          type: integer
+          format: int32
+        max_steps:
+          type: integer
+          format: int32
+        model_profile_id:
+          type: string
+          format: uuid
+        output_schema: {}
+        retry_policy: {}
+        token_budget:
+          type:
+          - integer
+          - 'null'
+          format: int64
+    CreateWorkspaceCapabilityRequest:
+      type: object
+      required:
+      - capability_id
+      properties:
+        approval_required:
+          type: boolean
+        capability_id:
+          type: string
+          format: uuid
+        connection_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        enabled:
+          type: boolean
+        policy: {}
+        timeout_seconds:
+          type: integer
+          format: int32
+    CreateWorkspaceRequest:
+      type: object
+      required:
+      - slug
+      - name
+      properties:
+        name:
+          type: string
+        slug:
+          type: string
+    CreatedOrganizationResponse:
+      type: object
+      required:
+      - organization_id
+      - workspace_id
+      properties:
+        organization_id:
+          type: string
+          format: uuid
+        workspace_id:
+          type: string
+          format: uuid
+    CreatedServiceAccountResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - name
+      - token_prefix
+      - token
+      - scopes
+      - created_at
+      properties:
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        organization_id:
+          type: string
+          format: uuid
+        scopes:
+          type: array
+          items:
+            type: string
+        token:
+          type: string
+          example: zsa_REDACTED.REDACTED
+          writeOnly: true
+        token_prefix:
+          type: string
+        workspace_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+    CreatedWebhookEndpointResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - workspace_id
+      - workflow_id
+      - public_key
+      - enabled
+      - revision
+      - created_at
+      - updated_at
+      - secret
+      properties:
+        created_at:
+          type: string
+          format: date-time
+        enabled:
+          type: boolean
+        id:
+          type: string
+          format: uuid
+        organization_id:
+          type: string
+          format: uuid
+        public_key:
+          type: string
+        revision:
+          type: integer
+          format: int64
+        secret:
+          type: string
+          description: Returned only in the create response; it cannot be read or rotated here.
+          writeOnly: true
+        updated_at:
+          type: string
+          format: date-time
+        workflow_id:
+          type: string
+          format: uuid
+        workspace_id:
+          type: string
+          format: uuid
+    CurrentUserResponse:
+      type: object
+      required:
+      - principal_kind
+      - principal_id
+      - organization_id
+      - scopes
+      - display_name
+      properties:
+        display_name:
+          type: string
+        email:
+          type:
+          - string
+          - 'null'
+        organization_id:
+          type: string
+          format: uuid
+        organization_role:
+          type:
+          - string
+          - 'null'
+        principal_id:
+          type: string
+          format: uuid
+        principal_kind:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+        user_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        workspace_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        workspace_role:
+          type:
+          - string
+          - 'null'
+    DecideApprovalRequest:
+      type: object
+      properties:
+        reason:
+          type:
+          - string
+          - 'null'
+    ExperienceCandidatePageResponse:
+      type: object
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExperienceCandidateResponse'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+    ExperienceCandidateResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - workspace_id
+      - source_run_id
+      - proposed_scope
+      - title
+      - content
+      - tags
+      - evidence
+      - status
+      - created_at
+      properties:
+        content:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        evidence: {}
+        id:
+          type: string
+          format: uuid
+        organization_id:
+          type: string
+          format: uuid
+        proposed_scope:
+          type: string
+        review_reason:
+          type:
+          - string
+          - 'null'
+        reviewed_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        reviewed_by:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        source_run_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        title:
+          type: string
+        workspace_id:
+          type: string
+          format: uuid
+    ExperienceEntryPageResponse:
+      type: object
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExperienceEntryResponse'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+    ExperienceEntryResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - candidate_id
+      - source_run_id
+      - scope
+      - version_number
+      - title
+      - content
+      - tags
+      - evidence
+      - published_by
+      - published_at
+      properties:
+        candidate_id:
+          type: string
+          format: uuid
+        content:
+          type: string
+        evidence: {}
+        id:
+          type: string
+          format: uuid
+        organization_id:
+          type: string
+          format: uuid
+        published_at:
+          type: string
+          format: date-time
+        published_by:
+          type: string
+          format: uuid
+        scope:
+          type: string
+        source_run_id:
+          type: string
+          format: uuid
+        tags:
+          type: array
+          items:
+            type: string
+        title:
+          type: string
+        version_number:
+          type: integer
+          format: int32
+        withdrawal_reason:
+          type:
+          - string
+          - 'null'
+        withdrawn_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        workspace_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+    ExperienceEvidenceRef:
+      type: object
+      required:
+      - event_kind
+      - event_id
+      properties:
+        event_id:
+          type: string
+          format: uuid
+        event_kind:
+          type: string
+    ExperienceSearchResult:
+      type: object
+      required:
+      - id
+      - scope
+      - version_number
+      - title
+      - content
+      - tags
+      - rank
+      - published_at
+      properties:
+        content:
+          type: string
+        id:
+          type: string
+          format: uuid
+        published_at:
+          type: string
+          format: date-time
+        rank:
+          type: number
+          format: float
+        scope:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        title:
+          type: string
+        version_number:
+          type: integer
+          format: int32
+    ExternalReferenceResponse:
+      type: object
+      required:
+      - id
+      - work_item_id
+      - source_kind
+      - external_reference
+      - metadata
+      - created_at
+      properties:
+        created_at:
+          type: string
+          format: date-time
+        created_by:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        external_reference:
+          type: string
+        id:
+          type: string
+          format: uuid
+        metadata: {}
+        source_kind:
+          type: string
+        work_item_id:
+          type: string
+          format: uuid
+    FeatureStatus:
+      type: object
+      required:
+      - name
+      - status
+      properties:
+        name:
+          type: string
+        status:
+          type: string
+    HealthResponse:
+      type: object
+      required:
+      - status
+      properties:
+        status:
+          type: string
+    MetaResponse:
+      type: object
+      required:
+      - product
+      - version
+      - api_version
+      - queue_backend
+      - worker_process
+      - features
+      properties:
+        api_version:
+          type: string
+        features:
+          type: array
+          items:
+            $ref: '#/components/schemas/FeatureStatus'
+        product:
+          type: string
+        queue_backend:
+          type: string
+        version:
+          type: string
+        worker_process:
+          type: boolean
+    ModelProfilePageResponse:
+      type: object
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelProfileResponse'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+    ModelProfileResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - workspace_id
+      - connection_id
+      - name
+      - provider_kind
+      - base_url
+      - model
+      - configuration
+      - revision
+      - created_at
+      - updated_at
+      properties:
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        base_url:
+          type: string
+        configuration: {}
+        connection_id:
+          type: string
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+        id:
+          type: string
+          format: uuid
+        model:
+          type: string
+        name:
+          type: string
+        organization_id:
+          type: string
+          format: uuid
+        provider_kind:
+          type: string
+        revision:
+          type: integer
+          format: int64
+        updated_at:
+          type: string
+          format: date-time
+        workspace_id:
+          type: string
+          format: uuid
+    OidcGroupMappingResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - provider_id
+      - group_value
+      - created_at
+      properties:
+        created_at:
+          type: string
+          format: date-time
+        group_value:
+          type: string
+        id:
+          type: string
+          format: uuid
+        organization_id:
+          type: string
+          format: uuid
+        organization_role:
+          type:
+          - string
+          - 'null'
+        provider_id:
+          type: string
+          format: uuid
+        workspace_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        workspace_role:
+          type:
+          - string
+          - 'null'
+    OidcProviderResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - issuer_url
+      - client_id
+      - scopes
+      - enabled
+      - revision
+      - created_at
+      - updated_at
+      properties:
+        client_id:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        enabled:
+          type: boolean
+        group_claim:
+          type:
+          - string
+          - 'null'
+        id:
+          type: string
+          format: uuid
+        issuer_url:
+          type: string
+        organization_id:
+          type: string
+          format: uuid
+        revision:
+          type: integer
+          format: int64
+        scopes:
+          type: array
+          items:
+            type: string
+        updated_at:
+          type: string
+          format: date-time
+    OrganizationMemberResponse:
+      type: object
+      required:
+      - user_id
+      - email
+      - display_name
+      - role
+      - status
+      - created_at
+      - updated_at
+      properties:
+        created_at:
+          type: string
+          format: date-time
+        display_name:
+          type: string
+        email:
+          type: string
+        role:
+          type: string
+        status:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+        user_id:
+          type: string
+          format: uuid
+    OrganizationResponse:
+      type: object
+      required:
+      - id
+      - slug
+      - name
+      - status
+      - revision
+      - created_at
+      - updated_at
+      properties:
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        revision:
+          type: integer
+          format: int64
+        slug:
+          type: string
+        status:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+    ProblemDetails:
+      type: object
+      required:
+      - type
+      - title
+      - status
+      - code
+      - detail
+      - request_id
+      properties:
+        code:
+          type: string
+        detail:
+          type: string
+        request_id:
+          type: string
+          format: uuid
+        status:
+          type: integer
+          format: int32
+          minimum: 0
+        title:
+          type: string
+        type:
+          type: string
+          example: https://zeus.example.com/problems/validation_failed
+    RetryRunRequest:
+      type: object
+    ReviewExperienceCandidateRequest:
+      type: object
+      required:
+      - decision
+      properties:
+        decision:
+          type: string
+        reason:
+          type:
+          - string
+          - 'null'
+    RunEventResponse:
+      type: object
+      required:
+      - id
+      - run_id
+      - sequence
+      - schema_version
+      - event_type
+      - payload
+      - occurred_at
+      properties:
+        event_type:
+          type: string
+        id:
+          type: string
+          format: uuid
+        occurred_at:
+          type: string
+          format: date-time
+        payload: {}
+        run_id:
+          type: string
+          format: uuid
+        schema_version:
+          type: integer
+          format: int32
+        sequence:
+          type: integer
+          format: int64
+        session_event_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+    RunPageResponse:
+      type: object
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RunResponse'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+    RunResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - workspace_id
+      - workflow_version_id
+      - session_id
+      - status
+      - input
+      - attempt_count
+      - created_at
+      - updated_at
+      properties:
+        attempt_count:
+          type: integer
+          format: int32
+        cancel_requested_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        error_code:
+          type:
+          - string
+          - 'null'
+        error_detail:
+          type:
+          - string
+          - 'null'
+        finished_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        id:
+          type: string
+          format: uuid
+        input: {}
+        organization_id:
+          type: string
+          format: uuid
+        output: {}
+        parent_run_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        retry_of_run_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        session_id:
+          type: string
+          format: uuid
+        started_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        status:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+        work_item_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        workflow_version_id:
+          type: string
+          format: uuid
+        workspace_id:
+          type: string
+          format: uuid
+    RunTraceResponse:
+      type: object
+      required:
+      - run
+      - run_events
+      - session_events
+      - tool_calls
+      - approvals
+      - usage
+      - linked_runs
+      - experience_injections
+      properties:
+        approvals:
+          type: array
+          items:
+            $ref: '#/components/schemas/ApprovalResponse'
+        experience_injections:
+          type: array
+          items:
+            $ref: '#/components/schemas/TraceExperienceInjectionResponse'
+        linked_runs:
+          type: array
+          items:
+            $ref: '#/components/schemas/TraceRunLinkResponse'
+        run:
+          $ref: '#/components/schemas/RunResponse'
+        run_events:
+          type: array
+          items:
+            $ref: '#/components/schemas/RunEventResponse'
+        session_events:
+          type: array
+          items:
+            $ref: '#/components/schemas/SessionEventResponse'
+        tool_calls:
+          type: array
+          items:
+            $ref: '#/components/schemas/TraceToolCallResponse'
+        usage:
+          $ref: '#/components/schemas/RunUsageSummaryResponse'
+    RunUsageResponse:
+      type: object
+      required:
+      - id
+      - run_id
+      - provider_request_id
+      - prompt_tokens
+      - completion_tokens
+      - cache_tokens
+      - occurred_at
+      properties:
+        cache_tokens:
+          type: integer
+          format: int64
+        completion_tokens:
+          type: integer
+          format: int64
+        id:
+          type: string
+          format: uuid
+        occurred_at:
+          type: string
+          format: date-time
+        prompt_tokens:
+          type: integer
+          format: int64
+        provider_request_id:
+          type: string
+        run_id:
+          type: string
+          format: uuid
+    RunUsageSummaryResponse:
+      type: object
+      required:
+      - prompt_tokens
+      - completion_tokens
+      - cache_tokens
+      - entries
+      properties:
+        cache_tokens:
+          type: integer
+          format: int64
+        completion_tokens:
+          type: integer
+          format: int64
+        entries:
+          type: array
+          items:
+            $ref: '#/components/schemas/RunUsageResponse'
+        prompt_tokens:
+          type: integer
+          format: int64
+    SchedulePageResponse:
+      type: object
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ScheduleResponse'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+    ScheduleResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - workspace_id
+      - workflow_id
+      - name
+      - cron_expression
+      - timezone
+      - input
+      - enabled
+      - revision
+      - created_at
+      - updated_at
+      properties:
+        created_at:
+          type: string
+          format: date-time
+        cron_expression:
+          type: string
+        enabled:
+          type: boolean
+        id:
+          type: string
+          format: uuid
+        input: {}
+        name:
+          type: string
+        next_run_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        organization_id:
+          type: string
+          format: uuid
+        revision:
+          type: integer
+          format: int64
+        timezone:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+        workflow_id:
+          type: string
+          format: uuid
+        workspace_id:
+          type: string
+          format: uuid
+    ServiceAccountResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - name
+      - token_prefix
+      - scopes
+      - created_at
+      properties:
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        id:
+          type: string
+          format: uuid
+        last_used_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        name:
+          type: string
+        organization_id:
+          type: string
+          format: uuid
+        revoked_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        scopes:
+          type: array
+          items:
+            type: string
+        token_prefix:
+          type: string
+        workspace_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+    SessionEventResponse:
+      type: object
+      required:
+      - id
+      - session_id
+      - sequence
+      - schema_version
+      - event_type
+      - actor_kind
+      - payload
+      - occurred_at
+      properties:
+        actor_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        actor_kind:
+          type: string
+        event_type:
+          type: string
+        id:
+          type: string
+          format: uuid
+        occurred_at:
+          type: string
+          format: date-time
+        payload: {}
+        run_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        schema_version:
+          type: integer
+          format: int32
+        sequence:
+          type: integer
+          format: int64
+        session_id:
+          type: string
+          format: uuid
+    SessionPageResponse:
+      type: object
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SessionResponse'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+    SessionResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - workspace_id
+      - title
+      - status
+      - created_at
+      - updated_at
+      properties:
+        closed_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        created_by:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        id:
+          type: string
+          format: uuid
+        organization_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+        title:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+        work_item_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        workspace_id:
+          type: string
+          format: uuid
+    SetOrganizationMemberRequest:
+      type: object
+      required:
+      - user_id
+      - role
+      properties:
+        role:
+          type: string
+        status:
+          type: string
+        user_id:
+          type: string
+          format: uuid
+    SetWorkspaceMemberRequest:
+      type: object
+      required:
+      - user_id
+      - role
+      properties:
+        role:
+          type: string
+        status:
+          type: string
+        user_id:
+          type: string
+          format: uuid
+    SubmitMessageRequest:
+      type: object
+      required:
+      - content
+      properties:
+        content:
+          type: string
+        kind:
+          type: string
+    TraceExperienceInjectionResponse:
+      type: object
+      required:
+      - id
+      - experience_entry_id
+      - experience_version
+      - rank
+      - query_sha256
+      - injected_at
+      properties:
+        experience_entry_id:
+          type: string
+          format: uuid
+        experience_version:
+          type: integer
+          format: int32
+        id:
+          type: string
+          format: uuid
+        injected_at:
+          type: string
+          format: date-time
+        query_sha256:
+          type: string
+        rank:
+          type: number
+          format: float
+    TraceRunLinkResponse:
+      type: object
+      required:
+      - relation
+      - run_id
+      - status
+      - created_at
+      properties:
+        created_at:
+          type: string
+          format: date-time
+        error_code:
+          type:
+          - string
+          - 'null'
+        output: {}
+        relation:
+          type: string
+        run_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+    TraceToolCallResponse:
+      type: object
+      required:
+      - id
+      - capability_id
+      - call_key
+      - status
+      - input
+      - created_at
+      properties:
+        call_key:
+          type: string
+        capability_id:
+          type: string
+          format: uuid
+        child_run_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+        error_code:
+          type:
+          - string
+          - 'null'
+        finished_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        id:
+          type: string
+          format: uuid
+        input: {}
+        result: {}
+        started_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        status:
+          type: string
+    UpdateAgentRequest:
+      type: object
+      properties:
+        archived:
+          type:
+          - boolean
+          - 'null'
+        description:
+          type:
+          - string
+          - 'null'
+        name:
+          type:
+          - string
+          - 'null'
+    UpdateCapabilityDefinitionRequest:
+      type: object
+      properties:
+        archived:
+          type:
+          - boolean
+          - 'null'
+        description:
+          type:
+          - string
+          - 'null'
+        display_name:
+          type:
+          - string
+          - 'null'
+        executor_key:
+          type:
+          - string
+          - 'null'
+        idempotency_mode:
+          type:
+          - string
+          - 'null'
+        input_schema: {}
+        output_schema: {}
+        registry_key:
+          type:
+          - string
+          - 'null'
+        risk_level:
+          type:
+          - string
+          - 'null'
+    UpdateConnectionRequest:
+      type: object
+      properties:
+        archived:
+          type:
+          - boolean
+          - 'null'
+        configuration: {}
+        name:
+          type:
+          - string
+          - 'null'
+        provider_kind:
+          type:
+          - string
+          - 'null'
+    UpdateModelProfileRequest:
+      type: object
+      properties:
+        archived:
+          type:
+          - boolean
+          - 'null'
+        base_url:
+          type:
+          - string
+          - 'null'
+        configuration: {}
+        connection_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        model:
+          type:
+          - string
+          - 'null'
+        name:
+          type:
+          - string
+          - 'null'
+        provider_kind:
+          type:
+          - string
+          - 'null'
+    UpdateOidcProviderRequest:
+      type: object
+      properties:
+        client_id:
+          type:
+          - string
+          - 'null'
+        client_secret:
+          type:
+          - string
+          - 'null'
+          writeOnly: true
+        enabled:
+          type:
+          - boolean
+          - 'null'
+        group_claim:
+          type:
+          - string
+          - 'null'
+        issuer_url:
+          type:
+          - string
+          - 'null'
+        scopes:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
+    UpdateOrganizationRequest:
+      type: object
+      properties:
+        name:
+          type:
+          - string
+          - 'null'
+        status:
+          type:
+          - string
+          - 'null'
+    UpdateScheduleRequest:
+      type: object
+      properties:
+        cron_expression:
+          type:
+          - string
+          - 'null'
+        enabled:
+          type:
+          - boolean
+          - 'null'
+        input: {}
+        name:
+          type:
+          - string
+          - 'null'
+        next_run_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        timezone:
+          type:
+          - string
+          - 'null'
+        workflow_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+    UpdateWebhookEndpointRequest:
+      type: object
+      properties:
+        enabled:
+          type:
+          - boolean
+          - 'null'
+        public_key:
+          type:
+          - string
+          - 'null'
+        workflow_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+    UpdateWorkItemRequest:
+      type: object
+      properties:
+        assignee_user_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        clear_assignee:
+          type: boolean
+        description:
+          type:
+          - string
+          - 'null'
+        input: {}
+        output: {}
+        priority:
+          type:
+          - string
+          - 'null'
+        status:
+          type:
+          - string
+          - 'null'
+        title:
+          type:
+          - string
+          - 'null'
+    UpdateWorkflowRequest:
+      type: object
+      properties:
+        archived:
+          type:
+          - boolean
+          - 'null'
+        description:
+          type:
+          - string
+          - 'null'
+        name:
+          type:
+          - string
+          - 'null'
+    UpdateWorkspaceCapabilityRequest:
+      type: object
+      properties:
+        approval_required:
+          type:
+          - boolean
+          - 'null'
+        connection_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        enabled:
+          type:
+          - boolean
+          - 'null'
+        policy: {}
+        timeout_seconds:
+          type:
+          - integer
+          - 'null'
+          format: int32
+    UpdateWorkspaceRequest:
+      type: object
+      properties:
+        name:
+          type:
+          - string
+          - 'null'
+        status:
+          type:
+          - string
+          - 'null'
+    WebhookEndpointPageResponse:
+      type: object
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/WebhookEndpointResponse'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+    WebhookEndpointResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - workspace_id
+      - workflow_id
+      - public_key
+      - enabled
+      - revision
+      - created_at
+      - updated_at
+      properties:
+        created_at:
+          type: string
+          format: date-time
+        enabled:
+          type: boolean
+        id:
+          type: string
+          format: uuid
+        organization_id:
+          type: string
+          format: uuid
+        public_key:
+          type: string
+        revision:
+          type: integer
+          format: int64
+        updated_at:
+          type: string
+          format: date-time
+        workflow_id:
+          type: string
+          format: uuid
+        workspace_id:
+          type: string
+          format: uuid
+    WithdrawExperienceRequest:
+      type: object
+      required:
+      - reason
+      properties:
+        reason:
+          type: string
+    WorkItemPageResponse:
+      type: object
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkItemResponse'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+    WorkItemResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - workspace_id
+      - title
+      - description
+      - status
+      - priority
+      - input
+      - revision
+      - created_at
+      - updated_at
+      properties:
+        assignee_user_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        completed_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        created_by:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        description:
+          type: string
+        external_reference:
+          type:
+          - string
+          - 'null'
+        id:
+          type: string
+          format: uuid
+        input: {}
+        organization_id:
+          type: string
+          format: uuid
+        output: {}
+        priority:
+          type: string
+        revision:
+          type: integer
+          format: int64
+        source_kind:
+          type:
+          - string
+          - 'null'
+        status:
+          type: string
+        title:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+        workspace_id:
+          type: string
+          format: uuid
+    WorkflowPageResponse:
+      type: object
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkflowResponse'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+    WorkflowResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - workspace_id
+      - name
+      - description
+      - revision
+      - created_at
+      - updated_at
+      properties:
+        active_version_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        description:
+          type: string
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        organization_id:
+          type: string
+          format: uuid
+        revision:
+          type: integer
+          format: int64
+        updated_at:
+          type: string
+          format: date-time
+        workspace_id:
+          type: string
+          format: uuid
+    WorkflowVersionResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - workspace_id
+      - workflow_id
+      - version_number
+      - agent_version_id
+      - model_profile_id
+      - input_schema
+      - output_schema
+      - capability_policy
+      - approval_policy
+      - experience_policy
+      - max_steps
+      - max_runtime_seconds
+      - retry_policy
+      - created_at
+      properties:
+        agent_version_id:
+          type: string
+          format: uuid
+        approval_policy: {}
+        capability_policy: {}
+        created_at:
+          type: string
+          format: date-time
+        created_by:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        experience_policy: {}
+        id:
+          type: string
+          format: uuid
+        input_schema: {}
+        max_runtime_seconds:
+          type: integer
+          format: int32
+        max_steps:
+          type: integer
+          format: int32
+        model_profile_id:
+          type: string
+          format: uuid
+        organization_id:
+          type: string
+          format: uuid
+        output_schema: {}
+        retry_policy: {}
+        token_budget:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        version_number:
+          type: integer
+          format: int32
+        workflow_id:
+          type: string
+          format: uuid
+        workspace_id:
+          type: string
+          format: uuid
+    WorkspaceCapabilityPageResponse:
+      type: object
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkspaceCapabilityResponse'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+    WorkspaceCapabilityResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - workspace_id
+      - capability_id
+      - enabled
+      - approval_required
+      - timeout_seconds
+      - policy
+      - revision
+      - created_at
+      - updated_at
+      properties:
+        approval_required:
+          type: boolean
+        capability_id:
+          type: string
+          format: uuid
+        connection_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+        enabled:
+          type: boolean
+        id:
+          type: string
+          format: uuid
+        organization_id:
+          type: string
+          format: uuid
+        policy: {}
+        revision:
+          type: integer
+          format: int64
+        timeout_seconds:
+          type: integer
+          format: int32
+        updated_at:
+          type: string
+          format: date-time
+        workspace_id:
+          type: string
+          format: uuid
+    WorkspaceMemberResponse:
+      type: object
+      required:
+      - user_id
+      - email
+      - display_name
+      - role
+      - status
+      - created_at
+      - updated_at
+      properties:
+        created_at:
+          type: string
+          format: date-time
+        display_name:
+          type: string
+        email:
+          type: string
+        role:
+          type: string
+        status:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+        user_id:
+          type: string
+          format: uuid
+    WorkspacePageResponse:
+      type: object
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkspaceResponse'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+    WorkspaceResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - slug
+      - name
+      - status
+      - revision
+      - created_at
+      - updated_at
+      properties:
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        organization_id:
+          type: string
+          format: uuid
+        revision:
+          type: integer
+          format: int64
+        slug:
+          type: string
+        status:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+  securitySchemes:
+    serviceAccountBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: ServiceAccount
+      description: Bearer token for a Zeus service account
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: zeus_session
+      description: HttpOnly session cookie
+tags:
+- name: operations
+  description: Process health and diagnostics
+- name: platform
+  description: API capabilities and version
+- name: identity
+  description: OIDC identity and service accounts
+- name: organization
+  description: Organizations, workspaces, members, and roles
+- name: agents
+  description: Agents and immutable agent versions
+- name: workflows
+  description: Versioned agent workflows, schedules, and webhooks
+- name: models-and-tools
+  description: Model profiles, connections, and capabilities
+- name: collaboration
+  description: Work items and sessions
+- name: execution
+  description: Runs, events, traces, and usage
+- name: approvals
+  description: Pending and resolved approvals
+- name: experience
+  description: Reviewed team experience
+- name: audit
+  description: Tenant audit events

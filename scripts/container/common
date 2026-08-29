@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+ZEUS_STATE_DIR="${REPO_ROOT}/.zeus"
+ZEUS_ENV_FILE="${ZEUS_STATE_DIR}/local.env"
+ZEUS_POSTGRES_CONTAINER="zeus-postgres"
+ZEUS_POSTGRES_VOLUME="zeus-postgres-data"
+
+require_container_cli() {
+  if ! command -v container >/dev/null 2>&1; then
+    echo "Apple container CLI is not installed." >&2
+    exit 1
+  fi
+}
+
+load_local_env() {
+  if [[ ! -f "${ZEUS_ENV_FILE}" ]]; then
+    "${SCRIPT_DIR}/init-env"
+  fi
+
+  set -a
+  # shellcheck disable=SC1090
+  source "${ZEUS_ENV_FILE}"
+  set +a
+}

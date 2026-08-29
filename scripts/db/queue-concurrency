@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -z "${DATABASE_URL:-}" ]]; then
+  echo "DATABASE_URL is required." >&2
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+ZEUS_TEST_DATABASE="zeus_claim_test_${RANDOM}_${RANDOM}"
+ZEUS_TEST_DATABASE_URL="${DATABASE_URL%/*}/${ZEUS_TEST_DATABASE}"
+ZEUS_CLAIM_RESULTS="$(mktemp -d)"
+
+cleanup() {
+  dropdb --if-exists --maintenance-db="${DATABASE_URL}" "${ZEUS_TEST_DATABASE}" >/dev/null
+  find "${ZEUS_CLAIM_RESULTS}" -type f -delete
+  rmdir "${ZEUS_CLAIM_RESULTS}"
+}
+trap cleanup EXIT
+
+createdb --maintenance-db="${DATABASE_URL}" "${ZEUS_TEST_DATABASE}"
+(
+  cd "${REPO_ROOT}"
+  DATABASE_URL="${ZEUS_TEST_DATABASE_URL}" cargo run --quiet -p zeus-api -- db migrate
+)
+
+psql "${ZEUS_TEST_DATABASE_URL}" --no-psqlrc --set ON_ERROR_STOP=1 --command "
+with organization as (
+  insert into organizations (slug, name)
+  values ('claim-test', 'Claim Test')
+  returning id
+), workspace as (
+  insert into workspaces (organization_id, slug, name)
+  select id, 'claim-test', 'Claim Test' from organization
+  returning id, organization_id
+), connection as (
+  insert into connections (organization_id, workspace_id, name, provider_kind)
+  select organization_id, id, 'claim-test', 'openai_compatible' from workspace
+  returning id, organization_id, workspace_id
+), model_profile as (
+  insert into model_profiles (
+    organization_id, workspace_id, connection_id, name, base_url, model
+  )
+  select organization_id, workspace_id, id, 'claim-test', 'https://model.invalid', 'test'
+  from connection
+  returning id, organization_id, workspace_id
+), agent as (
+  insert into agents (organization_id, workspace_id, name)
+  select organization_id, workspace_id, 'claim-test' from model_profile
+  returning id, organization_id, workspace_id
+), agent_version as (
+  insert into agent_versions (
+    organization_id, workspace_id, agent_id, version_number, instructions
+  )
+  select organization_id, workspace_id, id, 1, 'claim test' from agent
+  returning id, organization_id, workspace_id
+), workflow as (
+  insert into workflows (organization_id, workspace_id, name)
+  select organization_id, workspace_id, 'claim-test' from agent_version
+  returning id, organization_id, workspace_id
+), workflow_version as (
+  insert into workflow_versions (
+    organization_id, workspace_id, workflow_id, version_number,
+    agent_version_id, model_profile_id, input_schema, output_schema
+  )
+  select workflow.organization_id, workflow.workspace_id, workflow.id, 1,
+         agent_version.id, model_profile.id, '{}'::jsonb, '{}'::jsonb
+  from workflow, agent_version, model_profile
+  returning id, organization_id, workspace_id
+), session as (
+  insert into sessions (organization_id, workspace_id, title)
+  select organization_id, workspace_id, 'claim test' from workflow_version
+  returning id, organization_id, workspace_id
+)
+insert into runs (
+  organization_id, workspace_id, workflow_version_id, session_id, idempotency_key
+)
+select workflow_version.organization_id, workflow_version.workspace_id,
+       workflow_version.id, session.id, 'claim-' || sequence::text
+from workflow_version, session, generate_series(1, 32) as series(sequence);
+" >/dev/null
+
+for claimer in $(seq 1 32); do
+  psql "${ZEUS_TEST_DATABASE_URL}" \
+    --no-psqlrc \
+    --tuples-only \
+    --no-align \
+    --set ON_ERROR_STOP=1 \
+    --command "select run_id from zeus_private.claim_run('claim-${claimer}', 60);" \
+    > "${ZEUS_CLAIM_RESULTS}/${claimer}" &
+done
+wait
+
+claimed_count="$(awk 'NF { claimed[$0] = 1 } END { print length(claimed) }' "${ZEUS_CLAIM_RESULTS}"/*)"
+if [[ "${claimed_count}" != "32" ]]; then
+  echo "Expected 32 unique claims, got ${claimed_count}." >&2
+  exit 1
+fi
+
+database_count="$(psql "${ZEUS_TEST_DATABASE_URL}" --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 --command \
+  "select count(*) from runs where status = 'running' and fence_token = 1 and attempt_count = 1;")"
+if [[ "${database_count}" != "32" ]]; then
+  echo "Expected 32 fenced running rows, got ${database_count}." >&2
+  exit 1
+fi
+
+echo "32 concurrent claimers received 32 unique Runs with fence token 1."

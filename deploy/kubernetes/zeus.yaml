@@ -1,0 +1,650 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: zeus
+  labels:
+    app.kubernetes.io/part-of: zeus
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zeus-config
+  namespace: zeus
+data:
+  ZEUS_BIND_ADDRESS: "0.0.0.0:8080"
+  ZEUS_PUBLIC_URL: "https://zeus.example.com"
+  ZEUS_COOKIE_SECURE: "true"
+  ZEUS_RUN_CONCURRENCY: "32"
+  ZEUS_SUPERVISOR_ENABLED: "true"
+  ZEUS_HTTP_DB_CONNECTIONS: "10"
+  ZEUS_RUNTIME_DB_CONNECTIONS: "5"
+  ZEUS_RUN_LEASE_SECONDS: "60"
+  ZEUS_RUN_POLL_MILLISECONDS: "1000"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zeus-migrate
+  namespace: zeus
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: zeus-migrate
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      restartPolicy: OnFailure
+      containers:
+        - name: migrate
+          image: ghcr.io/zeus-harness/zeus-api:0.1.0
+          args: ["db", "migrate"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: zeus-runtime
+                  key: database-url
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zeus-api
+  namespace: zeus
+spec:
+  replicas: 7
+  minReadySeconds: 10
+  selector:
+    matchLabels:
+      app: zeus-api
+  template:
+    metadata:
+      labels:
+        app: zeus-api
+        app.kubernetes.io/name: zeus-api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "8080"
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 75
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: zeus-api
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: zeus-api
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: zeus-api
+      initContainers:
+        - name: stage-envelope-key
+          image: ghcr.io/zeus-harness/zeus-api:0.1.0
+          command: ["/bin/sh", "-ec"]
+          args:
+            - umask 077; cp /source/envelope-key /target/envelope-key; chmod 0400 /target/envelope-key
+          volumeMounts:
+            - name: envelope-key-source
+              mountPath: /source
+              readOnly: true
+            - name: envelope-key
+              mountPath: /target
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            capabilities:
+              drop: ["ALL"]
+      containers:
+        - name: api
+          image: ghcr.io/zeus-harness/zeus-api:0.1.0
+          args: ["serve"]
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: zeus-config
+          env:
+            - name: ZEUS_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: zeus-runtime
+                  key: database-url
+            - name: RUNTIME_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: zeus-runtime
+                  key: runtime-database-url
+            - name: ZEUS_ENVELOPE_KEY_FILE
+              value: /var/run/secrets/zeus/envelope-key
+            - name: ZEUS_ENVELOPE_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: zeus-runtime
+                  key: envelope-key-id
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector.observability.svc.cluster.local:4318
+          volumeMounts:
+            - name: envelope-key
+              mountPath: /var/run/secrets/zeus
+              readOnly: true
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: envelope-key-source
+          secret:
+            secretName: zeus-runtime
+            defaultMode: 0440
+            items:
+              - key: envelope-key
+                path: envelope-key
+                mode: 0440
+        - name: envelope-key
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Ki
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zeus-api
+  namespace: zeus
+spec:
+  selector:
+    app: zeus-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zeus-api-metrics
+  namespace: zeus
+spec:
+  clusterIP: None
+  selector:
+    app: zeus-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zeus-web
+  namespace: zeus
+spec:
+  replicas: 2
+  minReadySeconds: 5
+  selector:
+    matchLabels:
+      app: zeus-web
+  template:
+    metadata:
+      labels:
+        app: zeus-web
+        app.kubernetes.io/name: zeus-web
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: zeus-web
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: zeus-web
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: zeus-web
+      containers:
+        - name: web
+          image: ghcr.io/zeus-harness/zeus-web:0.1.0
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: ZEUS_API_URL
+              value: http://zeus-api.zeus.svc.cluster.local:8080
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zeus-web
+  namespace: zeus
+spec:
+  selector:
+    app: zeus-web
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: zeus-api
+  namespace: zeus
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: zeus-api
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: zeus-web
+  namespace: zeus
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: zeus-web
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: zeus-default-deny
+  namespace: zeus
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: zeus-api-ingress
+  namespace: zeus
+spec:
+  podSelector:
+    matchLabels:
+      app: zeus-api
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: opentelemetry-collector
+        - podSelector:
+            matchLabels:
+              app: zeus-web
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: zeus-api-egress
+  namespace: zeus
+spec:
+  podSelector:
+    matchLabels:
+      app: zeus-api
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: coredns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: opentelemetry-collector
+      ports:
+        - protocol: TCP
+          port: 4317
+        - protocol: TCP
+          port: 4318
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.0/8
+        - ipBlock:
+            cidr: 172.16.0.0/12
+        - ipBlock:
+            cidr: 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Provider, OIDC, and future KMS calls use HTTPS. Destination allowlists
+    # belong in the cluster egress gateway or an environment overlay because
+    # Kubernetes NetworkPolicy cannot match DNS names.
+    - ports:
+        - protocol: TCP
+          port: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: zeus-web-ingress
+  namespace: zeus
+spec:
+  podSelector:
+    matchLabels:
+      app: zeus-web
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 3000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: zeus-web-egress
+  namespace: zeus
+spec:
+  podSelector:
+    matchLabels:
+      app: zeus-web
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: coredns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app: zeus-api
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: zeus-migrate-egress
+  namespace: zeus
+spec:
+  podSelector:
+    matchLabels:
+      app: zeus-migrate
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: coredns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.0/8
+        - ipBlock:
+            cidr: 172.16.0.0/12
+        - ipBlock:
+            cidr: 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: zeus
+  namespace: zeus
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: zeus.example.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: zeus-api
+                port:
+                  name: http
+          - path: /auth
+            pathType: Prefix
+            backend:
+              service:
+                name: zeus-api
+                port:
+                  name: http
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: zeus-web
+                port:
+                  name: http
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: zeus-api
+  namespace: zeus
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: zeus-api
+  minReplicas: 7
+  maxReplicas: 30
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: zeus-web
+  namespace: zeus
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: zeus-web
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

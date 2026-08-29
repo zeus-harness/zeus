@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./common
+source "${SCRIPT_DIR}/common"
+
+require_container_cli
+if container inspect "${ZEUS_POSTGRES_CONTAINER}" >/dev/null 2>&1; then
+  container stop "${ZEUS_POSTGRES_CONTAINER}"
+else
+  echo "${ZEUS_POSTGRES_CONTAINER} does not exist."
+fi

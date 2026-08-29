@@ -1,25 +1,23 @@
 {
   "name": "zeus",
   "version": "0.1.0",
-  "description": "",
-  "keywords": [],
-  "license": "MIT",
-  "author": "Fynn Tang <fzpying@gmail.com>",
-  "homepage": "https://github.com/zeus-harness/zeus",
-  "repository": "https://github.com/zeus-harness/zeus.git",
-  "scripts": {
-    "build": "turbo run build",
-    "dev": "turbo run dev",
-    "lint": "turbo run lint",
-    "check": "turbo run check",
-    "test": "turbo run test",
-    "format": "prettier --write \"**/*.{ts,tsx,md}\""
-  },
+  "private": true,
   "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": "24.18.0",
+    "pnpm": "10.33.0"
+  },
+  "scripts": {
+    "build": "turbo run build && cargo build --workspace",
+    "check": "turbo run check && cargo check --workspace",
+    "test": "turbo run test && cargo test --workspace",
+    "dev:web": "pnpm --filter @zeus/web dev",
+    "dev:api": "cargo run -p zeus-api -- serve",
+    "load:capacity": "node scripts/load/capacity.mjs",
+    "db:bootstrap": "psql \"$DATABASE_URL\" --no-psqlrc --set ON_ERROR_STOP=1 --file scripts/db/bootstrap-roles.sql",
+    "db:migrate": "cargo run -p zeus-api -- db migrate"
+  },
   "devDependencies": {
-    "eslint": "^10.9.1",
-    "prettier": "^3.9.6",
-    "turbo": "^2.10.11",
-    "typescript": "6.0.3"
+    "turbo": "^2.8.0"
   }
 }

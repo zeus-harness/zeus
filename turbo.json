@@ -1,14 +1,19 @@
 {
-  "$schema": "https://turborepo.dev/schema.json",
+  "$schema": "https://turbo.build/schema.json",
+  "globalDependencies": ["pnpm-lock.yaml", "openapi/zeus.v1.yaml"],
   "tasks": {
     "build": {
       "dependsOn": ["^build"],
-      "inputs": ["$TURBO_DEFAULT$", ".env*"],
-      "outputs": ["dist/**", "build/**", ".svelte-kit/output/**"]
+      "outputs": ["build/**", "dist/**", ".svelte-kit/**"]
     },
-    "check": {},
-    "lint": {},
-    "test": {},
+    "check": {
+      "dependsOn": ["^build", "^check"],
+      "outputs": []
+    },
+    "test": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
     "dev": {
       "cache": false,
       "persistent": true

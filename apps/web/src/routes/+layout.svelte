@@ -1,10 +1,31 @@
 <script lang="ts">
-	import './layout.css';
-	import '@zeus/ui/styles.css';
-	import favicon from '$lib/assets/favicon.svg';
+  import { page } from '$app/state';
+  import type { Snippet } from 'svelte';
 
-	let { children } = $props();
+  import '../app.css';
+
+  import type { LayoutData } from './$types';
+
+  import WorkspaceNav from '$lib/components/WorkspaceNav.svelte';
+
+  let { children, data }: { children: Snippet; data: LayoutData } = $props();
+  let isAdmin = $derived(page.url.pathname.startsWith('/admin'));
 </script>
 
-<svelte:head><link rel="icon" href={favicon} /></svelte:head>
+<svelte:head>
+  <title>Zeus</title>
+  <meta
+    name="description"
+    content="Zeus enterprise Harness Agent control plane"
+  />
+</svelte:head>
+
+{#if !isAdmin}
+  <WorkspaceNav
+    authStatus={data.status}
+    workspaceId={data.principal?.workspace_id}
+    displayName={data.principal?.display_name}
+  />
+{/if}
+
 {@render children()}

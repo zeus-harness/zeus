@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./common
+source "${SCRIPT_DIR}/common"
+
+require_openssl() {
+  if ! command -v openssl >/dev/null 2>&1; then
+    echo "openssl is required to generate local secrets." >&2
+    exit 1
+  fi
+}
+
+rotate_postgres_password() {
+  require_container_cli
+  require_openssl
+  if [[ ! -f "${ZEUS_ENV_FILE}" ]]; then
+    echo "Local environment does not exist at ${ZEUS_ENV_FILE}." >&2
+    exit 1
+  fi
+
+  load_local_env
+  local rotated_password temporary_env
+  rotated_password="$(openssl rand -hex 24)"
+  temporary_env="$(mktemp "${ZEUS_STATE_DIR}/local.env.rotate.XXXXXX")"
+  chmod 0600 "${temporary_env}"
+  export ZEUS_ROTATED_PASSWORD="${rotated_password}"
+
+  printf '%s\n' \
+    '\getenv rotated_password ZEUS_ROTATED_PASSWORD' \
+    "ALTER ROLE zeus PASSWORD :'rotated_password';" \
+  | container exec --interactive --env ZEUS_ROTATED_PASSWORD "${ZEUS_POSTGRES_CONTAINER}" \
+    psql \
+    --username "${POSTGRES_USER}" \
+    --dbname "${POSTGRES_DB}" \
+    --set ON_ERROR_STOP=1 >/dev/null
+
+  awk '
+    /^POSTGRES_PASSWORD=/ {
+      print "POSTGRES_PASSWORD=" ENVIRON["ZEUS_ROTATED_PASSWORD"]
+      next
+    }
+    /^DATABASE_URL=/ {
+      print "DATABASE_URL=postgres://zeus:" ENVIRON["ZEUS_ROTATED_PASSWORD"] "@127.0.0.1:5432/zeus"
+      next
+    }
+    /^RUNTIME_DATABASE_URL=/ {
+      print "RUNTIME_DATABASE_URL=postgres://zeus:" ENVIRON["ZEUS_ROTATED_PASSWORD"] "@127.0.0.1:5432/zeus"
+      next
+    }
+    { print }
+  ' "${ZEUS_ENV_FILE}" > "${temporary_env}"
+  mv "${temporary_env}" "${ZEUS_ENV_FILE}"
+  chmod 0600 "${ZEUS_ENV_FILE}"
+  unset rotated_password ZEUS_ROTATED_PASSWORD
+  echo "Rotated the local PostgreSQL password. Secret values were not printed."
+}
+
+if [[ "${1:-}" == "--rotate-postgres-password" ]]; then
+  rotate_postgres_password
+  exit 0
+fi
+
+if [[ -n "${1:-}" ]]; then
+  echo "Usage: scripts/container/init-env [--rotate-postgres-password]" >&2
+  exit 2
+fi
+
+if [[ -f "${ZEUS_ENV_FILE}" ]]; then
+  echo "Local environment already exists at ${ZEUS_ENV_FILE}."
+  exit 0
+fi
+
+require_openssl
+
+umask 077
+mkdir -p "${ZEUS_STATE_DIR}"
+postgres_password="$(openssl rand -hex 24)"
+master_key="$(openssl rand -hex 32)"
+
+printf '%s\n' \
+  "POSTGRES_USER=zeus" \
+  "POSTGRES_PASSWORD=${postgres_password}" \
+  "POSTGRES_DB=zeus" \
+  "DATABASE_URL=postgres://zeus:${postgres_password}@127.0.0.1:5432/zeus" \
+  "RUNTIME_DATABASE_URL=postgres://zeus:${postgres_password}@127.0.0.1:5432/zeus" \
+  "ZEUS_LOCAL_MASTER_KEY=${master_key}" \
+  "ZEUS_BIND_ADDRESS=127.0.0.1:8080" \
+  "ZEUS_RUN_CONCURRENCY=4" \
+  "ZEUS_SUPERVISOR_ENABLED=false" \
+  > "${ZEUS_ENV_FILE}"
+chmod 0600 "${ZEUS_ENV_FILE}"
+
+unset postgres_password master_key
+echo "Created ${ZEUS_ENV_FILE} with mode 0600. Secret values were not printed."

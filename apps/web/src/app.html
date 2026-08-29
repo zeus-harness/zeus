@@ -1,44 +1,11 @@
 <!doctype html>
-<html lang="en">
-	<head>
-		<meta charset="utf-8" />
-		<meta name="viewport" content="width=device-width, initial-scale=1" />
-		<meta name="text-scale" content="scale" />
-		<script>
-			(() => {
-				const storageKey = 'zeus.theme';
-				const media = window.matchMedia('(prefers-color-scheme: dark)');
-				const readPreference = () => {
-					try {
-						const stored = window.localStorage.getItem(storageKey);
-						return stored === 'light' || stored === 'dark' || stored === 'system'
-							? stored
-							: 'system';
-					} catch {
-						return 'system';
-					}
-				};
-				const apply = () => {
-					const preference = readPreference();
-					const resolved =
-						preference === 'system' ? (media.matches ? 'dark' : 'light') : preference;
-					document.documentElement.classList.toggle('dark', resolved === 'dark');
-					document.documentElement.dataset.theme = resolved;
-					document.documentElement.style.colorScheme = resolved;
-				};
-
-				apply();
-				media.addEventListener('change', () => {
-					if (readPreference() === 'system') apply();
-				});
-				window.addEventListener('storage', (event) => {
-					if (event.key === storageKey) apply();
-				});
-			})();
-		</script>
-		%sveltekit.head%
-	</head>
-	<body data-sveltekit-preload-data="hover">
-		<div style="display: contents">%sveltekit.body%</div>
-	</body>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    %sveltekit.head%
+  </head>
+  <body data-sveltekit-preload-data="hover">
+    <div style="display: contents">%sveltekit.body%</div>
+  </body>
 </html>

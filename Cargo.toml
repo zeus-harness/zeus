@@ -1,57 +1,54 @@
 [workspace]
-members = [
-    "apps/zeus-api",
-    "crates/*"
-]
-resolver = "2"
+members = ["apps/zeus-api", "crates/zeus-core"]
+resolver = "3"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.97.1"
 license = "MIT"
-authors = ["Fynn Tang <fzpying@gmail.com>"]
-description = ""
-homepage = "https://github.com/zeus-harness/zeus"
-repository = "https://github.com/zeus-harness/zeus.git"
-publish = false
+repository = "https://github.com/zeus-harness/zeus"
 
 [workspace.dependencies]
-async-stream = "0.3.6"
-axum = { version = "0.8.4", features = ["json", "tokio"] }
+aes-gcm = { version = "0.11.1", features = ["getrandom"] }
+anyhow = "1.0"
+argon2 = "0.6.0"
+async-trait = "0.1"
+axum = "0.8"
 base64 = "0.22.1"
-cap-std = "4.0.3"
-chrono = { version = "0.4.42", default-features = false, features = ["clock", "serde"] }
-fs2 = "0.4.3"
-futures-core = "0.3.31"
-futures-util = "0.3.31"
-globset = "0.4.20"
-http-body-util = "0.1.3"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
-sha2 = "0.10.9"
-rusqlite = { version = "0.37.0", features = ["bundled"] }
-thiserror = "2.0.17"
-tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-tower = { version = "0.5.2", features = ["util"] }
-zeroize = "1.8.1"
+clap = { version = "4.5", features = ["derive", "env"] }
+eventsource-stream = "0.2.3"
+futures-util = "0.3.34"
+getrandom = "0.4.3"
+hex = "0.4.3"
+http = "1.3"
+jsonschema = { version = "0.52.0", default-features = false }
+openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls"] }
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+secrecy = "0.10.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "time", "json", "migrate", "macros"] }
+thiserror = "2.0"
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["catch-panic", "compression-gzip", "request-id", "trace"] }
+tracing = "0.1"
+tracing-opentelemetry = { version = "0.33", default-features = false }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+utoipa = { version = "5.4", features = ["axum_extras", "time", "uuid", "yaml"] }
+url = "2.5.8"
+uuid = { version = "1.18", features = ["serde", "v7"] }
 
-authz = { path = "crates/authz" }
-connectors = { path = "crates/connectors" }
-deployment = { path = "crates/deployment" }
-execution = { path = "crates/execution" }
-goals = { path = "crates/goals" }
-kernel = { path = "crates/kernel" }
-knowledge = { path = "crates/knowledge" }
-libc = "0.2.189"
-llm = { path = "crates/llm" }
-planning = { path = "crates/planning" }
-protocol = { path = "crates/protocol" }
-runtime = { path = "crates/runtime" }
-skills = { path = "crates/skills" }
-storage = { path = "crates/storage" }
-subagents = { path = "crates/subagents" }
-teams = { path = "crates/teams" }
-tenancy = { path = "crates/tenancy" }
-terminal = { path = "crates/terminal" }
-tools = { path = "crates/tools" }
-workflows = { path = "crates/workflows" }
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

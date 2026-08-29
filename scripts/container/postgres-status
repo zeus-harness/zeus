@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./common
+source "${SCRIPT_DIR}/common"
+
+require_container_cli
+container list --all | awk -v container_id="${ZEUS_POSTGRES_CONTAINER}" '
+  NR == 1 || $1 == container_id { print }
+'

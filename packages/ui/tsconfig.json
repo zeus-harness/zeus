@@ -1,15 +1,23 @@
 {
-  "extends": "@zeus/typescript-config/base.json",
-  "include": [
-    "./"
-  ],
-  "exclude": ["node_modules"],
   "compilerOptions": {
-    "strictNullChecks": true,
-    "baseUrl": ".",
+    "allowJs": true,
+    "checkJs": true,
+    "declaration": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "isolatedModules": true,
+    "lib": ["ES2024", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "target": "ES2024",
+    "verbatimModuleSyntax": true,
     "paths": {
-      "$lib": ["./lib"],
-      "$lib/*": ["./lib/*"]
+      "$lib": ["./src/lib"],
+      "$lib/*": ["./src/lib/*"]
     }
-  }
+  },
+  "include": ["src/**/*.d.ts", "src/**/*.ts", "src/**/*.svelte"]
 }

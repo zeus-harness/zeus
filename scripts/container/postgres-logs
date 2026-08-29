@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./common
+source "${SCRIPT_DIR}/common"
+
+require_container_cli
+container logs "${ZEUS_POSTGRES_CONTAINER}"

@@ -1,0 +1,314 @@
+{
+  "documentType": "codex-security.hardening-analysis",
+  "schemaVersion": "1.0",
+  "analysisId": "zeus_phase_h_20260830",
+  "sourceEvidence": {
+    "kind": "document_collection",
+    "label": "Zeus Phase H source and deployment security boundaries",
+    "collectionSha256": "7df75df17894d2d5a71b26d2e8568417e24e346b8e9184a52342221becfb8385",
+    "artifactCount": 8,
+    "sourceDrift": "present",
+    "targetRevision": "2765f44f65b197fb544150e31b5fbd0037193814"
+  },
+  "assessment": {
+    "outcome": "opportunities_identified",
+    "summary": "The current boundary is suitable for local and pre-production use; production should bind key delivery and outbound authority to the selected cloud environment."
+  },
+  "constraints": {
+    "profile": "balanced",
+    "changeHorizons": ["incremental", "medium_term"],
+    "nonNegotiables": [
+      "No secret value may enter logs, events, traces, OpenAPI responses, or repository files.",
+      "Zeus remains cloud-only and provider-neutral until a production cloud is selected.",
+      "OIDC and model providers require controlled HTTPS egress."
+    ],
+    "assumptions": [
+      "No cloud provider, KMS product, egress gateway, or workload identity implementation has been selected.",
+      "No production latency or KMS quota measurement is available."
+    ]
+  },
+  "opportunities": [
+    {
+      "opportunityId": "bind-secret-and-egress-authority",
+      "title": "Bind secret delivery and outbound authority to the production environment",
+      "summary": "Keep the application boundary provider-neutral while making key delivery and HTTPS destinations explicit deployment controls.",
+      "diagnosis": "The process accepts a protected key file, but the baseline still relies on a Kubernetes Secret and permits TCP 443 to any destination because provider endpoints are unknown.",
+      "evidence": [
+        {
+          "claimType": "observed",
+          "sourceKind": "source",
+          "evidenceId": "E003",
+          "path": "apps/zeus-api/src/config.rs",
+          "claim": "The process accepts one regular envelope-key file, rejects symlinks, limits its size, and rejects group or other access bits on Unix."
+        },
+        {
+          "claimType": "observed",
+          "sourceKind": "source",
+          "evidenceId": "E004",
+          "path": "apps/zeus-api/src/crypto.rs",
+          "claim": "Secret encryption is owned by an EnvelopeCipher trait; the current implementation keeps one AES-256-GCM master key in process memory."
+        },
+        {
+          "claimType": "observed",
+          "sourceKind": "source",
+          "evidenceId": "E007",
+          "path": "deploy/kubernetes/zeus.yaml",
+          "claim": "A non-root init container stages the Secret source into a memory-backed regular 0400 file for the API, which has a read-only root filesystem; the HTTPS egress rule still has no destination selector."
+        },
+        {
+          "claimType": "inferred",
+          "sourceKind": "threat_model",
+          "evidenceId": "E002",
+          "path": "docs/THREAT_MODEL.md",
+          "claim": "A compromised API process would inherit both decrypted secret access and broad HTTPS reach, so those authorities should be narrowed by the production environment."
+        }
+      ],
+      "desiredInvariants": [
+        "Every production envelope key originates from an approved KMS-backed delivery path and never appears in an environment variable.",
+        "Only the zeus-api Pod can read the mounted key, and a rollout can select a new key id without rewriting historical ciphertext in place.",
+        "Provider, OIDC, KMS, and telemetry traffic can reach only approved destinations through an observable egress control.",
+        "Loss of KMS or secret delivery fails readiness before Zeus accepts secret-dependent traffic."
+      ],
+      "proposalPath": "proposals/bind-secret-and-egress-authority.md",
+      "options": [
+        {
+          "optionId": "kms-backed-mounted-key",
+          "title": "KMS-backed mounted key with controlled egress",
+          "kind": "incremental",
+          "summary": "Use workload identity and the cloud secret driver to mount a KMS-protected key, while an egress gateway owns destination allowlists.",
+          "diagramPaths": {
+            "before": "diagrams/bind-secret-and-egress-authority-before.mmd",
+            "after": "diagrams/bind-secret-and-egress-authority-mounted-key-after.mmd"
+          },
+          "evidenceCoverage": [
+            {
+              "evidenceId": "E003",
+              "effect": "addresses",
+              "tacticalFixRequired": false,
+              "rationale": "The existing file seam is the application-side enforcement point."
+            },
+            {
+              "evidenceId": "E004",
+              "effect": "mitigates",
+              "tacticalFixRequired": true,
+              "rationale": "Key delivery improves, while the master key still exists in process memory during the Pod lifetime."
+            },
+            {
+              "evidenceId": "E007",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "A cloud overlay must replace broad HTTPS egress with gateway-routed allowlists."
+            },
+            {
+              "evidenceId": "E002",
+              "effect": "mitigates",
+              "tacticalFixRequired": true,
+              "rationale": "A compromised API retains necessary model and secret authority, but the reachable destinations become bounded and observable."
+            }
+          ],
+          "tradeoffs": [
+            {
+              "dimension": "security",
+              "direction": "improves",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "The key leaves environment variables and destination policy moves out of application convention; Pod memory remains a trusted boundary.",
+              "validationPlan": "Verify workload identity, SecretProviderClass policy, file mode, Pod access denial, egress deny logs, and key rotation in the target cluster."
+            },
+            {
+              "dimension": "performance",
+              "direction": "neutral",
+              "confidence": "medium",
+              "basis": "source-derived",
+              "assessment": "Encryption remains local AES-GCM; egress gateway latency affects remote calls only.",
+              "validationPlan": "Compare model, OIDC, and telemetry p95 latency with and without the gateway under the capacity workload."
+            },
+            {
+              "dimension": "memory",
+              "direction": "neutral",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "The process retains the same 32-byte master key and cipher state.",
+              "validationPlan": "Compare API Pod RSS before and after enabling the secret driver and gateway sidecars, if any."
+            },
+            {
+              "dimension": "reliability",
+              "direction": "improves",
+              "confidence": "medium",
+              "basis": "analogous",
+              "assessment": "A missing key fails startup, while secret-driver and gateway availability become deployment dependencies.",
+              "validationPlan": "Restart Pods during KMS denial, secret rotation, gateway restart, and DNS failure; verify readiness and lease recovery."
+            },
+            {
+              "dimension": "operability",
+              "direction": "regresses",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "Platform owners must operate workload identity, the secret driver, allowlists, and rotation alerts.",
+              "validationPlan": "Run the key-rotation and provider-outage procedures with the on-call team."
+            },
+            {
+              "dimension": "migration",
+              "direction": "improves",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "The application already reads a file, so the cloud overlay can change delivery without changing stored envelopes.",
+              "validationPlan": "Deploy one canary Pod with the mounted key, read existing ciphertext, write a test secret, then roll back to the prior Secret source."
+            }
+          ],
+          "residualRisks": [
+            "A compromised API process can read the active master key from memory.",
+            "A mistaken gateway allowlist can block OIDC or Provider access or permit an unintended host.",
+            "Kubernetes administrators with Secret or node access remain highly privileged."
+          ],
+          "implementationReadiness": {
+            "affectedComponents": [
+              "apps/zeus-api/src/config.rs",
+              "deploy/kubernetes/zeus.yaml",
+              "docs/runbooks"
+            ],
+            "workPackages": [
+              "Keep the strict file-loading seam and remove inline production key configuration.",
+              "Add the selected cloud secret-driver and workload-identity overlay.",
+              "Route HTTPS through an approved egress gateway and install destination policies.",
+              "Exercise rotation, denial, restart, and rollback procedures."
+            ],
+            "acceptanceCriteria": [
+              "No production Pod receives the envelope key through an environment variable.",
+              "An unlabelled Pod cannot read the key or reach Provider, OIDC, telemetry, or KMS endpoints.",
+              "Zeus reads existing envelopes before and after one key-delivery rotation.",
+              "The 200-Run capacity gate stays within its queue-wait target."
+            ],
+            "migrationNotes": [
+              "Select a cloud and secret driver before writing environment-specific manifests."
+            ],
+            "rollback": "Restore the prior Secret volume source and gateway policy while retaining the same key id and ciphertext."
+          }
+        },
+        {
+          "optionId": "direct-kms-envelope",
+          "title": "Direct KMS envelope encryption",
+          "kind": "structural",
+          "summary": "Use workload identity to ask KMS to wrap per-secret data keys and persist the encrypted data key with each envelope.",
+          "diagramPaths": {
+            "before": "diagrams/bind-secret-and-egress-authority-before.mmd",
+            "after": "diagrams/bind-secret-and-egress-authority-direct-kms-after.mmd"
+          },
+          "evidenceCoverage": [
+            {
+              "evidenceId": "E003",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "The static key file disappears after every ciphertext has a KMS-wrapped data key."
+            },
+            {
+              "evidenceId": "E004",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "A new asynchronous cipher boundary and envelope format are required."
+            },
+            {
+              "evidenceId": "E007",
+              "effect": "mitigates",
+              "tacticalFixRequired": true,
+              "rationale": "KMS gets a narrow destination and workload identity, while Provider and OIDC egress still need allowlists."
+            },
+            {
+              "evidenceId": "E002",
+              "effect": "mitigates",
+              "tacticalFixRequired": true,
+              "rationale": "No long-lived master key is mounted, but a compromised process can still request decrypt operations within its KMS policy."
+            }
+          ],
+          "tradeoffs": [
+            {
+              "dimension": "security",
+              "direction": "improves",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "The Pod loses a static master key; KMS authorization, request context, quotas, and audit logs become the main control plane.",
+              "validationPlan": "Prove KMS policy separation, encryption-context binding, denied cross-tenant decrypt, rotation, and KMS audit coverage."
+            },
+            {
+              "dimension": "performance",
+              "direction": "regresses",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "Cold decrypt and key generation add a network call; caching data keys trades latency for a longer plaintext lifetime.",
+              "validationPlan": "Benchmark secret write and cold/warm read p50, p95, p99 under 200 concurrent Runs and set a cache policy from measured results."
+            },
+            {
+              "dimension": "memory",
+              "direction": "unknown",
+              "confidence": "medium",
+              "basis": "hypothetical",
+              "assessment": "Removing one master key is small; SDK pools and optional data-key caches may increase retained memory.",
+              "validationPlan": "Measure Pod RSS with caching disabled and with the proposed bounded cache."
+            },
+            {
+              "dimension": "reliability",
+              "direction": "regresses",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "Secret reads depend on KMS availability and quotas unless carefully bounded caches are accepted.",
+              "validationPlan": "Inject KMS timeout, throttling, permission denial, and regional outage; confirm fail-closed behavior and Run recovery."
+            },
+            {
+              "dimension": "operability",
+              "direction": "regresses",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "The team owns KMS policy, SDK telemetry, quota alarms, encrypted-data-key migrations, and emergency access procedures.",
+              "validationPlan": "Run a game day with platform, security, database, and Zeus on-call owners."
+            },
+            {
+              "dimension": "migration",
+              "direction": "regresses",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "The synchronous trait and stored envelope lack an encrypted data key, so code, schema, dual-read, and rewrap work are required.",
+              "validationPlan": "Migrate a copied production-shaped dataset with dual-read, canary writes, restart, rollback, and checksum verification."
+            }
+          ],
+          "residualRisks": [
+            "A compromised API can call KMS while its workload identity remains valid.",
+            "Incorrect encryption context or tenant policy can create cross-tenant decrypt risk.",
+            "KMS throttling can block login, Provider access, and Capability execution."
+          ],
+          "implementationReadiness": {
+            "affectedComponents": [
+              "apps/zeus-api/src/crypto.rs",
+              "apps/zeus-api/src/config.rs",
+              "connection_secrets",
+              "oidc_providers",
+              "deploy/kubernetes"
+            ],
+            "workPackages": [
+              "Select one cloud KMS and define tenant-bound encryption context.",
+              "Make secret operations asynchronous and add a KMS-backed implementation.",
+              "Version the stored envelope and add encrypted data-key fields.",
+              "Ship dual-read and new-write migration before rewrapping historical rows."
+            ],
+            "acceptanceCriteria": [
+              "No static envelope master key is mounted in the API Pod.",
+              "Cross-tenant decrypt is denied by both application context and KMS policy.",
+              "KMS outage and throttling produce stable errors without secret disclosure or duplicate side effects.",
+              "All historical envelopes survive dual-read migration and rollback."
+            ],
+            "migrationNotes": [
+              "Do not start schema work before selecting the KMS provider and availability target."
+            ],
+            "rollback": "Keep old envelopes and the mounted-key reader until new writes, reads, rewrap, and rollback have completed in a production-shaped environment."
+          }
+        }
+      ],
+      "recommendedOptionId": "kms-backed-mounted-key",
+      "recommendation": "Use the mounted-key design for 0.1.0 because it fits the existing seam and keeps the cloud choice outside application code. Revisit direct KMS when the cloud, KMS SLO, quota, and measured secret-read budget are known."
+    }
+  ],
+  "openQuestions": [
+    "Which cloud, KMS, Secret CSI or external-secret controller, workload identity, and egress gateway will production use?",
+    "What KMS outage behavior and secret-read latency budget can the enterprise accept?",
+    "Will Organization isolation require separate KMS keys or encryption contexts?"
+  ]
+}

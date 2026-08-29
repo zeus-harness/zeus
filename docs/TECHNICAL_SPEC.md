@@ -1,0 +1,259 @@
+# Zeus 0.1.0 技术规范
+
+## 目标
+
+Zeus 是云端共享的企业 Harness Agent。一个 Organization 可以创建多个 Workspace。团队在 Workspace 中管理 Agent、Workflow、WorkItem、Run、审批和经验。
+
+Zeus 不依赖员工本机的 Agent 状态。模型历史、工具调用、审批和经验都保存在服务端。
+
+## 进程
+
+Zeus 初版只有两个部署单元：
+
+- `zeus-api`：Rust API 和 `ExecutionSupervisor`。
+- `zeus-web`：SvelteKit 控制台。
+
+每个 API 副本运行一个 Supervisor。多个副本通过 PostgreSQL 租约领取不同 Run。不创建 `zeus-worker`。
+
+HTTP 和 Run 使用不同的 SQLx 连接池与 semaphore。Run 执行时不持有数据库事务。
+
+## 模块
+
+```text
+apps/zeus-api       HTTP、SQLx、认证、模型、Capability、Supervisor
+crates/zeus-core    无 IO 的状态机、策略、事件和 ID
+apps/web            SvelteKit 业务页面
+packages/ui         shadcn-svelte 和共享 UI
+db/migrations       PostgreSQL 前向迁移
+openapi             公开 HTTP 契约
+```
+
+当前只保留 `zeus-core` 一个共享 Rust crate。IO 适配器留在 `zeus-api`。出现独立生命周期或两个以上消费者后再拆 crate。
+
+## 租户与权限
+
+租户层级为 `Organization → Workspace`。
+
+Organization 角色：
+
+- `owner`
+- `admin`
+- `member`
+- `auditor`
+
+Workspace 角色：
+
+- `admin`
+- `builder`
+- `operator`
+- `viewer`
+
+应用在事务中设置：
+
+```text
+zeus.user_id
+zeus.organization_id
+zeus.workspace_id
+```
+
+租户表启用 `ENABLE ROW LEVEL SECURITY` 和 `FORCE ROW LEVEL SECURITY`。应用 RBAC 负责动作权限，RLS 负责行隔离。
+
+HTTP SQLx 连接在 PostgreSQL startup packet 中切换到 `zeus_http`。Supervisor 连接切换到 `zeus_runtime`。迁移连接不切换角色。
+
+`zeus_http` 受 RLS 限制。`zeus_runtime` 带 `BYPASSRLS`，每条运行时 SQL 仍显式携带 Organization 和 Workspace。生产登录角色由部署平台创建，并只获得对应角色的 `SET ROLE` 权限。
+
+## 不可变版本
+
+`agents` 和 `workflows` 保存稳定 ID、名称和活动版本指针。
+
+`agent_versions` 和 `workflow_versions` 创建后禁止 UPDATE 和 DELETE。配置变化创建新版本。Run 固定引用 `workflow_version_id`，保证历史可复现。
+
+Workflow 是一个版本化 Agent 流程。初版没有 DAG、脚本节点或用户代码。
+
+默认限制：
+
+- `max_steps = 32`
+- `max_runtime_seconds = 900`
+- 模型网络重试 2 次
+- Capability 自动重试 0 次
+
+## Session Event
+
+`session_events` 是模型可见历史的事实来源。
+
+- 用户消息、助手消息、工具调用、工具结果和审批结果使用追加写入。
+- 工具调用必须有配对结果。
+- 取消时写入合成工具结果。
+- 流式 Token 增量只走 SSE。完整消息完成后持久化。
+- steering 在当前工具边界后插入。
+- follow-up 在当前 Run 结束后创建后续 Run。
+
+`run_events` 保存租约、状态、策略、用量和错误。模型事件通过 `session_event_id` 引用，正文不重复保存。
+
+## Run 队列
+
+`runs` 同时是业务记录和持久队列。
+
+状态：
+
+```text
+queued
+running
+waiting_approval
+waiting_child
+succeeded
+failed
+canceled
+```
+
+领取过程调用 `zeus_private.claim_run`：
+
+1. 查询已到期的 queued Run 或租约过期的 running Run。
+2. 使用 `FOR UPDATE SKIP LOCKED` 跳过其他副本已锁定的行。
+3. 写入 `lease_owner`、`lease_expires_at`。
+4. 增加 `fence_token` 和 `attempt_count`。
+5. 写入 `run_attempts`。
+6. 提交短事务。
+
+运行结果调用 `finish_run`。SQL 同时校验 owner 和 fence。过期执行者不能覆盖新结果。
+
+`LISTEN/NOTIFY` 只用于唤醒。轮询负责可靠性。Supervisor 已实现心跳、取消轮询、并发上限和 60 秒退出窗口。
+
+OpenAI-compatible Chat Completions 适配器支持 SSE、分片工具调用和 usage。完整助手消息完成后才写入 Session Event。模型请求失败会转成稳定错误码。
+
+## Capability
+
+Capability 在服务端注册。定义包含输入 Schema、输出 Schema、风险级别、executor key 和幂等模式。
+
+```text
+required
+supported
+unavailable
+```
+
+只有前两种模式允许自动重试。高风险 Capability 必须审批。
+
+固定调用顺序：
+
+```text
+validate
+→ tenant policy
+→ capability policy
+→ approval
+→ persist call
+→ execute
+→ normalize and redact
+→ persist result
+→ audit
+```
+
+初版不提供 shell、服务器文件系统和任意代码执行。
+
+输入和输出使用 JSON Schema 校验。Schema 创建时会校验元 Schema，并拒绝外部 `$ref`。验证器关闭 HTTP 和文件引用解析，Schema 不能触发 SSRF 或服务器文件读取。
+
+服务端注册表包含 `builtin.echo` 测试执行器和 `builtin.child_run` 平台执行器。`builtin.child_run` 只能由已启用、要求幂等的 `zeus.child-run` Capability 使用。企业 Capability 需要显式加入注册表后才能执行。
+
+## 数据
+
+PostgreSQL 18.6 保存：
+
+- 身份和成员关系
+- Agent、Workflow 和 Capability 配置
+- WorkItem、Session 和附件
+- Run、Attempt、Event 和 Approval
+- Experience Candidate 和发布内容
+- Audit Event 和 Outbox Event
+
+主键默认使用 `uuidv7()`。时间使用 `timestamptz`。状态使用 `text + CHECK`。
+
+附件单文件最大 5MiB。一个 WorkItem 最多 25MiB。经验搜索使用 `tsvector('simple', ...)` 和 GIN。初版不使用 pgvector。
+
+Redis 当前没有必要。PostgreSQL 已提供事务、队列、JSONB、Session、全文检索和审计一致性。
+
+## WorkItem 与附件
+
+WorkItem 使用 `revision` 做并发更新。创建要求 `Idempotency-Key`。分配对象必须是当前 Workspace 成员。外部引用和附件事实采用追加写入，应用角色不能修改或删除。
+
+附件通过 API 接收 base64 内容。单文件上限 5MiB，同一 WorkItem 累计上限 25MiB。服务端保存 SHA-256、MIME、长度和 `bytea` 数据。HTTP 全局请求体上限为 8MiB，能容纳一个 5MiB 文件的 base64 JSON 请求。
+
+Run Trace 聚合 Run Event、Session Event、Tool Call、Approval、usage、Experience 注入和 Child Run。聚合结果只读取同一 Organization 与 Workspace 的持久事实。
+
+## Experience
+
+Candidate 必须引用同一 Workspace 内已经成功的 Run 和可验证的 Session/Run Event。只有用户身份可以审阅与发布，Service Account 不能代替人工审阅。
+
+发布后的 Entry 不允许 UPDATE 或 DELETE。撤回写入独立追加事实。Workspace Entry 只在本 Workspace 检索；Organization Entry 需要授权角色发布。检索使用 PostgreSQL `tsvector('simple', ...)` 和 GIN。
+
+Runtime 在第一次模型调用前按 Workflow 的 Experience Policy 查询已发布且未撤回的内容。实际注入的 Entry ID、版本、排名和查询摘要写入 `run_experience_injections`。Run 恢复后复用同一组记录，不因后来发布或撤回改变本次上下文。经验正文带不可信标记和边界转义，不获得策略或 Capability 权限。
+
+## Child Run
+
+`builtin.child_run` 创建独立 Session 和 Run，不共享父 Run 的可变内存。父 Run 进入 `waiting_child`，子 Run 到达终态后由数据库触发器重新排队父 Run。父进程重启后从 `run_links`、`tool_calls`、Session Event 和 Run Event 恢复。
+
+子 Run 继承 Organization 与 Workspace，并满足以下收窄规则：
+
+- 深度最多 8。
+- Token 预算不得超过父 Run 剩余预算或目标 Workflow 上限。
+- 运行时间不得超过父 Run 持久化剩余时间或目标 Workflow 上限。
+- Capability 必须同时出现在父流程、目标流程和 Workspace 启用集合中。
+- 子流程审批规则不能放宽父流程的高风险要求。
+
+父 Run 取消会递归请求取消未完成子 Run。工具调用与子 Run 通过 `child_run_id` 配对。快速完成、租约恢复和旧 fence 写入仍由数据库状态机裁决。
+
+## HTTP
+
+协议前缀是 `/api/v1`。项目软件版本是 `0.1.0`。
+
+- ID 使用 UUIDv7 字符串。
+- 时间使用 UTC RFC3339。
+- 列表使用 opaque cursor。
+- 错误使用 `application/problem+json`。
+- Run、WorkItem 和 webhook 创建要求 `Idempotency-Key`。
+- SSE 使用 `Last-Event-ID` 续传。
+- 可变配置使用 `revision` 和 `If-Match`。
+- 原始密钥没有读取接口。
+
+Rust DTO、Utoipa Schema 和公开路由注册表生成 `openapi/zeus.v1.yaml`。当前契约包含 83 条路径和 118 个公开操作。内部 claim、heartbeat 和 finish 函数不暴露为 HTTP。
+
+## Web
+
+Web 使用 SvelteKit 5 SSR。组件使用 Svelte 5 runes。根 layout 的服务端 load 调用 `/api/v1/auth/me`，读取当前用户和 Workspace。Session Cookie 转发到内部 API，但不会进入客户端状态或日志。
+
+控制台提供 Agent、Workflow、Model Profile、Connection、Capability、Schedule、Webhook、WorkItem、Run Trace、Approval 和 Experience 入口。业务数据为空时显示真实空状态，不填充 mock 数据。
+
+shadcn-svelte 在 `packages/ui` 初始化。组件固定位于：
+
+```text
+packages/ui/src/lib/components/ui
+```
+
+业务组件留在 `apps/web`。OpenAPI 类型生成到 `apps/web/src/lib/api/schema.d.ts`。
+
+## 密钥
+
+- 浏览器 Session Token 使用 256-bit 随机值，数据库只保存哈希。
+- Service Account Token 只显示一次，数据库保存 Argon2 哈希。
+- Connection Secret 使用 envelope encryption。
+- 本地密钥写入 `.zeus/local.env`，权限为 `0600`。
+- 生产进程优先读取 `ZEUS_ENVELOPE_KEY_FILE`。文件必须是普通文件、不能是符号链接、大小不超过 4KiB，并且在 Unix 上不能向 group 或 other 开放权限。
+- Kubernetes Secret 卷本身使用 symlink 且默认归 root。基线通过非 root init container 把 group-readable Secret 源复制到内存 `emptyDir`，生成归 API 用户所有的普通 `0400` 文件。主容器只挂载暂存卷。
+- 生产环境由工作负载身份和 KMS 支持的 Secret driver 提供源 Secret。密钥变更后必须滚动 API Pod，不能依赖原地文件更新。
+- 应用直连 KMS 的 per-secret data key 方案留作后续选项。0.1.0 不声称已经完成云 KMS 联调。
+- 日志不记录 Authorization、Cookie、OIDC Secret、模型密钥或连接密钥。
+
+## 部署
+
+本地使用 Apple `container` 1.0.0 和 PostgreSQL 18.6。PostgreSQL 18 官方镜像的卷挂载点是 `/var/lib/postgresql`。
+
+`scripts/container/postgres-status` 只输出容器列表字段。不要用
+`container inspect` 分享诊断结果；inspect 会包含容器环境变量。
+
+生产使用 Kubernetes 和托管 PostgreSQL。Web 与 API 独立扩缩。Migration 由 Job 执行。API Pod 停止时停止领取新 Run，活动任务最多等待 60 秒；Kubernetes 终止窗口额外留出 15 秒做清理，未完成任务由租约恢复。
+
+API 进程输出 JSON 日志，并在配置 OTLP endpoint 时导出 Trace。OpenTelemetry Collector 基线接收 OTLP，通过 headless Service 抓取每个 API Pod 的 `/metrics`，再把 Trace 和指标发到环境指定的后端。`zeus_http_inflight_requests`、`zeus_active_runs` 和 `zeus_queue_depth` 可供 HPA 指标适配器使用；适配器保留 Pod 映射且指标数据存在前不能应用 custom metrics overlay。
+
+HTTP 边界只接受 UUIDv7 格式的 `x-request-id`，无效或缺失时由服务端生成。响应头、Problem Details 和 HTTP Trace 使用同一个值。HTTP Trace 只记录路径，不记录查询串。Runtime span 使用 `run_id`、`session_id`、Organization 和 Workspace 关联持久事件。
+
+Kubernetes 基线启用非 root、只读根文件系统、capability drop、默认拒绝 NetworkPolicy、PDB、拓扑分散和 CPU HPA。HTTPS 目的地由云环境 egress gateway 或 overlay 收窄。仓库中的通用 TCP 443 规则不等于生产 allowlist。
+
+数据库角色必须在 migration 前创建。`scripts/db/bootstrap-roles.sql` 只创建固定角色和默认权限，不创建带密码的生产登录账号。

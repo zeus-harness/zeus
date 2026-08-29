@@ -2,39 +2,50 @@
 name = "zeus-api"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
-authors.workspace = true
-description.workspace = true
-homepage.workspace = true
 repository.workspace = true
-publish.workspace = true
 
 [dependencies]
-async-stream.workspace = true
+aes-gcm.workspace = true
+anyhow.workspace = true
+argon2.workspace = true
+async-trait.workspace = true
 axum.workspace = true
-chrono.workspace = true
-deployment.workspace = true
-execution.workspace = true
+base64.workspace = true
+clap.workspace = true
+eventsource-stream.workspace = true
 futures-util.workspace = true
-kernel.workspace = true
-libc.workspace = true
-llm.workspace = true
-planning.workspace = true
-protocol.workspace = true
-runtime.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+http.workspace = true
+jsonschema.workspace = true
+openidconnect.workspace = true
+opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
+reqwest.workspace = true
+secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-skills.workspace = true
-subagents.workspace = true
-teams.workspace = true
-tenancy.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
 tokio.workspace = true
-zeroize.workspace = true
+tokio-util.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
+utoipa.workspace = true
+url.workspace = true
+uuid.workspace = true
+zeus-core = { path = "../../crates/zeus-core" }
 
 [dev-dependencies]
-goals.workspace = true
-http-body-util.workspace = true
-rusqlite.workspace = true
-terminal.workspace = true
-tower.workspace = true
+http-body-util = "0.1"
+
+[lints]
+workspace = true
