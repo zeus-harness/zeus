@@ -231,10 +231,13 @@ pub(crate) async fn token(
 ) -> Result<Response, OAuthError> {
     let Form(request) =
         request.map_err(|_| OAuthError::invalid_request("token request is invalid"))?;
-    if request.client_secret.is_some() {
-        return Err(OAuthError::invalid_client());
-    }
-    let client = authenticate_client(&state, &headers, request.client_id.as_deref()).await?;
+    let client = authenticate_client(
+        &state,
+        &headers,
+        request.client_id.as_deref(),
+        request.client_secret.as_deref(),
+    )
+    .await?;
     let signing_key = keys::ensure_signing_key(&state)
         .await
         .map_err(|_| OAuthError::server_error())?;
@@ -306,10 +309,16 @@ pub(crate) async fn revoke(
 ) -> Result<Response, OAuthError> {
     let Form(request) =
         request.map_err(|_| OAuthError::invalid_request("revocation request is invalid"))?;
-    if request.client_secret.is_some() || request.token.len() > 8192 {
-        return Err(OAuthError::invalid_client());
+    if request.token.len() > 8192 {
+        return Err(OAuthError::invalid_request("token is too long"));
     }
-    let client = authenticate_client(&state, &headers, request.client_id.as_deref()).await?;
+    let client = authenticate_client(
+        &state,
+        &headers,
+        request.client_id.as_deref(),
+        request.client_secret.as_deref(),
+    )
+    .await?;
     let hint = request.token_type_hint.as_deref();
     if hint.is_none() || hint == Some("refresh_token") {
         let revoked: bool = sqlx::query_scalar(
@@ -511,6 +520,9 @@ async fn exchange_refresh_token(
     .fetch_one(&state.database)
     .await
     .map_err(|_| OAuthError::server_error())?;
+    if rotated.disposition == "replay" {
+        state.metrics.record_oidc_refresh_replay();
+    }
     if rotated.disposition != "rotated" {
         return Err(OAuthError::invalid_grant(
             "refresh token is invalid, expired, revoked, or replayed",
@@ -612,8 +624,12 @@ async fn authenticate_client(
     state: &AppState,
     headers: &HeaderMap,
     form_client_id: Option<&str>,
+    form_client_secret: Option<&str>,
 ) -> Result<ProtocolClient, OAuthError> {
     let basic = parse_basic_client(headers)?;
+    if basic.is_some() && form_client_secret.is_some() {
+        return Err(OAuthError::invalid_client());
+    }
     let client_id = match basic.as_ref() {
         Some((client_id, _)) => {
             if form_client_id.is_some_and(|form| form != client_id) {
@@ -628,7 +644,13 @@ async fn authenticate_client(
         .map_err(|_| OAuthError::invalid_client())?;
     match client.client_type.as_str() {
         "confidential" => {
-            let (_, supplied_secret) = basic.ok_or_else(OAuthError::invalid_client)?;
+            let supplied_secret = match basic {
+                Some((_, secret)) => secret,
+                None => form_client_secret
+                    .filter(|secret| !secret.is_empty())
+                    .ok_or_else(OAuthError::invalid_client)?
+                    .to_owned(),
+            };
             let expected = client
                 .client_secret_hash
                 .clone()
@@ -643,7 +665,7 @@ async fn authenticate_client(
             }
         }
         "public" => {
-            if basic.is_some() {
+            if basic.is_some() || form_client_secret.is_some() {
                 return Err(OAuthError::invalid_client());
             }
         }

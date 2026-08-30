@@ -150,6 +150,7 @@ pub async fn create_client(
     Json(request): Json<CreateOidcClientRequest>,
 ) -> Result<(StatusCode, Json<CreatedOidcClientResponse>), ApiError> {
     auth.require_organization(organization_id, Permission::ManageOrganization)?;
+    auth.require_recent_authentication()?;
     let user_id = auth.user_id.ok_or(ApiError::Forbidden)?;
     let name = validate_name(&request.name)?;
     validate_client_type(&request.client_type)?;
@@ -238,6 +239,7 @@ pub async fn update_client(
     Json(request): Json<UpdateOidcClientRequest>,
 ) -> Result<(HeaderMap, Json<OidcClientResponse>), ApiError> {
     auth.require_organization(organization_id, Permission::ManageOrganization)?;
+    auth.require_recent_authentication()?;
     let revision = required_revision(&headers)?;
     let name = request.name.as_deref().map(validate_name).transpose()?;
     let scopes = request
@@ -321,6 +323,7 @@ pub async fn revoke_client(
     Path((organization_id, client_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
     auth.require_organization(organization_id, Permission::ManageOrganization)?;
+    auth.require_recent_authentication()?;
     let mut transaction = begin_tenant(
         &state.database,
         TenantScope::organization(auth.user_id, organization_id),

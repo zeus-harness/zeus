@@ -12,6 +12,7 @@ Zeus 同时有 Rust 服务、无 IO 的领域逻辑和 SvelteKit Web。边界不
 
 - `apps/zeus-api` 保存 HTTP、数据库、OIDC、模型、Capability、调度和运行时 IO。
 - `crates/zeus-core` 只保存无 IO 的领域类型、状态机和策略。它不得依赖 SQLx、Axum、Tokio 或 HTTP SDK。
+- `crates/zeus-identity` 保存密码、TOTP、OIDC 值对象和身份安全策略。它不得依赖 SQLx、Axum、SMTP 或外部 IdP SDK；Argon2 的 Tokio 隔离器留在该 crate。
 - `ExecutionSupervisor` 属于 `apps/zeus-api`。不创建 `zeus-worker`。
 - `apps/web` 保存业务页面和 SvelteKit 服务端代码。业务组件留在这里。
 - `packages/ui` 只保存共享视觉组件。shadcn-svelte 只在这里初始化，组件固定放在 `packages/ui/src/lib/components/ui`。

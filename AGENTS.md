@@ -14,6 +14,7 @@ Zeus 是面向企业团队的云端 Harness Agent。代码从 `0.1.0` 开始，H
 
 - `apps/zeus-api` 保存 HTTP、数据库、OIDC、模型、Capability、调度和运行时 IO。
 - `crates/zeus-core` 只保存无 IO 的领域类型、状态机和策略。
+- `crates/zeus-identity` 只保存无 IO 的密码、TOTP、OIDC 值对象和身份安全策略。
 - `apps/web` 保存业务页面和 SvelteKit 服务端代码。
 - `packages/ui` 保存共享视觉组件。
 - shadcn-svelte 只能在 `packages/ui` 初始化。
@@ -34,6 +35,7 @@ Zeus 是面向企业团队的云端 Harness Agent。代码从 `0.1.0` 开始，H
 - Rust 版本由 `rust-toolchain.toml` 固定。
 - workspace dependency 统一写在根 `Cargo.toml`。
 - `zeus-core` 不得依赖 SQLx、Axum、Tokio 或 HTTP SDK。
+- `zeus-identity` 不得依赖 SQLx、Axum、SMTP 或外部 IdP SDK。Argon2 的 Tokio 隔离器是该 crate 唯一的运行时适配。
 - 公开错误使用稳定错误码，不向客户端返回内部堆栈或 SQL。
 - Run 状态变化必须经过 `zeus-core` 状态机。
 - 模型可见的消息和工具事件必须写入 append-only Session Event。

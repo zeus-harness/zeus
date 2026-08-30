@@ -7,10 +7,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::crypto::{EnvelopeCipher, SealedSecret};
+use crate::{
+    crypto::{EnvelopeCipher, SealedSecret},
+    supervisor::SupervisorMetrics,
+};
 
 const MAX_EMAIL_ATTEMPTS: i32 = 10;
 const OIDC_MAINTENANCE_INTERVAL: Duration = Duration::from_hours(1);
+const IDENTITY_METRICS_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityMaintenanceError {
@@ -32,6 +36,14 @@ struct ClaimedEmail {
     key_id: String,
     fence_token: i64,
     attempt_count: i32,
+}
+
+#[derive(Debug, FromRow)]
+struct IdentityOperationalMetricsRow {
+    email_backlog: i64,
+    email_oldest_pending_age_seconds: i64,
+    signing_key_present: bool,
+    signing_key_age_seconds: i64,
 }
 
 pub struct IdentityMaintenance {
@@ -232,34 +244,72 @@ impl IdentityMaintenance {
 pub async fn run_oidc_protocol_maintenance(
     database: PgPool,
     envelope: Arc<dyn EnvelopeCipher>,
+    metrics: Arc<SupervisorMetrics>,
     shutdown: CancellationToken,
 ) {
     info!("OIDC protocol maintenance started");
+    maintain_oidc_protocol_state(&database, &envelope).await;
+    refresh_identity_operational_metrics(&database, &metrics).await;
+
+    let now = tokio::time::Instant::now();
+    let mut maintenance =
+        tokio::time::interval_at(now + OIDC_MAINTENANCE_INTERVAL, OIDC_MAINTENANCE_INTERVAL);
+    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut observation =
+        tokio::time::interval_at(now + IDENTITY_METRICS_INTERVAL, IDENTITY_METRICS_INTERVAL);
+    observation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
-        if shutdown.is_cancelled() {
-            break;
-        }
-        if let Err(error) = crate::oidc_provider::maintain_signing_key(&database, &envelope).await {
-            warn!(
-                error_kind = api_error_kind(&error),
-                "OIDC signing-key maintenance failed"
-            );
-        }
-        if let Err(error) = sqlx::query("select zeus_private.cleanup_oidc_protocol_state()")
-            .execute(&database)
-            .await
-        {
-            warn!(
-                error_kind = database_error_kind(&error),
-                "OIDC protocol-state cleanup failed"
-            );
-        }
         tokio::select! {
             () = shutdown.cancelled() => break,
-            () = tokio::time::sleep(OIDC_MAINTENANCE_INTERVAL) => {}
+            _ = maintenance.tick() => maintain_oidc_protocol_state(&database, &envelope).await,
+            _ = observation.tick() => {
+                refresh_identity_operational_metrics(&database, &metrics).await;
+            }
         }
     }
     info!("OIDC protocol maintenance stopped");
+}
+
+async fn maintain_oidc_protocol_state(database: &PgPool, envelope: &Arc<dyn EnvelopeCipher>) {
+    if let Err(error) = crate::oidc_provider::maintain_signing_key(database, envelope).await {
+        warn!(
+            error_kind = api_error_kind(&error),
+            "OIDC signing-key maintenance failed"
+        );
+    }
+    if let Err(error) = sqlx::query("select zeus_private.cleanup_oidc_protocol_state()")
+        .execute(database)
+        .await
+    {
+        warn!(
+            error_kind = database_error_kind(&error),
+            "OIDC protocol-state cleanup failed"
+        );
+    }
+}
+
+async fn refresh_identity_operational_metrics(database: &PgPool, metrics: &SupervisorMetrics) {
+    let row = sqlx::query_as::<_, IdentityOperationalMetricsRow>(
+        "select * from zeus_private.identity_operational_metrics()",
+    )
+    .fetch_one(database)
+    .await;
+    match row {
+        Ok(row) => metrics.set_identity_operational_metrics(
+            row.email_backlog,
+            row.email_oldest_pending_age_seconds,
+            row.signing_key_present,
+            row.signing_key_age_seconds,
+        ),
+        Err(error) => {
+            metrics.record_identity_operational_metrics_failure();
+            warn!(
+                error_kind = database_error_kind(&error),
+                "identity operational metrics query failed"
+            );
+        }
+    }
 }
 
 fn retry_delay_seconds(attempt: i32) -> i32 {

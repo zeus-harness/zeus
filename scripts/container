@@ -160,6 +160,13 @@ container_exists() {
   container inspect "$1" >/dev/null 2>&1
 }
 
+container_is_running() {
+  container list | awk -v container_name="$1" '
+    NR > 1 && $1 == container_name { found = 1 }
+    END { exit found ? 0 : 1 }
+  '
+}
+
 image_exists() {
   container image inspect "$1" >/dev/null 2>&1
 }
@@ -661,15 +668,35 @@ up_target() {
       start_mailpit
       ;;
     api)
+      local web_was_running=false gateway_was_running=false
       start_postgres
+      if container_is_running "${ZEUS_WEB_CONTAINER}"; then
+        web_was_running=true
+      fi
+      if container_is_running "${ZEUS_GATEWAY_CONTAINER}"; then
+        gateway_was_running=true
+      fi
       start_mailpit
       start_api
+      if [[ "${web_was_running}" == true || "${gateway_was_running}" == true ]]; then
+        start_web
+      fi
+      if [[ "${gateway_was_running}" == true ]]; then
+        start_gateway
+      fi
       ;;
     web)
+      local gateway_was_running=false
       start_postgres
+      if container_is_running "${ZEUS_GATEWAY_CONTAINER}"; then
+        gateway_was_running=true
+      fi
       start_mailpit
       start_api
       start_web
+      if [[ "${gateway_was_running}" == true ]]; then
+        start_gateway
+      fi
       ;;
     gateway | all)
       start_postgres

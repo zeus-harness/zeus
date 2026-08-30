@@ -121,6 +121,7 @@ async fn serve() -> anyhow::Result<()> {
     let oidc_maintenance_task = tokio::spawn(run_oidc_protocol_maintenance(
         state.database.clone(),
         Arc::clone(&state.envelope),
+        Arc::clone(&state.metrics),
         shutdown.child_token(),
     ));
 

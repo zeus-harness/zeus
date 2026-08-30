@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -37,7 +37,7 @@ async fn oidc_provider_supports_public_confidential_and_refresh_replay_protectio
         std::env::var("ZEUS_TEST_ENVELOPE_KEY")
             .expect("ZEUS_TEST_ENVELOPE_KEY is required for this ignored test"),
     );
-    let owner_pool = connect_pool(&database_url, 3)
+    let owner_pool = connect_pool(&database_url, 12)
         .await
         .expect("owner database connects");
     migrate(&owner_pool).await.expect("test database migrates");
@@ -145,14 +145,15 @@ async fn oidc_provider_supports_public_confidential_and_refresh_replay_protectio
     let http_pool = connect_pool_as_role(&database_url, 8, HTTP_DATABASE_ROLE)
         .await
         .expect("HTTP role database connects");
+    let metrics = Arc::new(SupervisorMetrics::default());
     let state = AppState {
-        database: http_pool,
+        database: http_pool.clone(),
         envelope: Arc::new(
             LocalEnvelopeCipher::from_encoded("test-v1".to_owned(), &envelope_key)
                 .expect("test envelope key is valid"),
         ),
         http_client: reqwest::Client::new(),
-        metrics: Arc::new(SupervisorMetrics::default()),
+        metrics: Arc::clone(&metrics),
         public_url: Url::parse(PUBLIC_URL).expect("public URL parses"),
         session_idle_ttl: Duration::from_hours(2),
         session_absolute_ttl: Duration::from_hours(12),
@@ -250,6 +251,7 @@ async fn oidc_provider_supports_public_confidential_and_refresh_replay_protectio
     let replay = exchange_refresh_response(&app, &public_client_id, None, first_refresh).await;
     let replay = expect_json(replay, StatusCode::BAD_REQUEST).await;
     assert_eq!(replay["error"], "invalid_grant");
+    assert_eq!(metrics.oidc_refresh_replays(), 1);
     let revoked_descendant =
         exchange_refresh_response(&app, &public_client_id, None, second_refresh).await;
     let revoked_descendant = expect_json(revoked_descendant, StatusCode::BAD_REQUEST).await;
@@ -291,6 +293,61 @@ async fn oidc_provider_supports_public_confidential_and_refresh_replay_protectio
             .as_str()
             .is_some_and(|token| !token.is_empty())
     );
+    let form_post_location = authorize(
+        &app,
+        &confidential_client_id,
+        CONFIDENTIAL_REDIRECT,
+        &challenge,
+        "confidential-form-post-state",
+    )
+    .await;
+    let form_post_code = query_value(&form_post_location, "code");
+    let form_post_tokens = exchange_code_with_form_secret(
+        &app,
+        &confidential_client_id,
+        confidential_secret,
+        CONFIDENTIAL_REDIRECT,
+        &form_post_code,
+    )
+    .await;
+    assert!(
+        form_post_tokens["access_token"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty())
+    );
+
+    let mixed_auth_location = authorize(
+        &app,
+        &confidential_client_id,
+        CONFIDENTIAL_REDIRECT,
+        &challenge,
+        "confidential-mixed-auth-state",
+    )
+    .await;
+    let mixed_auth_code = query_value(&mixed_auth_location, "code");
+    let mixed_auth = exchange_code_with_mixed_secret(
+        &app,
+        &confidential_client_id,
+        confidential_secret,
+        CONFIDENTIAL_REDIRECT,
+        &mixed_auth_code,
+    )
+    .await;
+    let mixed_auth = expect_json(mixed_auth, StatusCode::UNAUTHORIZED).await;
+    assert_eq!(mixed_auth["error"], "invalid_client");
+    let recovered_tokens = exchange_code(
+        &app,
+        &confidential_client_id,
+        Some(confidential_secret),
+        CONFIDENTIAL_REDIRECT,
+        &mixed_auth_code,
+    )
+    .await;
+    assert!(
+        recovered_tokens["access_token"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty())
+    );
 
     let jwks = send_public(&app, Method::GET, "/oauth2/jwks.json", None, &[]).await;
     let jwks = expect_json(jwks, StatusCode::OK).await;
@@ -301,6 +358,18 @@ async fn oidc_provider_supports_public_confidential_and_refresh_replay_protectio
             .as_str()
             .is_some_and(|value| !value.is_empty())
     );
+    let operational: (i64, i64, bool, i64) = sqlx::query_as(
+        "select email_backlog, email_oldest_pending_age_seconds,
+                signing_key_present, signing_key_age_seconds
+         from zeus_private.identity_operational_metrics()",
+    )
+    .fetch_one(&http_pool)
+    .await
+    .expect("HTTP role reads aggregate identity metrics");
+    assert_eq!(operational.0, 0);
+    assert_eq!(operational.1, 0);
+    assert!(operational.2);
+    assert!(operational.3 >= 0);
 
     let discovery = send_public(
         &app,
@@ -366,6 +435,63 @@ async fn oidc_provider_supports_public_confidential_and_refresh_replay_protectio
             .await
             .expect("logout session state reads");
     assert!(session_revoked);
+
+    exercise_signing_key_rotation_pressure(&owner_pool).await;
+}
+
+async fn exercise_signing_key_rotation_pressure(pool: &sqlx::PgPool) {
+    let requested: i64 =
+        sqlx::query_scalar("select zeus_private.request_oidc_signing_key_rotation('manual_test')")
+            .fetch_one(pool)
+            .await
+            .expect("current signing key moves into public overlap window");
+    assert_eq!(requested, 1);
+
+    let mut tasks = Vec::new();
+    for index in 0..32_u8 {
+        let pool = pool.clone();
+        tasks.push(tokio::spawn(async move {
+            sqlx::query_scalar::<_, String>(
+                "select key_id from zeus_private.install_oidc_signing_key(
+                   $1, $2, $3, $4, $5, $6
+                 )",
+            )
+            .bind(format!("rotation-pressure-key-{index:02}"))
+            .bind(vec![index.saturating_add(1)])
+            .bind(vec![index.saturating_add(2)])
+            .bind("rotation-pressure-envelope")
+            .bind(format!("rotation-pressure-modulus-{index:02}"))
+            .bind("AQAB")
+            .fetch_one(&pool)
+            .await
+        }));
+    }
+    let mut returned_keys = BTreeSet::new();
+    for task in tasks {
+        returned_keys.insert(
+            task.await
+                .expect("rotation pressure task joins")
+                .expect("rotation pressure install succeeds"),
+        );
+    }
+    assert_eq!(returned_keys.len(), 1);
+
+    let active: i64 = sqlx::query_scalar(
+        "select count(*)::bigint from oidc_signing_keys
+         where activates_at <= now() and rotates_at > now()",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("active signing keys count reads");
+    let public: i64 = sqlx::query_scalar(
+        "select count(*)::bigint from oidc_signing_keys
+         where activates_at <= now() and public_expires_at > now()",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("public signing keys count reads");
+    assert_eq!(active, 1);
+    assert_eq!(public, 2);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -495,6 +621,51 @@ async fn exchange_code_response(
         headers.push((header::AUTHORIZATION.as_str(), authorization));
     }
     send_public(app, Method::POST, "/oauth2/token", Some(body), &headers).await
+}
+
+async fn exchange_code_with_form_secret(
+    app: &Router,
+    client_id: &str,
+    secret: &str,
+    redirect_uri: &str,
+    code: &str,
+) -> Value {
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "authorization_code")
+        .append_pair("client_id", client_id)
+        .append_pair("client_secret", secret)
+        .append_pair("code", code)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("code_verifier", VERIFIER)
+        .finish();
+    let response = send_public(app, Method::POST, "/oauth2/token", Some(body), &[]).await;
+    expect_json(response, StatusCode::OK).await
+}
+
+async fn exchange_code_with_mixed_secret(
+    app: &Router,
+    client_id: &str,
+    secret: &str,
+    redirect_uri: &str,
+    code: &str,
+) -> Response<Body> {
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "authorization_code")
+        .append_pair("client_id", client_id)
+        .append_pair("client_secret", secret)
+        .append_pair("code", code)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("code_verifier", VERIFIER)
+        .finish();
+    let authorization = format!("Basic {}", STANDARD.encode(format!("{client_id}:{secret}")));
+    send_public(
+        app,
+        Method::POST,
+        "/oauth2/token",
+        Some(body),
+        &[(header::AUTHORIZATION.as_str(), &authorization)],
+    )
+    .await
 }
 
 async fn exchange_refresh(

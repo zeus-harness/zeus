@@ -12,13 +12,13 @@
 - 企业 Capability 必须在服务端注册，并通过租户策略和审批检查。
 - PostgreSQL RLS 和应用 RBAC 同时保护租户数据。
 - Session、Run、审批和审计事件采用追加写入。
-- 原始连接密钥没有读取 API。
-- 日志不得记录 Authorization、Cookie、OIDC Secret 或模型密钥。
+- 原始连接密钥、TOTP Secret、OIDC Client Secret 和签名私钥没有读取 API。
+- 日志、Trace、Problem Details 和 metrics 不得记录密码、验证码、Authorization、Cookie、Session、OIDC Code/Token、Client Secret 或模型密钥。
 
 `.zeus/local.env` 只用于本机开发，权限必须是 `0600`。不要提交该目录，
 不要把文件内容贴进 Issue、日志或聊天。
 
 `container inspect` 会显示容器环境变量。检查本地 PostgreSQL 时只运行
-`scripts/container/postgres-status`，不要粘贴原始 inspect 输出。
+`scripts/container status postgres`，不要粘贴原始 inspect 输出。
 
 详细威胁模型见 `docs/THREAT_MODEL.md`。

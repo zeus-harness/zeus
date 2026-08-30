@@ -366,6 +366,21 @@ pub(crate) fn verify_normalized_password(
         return Err(PasswordError::InvalidHash);
     }
     Params::try_from(&parsed).map_err(|_| PasswordError::InvalidHash)?;
+    if parsed
+        .params
+        .get_decimal("m")
+        .is_none_or(|value| value > ARGON2_MEMORY_KIB)
+        || parsed
+            .params
+            .get_decimal("t")
+            .is_none_or(|value| value > ARGON2_TIME_COST)
+        || parsed
+            .params
+            .get_decimal("p")
+            .is_none_or(|value| value > ARGON2_PARALLELISM)
+    {
+        return Err(PasswordError::InvalidHash);
+    }
 
     match Argon2::default().verify_password(normalized.as_str().as_bytes(), &parsed) {
         Ok(()) => Ok(PasswordVerification::valid(!is_current_hash(&parsed))),
@@ -532,6 +547,20 @@ mod tests {
         assert_eq!(
             verify_password(password, &old_hash).expect("old verify"),
             PasswordHashVerification::valid(true)
+        );
+    }
+
+    #[test]
+    fn verification_rejects_phc_costs_above_the_bounded_profile() {
+        let password = "correct horse battery staple";
+        let oversized = format!(
+            "$argon2id$v=19$m={},t=3,p=4$c29tZXNhbHQ$MTIzNDU2Nzg5MDEyMzQ1Ng",
+            ARGON2_MEMORY_KIB + 1
+        );
+
+        assert_eq!(
+            verify_password(password, &oversized),
+            Err(PasswordError::InvalidHash)
         );
     }
 }

@@ -23,6 +23,16 @@ pub struct SupervisorMetrics {
     queue_depth: AtomicU64,
     http_requests: AtomicU64,
     http_inflight: AtomicU64,
+    identity_password_failures: AtomicU64,
+    identity_mfa_failures: AtomicU64,
+    identity_throttled: AtomicU64,
+    identity_email_backlog: AtomicU64,
+    identity_email_oldest_pending_age_seconds: AtomicU64,
+    identity_operational_metrics_up: AtomicU64,
+    federated_provider_errors: AtomicU64,
+    oidc_refresh_replays: AtomicU64,
+    oidc_signing_key_present: AtomicU64,
+    oidc_signing_key_age_seconds: AtomicU64,
 }
 
 impl SupervisorMetrics {
@@ -61,6 +71,107 @@ impl SupervisorMetrics {
         self.http_inflight.load(Ordering::Relaxed)
     }
 
+    #[must_use]
+    pub fn identity_password_failures(&self) -> u64 {
+        self.identity_password_failures.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn identity_mfa_failures(&self) -> u64 {
+        self.identity_mfa_failures.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn identity_throttled(&self) -> u64 {
+        self.identity_throttled.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn identity_email_backlog(&self) -> u64 {
+        self.identity_email_backlog.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn identity_email_oldest_pending_age_seconds(&self) -> u64 {
+        self.identity_email_oldest_pending_age_seconds
+            .load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn identity_operational_metrics_up(&self) -> u64 {
+        self.identity_operational_metrics_up.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn federated_provider_errors(&self) -> u64 {
+        self.federated_provider_errors.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn oidc_refresh_replays(&self) -> u64 {
+        self.oidc_refresh_replays.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn oidc_signing_key_present(&self) -> u64 {
+        self.oidc_signing_key_present.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn oidc_signing_key_age_seconds(&self) -> u64 {
+        self.oidc_signing_key_age_seconds.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_identity_password_failure(&self) {
+        self.identity_password_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_identity_mfa_failure(&self) {
+        self.identity_mfa_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_identity_throttled(&self) {
+        self.identity_throttled.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_federated_provider_error(&self) {
+        self.federated_provider_errors
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_oidc_refresh_replay(&self) {
+        self.oidc_refresh_replays.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_identity_operational_metrics(
+        &self,
+        email_backlog: i64,
+        oldest_pending_age_seconds: i64,
+        signing_key_present: bool,
+        signing_key_age_seconds: i64,
+    ) {
+        self.identity_email_backlog
+            .store(nonnegative_metric(email_backlog), Ordering::Relaxed);
+        self.identity_email_oldest_pending_age_seconds.store(
+            nonnegative_metric(oldest_pending_age_seconds),
+            Ordering::Relaxed,
+        );
+        self.oidc_signing_key_present
+            .store(u64::from(signing_key_present), Ordering::Relaxed);
+        self.oidc_signing_key_age_seconds.store(
+            nonnegative_metric(signing_key_age_seconds),
+            Ordering::Relaxed,
+        );
+        self.identity_operational_metrics_up
+            .store(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_identity_operational_metrics_failure(&self) {
+        self.identity_operational_metrics_up
+            .store(0, Ordering::Relaxed);
+    }
+
     pub(crate) fn begin_http_request(self: &Arc<Self>) -> HttpRequestGuard {
         self.http_inflight.fetch_add(1, Ordering::Relaxed);
         HttpRequestGuard {
@@ -79,6 +190,10 @@ impl SupervisorMetrics {
         self.queue_depth
             .store(u64::try_from(depth).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
+}
+
+fn nonnegative_metric(value: i64) -> u64 {
+    u64::try_from(value.max(0)).unwrap_or(u64::MAX)
 }
 
 struct ActiveRunGuard {
@@ -432,5 +547,35 @@ mod tests {
         drop(first);
         assert_eq!(metrics.http_inflight(), 0);
         assert_eq!(metrics.http_requests(), 2);
+    }
+
+    #[test]
+    fn identity_metrics_use_bounded_unlabelled_values() {
+        let metrics = SupervisorMetrics::default();
+        metrics.record_identity_password_failure();
+        metrics.record_identity_mfa_failure();
+        metrics.record_identity_throttled();
+        metrics.record_federated_provider_error();
+        metrics.record_oidc_refresh_replay();
+        metrics.set_identity_operational_metrics(7, 19, true, 23);
+
+        assert_eq!(metrics.identity_password_failures(), 1);
+        assert_eq!(metrics.identity_mfa_failures(), 1);
+        assert_eq!(metrics.identity_throttled(), 1);
+        assert_eq!(metrics.federated_provider_errors(), 1);
+        assert_eq!(metrics.oidc_refresh_replays(), 1);
+        assert_eq!(metrics.identity_email_backlog(), 7);
+        assert_eq!(metrics.identity_email_oldest_pending_age_seconds(), 19);
+        assert_eq!(metrics.oidc_signing_key_present(), 1);
+        assert_eq!(metrics.oidc_signing_key_age_seconds(), 23);
+        assert_eq!(metrics.identity_operational_metrics_up(), 1);
+
+        metrics.set_identity_operational_metrics(-1, -1, false, -1);
+        assert_eq!(metrics.identity_email_backlog(), 0);
+        assert_eq!(metrics.identity_email_oldest_pending_age_seconds(), 0);
+        assert_eq!(metrics.oidc_signing_key_present(), 0);
+        assert_eq!(metrics.oidc_signing_key_age_seconds(), 0);
+        metrics.record_identity_operational_metrics_failure();
+        assert_eq!(metrics.identity_operational_metrics_up(), 0);
     }
 }

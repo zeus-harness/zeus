@@ -15,7 +15,8 @@ use time::OffsetDateTime;
 use utoipa::ToSchema;
 use uuid::Uuid;
 use zeus_identity::{
-    PasswordExecutorError, Totp, generate_recovery_codes, normalize_email, recovery_code_digest,
+    PasswordError, PasswordExecutorError, Totp, generate_recovery_codes, normalize_email,
+    recovery_code_digest,
 };
 
 use crate::{
@@ -116,7 +117,7 @@ pub async fn register(
         .password_executor
         .hash(SecretString::from(request.password))
         .await
-        .map_err(map_password_error)?;
+        .map_err(|error| map_password_error(&state, error))?;
     let invitation_hash = request
         .invitation_token
         .filter(|value| !value.is_empty())
@@ -181,16 +182,22 @@ struct NativeLoginRow {
         (status = 401, description = "Credentials rejected", body = crate::error::ProblemDetails, content_type = "application/problem+json")
     )
 )]
+#[allow(clippy::too_many_lines)] // Keep throttle, timing-work, and session transitions in order.
 pub async fn native_login(
     State(state): State<AppState>,
     address: ClientAddress,
     Json(request): Json<NativeLoginRequest>,
 ) -> Result<(HeaderMap, Json<NativeLoginResponse>), ApiError> {
-    let email = normalize_email(&request.email).map_err(|_| ApiError::Unauthorized)?;
-    let account_key = throttle_key(&state, "password-account", &email);
     let ip_key = address_throttle_key(&state, "password-ip", address);
-    ensure_not_throttled(&state, "password_account", &account_key).await?;
     ensure_not_throttled(&state, "password_ip", &ip_key).await?;
+    let Ok(email) = normalize_email(&request.email) else {
+        consume_dummy_password_work(&state).await?;
+        record_throttle(&state, "password_ip", &ip_key, 600, 30, 600).await?;
+        state.metrics.record_identity_password_failure();
+        return Err(ApiError::Unauthorized);
+    };
+    let account_key = throttle_key(&state, "password-account", &email);
+    ensure_not_throttled(&state, "password_account", &account_key).await?;
 
     let row =
         sqlx::query_as::<_, NativeLoginRow>("select * from zeus_private.lookup_native_login($1)")
@@ -205,11 +212,23 @@ pub async fn native_login(
     };
     let password = SecretString::from(request.password);
     let password_for_rehash = password.clone();
-    let verification = state
+    let verification = match state
         .password_executor
         .verify(password, row.password_hash.clone())
         .await
-        .map_err(map_password_error)?;
+    {
+        Ok(verification) => verification,
+        Err(error) => {
+            if is_password_candidate_error(error) {
+                consume_dummy_password_work(&state).await?;
+            }
+            let error = map_password_verification_error(&state, error);
+            if matches!(&error, ApiError::Unauthorized) {
+                record_password_failure(&state, &account_key, &ip_key).await?;
+            }
+            return Err(error);
+        }
+    };
     if !verification.valid || !matches!(row.status.as_str(), "pending_verification" | "active") {
         record_password_failure(&state, &account_key, &ip_key).await?;
         return Err(ApiError::Unauthorized);
@@ -222,7 +241,7 @@ pub async fn native_login(
             .password_executor
             .hash(password_for_rehash)
             .await
-            .map_err(map_password_error)?;
+            .map_err(|error| map_password_error(&state, error))?;
         sqlx::query_scalar::<_, bool>(
             "select zeus_private.update_password_hash_after_login($1, $2, $3)",
         )
@@ -400,7 +419,7 @@ pub async fn confirm_password_reset(
         .password_executor
         .hash(SecretString::from(request.password))
         .await
-        .map_err(map_password_error)?;
+        .map_err(|error| map_password_error(&state, error))?;
     let user_id = sqlx::query_scalar::<_, Option<Uuid>>(
         "select zeus_private.consume_password_reset_token($1, $2)",
     )
@@ -441,6 +460,7 @@ pub async fn verify_mfa(
         Ok(method) => method,
         Err(ApiError::Unauthorized) => {
             record_throttle(&state, "totp_account", &account_key, 300, 5, 300).await?;
+            state.metrics.record_identity_mfa_failure();
             return Err(ApiError::Unauthorized);
         }
         Err(error) => return Err(error),
@@ -569,7 +589,7 @@ pub async fn change_password(
             .password_executor
             .verify(SecretString::from(current_password), row.password_hash)
             .await
-            .map_err(map_password_error)?;
+            .map_err(|error| map_password_verification_error(&state, error))?;
         if !verified.valid {
             return Err(ApiError::Unauthorized);
         }
@@ -588,7 +608,7 @@ pub async fn change_password(
         .password_executor
         .hash(SecretString::from(request.new_password))
         .await
-        .map_err(map_password_error)?;
+        .map_err(|error| map_password_error(&state, error))?;
     let session_token = random_token(32).map_err(|_| ApiError::Internal)?;
     let csrf_token = random_token(32).map_err(|_| ApiError::Internal)?;
     let mut transaction = begin_user(&state.database, user_id).await?;
@@ -1167,7 +1187,7 @@ async fn verify_current_password(
         .password_executor
         .verify(SecretString::from(password), row.password_hash)
         .await
-        .map_err(map_password_error)?;
+        .map_err(|error| map_password_verification_error(state, error))?;
     if verified.valid {
         Ok(())
     } else {
@@ -1410,6 +1430,7 @@ async fn enforce_email_request_limits(
     let ip_retry = record_throttle(state, &ip_kind, &ip_key, 3600, 21, 3600).await?;
     let retry = email_retry.max(ip_retry);
     if retry > 0 {
+        state.metrics.record_identity_throttled();
         return Err(ApiError::RateLimited(u64::try_from(retry).unwrap_or(3600)));
     }
     Ok(())
@@ -1422,16 +1443,16 @@ async fn record_password_failure(
 ) -> Result<(), ApiError> {
     record_throttle(state, "password_account", account_key, 900, 10, 900).await?;
     record_throttle(state, "password_ip", ip_key, 600, 30, 600).await?;
+    state.metrics.record_identity_password_failure();
     Ok(())
 }
 
 async fn consume_dummy_password_work(state: &AppState) -> Result<(), ApiError> {
     state
         .password_executor
-        .hash(SecretString::from("zeus unknown account timing work value"))
+        .consume_dummy_work()
         .await
-        .map(|_| ())
-        .map_err(map_password_error)
+        .map_err(|error| map_password_error(state, error))
 }
 
 fn throttle_key(state: &AppState, domain: &str, value: &str) -> Vec<u8> {
@@ -1455,6 +1476,7 @@ async fn ensure_not_throttled(state: &AppState, kind: &str, key: &[u8]) -> Resul
     .await?
     .unwrap_or(0);
     if retry > 0 {
+        state.metrics.record_identity_throttled();
         return Err(ApiError::RateLimited(u64::try_from(retry).unwrap_or(1)));
     }
     Ok(())
@@ -1535,9 +1557,12 @@ fn expired_auth_cookie_headers(state: &AppState) -> Result<HeaderMap, ApiError> 
     Ok(headers)
 }
 
-fn map_password_error(error: PasswordExecutorError) -> ApiError {
+fn map_password_error(state: &AppState, error: PasswordExecutorError) -> ApiError {
     match error {
-        PasswordExecutorError::QueueFull => ApiError::RateLimited(1),
+        PasswordExecutorError::QueueFull => {
+            state.metrics.record_identity_throttled();
+            ApiError::RateLimited(1)
+        }
         PasswordExecutorError::Password(_) => {
             ApiError::Validation("password does not meet the configured policy".to_owned())
         }
@@ -1546,6 +1571,25 @@ fn map_password_error(error: PasswordExecutorError) -> ApiError {
         | PasswordExecutorError::TaskFailed
         | PasswordExecutorError::ExecutorClosed => ApiError::Internal,
     }
+}
+
+fn map_password_verification_error(state: &AppState, error: PasswordExecutorError) -> ApiError {
+    if is_password_candidate_error(error) {
+        ApiError::Unauthorized
+    } else {
+        map_password_error(state, error)
+    }
+}
+
+fn is_password_candidate_error(error: PasswordExecutorError) -> bool {
+    matches!(
+        error,
+        PasswordExecutorError::Password(
+            PasswordError::PasswordTooShort
+                | PasswordError::PasswordTooLong
+                | PasswordError::WeakPassword
+        )
+    )
 }
 
 fn validate_display_name(value: &str) -> Result<(), ApiError> {
@@ -1618,7 +1662,12 @@ fn base32_no_padding(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{base32_no_padding, percent_encode, validate_display_name, validate_opaque_token};
+    use zeus_identity::{PasswordError, PasswordExecutorError};
+
+    use super::{
+        base32_no_padding, is_password_candidate_error, percent_encode, validate_display_name,
+        validate_opaque_token,
+    };
 
     #[test]
     fn totp_transport_helpers_match_rfc4648_shape() {
@@ -1635,5 +1684,18 @@ mod tests {
         assert!(validate_display_name(" ").is_err());
         assert!(validate_opaque_token(&"a".repeat(43)).is_ok());
         assert!(validate_opaque_token("short").is_err());
+    }
+
+    #[test]
+    fn candidate_shape_errors_use_the_unauthorized_timing_path() {
+        assert!(is_password_candidate_error(
+            PasswordExecutorError::Password(PasswordError::PasswordTooShort)
+        ));
+        assert!(!is_password_candidate_error(
+            PasswordExecutorError::Password(PasswordError::InvalidHash)
+        ));
+        assert!(!is_password_candidate_error(
+            PasswordExecutorError::QueueFull
+        ));
     }
 }

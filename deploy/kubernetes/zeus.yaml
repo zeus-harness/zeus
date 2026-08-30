@@ -54,7 +54,7 @@ spec:
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
-                  name: zeus-runtime
+                  name: zeus-migration
                   key: database-url
           resources:
             requests:
@@ -182,11 +182,16 @@ spec:
                 secretKeyRef:
                   name: zeus-runtime
                   key: envelope-key-id
+            - name: ZEUS_WEAK_PASSWORD_FILE
+              value: /etc/zeus/password-policy/weak-passwords.txt
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://otel-collector.observability.svc.cluster.local:4318
           volumeMounts:
             - name: envelope-key
               mountPath: /var/run/secrets/zeus
+              readOnly: true
+            - name: password-policy
+              mountPath: /etc/zeus/password-policy
               readOnly: true
           startupProbe:
             httpGet:
@@ -235,6 +240,14 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 16Ki
+        # The platform team owns this ConfigMap. The API fails closed when the
+        # file is absent, empty, larger than 16 MiB, or has over 200000 entries.
+        - name: password-policy
+          configMap:
+            name: zeus-password-policy
+            items:
+              - key: weak-passwords.txt
+                path: weak-passwords.txt
 ---
 apiVersion: v1
 kind: Service

@@ -145,7 +145,11 @@ pub async fn build_state(config: &AppConfig) -> anyhow::Result<AppState> {
         .connect_timeout(Duration::from_secs(10))
         .user_agent(concat!("zeus-api/", env!("CARGO_PKG_VERSION")))
         .build()?;
-    let password_executor = PasswordExecutor::new(4, 32, PasswordPolicy::default())?;
+    let password_policy = config
+        .weak_passwords
+        .clone()
+        .map_or_else(PasswordPolicy::default, PasswordPolicy::with_weak_passwords);
+    let password_executor = PasswordExecutor::new(4, 32, password_policy)?;
     let identity_hash_key = config
         .identity_hash_key
         .clone()

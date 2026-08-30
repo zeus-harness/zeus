@@ -32,7 +32,7 @@
 状态：`done`
 
 - 完成基础表、外键、索引、约束、RLS 和审计写入。
-- 完成 OIDC discovery、Authorization Code + PKCE、回调校验、JIT 用户与 Group Mapping。
+- 完成企业联合 OIDC discovery、Authorization Code + PKCE、回调校验、JIT 用户与 Group Mapping。
 - 完成 Web Session、Service Account、Organization/Workspace 成员和 RBAC。
 - Session Token 只保存 SHA-256 摘要。Service Account Token 使用 Argon2。
 - OIDC、Connection Secret 使用 envelope encryption，本地实现为 AES-256-GCM。
@@ -50,7 +50,7 @@
 - 可变资源使用 `revision`、ETag 和 `If-Match`。旧 revision 返回 `412`。
 - 列表使用 opaque cursor。Run 和 Webhook 创建使用 `Idempotency-Key`。
 - Connection Secret 和 Webhook Secret 只在写入时返回，之后没有读取接口。
-- OpenAPI 由 Rust 路由注册表和 DTO 生成。E–G 合入后当前文件包含 83 条路径、118 个公开操作，没有保留的 `501` 路由。
+- OpenAPI 由 Rust 路由注册表和 DTO 生成。身份系统合入后当前文件包含 123 条路径、167 个公开操作，没有保留的 `501` 路由。
 - SvelteKit `/admin` 提供七类控制面资源入口。SSR 从 `/api/v1/auth/me` 读取当前 Workspace，不用部署级固定 Workspace。
 - 控制面创建链路、ETag 冲突、跨 Workspace 拒绝和 Web 构建已通过。
 
@@ -112,11 +112,11 @@
 
 - API、Web、Migration Job、PDB、NetworkPolicy、资源限制、CPU HPA 和可选 custom metrics overlay。
 - API Pod 内继续运行 Supervisor，给活动任务 60 秒退出时间，并给进程清理额外保留 15 秒；未完成 Run 由租约恢复。
-- JSON 日志、OTLP Trace、Pod 级 metrics 抓取、`zeus_http_inflight_requests`、`zeus_active_runs`、`zeus_queue_depth` 和 OpenTelemetry Collector 基线。
+- JSON 日志、OTLP Trace、Pod 级 metrics 抓取、Run/HTTP 指标、身份安全指标和 OpenTelemetry Collector 基线。
 - 响应头、Problem Details 和 HTTP Trace 共用 UUIDv7 `request_id`；Runtime span 带 `run_id` 和 `session_id`。
 - 生产 key 使用严格 `ZEUS_ENVELOPE_KEY_FILE` 契约；Kubernetes 由非 root init container 把 Secret 源暂存为内存卷普通 `0400` 文件。
 - 容量驱动要求 1,000 个用户 Session、100 个 Workspace、200 个并发 Run 和 1,800 秒窗口。
-- 备份恢复、租约积压、OIDC、Provider 和容量测试手册。
+- 备份恢复、租约积压、联合 IdP、SMTP、签名 key、身份压力、OpenID Conformance 和容量测试手册。
 - `docs/security/hardening/phase-h` 记录 KMS-backed mount 与应用直连 KMS 的选择、成本和迁移计划。
 
 外部验收：
@@ -124,7 +124,65 @@
 - 选定云 KMS、工作负载身份、Secret driver 和 egress gateway，完成环境 overlay。
 - 在托管 PostgreSQL 上校准连接池、PITR 和恢复目标。
 - 联调真实企业 IdP、模型 Provider 和遥测后端。
+- 运行 OpenID Foundation Basic OP、Config OP、Authorization Code、PKCE、Refresh Token 和 RP-Initiated Logout 计划。
 - 安装指标适配器后验证基于活动 Run 和队列深度的 HPA。
 - 在生产形态集群执行 30 分钟容量测试、跨租户测试、密钥轮换和四类故障演练。
 
 这些外部结果齐备前，H 不标记为 `done`。
+
+## I：身份系统重构
+
+### I1：身份基础与本地入口
+
+状态：`done`
+
+- 增加 `zeus-identity`，完成 Setup、平台管理员、用户级 Session 和租户 Context 分离。
+- Apple `container` 通过一个脚本管理 PostgreSQL、Mailpit、API、Web 和同源 Gateway。
+- 浏览器只访问 `http://127.0.0.1:3000`。API 与 Web 不发布宿主机端口。
+
+### I2：原生账号与组织管理
+
+状态：`done`
+
+- 完成注册、验证、密码登录、找回、TOTP、恢复码、Session 和身份限流。
+- 完成 Organization、Workspace、邀请、成员、注册策略和平台管理 API/Web。
+- IdentityMaintenance 使用 PostgreSQL lease/fence 投递加密邮件，并支持进程退出后的恢复。
+
+### I3：企业联合登录
+
+状态：`done`
+
+- 上游表和路由统一使用 `federated_*` 语义。
+- 一个 Zeus 用户可以绑定多个企业身份；同邮箱不自动合并。
+- 完成显式绑定、邀请/域名/Group Mapping JIT、Organization 强制 SSO 和可信 ACR/AMR。
+
+### I4：Zeus OIDC Provider
+
+状态：`done`
+
+- 完成 Authorization Code + S256 PKCE、Consent、Refresh Family、UserInfo、Discovery、JWKS、Revocation 和 Logout。
+- 支持 Public Client 的 `none`，以及 Confidential Client 的 `client_secret_basic`、`client_secret_post`。
+- RS256 签名 key 经过 envelope encryption 保存；协议状态、敏感列和数据库角色边界已经迁移约束。
+
+### I5：安全与生产门禁
+
+状态：`active`
+
+仓库已完成：
+
+- 身份、联合 IdP、Refresh 重放、邮件积压和签名 key 指标。
+- 100 并发恶意登录驱动、邮件 lease/fence 冒烟和 32 并发 key 安装测试。
+- 源码绑定的威胁模型、身份失败语义、SMTP、签名 key、备份恢复和 Conformance 手册。
+- OpenID 静态 Client 所需的 `client_secret_basic` 与 `client_secret_post` 本地集成测试。
+- Organization/Workspace 权限求值分离，Service Account Argon2 有界执行和 PHC 成本上限。
+- 部署方弱密码表加载契约，以及 Migration/API 数据库 Secret 分离的 Kubernetes 基线。
+- 2026-08-30 本机 Apple `container` 最终镜像验证发送 200 次合成无效登录，并发数 100；耗时 1,143ms，结果为 38 次 `401`、162 次 `429`、无网络失败、无异常状态码，结束后 readiness 正常。该结果只代表本机开发环境。
+
+外部验收：
+
+- OpenID Foundation Conformance Suite 状态是 `external_not_run`。
+- 100 并发恶意登录仍要在生产规格的 API、连接池和托管 PostgreSQL 上记录 RSS、重启和连接数据。
+- 云 KMS、受控 SMTP、真实 IdP、PITR 身份失效和下游 JWKS 缓存需要故障演练。
+- 生产 PostgreSQL 要核对 migration owner、HTTP 和 Runtime login 的真实 grant chain。
+
+这些外部结果齐备前，I5 不标记为 `done`。

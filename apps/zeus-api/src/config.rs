@@ -9,6 +9,10 @@ use std::{
 use anyhow::{Context, bail};
 use secrecy::{ExposeSecret, SecretString};
 use url::Url;
+use zeus_identity::WeakPasswordSet;
+
+const MAX_WEAK_PASSWORD_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_WEAK_PASSWORD_ENTRIES: usize = 200_000;
 
 #[derive(Clone, Debug)]
 #[allow(clippy::struct_excessive_bools)] // These are independent deployment policy switches.
@@ -40,6 +44,7 @@ pub struct AppConfig {
     pub identity_maintenance_enabled: bool,
     pub identity_email_poll_interval: Duration,
     pub identity_email_lease_duration: Duration,
+    pub weak_passwords: Option<WeakPasswordSet>,
 }
 
 impl AppConfig {
@@ -99,6 +104,7 @@ impl AppConfig {
         let identity_email_poll_milliseconds: u64 =
             parse("ZEUS_IDENTITY_EMAIL_POLL_MILLISECONDS", "1000")?;
         let identity_email_lease_seconds: u64 = parse("ZEUS_IDENTITY_EMAIL_LEASE_SECONDS", "60")?;
+        let weak_passwords = load_weak_passwords()?;
 
         if run_concurrency == 0 {
             bail!("ZEUS_RUN_CONCURRENCY must be greater than zero");
@@ -165,8 +171,41 @@ impl AppConfig {
             identity_maintenance_enabled,
             identity_email_poll_interval: Duration::from_millis(identity_email_poll_milliseconds),
             identity_email_lease_duration: Duration::from_secs(identity_email_lease_seconds),
+            weak_passwords,
         })
     }
+}
+
+fn load_weak_passwords() -> anyhow::Result<Option<WeakPasswordSet>> {
+    env::var("ZEUS_WEAK_PASSWORD_FILE")
+        .ok()
+        .map(PathBuf::from)
+        .as_deref()
+        .map(load_weak_password_file)
+        .transpose()
+}
+
+fn load_weak_password_file(path: &Path) -> anyhow::Result<WeakPasswordSet> {
+    let metadata = fs::metadata(path).context("ZEUS_WEAK_PASSWORD_FILE cannot be read")?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_WEAK_PASSWORD_FILE_BYTES {
+        bail!("ZEUS_WEAK_PASSWORD_FILE must be a non-empty regular file of at most 16 MiB");
+    }
+    let source =
+        fs::read_to_string(path).context("ZEUS_WEAK_PASSWORD_FILE cannot be read as UTF-8 text")?;
+    let entries = source
+        .lines()
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>();
+    if entries.is_empty() || entries.len() > MAX_WEAK_PASSWORD_ENTRIES {
+        bail!("ZEUS_WEAK_PASSWORD_FILE must contain between 1 and 200000 entries");
+    }
+    if entries
+        .iter()
+        .any(|entry| entry.chars().count() > zeus_identity::password::MAX_PASSWORD_CODE_POINTS)
+    {
+        bail!("ZEUS_WEAK_PASSWORD_FILE contains an entry longer than 128 code points");
+    }
+    Ok(WeakPasswordSet::new(entries))
 }
 
 fn load_bootstrap_token() -> anyhow::Result<Option<SecretString>> {
@@ -274,7 +313,7 @@ mod tests {
     use secrecy::ExposeSecret;
     use uuid::Uuid;
 
-    use super::{load_envelope_key_file, load_envelope_key_from};
+    use super::{load_envelope_key_file, load_envelope_key_from, load_weak_password_file};
 
     fn test_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("zeus-config-{name}-{}", Uuid::now_v7()))
@@ -339,5 +378,24 @@ mod tests {
         assert!(load_envelope_key_file(&missing).is_err());
         fs::remove_file(empty).expect("empty test file removes");
         fs::remove_file(oversized).expect("oversized test file removes");
+    }
+
+    #[test]
+    fn weak_password_file_is_loaded_without_exposing_entries() {
+        let path = test_path("weak-passwords");
+        fs::write(
+            &path,
+            "correct horse battery staple\ncommon enterprise password\n",
+        )
+        .expect("weak-password test file writes");
+
+        let weak_passwords = load_weak_password_file(&path).expect("weak passwords load");
+        assert_eq!(weak_passwords.len(), 2);
+        assert_eq!(
+            format!("{weak_passwords:?}"),
+            "WeakPasswordSet { entries: 2 }"
+        );
+
+        fs::remove_file(path).expect("weak-password test file removes");
     }
 }

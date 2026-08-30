@@ -22,13 +22,43 @@ HTTP 和 Run 使用不同的 SQLx 连接池与 semaphore。Run 执行时不持�
 ```text
 apps/zeus-api       HTTP、SQLx、认证、模型、Capability、Supervisor
 crates/zeus-core    无 IO 的状态机、策略、事件和 ID
+crates/zeus-identity 密码、TOTP、OIDC 值对象和安全策略
 apps/web            SvelteKit 业务页面
 packages/ui         shadcn-svelte 和共享 UI
 db/migrations       PostgreSQL 前向迁移
 openapi             公开 HTTP 契约
 ```
 
-当前只保留 `zeus-core` 一个共享 Rust crate。IO 适配器留在 `zeus-api`。出现独立生命周期或两个以上消费者后再拆 crate。
+`zeus-core` 保存 Agent 领域逻辑。`zeus-identity` 隔离密码、TOTP、OIDC 请求校验、Token Claim 和安全策略。两个 crate 都不依赖 Axum 或 SQLx。SMTP、数据库、HTTP 和 envelope encryption 适配留在 `zeus-api`。
+
+## 身份系统
+
+Zeus 管理全局用户、凭据、Session、平台角色和 Organization/Workspace 成员关系。企业 IdP 只提供联合认证证明。每个联合身份以 `(issuer, subject)` 唯一绑定到一个 Zeus 用户；同邮箱不会自动合并。
+
+原生身份支持：
+
+- Setup、注册模式、邮箱验证、密码登录和密码找回。
+- Argon2id `m=65536,t=3,p=4` PHC。原生密码、OIDC Client Secret 和 Service Account Token 共用最多四个活跃任务和有界等待队列。
+- 存量 PHC 的成本参数不得高于当前生成参数。生产环境通过 `ZEUS_WEAK_PASSWORD_FILE` 注入最多 16MiB、200000 条的弱密码表。
+- RFC 6238 TOTP、十个单次恢复码、账号/IP/PostgreSQL 持久限流。
+- 2 小时 idle、12 小时 absolute 的用户级 Session。数据库只保存 Session 与 CSRF Token 摘要。
+- Organization、Workspace、邀请、成员角色、MFA 策略和企业 IdP 强制策略。
+- 独立的 `platform_admin`。平台角色不提供租户业务数据读取权限。
+
+联合登录入口固定为：
+
+```text
+/auth/federated/{organization_slug}/{provider_slug}
+/auth/federated/{organization_slug}/{provider_slug}/callback
+```
+
+JIT 必须命中邀请、已验证企业域名或 Group Mapping。已有同邮箱账号返回 `account_link_required`，用户登录 Zeus 后再显式绑定。Provider 的可信 ACR/AMR 可以满足 Zeus MFA；未命中时继续要求 TOTP。可信 Claim 配置属于高风险管理动作，生产变更需要复核 IdP 的真实 Claim 语义。
+
+Zeus 同时提供一个全局 OIDC Issuer。0.1.0 支持 Authorization Code + S256 PKCE、Refresh Token、UserInfo、Discovery、JWKS、Revocation 和 RP-Initiated Logout。Public Client 使用 `none`，Confidential Client 支持 `client_secret_basic` 和 `client_secret_post`。Redirect URI 精确匹配。Client 属于 Organization，授权用户必须是该 Organization 的有效成员。Client 创建、修改和撤销要求十分钟内的交互式认证，Service Account 不能代办。
+
+Access Token 是 5 分钟有效的 RS256 `at+jwt`。Authorization Code 和 ID Token 有效期也是 5 分钟。Refresh Token 每次使用都轮换，idle expiry 7 天，absolute expiry 30 天；旧 Token 重放会撤销整个 Family。3072-bit RSA 私钥经过 envelope encryption 保存，90 天轮换，常规旧公钥在 JWKS 保留 7 天。
+
+每个 `zeus-api` 副本运行 `IdentityMaintenance`。它处理可恢复邮件任务、OIDC 协议清理、签名 key 维护和身份聚合指标。不增加独立 Worker、Redis 或消息队列。
 
 ## 租户与权限
 
@@ -157,7 +187,9 @@ validate
 
 PostgreSQL 18.6 保存：
 
-- 身份和成员关系
+- 用户、密码/TOTP、Session、邀请、联合身份和成员关系
+- OIDC Client、Consent、Code、Refresh Family、签名 key 和撤销记录
+- 邮件 outbox、认证限流和安全事件
 - Agent、Workflow 和 Capability 配置
 - WorkItem、Session 和附件
 - Run、Attempt、Event 和 Approval
@@ -213,7 +245,7 @@ Runtime 在第一次模型调用前按 Workflow 的 Experience Policy 查询已�
 - 可变配置使用 `revision` 和 `If-Match`。
 - 原始密钥没有读取接口。
 
-Rust DTO、Utoipa Schema 和公开路由注册表生成 `openapi/zeus.v1.yaml`。当前契约包含 83 条路径和 118 个公开操作。内部 claim、heartbeat 和 finish 函数不暴露为 HTTP。
+Rust DTO、Utoipa Schema 和公开路由注册表生成 `openapi/zeus.v1.yaml`。当前契约包含 123 条路径和 167 个公开操作。内部 claim、heartbeat、finish、邮件租约和签名 key 维护函数不暴露为 HTTP。
 
 ## Web
 
@@ -232,7 +264,9 @@ packages/ui/src/lib/components/ui
 ## 密钥
 
 - 浏览器 Session Token 使用 256-bit 随机值，数据库只保存哈希。
-- Service Account Token 只显示一次，数据库保存 Argon2 哈希。
+- CSRF Token 使用独立 256-bit 随机值，数据库只保存哈希。
+- 用户密码和 OIDC Client Secret 使用 Argon2id PHC。TOTP、邮件正文和 OIDC 签名私钥使用 envelope encryption。
+- Service Account Token 只显示一次，数据库保存 Argon2 PHC；创建与校验走同一个有界执行器。
 - Connection Secret 使用 envelope encryption。
 - 本地密钥写入 `.zeus/local.env`，权限为 `0600`。
 - 生产进程优先读取 `ZEUS_ENVELOPE_KEY_FILE`。文件必须是普通文件、不能是符号链接、大小不超过 4KiB，并且在 Unix 上不能向 group 或 other 开放权限。
@@ -256,12 +290,14 @@ packages/ui/src/lib/components/ui
 SvelteKit 产物。临时上下文放在被忽略的 `.zeus` 下，构建退出时删除。生产镜像
 继续使用 `zeus-api.Containerfile` 和 `web.Containerfile` 的完整构建链路。
 
-生产使用 Kubernetes 和托管 PostgreSQL。Web 与 API 独立扩缩。Migration 由 Job 执行。API Pod 停止时停止领取新 Run，活动任务最多等待 60 秒；Kubernetes 终止窗口额外留出 15 秒做清理，未完成任务由租约恢复。
+生产使用 Kubernetes 和托管 PostgreSQL。Web 与 API 独立扩缩。Migration 由 Job 执行。Job 只读取 `zeus-migration` 的 owner URI；API 只读取 `zeus-runtime` 的 HTTP/Runtime URI。Secret 名分离不能替代 PostgreSQL login、membership、`SET ROLE` 和 `BYPASSRLS` 验收。API Pod 停止时停止领取新 Run，活动任务最多等待 60 秒；Kubernetes 终止窗口额外留出 15 秒做清理，未完成任务由租约恢复。
 
 API 进程输出 JSON 日志，并在配置 OTLP endpoint 时导出 Trace。OpenTelemetry Collector 基线接收 OTLP，通过 headless Service 抓取每个 API Pod 的 `/metrics`，再把 Trace 和指标发到环境指定的后端。`zeus_http_inflight_requests`、`zeus_active_runs` 和 `zeus_queue_depth` 可供 HPA 指标适配器使用；适配器保留 Pod 映射且指标数据存在前不能应用 custom metrics overlay。
 
+身份指标包括密码失败、MFA 失败、限流、邮件积压、最老邮件年龄、联合 Provider 错误、Refresh 重放、当前签名 key 是否存在和 key 年龄。Counter 不带用户或租户标签。邮件和 key Gauge 每 30 秒从 PostgreSQL 聚合函数刷新；查询失败时 `zeus_identity_operational_metrics_up` 变为 `0`。
+
 HTTP 边界只接受 UUIDv7 格式的 `x-request-id`，无效或缺失时由服务端生成。响应头、Problem Details 和 HTTP Trace 使用同一个值。HTTP Trace 只记录路径，不记录查询串。Runtime span 使用 `run_id`、`session_id`、Organization 和 Workspace 关联持久事件。
 
-Kubernetes 基线启用非 root、只读根文件系统、capability drop、默认拒绝 NetworkPolicy、PDB、拓扑分散和 CPU HPA。HTTPS 目的地由云环境 egress gateway 或 overlay 收窄。仓库中的通用 TCP 443 规则不等于生产 allowlist。
+Kubernetes 基线启用非 root、只读根文件系统、capability drop、默认拒绝 NetworkPolicy、PDB、拓扑分散和 CPU HPA。API 必须挂载平台维护的 `zeus-password-policy/weak-passwords.txt`。HTTPS 目的地由云环境 egress gateway 或 overlay 收窄。仓库中的通用 TCP 443 规则不等于生产 allowlist。生产 Ingress 不路由 `/metrics`，指标只通过集群内 headless Service 抓取。
 
 数据库角色必须在 migration 前创建。`scripts/db/bootstrap-roles.sql` 只创建固定角色和默认权限，不创建带密码的生产登录账号。

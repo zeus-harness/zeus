@@ -32,6 +32,8 @@ http://127.0.0.1:3000/mailpit/
 
 API 和 Web 不发布宿主机端口。Gateway 把 `/api`、`/auth`、`/oauth2`、`/.well-known`、`/health` 和 `/metrics` 转给 API，其余请求转给 Web。
 
+空数据库会从 `/` 跳到 `/setup`。在页面中创建平台管理员、首个 Organization 和 Workspace。Bootstrap token 保存在本机 `.zeus/local.env` 的 `ZEUS_BOOTSTRAP_TOKEN`，只在 Setup 表单中使用，不要复制到终端记录或聊天。Setup 完成后使用 `/login` 登录；邮件验证、密码找回和邀请邮件在 `/mailpit/` 查看。
+
 `init-env` 会生成本地 Bootstrap token、数据库密码和 envelope key，写入权限为 `0600` 的 `.zeus/local.env`，不会打印这些值。代码变化后重新构建并启动：
 
 ```bash
@@ -59,6 +61,8 @@ set +a
 
 容器启动脚本会创建 `zeus_http` 和 `zeus_runtime` 固定角色。生产数据库的登录账号由部署平台创建：HTTP 登录账号只能切换到 `zeus_http`，Runtime 登录账号只能切换到 `zeus_runtime`。Migration 使用单独的 owner 连接。
 
+Kubernetes 基线要求平台创建两个独立 Secret：`zeus-migration` 只保存 migration owner 的 `database-url`，`zeus-runtime` 保存 API 的受限 `database-url`、`runtime-database-url` 和 envelope key。平台还要创建 `zeus-password-policy` ConfigMap，其中 `weak-passwords.txt` 每行一个弱密码。不要把 owner URI 放进 `zeus-runtime`。
+
 数据库冒烟测试：
 
 ```bash
@@ -68,6 +72,7 @@ psql "$DATABASE_URL" --set ON_ERROR_STOP=1 --file scripts/db/queue-smoke.sql
 psql "$DATABASE_URL" --set ON_ERROR_STOP=1 --file scripts/db/bcd-smoke.sql
 psql "$DATABASE_URL" --set ON_ERROR_STOP=1 --file scripts/db/efg-smoke.sql
 psql "$DATABASE_URL" --set ON_ERROR_STOP=1 --file scripts/db/runtime-fencing-smoke.sql
+psql "$DATABASE_URL" --set ON_ERROR_STOP=1 --file scripts/db/identity-maintenance-smoke.sql
 scripts/db/queue-concurrency
 ```
 
@@ -82,6 +87,9 @@ Web SSR 通过 `ZEUS_API_URL` 请求 API。Apple `container` 1.0.0 本地脚本�
 
 ## 已实现链路
 
+- Zeus 原生注册、验证、密码登录、TOTP、恢复码、Session 和 Organization/Workspace 管理。
+- 企业 OIDC 联合登录、多身份显式绑定、JIT 策略、企业 SSO 强制和域名验证。
+- Zeus OIDC Provider，覆盖 Authorization Code + S256 PKCE、Refresh、UserInfo、JWKS、Revocation 和 Logout。
 - WorkItem 创建、分配、状态更新、外部引用和附件。
 - Session、Run、Trace、Approval 与 SSE。
 - Experience Candidate 审阅、发布、撤回、PostgreSQL FTS 和运行时注入记录。
@@ -95,6 +103,14 @@ pnpm load:capacity -- --config /secure/path/zeus-capacity.json
 ```
 
 配置格式和通过条件见 `docs/runbooks/capacity-test.md`。真实云 KMS、企业 IdP、托管 PostgreSQL、集群网络策略和容量结果需要在生产形态环境验收。
+
+身份压力驱动默认发送 200 次合成无效登录，并发数是 100：
+
+```bash
+pnpm load:identity -- --base-url http://127.0.0.1:3000 --allow-http
+```
+
+它只用于隔离环境。判定和留存要求见 `docs/runbooks/identity-load-test.md`。OpenID Foundation Suite 的当前状态见 `docs/runbooks/openid-conformance.md`。
 
 ## 验证
 

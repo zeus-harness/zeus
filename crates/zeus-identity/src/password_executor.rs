@@ -14,6 +14,8 @@ use crate::password::{
 /// The maximum number of Argon2 operations that may run at once.
 pub const MAX_CONCURRENT_HASHES: usize = 4;
 
+const DUMMY_WORK_INPUT: &str = "zeus unknown account timing work value";
+
 /// Stable failures returned by the bounded password-hash executor.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum PasswordExecutorError {
@@ -214,6 +216,21 @@ impl PasswordHashExecutor {
             .map_err(PasswordExecutorError::Password)
     }
 
+    /// Consumes one bounded Argon2 operation for an unknown account.
+    ///
+    /// The fixed input bypasses the deployment weak-password set so changes to
+    /// that set cannot make unknown-account requests observably cheaper.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable queue, executor, randomness, hashing, or task error.
+    pub async fn consume_dummy_work(&self) -> Result<(), PasswordExecutorError> {
+        let normalized =
+            normalize_password(DUMMY_WORK_INPUT).map_err(PasswordExecutorError::Password)?;
+        let (_capacity_permit, _active_permit) = self.acquire().await?;
+        spawn_hash(normalized).await.map(drop)
+    }
+
     async fn acquire(
         &self,
     ) -> Result<
@@ -267,8 +284,10 @@ mod tests {
 
     use secrecy::SecretString;
 
-    use super::{MAX_CONCURRENT_HASHES, PasswordExecutorError, PasswordHashExecutor};
-    use crate::PasswordPolicy;
+    use super::{
+        DUMMY_WORK_INPUT, MAX_CONCURRENT_HASHES, PasswordExecutorError, PasswordHashExecutor,
+    };
+    use crate::{PasswordPolicy, WeakPasswordSet};
 
     const PASSWORD: &str = "correct horse battery staple";
 
@@ -306,6 +325,18 @@ mod tests {
             .expect("verify");
         assert!(verified.valid);
         assert!(!verified.needs_rehash);
+    }
+
+    #[tokio::test]
+    async fn dummy_work_is_not_blocked_by_the_deployment_weak_password_set() {
+        let executor = PasswordHashExecutor::new(
+            1,
+            0,
+            PasswordPolicy::with_weak_passwords(WeakPasswordSet::new([DUMMY_WORK_INPUT])),
+        )
+        .expect("executor");
+
+        executor.consume_dummy_work().await.expect("dummy work");
     }
 
     #[test]

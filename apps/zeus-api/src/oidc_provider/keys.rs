@@ -181,7 +181,11 @@ fn metadata(state: &AppState) -> ProviderMetadata {
         grant_types_supported: vec!["authorization_code", "refresh_token"],
         subject_types_supported: vec!["pairwise"],
         id_token_signing_alg_values_supported: vec!["RS256"],
-        token_endpoint_auth_methods_supported: vec!["client_secret_basic", "none"],
+        token_endpoint_auth_methods_supported: vec![
+            "client_secret_basic",
+            "client_secret_post",
+            "none",
+        ],
         code_challenge_methods_supported: vec!["S256"],
         scopes_supported: vec![
             "openid",

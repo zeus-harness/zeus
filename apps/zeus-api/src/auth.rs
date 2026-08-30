@@ -18,13 +18,11 @@ use time::OffsetDateTime;
 use utoipa::ToSchema;
 use uuid::Uuid;
 use zeus_core::{OrganizationRole, Permission, WorkspaceRole};
+use zeus_identity::PasswordExecutorError;
 
 use crate::{
     AppState,
-    crypto::{
-        SealedSecret, hash_service_account_token, random_token, sha256,
-        verify_service_account_token,
-    },
+    crypto::{SealedSecret, random_token, sha256},
     database::{TenantScope, begin_tenant},
     error::ApiError,
     oidc::{
@@ -67,6 +65,8 @@ pub struct AuthContext {
     pub scopes: BTreeSet<String>,
     pub email: Option<String>,
     pub display_name: String,
+    pub authenticated_at: Option<OffsetDateTime>,
+    pub mfa_satisfied_at: Option<OffsetDateTime>,
 }
 
 #[derive(Clone, Debug)]
@@ -112,7 +112,7 @@ impl AuthContext {
         organization_id: Uuid,
         permission: Permission,
     ) -> Result<(), ApiError> {
-        if self.organization_id != organization_id || !self.allows(permission) {
+        if self.organization_id != organization_id || !self.allows_organization(permission) {
             return Err(ApiError::Forbidden);
         }
         Ok(())
@@ -128,20 +128,54 @@ impl AuthContext {
         workspace_id: Uuid,
         permission: Permission,
     ) -> Result<(), ApiError> {
-        if self.workspace_id != Some(workspace_id) || !self.allows(permission) {
+        if self.workspace_id != Some(workspace_id) || !self.allows_workspace(permission) {
             return Err(ApiError::Forbidden);
         }
         Ok(())
     }
 
-    #[must_use]
-    pub fn allows(&self, permission: Permission) -> bool {
-        self.organization_role
-            .is_some_and(|role| role.allows(permission))
-            || self
-                .workspace_role
-                .is_some_and(|role| role.allows(permission))
-            || self.scope_allows(permission)
+    /// Requires a user session that completed authentication within ten minutes.
+    ///
+    /// Service accounts cannot satisfy an interactive reauthentication check.
+    pub fn require_recent_authentication(&self) -> Result<(), ApiError> {
+        if self.principal_kind != PrincipalKind::User {
+            return Err(ApiError::Forbidden);
+        }
+        let most_recent = [self.authenticated_at, self.mfa_satisfied_at]
+            .into_iter()
+            .flatten()
+            .max();
+        if most_recent
+            .is_some_and(|value| OffsetDateTime::now_utc() - value <= time::Duration::minutes(10))
+        {
+            Ok(())
+        } else {
+            Err(ApiError::ReauthenticationRequired)
+        }
+    }
+
+    fn allows_organization(&self, permission: Permission) -> bool {
+        match self.principal_kind {
+            PrincipalKind::User => self
+                .organization_role
+                .is_some_and(|role| role.allows(permission)),
+            PrincipalKind::ServiceAccount => {
+                self.workspace_id.is_none() && self.scope_allows(permission)
+            }
+        }
+    }
+
+    fn allows_workspace(&self, permission: Permission) -> bool {
+        match self.principal_kind {
+            PrincipalKind::User => {
+                self.organization_role
+                    .is_some_and(|role| role.allows(permission))
+                    || self
+                        .workspace_role
+                        .is_some_and(|role| role.allows(permission))
+            }
+            PrincipalKind::ServiceAccount => self.scope_allows(permission),
+        }
     }
 
     fn scope_allows(&self, permission: Permission) -> bool {
@@ -199,6 +233,8 @@ impl FromRequestParts<AppState> for AuthContext {
             scopes: principal.scopes,
             email: principal.email,
             display_name: principal.display_name,
+            authenticated_at: principal.authenticated_at,
+            mfa_satisfied_at: principal.mfa_satisfied_at,
         })
     }
 }
@@ -475,12 +511,12 @@ async fn authenticate_service_account(
     .await?
     .ok_or(ApiError::Unauthorized)?;
 
-    let encoded_hash = row.token_hash.clone();
-    let verified =
-        tokio::task::spawn_blocking(move || verify_service_account_token(&token, &encoded_hash))
-            .await
-            .map_err(|_| ApiError::Internal)?;
-    if !verified {
+    let verification = state
+        .password_executor
+        .verify(token, row.token_hash.clone())
+        .await
+        .map_err(|error| map_service_account_password_error(state, error))?;
+    if !verification.valid {
         return Err(ApiError::Unauthorized);
     }
     sqlx::query("select zeus_private.touch_service_account($1)")
@@ -669,7 +705,10 @@ pub async fn federated_callback(
             &pending,
         )
         .await
-        .map_err(|_| ApiError::IdentityProvider)?;
+        .map_err(|_| {
+            state.metrics.record_federated_provider_error();
+            ApiError::IdentityProvider
+        })?;
     let resolved = sqlx::query_as::<_, ResolvedFederatedIdentityRow>(
         "select * from zeus_private.resolve_federated_identity(
            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
@@ -891,23 +930,26 @@ pub async fn create_service_account(
     Path(organization_id): Path<Uuid>,
     Json(request): Json<CreateServiceAccountRequest>,
 ) -> Result<(StatusCode, Json<CreatedServiceAccountResponse>), ApiError> {
-    let permission = if request.workspace_id.is_some() {
-        Permission::ManageWorkspace
+    if let Some(workspace_id) = request.workspace_id {
+        if auth.organization_id != organization_id {
+            return Err(ApiError::Forbidden);
+        }
+        auth.require_workspace(workspace_id, Permission::ManageWorkspace)?;
     } else {
-        Permission::ManageOrganization
-    };
-    auth.require_organization(organization_id, permission)?;
+        auth.require_organization(organization_id, Permission::ManageOrganization)?;
+    }
+    auth.require_recent_authentication()?;
     validate_service_account_request(&request)?;
 
     let prefix_secret = random_token(9).map_err(|_| ApiError::Internal)?;
     let token_secret = random_token(32).map_err(|_| ApiError::Internal)?;
     let token_prefix = format!("{SERVICE_ACCOUNT_PREFIX}{}", prefix_secret.expose_secret());
     let full_token = SecretString::from(format!("{token_prefix}.{}", token_secret.expose_secret()));
-    let hash_token = full_token.clone();
-    let token_hash = tokio::task::spawn_blocking(move || hash_service_account_token(&hash_token))
+    let token_hash = state
+        .password_executor
+        .hash(full_token.clone())
         .await
-        .map_err(|_| ApiError::Internal)?
-        .map_err(|_| ApiError::Internal)?;
+        .map_err(|error| map_service_account_password_error(&state, error))?;
 
     let mut transaction = begin_tenant(
         &state.database,
@@ -1143,7 +1185,10 @@ async fn begin_federated_authorization(
             return_to,
         )
         .await
-        .map_err(|_| ApiError::IdentityProvider)?;
+        .map_err(|_| {
+            state.metrics.record_federated_provider_error();
+            ApiError::IdentityProvider
+        })?;
     let pending_json =
         serde_json::to_vec(&authorization.pending).map_err(|_| ApiError::Internal)?;
     let aad = federated_login_aad(provider.id);
@@ -1301,6 +1346,16 @@ fn validate_service_account_request(request: &CreateServiceAccountRequest) -> Re
             "service account scopes contain an unknown or empty value".to_owned(),
         ));
     }
+    if request.workspace_id.is_some()
+        && request
+            .scopes
+            .iter()
+            .any(|scope| scope == "organization:manage")
+    {
+        return Err(ApiError::Validation(
+            "workspace service accounts cannot receive organization scopes".to_owned(),
+        ));
+    }
     if request
         .expires_at
         .is_some_and(|expires| expires <= OffsetDateTime::now_utc())
@@ -1310,6 +1365,20 @@ fn validate_service_account_request(request: &CreateServiceAccountRequest) -> Re
         ));
     }
     Ok(())
+}
+
+fn map_service_account_password_error(state: &AppState, error: PasswordExecutorError) -> ApiError {
+    match error {
+        PasswordExecutorError::QueueFull => {
+            state.metrics.record_identity_throttled();
+            ApiError::RateLimited(1)
+        }
+        PasswordExecutorError::InvalidQueueCapacity
+        | PasswordExecutorError::InvalidConcurrency
+        | PasswordExecutorError::Password(_)
+        | PasswordExecutorError::TaskFailed
+        | PasswordExecutorError::ExecutorClosed => ApiError::Internal,
+    }
 }
 
 pub(crate) async fn insert_audit(
@@ -1386,13 +1455,19 @@ fn default_return_to() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use axum::http::{HeaderMap, HeaderValue, header};
     use time::OffsetDateTime;
     use uuid::Uuid;
+    use zeus_core::{OrganizationRole, Permission, WorkspaceRole};
+
+    use crate::error::ApiError;
 
     use super::{
-        CurrentUserResponse, SESSION_COOKIE, browser_write_security_exempt, cookie_value,
-        parse_service_account_token,
+        AuthContext, CreateServiceAccountRequest, CurrentUserResponse, PrincipalKind,
+        SESSION_COOKIE, browser_write_security_exempt, cookie_value, parse_service_account_token,
+        validate_service_account_request,
     };
 
     #[test]
@@ -1414,6 +1489,124 @@ mod tests {
             parse_service_account_token("zsa_12345678.abcdefghijklmnopqrstuvwxyz123456").is_ok()
         );
         assert!(parse_service_account_token("wrong.abcdefghijklmnopqrstuvwxyz123456").is_err());
+    }
+
+    #[test]
+    fn workspace_service_account_rejects_organization_scope() {
+        let request = CreateServiceAccountRequest {
+            name: "workspace automation".to_owned(),
+            workspace_id: Some(Uuid::now_v7()),
+            scopes: vec!["organization:manage".to_owned()],
+            expires_at: None,
+        };
+
+        assert!(validate_service_account_request(&request).is_err());
+    }
+
+    #[test]
+    fn workspace_role_does_not_grant_organization_permission() {
+        let organization_id = Uuid::now_v7();
+        let workspace_id = Uuid::now_v7();
+        let context = user_context(
+            organization_id,
+            workspace_id,
+            OrganizationRole::Member,
+            WorkspaceRole::Admin,
+        );
+
+        assert!(
+            context
+                .require_organization(organization_id, Permission::ManageWorkspace)
+                .is_err()
+        );
+        assert!(
+            context
+                .require_workspace(workspace_id, Permission::ManageWorkspace)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn organization_role_grants_organization_permission() {
+        let organization_id = Uuid::now_v7();
+        let workspace_id = Uuid::now_v7();
+        let context = user_context(
+            organization_id,
+            workspace_id,
+            OrganizationRole::Admin,
+            WorkspaceRole::Viewer,
+        );
+
+        assert!(
+            context
+                .require_organization(organization_id, Permission::ManageOrganization)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn workspace_service_account_cannot_cross_into_organization_routes() {
+        let organization_id = Uuid::now_v7();
+        let workspace_id = Uuid::now_v7();
+        let context = service_account_context(
+            organization_id,
+            Some(workspace_id),
+            ["organization:manage", "workspace:manage"],
+        );
+
+        assert!(
+            context
+                .require_organization(organization_id, Permission::ManageOrganization)
+                .is_err()
+        );
+        assert!(
+            context
+                .require_workspace(workspace_id, Permission::ManageWorkspace)
+                .is_ok()
+        );
+        assert!(
+            context
+                .require_workspace(Uuid::now_v7(), Permission::ManageWorkspace)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn organization_service_account_can_use_organization_scope() {
+        let organization_id = Uuid::now_v7();
+        let context = service_account_context(organization_id, None, ["organization:manage"]);
+
+        assert!(
+            context
+                .require_organization(organization_id, Permission::ManageOrganization)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn recent_authentication_requires_a_fresh_user_session() {
+        let organization_id = Uuid::now_v7();
+        let workspace_id = Uuid::now_v7();
+        let mut user = user_context(
+            organization_id,
+            workspace_id,
+            OrganizationRole::Admin,
+            WorkspaceRole::Admin,
+        );
+        assert!(user.require_recent_authentication().is_ok());
+
+        user.authenticated_at = Some(OffsetDateTime::now_utc() - time::Duration::minutes(11));
+        assert!(matches!(
+            user.require_recent_authentication(),
+            Err(ApiError::ReauthenticationRequired)
+        ));
+
+        let service_account =
+            service_account_context(organization_id, None, ["organization:manage"]);
+        assert!(matches!(
+            service_account.require_recent_authentication(),
+            Err(ApiError::Forbidden)
+        ));
     }
 
     #[test]
@@ -1454,5 +1647,50 @@ mod tests {
         assert_eq!(value["authenticated_at"], "1970-01-01T00:00:00Z");
         assert_eq!(value["idle_expires_at"], "1970-01-01T00:00:00Z");
         assert_eq!(value["absolute_expires_at"], "1970-01-01T00:00:00Z");
+    }
+
+    fn user_context(
+        organization_id: Uuid,
+        workspace_id: Uuid,
+        organization_role: OrganizationRole,
+        workspace_role: WorkspaceRole,
+    ) -> AuthContext {
+        AuthContext {
+            principal_kind: PrincipalKind::User,
+            principal_id: Uuid::now_v7(),
+            user_id: Some(Uuid::now_v7()),
+            session_id: Some(Uuid::now_v7()),
+            organization_id,
+            workspace_id: Some(workspace_id),
+            organization_role: Some(organization_role),
+            workspace_role: Some(workspace_role),
+            scopes: BTreeSet::new(),
+            email: Some("user@example.com".to_owned()),
+            display_name: "User".to_owned(),
+            authenticated_at: Some(OffsetDateTime::now_utc()),
+            mfa_satisfied_at: None,
+        }
+    }
+
+    fn service_account_context<const N: usize>(
+        organization_id: Uuid,
+        workspace_id: Option<Uuid>,
+        scopes: [&str; N],
+    ) -> AuthContext {
+        AuthContext {
+            principal_kind: PrincipalKind::ServiceAccount,
+            principal_id: Uuid::now_v7(),
+            user_id: None,
+            session_id: None,
+            organization_id,
+            workspace_id,
+            organization_role: None,
+            workspace_role: None,
+            scopes: scopes.into_iter().map(ToOwned::to_owned).collect(),
+            email: None,
+            display_name: "Service Account".to_owned(),
+            authenticated_at: None,
+            mfa_satisfied_at: None,
+        }
     }
 }
