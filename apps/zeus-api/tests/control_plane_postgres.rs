@@ -179,6 +179,8 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
         allow_private_oidc_issuers: false,
         allow_private_model_endpoints: false,
         bootstrap_token: None,
+        identity_hash_key: envelope_key,
+        trust_proxy_headers: false,
         password_executor: PasswordExecutor::new(4, 4, PasswordPolicy::default())
             .expect("password executor builds"),
         version: "0.1.0-test",

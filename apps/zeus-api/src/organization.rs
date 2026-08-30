@@ -17,7 +17,9 @@ use zeus_core::Permission;
 use crate::{
     AppState,
     api_support::{ListCursor, PageQuery, required_revision, revision_etag},
-    auth::{AuthContext, PrincipalKind, csrf_cookie, insert_audit, session_cookie},
+    auth::{
+        AuthContext, PrincipalContext, PrincipalKind, csrf_cookie, insert_audit, session_cookie,
+    },
     crypto::{random_token, sha256},
     database::{TenantScope, begin_tenant},
     error::ApiError,
@@ -68,17 +70,35 @@ pub struct CreatedOrganizationResponse {
 )]
 pub async fn create_organization(
     State(state): State<AppState>,
-    auth: AuthContext,
+    auth: PrincipalContext,
     Json(request): Json<CreateOrganizationRequest>,
-) -> Result<(StatusCode, Json<CreatedOrganizationResponse>), ApiError> {
+) -> Result<(StatusCode, HeaderMap, Json<CreatedOrganizationResponse>), ApiError> {
     if auth.principal_kind != PrincipalKind::User {
         return Err(ApiError::Forbidden);
+    }
+    if auth.email_verified_at.is_none() {
+        return Err(ApiError::EmailVerificationRequired);
     }
     validate_slug(&request.slug)?;
     validate_slug(&request.initial_workspace_slug)?;
     validate_name(&request.name)?;
     validate_name(&request.initial_workspace_name)?;
     let user_id = auth.user_id.ok_or(ApiError::Forbidden)?;
+    let session_id = auth.session_id.ok_or(ApiError::Forbidden)?;
+    let mfa_enabled: bool = sqlx::query_scalar(
+        "select exists (
+           select 1 from zeus_private.load_totp_credential($1)
+           where confirmed_at is not null
+         )",
+    )
+    .bind(user_id)
+    .fetch_one(&state.database)
+    .await?;
+    if (mfa_enabled || auth.platform_roles.contains("platform_admin"))
+        && auth.mfa_satisfied_at.is_none()
+    {
+        return Err(ApiError::MfaRequired);
+    }
     let created = sqlx::query_as::<_, CreatedOrganizationRow>(
         "select * from zeus_private.create_organization_for_user($1, $2, $3, $4, $5)",
     )
@@ -89,8 +109,46 @@ pub async fn create_organization(
     .bind(request.initial_workspace_name)
     .fetch_one(&state.database)
     .await?;
+    let session_token = random_token(32).map_err(|_| ApiError::Internal)?;
+    let csrf_token = random_token(32).map_err(|_| ApiError::Internal)?;
+    let selected: bool = sqlx::query_scalar(
+        "select zeus_private.rotate_user_session_context($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .bind(created.organization_id)
+    .bind(created.workspace_id)
+    .bind(sha256(session_token.expose_secret().as_bytes()))
+    .bind(sha256(csrf_token.expose_secret().as_bytes()))
+    .fetch_one(&state.database)
+    .await?;
+    if !selected {
+        return Err(ApiError::Internal);
+    }
+    let mut headers = HeaderMap::new();
+    headers.append(
+        header::SET_COOKIE,
+        session_cookie(
+            &state,
+            session_token.expose_secret(),
+            state.session_absolute_ttl.as_secs(),
+        )
+        .parse()
+        .map_err(|_| ApiError::Internal)?,
+    );
+    headers.append(
+        header::SET_COOKIE,
+        csrf_cookie(
+            &state,
+            csrf_token.expose_secret(),
+            state.session_absolute_ttl.as_secs(),
+        )
+        .parse()
+        .map_err(|_| ApiError::Internal)?,
+    );
     Ok((
         StatusCode::CREATED,
+        headers,
         Json(CreatedOrganizationResponse {
             organization_id: created.organization_id,
             workspace_id: created.workspace_id,

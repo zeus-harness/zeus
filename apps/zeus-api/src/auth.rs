@@ -166,6 +166,16 @@ impl FromRequestParts<AppState> for AuthContext {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let principal = PrincipalContext::from_request_parts(parts, state).await?;
+        if principal.principal_kind == PrincipalKind::User {
+            if principal.email_verified_at.is_none() {
+                return Err(ApiError::EmailVerificationRequired);
+            }
+            if principal.mfa_satisfied_at.is_none()
+                && principal_requires_mfa(state, &principal).await?
+            {
+                return Err(ApiError::MfaRequired);
+            }
+        }
         let organization_id = principal.organization_id.ok_or(ApiError::Forbidden)?;
         Ok(Self {
             principal_kind: principal.principal_kind,
@@ -181,6 +191,47 @@ impl FromRequestParts<AppState> for AuthContext {
             display_name: principal.display_name,
         })
     }
+}
+
+async fn principal_requires_mfa(
+    state: &AppState,
+    principal: &PrincipalContext,
+) -> Result<bool, ApiError> {
+    if principal.platform_roles.contains("platform_admin") {
+        return Ok(true);
+    }
+    let user_id = principal.user_id.ok_or(ApiError::Forbidden)?;
+    let has_totp: bool = sqlx::query_scalar(
+        "select exists (
+           select 1 from zeus_private.load_totp_credential($1)
+           where confirmed_at is not null
+         )",
+    )
+    .bind(user_id)
+    .fetch_one(&state.database)
+    .await?;
+    if has_totp {
+        return Ok(true);
+    }
+    let Some(organization_id) = principal.organization_id else {
+        return Ok(false);
+    };
+    let mut transaction = crate::database::begin_tenant(
+        &state.database,
+        TenantScope::organization(Some(user_id), organization_id),
+    )
+    .await?;
+    let required: bool = sqlx::query_scalar(
+        "select coalesce((
+           select mfa_required from organization_identity_policies
+           where organization_id = $1
+         ), false)",
+    )
+    .bind(organization_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(required)
 }
 
 impl FromRequestParts<AppState> for PrincipalContext {
@@ -930,7 +981,7 @@ pub(crate) fn session_cookie(state: &AppState, token: &str, max_age_seconds: u64
     )
 }
 
-fn expired_session_cookie(state: &AppState) -> String {
+pub(crate) fn expired_session_cookie(state: &AppState) -> String {
     let secure = if state.cookie_secure { "; Secure" } else { "" };
     format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}")
 }
@@ -940,7 +991,7 @@ pub(crate) fn csrf_cookie(state: &AppState, token: &str, max_age_seconds: u64) -
     format!("{CSRF_COOKIE}={token}; Path=/; SameSite=Lax; Max-Age={max_age_seconds}{secure}")
 }
 
-fn expired_csrf_cookie(state: &AppState) -> String {
+pub(crate) fn expired_csrf_cookie(state: &AppState) -> String {
     let secure = if state.cookie_secure { "; Secure" } else { "" };
     format!("{CSRF_COOKIE}=; Path=/; SameSite=Lax; Max-Age=0{secure}")
 }

@@ -4,6 +4,86 @@
  */
 
 export interface paths {
+    "/api/v1/auth/context": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["select_identity_context"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/email-verifications": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["request_email_verification"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/email-verifications/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["confirm_email_verification"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["native_login"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["native_logout"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/auth/me": {
         parameters: {
             query?: never;
@@ -15,6 +95,102 @@ export interface paths {
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/mfa/verify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["verify_mfa"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/password-resets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["request_password_reset"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/password-resets/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["confirm_password_reset"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/register": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["register"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/sessions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_web_sessions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/sessions/{session_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["revoke_web_session"];
         options?: never;
         head?: never;
         patch?: never;
@@ -126,6 +302,54 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["archive_capability_definition"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/organizations/{organization_id}/invitations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_invitations"];
+        put?: never;
+        post: operations["create_invitation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/organizations/{organization_id}/invitations/{invitation_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["revoke_invitation"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/organizations/{organization_id}/invitations/{invitation_id}/resend": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["resend_invitation"];
         delete?: never;
         options?: never;
         head?: never;
@@ -271,6 +495,38 @@ export interface paths {
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/users/me/password": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["change_password"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/users/me/totp": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["configure_totp"];
+        delete: operations["disable_totp"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1368,6 +1624,10 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        AcceptedIdentityResponse: {
+            accepted: boolean;
+            detail: string;
+        };
         ActivateVersionRequest: {
             /** Format: uuid */
             version_id: string;
@@ -1481,6 +1741,10 @@ export interface components {
             risk_level: string;
             /** Format: date-time */
             updated_at: string;
+        };
+        ChangePasswordRequest: {
+            current_password: string;
+            new_password: string;
         };
         ChildRunResponse: {
             /** Format: date-time */
@@ -1598,6 +1862,11 @@ export interface components {
             external_reference: string;
             metadata?: unknown;
             source_kind: string;
+        };
+        CreateInvitationRequest: {
+            email: string;
+            organization_role: string;
+            workspaces?: components["schemas"]["InvitationWorkspaceRequest"][];
         };
         CreateModelProfileRequest: {
             base_url: string;
@@ -1789,6 +2058,13 @@ export interface components {
         DecideApprovalRequest: {
             reason?: string | null;
         };
+        DisableTotpRequest: {
+            code: string;
+            password: string;
+        };
+        EmailAddressRequest: {
+            email: string;
+        };
         ExperienceCandidatePageResponse: {
             items: components["schemas"]["ExperienceCandidateResponse"][];
             next_cursor?: string | null;
@@ -1885,6 +2161,32 @@ export interface components {
         HealthResponse: {
             status: string;
         };
+        InvitationResponse: {
+            /** Format: date-time */
+            accepted_at?: string | null;
+            /** Format: uuid */
+            accepted_by?: string | null;
+            /** Format: date-time */
+            created_at: string;
+            email: string;
+            /** Format: date-time */
+            expires_at: string;
+            /** Format: uuid */
+            id: string;
+            /** Format: uuid */
+            invited_by: string;
+            /** Format: uuid */
+            organization_id: string;
+            organization_role: string;
+            /** Format: date-time */
+            revoked_at?: string | null;
+            status: string;
+        };
+        InvitationWorkspaceRequest: {
+            role: string;
+            /** Format: uuid */
+            workspace_id: string;
+        };
         MetaResponse: {
             api_version: string;
             features: components["schemas"]["FeatureStatus"][];
@@ -1892,6 +2194,13 @@ export interface components {
             queue_backend: string;
             version: string;
             worker_process: boolean;
+        };
+        MfaVerificationRequest: {
+            code: string;
+        };
+        MfaVerificationResponse: {
+            method: string;
+            verified: boolean;
         };
         ModelProfilePageResponse: {
             items: components["schemas"]["ModelProfileResponse"][];
@@ -1919,6 +2228,19 @@ export interface components {
             updated_at: string;
             /** Format: uuid */
             workspace_id: string;
+        };
+        NativeLoginRequest: {
+            email: string;
+            password: string;
+        };
+        NativeLoginResponse: {
+            email_verification_required: boolean;
+            mfa_required: boolean;
+            /** Format: uuid */
+            session_id: string;
+            totp_setup_required: boolean;
+            /** Format: uuid */
+            user_id: string;
         };
         OidcGroupMappingResponse: {
             /** Format: date-time */
@@ -1979,6 +2301,10 @@ export interface components {
             /** Format: date-time */
             updated_at: string;
         };
+        PasswordResetConfirmationRequest: {
+            password: string;
+            token: string;
+        };
         ProblemDetails: {
             code: string;
             detail: string;
@@ -1989,6 +2315,12 @@ export interface components {
             title: string;
             /** @example https://zeus.example.com/problems/validation_failed */
             type: string;
+        };
+        RegisterRequest: {
+            display_name: string;
+            email: string;
+            invitation_token?: string | null;
+            password: string;
         };
         RetryRunRequest: Record<string, never>;
         ReviewExperienceCandidateRequest: {
@@ -2111,6 +2443,12 @@ export interface components {
             /** Format: uuid */
             workspace_id: string;
         };
+        SelectIdentityContextRequest: {
+            /** Format: uuid */
+            organization_id?: string | null;
+            /** Format: uuid */
+            workspace_id?: string | null;
+        };
         ServiceAccountResponse: {
             /** Format: date-time */
             created_at: string;
@@ -2214,6 +2552,18 @@ export interface components {
         SubmitMessageRequest: {
             content: string;
             kind?: string;
+        };
+        TokenConfirmationRequest: {
+            token: string;
+        };
+        TotpSetupRequest: {
+            code?: string | null;
+        };
+        TotpSetupResponse: {
+            confirmed: boolean;
+            provisioning_uri?: string | null;
+            recovery_codes: string[];
+            secret?: string | null;
         };
         TraceExperienceInjectionResponse: {
             /** Format: uuid */
@@ -2346,6 +2696,26 @@ export interface components {
         UpdateWorkspaceRequest: {
             name?: string | null;
             status?: string | null;
+        };
+        WebSessionResponse: {
+            /** Format: date-time */
+            absolute_expires_at: string;
+            /** Format: uuid */
+            active_organization_id?: string | null;
+            /** Format: uuid */
+            active_workspace_id?: string | null;
+            auth_methods: string[];
+            /** Format: date-time */
+            authenticated_at: string;
+            current: boolean;
+            /** Format: uuid */
+            id: string;
+            /** Format: date-time */
+            idle_expires_at: string;
+            /** Format: date-time */
+            last_seen_at: string;
+            /** Format: date-time */
+            mfa_satisfied_at?: string | null;
         };
         WebhookEndpointPageResponse: {
             items: components["schemas"]["WebhookEndpointResponse"][];
@@ -2529,6 +2899,161 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    select_identity_context: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SelectIdentityContextRequest"];
+            };
+        };
+        responses: {
+            /** @description Session tenant context selected */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    request_email_verification: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EmailAddressRequest"];
+            };
+        };
+        responses: {
+            /** @description Verification request accepted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AcceptedIdentityResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    confirm_email_verification: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TokenConfirmationRequest"];
+            };
+        };
+        responses: {
+            /** @description Email verified */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    native_login: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NativeLoginRequest"];
+            };
+        };
+        responses: {
+            /** @description Native login completed or awaiting MFA */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NativeLoginResponse"];
+                };
+            };
+            /** @description Credentials rejected */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    native_logout: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current web session revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
     current_user: {
         parameters: {
             query?: never;
@@ -2549,6 +3074,194 @@ export interface operations {
             };
             /** @description Authentication required */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    verify_mfa: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MfaVerificationRequest"];
+            };
+        };
+        responses: {
+            /** @description MFA verified */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MfaVerificationResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    request_password_reset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EmailAddressRequest"];
+            };
+        };
+        responses: {
+            /** @description Password reset request accepted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AcceptedIdentityResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    confirm_password_reset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PasswordResetConfirmationRequest"];
+            };
+        };
+        responses: {
+            /** @description Password reset completed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    register: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RegisterRequest"];
+            };
+        };
+        responses: {
+            /** @description Registration request accepted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AcceptedIdentityResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    list_web_sessions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Active web sessions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebSessionResponse"][];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    revoke_web_session: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Web session revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Problem Details error */
+            default: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2885,6 +3598,134 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["CapabilityDefinitionResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    list_invitations: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Organization invitations */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InvitationResponse"][];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    create_invitation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateInvitationRequest"];
+            };
+        };
+        responses: {
+            /** @description Organization invitation created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InvitationResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    revoke_invitation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                organization_id: string;
+                invitation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Invitation revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    resend_invitation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                organization_id: string;
+                invitation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Invitation resend accepted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AcceptedIdentityResponse"];
                 };
             };
             /** @description Problem Details error */
@@ -3361,6 +4202,101 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["SetupStatusResponse"];
                 };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    change_password: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChangePasswordRequest"];
+            };
+        };
+        responses: {
+            /** @description Password changed and session rotated */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    configure_totp: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TotpSetupRequest"];
+            };
+        };
+        responses: {
+            /** @description TOTP enrollment state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TotpSetupResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    disable_totp: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DisableTotpRequest"];
+            };
+        };
+        responses: {
+            /** @description TOTP disabled and session rotated */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Problem Details error */
             default: {

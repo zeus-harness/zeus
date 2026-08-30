@@ -9,11 +9,14 @@ pub mod execution_api;
 pub mod experiences;
 pub mod http;
 pub mod idempotency;
+pub mod identity_maintenance;
 pub mod integrations;
 pub mod model;
+pub mod native_auth;
 pub mod native_identity;
 pub mod oidc;
 pub mod organization;
+pub mod organization_identity;
 pub mod runtime;
 pub mod supervisor;
 pub mod telemetry;
@@ -36,6 +39,7 @@ use crate::{
 };
 
 #[derive(Clone)]
+#[allow(clippy::struct_excessive_bools)] // Deployment and protocol switches are independent.
 pub struct AppState {
     pub database: PgPool,
     pub envelope: Arc<dyn EnvelopeCipher>,
@@ -49,6 +53,8 @@ pub struct AppState {
     pub allow_private_oidc_issuers: bool,
     pub allow_private_model_endpoints: bool,
     pub bootstrap_token: Option<SecretString>,
+    pub identity_hash_key: SecretString,
+    pub trust_proxy_headers: bool,
     pub password_executor: PasswordExecutor,
     pub version: &'static str,
 }
@@ -138,6 +144,10 @@ pub async fn build_state(config: &AppConfig) -> anyhow::Result<AppState> {
         .user_agent(concat!("zeus-api/", env!("CARGO_PKG_VERSION")))
         .build()?;
     let password_executor = PasswordExecutor::new(4, 32, PasswordPolicy::default())?;
+    let identity_hash_key = config
+        .identity_hash_key
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("ZEUS_IDENTITY_HASH_KEY or an envelope key is required"))?;
     Ok(AppState {
         database,
         envelope: Arc::new(envelope),
@@ -151,6 +161,8 @@ pub async fn build_state(config: &AppConfig) -> anyhow::Result<AppState> {
         allow_private_oidc_issuers: config.allow_private_oidc_issuers,
         allow_private_model_endpoints: config.allow_private_model_endpoints,
         bootstrap_token: config.bootstrap_token.clone(),
+        identity_hash_key,
+        trust_proxy_headers: config.trust_proxy_headers,
         password_executor,
         version: env!("CARGO_PKG_VERSION"),
     })

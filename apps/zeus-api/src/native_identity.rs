@@ -115,12 +115,13 @@ pub async fn setup(
         .map_err(map_password_error)?;
     let session_token = random_token(32).map_err(|_| ApiError::Internal)?;
     let csrf_token = random_token(32).map_err(|_| ApiError::Internal)?;
+    let mut transaction = state.database.begin().await?;
     let setup = sqlx::query_as::<_, SetupRow>(
         "select * from zeus_private.bootstrap_native_identity(
            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
          )",
     )
-    .bind(email)
+    .bind(&email)
     .bind(request.display_name.trim())
     .bind(password_hash)
     .bind(request.organization_slug)
@@ -131,8 +132,16 @@ pub async fn setup(
     .bind(sha256(csrf_token.expose_secret().as_bytes()))
     .bind(i32::try_from(state.session_idle_ttl.as_secs()).unwrap_or(i32::MAX))
     .bind(i32::try_from(state.session_absolute_ttl.as_secs()).unwrap_or(i32::MAX))
-    .fetch_one(&state.database)
+    .fetch_one(&mut *transaction)
     .await?;
+    crate::native_auth::queue_email_verification_on(
+        &state,
+        &mut transaction,
+        setup.user_id,
+        &email,
+    )
+    .await?;
+    transaction.commit().await?;
 
     let mut headers = HeaderMap::new();
     headers.append(

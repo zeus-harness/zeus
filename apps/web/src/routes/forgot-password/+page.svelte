@@ -1,20 +1,20 @@
 <script lang="ts">
-  import type { ActionData, PageData } from './$types';
+  import type { ActionData } from './$types';
 
-  let { data, form } = $props<{ data: PageData; form: ActionData }>();
+  let { form } = $props<{ form: ActionData }>();
   let email = $derived(form?.values?.email ?? '');
 </script>
 
 <svelte:head>
-  <title>Zeus · 验证邮箱</title>
+  <title>Zeus · 找回密码</title>
 </svelte:head>
 
 <main class="mx-auto flex min-h-screen max-w-xl items-center px-5 py-10 lg:px-8">
   <section class="w-full rounded-xl border border-border bg-card p-6 shadow-xs sm:p-8">
     <p class="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Zeus identity</p>
-    <h1 class="mt-3 text-3xl font-semibold tracking-tight">验证邮箱</h1>
+    <h1 class="mt-3 text-3xl font-semibold tracking-tight">找回密码</h1>
     <p class="mt-3 text-sm leading-6 text-muted-foreground">
-      请检查注册邮箱中的验证链接。验证成功后即可使用原生账号登录。
+      输入账号邮箱，我们会发送下一步指引。为保护账号安全，页面不会确认邮箱是否已注册。
     </p>
 
     {#if form?.type === 'success'}
@@ -27,23 +27,11 @@
       </div>
     {/if}
 
-    {#if data.tokenPresent}
-      <form method="POST" class="mt-6">
-        <button type="submit" class="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">
-          确认邮箱
-        </button>
-      </form>
-    {:else}
-      <div class="mt-6 rounded-xl border border-border bg-muted/40 p-4 text-sm text-muted-foreground" role="status">
-        当前地址没有验证 token。请从邮件中的完整链接打开此页面。
-      </div>
-    {/if}
-
-    <form method="POST" action="?/resend" class="mt-6 space-y-3 border-t border-border pt-6">
+    <form method="POST" class="mt-6 space-y-5">
       <div>
-        <label class="text-sm font-medium" for="resend-email">Email</label>
+        <label class="text-sm font-medium" for="email">Email</label>
         <input
-          id="resend-email"
+          id="email"
           name="email"
           type="email"
           autocomplete="email"
@@ -52,8 +40,9 @@
           class="mt-2 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
         />
       </div>
-      <button type="submit" class="w-full rounded-md border border-border px-4 py-2 text-sm font-medium hover:bg-accent">
-        重发验证邮件
+
+      <button type="submit" class="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">
+        发送找回指引
       </button>
     </form>
 

@@ -7,6 +7,120 @@ info:
     identifier: MIT
   version: 0.1.0
 paths:
+  /api/v1/auth/context:
+    post:
+      tags:
+      - identity
+      operationId: select_identity_context
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SelectIdentityContextRequest'
+        required: true
+      responses:
+        '204':
+          description: Session tenant context selected
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/auth/email-verifications:
+    post:
+      tags:
+      - identity
+      operationId: request_email_verification
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmailAddressRequest'
+        required: true
+      responses:
+        '202':
+          description: Verification request accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AcceptedIdentityResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - {}
+  /api/v1/auth/email-verifications/confirm:
+    post:
+      tags:
+      - identity
+      operationId: confirm_email_verification
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TokenConfirmationRequest'
+        required: true
+      responses:
+        '204':
+          description: Email verified
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - {}
+  /api/v1/auth/login:
+    post:
+      tags:
+      - identity
+      operationId: native_login
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NativeLoginRequest'
+        required: true
+      responses:
+        '200':
+          description: Native login completed or awaiting MFA
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NativeLoginResponse'
+        '401':
+          description: Credentials rejected
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - {}
+  /api/v1/auth/logout:
+    post:
+      tags:
+      - identity
+      operationId: native_logout
+      responses:
+        '204':
+          description: Current web session revoked
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
   /api/v1/auth/me:
     get:
       tags:
@@ -21,6 +135,154 @@ paths:
                 $ref: '#/components/schemas/CurrentUserResponse'
         '401':
           description: Authentication required
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/auth/mfa/verify:
+    post:
+      tags:
+      - identity
+      operationId: verify_mfa
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MfaVerificationRequest'
+        required: true
+      responses:
+        '200':
+          description: MFA verified
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MfaVerificationResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/auth/password-resets:
+    post:
+      tags:
+      - identity
+      operationId: request_password_reset
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmailAddressRequest'
+        required: true
+      responses:
+        '202':
+          description: Password reset request accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AcceptedIdentityResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - {}
+  /api/v1/auth/password-resets/confirm:
+    post:
+      tags:
+      - identity
+      operationId: confirm_password_reset
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordResetConfirmationRequest'
+        required: true
+      responses:
+        '204':
+          description: Password reset completed
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - {}
+  /api/v1/auth/register:
+    post:
+      tags:
+      - identity
+      operationId: register
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+        required: true
+      responses:
+        '202':
+          description: Registration request accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AcceptedIdentityResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - {}
+  /api/v1/auth/sessions:
+    get:
+      tags:
+      - identity
+      operationId: list_web_sessions
+      responses:
+        '200':
+          description: Active web sessions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/WebSessionResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/auth/sessions/{session_id}:
+    delete:
+      tags:
+      - identity
+      operationId: revoke_web_session
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '204':
+          description: Web session revoked
+        default:
+          description: Problem Details error
           content:
             application/problem+json:
               schema:
@@ -320,6 +582,133 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CapabilityDefinitionResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/invitations:
+    get:
+      tags:
+      - identity
+      operationId: list_invitations
+      parameters:
+      - name: organization_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Organization invitations
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/InvitationResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - identity
+      operationId: create_invitation
+      parameters:
+      - name: organization_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateInvitationRequest'
+        required: true
+      responses:
+        '201':
+          description: Organization invitation created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvitationResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/invitations/{invitation_id}:
+    delete:
+      tags:
+      - identity
+      operationId: revoke_invitation
+      parameters:
+      - name: organization_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: invitation_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '204':
+          description: Invitation revoked
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/invitations/{invitation_id}/resend:
+    post:
+      tags:
+      - identity
+      operationId: resend_invitation
+      parameters:
+      - name: organization_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: invitation_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '202':
+          description: Invitation resend accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AcceptedIdentityResponse'
         default:
           description: Problem Details error
           content:
@@ -782,6 +1171,78 @@ paths:
                 $ref: '#/components/schemas/ProblemDetails'
       security:
       - {}
+  /api/v1/users/me/password:
+    put:
+      tags:
+      - identity
+      operationId: change_password
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangePasswordRequest'
+        required: true
+      responses:
+        '204':
+          description: Password changed and session rotated
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/users/me/totp:
+    post:
+      tags:
+      - identity
+      operationId: configure_totp
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TotpSetupRequest'
+        required: true
+      responses:
+        '200':
+          description: TOTP enrollment state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TotpSetupResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    delete:
+      tags:
+      - identity
+      operationId: disable_totp
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DisableTotpRequest'
+        required: true
+      responses:
+        '204':
+          description: TOTP disabled and session rotated
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
   /api/v1/workspaces/{workspace_id}:
     get:
       tags:
@@ -4010,6 +4471,16 @@ paths:
       - {}
 components:
   schemas:
+    AcceptedIdentityResponse:
+      type: object
+      required:
+      - accepted
+      - detail
+      properties:
+        accepted:
+          type: boolean
+        detail:
+          type: string
     ActivateVersionRequest:
       type: object
       required:
@@ -4273,6 +4744,20 @@ components:
         updated_at:
           type: string
           format: date-time
+    ChangePasswordRequest:
+      type: object
+      required:
+      - current_password
+      - new_password
+      properties:
+        current_password:
+          type: string
+          writeOnly: true
+        new_password:
+          type: string
+          writeOnly: true
+          maxLength: 128
+          minLength: 15
     ChildRunResponse:
       type: object
       required:
@@ -4549,6 +5034,20 @@ components:
         metadata: {}
         source_kind:
           type: string
+    CreateInvitationRequest:
+      type: object
+      required:
+      - email
+      - organization_role
+      properties:
+        email:
+          type: string
+        organization_role:
+          type: string
+        workspaces:
+          type: array
+          items:
+            $ref: '#/components/schemas/InvitationWorkspaceRequest'
     CreateModelProfileRequest:
       type: object
       required:
@@ -4997,6 +5496,25 @@ components:
           type:
           - string
           - 'null'
+    DisableTotpRequest:
+      type: object
+      required:
+      - password
+      - code
+      properties:
+        code:
+          type: string
+          writeOnly: true
+        password:
+          type: string
+          writeOnly: true
+    EmailAddressRequest:
+      type: object
+      required:
+      - email
+      properties:
+        email:
+          type: string
     ExperienceCandidatePageResponse:
       type: object
       required:
@@ -5233,6 +5751,65 @@ components:
       properties:
         status:
           type: string
+    InvitationResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - invited_by
+      - email
+      - organization_role
+      - status
+      - expires_at
+      - created_at
+      properties:
+        accepted_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        accepted_by:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+        email:
+          type: string
+        expires_at:
+          type: string
+          format: date-time
+        id:
+          type: string
+          format: uuid
+        invited_by:
+          type: string
+          format: uuid
+        organization_id:
+          type: string
+          format: uuid
+        organization_role:
+          type: string
+        revoked_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        status:
+          type: string
+    InvitationWorkspaceRequest:
+      type: object
+      required:
+      - workspace_id
+      - role
+      properties:
+        role:
+          type: string
+        workspace_id:
+          type: string
+          format: uuid
     MetaResponse:
       type: object
       required:
@@ -5256,6 +5833,24 @@ components:
         version:
           type: string
         worker_process:
+          type: boolean
+    MfaVerificationRequest:
+      type: object
+      required:
+      - code
+      properties:
+        code:
+          type: string
+          writeOnly: true
+    MfaVerificationResponse:
+      type: object
+      required:
+      - verified
+      - method
+      properties:
+        method:
+          type: string
+        verified:
           type: boolean
     ModelProfilePageResponse:
       type: object
@@ -5319,6 +5914,38 @@ components:
           type: string
           format: date-time
         workspace_id:
+          type: string
+          format: uuid
+    NativeLoginRequest:
+      type: object
+      required:
+      - email
+      - password
+      properties:
+        email:
+          type: string
+        password:
+          type: string
+          writeOnly: true
+    NativeLoginResponse:
+      type: object
+      required:
+      - user_id
+      - session_id
+      - email_verification_required
+      - mfa_required
+      - totp_setup_required
+      properties:
+        email_verification_required:
+          type: boolean
+        mfa_required:
+          type: boolean
+        session_id:
+          type: string
+          format: uuid
+        totp_setup_required:
+          type: boolean
+        user_id:
           type: string
           format: uuid
     OidcGroupMappingResponse:
@@ -5461,6 +6088,20 @@ components:
         updated_at:
           type: string
           format: date-time
+    PasswordResetConfirmationRequest:
+      type: object
+      required:
+      - token
+      - password
+      properties:
+        password:
+          type: string
+          writeOnly: true
+          maxLength: 128
+          minLength: 15
+        token:
+          type: string
+          writeOnly: true
     ProblemDetails:
       type: object
       required:
@@ -5487,6 +6128,27 @@ components:
         type:
           type: string
           example: https://zeus.example.com/problems/validation_failed
+    RegisterRequest:
+      type: object
+      required:
+      - email
+      - display_name
+      - password
+      properties:
+        display_name:
+          type: string
+        email:
+          type: string
+        invitation_token:
+          type:
+          - string
+          - 'null'
+          writeOnly: true
+        password:
+          type: string
+          writeOnly: true
+          maxLength: 128
+          minLength: 15
     RetryRunRequest:
       type: object
     ReviewExperienceCandidateRequest:
@@ -5783,6 +6445,19 @@ components:
         workspace_id:
           type: string
           format: uuid
+    SelectIdentityContextRequest:
+      type: object
+      properties:
+        organization_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        workspace_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
     ServiceAccountResponse:
       type: object
       required:
@@ -6033,6 +6708,45 @@ components:
           type: string
         kind:
           type: string
+    TokenConfirmationRequest:
+      type: object
+      required:
+      - token
+      properties:
+        token:
+          type: string
+          writeOnly: true
+    TotpSetupRequest:
+      type: object
+      properties:
+        code:
+          type:
+          - string
+          - 'null'
+          writeOnly: true
+    TotpSetupResponse:
+      type: object
+      required:
+      - confirmed
+      - recovery_codes
+      properties:
+        confirmed:
+          type: boolean
+        provisioning_uri:
+          type:
+          - string
+          - 'null'
+          writeOnly: true
+        recovery_codes:
+          type: array
+          items:
+            type: string
+            writeOnly: true
+        secret:
+          type:
+          - string
+          - 'null'
+          writeOnly: true
     TraceExperienceInjectionResponse:
       type: object
       required:
@@ -6383,6 +7097,53 @@ components:
           type:
           - string
           - 'null'
+    WebSessionResponse:
+      type: object
+      required:
+      - id
+      - auth_methods
+      - authenticated_at
+      - last_seen_at
+      - idle_expires_at
+      - absolute_expires_at
+      - current
+      properties:
+        absolute_expires_at:
+          type: string
+          format: date-time
+        active_organization_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        active_workspace_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        auth_methods:
+          type: array
+          items:
+            type: string
+        authenticated_at:
+          type: string
+          format: date-time
+        current:
+          type: boolean
+        id:
+          type: string
+          format: uuid
+        idle_expires_at:
+          type: string
+          format: date-time
+        last_seen_at:
+          type: string
+          format: date-time
+        mfa_satisfied_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
     WebhookEndpointPageResponse:
       type: object
       required:

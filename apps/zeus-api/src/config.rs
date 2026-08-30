@@ -33,6 +33,13 @@ pub struct AppConfig {
     pub envelope_key_id: String,
     pub envelope_key: Option<SecretString>,
     pub bootstrap_token: Option<SecretString>,
+    pub identity_hash_key: Option<SecretString>,
+    pub trust_proxy_headers: bool,
+    pub smtp_url: Option<SecretString>,
+    pub mail_from: Option<String>,
+    pub identity_maintenance_enabled: bool,
+    pub identity_email_poll_interval: Duration,
+    pub identity_email_lease_duration: Duration,
 }
 
 impl AppConfig {
@@ -42,6 +49,7 @@ impl AppConfig {
     ///
     /// Returns an error when a required value is missing, a value cannot be
     /// parsed, or a configured limit is outside the accepted range.
+    #[allow(clippy::too_many_lines)]
     pub fn from_env() -> anyhow::Result<Self> {
         let database_url = required("DATABASE_URL")?;
         let runtime_database_url =
@@ -77,6 +85,20 @@ impl AppConfig {
             env::var("ZEUS_ENVELOPE_KEY_ID").unwrap_or_else(|_| "local-v1".to_owned());
         let envelope_key = load_envelope_key()?;
         let bootstrap_token = load_bootstrap_token()?;
+        let identity_hash_key = env::var("ZEUS_IDENTITY_HASH_KEY")
+            .ok()
+            .map(SecretString::from)
+            .or_else(|| envelope_key.clone());
+        let trust_proxy_headers = parse("ZEUS_TRUST_PROXY_HEADERS", "false")?;
+        let smtp_url = env::var("ZEUS_SMTP_URL").ok().map(SecretString::from);
+        let mail_from = env::var("ZEUS_MAIL_FROM").ok();
+        let identity_maintenance_enabled = parse(
+            "ZEUS_IDENTITY_MAINTENANCE_ENABLED",
+            if smtp_url.is_some() { "true" } else { "false" },
+        )?;
+        let identity_email_poll_milliseconds: u64 =
+            parse("ZEUS_IDENTITY_EMAIL_POLL_MILLISECONDS", "1000")?;
+        let identity_email_lease_seconds: u64 = parse("ZEUS_IDENTITY_EMAIL_LEASE_SECONDS", "60")?;
 
         if run_concurrency == 0 {
             bail!("ZEUS_RUN_CONCURRENCY must be greater than zero");
@@ -96,6 +118,23 @@ impl AppConfig {
         }
         if !(60..=1800).contains(&oidc_state_ttl_seconds) {
             bail!("ZEUS_OIDC_STATE_TTL_SECONDS must be between 60 and 1800");
+        }
+        if identity_hash_key
+            .as_ref()
+            .is_some_and(|key| key.expose_secret().len() < 32)
+        {
+            bail!("ZEUS_IDENTITY_HASH_KEY must contain at least 32 bytes");
+        }
+        if identity_maintenance_enabled && (smtp_url.is_none() || mail_from.is_none()) {
+            bail!(
+                "ZEUS_SMTP_URL and ZEUS_MAIL_FROM are required when identity maintenance is enabled"
+            );
+        }
+        if !(100..=60_000).contains(&identity_email_poll_milliseconds) {
+            bail!("ZEUS_IDENTITY_EMAIL_POLL_MILLISECONDS must be between 100 and 60000");
+        }
+        if !(10..=600).contains(&identity_email_lease_seconds) {
+            bail!("ZEUS_IDENTITY_EMAIL_LEASE_SECONDS must be between 10 and 600");
         }
 
         Ok(Self {
@@ -119,6 +158,13 @@ impl AppConfig {
             envelope_key_id,
             envelope_key,
             bootstrap_token,
+            identity_hash_key,
+            trust_proxy_headers,
+            smtp_url,
+            mail_from,
+            identity_maintenance_enabled,
+            identity_email_poll_interval: Duration::from_millis(identity_email_poll_milliseconds),
+            identity_email_lease_duration: Duration::from_secs(identity_email_lease_seconds),
         })
     }
 }

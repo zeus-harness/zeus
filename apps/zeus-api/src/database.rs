@@ -61,6 +61,30 @@ pub async fn begin_tenant(
     Ok(transaction)
 }
 
+/// Starts a user-scoped transaction for global account resources.
+///
+/// Organization and workspace settings remain empty, so tenant tables stay
+/// inaccessible while user-level RLS policies can authorize the account owner.
+///
+/// # Errors
+///
+/// Returns a database error when the transaction or user context cannot be created.
+pub async fn begin_user(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query(
+        "select set_config('zeus.user_id', $1, true),
+                set_config('zeus.organization_id', '', true),
+                set_config('zeus.workspace_id', '', true)",
+    )
+    .bind(user_id.to_string())
+    .execute(&mut *transaction)
+    .await?;
+    Ok(transaction)
+}
+
 #[cfg(test)]
 mod tests {
     use uuid::Uuid;

@@ -130,6 +130,8 @@ init_env() {
     "ZEUS_COOKIE_SECURE=false" \
     "ZEUS_RUN_CONCURRENCY=4" \
     "ZEUS_SUPERVISOR_ENABLED=true" \
+    "ZEUS_TRUST_PROXY_HEADERS=true" \
+    "ZEUS_IDENTITY_MAINTENANCE_ENABLED=true" \
     > "${ZEUS_ENV_FILE}"
   chmod 0600 "${ZEUS_ENV_FILE}"
 
@@ -534,6 +536,8 @@ start_api() {
   export ZEUS_ENVELOPE_KEY_ID="${ZEUS_ENVELOPE_KEY_ID:-local-v1}"
   export ZEUS_SMTP_URL="smtp://${mailpit_ip}:1025"
   export ZEUS_MAIL_FROM="noreply@zeus.local"
+  export ZEUS_TRUST_PROXY_HEADERS="true"
+  export ZEUS_IDENTITY_MAINTENANCE_ENABLED="true"
 
   recreate_stateless_container "${ZEUS_API_CONTAINER}" 60
   container run \
@@ -557,6 +561,8 @@ start_api() {
     --env ZEUS_BOOTSTRAP_TOKEN \
     --env ZEUS_SMTP_URL \
     --env ZEUS_MAIL_FROM \
+    --env ZEUS_TRUST_PROXY_HEADERS \
+    --env ZEUS_IDENTITY_MAINTENANCE_ENABLED \
     "${ZEUS_API_IMAGE}" >/dev/null
 
   unset database_url

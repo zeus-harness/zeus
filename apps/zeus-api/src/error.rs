@@ -28,6 +28,12 @@ pub enum ApiError {
     Unauthorized,
     #[error("access is denied")]
     Forbidden,
+    #[error("email verification is required")]
+    EmailVerificationRequired,
+    #[error("multi-factor authentication is required")]
+    MfaRequired,
+    #[error("recent authentication is required")]
+    ReauthenticationRequired,
     #[error("the request conflicts with current resource state: {0}")]
     Conflict(String),
     #[error("If-Match is required for this operation")]
@@ -58,6 +64,7 @@ pub struct ProblemDetails {
 }
 
 impl IntoResponse for ApiError {
+    #[allow(clippy::too_many_lines)]
     fn into_response(self) -> axum::response::Response {
         let (status, code, title, retry_after) = match self {
             Self::DatabaseUnavailable => (
@@ -81,6 +88,24 @@ impl IntoResponse for ApiError {
                 None,
             ),
             Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden", "Access denied", None),
+            Self::EmailVerificationRequired => (
+                StatusCode::FORBIDDEN,
+                "email_verification_required",
+                "Email verification required",
+                None,
+            ),
+            Self::MfaRequired => (
+                StatusCode::FORBIDDEN,
+                "mfa_required",
+                "Multi-factor authentication required",
+                None,
+            ),
+            Self::ReauthenticationRequired => (
+                StatusCode::FORBIDDEN,
+                "reauthentication_required",
+                "Recent authentication required",
+                None,
+            ),
             Self::Conflict(_) => (StatusCode::CONFLICT, "conflict", "Conflict", None),
             Self::PreconditionRequired => (
                 StatusCode::PRECONDITION_REQUIRED,

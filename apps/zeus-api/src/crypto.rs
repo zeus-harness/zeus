@@ -4,6 +4,7 @@ use aes_gcm::{
 };
 use argon2::{Argon2, PasswordHasher, PasswordVerifier, password_hash::phc::PasswordHash};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, Mac};
 use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
 
@@ -127,6 +128,21 @@ pub fn sha256(value: &[u8]) -> Vec<u8> {
     Sha256::digest(value).to_vec()
 }
 
+/// Produces a keyed, one-way digest for low-entropy identity metadata.
+///
+/// # Panics
+///
+/// HMAC-SHA256 accepts keys of every length, so construction cannot fail.
+#[must_use]
+pub fn privacy_digest(key: &SecretString, domain: &str, value: &str) -> Vec<u8> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key.expose_secret().as_bytes())
+        .expect("HMAC accepts keys of every size");
+    mac.update(domain.as_bytes());
+    mac.update(&[0]);
+    mac.update(value.as_bytes());
+    mac.finalize().into_bytes().to_vec()
+}
+
 /// Generates a URL-safe secret using operating-system randomness.
 ///
 /// # Errors
@@ -175,8 +191,8 @@ mod tests {
     use secrecy::SecretString;
 
     use super::{
-        EnvelopeCipher, LocalEnvelopeCipher, hash_service_account_token, random_token,
-        verify_service_account_token,
+        EnvelopeCipher, LocalEnvelopeCipher, hash_service_account_token, privacy_digest,
+        random_token, verify_service_account_token,
     };
 
     #[test]
@@ -204,5 +220,19 @@ mod tests {
             &SecretString::from("wrong-token"),
             &hash
         ));
+    }
+
+    #[test]
+    fn privacy_digest_is_keyed_and_domain_separated() {
+        let first = SecretString::from("11".repeat(32));
+        let second = SecretString::from("22".repeat(32));
+        assert_ne!(
+            privacy_digest(&first, "ip", "127.0.0.1"),
+            privacy_digest(&second, "ip", "127.0.0.1")
+        );
+        assert_ne!(
+            privacy_digest(&first, "ip", "127.0.0.1"),
+            privacy_digest(&first, "email", "127.0.0.1")
+        );
     }
 }
