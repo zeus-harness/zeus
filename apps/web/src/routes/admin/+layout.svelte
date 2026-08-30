@@ -5,6 +5,11 @@
 
   let { children } = $props();
   let pathname = $derived(page.url.pathname);
+  const identityNavigation = [
+    { href: '/admin/identity-providers', label: 'Identity Providers', hint: '身份提供商' },
+    { href: '/admin/domains', label: 'Domains', hint: '已验证域名' },
+    { href: '/admin/security', label: 'Security', hint: '身份策略' }
+  ] as const;
 
   function navigationClass(active: boolean) {
     return active ? 'navigation-link is-active' : 'navigation-link';
@@ -49,6 +54,19 @@
             aria-current={pathname === `/admin/${resource.slug}` ? 'page' : undefined}
           >
             <span>{resource.label}</span>
+          </a>
+        {/each}
+
+        <div class="navigation-divider" aria-hidden="true"></div>
+        <div class="sidebar-heading nested-heading">Organization</div>
+        {#each identityNavigation as item (item.href)}
+          <a
+            class={navigationClass(pathname === item.href)}
+            href={item.href}
+            aria-current={pathname === item.href ? 'page' : undefined}
+          >
+            <span>{item.label}</span>
+            <span class="navigation-hint">{item.hint}</span>
           </a>
         {/each}
       </nav>
@@ -187,6 +205,16 @@
   .navigation-link.is-active {
     background: var(--accent);
     color: var(--accent-foreground);
+  }
+
+  .navigation-divider {
+    height: 1px;
+    margin: 0.65rem 0.75rem 0.35rem;
+    background: var(--border);
+  }
+
+  .nested-heading {
+    padding-top: 0.25rem;
   }
 
   .navigation-hint {

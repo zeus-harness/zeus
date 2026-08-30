@@ -13,7 +13,7 @@ use url::Url;
 use uuid::Uuid;
 use zeus_api::{
     AppState, HTTP_DATABASE_ROLE, connect_pool, connect_pool_as_role,
-    crypto::{LocalEnvelopeCipher, hash_service_account_token},
+    crypto::{LocalEnvelopeCipher, hash_service_account_token, sha256},
     http, migrate,
     supervisor::SupervisorMetrics,
 };
@@ -43,6 +43,14 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
         .execute(&owner_pool)
         .await
         .expect("organization inserts");
+    sqlx::query(
+        "insert into organization_identity_policies (organization_id)
+         values ($1)",
+    )
+    .bind(organization_id)
+    .execute(&owner_pool)
+    .await
+    .expect("organization identity policy inserts");
     for (id, name) in [
         (workspace_id, "Primary Workspace"),
         (other_workspace_id, "Other Workspace"),
@@ -60,44 +68,47 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
         .expect("workspace inserts");
     }
 
-    let oidc_provider_id = Uuid::now_v7();
+    let federated_provider_id = Uuid::now_v7();
     sqlx::query(
-        "insert into oidc_providers (
-            id, organization_id, issuer_url, client_id,
-            encrypted_client_secret, secret_nonce, key_id
-         ) values ($1, $2, 'https://issuer.example.test', 'control-client', $3, $4, 'test-v1')",
+        "insert into federated_identity_providers (
+            id, organization_id, slug, issuer_url, client_id,
+            encrypted_client_secret, secret_nonce, key_id, jit_enabled
+         ) values (
+            $1, $2, 'control-provider', 'https://issuer.example.test',
+            'control-client', $3, $4, 'test-v1', true
+         )",
     )
-    .bind(oidc_provider_id)
+    .bind(federated_provider_id)
     .bind(organization_id)
     .bind(vec![0_u8; 32])
     .bind(vec![0_u8; 12])
     .execute(&owner_pool)
     .await
-    .expect("OIDC provider inserts");
+    .expect("federated provider inserts");
     sqlx::query(
-        "insert into oidc_group_mappings (
+        "insert into federated_group_mappings (
             organization_id, provider_id, group_value, organization_role
          ) values ($1, $2, 'zeus-admins', 'admin')",
     )
     .bind(organization_id)
-    .bind(oidc_provider_id)
+    .bind(federated_provider_id)
     .execute(&owner_pool)
     .await
     .expect("organization group mapping inserts");
     sqlx::query(
-        "insert into oidc_group_mappings (
+        "insert into federated_group_mappings (
             organization_id, provider_id, group_value, workspace_id, workspace_role
          ) values ($1, $2, 'zeus-builders', $3, 'builder')",
     )
     .bind(organization_id)
-    .bind(oidc_provider_id)
+    .bind(federated_provider_id)
     .bind(workspace_id)
     .execute(&owner_pool)
     .await
     .expect("workspace group mapping inserts");
 
     let service_account_id = Uuid::now_v7();
-    let token_prefix = "zsa_control01";
+    let token_prefix = format!("zsa_{}", &service_account_id.simple().to_string()[..12]);
     let token = format!("{token_prefix}.abcdefghijklmnopqrstuvwxyz1234567890ABCD");
     let token_hash = hash_service_account_token(&SecretString::from(token.clone()))
         .expect("service account token hashes");
@@ -109,7 +120,7 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     .bind(service_account_id)
     .bind(organization_id)
     .bind(workspace_id)
-    .bind(token_prefix)
+    .bind(&token_prefix)
     .bind(token_hash)
     .bind(vec![
         "organization:manage",
@@ -132,28 +143,200 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
         .await
         .expect("HTTP role can query its identity");
     assert_eq!(current_role, HTTP_DATABASE_ROLE);
-    let jit_identity = sqlx::query_as::<_, (Uuid, Uuid, Option<Uuid>)>(
-        "select * from zeus_private.jit_oidc_identity($1, $2, $3, $4, $5, $6, $7)",
+
+    let existing_user_id = Uuid::now_v7();
+    sqlx::query(
+        "insert into users (id, email, display_name, status, email_verified_at)
+         values ($1, 'existing@example.test', 'Existing User', 'active', now())",
     )
-    .bind(oidc_provider_id)
+    .bind(existing_user_id)
+    .execute(&owner_pool)
+    .await
+    .expect("existing Zeus user inserts");
+    sqlx::query(
+        "insert into organization_memberships (organization_id, user_id, role, status)
+         values ($1, $2, 'admin', 'active')",
+    )
+    .bind(organization_id)
+    .bind(existing_user_id)
+    .execute(&owner_pool)
+    .await
+    .expect("existing Zeus user joins organization");
+    let account_link_required = sqlx::query_as::<_, (String, Option<Uuid>, Uuid, Option<Uuid>)>(
+        "select * from zeus_private.resolve_federated_identity(
+           $1, 'login', null, $2, $3, $4, $5, true, $6, $7
+         )",
+    )
+    .bind(federated_provider_id)
+    .bind("https://issuer.example.test")
+    .bind("existing-subject")
+    .bind("existing@example.test")
+    .bind("Existing User")
+    .bind(json!({ "groups": ["zeus-admins"] }))
+    .bind(vec!["zeus-admins"])
+    .fetch_one(&http_pool)
+    .await
+    .expect("same-email federated login is resolved safely");
+    assert_eq!(account_link_required.0, "account_link_required");
+    assert_eq!(account_link_required.1, None);
+    let identity_count: i64 = sqlx::query_scalar(
+        "select count(*) from federated_identities
+         where issuer = 'https://issuer.example.test' and subject = 'existing-subject'",
+    )
+    .fetch_one(&owner_pool)
+    .await
+    .expect("federated identity count reads");
+    assert_eq!(
+        identity_count, 0,
+        "same email must not auto-link an account"
+    );
+
+    let linked = sqlx::query_as::<_, (String, Option<Uuid>, Uuid, Option<Uuid>)>(
+        "select * from zeus_private.resolve_federated_identity(
+           $1, 'link', $2, $3, $4, $5, $6, true, $7, $8
+         )",
+    )
+    .bind(federated_provider_id)
+    .bind(existing_user_id)
+    .bind("https://issuer.example.test")
+    .bind("existing-subject")
+    .bind("existing@example.test")
+    .bind("Existing User")
+    .bind(json!({ "groups": ["zeus-admins"] }))
+    .bind(vec!["zeus-admins"])
+    .fetch_one(&http_pool)
+    .await
+    .expect("explicit link binds the upstream identity");
+    assert_eq!(linked.0, "linked");
+    assert_eq!(linked.1, Some(existing_user_id));
+
+    let authenticated = sqlx::query_as::<_, (String, Option<Uuid>, Uuid, Option<Uuid>)>(
+        "select * from zeus_private.resolve_federated_identity(
+           $1, 'login', null, $2, $3, $4, $5, true, $6, $7
+         )",
+    )
+    .bind(federated_provider_id)
+    .bind("https://issuer.example.test")
+    .bind("existing-subject")
+    .bind("existing@example.test")
+    .bind("Existing User")
+    .bind(json!({ "groups": ["zeus-admins"] }))
+    .bind(vec!["zeus-admins"])
+    .fetch_one(&http_pool)
+    .await
+    .expect("linked upstream identity authenticates the Zeus user");
+    assert_eq!(authenticated.0, "authenticated");
+    assert_eq!(authenticated.1, Some(existing_user_id));
+
+    let existing_session_id = Uuid::now_v7();
+    let existing_session_token = "integration-user-session-token";
+    let existing_csrf_token = "integration-user-csrf-token";
+    sqlx::query(
+        "insert into web_sessions (
+           id, user_id, active_organization_id, token_hash, csrf_token_hash,
+           auth_methods, authenticated_at, idle_expires_at, absolute_expires_at
+         ) values (
+           $1, $2, $3, $4, $5, array['password'], now(),
+           now() + interval '2 hours', now() + interval '12 hours'
+         )",
+    )
+    .bind(existing_session_id)
+    .bind(existing_user_id)
+    .bind(organization_id)
+    .bind(sha256(existing_session_token.as_bytes()))
+    .bind(sha256(existing_csrf_token.as_bytes()))
+    .execute(&owner_pool)
+    .await
+    .expect("existing user session inserts");
+    let linkable_provider = sqlx::query_as::<_, (Uuid, Uuid)>(
+        "select id, organization_id
+         from zeus_private.get_federated_provider_for_link($1, $2, $3)",
+    )
+    .bind(federated_provider_id)
+    .bind(existing_user_id)
+    .bind(existing_session_id)
+    .fetch_one(&http_pool)
+    .await
+    .expect("a member session can load its provider without active tenant RLS context");
+    assert_eq!(linkable_provider, (federated_provider_id, organization_id));
+
+    let other_organization_id = Uuid::now_v7();
+    sqlx::query(
+        "insert into organizations (id, slug, name)
+         values ($1, $2, 'Other Federated Organization')",
+    )
+    .bind(other_organization_id)
+    .bind(format!("federated-other-{other_organization_id}"))
+    .execute(&owner_pool)
+    .await
+    .expect("other federated organization inserts");
+    let other_provider_id = Uuid::now_v7();
+    sqlx::query(
+        "insert into federated_identity_providers (
+           id, organization_id, slug, issuer_url, client_id,
+           encrypted_client_secret, secret_nonce, key_id
+         ) values (
+           $1, $2, 'other-provider', 'https://other-issuer.example.test',
+           'other-client', $3, $4, 'test-v1'
+         )",
+    )
+    .bind(other_provider_id)
+    .bind(other_organization_id)
+    .bind(vec![11_u8; 32])
+    .bind(vec![12_u8; 12])
+    .execute(&owner_pool)
+    .await
+    .expect("other federated provider inserts");
+    let cross_organization_link = sqlx::query_scalar::<_, Uuid>(
+        "select zeus_private.create_federated_login_transaction(
+           $1, 'link', $2, $3, $4, $5, $6, 'test-v1',
+           '/account/federation', $7
+         )",
+    )
+    .bind(other_provider_id)
+    .bind(existing_user_id)
+    .bind(existing_session_id)
+    .bind(vec![13_u8; 32])
+    .bind(vec![14_u8; 32])
+    .bind(vec![15_u8; 12])
+    .bind(time::OffsetDateTime::now_utc() + time::Duration::minutes(10))
+    .fetch_one(&http_pool)
+    .await
+    .expect_err("a session from another organization cannot start a provider link");
+    assert_eq!(
+        cross_organization_link
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code),
+        Some(std::borrow::Cow::Borrowed("42501"))
+    );
+
+    let jit_identity = sqlx::query_as::<_, (String, Option<Uuid>, Uuid, Option<Uuid>)>(
+        "select * from zeus_private.resolve_federated_identity(
+           $1, 'login', null, $2, $3, $4, $5, $6, $7, $8
+         )",
+    )
+    .bind(federated_provider_id)
     .bind("https://issuer.example.test")
     .bind("control-subject")
     .bind("builder@example.test")
     .bind("Control Builder")
     .bind(true)
     .bind(json!({ "groups": ["zeus-admins", "zeus-builders"] }))
+    .bind(vec!["zeus-admins", "zeus-builders"])
     .fetch_one(&http_pool)
     .await
-    .expect("OIDC identity is JIT provisioned through the HTTP role");
-    assert_eq!(jit_identity.1, organization_id);
-    assert_eq!(jit_identity.2, Some(workspace_id));
+    .expect("federated identity is JIT provisioned through the HTTP role");
+    assert_eq!(jit_identity.0, "jit_created");
+    assert_eq!(jit_identity.2, organization_id);
+    assert_eq!(jit_identity.3, Some(workspace_id));
+    let jit_user_id = jit_identity.1.expect("JIT creates a user");
     let roles = sqlx::query_as::<_, (String, String)>(
         "select om.role, wm.role
          from organization_memberships om
          join workspace_memberships wm on wm.user_id = om.user_id
          where om.user_id = $1 and om.organization_id = $2 and wm.workspace_id = $3",
     )
-    .bind(jit_identity.0)
+    .bind(jit_user_id)
     .bind(organization_id)
     .bind(workspace_id)
     .fetch_one(&owner_pool)
@@ -191,6 +374,92 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     let (_, me) = expect_json(me, StatusCode::OK).await;
     assert_eq!(me["principal_kind"], "service_account");
     assert_eq!(me["workspace_id"], workspace_id.to_string());
+
+    let user_organizations = send_user(
+        &app,
+        Method::GET,
+        "/api/v1/users/me/organizations",
+        existing_session_token,
+        existing_csrf_token,
+        None,
+        &[],
+    )
+    .await;
+    let (_, user_organizations) = expect_json(user_organizations, StatusCode::OK).await;
+    assert_eq!(
+        user_organizations[0]["organization_id"],
+        organization_id.to_string()
+    );
+    assert_eq!(
+        user_organizations[0]["identity_providers"][0]["id"],
+        federated_provider_id.to_string()
+    );
+
+    let providers = send(
+        &app,
+        Method::GET,
+        &format!("/api/v1/organizations/{organization_id}/identity-providers"),
+        &token,
+        None,
+        &[],
+    )
+    .await;
+    let (_, providers) = expect_json(providers, StatusCode::OK).await;
+    assert_eq!(providers.as_array().map(Vec::len), Some(1));
+    assert_eq!(providers[0]["id"], federated_provider_id.to_string());
+
+    let domain = send_user(
+        &app,
+        Method::POST,
+        &format!("/api/v1/organizations/{organization_id}/domains"),
+        existing_session_token,
+        existing_csrf_token,
+        Some(json!({
+            "domain": format!("control-{organization_id}.example.test")
+        })),
+        &[],
+    )
+    .await;
+    let (_, domain) = expect_json(domain, StatusCode::CREATED).await;
+    assert_eq!(domain["status"], "pending");
+    assert!(
+        domain["txt_record_value"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("zeus-domain-verification="))
+    );
+
+    let policy = send_user(
+        &app,
+        Method::GET,
+        &format!("/api/v1/organizations/{organization_id}/identity-policy"),
+        existing_session_token,
+        existing_csrf_token,
+        None,
+        &[],
+    )
+    .await;
+    let (_, policy) = expect_json(policy, StatusCode::OK).await;
+    assert_eq!(policy["revision"], 1);
+    let policy = send_user(
+        &app,
+        Method::PUT,
+        &format!("/api/v1/organizations/{organization_id}/identity-policy"),
+        existing_session_token,
+        existing_csrf_token,
+        Some(json!({
+            "mfa_required": false,
+            "federated_required": true,
+            "required_federated_provider_id": federated_provider_id
+        })),
+        &[(header::IF_MATCH.as_str(), "\"revision-1\"")],
+    )
+    .await;
+    let (_, policy) = expect_json(policy, StatusCode::OK).await;
+    assert_eq!(policy["revision"], 2);
+    assert_eq!(
+        policy["required_federated_provider_id"],
+        federated_provider_id.to_string()
+    );
 
     let forbidden = send(
         &app,
@@ -473,6 +742,41 @@ async fn send(
         .method(method)
         .uri(uri)
         .header(header::AUTHORIZATION, format!("Bearer {token}"));
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let body = match body {
+        Some(body) => {
+            request = request.header(header::CONTENT_TYPE, "application/json");
+            Body::from(body.to_string())
+        }
+        None => Body::empty(),
+    };
+    app.clone()
+        .oneshot(request.body(body).expect("request builds"))
+        .await
+        .expect("router responds")
+}
+
+async fn send_user(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    session_token: &str,
+    csrf_token: &str,
+    body: Option<Value>,
+    headers: &[(&str, &str)],
+) -> Response<Body> {
+    let is_write = !matches!(method, Method::GET | Method::HEAD | Method::OPTIONS);
+    let mut request = Request::builder().method(method).uri(uri).header(
+        header::COOKIE,
+        format!("zeus_session={session_token}; zeus_csrf={csrf_token}"),
+    );
+    if is_write {
+        request = request
+            .header(header::ORIGIN, "http://127.0.0.1:8080")
+            .header("x-zeus-csrf", csrf_token);
+    }
     for (name, value) in headers {
         request = request.header(*name, *value);
     }

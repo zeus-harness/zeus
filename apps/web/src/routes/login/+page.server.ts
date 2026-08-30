@@ -22,6 +22,30 @@ function loginError(status: number): string {
   return '邮箱或密码不正确。';
 }
 
+const SLUG_PATTERN = /^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])$/;
+
+type FederatedLoginValues = {
+  organization_slug: string;
+  provider_slug: string;
+};
+
+function isStrictSlug(value: string): boolean {
+  return SLUG_PATTERN.test(value);
+}
+
+function federatedActionError(status: number, message: string, values: FederatedLoginValues) {
+  return fail(status, { type: 'error' as const, message, values });
+}
+
+function isTotpSetupRequired(payload: unknown): boolean {
+  return (
+    typeof payload === 'object' &&
+    payload !== null &&
+    !Array.isArray(payload) &&
+    (payload as Record<string, unknown>).totp_setup_required === true
+  );
+}
+
 export const actions: Actions = {
   default: async (event) => {
     const formData = await event.request.formData();
@@ -48,9 +72,36 @@ export const actions: Actions = {
       return actionError(status, loginError(response.status), email);
     }
 
+    if (isTotpSetupRequired(payload)) {
+      redirect(303, '/account/security?setup_totp=1');
+    }
     if (isMfaRequired(payload)) {
       redirect(303, '/mfa');
     }
     redirect(303, '/');
+  },
+
+  federated: async (event) => {
+    const formData = await event.request.formData();
+    const values: FederatedLoginValues = {
+      organization_slug: formValue(formData, 'organization_slug'),
+      provider_slug: formValue(formData, 'provider_slug')
+    };
+
+    if (!values.organization_slug) {
+      return federatedActionError(400, 'Organization slug 不能为空。', values);
+    }
+    if (!values.provider_slug) {
+      return federatedActionError(400, 'Provider slug 不能为空。', values);
+    }
+    if (!isStrictSlug(values.organization_slug) || !isStrictSlug(values.provider_slug)) {
+      return federatedActionError(400, 'Organization slug 或 Provider slug 格式无效。', values);
+    }
+
+    const loginUrl = new URL(
+      `/auth/federated/${encodeURIComponent(values.organization_slug)}/${encodeURIComponent(values.provider_slug)}`,
+      event.url.origin
+    );
+    redirect(303, `${loginUrl.pathname}?return_to=/`);
   }
 };

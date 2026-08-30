@@ -121,7 +121,6 @@ export const actions: Actions = {
     const newPassword = formValue(formData, 'new_password', false);
     const confirmation = formData.get('new_password_confirmation');
 
-    if (!currentPassword) return actionError(400, '当前密码不能为空。');
     if (!newPassword) return actionError(400, '新密码不能为空。');
     if (typeof confirmation === 'string' && confirmation !== newPassword) {
       return actionError(400, '两次输入的新密码不一致。');
@@ -133,7 +132,7 @@ export const actions: Actions = {
     let response: Response;
     try {
       response = await accountApi(event, 'PUT', '/api/v1/users/me/password', {
-        current_password: currentPassword,
+        current_password: currentPassword || null,
         new_password: newPassword
       });
     } catch {

@@ -34,6 +34,8 @@ pub enum ApiError {
     MfaRequired,
     #[error("recent authentication is required")]
     ReauthenticationRequired,
+    #[error("the organization requires its configured federated identity provider")]
+    FederatedAuthenticationRequired,
     #[error("the request conflicts with current resource state: {0}")]
     Conflict(String),
     #[error("If-Match is required for this operation")]
@@ -104,6 +106,12 @@ impl IntoResponse for ApiError {
                 StatusCode::FORBIDDEN,
                 "reauthentication_required",
                 "Recent authentication required",
+                None,
+            ),
+            Self::FederatedAuthenticationRequired => (
+                StatusCode::FORBIDDEN,
+                "federated_authentication_required",
+                "Federated authentication required",
                 None,
             ),
             Self::Conflict(_) => (StatusCode::CONFLICT, "conflict", "Conflict", None),

@@ -290,6 +290,30 @@ paths:
       security:
       - sessionCookie: []
       - serviceAccountBearer: []
+  /api/v1/invitations/{token}/accept:
+    post:
+      tags:
+      - identity
+      operationId: accept_invitation
+      parameters:
+      - name: token
+        in: path
+        description: One-time invitation token
+        required: true
+        schema:
+          type: string
+      responses:
+        '204':
+          description: Invitation accepted and tenant context selected
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
   /api/v1/meta:
     get:
       tags:
@@ -591,6 +615,375 @@ paths:
       security:
       - sessionCookie: []
       - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/domains:
+    get:
+      tags:
+      - identity
+      operationId: list_domains
+      parameters:
+      - name: organization_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Verified-domain configuration
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/OrganizationDomainResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - identity
+      operationId: create_domain
+      parameters:
+      - name: organization_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrganizationDomainRequest'
+        required: true
+      responses:
+        '201':
+          description: Domain verification challenge created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedOrganizationDomainResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/domains/{domain_id}:
+    delete:
+      tags:
+      - identity
+      operationId: revoke_domain
+      parameters:
+      - name: organization_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: domain_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '204':
+          description: Domain revoked
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/domains/{domain_id}/verify:
+    post:
+      tags:
+      - identity
+      operationId: verify_domain
+      parameters:
+      - name: organization_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: domain_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Domain verified
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrganizationDomainResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/identity-policy:
+    get:
+      tags:
+      - identity
+      operationId: get_identity_policy
+      parameters:
+      - name: organization_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Organization identity policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrganizationIdentityPolicyResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    put:
+      tags:
+      - identity
+      operationId: update_identity_policy
+      parameters:
+      - name: organization_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateOrganizationIdentityPolicyRequest'
+        required: true
+      responses:
+        '200':
+          description: Organization identity policy updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrganizationIdentityPolicyResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/identity-providers:
+    get:
+      tags:
+      - organization
+      operationId: list_federated_identity_providers
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/FederatedIdentityProviderResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - organization
+      operationId: create_federated_identity_provider
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateFederatedIdentityProviderRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FederatedIdentityProviderResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/identity-providers/{provider_id}:
+    patch:
+      tags:
+      - organization
+      operationId: update_federated_identity_provider
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: provider_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateFederatedIdentityProviderRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FederatedIdentityProviderResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/identity-providers/{provider_id}/group-mappings:
+    get:
+      tags:
+      - organization
+      operationId: list_federated_group_mappings
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: provider_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/FederatedGroupMappingResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - organization
+      operationId: create_federated_group_mapping
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: provider_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateFederatedGroupMappingRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FederatedGroupMappingResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
   /api/v1/organizations/{organization_id}/invitations:
     get:
       tags:
@@ -769,187 +1162,6 @@ paths:
       responses:
         '204':
           description: Successful response
-        default:
-          description: Problem Details error
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/ProblemDetails'
-      security:
-      - sessionCookie: []
-      - serviceAccountBearer: []
-  /api/v1/organizations/{organization_id}/oidc-providers:
-    get:
-      tags:
-      - organization
-      operationId: list_oidc_providers
-      parameters:
-      - name: organization_id
-        in: path
-        description: Path identifier
-        required: true
-        schema:
-          type: string
-      responses:
-        '200':
-          description: Successful response
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/OidcProviderResponse'
-        default:
-          description: Problem Details error
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/ProblemDetails'
-      security:
-      - sessionCookie: []
-      - serviceAccountBearer: []
-    post:
-      tags:
-      - organization
-      operationId: create_oidc_provider
-      parameters:
-      - name: organization_id
-        in: path
-        description: Path identifier
-        required: true
-        schema:
-          type: string
-      requestBody:
-        description: JSON request body
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/CreateOidcProviderRequest'
-        required: true
-      responses:
-        '201':
-          description: Successful response
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/OidcProviderResponse'
-        default:
-          description: Problem Details error
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/ProblemDetails'
-      security:
-      - sessionCookie: []
-      - serviceAccountBearer: []
-  /api/v1/organizations/{organization_id}/oidc-providers/{provider_id}:
-    patch:
-      tags:
-      - organization
-      operationId: update_oidc_provider
-      parameters:
-      - name: organization_id
-        in: path
-        description: Path identifier
-        required: true
-        schema:
-          type: string
-      - name: provider_id
-        in: path
-        description: Path identifier
-        required: true
-        schema:
-          type: string
-      requestBody:
-        description: JSON request body
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/UpdateOidcProviderRequest'
-        required: true
-      responses:
-        '200':
-          description: Successful response
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/OidcProviderResponse'
-        default:
-          description: Problem Details error
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/ProblemDetails'
-      security:
-      - sessionCookie: []
-      - serviceAccountBearer: []
-  /api/v1/organizations/{organization_id}/oidc-providers/{provider_id}/group-mappings:
-    get:
-      tags:
-      - organization
-      operationId: list_oidc_group_mappings
-      parameters:
-      - name: organization_id
-        in: path
-        description: Path identifier
-        required: true
-        schema:
-          type: string
-      - name: provider_id
-        in: path
-        description: Path identifier
-        required: true
-        schema:
-          type: string
-      responses:
-        '200':
-          description: Successful response
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/OidcGroupMappingResponse'
-        default:
-          description: Problem Details error
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/ProblemDetails'
-      security:
-      - sessionCookie: []
-      - serviceAccountBearer: []
-    post:
-      tags:
-      - organization
-      operationId: create_oidc_group_mapping
-      parameters:
-      - name: organization_id
-        in: path
-        description: Path identifier
-        required: true
-        schema:
-          type: string
-      - name: provider_id
-        in: path
-        description: Path identifier
-        required: true
-        schema:
-          type: string
-      requestBody:
-        description: JSON request body
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/CreateOidcGroupMappingRequest'
-        required: true
-      responses:
-        '201':
-          description: Successful response
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/OidcGroupMappingResponse'
         default:
           description: Problem Details error
           content:
@@ -1171,6 +1383,104 @@ paths:
                 $ref: '#/components/schemas/ProblemDetails'
       security:
       - {}
+  /api/v1/users/me/federated-identities:
+    get:
+      tags:
+      - identity
+      operationId: list_federated_identities
+      responses:
+        '200':
+          description: Federated identities linked to the current user
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/FederatedIdentityResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/users/me/federated-identities/{identity_id}:
+    delete:
+      tags:
+      - identity
+      operationId: unlink_federated_identity
+      parameters:
+      - name: identity_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '204':
+          description: Federated identity unlinked
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/users/me/federated-identities/{provider_id}/link-intents:
+    post:
+      tags:
+      - identity
+      operationId: create_federated_link_intent
+      parameters:
+      - name: provider_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Federated link authorization URL
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FederatedLinkIntentResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/users/me/organizations:
+    get:
+      tags:
+      - identity
+      operationId: list_user_organizations
+      responses:
+        '200':
+          description: Organizations available to the current user
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/UserOrganizationResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
   /api/v1/users/me/password:
     put:
       tags:
@@ -4351,20 +4661,26 @@ paths:
       security:
       - sessionCookie: []
       - serviceAccountBearer: []
-  /auth/callback/{provider_id}:
+  /auth/federated/{organization_slug}/{provider_slug}:
     get:
       tags:
       - identity
-      operationId: callback
+      operationId: federated_login
       parameters:
-      - name: provider_id
+      - name: organization_slug
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: provider_slug
         in: path
         description: Path identifier
         required: true
         schema:
           type: string
       responses:
-        '302':
+        '303':
           description: Successful response
         default:
           description: Problem Details error
@@ -4374,20 +4690,26 @@ paths:
                 $ref: '#/components/schemas/ProblemDetails'
       security:
       - {}
-  /auth/login/{provider_id}:
+  /auth/federated/{organization_slug}/{provider_slug}/callback:
     get:
       tags:
       - identity
-      operationId: login
+      operationId: federated_callback
       parameters:
-      - name: provider_id
+      - name: organization_slug
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: provider_slug
         in: path
         description: Path identifier
         required: true
         schema:
           type: string
       responses:
-        '302':
+        '303':
           description: Successful response
         default:
           description: Problem Details error
@@ -4403,7 +4725,7 @@ paths:
       - identity
       operationId: logout
       responses:
-        '302':
+        '303':
           description: Successful response
         default:
           description: Problem Details error
@@ -4747,11 +5069,12 @@ components:
     ChangePasswordRequest:
       type: object
       required:
-      - current_password
       - new_password
       properties:
         current_password:
-          type: string
+          type:
+          - string
+          - 'null'
           writeOnly: true
         new_password:
           type: string
@@ -5034,6 +5357,61 @@ components:
         metadata: {}
         source_kind:
           type: string
+    CreateFederatedGroupMappingRequest:
+      type: object
+      required:
+      - group_value
+      properties:
+        group_value:
+          type: string
+        organization_role:
+          type:
+          - string
+          - 'null'
+        workspace_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        workspace_role:
+          type:
+          - string
+          - 'null'
+    CreateFederatedIdentityProviderRequest:
+      type: object
+      required:
+      - slug
+      - issuer_url
+      - client_id
+      - client_secret
+      properties:
+        client_id:
+          type: string
+        client_secret:
+          type: string
+          writeOnly: true
+        group_claim:
+          type:
+          - string
+          - 'null'
+        issuer_url:
+          type: string
+        jit_enabled:
+          type: boolean
+        scopes:
+          type: array
+          items:
+            type: string
+        slug:
+          type: string
+        trusted_acr:
+          type: array
+          items:
+            type: string
+        trusted_amr:
+          type: array
+          items:
+            type: string
     CreateInvitationRequest:
       type: object
       required:
@@ -5068,48 +5446,13 @@ components:
           type: string
         provider_kind:
           type: string
-    CreateOidcGroupMappingRequest:
+    CreateOrganizationDomainRequest:
       type: object
       required:
-      - group_value
+      - domain
       properties:
-        group_value:
+        domain:
           type: string
-        organization_role:
-          type:
-          - string
-          - 'null'
-        workspace_id:
-          type:
-          - string
-          - 'null'
-          format: uuid
-        workspace_role:
-          type:
-          - string
-          - 'null'
-    CreateOidcProviderRequest:
-      type: object
-      required:
-      - issuer_url
-      - client_id
-      - client_secret
-      properties:
-        client_id:
-          type: string
-        client_secret:
-          type: string
-          writeOnly: true
-        group_claim:
-          type:
-          - string
-          - 'null'
-        issuer_url:
-          type: string
-        scopes:
-          type: array
-          items:
-            type: string
     CreateOrganizationRequest:
       type: object
       required:
@@ -5311,6 +5654,19 @@ components:
           type: string
         slug:
           type: string
+    CreatedOrganizationDomainResponse:
+      allOf:
+      - $ref: '#/components/schemas/OrganizationDomainResponse'
+      - type: object
+        required:
+        - txt_record_name
+        - txt_record_value
+        properties:
+          txt_record_name:
+            type: string
+          txt_record_value:
+            type: string
+            writeOnly: true
     CreatedOrganizationResponse:
       type: object
       required:
@@ -5417,6 +5773,7 @@ components:
       - display_name
       - platform_roles
       - auth_methods
+      - has_native_password
       properties:
         absolute_expires_at:
           type:
@@ -5443,6 +5800,8 @@ components:
           - string
           - 'null'
           format: date-time
+        has_native_password:
+          type: boolean
         idle_expires_at:
           type:
           - string
@@ -5744,6 +6103,143 @@ components:
           type: string
         status:
           type: string
+    FederatedGroupMappingResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - provider_id
+      - group_value
+      - created_at
+      properties:
+        created_at:
+          type: string
+          format: date-time
+        group_value:
+          type: string
+        id:
+          type: string
+          format: uuid
+        organization_id:
+          type: string
+          format: uuid
+        organization_role:
+          type:
+          - string
+          - 'null'
+        provider_id:
+          type: string
+          format: uuid
+        workspace_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        workspace_role:
+          type:
+          - string
+          - 'null'
+    FederatedIdentityProviderResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - slug
+      - issuer_url
+      - client_id
+      - scopes
+      - jit_enabled
+      - trusted_acr
+      - trusted_amr
+      - enabled
+      - revision
+      - created_at
+      - updated_at
+      properties:
+        client_id:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        enabled:
+          type: boolean
+        group_claim:
+          type:
+          - string
+          - 'null'
+        id:
+          type: string
+          format: uuid
+        issuer_url:
+          type: string
+        jit_enabled:
+          type: boolean
+        organization_id:
+          type: string
+          format: uuid
+        revision:
+          type: integer
+          format: int64
+        scopes:
+          type: array
+          items:
+            type: string
+        slug:
+          type: string
+        trusted_acr:
+          type: array
+          items:
+            type: string
+        trusted_amr:
+          type: array
+          items:
+            type: string
+        updated_at:
+          type: string
+          format: date-time
+    FederatedIdentityResponse:
+      type: object
+      required:
+      - identity_id
+      - provider_id
+      - organization_id
+      - organization_name
+      - provider_slug
+      - issuer
+      - subject
+      - linked_at
+      - last_login_at
+      properties:
+        identity_id:
+          type: string
+          format: uuid
+        issuer:
+          type: string
+        last_login_at:
+          type: string
+          format: date-time
+        linked_at:
+          type: string
+          format: date-time
+        organization_id:
+          type: string
+          format: uuid
+        organization_name:
+          type: string
+        provider_id:
+          type: string
+          format: uuid
+        provider_slug:
+          type: string
+        subject:
+          type: string
+    FederatedLinkIntentResponse:
+      type: object
+      required:
+      - authorization_url
+      properties:
+        authorization_url:
+          type: string
     HealthResponse:
       type: object
       required:
@@ -5948,84 +6444,73 @@ components:
         user_id:
           type: string
           format: uuid
-    OidcGroupMappingResponse:
+    OrganizationDomainResponse:
       type: object
       required:
       - id
       - organization_id
-      - provider_id
-      - group_value
-      - created_at
-      properties:
-        created_at:
-          type: string
-          format: date-time
-        group_value:
-          type: string
-        id:
-          type: string
-          format: uuid
-        organization_id:
-          type: string
-          format: uuid
-        organization_role:
-          type:
-          - string
-          - 'null'
-        provider_id:
-          type: string
-          format: uuid
-        workspace_id:
-          type:
-          - string
-          - 'null'
-          format: uuid
-        workspace_role:
-          type:
-          - string
-          - 'null'
-    OidcProviderResponse:
-      type: object
-      required:
-      - id
-      - organization_id
-      - issuer_url
-      - client_id
-      - scopes
-      - enabled
-      - revision
+      - domain
+      - status
+      - created_by
       - created_at
       - updated_at
       properties:
-        client_id:
-          type: string
         created_at:
           type: string
           format: date-time
-        enabled:
-          type: boolean
-        group_claim:
-          type:
-          - string
-          - 'null'
+        created_by:
+          type: string
+          format: uuid
+        domain:
+          type: string
         id:
           type: string
           format: uuid
-        issuer_url:
-          type: string
         organization_id:
           type: string
+          format: uuid
+        status:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+        verified_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+    OrganizationIdentityPolicyResponse:
+      type: object
+      required:
+      - organization_id
+      - mfa_required
+      - federated_required
+      - revision
+      - updated_at
+      properties:
+        federated_required:
+          type: boolean
+        mfa_required:
+          type: boolean
+        organization_id:
+          type: string
+          format: uuid
+        required_federated_provider_id:
+          type:
+          - string
+          - 'null'
           format: uuid
         revision:
           type: integer
           format: int64
-        scopes:
-          type: array
-          items:
-            type: string
         updated_at:
           type: string
           format: date-time
+        updated_by:
+          type:
+          - string
+          - 'null'
+          format: uuid
     OrganizationMemberResponse:
       type: object
       required:
@@ -6905,6 +7390,56 @@ components:
           type:
           - string
           - 'null'
+    UpdateFederatedIdentityProviderRequest:
+      type: object
+      properties:
+        client_id:
+          type:
+          - string
+          - 'null'
+        client_secret:
+          type:
+          - string
+          - 'null'
+          writeOnly: true
+        enabled:
+          type:
+          - boolean
+          - 'null'
+        group_claim:
+          type:
+          - string
+          - 'null'
+        issuer_url:
+          type:
+          - string
+          - 'null'
+        jit_enabled:
+          type:
+          - boolean
+          - 'null'
+        scopes:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
+        slug:
+          type:
+          - string
+          - 'null'
+        trusted_acr:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
+        trusted_amr:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
     UpdateModelProfileRequest:
       type: object
       properties:
@@ -6934,36 +7469,21 @@ components:
           type:
           - string
           - 'null'
-    UpdateOidcProviderRequest:
+    UpdateOrganizationIdentityPolicyRequest:
       type: object
+      required:
+      - mfa_required
+      - federated_required
       properties:
-        client_id:
+        federated_required:
+          type: boolean
+        mfa_required:
+          type: boolean
+        required_federated_provider_id:
           type:
           - string
           - 'null'
-        client_secret:
-          type:
-          - string
-          - 'null'
-          writeOnly: true
-        enabled:
-          type:
-          - boolean
-          - 'null'
-        group_claim:
-          type:
-          - string
-          - 'null'
-        issuer_url:
-          type:
-          - string
-          - 'null'
-        scopes:
-          type:
-          - array
-          - 'null'
-          items:
-            type: string
+          format: uuid
     UpdateOrganizationRequest:
       type: object
       properties:
@@ -7097,6 +7617,30 @@ components:
           type:
           - string
           - 'null'
+    UserOrganizationResponse:
+      type: object
+      required:
+      - organization_id
+      - organization_slug
+      - organization_name
+      - organization_status
+      - organization_role
+      - workspaces
+      - identity_providers
+      properties:
+        identity_providers: {}
+        organization_id:
+          type: string
+          format: uuid
+        organization_name:
+          type: string
+        organization_role:
+          type: string
+        organization_slug:
+          type: string
+        organization_status:
+          type: string
+        workspaces: {}
     WebSessionResponse:
       type: object
       required:

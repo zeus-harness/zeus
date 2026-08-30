@@ -196,6 +196,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/invitations/{token}/accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["accept_invitation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/meta": {
         parameters: {
             query?: never;
@@ -308,6 +324,118 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/organizations/{organization_id}/domains": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_domains"];
+        put?: never;
+        post: operations["create_domain"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/organizations/{organization_id}/domains/{domain_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["revoke_domain"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/organizations/{organization_id}/domains/{domain_id}/verify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["verify_domain"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/organizations/{organization_id}/identity-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_identity_policy"];
+        put: operations["update_identity_policy"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/organizations/{organization_id}/identity-providers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_federated_identity_providers"];
+        put?: never;
+        post: operations["create_federated_identity_provider"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/organizations/{organization_id}/identity-providers/{provider_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch: operations["update_federated_identity_provider"];
+        trace?: never;
+    };
+    "/api/v1/organizations/{organization_id}/identity-providers/{provider_id}/group-mappings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_federated_group_mappings"];
+        put?: never;
+        post: operations["create_federated_group_mapping"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/organizations/{organization_id}/invitations": {
         parameters: {
             query?: never;
@@ -366,54 +494,6 @@ export interface paths {
         get: operations["list_organization_members"];
         put: operations["set_organization_member"];
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/organizations/{organization_id}/oidc-providers": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["list_oidc_providers"];
-        put?: never;
-        post: operations["create_oidc_provider"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/organizations/{organization_id}/oidc-providers/{provider_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch: operations["update_oidc_provider"];
-        trace?: never;
-    };
-    "/api/v1/organizations/{organization_id}/oidc-providers/{provider_id}/group-mappings": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["list_oidc_group_mappings"];
-        put?: never;
-        post: operations["create_oidc_group_mapping"];
         delete?: never;
         options?: never;
         head?: never;
@@ -492,6 +572,70 @@ export interface paths {
             cookie?: never;
         };
         get: operations["setup_status"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/users/me/federated-identities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_federated_identities"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/users/me/federated-identities/{identity_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["unlink_federated_identity"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/users/me/federated-identities/{provider_id}/link-intents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["create_federated_link_intent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/users/me/organizations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_user_organizations"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1524,14 +1668,14 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/auth/callback/{provider_id}": {
+    "/auth/federated/{organization_slug}/{provider_slug}": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get: operations["callback"];
+        get: operations["federated_login"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1540,14 +1684,14 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/auth/login/{provider_id}": {
+    "/auth/federated/{organization_slug}/{provider_slug}/callback": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get: operations["login"];
+        get: operations["federated_callback"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1743,7 +1887,7 @@ export interface components {
             updated_at: string;
         };
         ChangePasswordRequest: {
-            current_password: string;
+            current_password?: string | null;
             new_password: string;
         };
         ChildRunResponse: {
@@ -1863,6 +2007,24 @@ export interface components {
             metadata?: unknown;
             source_kind: string;
         };
+        CreateFederatedGroupMappingRequest: {
+            group_value: string;
+            organization_role?: string | null;
+            /** Format: uuid */
+            workspace_id?: string | null;
+            workspace_role?: string | null;
+        };
+        CreateFederatedIdentityProviderRequest: {
+            client_id: string;
+            client_secret: string;
+            group_claim?: string | null;
+            issuer_url: string;
+            jit_enabled?: boolean;
+            scopes?: string[];
+            slug: string;
+            trusted_acr?: string[];
+            trusted_amr?: string[];
+        };
         CreateInvitationRequest: {
             email: string;
             organization_role: string;
@@ -1877,19 +2039,8 @@ export interface components {
             name: string;
             provider_kind?: string;
         };
-        CreateOidcGroupMappingRequest: {
-            group_value: string;
-            organization_role?: string | null;
-            /** Format: uuid */
-            workspace_id?: string | null;
-            workspace_role?: string | null;
-        };
-        CreateOidcProviderRequest: {
-            client_id: string;
-            client_secret: string;
-            group_claim?: string | null;
-            issuer_url: string;
-            scopes?: string[];
+        CreateOrganizationDomainRequest: {
+            domain: string;
         };
         CreateOrganizationRequest: {
             initial_workspace_name: string;
@@ -1984,6 +2135,10 @@ export interface components {
             name: string;
             slug: string;
         };
+        CreatedOrganizationDomainResponse: components["schemas"]["OrganizationDomainResponse"] & {
+            txt_record_name: string;
+            txt_record_value: string;
+        };
         CreatedOrganizationResponse: {
             /** Format: uuid */
             organization_id: string;
@@ -2037,6 +2192,7 @@ export interface components {
             email?: string | null;
             /** Format: date-time */
             email_verified_at?: string | null;
+            has_native_password: boolean;
             /** Format: date-time */
             idle_expires_at?: string | null;
             /** Format: date-time */
@@ -2158,6 +2314,61 @@ export interface components {
             name: string;
             status: string;
         };
+        FederatedGroupMappingResponse: {
+            /** Format: date-time */
+            created_at: string;
+            group_value: string;
+            /** Format: uuid */
+            id: string;
+            /** Format: uuid */
+            organization_id: string;
+            organization_role?: string | null;
+            /** Format: uuid */
+            provider_id: string;
+            /** Format: uuid */
+            workspace_id?: string | null;
+            workspace_role?: string | null;
+        };
+        FederatedIdentityProviderResponse: {
+            client_id: string;
+            /** Format: date-time */
+            created_at: string;
+            enabled: boolean;
+            group_claim?: string | null;
+            /** Format: uuid */
+            id: string;
+            issuer_url: string;
+            jit_enabled: boolean;
+            /** Format: uuid */
+            organization_id: string;
+            /** Format: int64 */
+            revision: number;
+            scopes: string[];
+            slug: string;
+            trusted_acr: string[];
+            trusted_amr: string[];
+            /** Format: date-time */
+            updated_at: string;
+        };
+        FederatedIdentityResponse: {
+            /** Format: uuid */
+            identity_id: string;
+            issuer: string;
+            /** Format: date-time */
+            last_login_at: string;
+            /** Format: date-time */
+            linked_at: string;
+            /** Format: uuid */
+            organization_id: string;
+            organization_name: string;
+            /** Format: uuid */
+            provider_id: string;
+            provider_slug: string;
+            subject: string;
+        };
+        FederatedLinkIntentResponse: {
+            authorization_url: string;
+        };
         HealthResponse: {
             status: string;
         };
@@ -2242,37 +2453,35 @@ export interface components {
             /** Format: uuid */
             user_id: string;
         };
-        OidcGroupMappingResponse: {
+        OrganizationDomainResponse: {
             /** Format: date-time */
             created_at: string;
-            group_value: string;
+            /** Format: uuid */
+            created_by: string;
+            domain: string;
             /** Format: uuid */
             id: string;
             /** Format: uuid */
             organization_id: string;
-            organization_role?: string | null;
-            /** Format: uuid */
-            provider_id: string;
-            /** Format: uuid */
-            workspace_id?: string | null;
-            workspace_role?: string | null;
-        };
-        OidcProviderResponse: {
-            client_id: string;
-            /** Format: date-time */
-            created_at: string;
-            enabled: boolean;
-            group_claim?: string | null;
-            /** Format: uuid */
-            id: string;
-            issuer_url: string;
-            /** Format: uuid */
-            organization_id: string;
-            /** Format: int64 */
-            revision: number;
-            scopes: string[];
+            status: string;
             /** Format: date-time */
             updated_at: string;
+            /** Format: date-time */
+            verified_at?: string | null;
+        };
+        OrganizationIdentityPolicyResponse: {
+            federated_required: boolean;
+            mfa_required: boolean;
+            /** Format: uuid */
+            organization_id: string;
+            /** Format: uuid */
+            required_federated_provider_id?: string | null;
+            /** Format: int64 */
+            revision: number;
+            /** Format: date-time */
+            updated_at: string;
+            /** Format: uuid */
+            updated_by?: string | null;
         };
         OrganizationMemberResponse: {
             /** Format: date-time */
@@ -2629,6 +2838,18 @@ export interface components {
             name?: string | null;
             provider_kind?: string | null;
         };
+        UpdateFederatedIdentityProviderRequest: {
+            client_id?: string | null;
+            client_secret?: string | null;
+            enabled?: boolean | null;
+            group_claim?: string | null;
+            issuer_url?: string | null;
+            jit_enabled?: boolean | null;
+            scopes?: string[] | null;
+            slug?: string | null;
+            trusted_acr?: string[] | null;
+            trusted_amr?: string[] | null;
+        };
         UpdateModelProfileRequest: {
             archived?: boolean | null;
             base_url?: string | null;
@@ -2639,13 +2860,11 @@ export interface components {
             name?: string | null;
             provider_kind?: string | null;
         };
-        UpdateOidcProviderRequest: {
-            client_id?: string | null;
-            client_secret?: string | null;
-            enabled?: boolean | null;
-            group_claim?: string | null;
-            issuer_url?: string | null;
-            scopes?: string[] | null;
+        UpdateOrganizationIdentityPolicyRequest: {
+            federated_required: boolean;
+            mfa_required: boolean;
+            /** Format: uuid */
+            required_federated_provider_id?: string | null;
         };
         UpdateOrganizationRequest: {
             name?: string | null;
@@ -2696,6 +2915,16 @@ export interface components {
         UpdateWorkspaceRequest: {
             name?: string | null;
             status?: string | null;
+        };
+        UserOrganizationResponse: {
+            identity_providers: unknown;
+            /** Format: uuid */
+            organization_id: string;
+            organization_name: string;
+            organization_role: string;
+            organization_slug: string;
+            organization_status: string;
+            workspaces: unknown;
         };
         WebSessionResponse: {
             /** Format: date-time */
@@ -3271,6 +3500,36 @@ export interface operations {
             };
         };
     };
+    accept_invitation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description One-time invitation token */
+                token: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Invitation accepted and tenant context selected */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
     meta: {
         parameters: {
             query?: never;
@@ -3611,6 +3870,381 @@ export interface operations {
             };
         };
     };
+    list_domains: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Verified-domain configuration */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrganizationDomainResponse"][];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    create_domain: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateOrganizationDomainRequest"];
+            };
+        };
+        responses: {
+            /** @description Domain verification challenge created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreatedOrganizationDomainResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    revoke_domain: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                organization_id: string;
+                domain_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Domain revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    verify_domain: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                organization_id: string;
+                domain_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Domain verified */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrganizationDomainResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    get_identity_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Organization identity policy */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrganizationIdentityPolicyResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    update_identity_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateOrganizationIdentityPolicyRequest"];
+            };
+        };
+        responses: {
+            /** @description Organization identity policy updated */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrganizationIdentityPolicyResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    list_federated_identity_providers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FederatedIdentityProviderResponse"][];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    create_federated_identity_provider: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        /** @description JSON request body */
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateFederatedIdentityProviderRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FederatedIdentityProviderResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    update_federated_identity_provider: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+                /** @description Path identifier */
+                provider_id: string;
+            };
+            cookie?: never;
+        };
+        /** @description JSON request body */
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateFederatedIdentityProviderRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FederatedIdentityProviderResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    list_federated_group_mappings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+                /** @description Path identifier */
+                provider_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FederatedGroupMappingResponse"][];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    create_federated_group_mapping: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+                /** @description Path identifier */
+                provider_id: string;
+            };
+            cookie?: never;
+        };
+        /** @description JSON request body */
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateFederatedGroupMappingRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FederatedGroupMappingResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
     list_invitations: {
         parameters: {
             query?: never;
@@ -3794,187 +4428,6 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
-            };
-            /** @description Problem Details error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/problem+json": components["schemas"]["ProblemDetails"];
-                };
-            };
-        };
-    };
-    list_oidc_providers: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Path identifier */
-                organization_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["OidcProviderResponse"][];
-                };
-            };
-            /** @description Problem Details error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/problem+json": components["schemas"]["ProblemDetails"];
-                };
-            };
-        };
-    };
-    create_oidc_provider: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Path identifier */
-                organization_id: string;
-            };
-            cookie?: never;
-        };
-        /** @description JSON request body */
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["CreateOidcProviderRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful response */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["OidcProviderResponse"];
-                };
-            };
-            /** @description Problem Details error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/problem+json": components["schemas"]["ProblemDetails"];
-                };
-            };
-        };
-    };
-    update_oidc_provider: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Path identifier */
-                organization_id: string;
-                /** @description Path identifier */
-                provider_id: string;
-            };
-            cookie?: never;
-        };
-        /** @description JSON request body */
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["UpdateOidcProviderRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["OidcProviderResponse"];
-                };
-            };
-            /** @description Problem Details error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/problem+json": components["schemas"]["ProblemDetails"];
-                };
-            };
-        };
-    };
-    list_oidc_group_mappings: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Path identifier */
-                organization_id: string;
-                /** @description Path identifier */
-                provider_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["OidcGroupMappingResponse"][];
-                };
-            };
-            /** @description Problem Details error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/problem+json": components["schemas"]["ProblemDetails"];
-                };
-            };
-        };
-    };
-    create_oidc_group_mapping: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Path identifier */
-                organization_id: string;
-                /** @description Path identifier */
-                provider_id: string;
-            };
-            cookie?: never;
-        };
-        /** @description JSON request body */
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["CreateOidcGroupMappingRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful response */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["OidcGroupMappingResponse"];
-                };
             };
             /** @description Problem Details error */
             default: {
@@ -4201,6 +4654,124 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SetupStatusResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    list_federated_identities: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Federated identities linked to the current user */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FederatedIdentityResponse"][];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    unlink_federated_identity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                identity_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Federated identity unlinked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    create_federated_link_intent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                provider_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Federated link authorization URL */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FederatedLinkIntentResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    list_user_organizations: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Organizations available to the current user */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UserOrganizationResponse"][];
                 };
             };
             /** @description Problem Details error */
@@ -7464,20 +8035,22 @@ export interface operations {
             };
         };
     };
-    callback: {
+    federated_login: {
         parameters: {
             query?: never;
             header?: never;
             path: {
                 /** @description Path identifier */
-                provider_id: string;
+                organization_slug: string;
+                /** @description Path identifier */
+                provider_slug: string;
             };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
             /** @description Successful response */
-            302: {
+            303: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -7494,20 +8067,22 @@ export interface operations {
             };
         };
     };
-    login: {
+    federated_callback: {
         parameters: {
             query?: never;
             header?: never;
             path: {
                 /** @description Path identifier */
-                provider_id: string;
+                organization_slug: string;
+                /** @description Path identifier */
+                provider_slug: string;
             };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
             /** @description Successful response */
-            302: {
+            303: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -7534,7 +8109,7 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Successful response */
-            302: {
+            303: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -19,6 +19,7 @@ futures-util.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 hmac.workspace = true
+hickory-resolver.workspace = true
 http.workspace = true
 jsonschema.workspace = true
 lettre.workspace = true

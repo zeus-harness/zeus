@@ -87,6 +87,25 @@ describe('account security actions', () => {
     expect(cookies).toHaveBeenCalledWith('zeus_session', 'ROTATED_SESSION_FOR_TEST', expect.any(Object));
   });
 
+  it('allows a federated-only account to set its first native password', async () => {
+    const { event, fetcher } = actionEvent(
+      {
+        current_password: '',
+        new_password: 'FIRST_NATIVE_PASSWORD_123',
+        new_password_confirmation: 'FIRST_NATIVE_PASSWORD_123'
+      },
+      new Response(null, { status: 204 })
+    );
+
+    await expect(handler(actions.changePassword)(event)).resolves.toMatchObject({
+      type: 'success'
+    });
+    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({
+      current_password: null,
+      new_password: 'FIRST_NATIVE_PASSWORD_123'
+    });
+  });
+
   it('starts TOTP enrollment with a null code and returns setup data only in the action result', async () => {
     const { event, fetcher } = actionEvent(
       {},

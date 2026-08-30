@@ -13,6 +13,7 @@
   const accountNavigation = [
     { href: '/account/profile', label: '个人资料', description: '账号身份与会话状态' },
     { href: '/account/security', label: '安全设置', description: '密码与双因素认证' },
+    { href: '/account/federation', label: '联合身份', description: '管理企业登录绑定' },
     { href: '/account/sessions', label: '登录会话', description: '查看并撤销活动会话' }
   ] as const;
 

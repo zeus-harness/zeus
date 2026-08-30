@@ -27,7 +27,10 @@ use crate::{
     },
     database::{TenantScope, begin_tenant},
     error::ApiError,
-    oidc::{OidcFlow, OidcProviderConfig, PendingOidcAuthorization, sanitize_return_to},
+    oidc::{
+        OidcFlow, OidcProviderConfig, PendingOidcAuthorization, VerifiedOidcIdentity,
+        sanitize_return_to,
+    },
 };
 
 const SESSION_COOKIE: &str = "zeus_session";
@@ -175,6 +178,13 @@ impl FromRequestParts<AppState> for AuthContext {
             {
                 return Err(ApiError::MfaRequired);
             }
+            if let Some(provider_id) = required_federated_provider(state, &principal).await?
+                && !principal
+                    .auth_methods
+                    .contains(&format!("federated:{provider_id}"))
+            {
+                return Err(ApiError::FederatedAuthenticationRequired);
+            }
         }
         let organization_id = principal.organization_id.ok_or(ApiError::Forbidden)?;
         Ok(Self {
@@ -201,15 +211,7 @@ async fn principal_requires_mfa(
         return Ok(true);
     }
     let user_id = principal.user_id.ok_or(ApiError::Forbidden)?;
-    let has_totp: bool = sqlx::query_scalar(
-        "select exists (
-           select 1 from zeus_private.load_totp_credential($1)
-           where confirmed_at is not null
-         )",
-    )
-    .bind(user_id)
-    .fetch_one(&state.database)
-    .await?;
+    let has_totp = user_has_totp(state, user_id).await?;
     if has_totp {
         return Ok(true);
     }
@@ -232,6 +234,45 @@ async fn principal_requires_mfa(
     .await?;
     transaction.commit().await?;
     Ok(required)
+}
+
+async fn user_has_totp(state: &AppState, user_id: Uuid) -> Result<bool, ApiError> {
+    sqlx::query_scalar(
+        "select exists (
+           select 1 from zeus_private.load_totp_credential($1)
+           where confirmed_at is not null
+         )",
+    )
+    .bind(user_id)
+    .fetch_one(&state.database)
+    .await
+    .map_err(Into::into)
+}
+
+pub(crate) async fn required_federated_provider(
+    state: &AppState,
+    principal: &PrincipalContext,
+) -> Result<Option<Uuid>, ApiError> {
+    let Some(organization_id) = principal.organization_id else {
+        return Ok(None);
+    };
+    let user_id = principal.user_id.ok_or(ApiError::Forbidden)?;
+    let mut transaction = crate::database::begin_tenant(
+        &state.database,
+        TenantScope::organization(Some(user_id), organization_id),
+    )
+    .await?;
+    let provider_id = sqlx::query_scalar::<_, Option<Uuid>>(
+        "select required_federated_provider_id
+         from organization_identity_policies
+         where organization_id = $1 and federated_required",
+    )
+    .bind(organization_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .flatten();
+    transaction.commit().await?;
+    Ok(provider_id)
 }
 
 impl FromRequestParts<AppState> for PrincipalContext {
@@ -473,8 +514,11 @@ pub struct CallbackQuery {
 }
 
 #[derive(Debug, FromRow)]
-struct OidcProviderLoginRow {
+struct FederatedProviderLoginRow {
     id: Uuid,
+    organization_id: Uuid,
+    organization_slug: String,
+    provider_slug: String,
     issuer_url: String,
     client_id: String,
     encrypted_client_secret: Vec<u8>,
@@ -482,10 +526,15 @@ struct OidcProviderLoginRow {
     key_id: String,
     scopes: Vec<String>,
     group_claim: Option<String>,
+    trusted_acr: Vec<String>,
+    trusted_amr: Vec<String>,
 }
 
 #[derive(Debug, FromRow)]
-struct ConsumedOidcLoginRow {
+struct ConsumedFederatedLoginRow {
+    purpose: String,
+    initiating_user_id: Option<Uuid>,
+    initiating_session_id: Option<Uuid>,
     ciphertext: Vec<u8>,
     nonce: Vec<u8>,
     key_id: String,
@@ -493,60 +542,75 @@ struct ConsumedOidcLoginRow {
 
 #[derive(Debug, FromRow)]
 #[allow(clippy::struct_field_names)] // Names mirror the SQL function's result columns.
-struct JitIdentityRow {
-    user_id: Uuid,
-    organization_id: Uuid,
-    workspace_id: Option<Uuid>,
+struct ResolvedFederatedIdentityRow {
+    disposition: String,
+    resolved_user_id: Option<Uuid>,
+    resolved_organization_id: Uuid,
+    resolved_workspace_id: Option<Uuid>,
 }
 
-pub async fn login(
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FederatedLinkIntentResponse {
+    pub authorization_url: String,
+}
+
+pub async fn federated_login(
     State(state): State<AppState>,
-    Path(provider_id): Path<Uuid>,
+    Path((organization_slug, provider_slug)): Path<(String, String)>,
     Query(query): Query<LoginQuery>,
 ) -> Result<Response, ApiError> {
-    let provider = load_oidc_provider(&state, provider_id).await?;
-    let redirect_url = callback_url(&state, provider_id)?;
-    let flow = OidcFlow::new(&state.http_client, state.allow_private_oidc_issuers);
-    let authorization = flow
-        .authorize(
-            &provider_config(&state, &provider)?,
-            redirect_url.clone(),
-            query.return_to,
-        )
-        .await
-        .map_err(|_| ApiError::IdentityProvider)?;
-    let pending_json =
-        serde_json::to_vec(&authorization.pending).map_err(|_| ApiError::Internal)?;
-    let aad = oidc_login_aad(provider.id);
-    let sealed = state
-        .envelope
-        .seal(&pending_json, aad.as_bytes())
-        .map_err(|_| ApiError::Internal)?;
-
-    sqlx::query_scalar::<_, Uuid>(
-        "select zeus_private.create_oidc_login_transaction($1, $2, $3, $4, $5, $6, $7)",
-    )
-    .bind(provider.id)
-    .bind(sha256(authorization.pending.state.as_bytes()))
-    .bind(sealed.ciphertext)
-    .bind(sealed.nonce)
-    .bind(sealed.key_id)
-    .bind(redirect_url.to_string())
-    .bind(
-        OffsetDateTime::now_utc()
-            + time::Duration::seconds(
-                i64::try_from(state.oidc_state_ttl.as_secs()).unwrap_or(i64::MAX),
-            ),
-    )
-    .fetch_one(&state.database)
-    .await?;
-
-    redirect_response(authorization.url.as_str(), &[])
+    let provider = load_federated_provider(&state, &organization_slug, &provider_slug).await?;
+    let authorization_url =
+        begin_federated_authorization(&state, &provider, "login", None, None, query.return_to)
+            .await?;
+    redirect_response(authorization_url.as_str(), &[])
 }
 
-pub async fn callback(
+#[utoipa::path(
+    post,
+    path = "/api/v1/users/me/federated-identities/{provider_id}/link-intents",
+    tag = "identity",
+    params(("provider_id" = Uuid, Path)),
+    responses((status = 200, description = "Federated link authorization URL", body = FederatedLinkIntentResponse))
+)]
+pub async fn create_federated_link_intent(
     State(state): State<AppState>,
+    principal: PrincipalContext,
     Path(provider_id): Path<Uuid>,
+) -> Result<Json<FederatedLinkIntentResponse>, ApiError> {
+    if principal.email_verified_at.is_none() {
+        return Err(ApiError::EmailVerificationRequired);
+    }
+    crate::native_auth::require_recent_authentication(&principal)?;
+    let user_id = principal.user_id.ok_or(ApiError::Forbidden)?;
+    let session_id = principal.session_id.ok_or(ApiError::Forbidden)?;
+    let provider = sqlx::query_as::<_, FederatedProviderLoginRow>(
+        "select * from zeus_private.get_federated_provider_for_link($1, $2, $3)",
+    )
+    .bind(provider_id)
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_optional(&state.database)
+    .await?
+    .ok_or(ApiError::NotFound)?;
+    let authorization_url = begin_federated_authorization(
+        &state,
+        &provider,
+        "link",
+        Some(user_id),
+        Some(session_id),
+        "/account/federation".to_owned(),
+    )
+    .await?;
+    Ok(Json(FederatedLinkIntentResponse {
+        authorization_url: authorization_url.into(),
+    }))
+}
+
+#[allow(clippy::too_many_lines)] // The callback keeps protocol checks in their execution order.
+pub async fn federated_callback(
+    State(state): State<AppState>,
+    Path((organization_slug, provider_slug)): Path<(String, String)>,
     Query(query): Query<CallbackQuery>,
 ) -> Result<Response, ApiError> {
     if query.error.is_some() {
@@ -558,18 +622,16 @@ pub async fn callback(
     let code = query
         .code
         .ok_or_else(|| ApiError::BadRequest("missing code".to_owned()))?;
-    let consumed = sqlx::query_as::<_, ConsumedOidcLoginRow>(
-        "select pkce_verifier_ciphertext as ciphertext,
-                pkce_verifier_nonce as nonce,
-                pkce_verifier_key_id as key_id
-         from zeus_private.consume_oidc_login_transaction($1, $2)",
+    let provider = load_federated_provider(&state, &organization_slug, &provider_slug).await?;
+    let consumed = sqlx::query_as::<_, ConsumedFederatedLoginRow>(
+        "select * from zeus_private.consume_federated_login_transaction($1, $2)",
     )
-    .bind(provider_id)
+    .bind(provider.id)
     .bind(sha256(state_value.as_bytes()))
     .fetch_optional(&state.database)
     .await?
     .ok_or(ApiError::Unauthorized)?;
-    let aad = oidc_login_aad(provider_id);
+    let aad = federated_login_aad(provider.id);
     let plaintext = state
         .envelope
         .open(
@@ -587,8 +649,7 @@ pub async fn callback(
         return Err(ApiError::Unauthorized);
     }
 
-    let provider = load_oidc_provider(&state, provider_id).await?;
-    let redirect_url = callback_url(&state, provider_id)?;
+    let redirect_url = federated_callback_url(&state, &provider)?;
     let identity = OidcFlow::new(&state.http_client, state.allow_private_oidc_issuers)
         .complete(
             &provider_config(&state, &provider)?,
@@ -598,35 +659,83 @@ pub async fn callback(
         )
         .await
         .map_err(|_| ApiError::IdentityProvider)?;
-    let jit = sqlx::query_as::<_, JitIdentityRow>(
-        "select * from zeus_private.jit_oidc_identity($1, $2, $3, $4, $5, $6, $7)",
+    let resolved = sqlx::query_as::<_, ResolvedFederatedIdentityRow>(
+        "select * from zeus_private.resolve_federated_identity(
+           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+         )",
     )
     .bind(provider.id)
+    .bind(&consumed.purpose)
+    .bind(consumed.initiating_user_id)
     .bind(&identity.issuer)
     .bind(&identity.subject)
     .bind(identity.email.to_ascii_lowercase())
     .bind(&identity.display_name)
     .bind(identity.email_verified)
-    .bind(identity.stored_claims)
+    .bind(&identity.stored_claims)
+    .bind(&identity.groups)
     .fetch_one(&state.database)
     .await?;
+    if resolved.resolved_organization_id != provider.organization_id {
+        return Err(ApiError::Unauthorized);
+    }
+
+    if resolved.disposition == "account_link_required" {
+        return redirect_response("/login?error=account_link_required", &[]);
+    }
+    if resolved.disposition == "jit_not_allowed" {
+        return redirect_response("/login?error=federated_not_allowed", &[]);
+    }
+    let user_id = resolved.resolved_user_id.ok_or(ApiError::Unauthorized)?;
+    let method = format!("federated:{}", provider.id);
+    let mfa_satisfied_at =
+        trusted_federated_mfa(&provider, &identity).then(OffsetDateTime::now_utc);
+
+    if consumed.purpose == "link" {
+        if consumed.initiating_user_id != Some(user_id) {
+            return Err(ApiError::Unauthorized);
+        }
+        let session_id = consumed
+            .initiating_session_id
+            .ok_or(ApiError::Unauthorized)?;
+        let cookies =
+            rotate_federated_session(&state, session_id, user_id, mfa_satisfied_at, &method)
+                .await?;
+        return redirect_response("/account/federation?linked=1", &cookies);
+    }
 
     let session_token = random_token(32).map_err(|_| ApiError::Internal)?;
     let csrf_token = random_token(32).map_err(|_| ApiError::Internal)?;
     sqlx::query_scalar::<_, Uuid>(
         "select zeus_private.create_user_session($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
-    .bind(jit.user_id)
-    .bind(jit.organization_id)
-    .bind(jit.workspace_id)
+    .bind(user_id)
+    .bind(resolved.resolved_organization_id)
+    .bind(resolved.resolved_workspace_id)
     .bind(sha256(session_token.expose_secret().as_bytes()))
     .bind(sha256(csrf_token.expose_secret().as_bytes()))
-    .bind(vec!["federated".to_owned()])
-    .bind(Option::<OffsetDateTime>::None)
+    .bind(vec![method])
+    .bind(mfa_satisfied_at)
     .bind(i32::try_from(state.session_idle_ttl.as_secs()).unwrap_or(i32::MAX))
     .bind(i32::try_from(state.session_absolute_ttl.as_secs()).unwrap_or(i32::MAX))
     .fetch_one(&state.database)
     .await?;
+
+    let redirect_to = if mfa_satisfied_at.is_none() {
+        let principal =
+            authenticate_user_session(&state, session_token.expose_secret().to_owned()).await?;
+        if principal_requires_mfa(&state, &principal).await? {
+            if user_has_totp(&state, user_id).await? {
+                "/mfa".to_owned()
+            } else {
+                "/account/security?setup_totp=1".to_owned()
+            }
+        } else {
+            sanitize_return_to(&pending.return_to)
+        }
+    } else {
+        sanitize_return_to(&pending.return_to)
+    };
 
     let cookies = vec![
         session_cookie(
@@ -640,7 +749,7 @@ pub async fn callback(
             state.session_absolute_ttl.as_secs(),
         ),
     ];
-    redirect_response(&sanitize_return_to(&pending.return_to), &cookies)
+    redirect_response(&redirect_to, &cookies)
 }
 
 pub async fn logout(
@@ -673,6 +782,7 @@ pub struct CurrentUserResponse {
     pub email_verified_at: Option<OffsetDateTime>,
     pub platform_roles: Vec<String>,
     pub auth_methods: Vec<String>,
+    pub has_native_password: bool,
     #[serde(with = "time::serde::rfc3339::option")]
     pub authenticated_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
@@ -687,8 +797,21 @@ pub struct CurrentUserResponse {
     (status = 200, description = "Current authenticated principal", body = CurrentUserResponse),
     (status = 401, description = "Authentication required", body = crate::error::ProblemDetails, content_type = "application/problem+json")
 ))]
-pub async fn current_user(auth: PrincipalContext) -> Json<CurrentUserResponse> {
-    Json(CurrentUserResponse {
+pub async fn current_user(
+    State(state): State<AppState>,
+    auth: PrincipalContext,
+) -> Result<Json<CurrentUserResponse>, ApiError> {
+    let has_native_password = match (auth.user_id, auth.session_id) {
+        (Some(user_id), Some(session_id)) => {
+            sqlx::query_scalar("select zeus_private.user_has_native_password($1, $2)")
+                .bind(user_id)
+                .bind(session_id)
+                .fetch_one(&state.database)
+                .await?
+        }
+        _ => false,
+    };
+    Ok(Json(CurrentUserResponse {
         principal_kind: match auth.principal_kind {
             PrincipalKind::User => "user",
             PrincipalKind::ServiceAccount => "service_account",
@@ -706,11 +829,12 @@ pub async fn current_user(auth: PrincipalContext) -> Json<CurrentUserResponse> {
         email_verified_at: auth.email_verified_at,
         platform_roles: auth.platform_roles.into_iter().collect(),
         auth_methods: auth.auth_methods.into_iter().collect(),
+        has_native_password,
         authenticated_at: auth.authenticated_at,
         mfa_satisfied_at: auth.mfa_satisfied_at,
         idle_expires_at: auth.idle_expires_at,
         absolute_expires_at: auth.absolute_expires_at,
-    })
+    }))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -910,10 +1034,20 @@ pub async fn revoke_service_account(
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/auth/login/{provider_id}", get(login))
-        .route("/auth/callback/{provider_id}", get(callback))
+        .route(
+            "/auth/federated/{organization_slug}/{provider_slug}",
+            get(federated_login),
+        )
+        .route(
+            "/auth/federated/{organization_slug}/{provider_slug}/callback",
+            get(federated_callback),
+        )
         .route("/auth/logout", post(logout))
         .route("/api/v1/auth/me", get(current_user))
+        .route(
+            "/api/v1/users/me/federated-identities/{provider_id}/link-intents",
+            post(create_federated_link_intent),
+        )
         .route(
             "/api/v1/organizations/{organization_id}/service-accounts",
             get(list_service_accounts).post(create_service_account),
@@ -926,7 +1060,7 @@ pub fn routes() -> Router<AppState> {
 
 fn provider_config(
     state: &AppState,
-    row: &OidcProviderLoginRow,
+    row: &FederatedProviderLoginRow,
 ) -> Result<OidcProviderConfig, ApiError> {
     let aad = format!("oidc-provider/{}/client-secret", row.id);
     let plaintext = state
@@ -950,28 +1084,135 @@ fn provider_config(
     })
 }
 
-async fn load_oidc_provider(
+async fn load_federated_provider(
     state: &AppState,
-    provider_id: Uuid,
-) -> Result<OidcProviderLoginRow, ApiError> {
-    sqlx::query_as::<_, OidcProviderLoginRow>(
-        "select * from zeus_private.get_oidc_provider_for_login($1)",
+    organization_slug: &str,
+    provider_slug: &str,
+) -> Result<FederatedProviderLoginRow, ApiError> {
+    sqlx::query_as::<_, FederatedProviderLoginRow>(
+        "select * from zeus_private.get_federated_provider_for_login($1, $2)",
     )
-    .bind(provider_id)
+    .bind(organization_slug)
+    .bind(provider_slug)
     .fetch_optional(&state.database)
     .await?
     .ok_or(ApiError::NotFound)
 }
 
-fn callback_url(state: &AppState, provider_id: Uuid) -> Result<url::Url, ApiError> {
+fn federated_callback_url(
+    state: &AppState,
+    provider: &FederatedProviderLoginRow,
+) -> Result<url::Url, ApiError> {
     state
         .public_url
-        .join(&format!("auth/callback/{provider_id}"))
+        .join(&format!(
+            "auth/federated/{}/{}/callback",
+            provider.organization_slug, provider.provider_slug
+        ))
         .map_err(|_| ApiError::Internal)
 }
 
-fn oidc_login_aad(provider_id: Uuid) -> String {
-    format!("oidc-login/{provider_id}")
+fn federated_login_aad(provider_id: Uuid) -> String {
+    format!("federated-login/{provider_id}")
+}
+
+async fn begin_federated_authorization(
+    state: &AppState,
+    provider: &FederatedProviderLoginRow,
+    purpose: &str,
+    initiating_user_id: Option<Uuid>,
+    initiating_session_id: Option<Uuid>,
+    return_to: String,
+) -> Result<url::Url, ApiError> {
+    let redirect_url = federated_callback_url(state, provider)?;
+    let authorization = OidcFlow::new(&state.http_client, state.allow_private_oidc_issuers)
+        .authorize(
+            &provider_config(state, provider)?,
+            redirect_url.clone(),
+            return_to,
+        )
+        .await
+        .map_err(|_| ApiError::IdentityProvider)?;
+    let pending_json =
+        serde_json::to_vec(&authorization.pending).map_err(|_| ApiError::Internal)?;
+    let aad = federated_login_aad(provider.id);
+    let sealed = state
+        .envelope
+        .seal(&pending_json, aad.as_bytes())
+        .map_err(|_| ApiError::Internal)?;
+    sqlx::query_scalar::<_, Uuid>(
+        "select zeus_private.create_federated_login_transaction(
+           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+         )",
+    )
+    .bind(provider.id)
+    .bind(purpose)
+    .bind(initiating_user_id)
+    .bind(initiating_session_id)
+    .bind(sha256(authorization.pending.state.as_bytes()))
+    .bind(sealed.ciphertext)
+    .bind(sealed.nonce)
+    .bind(sealed.key_id)
+    .bind(redirect_url.to_string())
+    .bind(
+        OffsetDateTime::now_utc()
+            + time::Duration::seconds(
+                i64::try_from(state.oidc_state_ttl.as_secs()).unwrap_or(i64::MAX),
+            ),
+    )
+    .fetch_one(&state.database)
+    .await?;
+    Ok(authorization.url)
+}
+
+fn trusted_federated_mfa(
+    provider: &FederatedProviderLoginRow,
+    identity: &VerifiedOidcIdentity,
+) -> bool {
+    identity
+        .acr
+        .as_ref()
+        .is_some_and(|acr| provider.trusted_acr.contains(acr))
+        || identity
+            .amr
+            .iter()
+            .any(|amr| provider.trusted_amr.contains(amr))
+}
+
+async fn rotate_federated_session(
+    state: &AppState,
+    session_id: Uuid,
+    user_id: Uuid,
+    mfa_satisfied_at: Option<OffsetDateTime>,
+    method: &str,
+) -> Result<Vec<String>, ApiError> {
+    let session_token = random_token(32).map_err(|_| ApiError::Internal)?;
+    let csrf_token = random_token(32).map_err(|_| ApiError::Internal)?;
+    let rotated: bool =
+        sqlx::query_scalar("select zeus_private.rotate_user_session_token($1, $2, $3, $4, $5, $6)")
+            .bind(session_id)
+            .bind(user_id)
+            .bind(sha256(session_token.expose_secret().as_bytes()))
+            .bind(sha256(csrf_token.expose_secret().as_bytes()))
+            .bind(mfa_satisfied_at)
+            .bind(method)
+            .fetch_one(&state.database)
+            .await?;
+    if !rotated {
+        return Err(ApiError::Unauthorized);
+    }
+    Ok(vec![
+        session_cookie(
+            state,
+            session_token.expose_secret(),
+            state.session_absolute_ttl.as_secs(),
+        ),
+        csrf_cookie(
+            state,
+            csrf_token.expose_secret(),
+            state.session_absolute_ttl.as_secs(),
+        ),
+    ])
 }
 
 pub(crate) fn session_cookie(state: &AppState, token: &str, max_age_seconds: u64) -> String {
@@ -1177,6 +1418,7 @@ mod tests {
             email_verified_at: None,
             platform_roles: Vec::new(),
             auth_methods: vec!["password".to_owned()],
+            has_native_password: true,
             authenticated_at: Some(OffsetDateTime::UNIX_EPOCH),
             mfa_satisfied_at: None,
             idle_expires_at: Some(OffsetDateTime::UNIX_EPOCH),

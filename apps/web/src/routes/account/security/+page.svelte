@@ -11,11 +11,13 @@
   let pathname = $derived(page.url.pathname);
   let principal = $derived(data.principal);
   let totpEnabled = $derived(principal?.auth_methods.includes('totp') ?? false);
+  let hasNativePassword = $derived(principal?.has_native_password ?? false);
   let isPlatformAdmin = $derived(principal?.platform_roles.includes('platform_admin') ?? false);
 
   const accountNavigation = [
     { href: '/account/profile', label: '个人资料', description: '账号身份与会话状态' },
     { href: '/account/security', label: '安全设置', description: '密码与双因素认证' },
+    { href: '/account/federation', label: '联合身份', description: '管理企业登录绑定' },
     { href: '/account/sessions', label: '登录会话', description: '查看并撤销活动会话' }
   ] as const;
 
@@ -86,18 +88,24 @@
       <Card.Root>
         <Card.Header>
           <Card.Title>修改密码</Card.Title>
-          <Card.Description>新密码至少需要 15 个 NFC Unicode 字符。</Card.Description>
+          <Card.Description>
+            {hasNativePassword
+              ? '输入当前密码后更新。新密码至少需要 15 个 NFC Unicode 字符。'
+              : '为当前联合账号设置一个 Zeus 原生密码。新密码至少需要 15 个 NFC Unicode 字符。'}
+          </Card.Description>
         </Card.Header>
         <Card.Content>
           <form method="POST" action="?/changePassword" class="space-y-4">
             <div>
-              <label class="text-sm font-medium" for="current_password">当前密码</label>
+              <label class="text-sm font-medium" for="current_password">
+                {hasNativePassword ? '当前密码' : '当前密码（首次设置无需填写）'}
+              </label>
               <input
                 id="current_password"
                 name="current_password"
                 type="password"
                 autocomplete="current-password"
-                required
+                required={hasNativePassword}
                 class="mt-2 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
               />
             </div>

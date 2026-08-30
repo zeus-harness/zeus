@@ -42,6 +42,8 @@ pub struct VerifiedOidcIdentity {
     pub email_verified: bool,
     pub display_name: String,
     pub groups: Vec<String>,
+    pub acr: Option<String>,
+    pub amr: Vec<String>,
     pub stored_claims: Value,
 }
 
@@ -145,6 +147,7 @@ impl<'a> OidcFlow<'a> {
     /// # Errors
     ///
     /// Returns a stable error when discovery, exchange, token verification, or user-info fails.
+    #[allow(clippy::too_many_lines)] // Provider verification follows the OIDC exchange order.
     pub async fn complete(
         &self,
         provider: &OidcProviderConfig,
@@ -238,6 +241,21 @@ impl<'a> OidcFlow<'a> {
             .trim_end_matches('/')
             .to_owned();
         let subject = claims.subject().as_str().to_owned();
+        let acr = claims
+            .auth_context_ref()
+            .map(|value| value.as_ref().to_owned());
+        let amr = claims
+            .auth_method_refs()
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|value| {
+                        let method: &str = value.as_ref();
+                        method.to_owned()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let stored_claims = json!({
             "issuer": issuer,
             "subject": subject,
@@ -245,6 +263,8 @@ impl<'a> OidcFlow<'a> {
             "email_verified": email_verified,
             "display_name": display_name,
             "groups": groups,
+            "acr": acr,
+            "amr": amr,
         });
 
         Ok(VerifiedOidcIdentity {
@@ -254,6 +274,8 @@ impl<'a> OidcFlow<'a> {
             email_verified,
             display_name,
             groups,
+            acr,
+            amr,
             stored_claims,
         })
     }

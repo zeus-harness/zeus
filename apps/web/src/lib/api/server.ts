@@ -14,6 +14,7 @@ export type CurrentPrincipal = {
   email_verified_at: string | null;
   platform_roles: string[];
   auth_methods: string[];
+  has_native_password: boolean;
   authenticated_at: string | null;
   mfa_satisfied_at: string | null;
   idle_expires_at: string | null;

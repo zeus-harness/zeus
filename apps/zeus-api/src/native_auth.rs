@@ -21,7 +21,8 @@ use zeus_identity::{
 use crate::{
     AppState,
     auth::{
-        PrincipalContext, csrf_cookie, expired_csrf_cookie, expired_session_cookie, session_cookie,
+        PrincipalContext, csrf_cookie, expired_csrf_cookie, expired_session_cookie,
+        required_federated_provider, session_cookie,
     },
     crypto::{SealedSecret, privacy_digest, random_token, sha256},
     database::begin_user,
@@ -536,8 +537,9 @@ pub async fn revoke_web_session(
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ChangePasswordRequest {
-    #[schema(write_only, value_type = String)]
-    pub current_password: String,
+    #[serde(default)]
+    #[schema(write_only, value_type = Option<String>)]
+    pub current_password: Option<String>,
     #[schema(write_only, value_type = String, min_length = 15, max_length = 128)]
     pub new_password: String,
 }
@@ -559,20 +561,29 @@ pub async fn change_password(
         sqlx::query_as::<_, NativeLoginRow>("select * from zeus_private.lookup_native_login($1)")
             .bind(email)
             .fetch_optional(&state.database)
-            .await?
-            .ok_or(ApiError::Unauthorized)?;
-    let current_hash = row.password_hash.clone();
-    let verified = state
-        .password_executor
-        .verify(
-            SecretString::from(request.current_password),
-            row.password_hash,
-        )
-        .await
-        .map_err(map_password_error)?;
-    if !verified.valid {
-        return Err(ApiError::Unauthorized);
-    }
+            .await?;
+    let current_hash = if let Some(row) = row {
+        let current_password = request.current_password.ok_or(ApiError::Unauthorized)?;
+        let current_hash = row.password_hash.clone();
+        let verified = state
+            .password_executor
+            .verify(SecretString::from(current_password), row.password_hash)
+            .await
+            .map_err(map_password_error)?;
+        if !verified.valid {
+            return Err(ApiError::Unauthorized);
+        }
+        Some(current_hash)
+    } else {
+        if !principal
+            .auth_methods
+            .iter()
+            .any(|method| method.starts_with("federated:"))
+        {
+            return Err(ApiError::Unauthorized);
+        }
+        None
+    };
     let password_hash = state
         .password_executor
         .hash(SecretString::from(request.new_password))
@@ -581,13 +592,21 @@ pub async fn change_password(
     let session_token = random_token(32).map_err(|_| ApiError::Internal)?;
     let csrf_token = random_token(32).map_err(|_| ApiError::Internal)?;
     let mut transaction = begin_user(&state.database, user_id).await?;
-    let updated: bool =
+    let updated: bool = if let Some(current_hash) = current_hash {
         sqlx::query_scalar("select zeus_private.update_password_hash_after_login($1, $2, $3)")
             .bind(user_id)
             .bind(current_hash)
             .bind(password_hash)
             .fetch_one(&mut *transaction)
-            .await?;
+            .await?
+    } else {
+        sqlx::query_scalar("select zeus_private.set_initial_native_password($1, $2, $3)")
+            .bind(user_id)
+            .bind(session_id)
+            .bind(password_hash)
+            .fetch_one(&mut *transaction)
+            .await?
+    };
     if !updated {
         return Err(ApiError::Conflict(
             "password credential changed concurrently".to_owned(),
@@ -823,6 +842,18 @@ pub async fn select_identity_context(
     {
         return Err(ApiError::MfaRequired);
     }
+    if request.organization_id.is_some() {
+        let mut selected_principal = principal.clone();
+        selected_principal.organization_id = request.organization_id;
+        selected_principal.workspace_id = request.workspace_id;
+        if let Some(provider_id) = required_federated_provider(&state, &selected_principal).await?
+            && !principal
+                .auth_methods
+                .contains(&format!("federated:{provider_id}"))
+        {
+            return Err(ApiError::FederatedAuthenticationRequired);
+        }
+    }
     let session_token = random_token(32).map_err(|_| ApiError::Internal)?;
     let csrf_token = random_token(32).map_err(|_| ApiError::Internal)?;
     let selected: bool = sqlx::query_scalar(
@@ -843,6 +874,152 @@ pub async fn select_identity_context(
         auth_cookie_headers(&state, &session_token, &csrf_token)?,
         StatusCode::NO_CONTENT,
     ))
+}
+
+#[derive(Debug, Serialize, ToSchema, FromRow)]
+pub struct UserOrganizationResponse {
+    pub organization_id: Uuid,
+    pub organization_slug: String,
+    pub organization_name: String,
+    pub organization_status: String,
+    pub organization_role: String,
+    pub workspaces: serde_json::Value,
+    pub identity_providers: serde_json::Value,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/users/me/organizations",
+    tag = "identity",
+    responses((status = 200, description = "Organizations available to the current user", body = [UserOrganizationResponse]))
+)]
+pub async fn list_user_organizations(
+    State(state): State<AppState>,
+    principal: PrincipalContext,
+) -> Result<Json<Vec<UserOrganizationResponse>>, ApiError> {
+    let user_id = principal.user_id.ok_or(ApiError::Forbidden)?;
+    let session_id = principal.session_id.ok_or(ApiError::Forbidden)?;
+    let organizations = sqlx::query_as::<_, UserOrganizationResponse>(
+        "select * from zeus_private.list_user_organizations($1, $2)",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_all(&state.database)
+    .await?;
+    Ok(Json(organizations))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/invitations/{token}/accept",
+    tag = "identity",
+    params(("token" = String, Path, description = "One-time invitation token")),
+    responses((status = 204, description = "Invitation accepted and tenant context selected"))
+)]
+pub async fn accept_invitation(
+    State(state): State<AppState>,
+    principal: PrincipalContext,
+    Path(token): Path<String>,
+) -> Result<(HeaderMap, StatusCode), ApiError> {
+    if token.len() < 43 || token.len() > 256 {
+        return Err(ApiError::Unauthorized);
+    }
+    let user_id = principal.user_id.ok_or(ApiError::Forbidden)?;
+    let session_id = principal.session_id.ok_or(ApiError::Forbidden)?;
+    let accepted = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
+        "select organization_id, workspace_id
+         from zeus_private.accept_organization_invitation($1, $2, $3)",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(sha256(token.as_bytes()))
+    .fetch_one(&state.database)
+    .await?;
+    let session_token = random_token(32).map_err(|_| ApiError::Internal)?;
+    let csrf_token = random_token(32).map_err(|_| ApiError::Internal)?;
+    let selected: bool = sqlx::query_scalar(
+        "select zeus_private.rotate_user_session_context($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .bind(Some(accepted.0))
+    .bind(accepted.1)
+    .bind(sha256(session_token.expose_secret().as_bytes()))
+    .bind(sha256(csrf_token.expose_secret().as_bytes()))
+    .fetch_one(&state.database)
+    .await?;
+    if !selected {
+        return Err(ApiError::Forbidden);
+    }
+    Ok((
+        auth_cookie_headers(&state, &session_token, &csrf_token)?,
+        StatusCode::NO_CONTENT,
+    ))
+}
+
+#[derive(Debug, Serialize, ToSchema, FromRow)]
+pub struct FederatedIdentityResponse {
+    pub identity_id: Uuid,
+    pub provider_id: Uuid,
+    pub organization_id: Uuid,
+    pub organization_name: String,
+    pub provider_slug: String,
+    pub issuer: String,
+    pub subject: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub linked_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub last_login_at: OffsetDateTime,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/users/me/federated-identities",
+    tag = "identity",
+    responses((status = 200, description = "Federated identities linked to the current user", body = [FederatedIdentityResponse]))
+)]
+pub async fn list_federated_identities(
+    State(state): State<AppState>,
+    principal: PrincipalContext,
+) -> Result<Json<Vec<FederatedIdentityResponse>>, ApiError> {
+    let user_id = principal.user_id.ok_or(ApiError::Forbidden)?;
+    let session_id = principal.session_id.ok_or(ApiError::Forbidden)?;
+    let identities = sqlx::query_as::<_, FederatedIdentityResponse>(
+        "select * from zeus_private.list_user_federated_identities($1, $2)",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_all(&state.database)
+    .await?;
+    Ok(Json(identities))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/v1/users/me/federated-identities/{identity_id}",
+    tag = "identity",
+    params(("identity_id" = Uuid, Path)),
+    responses((status = 204, description = "Federated identity unlinked"))
+)]
+pub async fn unlink_federated_identity(
+    State(state): State<AppState>,
+    principal: PrincipalContext,
+    Path(identity_id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    require_recent_authentication(&principal)?;
+    let user_id = principal.user_id.ok_or(ApiError::Forbidden)?;
+    let session_id = principal.session_id.ok_or(ApiError::Forbidden)?;
+    let removed: bool =
+        sqlx::query_scalar("select zeus_private.unlink_federated_identity($1, $2, $3)")
+            .bind(user_id)
+            .bind(session_id)
+            .bind(identity_id)
+            .fetch_one(&state.database)
+            .await?;
+    if !removed {
+        return Err(ApiError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub fn routes() -> Router<AppState> {
@@ -871,6 +1048,22 @@ pub fn routes() -> Router<AppState> {
             delete(revoke_web_session),
         )
         .route("/api/v1/users/me/password", put(change_password))
+        .route(
+            "/api/v1/users/me/organizations",
+            get(list_user_organizations),
+        )
+        .route(
+            "/api/v1/invitations/{token}/accept",
+            post(accept_invitation),
+        )
+        .route(
+            "/api/v1/users/me/federated-identities",
+            get(list_federated_identities),
+        )
+        .route(
+            "/api/v1/users/me/federated-identities/{identity_id}",
+            delete(unlink_federated_identity),
+        )
         .route(
             "/api/v1/users/me/totp",
             post(configure_totp).delete(disable_totp),
@@ -1007,7 +1200,7 @@ async fn rotate_authenticated_session(
     auth_cookie_headers(state, &session_token, &csrf_token)
 }
 
-fn require_recent_authentication(principal: &PrincipalContext) -> Result<(), ApiError> {
+pub(crate) fn require_recent_authentication(principal: &PrincipalContext) -> Result<(), ApiError> {
     let most_recent = [principal.authenticated_at, principal.mfa_satisfied_at]
         .into_iter()
         .flatten()

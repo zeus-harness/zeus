@@ -7,6 +7,7 @@ pub mod database;
 pub mod error;
 pub mod execution_api;
 pub mod experiences;
+pub mod federated_identity;
 pub mod http;
 pub mod idempotency;
 pub mod identity_maintenance;
