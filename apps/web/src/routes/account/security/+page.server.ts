@@ -7,6 +7,7 @@ import {
   serverApiFetcher,
   serverApiUrl
 } from '$lib/api/server';
+import { safeReturnTo, safeReturnToValue } from '$lib/server/auth';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -105,13 +106,13 @@ function totpErrorMessage(status: number, operation: 'enable' | 'disable'): stri
   return operation === 'disable' ? 'TOTP 关闭失败，请稍后重试。' : 'TOTP 设置失败，请稍后重试。';
 }
 
-export const load: PageServerLoad = async ({ parent }) => {
+export const load: PageServerLoad = async ({ parent, url }) => {
   const auth = await parent();
   if (auth.status === 'unauthenticated') {
     redirect(303, '/login');
   }
 
-  return {};
+  return { return_to: safeReturnTo(url, '/account/security') };
 };
 
 export const actions: Actions = {
@@ -148,6 +149,11 @@ export const actions: Actions = {
   },
 
   startTotp: async (event) => {
+    const returnTo = safeReturnToValue(
+      formValue(await event.request.clone().formData(), 'return_to'),
+      event.url.origin,
+      '/account/security'
+    );
     let response: Response;
     try {
       response = await accountApi(event, 'POST', '/api/v1/users/me/totp', { code: null });
@@ -174,12 +180,19 @@ export const actions: Actions = {
     return {
       type: 'totp_setup' as const,
       secret: payload.secret,
-      provisioning_uri: payload.provisioning_uri
+      provisioning_uri: payload.provisioning_uri,
+      return_to: returnTo
     };
   },
 
   confirmTotp: async (event) => {
-    const code = formValue(await event.request.formData(), 'code');
+    const formData = await event.request.formData();
+    const code = formValue(formData, 'code');
+    const returnTo = safeReturnToValue(
+      formValue(formData, 'return_to'),
+      event.url.origin,
+      '/account/security'
+    );
     if (!code) return actionError(400, 'TOTP 验证码不能为空。');
 
     let response: Response;
@@ -202,7 +215,8 @@ export const actions: Actions = {
     return {
       type: 'totp_confirmed' as const,
       message: 'TOTP 已启用。请立即保存以下一次性恢复码。',
-      recovery_codes: payload.recovery_codes
+      recovery_codes: payload.recovery_codes,
+      return_to: returnTo
     };
   },
 

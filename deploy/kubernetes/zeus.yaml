@@ -598,6 +598,20 @@ spec:
                 name: zeus-api
                 port:
                   name: http
+          - path: /oauth2
+            pathType: Prefix
+            backend:
+              service:
+                name: zeus-api
+                port:
+                  name: http
+          - path: /.well-known
+            pathType: Prefix
+            backend:
+              service:
+                name: zeus-api
+                port:
+                  name: http
           - path: /
             pathType: Prefix
             backend:

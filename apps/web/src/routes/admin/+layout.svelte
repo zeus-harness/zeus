@@ -8,7 +8,8 @@
   const identityNavigation = [
     { href: '/admin/identity-providers', label: 'Identity Providers', hint: '身份提供商' },
     { href: '/admin/domains', label: 'Domains', hint: '已验证域名' },
-    { href: '/admin/security', label: 'Security', hint: '身份策略' }
+    { href: '/admin/security', label: 'Security', hint: '身份策略' },
+    { href: '/admin/oidc-clients', label: 'OIDC Clients', hint: '应用接入' }
   ] as const;
 
   function navigationClass(active: boolean) {

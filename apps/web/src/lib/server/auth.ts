@@ -34,6 +34,39 @@ export function urlToken(url: URL, name = 'token'): string | null {
   return token || null;
 }
 
+export function safeReturnTo(url: URL, fallback = '/'): string {
+  return safeReturnToValue(url.searchParams.get('return_to'), url.origin, fallback);
+}
+
+export function safeReturnToValue(
+  candidate: string | null | undefined,
+  origin: string,
+  fallback = '/'
+): string {
+  if (
+    !candidate ||
+    candidate.length > 8192 ||
+    !candidate.startsWith('/') ||
+    candidate.startsWith('//') ||
+    Array.from(candidate).some((character) => /[\u0000-\u001f\u007f]/u.test(character))
+  ) {
+    return fallback;
+  }
+  try {
+    const parsed = new URL(candidate, origin);
+    if (parsed.origin !== origin) return fallback;
+    return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+  } catch {
+    return fallback;
+  }
+}
+
+export function withReturnTo(path: string, returnTo: string): string {
+  const target = new URL(path, 'http://zeus.local');
+  target.searchParams.set('return_to', returnTo);
+  return `${target.pathname}${target.search}`;
+}
+
 export function postAuth(
   fetcher: typeof fetch,
   apiBaseUrl: string | undefined,

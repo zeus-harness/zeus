@@ -16,6 +16,7 @@ pub mod model;
 pub mod native_auth;
 pub mod native_identity;
 pub mod oidc;
+pub mod oidc_provider;
 pub mod organization;
 pub mod organization_identity;
 pub mod runtime;

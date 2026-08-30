@@ -6,6 +6,8 @@ import {
   postAuth,
   responseJson,
   responseOk,
+  safeReturnTo,
+  safeReturnToValue,
   urlToken
 } from './auth';
 
@@ -67,5 +69,16 @@ describe('native identity server helpers', () => {
     expect(responseOk(new Response(null, { status: 204 }))).toBe(true);
     expect(responseOk(new Response(null, { status: 400 }))).toBe(false);
     expect(GENERIC_IDENTITY_MESSAGE).toBe('如果该请求符合条件，我们会发送下一步指引。请检查邮箱。');
+  });
+
+  it('accepts only same-origin relative return paths', () => {
+    expect(safeReturnTo(new URL('https://zeus.test/login?return_to=%2Foauth2%2Fauthorize%3Fx%3D1'))).toBe(
+      '/oauth2/authorize?x=1'
+    );
+    expect(safeReturnTo(new URL('https://zeus.test/login?return_to=https%3A%2F%2Fevil.test'))).toBe('/');
+    expect(safeReturnToValue('//evil.test/path', 'https://zeus.test', '/account')).toBe('/account');
+    expect(safeReturnToValue('/account/security#totp', 'https://zeus.test')).toBe(
+      '/account/security#totp'
+    );
   });
 });

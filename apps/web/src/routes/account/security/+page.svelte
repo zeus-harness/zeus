@@ -13,12 +13,18 @@
   let totpEnabled = $derived(principal?.auth_methods.includes('totp') ?? false);
   let hasNativePassword = $derived(principal?.has_native_password ?? false);
   let isPlatformAdmin = $derived(principal?.platform_roles.includes('platform_admin') ?? false);
+  let returnTo = $derived(
+    form?.type === 'totp_setup' || form?.type === 'totp_confirmed'
+      ? form.return_to
+      : data.return_to
+  );
 
   const accountNavigation = [
     { href: '/account/profile', label: '个人资料', description: '账号身份与会话状态' },
     { href: '/account/security', label: '安全设置', description: '密码与双因素认证' },
     { href: '/account/federation', label: '联合身份', description: '管理企业登录绑定' },
-    { href: '/account/sessions', label: '登录会话', description: '查看并撤销活动会话' }
+    { href: '/account/sessions', label: '登录会话', description: '查看并撤销活动会话' },
+    { href: '/account/authorizations', label: '应用授权', description: '查看并撤销 OIDC 授权' }
   ] as const;
 
   function navigationClass(href: string): string {
@@ -82,6 +88,11 @@
               <code class="font-mono text-sm">{recoveryCode}</code>
             {/each}
           </div>
+          {#if returnTo !== '/account/security'}
+            <div class="mt-4">
+              <Button href={returnTo}>恢复之前的授权流程</Button>
+            </div>
+          {/if}
         </section>
       {/if}
 
@@ -170,6 +181,7 @@
                 <code class="mt-2 block break-all rounded-lg border border-border bg-muted/40 p-3 font-mono text-xs leading-5">{form.provisioning_uri}</code>
               </div>
               <form method="POST" action="?/confirmTotp" class="space-y-4">
+                <input type="hidden" name="return_to" value={returnTo} />
                 <div>
                   <label class="text-sm font-medium" for="totp_setup_code">验证码</label>
                   <input
@@ -229,6 +241,7 @@
                 启用后，登录和敏感账号操作会要求身份验证器验证码。请先确认邮箱已验证。
               </p>
               <form method="POST" action="?/startTotp">
+                <input type="hidden" name="return_to" value={returnTo} />
                 <Button type="submit">开始设置 TOTP</Button>
               </form>
             </div>

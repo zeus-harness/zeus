@@ -4,9 +4,14 @@ use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use zeus_api::{
-    RUNTIME_DATABASE_ROLE, build_state, config::AppConfig, connect_pool, connect_pool_as_role,
-    http, identity_maintenance::IdentityMaintenance, migrate, runtime::DurableRunExecutor,
-    supervisor::ExecutionSupervisor, telemetry,
+    RUNTIME_DATABASE_ROLE, build_state,
+    config::AppConfig,
+    connect_pool, connect_pool_as_role, http,
+    identity_maintenance::{IdentityMaintenance, run_oidc_protocol_maintenance},
+    migrate,
+    runtime::DurableRunExecutor,
+    supervisor::ExecutionSupervisor,
+    telemetry,
 };
 
 #[derive(Debug, Parser)]
@@ -113,6 +118,11 @@ async fn serve() -> anyhow::Result<()> {
         warn!("identity maintenance is disabled; queued email will remain pending");
         None
     };
+    let oidc_maintenance_task = tokio::spawn(run_oidc_protocol_maintenance(
+        state.database.clone(),
+        Arc::clone(&state.envelope),
+        shutdown.child_token(),
+    ));
 
     let listener = tokio::net::TcpListener::bind(config.bind_address).await?;
     info!(address = %config.bind_address, "zeus api listening");
@@ -129,6 +139,7 @@ async fn serve() -> anyhow::Result<()> {
     if let Some(task) = identity_maintenance_task {
         task.await?;
     }
+    oidc_maintenance_task.await?;
     Ok(())
 }
 

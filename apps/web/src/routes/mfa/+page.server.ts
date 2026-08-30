@@ -1,8 +1,15 @@
 import { fail, redirect } from '@sveltejs/kit';
 import { env } from '$env/dynamic/private';
-import type { Actions } from './$types';
+import type { Actions, PageServerLoad } from './$types';
 
-import { authApiFetcher, formValue, forwardZeusAuthCookies, postAuth, responseOk } from '$lib/server/auth';
+import {
+  authApiFetcher,
+  formValue,
+  forwardZeusAuthCookies,
+  postAuth,
+  responseOk,
+  safeReturnTo
+} from '$lib/server/auth';
 
 function actionError(status: number, message: string) {
   return fail(status, { type: 'error' as const, message });
@@ -10,6 +17,7 @@ function actionError(status: number, message: string) {
 
 export const actions: Actions = {
   default: async (event) => {
+    const returnTo = safeReturnTo(event.url);
     const formData = await event.request.formData();
     const code = formValue(formData, 'code');
     if (!code) return actionError(400, '验证码不能为空。');
@@ -34,6 +42,10 @@ export const actions: Actions = {
             : '验证码无效，请检查后重试。'
       );
     }
-    redirect(303, '/');
+    redirect(303, returnTo);
   }
 };
+
+export const load: PageServerLoad = ({ url }) => ({
+  return_to: safeReturnTo(url)
+});

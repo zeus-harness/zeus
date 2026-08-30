@@ -1,7 +1,7 @@
 <script lang="ts">
-  import type { ActionData } from './$types';
+  import type { ActionData, PageData } from './$types';
 
-  let { form } = $props<{ form: ActionData }>();
+  let { data, form } = $props<{ data: PageData; form: ActionData }>();
 </script>
 
 <svelte:head>
@@ -43,7 +43,7 @@
     </form>
 
     <p class="mt-6 text-center text-sm text-muted-foreground">
-      <a class="font-medium text-foreground hover:underline" href="/login">返回登录</a>
+      <a class="font-medium text-foreground hover:underline" href={`/login?return_to=${encodeURIComponent(data.return_to)}`}>返回登录</a>
     </p>
   </section>
 </main>

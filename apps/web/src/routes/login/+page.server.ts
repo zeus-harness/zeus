@@ -9,7 +9,9 @@ import {
   isMfaRequired,
   postAuth,
   responseJson,
-  responseOk
+  responseOk,
+  safeReturnTo,
+  withReturnTo
 } from '$lib/server/auth';
 
 function actionError(status: number, message: string, email: string) {
@@ -48,6 +50,7 @@ function isTotpSetupRequired(payload: unknown): boolean {
 
 export const actions: Actions = {
   default: async (event) => {
+    const returnTo = safeReturnTo(event.url);
     const formData = await event.request.formData();
     const email = formValue(formData, 'email').toLowerCase();
     const password = formValue(formData, 'password', false);
@@ -73,15 +76,16 @@ export const actions: Actions = {
     }
 
     if (isTotpSetupRequired(payload)) {
-      redirect(303, '/account/security?setup_totp=1');
+      redirect(303, withReturnTo('/account/security?setup_totp=1', returnTo));
     }
     if (isMfaRequired(payload)) {
-      redirect(303, '/mfa');
+      redirect(303, withReturnTo('/mfa', returnTo));
     }
-    redirect(303, '/');
+    redirect(303, returnTo);
   },
 
   federated: async (event) => {
+    const returnTo = safeReturnTo(event.url);
     const formData = await event.request.formData();
     const values: FederatedLoginValues = {
       organization_slug: formValue(formData, 'organization_slug'),
@@ -102,6 +106,7 @@ export const actions: Actions = {
       `/auth/federated/${encodeURIComponent(values.organization_slug)}/${encodeURIComponent(values.provider_slug)}`,
       event.url.origin
     );
-    redirect(303, `${loginUrl.pathname}?return_to=/`);
+    loginUrl.searchParams.set('return_to', returnTo);
+    redirect(303, `${loginUrl.pathname}${loginUrl.search}`);
   }
 };

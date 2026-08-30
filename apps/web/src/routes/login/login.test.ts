@@ -49,7 +49,7 @@ describe('login route actions', () => {
 
     await expect(actionHandler(actions.default)(event)).rejects.toMatchObject({
       status: 303,
-      location: '/account/security?setup_totp=1'
+      location: '/account/security?setup_totp=1&return_to=%2F'
     });
   });
 
@@ -62,7 +62,7 @@ describe('login route actions', () => {
 
     await expect(actionHandler(actions.default)(event)).rejects.toMatchObject({
       status: 303,
-      location: '/mfa'
+      location: '/mfa?return_to=%2F'
     });
   });
 
@@ -75,7 +75,7 @@ describe('login route actions', () => {
 
     await expect(actionHandler(actions.federated)(event)).rejects.toMatchObject({
       status: 303,
-      location: '/auth/federated/acme-team/entra-id?return_to=/'
+      location: '/auth/federated/acme-team/entra-id?return_to=%2F'
     });
     expect(fetcher).not.toHaveBeenCalled();
   });
@@ -100,5 +100,31 @@ describe('login route actions', () => {
       }
     });
     expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('preserves a safe authorization return path after native login', async () => {
+    const { event } = actionEvent(
+      'http://web.test/login?return_to=%2Foauth2%2Fauthorize%3Fclient_id%3DCLIENT_FOR_TEST',
+      { email: 'person@example.test', password: 'YOUR_PASSWORD_HERE' },
+      jsonResponse(200, { totp_setup_required: false, mfa_required: false })
+    );
+
+    await expect(actionHandler(actions.default)(event)).rejects.toMatchObject({
+      status: 303,
+      location: '/oauth2/authorize?client_id=CLIENT_FOR_TEST'
+    });
+  });
+
+  it('rejects an external return target after native login', async () => {
+    const { event } = actionEvent(
+      'http://web.test/login?return_to=https%3A%2F%2Fevil.test%2Fcallback',
+      { email: 'person@example.test', password: 'YOUR_PASSWORD_HERE' },
+      jsonResponse(200, { totp_setup_required: false, mfa_required: false })
+    );
+
+    await expect(actionHandler(actions.default)(event)).rejects.toMatchObject({
+      status: 303,
+      location: '/'
+    });
   });
 });

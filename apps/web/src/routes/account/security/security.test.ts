@@ -120,7 +120,8 @@ describe('account security actions', () => {
     await expect(handler(actions.startTotp)(event)).resolves.toEqual({
       type: 'totp_setup',
       secret: 'TEST_TOTP_SECRET',
-      provisioning_uri: 'otpauth://totp/Zeus:test?secret=TEST_TOTP_SECRET'
+      provisioning_uri: 'otpauth://totp/Zeus:test?secret=TEST_TOTP_SECRET',
+      return_to: '/account/security'
     });
     expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({ code: null });
   });
@@ -139,7 +140,8 @@ describe('account security actions', () => {
     await expect(handler(actions.confirmTotp)(event)).resolves.toEqual({
       type: 'totp_confirmed',
       message: 'TOTP 已启用。请立即保存以下一次性恢复码。',
-      recovery_codes: ['RECOVERY_CODE_FOR_TEST_1', 'RECOVERY_CODE_FOR_TEST_2']
+      recovery_codes: ['RECOVERY_CODE_FOR_TEST_1', 'RECOVERY_CODE_FOR_TEST_2'],
+      return_to: '/account/security'
     });
     expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({ code: '123456' });
   });

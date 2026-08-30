@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::crypto::{EnvelopeCipher, SealedSecret};
 
 const MAX_EMAIL_ATTEMPTS: i32 = 10;
+const OIDC_MAINTENANCE_INTERVAL: Duration = Duration::from_hours(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityMaintenanceError {
@@ -228,6 +229,39 @@ impl IdentityMaintenance {
     }
 }
 
+pub async fn run_oidc_protocol_maintenance(
+    database: PgPool,
+    envelope: Arc<dyn EnvelopeCipher>,
+    shutdown: CancellationToken,
+) {
+    info!("OIDC protocol maintenance started");
+    loop {
+        if shutdown.is_cancelled() {
+            break;
+        }
+        if let Err(error) = crate::oidc_provider::maintain_signing_key(&database, &envelope).await {
+            warn!(
+                error_kind = api_error_kind(&error),
+                "OIDC signing-key maintenance failed"
+            );
+        }
+        if let Err(error) = sqlx::query("select zeus_private.cleanup_oidc_protocol_state()")
+            .execute(&database)
+            .await
+        {
+            warn!(
+                error_kind = database_error_kind(&error),
+                "OIDC protocol-state cleanup failed"
+            );
+        }
+        tokio::select! {
+            () = shutdown.cancelled() => break,
+            () = tokio::time::sleep(OIDC_MAINTENANCE_INTERVAL) => {}
+        }
+    }
+    info!("OIDC protocol maintenance stopped");
+}
+
 fn retry_delay_seconds(attempt: i32) -> i32 {
     let exponent = u32::try_from(attempt.clamp(1, 9)).unwrap_or(1);
     5_i32
@@ -242,6 +276,14 @@ fn database_error_kind(error: &sqlx::Error) -> &'static str {
         sqlx::Error::Io(_) => "io",
         sqlx::Error::Database(_) => "database",
         _ => "other",
+    }
+}
+
+fn api_error_kind(error: &crate::error::ApiError) -> &'static str {
+    match error {
+        crate::error::ApiError::DatabaseUnavailable => "database",
+        crate::error::ApiError::Internal => "internal",
+        _ => "protocol",
     }
 }
 

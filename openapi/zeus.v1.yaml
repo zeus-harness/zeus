@@ -7,6 +7,38 @@ info:
     identifier: MIT
   version: 0.1.0
 paths:
+  /.well-known/oauth-authorization-server:
+    get:
+      tags:
+      - identity
+      operationId: oauth_authorization_server_metadata
+      responses:
+        '200':
+          description: Successful response
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - {}
+  /.well-known/openid-configuration:
+    get:
+      tags:
+      - identity
+      operationId: oidc_discovery
+      responses:
+        '200':
+          description: Successful response
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - {}
   /api/v1/auth/context:
     post:
       tags:
@@ -1171,6 +1203,140 @@ paths:
       security:
       - sessionCookie: []
       - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/oidc-clients:
+    get:
+      tags:
+      - identity
+      operationId: list_oidc_clients
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/OidcClientResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - identity
+      operationId: create_oidc_client
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOidcClientRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedOidcClientResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/oidc-clients/{client_id}:
+    delete:
+      tags:
+      - identity
+      operationId: revoke_oidc_client
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: client_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '204':
+          description: Successful response
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    patch:
+      tags:
+      - identity
+      operationId: update_oidc_client
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: client_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateOidcClientRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OidcClientResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
   /api/v1/organizations/{organization_id}/service-accounts:
     get:
       tags:
@@ -1449,6 +1615,115 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/FederatedLinkIntentResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/users/me/oidc-authorization-requests/{request_id}:
+    get:
+      tags:
+      - identity
+      operationId: get_oidc_authorization_request
+      parameters:
+      - name: request_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthorizationRequestResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - identity
+      operationId: decide_oidc_authorization_request
+      parameters:
+      - name: request_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthorizationDecisionRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthorizationDecisionResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/users/me/oidc-grants:
+    get:
+      tags:
+      - identity
+      operationId: list_oidc_grants
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/OidcGrantResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/users/me/oidc-grants/{client_id}:
+    delete:
+      tags:
+      - identity
+      operationId: revoke_oidc_grant
+      parameters:
+      - name: client_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '204':
+          description: Successful response
         default:
           description: Problem Details error
           content:
@@ -4791,6 +5066,132 @@ paths:
                 $ref: '#/components/schemas/ProblemDetails'
       security:
       - {}
+  /oauth2/authorize:
+    get:
+      tags:
+      - identity
+      operationId: oidc_authorize
+      responses:
+        '303':
+          description: Successful response
+        default:
+          description: OAuth 2.0 or OpenID Connect error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthProtocolError'
+      security:
+      - {}
+  /oauth2/jwks.json:
+    get:
+      tags:
+      - identity
+      operationId: oidc_jwks
+      responses:
+        '200':
+          description: Successful response
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - {}
+  /oauth2/logout:
+    get:
+      tags:
+      - identity
+      operationId: oidc_logout_get
+      responses:
+        '303':
+          description: Successful response
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - {}
+    post:
+      tags:
+      - identity
+      operationId: oidc_logout_post
+      responses:
+        '303':
+          description: Successful response
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - {}
+  /oauth2/revoke:
+    post:
+      tags:
+      - identity
+      operationId: oidc_revoke
+      responses:
+        '200':
+          description: Successful response
+        default:
+          description: OAuth 2.0 or OpenID Connect error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthProtocolError'
+      security:
+      - {}
+  /oauth2/token:
+    post:
+      tags:
+      - identity
+      operationId: oidc_token
+      responses:
+        '200':
+          description: Successful response
+        default:
+          description: OAuth 2.0 or OpenID Connect error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthProtocolError'
+      security:
+      - {}
+  /oauth2/userinfo:
+    get:
+      tags:
+      - identity
+      operationId: oidc_userinfo_get
+      responses:
+        '200':
+          description: Successful response
+        default:
+          description: OAuth 2.0 or OpenID Connect error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthProtocolError'
+      security:
+      - {}
+    post:
+      tags:
+      - identity
+      operationId: oidc_userinfo_post
+      responses:
+        '200':
+          description: Successful response
+        default:
+          description: OAuth 2.0 or OpenID Connect error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthProtocolError'
+      security:
+      - {}
 components:
   schemas:
     AcceptedIdentityResponse:
@@ -4995,6 +5396,50 @@ components:
           - string
           - 'null'
           format: uuid
+    AuthorizationDecisionRequest:
+      type: object
+      required:
+      - approved
+      properties:
+        approved:
+          type: boolean
+    AuthorizationDecisionResponse:
+      type: object
+      required:
+      - redirect_url
+      properties:
+        redirect_url:
+          type: string
+    AuthorizationRequestResponse:
+      type: object
+      required:
+      - request_id
+      - organization_id
+      - organization_name
+      - client_id
+      - client_public_id
+      - client_name
+      - scopes
+      properties:
+        client_id:
+          type: string
+          format: uuid
+        client_name:
+          type: string
+        client_public_id:
+          type: string
+        organization_id:
+          type: string
+          format: uuid
+        organization_name:
+          type: string
+        request_id:
+          type: string
+          format: uuid
+        scopes:
+          type: array
+          items:
+            type: string
     CancelRunRequest:
       type: object
       properties:
@@ -5446,6 +5891,31 @@ components:
           type: string
         provider_kind:
           type: string
+    CreateOidcClientRequest:
+      type: object
+      required:
+      - name
+      - client_type
+      - redirect_uris
+      properties:
+        allowed_scopes:
+          type: array
+          items:
+            type: string
+        client_type:
+          type: string
+        name:
+          type: string
+        post_logout_redirect_uris:
+          type: array
+          items:
+            type: string
+        redirect_uris:
+          type: array
+          items:
+            type: string
+        trusted:
+          type: boolean
     CreateOrganizationDomainRequest:
       type: object
       required:
@@ -5654,6 +6124,16 @@ components:
           type: string
         slug:
           type: string
+    CreatedOidcClientResponse:
+      allOf:
+      - $ref: '#/components/schemas/OidcClientResponse'
+      - type: object
+        properties:
+          client_secret:
+            type:
+            - string
+            - 'null'
+            writeOnly: true
     CreatedOrganizationDomainResponse:
       allOf:
       - $ref: '#/components/schemas/OrganizationDomainResponse'
@@ -6444,6 +6924,109 @@ components:
         user_id:
           type: string
           format: uuid
+    OAuthProtocolError:
+      type: object
+      required:
+      - error
+      properties:
+        error:
+          type: string
+        error_description:
+          type:
+          - string
+          - 'null'
+    OidcClientResponse:
+      type: object
+      required:
+      - id
+      - organization_id
+      - client_id
+      - name
+      - client_type
+      - trusted
+      - allowed_scopes
+      - redirect_uris
+      - post_logout_redirect_uris
+      - status
+      - revision
+      - created_by
+      - created_at
+      - updated_at
+      properties:
+        allowed_scopes:
+          type: array
+          items:
+            type: string
+        client_id:
+          type: string
+        client_type:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        created_by:
+          type: string
+          format: uuid
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        organization_id:
+          type: string
+          format: uuid
+        post_logout_redirect_uris:
+          type: array
+          items:
+            type: string
+        redirect_uris:
+          type: array
+          items:
+            type: string
+        revision:
+          type: integer
+          format: int64
+        status:
+          type: string
+        trusted:
+          type: boolean
+        updated_at:
+          type: string
+          format: date-time
+    OidcGrantResponse:
+      type: object
+      required:
+      - client_id
+      - client_public_id
+      - client_name
+      - organization_id
+      - organization_name
+      - scopes
+      - granted_at
+      - last_used_at
+      properties:
+        client_id:
+          type: string
+          format: uuid
+        client_name:
+          type: string
+        client_public_id:
+          type: string
+        granted_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: string
+          format: date-time
+        organization_id:
+          type: string
+          format: uuid
+        organization_name:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
     OrganizationDomainResponse:
       type: object
       required:
@@ -7468,6 +8051,35 @@ components:
         provider_kind:
           type:
           - string
+          - 'null'
+    UpdateOidcClientRequest:
+      type: object
+      properties:
+        allowed_scopes:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
+        name:
+          type:
+          - string
+          - 'null'
+        post_logout_redirect_uris:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
+        redirect_uris:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
+        trusted:
+          type:
+          - boolean
           - 'null'
     UpdateOrganizationIdentityPolicyRequest:
       type: object

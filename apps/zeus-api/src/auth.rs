@@ -203,7 +203,7 @@ impl FromRequestParts<AppState> for AuthContext {
     }
 }
 
-async fn principal_requires_mfa(
+pub(crate) async fn principal_requires_mfa(
     state: &AppState,
     principal: &PrincipalContext,
 ) -> Result<bool, ApiError> {
@@ -236,7 +236,7 @@ async fn principal_requires_mfa(
     Ok(required)
 }
 
-async fn user_has_totp(state: &AppState, user_id: Uuid) -> Result<bool, ApiError> {
+pub(crate) async fn user_has_totp(state: &AppState, user_id: Uuid) -> Result<bool, ApiError> {
     sqlx::query_scalar(
         "select exists (
            select 1 from zeus_private.load_totp_credential($1)
@@ -374,6 +374,9 @@ fn browser_write_security_exempt(path: &str) -> bool {
             | "/api/v1/auth/email-verifications/confirm"
             | "/api/v1/auth/password-resets"
             | "/api/v1/auth/password-resets/confirm"
+            | "/oauth2/token"
+            | "/oauth2/userinfo"
+            | "/oauth2/revoke"
     )
 }
 
@@ -449,6 +452,14 @@ async fn authenticate_user_session(
         absolute_expires_at: Some(row.absolute_expires_at),
         csrf_token_hash: row.csrf_token_hash,
     })
+}
+
+pub(crate) async fn authenticate_user_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<PrincipalContext, ApiError> {
+    let token = cookie_value(headers, SESSION_COOKIE).ok_or(ApiError::Unauthorized)?;
+    authenticate_user_session(state, token).await
 }
 
 async fn authenticate_service_account(
@@ -1379,7 +1390,10 @@ mod tests {
     use time::OffsetDateTime;
     use uuid::Uuid;
 
-    use super::{CurrentUserResponse, SESSION_COOKIE, cookie_value, parse_service_account_token};
+    use super::{
+        CurrentUserResponse, SESSION_COOKIE, browser_write_security_exempt, cookie_value,
+        parse_service_account_token,
+    };
 
     #[test]
     fn cookie_parser_does_not_confuse_neighboring_names() {
@@ -1400,6 +1414,17 @@ mod tests {
             parse_service_account_token("zsa_12345678.abcdefghijklmnopqrstuvwxyz123456").is_ok()
         );
         assert!(parse_service_account_token("wrong.abcdefghijklmnopqrstuvwxyz123456").is_err());
+    }
+
+    #[test]
+    fn oauth_credential_endpoints_do_not_depend_on_an_incidental_web_session_cookie() {
+        assert!(browser_write_security_exempt("/oauth2/token"));
+        assert!(browser_write_security_exempt("/oauth2/userinfo"));
+        assert!(browser_write_security_exempt("/oauth2/revoke"));
+        assert!(!browser_write_security_exempt("/oauth2/logout"));
+        assert!(!browser_write_security_exempt(
+            "/api/v1/users/me/oidc-authorization-requests/request-id"
+        ));
     }
 
     #[test]

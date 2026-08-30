@@ -32,7 +32,7 @@ use crate::{
     AppState, agents, auth,
     error::{ApiError, ProblemDetails, REQUEST_ID},
     execution_api, experiences, federated_identity, integrations, native_auth, native_identity,
-    organization, organization_identity,
+    oidc_provider, organization, organization_identity,
     supervisor::SupervisorMetrics,
     work_items,
 };
@@ -99,6 +99,7 @@ use crate::{
         MetaResponse,
         FeatureStatus,
         ProblemDetails,
+        OAuthProtocolError,
         native_identity::SetupStatusResponse,
         native_identity::SetupRequest,
         native_identity::SetupResponse,
@@ -132,6 +133,14 @@ use crate::{
         federated_identity::CreatedOrganizationDomainResponse,
         federated_identity::OrganizationIdentityPolicyResponse,
         federated_identity::UpdateOrganizationIdentityPolicyRequest,
+        oidc_provider::OidcClientResponse,
+        oidc_provider::CreateOidcClientRequest,
+        oidc_provider::CreatedOidcClientResponse,
+        oidc_provider::UpdateOidcClientRequest,
+        oidc_provider::OidcGrantResponse,
+        oidc_provider::AuthorizationRequestResponse,
+        oidc_provider::AuthorizationDecisionRequest,
+        oidc_provider::AuthorizationDecisionResponse,
         organization::OrganizationResponse,
         organization::CreateOrganizationRequest,
         organization::UpdateOrganizationRequest,
@@ -256,6 +265,12 @@ pub struct HealthResponse {
 pub struct FeatureStatus {
     pub name: &'static str,
     pub status: &'static str,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OAuthProtocolError {
+    pub error: String,
+    pub error_description: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1804,6 +1819,186 @@ pub const PUBLIC_ROUTES: &[PublicRoute] = &[
         BodySchema::None,
         true,
     ),
+    public_route(
+        "/api/v1/organizations/{organization_id}/oidc-clients",
+        "GET",
+        "list_oidc_clients",
+        "identity",
+        200,
+        None,
+        BodySchema::Array("OidcClientResponse"),
+        true,
+    ),
+    public_route(
+        "/api/v1/organizations/{organization_id}/oidc-clients",
+        "POST",
+        "create_oidc_client",
+        "identity",
+        201,
+        Some("CreateOidcClientRequest"),
+        BodySchema::Object("CreatedOidcClientResponse"),
+        true,
+    ),
+    public_route(
+        "/api/v1/organizations/{organization_id}/oidc-clients/{client_id}",
+        "PATCH",
+        "update_oidc_client",
+        "identity",
+        200,
+        Some("UpdateOidcClientRequest"),
+        BodySchema::Object("OidcClientResponse"),
+        true,
+    ),
+    public_route(
+        "/api/v1/organizations/{organization_id}/oidc-clients/{client_id}",
+        "DELETE",
+        "revoke_oidc_client",
+        "identity",
+        204,
+        None,
+        BodySchema::None,
+        true,
+    ),
+    public_route(
+        "/api/v1/users/me/oidc-grants",
+        "GET",
+        "list_oidc_grants",
+        "identity",
+        200,
+        None,
+        BodySchema::Array("OidcGrantResponse"),
+        true,
+    ),
+    public_route(
+        "/api/v1/users/me/oidc-grants/{client_id}",
+        "DELETE",
+        "revoke_oidc_grant",
+        "identity",
+        204,
+        None,
+        BodySchema::None,
+        true,
+    ),
+    public_route(
+        "/api/v1/users/me/oidc-authorization-requests/{request_id}",
+        "GET",
+        "get_oidc_authorization_request",
+        "identity",
+        200,
+        None,
+        BodySchema::Object("AuthorizationRequestResponse"),
+        true,
+    ),
+    public_route(
+        "/api/v1/users/me/oidc-authorization-requests/{request_id}",
+        "POST",
+        "decide_oidc_authorization_request",
+        "identity",
+        200,
+        Some("AuthorizationDecisionRequest"),
+        BodySchema::Object("AuthorizationDecisionResponse"),
+        true,
+    ),
+    public_route(
+        "/.well-known/openid-configuration",
+        "GET",
+        "oidc_discovery",
+        "identity",
+        200,
+        None,
+        BodySchema::None,
+        false,
+    ),
+    public_route(
+        "/.well-known/oauth-authorization-server",
+        "GET",
+        "oauth_authorization_server_metadata",
+        "identity",
+        200,
+        None,
+        BodySchema::None,
+        false,
+    ),
+    public_route(
+        "/oauth2/authorize",
+        "GET",
+        "oidc_authorize",
+        "identity",
+        303,
+        None,
+        BodySchema::None,
+        false,
+    ),
+    public_route(
+        "/oauth2/token",
+        "POST",
+        "oidc_token",
+        "identity",
+        200,
+        None,
+        BodySchema::None,
+        false,
+    ),
+    public_route(
+        "/oauth2/userinfo",
+        "GET",
+        "oidc_userinfo_get",
+        "identity",
+        200,
+        None,
+        BodySchema::None,
+        false,
+    ),
+    public_route(
+        "/oauth2/userinfo",
+        "POST",
+        "oidc_userinfo_post",
+        "identity",
+        200,
+        None,
+        BodySchema::None,
+        false,
+    ),
+    public_route(
+        "/oauth2/revoke",
+        "POST",
+        "oidc_revoke",
+        "identity",
+        200,
+        None,
+        BodySchema::None,
+        false,
+    ),
+    public_route(
+        "/oauth2/logout",
+        "GET",
+        "oidc_logout_get",
+        "identity",
+        303,
+        None,
+        BodySchema::None,
+        false,
+    ),
+    public_route(
+        "/oauth2/logout",
+        "POST",
+        "oidc_logout_post",
+        "identity",
+        303,
+        None,
+        BodySchema::None,
+        false,
+    ),
+    public_route(
+        "/oauth2/jwks.json",
+        "GET",
+        "oidc_jwks",
+        "identity",
+        200,
+        None,
+        BodySchema::None,
+        false,
+    ),
 ];
 
 struct OpenApiModifier;
@@ -1858,7 +2053,12 @@ impl Modify for OpenApiModifier {
                 .responses
                 .entry(route.success_status.to_string())
                 .or_insert_with(|| RefOr::T(success_response(route.response_schema)));
-            if !has_problem_response(&operation.responses) {
+            if uses_oauth_error_contract(route.path) {
+                operation
+                    .responses
+                    .responses
+                    .insert("default".to_owned(), RefOr::T(oauth_error_response()));
+            } else if !has_problem_response(&operation.responses) {
                 operation
                     .responses
                     .responses
@@ -1985,11 +2185,35 @@ fn problem_response() -> Response {
     response
 }
 
+fn oauth_error_response() -> Response {
+    let mut response = Response::new("OAuth 2.0 or OpenID Connect error");
+    response.content.insert(
+        "application/json".to_owned(),
+        json_content(BodySchema::Object("OAuthProtocolError")),
+    );
+    response
+}
+
+fn uses_oauth_error_contract(path: &str) -> bool {
+    matches!(
+        path,
+        "/oauth2/authorize" | "/oauth2/token" | "/oauth2/userinfo" | "/oauth2/revoke"
+    )
+}
+
 fn has_problem_response(responses: &Responses) -> bool {
     responses.responses.values().any(|response| match response {
         RefOr::Ref(_) => false,
         RefOr::T(response) => response.content.contains_key("application/problem+json"),
     })
+}
+
+#[cfg(test)]
+fn has_oauth_error_response(responses: &Responses) -> bool {
+    matches!(
+        responses.responses.get("default"),
+        Some(RefOr::T(response)) if response.content.contains_key("application/json")
+    )
 }
 
 fn security_requirements(requires_auth: bool) -> Vec<SecurityRequirement> {
@@ -2039,6 +2263,7 @@ pub fn router(state: AppState) -> Router {
         .merge(organization::routes())
         .merge(organization_identity::routes())
         .merge(federated_identity::routes())
+        .merge(oidc_provider::routes())
         .merge(agents::routes())
         .merge(integrations::routes())
         .merge(work_items::routes())
@@ -2218,8 +2443,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        ApiDoc, PUBLIC_ROUTES, has_problem_response, request_id_from_headers,
-        should_track_http_path,
+        ApiDoc, PUBLIC_ROUTES, has_oauth_error_response, has_problem_response,
+        request_id_from_headers, should_track_http_path, uses_oauth_error_contract,
     };
     use http::{HeaderMap, HeaderValue};
     use utoipa::OpenApi;
@@ -2259,12 +2484,21 @@ mod tests {
                 route.method,
                 route.path
             );
-            assert!(
-                has_problem_response(&operation.responses),
-                "missing problem+json response for {} {}",
-                route.method,
-                route.path
-            );
+            if uses_oauth_error_contract(route.path) {
+                assert!(
+                    has_oauth_error_response(&operation.responses),
+                    "missing OAuth error response for {} {}",
+                    route.method,
+                    route.path
+                );
+            } else {
+                assert!(
+                    has_problem_response(&operation.responses),
+                    "missing problem+json response for {} {}",
+                    route.method,
+                    route.path
+                );
+            }
             assert!(
                 registered_operation_ids.insert(route.operation_id),
                 "duplicate operationId {}",

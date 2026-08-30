@@ -68,7 +68,7 @@ describe('native identity route actions', () => {
 
     await expect(actionHandler(loginActions.default)(event)).rejects.toMatchObject({
       status: 303,
-      location: '/mfa'
+      location: '/mfa?return_to=%2F'
     });
   });
 

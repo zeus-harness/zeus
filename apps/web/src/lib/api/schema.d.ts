@@ -4,6 +4,38 @@
  */
 
 export interface paths {
+    "/.well-known/oauth-authorization-server": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["oauth_authorization_server_metadata"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/.well-known/openid-configuration": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["oidc_discovery"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/auth/context": {
         parameters: {
             query?: never;
@@ -500,6 +532,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/organizations/{organization_id}/oidc-clients": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_oidc_clients"];
+        put?: never;
+        post: operations["create_oidc_client"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/organizations/{organization_id}/oidc-clients/{client_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["revoke_oidc_client"];
+        options?: never;
+        head?: never;
+        patch: operations["update_oidc_client"];
+        trace?: never;
+    };
     "/api/v1/organizations/{organization_id}/service-accounts": {
         parameters: {
             query?: never;
@@ -623,6 +687,54 @@ export interface paths {
         put?: never;
         post: operations["create_federated_link_intent"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/users/me/oidc-authorization-requests/{request_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_oidc_authorization_request"];
+        put?: never;
+        post: operations["decide_oidc_authorization_request"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/users/me/oidc-grants": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_oidc_grants"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/users/me/oidc-grants/{client_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["revoke_oidc_grant"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1764,6 +1876,102 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/oauth2/authorize": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["oidc_authorize"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/oauth2/jwks.json": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["oidc_jwks"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/oauth2/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["oidc_logout_get"];
+        put?: never;
+        post: operations["oidc_logout_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/oauth2/revoke": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["oidc_revoke"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/oauth2/token": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["oidc_token"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/oauth2/userinfo": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["oidc_userinfo_get"];
+        put?: never;
+        post: operations["oidc_userinfo_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -1856,6 +2064,24 @@ export interface components {
             size_bytes: number;
             /** Format: uuid */
             work_item_id?: string | null;
+        };
+        AuthorizationDecisionRequest: {
+            approved: boolean;
+        };
+        AuthorizationDecisionResponse: {
+            redirect_url: string;
+        };
+        AuthorizationRequestResponse: {
+            /** Format: uuid */
+            client_id: string;
+            client_name: string;
+            client_public_id: string;
+            /** Format: uuid */
+            organization_id: string;
+            organization_name: string;
+            /** Format: uuid */
+            request_id: string;
+            scopes: string[];
         };
         CancelRunRequest: {
             reason?: string | null;
@@ -2039,6 +2265,14 @@ export interface components {
             name: string;
             provider_kind?: string;
         };
+        CreateOidcClientRequest: {
+            allowed_scopes?: string[];
+            client_type: string;
+            name: string;
+            post_logout_redirect_uris?: string[];
+            redirect_uris: string[];
+            trusted?: boolean;
+        };
         CreateOrganizationDomainRequest: {
             domain: string;
         };
@@ -2134,6 +2368,9 @@ export interface components {
         CreateWorkspaceRequest: {
             name: string;
             slug: string;
+        };
+        CreatedOidcClientResponse: components["schemas"]["OidcClientResponse"] & {
+            client_secret?: string | null;
         };
         CreatedOrganizationDomainResponse: components["schemas"]["OrganizationDomainResponse"] & {
             txt_record_name: string;
@@ -2452,6 +2689,46 @@ export interface components {
             totp_setup_required: boolean;
             /** Format: uuid */
             user_id: string;
+        };
+        OAuthProtocolError: {
+            error: string;
+            error_description?: string | null;
+        };
+        OidcClientResponse: {
+            allowed_scopes: string[];
+            client_id: string;
+            client_type: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: uuid */
+            created_by: string;
+            /** Format: uuid */
+            id: string;
+            name: string;
+            /** Format: uuid */
+            organization_id: string;
+            post_logout_redirect_uris: string[];
+            redirect_uris: string[];
+            /** Format: int64 */
+            revision: number;
+            status: string;
+            trusted: boolean;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        OidcGrantResponse: {
+            /** Format: uuid */
+            client_id: string;
+            client_name: string;
+            client_public_id: string;
+            /** Format: date-time */
+            granted_at: string;
+            /** Format: date-time */
+            last_used_at: string;
+            /** Format: uuid */
+            organization_id: string;
+            organization_name: string;
+            scopes: string[];
         };
         OrganizationDomainResponse: {
             /** Format: date-time */
@@ -2860,6 +3137,13 @@ export interface components {
             name?: string | null;
             provider_kind?: string | null;
         };
+        UpdateOidcClientRequest: {
+            allowed_scopes?: string[] | null;
+            name?: string | null;
+            post_logout_redirect_uris?: string[] | null;
+            redirect_uris?: string[] | null;
+            trusted?: boolean | null;
+        };
         UpdateOrganizationIdentityPolicyRequest: {
             federated_required: boolean;
             mfa_required: boolean;
@@ -3128,6 +3412,60 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    oauth_authorization_server_metadata: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    oidc_discovery: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
     select_identity_context: {
         parameters: {
             query?: never;
@@ -4440,6 +4778,146 @@ export interface operations {
             };
         };
     };
+    list_oidc_clients: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OidcClientResponse"][];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    create_oidc_client: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        /** @description JSON request body */
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateOidcClientRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreatedOidcClientResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    revoke_oidc_client: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+                /** @description Path identifier */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    update_oidc_client: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+                /** @description Path identifier */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        /** @description JSON request body */
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateOidcClientRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OidcClientResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
     list_service_accounts: {
         parameters: {
             query?: never;
@@ -4744,6 +5222,134 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["FederatedLinkIntentResponse"];
                 };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    get_oidc_authorization_request: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                request_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthorizationRequestResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    decide_oidc_authorization_request: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                request_id: string;
+            };
+            cookie?: never;
+        };
+        /** @description JSON request body */
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AuthorizationDecisionRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthorizationDecisionResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    list_oidc_grants: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OidcGrantResponse"][];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    revoke_oidc_grant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Problem Details error */
             default: {
@@ -8207,6 +8813,222 @@ export interface operations {
                 };
                 content: {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    oidc_authorize: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            303: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description OAuth 2.0 or OpenID Connect error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OAuthProtocolError"];
+                };
+            };
+        };
+    };
+    oidc_jwks: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    oidc_logout_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            303: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    oidc_logout_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            303: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    oidc_revoke: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description OAuth 2.0 or OpenID Connect error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OAuthProtocolError"];
+                };
+            };
+        };
+    };
+    oidc_token: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description OAuth 2.0 or OpenID Connect error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OAuthProtocolError"];
+                };
+            };
+        };
+    };
+    oidc_userinfo_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description OAuth 2.0 or OpenID Connect error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OAuthProtocolError"];
+                };
+            };
+        };
+    };
+    oidc_userinfo_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description OAuth 2.0 or OpenID Connect error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OAuthProtocolError"];
                 };
             };
         };

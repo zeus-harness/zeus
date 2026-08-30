@@ -15,7 +15,8 @@
     '/verify-email',
     '/forgot-password',
     '/reset-password',
-    '/mfa'
+    '/mfa',
+    '/oauth/consent'
   ] as const;
 
   let { children, data }: { children: Snippet; data: LayoutData } = $props();
