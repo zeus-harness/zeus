@@ -32,7 +32,11 @@ function actionError(status: number, message: string) {
 }
 
 async function actionWorkspace(event: Parameters<NonNullable<Actions['create']>>[0]) {
-  const apiFetch = serverApiFetcher(event.fetch, event.request.headers.get('cookie'));
+  const apiFetch = serverApiFetcher(
+    event.fetch,
+    event.request.headers.get('cookie'),
+    event.url.origin
+  );
   const auth = await loadCurrentPrincipal(apiFetch, env.ZEUS_API_URL);
   if (auth.status === 'unauthenticated') {
     return { apiFetch, error: actionError(401, '当前会话未登录，请先登录 Zeus。') };
@@ -49,7 +53,7 @@ async function actionWorkspace(event: Parameters<NonNullable<Actions['create']>>
 
 export const load: PageServerLoad = async ({ fetch, parent, request, url }) => {
   const { principal, status: authStatus } = await parent();
-  const apiFetch = serverApiFetcher(fetch, request.headers.get('cookie'));
+  const apiFetch = serverApiFetcher(fetch, request.headers.get('cookie'), url.origin);
   const status = url.searchParams.get('status') || undefined;
   const cursor = url.searchParams.get('cursor') || undefined;
   const result = await loadWorkspaceData(

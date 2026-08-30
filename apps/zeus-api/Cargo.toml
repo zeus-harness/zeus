@@ -30,6 +30,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
@@ -43,6 +44,7 @@ utoipa.workspace = true
 url.workspace = true
 uuid.workspace = true
 zeus-core = { path = "../../crates/zeus-core" }
+zeus-identity = { path = "../../crates/zeus-identity" }
 
 [dev-dependencies]
 http-body-util = "0.1"

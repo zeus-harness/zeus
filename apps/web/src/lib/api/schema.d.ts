@@ -244,6 +244,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/setup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["setup"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/setup/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["setup_status"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}": {
         parameters: {
             query?: never;
@@ -1727,11 +1759,23 @@ export interface components {
             workspace_id: string;
         };
         CurrentUserResponse: {
+            /** Format: date-time */
+            absolute_expires_at?: string | null;
+            auth_methods: string[];
+            /** Format: date-time */
+            authenticated_at?: string | null;
             display_name: string;
             email?: string | null;
+            /** Format: date-time */
+            email_verified_at?: string | null;
+            /** Format: date-time */
+            idle_expires_at?: string | null;
+            /** Format: date-time */
+            mfa_satisfied_at?: string | null;
             /** Format: uuid */
-            organization_id: string;
+            organization_id?: string | null;
             organization_role?: string | null;
+            platform_roles: string[];
             /** Format: uuid */
             principal_id: string;
             principal_kind: string;
@@ -2140,6 +2184,32 @@ export interface components {
             status?: string;
             /** Format: uuid */
             user_id: string;
+        };
+        SetupRequest: {
+            bootstrap_token: string;
+            display_name: string;
+            email: string;
+            organization_name: string;
+            organization_slug: string;
+            password: string;
+            workspace_name: string;
+            workspace_slug: string;
+        };
+        SetupResponse: {
+            email_verification_required: boolean;
+            /** Format: uuid */
+            organization_id: string;
+            /** Format: uuid */
+            session_id: string;
+            totp_setup_required: boolean;
+            /** Format: uuid */
+            user_id: string;
+            /** Format: uuid */
+            workspace_id: string;
+        };
+        SetupStatusResponse: {
+            bootstrap_token_configured: boolean;
+            setup_required: boolean;
         };
         SubmitMessageRequest: {
             content: string;
@@ -3228,6 +3298,68 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["WorkspaceResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    setup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetupRequest"];
+            };
+        };
+        responses: {
+            /** @description Platform admin and first tenant created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SetupResponse"];
+                };
+            };
+            /** @description Setup was already completed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    setup_status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Native identity setup state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SetupStatusResponse"];
                 };
             };
             /** @description Problem Details error */

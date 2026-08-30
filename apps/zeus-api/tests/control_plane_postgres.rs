@@ -17,6 +17,7 @@ use zeus_api::{
     http, migrate,
     supervisor::SupervisorMetrics,
 };
+use zeus_identity::{PasswordExecutor, PasswordPolicy};
 
 #[tokio::test]
 #[ignore = "requires ZEUS_TEST_DATABASE_URL and ZEUS_TEST_ENVELOPE_KEY"]
@@ -171,11 +172,15 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
             .expect("HTTP client builds"),
         metrics: Arc::new(SupervisorMetrics::default()),
         public_url: Url::parse("http://127.0.0.1:8080").expect("public URL parses"),
-        session_ttl: Duration::from_hours(12),
+        session_idle_ttl: Duration::from_hours(2),
+        session_absolute_ttl: Duration::from_hours(12),
         oidc_state_ttl: Duration::from_mins(10),
         cookie_secure: false,
         allow_private_oidc_issuers: false,
         allow_private_model_endpoints: false,
+        bootstrap_token: None,
+        password_executor: PasswordExecutor::new(4, 4, PasswordPolicy::default())
+            .expect("password executor builds"),
         version: "0.1.0-test",
     };
     let app = http::router(state);

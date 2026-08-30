@@ -6,7 +6,7 @@ import { serverApiFetcher } from '$lib/api/server';
 
 export const load: PageServerLoad = async ({ fetch, parent, request, url }) => {
   const { principal, status: authStatus } = await parent();
-  const apiFetch = serverApiFetcher(fetch, request.headers.get('cookie'));
+  const apiFetch = serverApiFetcher(fetch, request.headers.get('cookie'), url.origin);
   const result = await loadWorkspaceData(
     apiFetch,
     { authStatus, workspaceId: principal?.workspace_id },

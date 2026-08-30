@@ -38,6 +38,8 @@ pub enum ApiError {
     IdempotencyConflict,
     #[error("the identity provider could not complete authentication")]
     IdentityProvider,
+    #[error("too many authentication attempts")]
+    RateLimited(u64),
     #[error("an internal operation failed")]
     Internal,
     #[error("the requested feature is not available yet")]
@@ -57,55 +59,70 @@ pub struct ProblemDetails {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let (status, code, title) = match self {
+        let (status, code, title, retry_after) = match self {
             Self::DatabaseUnavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "database_unavailable",
                 "Database unavailable",
+                None,
             ),
-            Self::NotFound => (StatusCode::NOT_FOUND, "not_found", "Not found"),
-            Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request", "Bad request"),
+            Self::NotFound => (StatusCode::NOT_FOUND, "not_found", "Not found", None),
+            Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request", "Bad request", None),
             Self::Validation(_) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "validation_failed",
                 "Validation failed",
+                None,
             ),
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 "unauthorized",
                 "Authentication required",
+                None,
             ),
-            Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden", "Access denied"),
-            Self::Conflict(_) => (StatusCode::CONFLICT, "conflict", "Conflict"),
+            Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden", "Access denied", None),
+            Self::Conflict(_) => (StatusCode::CONFLICT, "conflict", "Conflict", None),
             Self::PreconditionRequired => (
                 StatusCode::PRECONDITION_REQUIRED,
                 "precondition_required",
                 "Precondition required",
+                None,
             ),
             Self::PreconditionFailed => (
                 StatusCode::PRECONDITION_FAILED,
                 "precondition_failed",
                 "Precondition failed",
+                None,
             ),
             Self::IdempotencyConflict => (
                 StatusCode::CONFLICT,
                 "idempotency_conflict",
                 "Idempotency conflict",
+                None,
             ),
             Self::IdentityProvider => (
                 StatusCode::BAD_GATEWAY,
                 "identity_provider_error",
                 "Identity provider error",
+                None,
+            ),
+            Self::RateLimited(seconds) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "Too many requests",
+                Some(seconds),
             ),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
                 "Internal error",
+                None,
             ),
             Self::NotImplemented => (
                 StatusCode::NOT_IMPLEMENTED,
                 "feature_not_available",
                 "Feature not available",
+                None,
             ),
         };
         let body = ProblemDetails {
@@ -116,12 +133,20 @@ impl IntoResponse for ApiError {
             detail: self.to_string(),
             request_id: current_request_id(),
         };
-        (
+        let mut response = (
             status,
             [(http::header::CONTENT_TYPE, "application/problem+json")],
             Json(body),
         )
-            .into_response()
+            .into_response();
+        if let Some(seconds) = retry_after
+            && let Ok(value) = http::HeaderValue::from_str(&seconds.to_string())
+        {
+            response
+                .headers_mut()
+                .insert(http::header::RETRY_AFTER, value);
+        }
+        response
     }
 }
 
@@ -137,6 +162,7 @@ impl From<sqlx::Error> for ApiError {
                 Some("23514" | "22023") => {
                     Self::Validation("database constraint rejected the request".to_owned())
                 }
+                Some("42501") => Self::Forbidden,
                 _ => Self::Internal,
             };
         }

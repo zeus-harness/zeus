@@ -23,7 +23,16 @@ scripts/container init-env
 scripts/container up
 ```
 
-`up` 会创建 Zeus 专用网络，启动 PostgreSQL，创建数据库角色，执行 migration，随后启动内嵌 Supervisor 的 `zeus-api` 和 Web。缺少本地镜像时会自动构建。代码变化后重新构建并启动：
+`up` 会创建 Zeus 专用网络，启动 PostgreSQL、Mailpit、内嵌 Supervisor 的 `zeus-api`、Web 和同源 Gateway。数据库角色和 migration 会在 API 启动前完成。缺少本地镜像时会自动构建。浏览器统一访问：
+
+```text
+http://127.0.0.1:3000
+http://127.0.0.1:3000/mailpit/
+```
+
+API 和 Web 不发布宿主机端口。Gateway 把 `/api`、`/auth`、`/oauth2`、`/.well-known`、`/health` 和 `/metrics` 转给 API，其余请求转给 Web。
+
+`init-env` 会生成本地 Bootstrap token、数据库密码和 envelope key，写入权限为 `0600` 的 `.zeus/local.env`，不会打印这些值。代码变化后重新构建并启动：
 
 ```bash
 scripts/container build all
@@ -36,7 +45,7 @@ scripts/container up all
 
 ```bash
 scripts/container status all
-scripts/container logs api -n 100
+scripts/container logs gateway -n 100
 scripts/container down all
 ```
 
@@ -69,7 +78,7 @@ pnpm dev:api
 pnpm dev:web
 ```
 
-Web SSR 通过 `ZEUS_API_URL` 请求 API。Apple `container` 1.0.0 本地脚本会注入同网络 API 地址；Kubernetes 使用 Service 地址。当前 Workspace 来自登录 Session，不使用部署级固定 Workspace。
+Web SSR 通过 `ZEUS_API_URL` 请求 API。Apple `container` 1.0.0 本地脚本会注入同网络 API 地址；Kubernetes 使用 Service 地址。浏览器 Cookie 只经过同源 Gateway。当前 Workspace 来自登录 Session，不使用部署级固定 Workspace。
 
 ## 已实现链路
 

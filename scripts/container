@@ -10,10 +10,14 @@ ZEUS_NETWORK="zeus-local"
 ZEUS_POSTGRES_CONTAINER="zeus-postgres"
 ZEUS_API_CONTAINER="zeus-api"
 ZEUS_WEB_CONTAINER="zeus-web"
+ZEUS_GATEWAY_CONTAINER="zeus-gateway"
+ZEUS_MAILPIT_CONTAINER="zeus-mailpit"
 ZEUS_POSTGRES_VOLUME="zeus-postgres-data"
 ZEUS_POSTGRES_IMAGE="docker.io/library/postgres:18.6"
 ZEUS_API_IMAGE="zeus-api:0.1.0"
 ZEUS_WEB_IMAGE="zeus-web:0.1.0"
+ZEUS_GATEWAY_IMAGE="zeus-gateway:0.1.0"
+ZEUS_MAILPIT_IMAGE="docker.io/axllent/mailpit:v1.30.0"
 
 usage() {
   cat <<'EOF'
@@ -22,18 +26,21 @@ Usage: scripts/container <command> [target] [options]
 Commands:
   init-env                         Create .zeus/local.env with mode 0600
   rotate-postgres-password        Rotate the local PostgreSQL password
-  build [api|web|all]              Build local OCI images; default: all
-  up [postgres|api|web|all]        Start a service and its dependencies; default: all
-  down [postgres|api|web|all]      Stop services; default: all
-  status [postgres|api|web|all]    Show safe container list fields; default: all
-  logs <postgres|api|web> [flags]  Show logs; supports --follow, --boot, and -n
+  build [api|web|gateway|all]      Build local OCI images; default: all
+  up [postgres|mailpit|api|web|gateway|all]
+                                   Start a service and its dependencies; default: all
+  down [postgres|mailpit|api|web|gateway|all]
+                                   Stop services; default: all
+  status [postgres|mailpit|api|web|gateway|all]
+                                   Show safe container list fields; default: all
+  logs <service> [flags]           Show logs; supports --follow, --boot, and -n
   reset-db --yes                   Remove the local database container and volume
   help                             Show this help
 
 Examples:
   scripts/container up
   scripts/container build api
-  scripts/container logs api -n 100
+  scripts/container logs gateway -n 100
   scripts/container down all
 EOF
 }
@@ -88,18 +95,25 @@ cleanup_build_context() {
 init_env() {
   require_openssl
 
-  if [[ -f "${ZEUS_ENV_FILE}" ]]; then
-    chmod 0600 "${ZEUS_ENV_FILE}"
-    echo "Local environment already exists at ${ZEUS_ENV_FILE}."
-    return
-  fi
-
   umask 077
   mkdir -p "${ZEUS_STATE_DIR}"
 
-  local postgres_password master_key
+  if [[ -f "${ZEUS_ENV_FILE}" ]]; then
+    chmod 0600 "${ZEUS_ENV_FILE}"
+    if ! grep -q '^ZEUS_BOOTSTRAP_TOKEN=' "${ZEUS_ENV_FILE}"; then
+      local bootstrap_token
+      bootstrap_token="$(openssl rand -hex 32)"
+      printf '%s\n' "ZEUS_BOOTSTRAP_TOKEN=${bootstrap_token}" >> "${ZEUS_ENV_FILE}"
+      unset bootstrap_token
+    fi
+    echo "Local environment already exists at ${ZEUS_ENV_FILE}; required identity settings are present."
+    return
+  fi
+
+  local postgres_password master_key bootstrap_token
   postgres_password="$(openssl rand -hex 24)"
   master_key="$(openssl rand -hex 32)"
+  bootstrap_token="$(openssl rand -hex 32)"
 
   printf '%s\n' \
     "POSTGRES_USER=zeus" \
@@ -108,9 +122,10 @@ init_env() {
     "DATABASE_URL=postgres://zeus:${postgres_password}@127.0.0.1:5432/zeus" \
     "RUNTIME_DATABASE_URL=postgres://zeus:${postgres_password}@127.0.0.1:5432/zeus" \
     "ZEUS_LOCAL_MASTER_KEY=${master_key}" \
+    "ZEUS_BOOTSTRAP_TOKEN=${bootstrap_token}" \
     "ZEUS_ENVELOPE_KEY_ID=local-v1" \
     "ZEUS_BIND_ADDRESS=127.0.0.1:8080" \
-    "ZEUS_PUBLIC_URL=http://127.0.0.1:8080" \
+    "ZEUS_PUBLIC_URL=http://127.0.0.1:3000" \
     "ZEUS_API_URL=http://127.0.0.1:8080" \
     "ZEUS_COOKIE_SECURE=false" \
     "ZEUS_RUN_CONCURRENCY=4" \
@@ -118,7 +133,7 @@ init_env() {
     > "${ZEUS_ENV_FILE}"
   chmod 0600 "${ZEUS_ENV_FILE}"
 
-  unset postgres_password master_key
+  unset postgres_password master_key bootstrap_token
   echo "Created ${ZEUS_ENV_FILE} with mode 0600. Secret values were not printed."
 }
 
@@ -348,6 +363,7 @@ build_api_image() (
 
   cp "${REPO_ROOT}/Cargo.toml" "${REPO_ROOT}/Cargo.lock" "${build_context}/"
   cp -R "${REPO_ROOT}/crates/zeus-core" "${build_context}/crates/zeus-core"
+  cp -R "${REPO_ROOT}/crates/zeus-identity" "${build_context}/crates/zeus-identity"
   cp -R "${REPO_ROOT}/apps/zeus-api" "${build_context}/apps/zeus-api"
   cp -R "${REPO_ROOT}/db/migrations" "${build_context}/db/migrations"
   cp \
@@ -394,6 +410,27 @@ build_web_image() (
   )
 )
 
+build_gateway_image() (
+  local build_context
+  build_context="$(create_build_context)"
+  trap 'cleanup_build_context "${build_context}"' EXIT
+
+  echo "Building ${ZEUS_GATEWAY_IMAGE}."
+  cp "${REPO_ROOT}/deploy/container/Caddyfile.local" "${build_context}/Caddyfile"
+  cp \
+    "${REPO_ROOT}/deploy/container/gateway.local.Containerfile" \
+    "${build_context}/Containerfile"
+
+  (
+    cd "${build_context}"
+    container build \
+      --tag "${ZEUS_GATEWAY_IMAGE}" \
+      --label dev.zeus-harness.project=zeus \
+      --file Containerfile \
+      .
+  )
+)
+
 build_target() {
   local target="$1"
   require_container_cli
@@ -406,12 +443,16 @@ build_target() {
     web)
       build_web_image
       ;;
+    gateway)
+      build_gateway_image
+      ;;
     all)
       build_api_image
       build_web_image
+      build_gateway_image
       ;;
     *)
-      die "Build target must be api, web, or all."
+      die "Build target must be api, web, gateway, or all."
       ;;
   esac
 }
@@ -425,6 +466,12 @@ ensure_api_image() {
 ensure_web_image() {
   if ! image_exists "${ZEUS_WEB_IMAGE}"; then
     build_web_image
+  fi
+}
+
+ensure_gateway_image() {
+  if ! image_exists "${ZEUS_GATEWAY_IMAGE}"; then
+    build_gateway_image
   fi
 }
 
@@ -472,18 +519,21 @@ start_api() {
   bootstrap_database
   migrate_database
 
-  local postgres_ip database_url
+  local postgres_ip mailpit_ip database_url
   postgres_ip="$(container_ipv4 "${ZEUS_POSTGRES_CONTAINER}")"
+  mailpit_ip="$(container_ipv4 "${ZEUS_MAILPIT_CONTAINER}")"
   database_url="$(container_database_url "${postgres_ip}")"
 
   export DATABASE_URL="${database_url}"
   export RUNTIME_DATABASE_URL="${database_url}"
   export ZEUS_BIND_ADDRESS="0.0.0.0:8080"
-  export ZEUS_PUBLIC_URL="http://127.0.0.1:8080"
+  export ZEUS_PUBLIC_URL="http://127.0.0.1:3000"
   export ZEUS_COOKIE_SECURE="false"
   export ZEUS_RUN_CONCURRENCY="${ZEUS_RUN_CONCURRENCY:-4}"
   export ZEUS_SUPERVISOR_ENABLED="true"
   export ZEUS_ENVELOPE_KEY_ID="${ZEUS_ENVELOPE_KEY_ID:-local-v1}"
+  export ZEUS_SMTP_URL="smtp://${mailpit_ip}:1025"
+  export ZEUS_MAIL_FROM="noreply@zeus.local"
 
   recreate_stateless_container "${ZEUS_API_CONTAINER}" 60
   container run \
@@ -504,12 +554,13 @@ start_api() {
     --env ZEUS_SUPERVISOR_ENABLED \
     --env ZEUS_LOCAL_MASTER_KEY \
     --env ZEUS_ENVELOPE_KEY_ID \
-    --publish 127.0.0.1:8080:8080 \
+    --env ZEUS_BOOTSTRAP_TOKEN \
+    --env ZEUS_SMTP_URL \
+    --env ZEUS_MAIL_FROM \
     "${ZEUS_API_IMAGE}" >/dev/null
 
-  wait_for_http "${ZEUS_API_CONTAINER}" "http://127.0.0.1:8080/health/ready" 90
   unset database_url
-  echo "zeus-api is ready on http://127.0.0.1:8080."
+  echo "zeus-api started on the private ${ZEUS_NETWORK} network."
 }
 
 start_web() {
@@ -536,11 +587,62 @@ start_web() {
     --env HOST \
     --env PORT \
     --env ORIGIN \
-    --publish 127.0.0.1:3000:3000 \
     "${ZEUS_WEB_IMAGE}" >/dev/null
 
-  wait_for_http "${ZEUS_WEB_CONTAINER}" "http://127.0.0.1:3000/" 60
-  echo "Zeus Web is ready on http://127.0.0.1:3000."
+  echo "Zeus Web started on the private ${ZEUS_NETWORK} network."
+}
+
+start_mailpit() {
+  require_container_cli
+  ensure_container_system
+  ensure_network
+  export MP_WEBROOT="/mailpit/"
+
+  recreate_stateless_container "${ZEUS_MAILPIT_CONTAINER}" 10
+  container run \
+    --name "${ZEUS_MAILPIT_CONTAINER}" \
+    --detach \
+    --init \
+    --network "${ZEUS_NETWORK}" \
+    --cpus 1 \
+    --memory 512M \
+    --label dev.zeus-harness.managed=true \
+    --label dev.zeus-harness.project=zeus \
+    --env MP_WEBROOT \
+    "${ZEUS_MAILPIT_IMAGE}" >/dev/null
+  echo "Mailpit started on the private ${ZEUS_NETWORK} network."
+}
+
+start_gateway() {
+  ensure_gateway_image
+
+  local api_ip web_ip mailpit_ip
+  api_ip="$(container_ipv4 "${ZEUS_API_CONTAINER}")"
+  web_ip="$(container_ipv4 "${ZEUS_WEB_CONTAINER}")"
+  mailpit_ip="$(container_ipv4 "${ZEUS_MAILPIT_CONTAINER}")"
+  export ZEUS_API_UPSTREAM="${api_ip}:8080"
+  export ZEUS_WEB_UPSTREAM="${web_ip}:3000"
+  export ZEUS_MAILPIT_UPSTREAM="${mailpit_ip}:8025"
+
+  recreate_stateless_container "${ZEUS_GATEWAY_CONTAINER}" 10
+  container run \
+    --name "${ZEUS_GATEWAY_CONTAINER}" \
+    --detach \
+    --init \
+    --network "${ZEUS_NETWORK}" \
+    --cpus 1 \
+    --memory 512M \
+    --label dev.zeus-harness.managed=true \
+    --label dev.zeus-harness.project=zeus \
+    --env ZEUS_API_UPSTREAM \
+    --env ZEUS_WEB_UPSTREAM \
+    --env ZEUS_MAILPIT_UPSTREAM \
+    --publish 127.0.0.1:3000:3000 \
+    "${ZEUS_GATEWAY_IMAGE}" >/dev/null
+
+  wait_for_http "${ZEUS_GATEWAY_CONTAINER}" "http://127.0.0.1:3000/health/ready" 90
+  wait_for_http "${ZEUS_GATEWAY_CONTAINER}" "http://127.0.0.1:3000/" 60
+  echo "Zeus is ready on http://127.0.0.1:3000. Mailpit is under /mailpit/."
 }
 
 up_target() {
@@ -549,17 +651,29 @@ up_target() {
     postgres)
       start_postgres
       ;;
+    mailpit)
+      start_mailpit
+      ;;
     api)
       start_postgres
+      start_mailpit
       start_api
       ;;
-    web | all)
+    web)
       start_postgres
+      start_mailpit
       start_api
       start_web
       ;;
+    gateway | all)
+      start_postgres
+      start_mailpit
+      start_api
+      start_web
+      start_gateway
+      ;;
     *)
-      die "Up target must be postgres, api, web, or all."
+      die "Up target must be postgres, mailpit, api, web, gateway, or all."
       ;;
   esac
 }
@@ -572,19 +686,27 @@ down_target() {
     postgres)
       stop_container "${ZEUS_POSTGRES_CONTAINER}" 30
       ;;
+    mailpit)
+      stop_container "${ZEUS_MAILPIT_CONTAINER}" 10
+      ;;
     api)
       stop_container "${ZEUS_API_CONTAINER}" 60
       ;;
     web)
       stop_container "${ZEUS_WEB_CONTAINER}" 10
       ;;
+    gateway)
+      stop_container "${ZEUS_GATEWAY_CONTAINER}" 10
+      ;;
     all)
+      stop_container "${ZEUS_GATEWAY_CONTAINER}" 10
       stop_container "${ZEUS_WEB_CONTAINER}" 10
       stop_container "${ZEUS_API_CONTAINER}" 60
+      stop_container "${ZEUS_MAILPIT_CONTAINER}" 10
       stop_container "${ZEUS_POSTGRES_CONTAINER}" 30
       ;;
     *)
-      die "Down target must be postgres, api, web, or all."
+      die "Down target must be postgres, mailpit, api, web, gateway, or all."
       ;;
   esac
 }
@@ -594,29 +716,35 @@ status_target() {
   require_container_cli
 
   case "${target}" in
-    postgres | api | web | all) ;;
-    *) die "Status target must be postgres, api, web, or all." ;;
+    postgres | mailpit | api | web | gateway | all) ;;
+    *) die "Status target must be postgres, mailpit, api, web, gateway, or all." ;;
   esac
 
   container list --all | awk \
     -v target="${target}" \
     -v postgres="${ZEUS_POSTGRES_CONTAINER}" \
+    -v mailpit="${ZEUS_MAILPIT_CONTAINER}" \
     -v api="${ZEUS_API_CONTAINER}" \
-    -v web="${ZEUS_WEB_CONTAINER}" '
+    -v web="${ZEUS_WEB_CONTAINER}" \
+    -v gateway="${ZEUS_GATEWAY_CONTAINER}" '
       NR == 1 { print; next }
-      target == "all" && ($1 == postgres || $1 == api || $1 == web) { print; next }
+      target == "all" && ($1 == postgres || $1 == mailpit || $1 == api || $1 == web || $1 == gateway) { print; next }
       target == "postgres" && $1 == postgres { print; next }
+      target == "mailpit" && $1 == mailpit { print; next }
       target == "api" && $1 == api { print; next }
-      target == "web" && $1 == web { print }
+      target == "web" && $1 == web { print; next }
+      target == "gateway" && $1 == gateway { print }
     '
 }
 
 container_for_target() {
   case "$1" in
     postgres) printf '%s\n' "${ZEUS_POSTGRES_CONTAINER}" ;;
+    mailpit) printf '%s\n' "${ZEUS_MAILPIT_CONTAINER}" ;;
     api) printf '%s\n' "${ZEUS_API_CONTAINER}" ;;
     web) printf '%s\n' "${ZEUS_WEB_CONTAINER}" ;;
-    *) die "Log target must be postgres, api, or web." ;;
+    gateway) printf '%s\n' "${ZEUS_GATEWAY_CONTAINER}" ;;
+    *) die "Log target must be postgres, mailpit, api, web, or gateway." ;;
   esac
 }
 
@@ -689,17 +817,21 @@ rotate_postgres_password() {
 
 reset_database() {
   if [[ "${1:-}" != "--yes" || "$#" -ne 1 ]]; then
-    echo "This removes zeus-postgres, zeus-api, zeus-web, and the zeus-postgres-data volume." >&2
+    echo "This removes local Zeus service containers and the zeus-postgres-data volume." >&2
     echo "Run scripts/container reset-db --yes to continue." >&2
     exit 2
   fi
 
   require_container_cli
+  stop_container "${ZEUS_GATEWAY_CONTAINER}" 10
   stop_container "${ZEUS_WEB_CONTAINER}" 10
   stop_container "${ZEUS_API_CONTAINER}" 60
+  stop_container "${ZEUS_MAILPIT_CONTAINER}" 10
   stop_container "${ZEUS_POSTGRES_CONTAINER}" 30
+  delete_container "${ZEUS_GATEWAY_CONTAINER}"
   delete_container "${ZEUS_WEB_CONTAINER}"
   delete_container "${ZEUS_API_CONTAINER}"
+  delete_container "${ZEUS_MAILPIT_CONTAINER}"
   delete_container "${ZEUS_POSTGRES_CONTAINER}"
 
   if volume_exists "${ZEUS_POSTGRES_VOLUME}"; then
@@ -751,7 +883,7 @@ main() {
       ;;
     logs)
       if [[ "$#" -eq 0 ]]; then
-        die "Log target must be postgres, api, or web."
+        die "Log target must be postgres, mailpit, api, web, or gateway."
       fi
       local log_target_name="$1"
       shift

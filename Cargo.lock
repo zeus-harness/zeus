@@ -4251,6 +4251,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlx",
+ "subtle",
  "thiserror 2.0.20",
  "time",
  "tokio",
@@ -4264,6 +4265,7 @@ dependencies = [
  "utoipa",
  "uuid",
  "zeus-core",
+ "zeus-identity",
 ]
 
 [[package]]
@@ -4275,6 +4277,23 @@ dependencies = [
  "thiserror 2.0.20",
  "time",
  "uuid",
+]
+
+[[package]]
+name = "zeus-identity"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "base64 0.22.1",
+ "getrandom 0.4.3",
+ "hmac",
+ "secrecy",
+ "serde",
+ "sha1",
+ "sha2",
+ "thiserror 2.0.20",
+ "tokio",
+ "unicode-normalization",
 ]
 
 [[package]]

@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use url::Url;
 
 #[derive(Clone, Debug)]
@@ -24,13 +24,15 @@ pub struct AppConfig {
     pub lease_duration: Duration,
     pub poll_interval: Duration,
     pub node_id: String,
-    pub session_ttl: Duration,
+    pub session_idle_ttl: Duration,
+    pub session_absolute_ttl: Duration,
     pub oidc_state_ttl: Duration,
     pub cookie_secure: bool,
     pub allow_private_oidc_issuers: bool,
     pub allow_private_model_endpoints: bool,
     pub envelope_key_id: String,
     pub envelope_key: Option<SecretString>,
+    pub bootstrap_token: Option<SecretString>,
 }
 
 impl AppConfig {
@@ -57,7 +59,9 @@ impl AppConfig {
         let poll_milliseconds: u64 = parse("ZEUS_RUN_POLL_MILLISECONDS", "1000")?;
         let node_id = env::var("ZEUS_NODE_ID")
             .unwrap_or_else(|_| format!("zeus-api-{}", uuid::Uuid::now_v7()));
-        let session_ttl_seconds: u64 = parse("ZEUS_SESSION_TTL_SECONDS", "43200")?;
+        let session_idle_ttl_seconds: u64 = parse("ZEUS_SESSION_IDLE_TTL_SECONDS", "7200")?;
+        let session_absolute_ttl_seconds: u64 =
+            parse("ZEUS_SESSION_ABSOLUTE_TTL_SECONDS", "43200")?;
         let oidc_state_ttl_seconds: u64 = parse("ZEUS_OIDC_STATE_TTL_SECONDS", "600")?;
         let cookie_secure = parse(
             "ZEUS_COOKIE_SECURE",
@@ -72,6 +76,7 @@ impl AppConfig {
         let envelope_key_id =
             env::var("ZEUS_ENVELOPE_KEY_ID").unwrap_or_else(|_| "local-v1".to_owned());
         let envelope_key = load_envelope_key()?;
+        let bootstrap_token = load_bootstrap_token()?;
 
         if run_concurrency == 0 {
             bail!("ZEUS_RUN_CONCURRENCY must be greater than zero");
@@ -79,8 +84,15 @@ impl AppConfig {
         if lease_seconds < 10 {
             bail!("ZEUS_RUN_LEASE_SECONDS must be at least 10");
         }
-        if session_ttl_seconds < 300 {
-            bail!("ZEUS_SESSION_TTL_SECONDS must be at least 300");
+        if !(300..=43_200).contains(&session_idle_ttl_seconds) {
+            bail!("ZEUS_SESSION_IDLE_TTL_SECONDS must be between 300 and 43200");
+        }
+        if session_absolute_ttl_seconds < session_idle_ttl_seconds
+            || session_absolute_ttl_seconds > 2_592_000
+        {
+            bail!(
+                "ZEUS_SESSION_ABSOLUTE_TTL_SECONDS must be at least the idle TTL and at most 2592000"
+            );
         }
         if !(60..=1800).contains(&oidc_state_ttl_seconds) {
             bail!("ZEUS_OIDC_STATE_TTL_SECONDS must be between 60 and 1800");
@@ -98,15 +110,32 @@ impl AppConfig {
             lease_duration: Duration::from_secs(lease_seconds),
             poll_interval: Duration::from_millis(poll_milliseconds),
             node_id,
-            session_ttl: Duration::from_secs(session_ttl_seconds),
+            session_idle_ttl: Duration::from_secs(session_idle_ttl_seconds),
+            session_absolute_ttl: Duration::from_secs(session_absolute_ttl_seconds),
             oidc_state_ttl: Duration::from_secs(oidc_state_ttl_seconds),
             cookie_secure,
             allow_private_oidc_issuers,
             allow_private_model_endpoints,
             envelope_key_id,
             envelope_key,
+            bootstrap_token,
         })
     }
+}
+
+fn load_bootstrap_token() -> anyhow::Result<Option<SecretString>> {
+    let direct = env::var("ZEUS_BOOTSTRAP_TOKEN").ok();
+    let file = env::var("ZEUS_BOOTSTRAP_TOKEN_FILE")
+        .ok()
+        .map(PathBuf::from);
+    let token = load_protected_secret_from("ZEUS_BOOTSTRAP_TOKEN", direct, file.as_deref(), 4_096)?;
+    if token
+        .as_ref()
+        .is_some_and(|value| value.expose_secret().chars().count() < 43)
+    {
+        bail!("ZEUS_BOOTSTRAP_TOKEN must contain at least 256 bits of entropy");
+    }
+    Ok(token)
 }
 
 fn load_envelope_key() -> anyhow::Result<Option<SecretString>> {
@@ -121,36 +150,53 @@ fn load_envelope_key_from(
     direct: Option<String>,
     file: Option<&Path>,
 ) -> anyhow::Result<Option<SecretString>> {
+    load_protected_secret_from("ZEUS_ENVELOPE_KEY", direct, file, 4_096)
+}
+
+#[cfg(test)]
+fn load_envelope_key_file(path: &Path) -> anyhow::Result<SecretString> {
+    load_protected_secret_file("ZEUS_ENVELOPE_KEY_FILE", path, 4_096)
+}
+
+fn load_protected_secret_from(
+    name: &str,
+    direct: Option<String>,
+    file: Option<&Path>,
+    maximum_bytes: u64,
+) -> anyhow::Result<Option<SecretString>> {
     if direct.is_some() && file.is_some() {
-        bail!("configure either ZEUS_ENVELOPE_KEY_FILE or an inline envelope key, not both");
+        bail!("configure either {name}_FILE or an inline {name}, not both");
     }
     if let Some(path) = file {
-        return load_envelope_key_file(path).map(Some);
+        return load_protected_secret_file(&format!("{name}_FILE"), path, maximum_bytes).map(Some);
     }
     Ok(direct.map(SecretString::from))
 }
 
-fn load_envelope_key_file(path: &Path) -> anyhow::Result<SecretString> {
-    let metadata =
-        fs::symlink_metadata(path).with_context(|| "ZEUS_ENVELOPE_KEY_FILE cannot be read")?;
+fn load_protected_secret_file(
+    name: &str,
+    path: &Path,
+    maximum_bytes: u64,
+) -> anyhow::Result<SecretString> {
+    let metadata = fs::symlink_metadata(path).with_context(|| format!("{name} cannot be read"))?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        bail!("ZEUS_ENVELOPE_KEY_FILE must reference a regular file");
+        bail!("{name} must reference a regular file");
     }
-    if metadata.len() == 0 || metadata.len() > 4_096 {
-        bail!("ZEUS_ENVELOPE_KEY_FILE has an invalid size");
+    if metadata.len() == 0 || metadata.len() > maximum_bytes {
+        bail!("{name} has an invalid size");
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if metadata.permissions().mode() & 0o077 != 0 {
-            bail!("ZEUS_ENVELOPE_KEY_FILE must not be accessible by group or other users");
+            bail!("{name} must not be accessible by group or other users");
         }
     }
-    let encoded = fs::read_to_string(path)
-        .with_context(|| "ZEUS_ENVELOPE_KEY_FILE cannot be read as text")?;
+    let encoded =
+        fs::read_to_string(path).with_context(|| format!("{name} cannot be read as text"))?;
     let encoded = encoded.trim();
     if encoded.is_empty() {
-        bail!("ZEUS_ENVELOPE_KEY_FILE is empty");
+        bail!("{name} is empty");
     }
     Ok(SecretString::from(encoded.to_owned()))
 }

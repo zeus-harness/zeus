@@ -6,6 +6,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     routing::{get, patch, post},
 };
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use time::OffsetDateTime;
@@ -16,7 +17,8 @@ use zeus_core::Permission;
 use crate::{
     AppState,
     api_support::{ListCursor, PageQuery, required_revision, revision_etag},
-    auth::{AuthContext, PrincipalKind, insert_audit},
+    auth::{AuthContext, PrincipalKind, csrf_cookie, insert_audit, session_cookie},
+    crypto::{random_token, sha256},
     database::{TenantScope, begin_tenant},
     error::ApiError,
     oidc::validate_remote_url,
@@ -406,22 +408,49 @@ pub async fn select_workspace(
     State(state): State<AppState>,
     auth: AuthContext,
     Path(workspace_id): Path<Uuid>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<(HeaderMap, StatusCode), ApiError> {
     if auth.principal_kind != PrincipalKind::User {
         return Err(ApiError::Forbidden);
     }
     let session_id = auth.session_id.ok_or(ApiError::Forbidden)?;
-    let selected: bool =
-        sqlx::query_scalar("select zeus_private.select_web_session_workspace($1, $2, $3)")
-            .bind(session_id)
-            .bind(auth.principal_id)
-            .bind(workspace_id)
-            .fetch_one(&state.database)
-            .await?;
+    let session_token = random_token(32).map_err(|_| ApiError::Internal)?;
+    let csrf_token = random_token(32).map_err(|_| ApiError::Internal)?;
+    let selected: bool = sqlx::query_scalar(
+        "select zeus_private.rotate_user_session_context($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(session_id)
+    .bind(auth.principal_id)
+    .bind(auth.organization_id)
+    .bind(workspace_id)
+    .bind(sha256(session_token.expose_secret().as_bytes()))
+    .bind(sha256(csrf_token.expose_secret().as_bytes()))
+    .fetch_one(&state.database)
+    .await?;
     if !selected {
         return Err(ApiError::Forbidden);
     }
-    Ok(StatusCode::NO_CONTENT)
+    let mut headers = HeaderMap::new();
+    headers.append(
+        header::SET_COOKIE,
+        session_cookie(
+            &state,
+            session_token.expose_secret(),
+            state.session_absolute_ttl.as_secs(),
+        )
+        .parse()
+        .map_err(|_| ApiError::Internal)?,
+    );
+    headers.append(
+        header::SET_COOKIE,
+        csrf_cookie(
+            &state,
+            csrf_token.expose_secret(),
+            state.session_absolute_ttl.as_secs(),
+        )
+        .parse()
+        .map_err(|_| ApiError::Internal)?,
+    );
+    Ok((headers, StatusCode::NO_CONTENT))
 }
 
 #[derive(Debug, Serialize, ToSchema, FromRow)]

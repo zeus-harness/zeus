@@ -31,7 +31,7 @@ use uuid::Uuid;
 use crate::{
     AppState, agents, auth,
     error::{ApiError, ProblemDetails, REQUEST_ID},
-    execution_api, experiences, integrations, organization,
+    execution_api, experiences, integrations, native_identity, organization,
     supervisor::SupervisorMetrics,
     work_items,
 };
@@ -47,6 +47,8 @@ use crate::{
         live,
         ready,
         meta,
+        native_identity::setup_status,
+        native_identity::setup,
         auth::current_user,
         auth::create_service_account,
         auth::list_service_accounts,
@@ -67,6 +69,9 @@ use crate::{
         MetaResponse,
         FeatureStatus,
         ProblemDetails,
+        native_identity::SetupStatusResponse,
+        native_identity::SetupRequest,
+        native_identity::SetupResponse,
         auth::CurrentUserResponse,
         auth::CreateServiceAccountRequest,
         auth::CreatedServiceAccountResponse,
@@ -301,6 +306,26 @@ pub const PUBLIC_ROUTES: &[PublicRoute] = &[
         200,
         None,
         BodySchema::None,
+        false,
+    ),
+    public_route(
+        "/api/v1/setup/status",
+        "GET",
+        "setup_status",
+        "identity",
+        200,
+        None,
+        BodySchema::Object("SetupStatusResponse"),
+        false,
+    ),
+    public_route(
+        "/api/v1/setup",
+        "POST",
+        "setup",
+        "identity",
+        201,
+        Some("SetupRequest"),
+        BodySchema::Object("SetupResponse"),
         false,
     ),
     public_route(
@@ -1650,8 +1675,10 @@ impl PublicRoute {
 
 pub fn router(state: AppState) -> Router {
     let request_metrics = Arc::clone(&state.metrics);
+    let browser_security_state = state.clone();
     Router::new()
         .merge(auth::routes())
+        .merge(native_identity::routes())
         .merge(organization::routes())
         .merge(agents::routes())
         .merge(integrations::routes())
@@ -1664,6 +1691,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/meta", get(meta))
         .route("/api/v1/openapi.json", get(openapi))
         .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            browser_security_state,
+            auth::enforce_browser_write_security,
+        ))
         .layer(middleware::from_fn_with_state(
             request_metrics,
             track_http_request,

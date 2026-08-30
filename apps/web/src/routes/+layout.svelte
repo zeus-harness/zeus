@@ -8,8 +8,23 @@
 
   import WorkspaceNav from '$lib/components/WorkspaceNav.svelte';
 
+  const publicIdentityRoutes = [
+    '/setup',
+    '/login',
+    '/register',
+    '/verify-email',
+    '/forgot-password',
+    '/reset-password',
+    '/mfa'
+  ] as const;
+
   let { children, data }: { children: Snippet; data: LayoutData } = $props();
   let isAdmin = $derived(page.url.pathname.startsWith('/admin'));
+  let isPublicIdentityPage = $derived(
+    publicIdentityRoutes.some(
+      (route) => page.url.pathname === route || page.url.pathname.startsWith(`${route}/`)
+    )
+  );
 </script>
 
 <svelte:head>
@@ -20,7 +35,7 @@
   />
 </svelte:head>
 
-{#if !isAdmin}
+{#if !isAdmin && !isPublicIdentityPage}
   <WorkspaceNav
     authStatus={data.status}
     workspaceId={data.principal?.workspace_id}

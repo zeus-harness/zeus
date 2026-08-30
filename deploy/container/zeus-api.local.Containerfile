@@ -4,6 +4,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY .cargo .cargo
 COPY vendor vendor
 COPY crates/zeus-core crates/zeus-core
+COPY crates/zeus-identity crates/zeus-identity
 COPY apps/zeus-api apps/zeus-api
 COPY db/migrations db/migrations
 RUN cargo build --locked --offline --release -p zeus-api

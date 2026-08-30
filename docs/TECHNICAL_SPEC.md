@@ -247,8 +247,11 @@ packages/ui/src/lib/components/ui
 
 `scripts/container status` 只输出容器列表字段。不要用 `container inspect`
 分享诊断结果；inspect 会包含容器环境变量。`scripts/container up` 在 Zeus
-专用网络内启动 PostgreSQL、内嵌 Supervisor 的 API 和 Web。Apple `container`
+专用网络内启动 PostgreSQL、Mailpit、内嵌 Supervisor 的 API、Web 和 Gateway。Apple `container`
 1.0.0 本机不依赖容器名解析，脚本只提取运行时 IP 并注入内部连接地址。
+浏览器只访问 `http://127.0.0.1:3000`。API 和 Web 不发布宿主机端口；Mailpit
+通过 `/mailpit/` 查看。`/api`、`/auth`、`/oauth2`、`/.well-known`、`/health`
+和 `/metrics` 由 Gateway 转发到 API。
 本地 API 镜像通过临时 Cargo vendor 上下文离线编译，Web 镜像封装宿主机生成的
 SvelteKit 产物。临时上下文放在被忽略的 `.zeus` 下，构建退出时删除。生产镜像
 继续使用 `zeus-api.Containerfile` 和 `web.Containerfile` 的完整构建链路。

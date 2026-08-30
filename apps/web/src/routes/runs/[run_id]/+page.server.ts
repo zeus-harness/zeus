@@ -4,9 +4,9 @@ import type { PageServerLoad } from './$types';
 import { getRunTrace, listChildRuns, loadWorkspaceData } from '$lib/api/workspace';
 import { serverApiFetcher } from '$lib/api/server';
 
-export const load: PageServerLoad = async ({ fetch, parent, request, params }) => {
+export const load: PageServerLoad = async ({ fetch, parent, request, params, url }) => {
   const { principal, status: authStatus } = await parent();
-  const apiFetch = serverApiFetcher(fetch, request.headers.get('cookie'));
+  const apiFetch = serverApiFetcher(fetch, request.headers.get('cookie'), url.origin);
   const workspaceContext = {
     authStatus,
     workspaceId: principal?.workspace_id

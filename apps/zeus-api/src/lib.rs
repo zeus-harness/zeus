@@ -11,6 +11,7 @@ pub mod http;
 pub mod idempotency;
 pub mod integrations;
 pub mod model;
+pub mod native_identity;
 pub mod oidc;
 pub mod organization;
 pub mod runtime;
@@ -20,11 +21,13 @@ pub mod work_items;
 
 use std::{str::FromStr, sync::Arc, time::Duration};
 
+use secrecy::SecretString;
 use sqlx::{
     PgPool,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 use url::Url;
+use zeus_identity::{PasswordExecutor, PasswordPolicy};
 
 use crate::{
     config::AppConfig,
@@ -39,11 +42,14 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub metrics: Arc<SupervisorMetrics>,
     pub public_url: Url,
-    pub session_ttl: Duration,
+    pub session_idle_ttl: Duration,
+    pub session_absolute_ttl: Duration,
     pub oidc_state_ttl: Duration,
     pub cookie_secure: bool,
     pub allow_private_oidc_issuers: bool,
     pub allow_private_model_endpoints: bool,
+    pub bootstrap_token: Option<SecretString>,
+    pub password_executor: PasswordExecutor,
     pub version: &'static str,
 }
 
@@ -131,17 +137,21 @@ pub async fn build_state(config: &AppConfig) -> anyhow::Result<AppState> {
         .connect_timeout(Duration::from_secs(10))
         .user_agent(concat!("zeus-api/", env!("CARGO_PKG_VERSION")))
         .build()?;
+    let password_executor = PasswordExecutor::new(4, 32, PasswordPolicy::default())?;
     Ok(AppState {
         database,
         envelope: Arc::new(envelope),
         http_client,
         metrics: Arc::new(SupervisorMetrics::default()),
         public_url: config.public_url.clone(),
-        session_ttl: config.session_ttl,
+        session_idle_ttl: config.session_idle_ttl,
+        session_absolute_ttl: config.session_absolute_ttl,
         oidc_state_ttl: config.oidc_state_ttl,
         cookie_secure: config.cookie_secure,
         allow_private_oidc_issuers: config.allow_private_oidc_issuers,
         allow_private_model_endpoints: config.allow_private_model_endpoints,
+        bootstrap_token: config.bootstrap_token.clone(),
+        password_executor,
         version: env!("CARGO_PKG_VERSION"),
     })
 }

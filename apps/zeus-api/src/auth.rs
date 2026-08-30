@@ -5,13 +5,15 @@ use std::collections::BTreeSet;
 use axum::{
     Json, Router,
     extract::{FromRequestParts, Path, Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header, request::Parts},
+    http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header, request::Parts},
+    middleware::Next,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -29,6 +31,8 @@ use crate::{
 };
 
 const SESSION_COOKIE: &str = "zeus_session";
+const CSRF_COOKIE: &str = "zeus_csrf";
+const CSRF_HEADER: &str = "x-zeus-csrf";
 const SERVICE_ACCOUNT_PREFIX: &str = "zsa_";
 const KNOWN_SERVICE_ACCOUNT_SCOPES: &[&str] = &[
     "organization:manage",
@@ -60,6 +64,29 @@ pub struct AuthContext {
     pub scopes: BTreeSet<String>,
     pub email: Option<String>,
     pub display_name: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct PrincipalContext {
+    pub principal_kind: PrincipalKind,
+    pub principal_id: Uuid,
+    pub user_id: Option<Uuid>,
+    pub session_id: Option<Uuid>,
+    pub organization_id: Option<Uuid>,
+    pub workspace_id: Option<Uuid>,
+    pub organization_role: Option<OrganizationRole>,
+    pub workspace_role: Option<WorkspaceRole>,
+    pub scopes: BTreeSet<String>,
+    pub email: Option<String>,
+    pub display_name: String,
+    pub email_verified_at: Option<OffsetDateTime>,
+    pub platform_roles: BTreeSet<String>,
+    pub auth_methods: BTreeSet<String>,
+    pub authenticated_at: Option<OffsetDateTime>,
+    pub mfa_satisfied_at: Option<OffsetDateTime>,
+    pub idle_expires_at: Option<OffsetDateTime>,
+    pub absolute_expires_at: Option<OffsetDateTime>,
+    pub(crate) csrf_token_hash: Option<Vec<u8>>,
 }
 
 impl AuthContext {
@@ -138,6 +165,31 @@ impl FromRequestParts<AppState> for AuthContext {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        let principal = PrincipalContext::from_request_parts(parts, state).await?;
+        let organization_id = principal.organization_id.ok_or(ApiError::Forbidden)?;
+        Ok(Self {
+            principal_kind: principal.principal_kind,
+            principal_id: principal.principal_id,
+            user_id: principal.user_id,
+            session_id: principal.session_id,
+            organization_id,
+            workspace_id: principal.workspace_id,
+            organization_role: principal.organization_role,
+            workspace_role: principal.workspace_role,
+            scopes: principal.scopes,
+            email: principal.email,
+            display_name: principal.display_name,
+        })
+    }
+}
+
+impl FromRequestParts<AppState> for PrincipalContext {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
         if let Some(authorization) = parts.headers.get(header::AUTHORIZATION) {
             let authorization = authorization.to_str().map_err(|_| ApiError::Unauthorized)?;
             let token = authorization
@@ -147,20 +199,110 @@ impl FromRequestParts<AppState> for AuthContext {
         }
 
         let token = cookie_value(&parts.headers, SESSION_COOKIE).ok_or(ApiError::Unauthorized)?;
-        authenticate_web_session(state, token).await
+        authenticate_user_session(state, token).await
     }
+}
+
+pub async fn enforce_browser_write_security(
+    State(state): State<AppState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    ) || request.headers().contains_key(header::AUTHORIZATION)
+        || browser_write_security_exempt(request.uri().path())
+    {
+        return next.run(request).await;
+    }
+    let Some(session_token) = cookie_value(request.headers(), SESSION_COOKIE) else {
+        return next.run(request).await;
+    };
+    let Some(csrf_cookie) = cookie_value(request.headers(), CSRF_COOKIE) else {
+        return ApiError::Forbidden.into_response();
+    };
+    let Some(csrf_header) = request
+        .headers()
+        .get(CSRF_HEADER)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return ApiError::Forbidden.into_response();
+    };
+    if csrf_cookie
+        .as_bytes()
+        .ct_eq(csrf_header.as_bytes())
+        .unwrap_u8()
+        != 1
+    {
+        return ApiError::Forbidden.into_response();
+    }
+    let expected_origin = state.public_url.origin().ascii_serialization();
+    let Some(origin) = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return ApiError::Forbidden.into_response();
+    };
+    if origin
+        .as_bytes()
+        .ct_eq(expected_origin.as_bytes())
+        .unwrap_u8()
+        != 1
+    {
+        return ApiError::Forbidden.into_response();
+    }
+    let principal = match authenticate_user_session(&state, session_token).await {
+        Ok(principal) => principal,
+        Err(error) => return error.into_response(),
+    };
+    let Some(expected_digest) = principal.csrf_token_hash else {
+        return ApiError::Forbidden.into_response();
+    };
+    let supplied_digest = sha256(csrf_header.as_bytes());
+    if expected_digest
+        .as_slice()
+        .ct_eq(supplied_digest.as_slice())
+        .unwrap_u8()
+        != 1
+    {
+        return ApiError::Forbidden.into_response();
+    }
+    next.run(request).await
+}
+
+fn browser_write_security_exempt(path: &str) -> bool {
+    matches!(
+        path,
+        "/api/v1/setup"
+            | "/api/v1/auth/login"
+            | "/api/v1/auth/register"
+            | "/api/v1/auth/email-verifications"
+            | "/api/v1/auth/email-verifications/confirm"
+            | "/api/v1/auth/password-resets"
+            | "/api/v1/auth/password-resets/confirm"
+    )
 }
 
 #[derive(Debug, FromRow)]
 struct WebSessionPrincipalRow {
     session_id: Uuid,
     user_id: Uuid,
-    organization_id: Uuid,
-    workspace_id: Option<Uuid>,
-    organization_role: String,
+    active_organization_id: Option<Uuid>,
+    active_workspace_id: Option<Uuid>,
+    organization_role: Option<String>,
     workspace_role: Option<String>,
     email: String,
     display_name: String,
+    email_verified_at: Option<OffsetDateTime>,
+    platform_roles: Vec<String>,
+    auth_methods: Vec<String>,
+    authenticated_at: OffsetDateTime,
+    mfa_satisfied_at: Option<OffsetDateTime>,
+    idle_expires_at: OffsetDateTime,
+    absolute_expires_at: OffsetDateTime,
+    csrf_token_hash: Option<Vec<u8>>,
 }
 
 #[derive(Debug, FromRow)]
@@ -173,27 +315,31 @@ struct ServiceAccountPrincipalRow {
     scopes: Vec<String>,
 }
 
-async fn authenticate_web_session(
+async fn authenticate_user_session(
     state: &AppState,
     token: String,
-) -> Result<AuthContext, ApiError> {
+) -> Result<PrincipalContext, ApiError> {
     let digest = sha256(token.as_bytes());
     let row = sqlx::query_as::<_, WebSessionPrincipalRow>(
-        "select * from zeus_private.authenticate_web_session($1)",
+        "select * from zeus_private.authenticate_user_session($1)",
     )
     .bind(digest)
     .fetch_optional(&state.database)
     .await?
     .ok_or(ApiError::Unauthorized)?;
 
-    Ok(AuthContext {
+    Ok(PrincipalContext {
         principal_kind: PrincipalKind::User,
         principal_id: row.user_id,
         user_id: Some(row.user_id),
         session_id: Some(row.session_id),
-        organization_id: row.organization_id,
-        workspace_id: row.workspace_id,
-        organization_role: Some(parse_organization_role(&row.organization_role)?),
+        organization_id: row.active_organization_id,
+        workspace_id: row.active_workspace_id,
+        organization_role: row
+            .organization_role
+            .as_deref()
+            .map(parse_organization_role)
+            .transpose()?,
         workspace_role: row
             .workspace_role
             .as_deref()
@@ -202,13 +348,21 @@ async fn authenticate_web_session(
         scopes: BTreeSet::new(),
         email: Some(row.email),
         display_name: row.display_name,
+        email_verified_at: row.email_verified_at,
+        platform_roles: row.platform_roles.into_iter().collect(),
+        auth_methods: row.auth_methods.into_iter().collect(),
+        authenticated_at: Some(row.authenticated_at),
+        mfa_satisfied_at: row.mfa_satisfied_at,
+        idle_expires_at: Some(row.idle_expires_at),
+        absolute_expires_at: Some(row.absolute_expires_at),
+        csrf_token_hash: row.csrf_token_hash,
     })
 }
 
 async fn authenticate_service_account(
     state: &AppState,
     raw_token: &str,
-) -> Result<AuthContext, ApiError> {
+) -> Result<PrincipalContext, ApiError> {
     let (prefix, token) = parse_service_account_token(raw_token)?;
     let row = sqlx::query_as::<_, ServiceAccountPrincipalRow>(
         "select * from zeus_private.lookup_service_account($1)",
@@ -231,18 +385,26 @@ async fn authenticate_service_account(
         .execute(&state.database)
         .await?;
 
-    Ok(AuthContext {
+    Ok(PrincipalContext {
         principal_kind: PrincipalKind::ServiceAccount,
         principal_id: row.service_account_id,
         user_id: None,
         session_id: None,
-        organization_id: row.organization_id,
+        organization_id: Some(row.organization_id),
         workspace_id: row.workspace_id,
         organization_role: None,
         workspace_role: None,
         scopes: row.scopes.into_iter().collect(),
         email: None,
         display_name: row.name,
+        email_verified_at: None,
+        platform_roles: BTreeSet::new(),
+        auth_methods: BTreeSet::new(),
+        authenticated_at: None,
+        mfa_satisfied_at: None,
+        idle_expires_at: None,
+        absolute_expires_at: None,
+        csrf_token_hash: None,
     })
 }
 
@@ -328,7 +490,7 @@ pub async fn login(
     .fetch_one(&state.database)
     .await?;
 
-    redirect_response(authorization.url.as_str(), None)
+    redirect_response(authorization.url.as_str(), &[])
 }
 
 pub async fn callback(
@@ -399,21 +561,35 @@ pub async fn callback(
     .await?;
 
     let session_token = random_token(32).map_err(|_| ApiError::Internal)?;
-    sqlx::query_scalar::<_, Uuid>("select zeus_private.create_web_session($1, $2, $3, $4, $5)")
-        .bind(jit.user_id)
-        .bind(jit.organization_id)
-        .bind(jit.workspace_id)
-        .bind(sha256(session_token.expose_secret().as_bytes()))
-        .bind(i32::try_from(state.session_ttl.as_secs()).unwrap_or(i32::MAX))
-        .fetch_one(&state.database)
-        .await?;
+    let csrf_token = random_token(32).map_err(|_| ApiError::Internal)?;
+    sqlx::query_scalar::<_, Uuid>(
+        "select zeus_private.create_user_session($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+    )
+    .bind(jit.user_id)
+    .bind(jit.organization_id)
+    .bind(jit.workspace_id)
+    .bind(sha256(session_token.expose_secret().as_bytes()))
+    .bind(sha256(csrf_token.expose_secret().as_bytes()))
+    .bind(vec!["federated".to_owned()])
+    .bind(Option::<OffsetDateTime>::None)
+    .bind(i32::try_from(state.session_idle_ttl.as_secs()).unwrap_or(i32::MAX))
+    .bind(i32::try_from(state.session_absolute_ttl.as_secs()).unwrap_or(i32::MAX))
+    .fetch_one(&state.database)
+    .await?;
 
-    let cookie = session_cookie(
-        &state,
-        session_token.expose_secret(),
-        state.session_ttl.as_secs(),
-    );
-    redirect_response(&sanitize_return_to(&pending.return_to), Some(cookie))
+    let cookies = vec![
+        session_cookie(
+            &state,
+            session_token.expose_secret(),
+            state.session_absolute_ttl.as_secs(),
+        ),
+        csrf_cookie(
+            &state,
+            csrf_token.expose_secret(),
+            state.session_absolute_ttl.as_secs(),
+        ),
+    ];
+    redirect_response(&sanitize_return_to(&pending.return_to), &cookies)
 }
 
 pub async fn logout(
@@ -426,8 +602,8 @@ pub async fn logout(
             .execute(&state.database)
             .await?;
     }
-    let expired = expired_session_cookie(&state);
-    redirect_response("/", Some(expired))
+    let cookies = vec![expired_session_cookie(&state), expired_csrf_cookie(&state)];
+    redirect_response("/", &cookies)
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -435,20 +611,32 @@ pub struct CurrentUserResponse {
     pub principal_kind: String,
     pub principal_id: Uuid,
     pub user_id: Option<Uuid>,
-    pub organization_id: Uuid,
+    pub organization_id: Option<Uuid>,
     pub workspace_id: Option<Uuid>,
     pub organization_role: Option<String>,
     pub workspace_role: Option<String>,
     pub scopes: Vec<String>,
     pub email: Option<String>,
     pub display_name: String,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub email_verified_at: Option<OffsetDateTime>,
+    pub platform_roles: Vec<String>,
+    pub auth_methods: Vec<String>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub authenticated_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub mfa_satisfied_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub idle_expires_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub absolute_expires_at: Option<OffsetDateTime>,
 }
 
 #[utoipa::path(get, path = "/api/v1/auth/me", tag = "identity", responses(
     (status = 200, description = "Current authenticated principal", body = CurrentUserResponse),
     (status = 401, description = "Authentication required", body = crate::error::ProblemDetails, content_type = "application/problem+json")
 ))]
-pub async fn current_user(auth: AuthContext) -> Json<CurrentUserResponse> {
+pub async fn current_user(auth: PrincipalContext) -> Json<CurrentUserResponse> {
     Json(CurrentUserResponse {
         principal_kind: match auth.principal_kind {
             PrincipalKind::User => "user",
@@ -464,6 +652,13 @@ pub async fn current_user(auth: AuthContext) -> Json<CurrentUserResponse> {
         scopes: auth.scopes.into_iter().collect(),
         email: auth.email,
         display_name: auth.display_name,
+        email_verified_at: auth.email_verified_at,
+        platform_roles: auth.platform_roles.into_iter().collect(),
+        auth_methods: auth.auth_methods.into_iter().collect(),
+        authenticated_at: auth.authenticated_at,
+        mfa_satisfied_at: auth.mfa_satisfied_at,
+        idle_expires_at: auth.idle_expires_at,
+        absolute_expires_at: auth.absolute_expires_at,
     })
 }
 
@@ -473,6 +668,7 @@ pub struct CreateServiceAccountRequest {
     pub workspace_id: Option<Uuid>,
     #[serde(default)]
     pub scopes: Vec<String>,
+    #[serde(with = "time::serde::rfc3339::option")]
     pub expires_at: Option<OffsetDateTime>,
 }
 
@@ -486,7 +682,9 @@ pub struct CreatedServiceAccountResponse {
     #[schema(value_type = String, example = "zsa_REDACTED.REDACTED")]
     pub token: String,
     pub scopes: Vec<String>,
+    #[serde(with = "time::serde::rfc3339::option")]
     pub expires_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
 
@@ -580,9 +778,13 @@ pub struct ServiceAccountResponse {
     pub name: String,
     pub token_prefix: String,
     pub scopes: Vec<String>,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
     pub expires_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
     pub revoked_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
     pub last_used_at: Option<OffsetDateTime>,
 }
 
@@ -721,7 +923,7 @@ fn oidc_login_aad(provider_id: Uuid) -> String {
     format!("oidc-login/{provider_id}")
 }
 
-fn session_cookie(state: &AppState, token: &str, max_age_seconds: u64) -> String {
+pub(crate) fn session_cookie(state: &AppState, token: &str, max_age_seconds: u64) -> String {
     let secure = if state.cookie_secure { "; Secure" } else { "" };
     format!(
         "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age_seconds}{secure}"
@@ -733,17 +935,27 @@ fn expired_session_cookie(state: &AppState) -> String {
     format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}")
 }
 
-fn redirect_response(location: &str, cookie: Option<String>) -> Result<Response, ApiError> {
+pub(crate) fn csrf_cookie(state: &AppState, token: &str, max_age_seconds: u64) -> String {
+    let secure = if state.cookie_secure { "; Secure" } else { "" };
+    format!("{CSRF_COOKIE}={token}; Path=/; SameSite=Lax; Max-Age={max_age_seconds}{secure}")
+}
+
+fn expired_csrf_cookie(state: &AppState) -> String {
+    let secure = if state.cookie_secure { "; Secure" } else { "" };
+    format!("{CSRF_COOKIE}=; Path=/; SameSite=Lax; Max-Age=0{secure}")
+}
+
+fn redirect_response(location: &str, cookies: &[String]) -> Result<Response, ApiError> {
     let mut response = StatusCode::SEE_OTHER.into_response();
     response.headers_mut().insert(
         header::LOCATION,
         HeaderValue::from_str(location)
             .map_err(|_| ApiError::BadRequest("invalid redirect".to_owned()))?,
     );
-    if let Some(cookie) = cookie {
-        response.headers_mut().insert(
+    for cookie in cookies {
+        response.headers_mut().append(
             header::SET_COOKIE,
-            HeaderValue::from_str(&cookie).map_err(|_| ApiError::Internal)?,
+            HeaderValue::from_str(cookie).map_err(|_| ApiError::Internal)?,
         );
     }
     Ok(response)
@@ -872,8 +1084,10 @@ fn default_return_to() -> String {
 #[cfg(test)]
 mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
+    use time::OffsetDateTime;
+    use uuid::Uuid;
 
-    use super::{SESSION_COOKIE, cookie_value, parse_service_account_token};
+    use super::{CurrentUserResponse, SESSION_COOKIE, cookie_value, parse_service_account_token};
 
     #[test]
     fn cookie_parser_does_not_confuse_neighboring_names() {
@@ -894,5 +1108,33 @@ mod tests {
             parse_service_account_token("zsa_12345678.abcdefghijklmnopqrstuvwxyz123456").is_ok()
         );
         assert!(parse_service_account_token("wrong.abcdefghijklmnopqrstuvwxyz123456").is_err());
+    }
+
+    #[test]
+    fn current_user_times_are_rfc3339_strings() {
+        let response = CurrentUserResponse {
+            principal_kind: "user".to_owned(),
+            principal_id: Uuid::now_v7(),
+            user_id: None,
+            organization_id: None,
+            workspace_id: None,
+            organization_role: None,
+            workspace_role: None,
+            scopes: Vec::new(),
+            email: None,
+            display_name: "User".to_owned(),
+            email_verified_at: None,
+            platform_roles: Vec::new(),
+            auth_methods: vec!["password".to_owned()],
+            authenticated_at: Some(OffsetDateTime::UNIX_EPOCH),
+            mfa_satisfied_at: None,
+            idle_expires_at: Some(OffsetDateTime::UNIX_EPOCH),
+            absolute_expires_at: Some(OffsetDateTime::UNIX_EPOCH),
+        };
+
+        let value = serde_json::to_value(response).expect("serialize current user");
+        assert_eq!(value["authenticated_at"], "1970-01-01T00:00:00Z");
+        assert_eq!(value["idle_expires_at"], "1970-01-01T00:00:00Z");
+        assert_eq!(value["absolute_expires_at"], "1970-01-01T00:00:00Z");
     }
 }

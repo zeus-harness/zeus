@@ -736,6 +736,52 @@ paths:
       security:
       - sessionCookie: []
       - serviceAccountBearer: []
+  /api/v1/setup:
+    post:
+      tags:
+      - identity
+      operationId: setup
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetupRequest'
+        required: true
+      responses:
+        '201':
+          description: Platform admin and first tenant created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SetupResponse'
+        '409':
+          description: Setup was already completed
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - {}
+  /api/v1/setup/status:
+    get:
+      tags:
+      - identity
+      operationId: setup_status
+      responses:
+        '200':
+          description: Native identity setup state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SetupStatusResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - {}
   /api/v1/workspaces/{workspace_id}:
     get:
       tags:
@@ -4868,23 +4914,59 @@ components:
       required:
       - principal_kind
       - principal_id
-      - organization_id
       - scopes
       - display_name
+      - platform_roles
+      - auth_methods
       properties:
+        absolute_expires_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        auth_methods:
+          type: array
+          items:
+            type: string
+        authenticated_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
         display_name:
           type: string
         email:
           type:
           - string
           - 'null'
+        email_verified_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        idle_expires_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        mfa_satisfied_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
         organization_id:
-          type: string
+          type:
+          - string
+          - 'null'
           format: uuid
         organization_role:
           type:
           - string
           - 'null'
+        platform_roles:
+          type: array
+          items:
+            type: string
         principal_id:
           type: string
           format: uuid
@@ -5874,6 +5956,74 @@ components:
         user_id:
           type: string
           format: uuid
+    SetupRequest:
+      type: object
+      required:
+      - bootstrap_token
+      - email
+      - display_name
+      - password
+      - organization_slug
+      - organization_name
+      - workspace_slug
+      - workspace_name
+      properties:
+        bootstrap_token:
+          type: string
+          writeOnly: true
+        display_name:
+          type: string
+        email:
+          type: string
+        organization_name:
+          type: string
+        organization_slug:
+          type: string
+        password:
+          type: string
+          writeOnly: true
+          maxLength: 128
+          minLength: 15
+        workspace_name:
+          type: string
+        workspace_slug:
+          type: string
+    SetupResponse:
+      type: object
+      required:
+      - user_id
+      - organization_id
+      - workspace_id
+      - session_id
+      - email_verification_required
+      - totp_setup_required
+      properties:
+        email_verification_required:
+          type: boolean
+        organization_id:
+          type: string
+          format: uuid
+        session_id:
+          type: string
+          format: uuid
+        totp_setup_required:
+          type: boolean
+        user_id:
+          type: string
+          format: uuid
+        workspace_id:
+          type: string
+          format: uuid
+    SetupStatusResponse:
+      type: object
+      required:
+      - setup_required
+      - bootstrap_token_configured
+      properties:
+        bootstrap_token_configured:
+          type: boolean
+        setup_required:
+          type: boolean
     SubmitMessageRequest:
       type: object
       required:

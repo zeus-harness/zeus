@@ -17,6 +17,7 @@
 | Windmill | `7a0c81d7222f3e7bb971c3cb9baeb82f153ba749` | 工作流和工具边界 | Windmill 混合许可证只学习不复制。不得带入代码、依赖、片段或生成物。 |
 | Codex | `4ee04c0aa5833ac39b1763f6ea44c7bc777c83dd` | Agent 任务、工具调用和恢复边界 | 只比较任务编排和工具约束；授权和审计由 Zeus 控制。 |
 | PGMQ | `c41b93adc4a93914339bde0ec3792311191f9e73` | 队列 claim、重试和可见性边界 | 只学习队列语义。Zeus 0.1.0 不接入 PGMQ 扩展。 |
+| Rauthy | `e2367289847e0db252eb3f5aa1a2ceee87deb3e3` | 原生身份、联合登录和 OIDC Provider | 学习安全状态和故障恢复语义。Zeus 不复制源码，也不依赖 Rauthy 内部模块。 |
 
 DeepSeek Harness 和 Pi 的提交已用独立临时检出复核。复核目录不进入 Zeus 仓库。
 
@@ -57,6 +58,27 @@ DeepSeek Harness 和 Pi 的提交已用独立临时检出复核。复核目录�
 - 面向单机 Coding Agent 的 shell、文件修改和本地 Session 后端。
 - Session 单写进程假设。Zeus 使用 PostgreSQL lease 和 fence 支持多个 API 副本。
 - Pi Harness 文档里尚未落地的接口行为。
+
+## Rauthy 源码结论
+
+复核提交：[`e2367289`](https://github.com/sebadob/rauthy/tree/e2367289847e0db252eb3f5aa1a2ceee87deb3e3)
+
+| 源码位置 | 看到的约束 | Zeus 的处理 |
+| --- | --- | --- |
+| `src/api_types/src/sessions.rs`、`src/middlewares/src/principal.rs`、`csrf_protection.rs` | Session 有显式状态、过期时间和最后活动时间。Cookie 请求经过 CSRF 与浏览器安全头检查。 | `web_sessions` 保存认证方法、空闲/绝对过期和 CSRF 摘要。Cookie 写请求同时校验 Origin、双提交 CSRF 和数据库摘要。 |
+| `src/common/src/password_hasher.rs`、`src/bin/src/init_static_vars.rs` | Argon2 工作通过有界 channel 限制并发，避免哈希请求把内存吃满。 | `zeus-identity::PasswordExecutor` 固定最多四个活跃哈希，并设置有界等待队列。队列满返回 `429`。 |
+| `src/service/src/oidc/auth_providers/login_finish.rs`、`src/data/src/entity/auth_providers.rs` | 普通联合登录和账号绑定走不同分支。未绑定的同邮箱账号默认拒绝，显式 link cookie 才允许绑定。 | Zeus 返回 `account_link_required`。用户登录后创建短期绑定意图。邮箱相同不会触发自动合并。 |
+| `src/service/src/oidc/validation.rs`、`src/data/src/entity/refresh_tokens.rs` | Refresh Token 在签发替代 Token 前原子 claim。重放触发同组 Token 撤销。 | Zeus 用 PostgreSQL 单次 claim Refresh Token，并按 `family_id` 撤销整个 Family。 |
+| `src/data/src/entity/jwk.rs`、`src/schedulers/src/jwks.rs` | 私钥加密入库。轮换后继续发布旧公钥，再按保留期清理。 | Zeus 存储 envelope-encrypted 3072-bit RSA 私钥。新密钥接管签名，旧公钥保留七天。 |
+| `src/data/src/entity/email_jobs.rs`、`src/schedulers/src/email_jobs.rs` | 邮件任务保存进度。调度器可以找回超时或中断的任务。 | `email_outbox` 使用 lease、fence、attempt 和可用时间。API 副本中断后，其他 `IdentityMaintenance` 可继续投递。 |
+
+不采用的部分：
+
+- `users.auth_provider_id` 和 `users.federation_uid` 的单上游绑定结构。Zeus 使用独立的多值 `federated_identities`。
+- Hiqlite、cache-first 查询路径和 Rauthy 的数据库抽象。
+- Password Grant、Device Flow、动态 Client 注册、SCIM 和 Rauthy 扩展协议。
+- 将上游 Group 或全局角色直接映射成租户授权。
+- Rauthy 的源码、crate、内部 API、迁移和前端组件。
 
 ## 采用的方向
 

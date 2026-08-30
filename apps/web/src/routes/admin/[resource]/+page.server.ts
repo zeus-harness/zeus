@@ -7,7 +7,7 @@ import { fetchWorkspaceCollection } from '$lib/api/collections';
 
 import { serverApiFetcher } from '$lib/api/server';
 
-export const load: PageServerLoad = async ({ params, fetch, parent, request }) => {
+export const load: PageServerLoad = async ({ params, fetch, parent, request, url }) => {
   const resource = getManagementResource(params.resource);
 
   if (!resource) {
@@ -15,7 +15,7 @@ export const load: PageServerLoad = async ({ params, fetch, parent, request }) =
   }
 
   const { principal } = await parent();
-  const apiFetch = serverApiFetcher(fetch, request.headers.get('cookie'));
+  const apiFetch = serverApiFetcher(fetch, request.headers.get('cookie'), url.origin);
   const collection = await fetchWorkspaceCollection(apiFetch, resource, {
     apiBaseUrl: env.ZEUS_API_URL,
     workspaceId: principal?.workspace_id ?? undefined

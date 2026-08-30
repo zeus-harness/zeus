@@ -13,7 +13,8 @@
 - 本地容器生命周期使用 Apple `container`。单文件 `scripts/container` 通过子命令管理 PostgreSQL、API、Web、镜像和日志。脚本不假设 Docker Compose 存在。
 - API 与 `ExecutionSupervisor` 使用同一个 `zeus-api` 运行边界；PostgreSQL 放在私有容器网络中，只有明确的 API 路径访问。
 - 本地密码由 `scripts/container init-env` 生成到 `.zeus/local.env`，权限固定为 `0600`。脚本和日志不打印密码、Token、Cookie 或 Authorization。
-- `scripts/container up` 启动 PostgreSQL、内嵌 Supervisor 的 API 和 Web。Apple `container` 1.0.0 本地环境不依赖容器名 DNS，脚本从受控 inspect 结果中只提取网络名和 IP，不把完整结果写入终端。
+- `scripts/container up` 启动 PostgreSQL、Mailpit、内嵌 Supervisor 的 API、Web 和 Caddy Gateway。Apple `container` 1.0.0 本地环境不依赖容器名 DNS，脚本从受控 inspect 结果中只提取网络名和 IP，不把完整结果写入终端。
+- Gateway 是唯一宿主机入口，固定为 `http://127.0.0.1:3000`。API、Web 和 Mailpit 只在 Zeus 私有网络监听。Mailpit UI 挂在 `/mailpit/`。
 - 本地镜像使用 `*.local.Containerfile`。API 依赖由宿主机 `cargo vendor` 放入临时上下文，BuildKit 离线编译；Web 只封装宿主机生成的 SvelteKit 产物。生产 Containerfile 不走这条兼容路径。
 - 容器只暴露本地或私有网络入口。不要把开发 API 直接暴露到公网。
 - 数据卷、镜像和网络只由带有 Zeus 标识的脚本管理。清理操作必须先解析精确目标，不删除工作区或宿主机的宽目录。
