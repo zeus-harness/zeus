@@ -24,8 +24,8 @@
 - PostgreSQL 18.6 已通过 Apple `container` 启动、迁移和连接检查。
 - Rust、Svelte、pnpm 和 Turbo 门禁通过。
 - API 健康检查、元数据和 OpenAPI 已实机请求。
-- OCI 构建进入 BuildKit 后被 DNS 解析失败阻断。Apple container 已有同类
-  [问题 #1033](https://github.com/apple/container/issues/1033)；代码编译和 Containerfile 静态检查不受影响。
+- 生产 Containerfile 的在线依赖步骤仍会被本机 BuildKit DNS 解析失败阻断。Apple container 已有同类
+  [问题 #1033](https://github.com/apple/container/issues/1033)。本地脚本通过临时 Cargo vendor 和宿主机 Web 构建绕开该限制；API/Web 镜像、migration、健康检查和同网络调用已通过 Apple `container` 实机验证。
 
 ## B：数据库与租户
 

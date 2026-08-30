@@ -79,7 +79,7 @@ curl --fail --silent http://127.0.0.1:18080/metrics | sed -n '1,40p'
 ## 本机验证
 
 ```bash
-scripts/container/postgres-up
+scripts/container up postgres
 set -a
 source .zeus/local.env
 set +a

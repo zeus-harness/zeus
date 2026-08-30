@@ -23,7 +23,7 @@
 使用本地 Apple `container` PostgreSQL 做一次可恢复性检查：
 
 ```bash
-scripts/container/postgres-up
+scripts/container up postgres
 set -a
 source .zeus/local.env
 set +a

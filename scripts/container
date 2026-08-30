@@ -1,0 +1,774 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+ZEUS_STATE_DIR="${REPO_ROOT}/.zeus"
+ZEUS_ENV_FILE="${ZEUS_STATE_DIR}/local.env"
+
+ZEUS_NETWORK="zeus-local"
+ZEUS_POSTGRES_CONTAINER="zeus-postgres"
+ZEUS_API_CONTAINER="zeus-api"
+ZEUS_WEB_CONTAINER="zeus-web"
+ZEUS_POSTGRES_VOLUME="zeus-postgres-data"
+ZEUS_POSTGRES_IMAGE="docker.io/library/postgres:18.6"
+ZEUS_API_IMAGE="zeus-api:0.1.0"
+ZEUS_WEB_IMAGE="zeus-web:0.1.0"
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/container <command> [target] [options]
+
+Commands:
+  init-env                         Create .zeus/local.env with mode 0600
+  rotate-postgres-password        Rotate the local PostgreSQL password
+  build [api|web|all]              Build local OCI images; default: all
+  up [postgres|api|web|all]        Start a service and its dependencies; default: all
+  down [postgres|api|web|all]      Stop services; default: all
+  status [postgres|api|web|all]    Show safe container list fields; default: all
+  logs <postgres|api|web> [flags]  Show logs; supports --follow, --boot, and -n
+  reset-db --yes                   Remove the local database container and volume
+  help                             Show this help
+
+Examples:
+  scripts/container up
+  scripts/container build api
+  scripts/container logs api -n 100
+  scripts/container down all
+EOF
+}
+
+die() {
+  echo "$*" >&2
+  exit 1
+}
+
+require_no_extra_args() {
+  if [[ "$#" -ne 0 ]]; then
+    die "Unexpected argument: $1"
+  fi
+}
+
+require_command() {
+  local command_name="$1"
+  if ! command -v "${command_name}" >/dev/null 2>&1; then
+    die "${command_name} is required."
+  fi
+}
+
+require_container_cli() {
+  if ! command -v container >/dev/null 2>&1; then
+    die "Apple container CLI is not installed."
+  fi
+}
+
+require_openssl() {
+  require_command openssl
+}
+
+create_build_context() {
+  umask 077
+  mkdir -p "${ZEUS_STATE_DIR}"
+  mktemp -d "${ZEUS_STATE_DIR}/container-build.XXXXXX"
+}
+
+cleanup_build_context() {
+  local build_context="$1"
+
+  case "${build_context}" in
+    "${ZEUS_STATE_DIR}"/container-build.*)
+      /bin/rm -rf -- "${build_context}"
+      ;;
+    *)
+      echo "Refused to remove unexpected build context ${build_context}." >&2
+      ;;
+  esac
+}
+
+init_env() {
+  require_openssl
+
+  if [[ -f "${ZEUS_ENV_FILE}" ]]; then
+    chmod 0600 "${ZEUS_ENV_FILE}"
+    echo "Local environment already exists at ${ZEUS_ENV_FILE}."
+    return
+  fi
+
+  umask 077
+  mkdir -p "${ZEUS_STATE_DIR}"
+
+  local postgres_password master_key
+  postgres_password="$(openssl rand -hex 24)"
+  master_key="$(openssl rand -hex 32)"
+
+  printf '%s\n' \
+    "POSTGRES_USER=zeus" \
+    "POSTGRES_PASSWORD=${postgres_password}" \
+    "POSTGRES_DB=zeus" \
+    "DATABASE_URL=postgres://zeus:${postgres_password}@127.0.0.1:5432/zeus" \
+    "RUNTIME_DATABASE_URL=postgres://zeus:${postgres_password}@127.0.0.1:5432/zeus" \
+    "ZEUS_LOCAL_MASTER_KEY=${master_key}" \
+    "ZEUS_ENVELOPE_KEY_ID=local-v1" \
+    "ZEUS_BIND_ADDRESS=127.0.0.1:8080" \
+    "ZEUS_PUBLIC_URL=http://127.0.0.1:8080" \
+    "ZEUS_API_URL=http://127.0.0.1:8080" \
+    "ZEUS_COOKIE_SECURE=false" \
+    "ZEUS_RUN_CONCURRENCY=4" \
+    "ZEUS_SUPERVISOR_ENABLED=true" \
+    > "${ZEUS_ENV_FILE}"
+  chmod 0600 "${ZEUS_ENV_FILE}"
+
+  unset postgres_password master_key
+  echo "Created ${ZEUS_ENV_FILE} with mode 0600. Secret values were not printed."
+}
+
+load_local_env() {
+  if [[ ! -f "${ZEUS_ENV_FILE}" ]]; then
+    init_env
+  fi
+
+  chmod 0600 "${ZEUS_ENV_FILE}"
+  set -a
+  # shellcheck disable=SC1090
+  source "${ZEUS_ENV_FILE}"
+  set +a
+
+  : "${POSTGRES_USER:?POSTGRES_USER is required in .zeus/local.env}"
+  : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required in .zeus/local.env}"
+  : "${POSTGRES_DB:?POSTGRES_DB is required in .zeus/local.env}"
+  : "${ZEUS_LOCAL_MASTER_KEY:?ZEUS_LOCAL_MASTER_KEY is required in .zeus/local.env}"
+}
+
+container_exists() {
+  container inspect "$1" >/dev/null 2>&1
+}
+
+image_exists() {
+  container image inspect "$1" >/dev/null 2>&1
+}
+
+network_exists() {
+  container network inspect "$1" >/dev/null 2>&1
+}
+
+volume_exists() {
+  container volume inspect "$1" >/dev/null 2>&1
+}
+
+container_network() {
+  container inspect "$1" \
+    | /usr/bin/plutil -extract 0.configuration.networks.0.network raw -o - - 2>/dev/null
+}
+
+container_ipv4() {
+  local cidr
+  cidr="$(
+    container inspect "$1" \
+      | /usr/bin/plutil -extract 0.status.networks.0.ipv4Address raw -o - - 2>/dev/null
+  )"
+  if [[ -z "${cidr}" ]]; then
+    die "Could not resolve the IPv4 address for $1."
+  fi
+  printf '%s\n' "${cidr%%/*}"
+}
+
+ensure_container_system() {
+  container system start >/dev/null
+}
+
+ensure_network() {
+  if ! network_exists "${ZEUS_NETWORK}"; then
+    container network create \
+      --label dev.zeus-harness.managed=true \
+      --label dev.zeus-harness.project=zeus \
+      "${ZEUS_NETWORK}" >/dev/null
+    echo "Created Apple container network ${ZEUS_NETWORK}."
+  fi
+}
+
+ensure_volume() {
+  if ! volume_exists "${ZEUS_POSTGRES_VOLUME}"; then
+    container volume create \
+      --label dev.zeus-harness.managed=true \
+      --label dev.zeus-harness.project=zeus \
+      -s 20G \
+      "${ZEUS_POSTGRES_VOLUME}" >/dev/null
+    echo "Created PostgreSQL volume ${ZEUS_POSTGRES_VOLUME}."
+  fi
+}
+
+stop_container() {
+  local container_name="$1"
+  local timeout_seconds="$2"
+
+  if container_exists "${container_name}"; then
+    container stop --time "${timeout_seconds}" "${container_name}" >/dev/null 2>&1 || true
+  fi
+}
+
+delete_container() {
+  local container_name="$1"
+  if container_exists "${container_name}"; then
+    container delete "${container_name}" >/dev/null
+  fi
+}
+
+recreate_stateless_container() {
+  local container_name="$1"
+  local timeout_seconds="$2"
+  stop_container "${container_name}" "${timeout_seconds}"
+  delete_container "${container_name}"
+}
+
+prepare_postgres_container() {
+  if ! container_exists "${ZEUS_POSTGRES_CONTAINER}"; then
+    return
+  fi
+
+  local current_network
+  current_network="$(container_network "${ZEUS_POSTGRES_CONTAINER}" || true)"
+  if [[ "${current_network}" == "${ZEUS_NETWORK}" ]]; then
+    return
+  fi
+
+  echo "Recreating ${ZEUS_POSTGRES_CONTAINER} on ${ZEUS_NETWORK}; the data volume is preserved."
+  stop_container "${ZEUS_POSTGRES_CONTAINER}" 30
+  delete_container "${ZEUS_POSTGRES_CONTAINER}"
+}
+
+sync_postgres_password() {
+  export ZEUS_POSTGRES_PASSWORD_SYNC="${POSTGRES_PASSWORD}"
+  printf '%s\n' \
+    '\getenv zeus_password ZEUS_POSTGRES_PASSWORD_SYNC' \
+    "ALTER ROLE zeus PASSWORD :'zeus_password';" \
+    | container exec \
+      --interactive \
+      --env ZEUS_POSTGRES_PASSWORD_SYNC \
+      "${ZEUS_POSTGRES_CONTAINER}" \
+      psql \
+      --username "${POSTGRES_USER}" \
+      --dbname "${POSTGRES_DB}" \
+      --no-psqlrc \
+      --set ON_ERROR_STOP=1 >/dev/null
+  unset ZEUS_POSTGRES_PASSWORD_SYNC
+}
+
+start_postgres() {
+  require_container_cli
+  load_local_env
+  ensure_container_system
+  ensure_network
+  ensure_volume
+  prepare_postgres_container
+
+  if container_exists "${ZEUS_POSTGRES_CONTAINER}"; then
+    container start "${ZEUS_POSTGRES_CONTAINER}" >/dev/null
+  else
+    container run \
+      --name "${ZEUS_POSTGRES_CONTAINER}" \
+      --detach \
+      --network "${ZEUS_NETWORK}" \
+      --cpus 2 \
+      --memory 2G \
+      --label dev.zeus-harness.managed=true \
+      --label dev.zeus-harness.project=zeus \
+      --env POSTGRES_USER \
+      --env POSTGRES_PASSWORD \
+      --env POSTGRES_DB \
+      --publish 127.0.0.1:5432:5432 \
+      --volume "${ZEUS_POSTGRES_VOLUME}:/var/lib/postgresql" \
+      "${ZEUS_POSTGRES_IMAGE}" >/dev/null
+  fi
+
+  local attempt
+  for ((attempt = 1; attempt <= 60; attempt += 1)); do
+    if container exec "${ZEUS_POSTGRES_CONTAINER}" \
+      pg_isready -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" >/dev/null 2>&1; then
+      sync_postgres_password
+      echo "PostgreSQL 18.6 is ready on 127.0.0.1:5432."
+      return
+    fi
+    sleep 1
+  done
+
+  echo "PostgreSQL did not become ready within 60 seconds." >&2
+  container logs -n 100 "${ZEUS_POSTGRES_CONTAINER}" >&2 || true
+  exit 1
+}
+
+bootstrap_database() {
+  container exec \
+    --interactive \
+    "${ZEUS_POSTGRES_CONTAINER}" \
+    psql \
+    --username "${POSTGRES_USER}" \
+    --dbname "${POSTGRES_DB}" \
+    --no-psqlrc \
+    --set ON_ERROR_STOP=1 \
+    < "${REPO_ROOT}/scripts/db/bootstrap-roles.sql" >/dev/null
+  echo "Database roles are ready."
+}
+
+container_database_url() {
+  local postgres_ip="$1"
+  printf 'postgres://%s:%s@%s:5432/%s\n' \
+    "${POSTGRES_USER}" \
+    "${POSTGRES_PASSWORD}" \
+    "${postgres_ip}" \
+    "${POSTGRES_DB}"
+}
+
+build_api_image() (
+  require_command cargo
+  local build_context
+  build_context="$(create_build_context)"
+  trap 'cleanup_build_context "${build_context}"' EXIT
+
+  echo "Building ${ZEUS_API_IMAGE}."
+  mkdir -p \
+    "${build_context}/.cargo" \
+    "${build_context}/apps" \
+    "${build_context}/crates" \
+    "${build_context}/db"
+
+  if ! (
+    cd "${build_context}"
+    cargo vendor \
+      --locked \
+      --manifest-path "${REPO_ROOT}/Cargo.toml" \
+      vendor \
+      > .cargo/config.toml \
+      2> cargo-vendor.log
+  ); then
+    echo "cargo vendor failed:" >&2
+    tail -n 100 "${build_context}/cargo-vendor.log" >&2 || true
+    exit 1
+  fi
+  /bin/rm -f "${build_context}/cargo-vendor.log"
+
+  cp "${REPO_ROOT}/Cargo.toml" "${REPO_ROOT}/Cargo.lock" "${build_context}/"
+  cp -R "${REPO_ROOT}/crates/zeus-core" "${build_context}/crates/zeus-core"
+  cp -R "${REPO_ROOT}/apps/zeus-api" "${build_context}/apps/zeus-api"
+  cp -R "${REPO_ROOT}/db/migrations" "${build_context}/db/migrations"
+  cp \
+    "${REPO_ROOT}/deploy/container/zeus-api.local.Containerfile" \
+    "${build_context}/Containerfile"
+
+  (
+    cd "${build_context}"
+    container build \
+      --tag "${ZEUS_API_IMAGE}" \
+      --label dev.zeus-harness.project=zeus \
+      --file Containerfile \
+      .
+  )
+)
+
+build_web_image() (
+  require_command pnpm
+  local build_context
+  build_context="$(create_build_context)"
+  trap 'cleanup_build_context "${build_context}"' EXIT
+
+  echo "Building ${ZEUS_WEB_IMAGE}."
+  (
+    cd "${REPO_ROOT}"
+    unset CI
+    pnpm install --frozen-lockfile --config.confirmModulesPurge=false
+    pnpm --filter @zeus/ui build
+    pnpm --filter @zeus/web build
+  )
+
+  cp -R "${REPO_ROOT}/apps/web/build" "${build_context}/build"
+  cp \
+    "${REPO_ROOT}/deploy/container/web.local.Containerfile" \
+    "${build_context}/Containerfile"
+
+  (
+    cd "${build_context}"
+    container build \
+      --tag "${ZEUS_WEB_IMAGE}" \
+      --label dev.zeus-harness.project=zeus \
+      --file Containerfile \
+      .
+  )
+)
+
+build_target() {
+  local target="$1"
+  require_container_cli
+  ensure_container_system
+
+  case "${target}" in
+    api)
+      build_api_image
+      ;;
+    web)
+      build_web_image
+      ;;
+    all)
+      build_api_image
+      build_web_image
+      ;;
+    *)
+      die "Build target must be api, web, or all."
+      ;;
+  esac
+}
+
+ensure_api_image() {
+  if ! image_exists "${ZEUS_API_IMAGE}"; then
+    build_api_image
+  fi
+}
+
+ensure_web_image() {
+  if ! image_exists "${ZEUS_WEB_IMAGE}"; then
+    build_web_image
+  fi
+}
+
+migrate_database() {
+  local postgres_ip database_url
+  postgres_ip="$(container_ipv4 "${ZEUS_POSTGRES_CONTAINER}")"
+  database_url="$(container_database_url "${postgres_ip}")"
+
+  export DATABASE_URL="${database_url}"
+  export RUNTIME_DATABASE_URL="${database_url}"
+  if ! container run \
+    --remove \
+    --network "${ZEUS_NETWORK}" \
+    --env DATABASE_URL \
+    --env RUNTIME_DATABASE_URL \
+    "${ZEUS_API_IMAGE}" db migrate; then
+    echo "Database migration failed. Existing data was preserved." >&2
+    echo "Inspect the migration error before using scripts/container reset-db --yes." >&2
+    return 1
+  fi
+  unset database_url
+  echo "Database migrations are ready."
+}
+
+wait_for_http() {
+  local service_name="$1"
+  local url="$2"
+  local timeout_seconds="$3"
+  local attempt
+
+  for ((attempt = 1; attempt <= timeout_seconds; attempt += 1)); do
+    if /usr/bin/curl --silent --show-error --fail "${url}" >/dev/null 2>&1; then
+      return
+    fi
+    sleep 1
+  done
+
+  echo "${service_name} did not become ready within ${timeout_seconds} seconds." >&2
+  container logs -n 100 "${service_name}" >&2 || true
+  exit 1
+}
+
+start_api() {
+  ensure_api_image
+  bootstrap_database
+  migrate_database
+
+  local postgres_ip database_url
+  postgres_ip="$(container_ipv4 "${ZEUS_POSTGRES_CONTAINER}")"
+  database_url="$(container_database_url "${postgres_ip}")"
+
+  export DATABASE_URL="${database_url}"
+  export RUNTIME_DATABASE_URL="${database_url}"
+  export ZEUS_BIND_ADDRESS="0.0.0.0:8080"
+  export ZEUS_PUBLIC_URL="http://127.0.0.1:8080"
+  export ZEUS_COOKIE_SECURE="false"
+  export ZEUS_RUN_CONCURRENCY="${ZEUS_RUN_CONCURRENCY:-4}"
+  export ZEUS_SUPERVISOR_ENABLED="true"
+  export ZEUS_ENVELOPE_KEY_ID="${ZEUS_ENVELOPE_KEY_ID:-local-v1}"
+
+  recreate_stateless_container "${ZEUS_API_CONTAINER}" 60
+  container run \
+    --name "${ZEUS_API_CONTAINER}" \
+    --detach \
+    --init \
+    --network "${ZEUS_NETWORK}" \
+    --cpus 4 \
+    --memory 2G \
+    --label dev.zeus-harness.managed=true \
+    --label dev.zeus-harness.project=zeus \
+    --env DATABASE_URL \
+    --env RUNTIME_DATABASE_URL \
+    --env ZEUS_BIND_ADDRESS \
+    --env ZEUS_PUBLIC_URL \
+    --env ZEUS_COOKIE_SECURE \
+    --env ZEUS_RUN_CONCURRENCY \
+    --env ZEUS_SUPERVISOR_ENABLED \
+    --env ZEUS_LOCAL_MASTER_KEY \
+    --env ZEUS_ENVELOPE_KEY_ID \
+    --publish 127.0.0.1:8080:8080 \
+    "${ZEUS_API_IMAGE}" >/dev/null
+
+  wait_for_http "${ZEUS_API_CONTAINER}" "http://127.0.0.1:8080/health/ready" 90
+  unset database_url
+  echo "zeus-api is ready on http://127.0.0.1:8080."
+}
+
+start_web() {
+  ensure_web_image
+
+  local api_ip
+  api_ip="$(container_ipv4 "${ZEUS_API_CONTAINER}")"
+  export ZEUS_API_URL="http://${api_ip}:8080"
+  export HOST="0.0.0.0"
+  export PORT="3000"
+  export ORIGIN="http://127.0.0.1:3000"
+
+  recreate_stateless_container "${ZEUS_WEB_CONTAINER}" 10
+  container run \
+    --name "${ZEUS_WEB_CONTAINER}" \
+    --detach \
+    --init \
+    --network "${ZEUS_NETWORK}" \
+    --cpus 2 \
+    --memory 1G \
+    --label dev.zeus-harness.managed=true \
+    --label dev.zeus-harness.project=zeus \
+    --env ZEUS_API_URL \
+    --env HOST \
+    --env PORT \
+    --env ORIGIN \
+    --publish 127.0.0.1:3000:3000 \
+    "${ZEUS_WEB_IMAGE}" >/dev/null
+
+  wait_for_http "${ZEUS_WEB_CONTAINER}" "http://127.0.0.1:3000/" 60
+  echo "Zeus Web is ready on http://127.0.0.1:3000."
+}
+
+up_target() {
+  local target="$1"
+  case "${target}" in
+    postgres)
+      start_postgres
+      ;;
+    api)
+      start_postgres
+      start_api
+      ;;
+    web | all)
+      start_postgres
+      start_api
+      start_web
+      ;;
+    *)
+      die "Up target must be postgres, api, web, or all."
+      ;;
+  esac
+}
+
+down_target() {
+  local target="$1"
+  require_container_cli
+
+  case "${target}" in
+    postgres)
+      stop_container "${ZEUS_POSTGRES_CONTAINER}" 30
+      ;;
+    api)
+      stop_container "${ZEUS_API_CONTAINER}" 60
+      ;;
+    web)
+      stop_container "${ZEUS_WEB_CONTAINER}" 10
+      ;;
+    all)
+      stop_container "${ZEUS_WEB_CONTAINER}" 10
+      stop_container "${ZEUS_API_CONTAINER}" 60
+      stop_container "${ZEUS_POSTGRES_CONTAINER}" 30
+      ;;
+    *)
+      die "Down target must be postgres, api, web, or all."
+      ;;
+  esac
+}
+
+status_target() {
+  local target="$1"
+  require_container_cli
+
+  case "${target}" in
+    postgres | api | web | all) ;;
+    *) die "Status target must be postgres, api, web, or all." ;;
+  esac
+
+  container list --all | awk \
+    -v target="${target}" \
+    -v postgres="${ZEUS_POSTGRES_CONTAINER}" \
+    -v api="${ZEUS_API_CONTAINER}" \
+    -v web="${ZEUS_WEB_CONTAINER}" '
+      NR == 1 { print; next }
+      target == "all" && ($1 == postgres || $1 == api || $1 == web) { print; next }
+      target == "postgres" && $1 == postgres { print; next }
+      target == "api" && $1 == api { print; next }
+      target == "web" && $1 == web { print }
+    '
+}
+
+container_for_target() {
+  case "$1" in
+    postgres) printf '%s\n' "${ZEUS_POSTGRES_CONTAINER}" ;;
+    api) printf '%s\n' "${ZEUS_API_CONTAINER}" ;;
+    web) printf '%s\n' "${ZEUS_WEB_CONTAINER}" ;;
+    *) die "Log target must be postgres, api, or web." ;;
+  esac
+}
+
+logs_target() {
+  local target="$1"
+  shift
+  local container_name
+  container_name="$(container_for_target "${target}")"
+
+  require_container_cli
+  if ! container_exists "${container_name}"; then
+    die "${container_name} does not exist."
+  fi
+  container logs "$@" "${container_name}"
+}
+
+rotate_postgres_password() {
+  require_container_cli
+  require_openssl
+  if [[ ! -f "${ZEUS_ENV_FILE}" ]]; then
+    die "Local environment does not exist at ${ZEUS_ENV_FILE}."
+  fi
+
+  load_local_env
+  if ! container_exists "${ZEUS_POSTGRES_CONTAINER}"; then
+    die "${ZEUS_POSTGRES_CONTAINER} is not running. Start PostgreSQL before rotating its password."
+  fi
+
+  local rotated_password temporary_env
+  rotated_password="$(openssl rand -hex 24)"
+  temporary_env="$(mktemp "${ZEUS_STATE_DIR}/local.env.rotate.XXXXXX")"
+  chmod 0600 "${temporary_env}"
+  export ZEUS_ROTATED_PASSWORD="${rotated_password}"
+
+  printf '%s\n' \
+    '\getenv rotated_password ZEUS_ROTATED_PASSWORD' \
+    "ALTER ROLE zeus PASSWORD :'rotated_password';" \
+    | container exec \
+      --interactive \
+      --env ZEUS_ROTATED_PASSWORD \
+      "${ZEUS_POSTGRES_CONTAINER}" \
+      psql \
+      --username "${POSTGRES_USER}" \
+      --dbname "${POSTGRES_DB}" \
+      --no-psqlrc \
+      --set ON_ERROR_STOP=1 >/dev/null
+
+  awk '
+    /^POSTGRES_PASSWORD=/ {
+      print "POSTGRES_PASSWORD=" ENVIRON["ZEUS_ROTATED_PASSWORD"]
+      next
+    }
+    /^DATABASE_URL=/ {
+      print "DATABASE_URL=postgres://zeus:" ENVIRON["ZEUS_ROTATED_PASSWORD"] "@127.0.0.1:5432/zeus"
+      next
+    }
+    /^RUNTIME_DATABASE_URL=/ {
+      print "RUNTIME_DATABASE_URL=postgres://zeus:" ENVIRON["ZEUS_ROTATED_PASSWORD"] "@127.0.0.1:5432/zeus"
+      next
+    }
+    { print }
+  ' "${ZEUS_ENV_FILE}" > "${temporary_env}"
+  mv "${temporary_env}" "${ZEUS_ENV_FILE}"
+  chmod 0600 "${ZEUS_ENV_FILE}"
+  unset rotated_password ZEUS_ROTATED_PASSWORD
+
+  echo "Rotated the local PostgreSQL password. Secret values were not printed."
+  echo "Run scripts/container up all to refresh API and Web connections."
+}
+
+reset_database() {
+  if [[ "${1:-}" != "--yes" || "$#" -ne 1 ]]; then
+    echo "This removes zeus-postgres, zeus-api, zeus-web, and the zeus-postgres-data volume." >&2
+    echo "Run scripts/container reset-db --yes to continue." >&2
+    exit 2
+  fi
+
+  require_container_cli
+  stop_container "${ZEUS_WEB_CONTAINER}" 10
+  stop_container "${ZEUS_API_CONTAINER}" 60
+  stop_container "${ZEUS_POSTGRES_CONTAINER}" 30
+  delete_container "${ZEUS_WEB_CONTAINER}"
+  delete_container "${ZEUS_API_CONTAINER}"
+  delete_container "${ZEUS_POSTGRES_CONTAINER}"
+
+  if volume_exists "${ZEUS_POSTGRES_VOLUME}"; then
+    container volume delete "${ZEUS_POSTGRES_VOLUME}" >/dev/null
+  fi
+
+  echo "Removed local Zeus containers and PostgreSQL volume. Database contents are not recoverable without a backup."
+  echo "Local environment, images, and network were preserved."
+}
+
+main() {
+  local command_name="${1:-help}"
+  if [[ "$#" -gt 0 ]]; then
+    shift
+  fi
+
+  case "${command_name}" in
+    init-env)
+      require_no_extra_args "$@"
+      init_env
+      ;;
+    rotate-postgres-password)
+      require_no_extra_args "$@"
+      rotate_postgres_password
+      ;;
+    build)
+      local build_target_name="${1:-all}"
+      if [[ "$#" -gt 0 ]]; then shift; fi
+      require_no_extra_args "$@"
+      build_target "${build_target_name}"
+      ;;
+    up)
+      local up_target_name="${1:-all}"
+      if [[ "$#" -gt 0 ]]; then shift; fi
+      require_no_extra_args "$@"
+      up_target "${up_target_name}"
+      ;;
+    down)
+      local down_target_name="${1:-all}"
+      if [[ "$#" -gt 0 ]]; then shift; fi
+      require_no_extra_args "$@"
+      down_target "${down_target_name}"
+      ;;
+    status)
+      local status_target_name="${1:-all}"
+      if [[ "$#" -gt 0 ]]; then shift; fi
+      require_no_extra_args "$@"
+      status_target "${status_target_name}"
+      ;;
+    logs)
+      if [[ "$#" -eq 0 ]]; then
+        die "Log target must be postgres, api, or web."
+      fi
+      local log_target_name="$1"
+      shift
+      logs_target "${log_target_name}" "$@"
+      ;;
+    reset-db)
+      reset_database "$@"
+      ;;
+    help | --help | -h)
+      require_no_extra_args "$@"
+      usage
+      ;;
+    *)
+      usage >&2
+      die "Unknown command: ${command_name}"
+      ;;
+  esac
+}
+
+main "$@"

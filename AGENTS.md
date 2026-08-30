@@ -97,5 +97,6 @@ npx @sveltejs/mcp svelte-autofixer <file> --svelte-version 5
 
 - 本机使用 Apple `container`，不依赖 Docker Compose。
 - PostgreSQL 版本为 `18.6`。
-- 本地密码由 `scripts/container/init-env` 生成到 `.zeus/local.env`。
+- 本地密码由 `scripts/container init-env` 生成到 `.zeus/local.env`。
+- Apple `container` 生命周期统一通过单文件 `scripts/container` 管理。不要再增加一命令一文件的容器脚本。
 - `.zeus/local.env` 权限必须是 `0600`，脚本和日志不得打印密码。

@@ -245,8 +245,13 @@ packages/ui/src/lib/components/ui
 
 本地使用 Apple `container` 1.0.0 和 PostgreSQL 18.6。PostgreSQL 18 官方镜像的卷挂载点是 `/var/lib/postgresql`。
 
-`scripts/container/postgres-status` 只输出容器列表字段。不要用
-`container inspect` 分享诊断结果；inspect 会包含容器环境变量。
+`scripts/container status` 只输出容器列表字段。不要用 `container inspect`
+分享诊断结果；inspect 会包含容器环境变量。`scripts/container up` 在 Zeus
+专用网络内启动 PostgreSQL、内嵌 Supervisor 的 API 和 Web。Apple `container`
+1.0.0 本机不依赖容器名解析，脚本只提取运行时 IP 并注入内部连接地址。
+本地 API 镜像通过临时 Cargo vendor 上下文离线编译，Web 镜像封装宿主机生成的
+SvelteKit 产物。临时上下文放在被忽略的 `.zeus` 下，构建退出时删除。生产镜像
+继续使用 `zeus-api.Containerfile` 和 `web.Containerfile` 的完整构建链路。
 
 生产使用 Kubernetes 和托管 PostgreSQL。Web 与 API 独立扩缩。Migration 由 Job 执行。API Pod 停止时停止领取新 Run，活动任务最多等待 60 秒；Kubernetes 终止窗口额外留出 15 秒做清理，未完成任务由租约恢复。
 
