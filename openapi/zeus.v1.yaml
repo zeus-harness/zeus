@@ -2197,13 +2197,26 @@ paths:
       parameters:
       - name: workspace_id
         in: path
-        description: Path identifier
         required: true
         schema:
           type: string
+          format: uuid
+      - name: status
+        in: query
+        description: Approval state; defaults to pending
+        required: false
+        schema:
+          type: string
+      - name: work_item_id
+        in: query
+        description: Only approvals linked to this WorkItem
+        required: false
+        schema:
+          type: string
+          format: uuid
       responses:
         '200':
-          description: Successful response
+          description: Workspace approvals
           content:
             application/json:
               schema:
@@ -3372,13 +3385,40 @@ paths:
       parameters:
       - name: workspace_id
         in: path
-        description: Path identifier
         required: true
+        schema:
+          type: string
+          format: uuid
+      - name: cursor
+        in: query
+        description: Opaque pagination cursor
+        required: false
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Page size from 1 to 100
+        required: false
+        schema:
+          type: integer
+          format: int32
+          minimum: 0
+      - name: work_item_id
+        in: query
+        description: Only Runs linked to this WorkItem
+        required: false
+        schema:
+          type: string
+          format: uuid
+      - name: status
+        in: query
+        description: Only Runs in this state
+        required: false
         schema:
           type: string
       responses:
         '200':
-          description: Successful response
+          description: Workspace Runs
           content:
             application/json:
               schema:
@@ -4634,6 +4674,53 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ExternalReferenceResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/runs:
+    post:
+      tags:
+      - execution
+      operationId: start_work_item_run
+      parameters:
+      - name: workspace_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: work_item_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartWorkItemRunRequest'
+        required: true
+      responses:
+        '201':
+          description: Linked session and queued Run
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkItemRunStartResponse'
+        '409':
+          description: Workflow state or idempotency conflict
         default:
           description: Problem Details error
           content:
@@ -7767,6 +7854,19 @@ components:
           type: boolean
         setup_required:
           type: boolean
+    StartWorkItemRunRequest:
+      type: object
+      required:
+      - workflow_id
+      properties:
+        input: {}
+        message:
+          type:
+          - string
+          - 'null'
+        workflow_id:
+          type: string
+          format: uuid
     SubmitMessageRequest:
       type: object
       required:
@@ -8437,6 +8537,16 @@ components:
         workspace_id:
           type: string
           format: uuid
+    WorkItemRunStartResponse:
+      type: object
+      required:
+      - session
+      - run
+      properties:
+        run:
+          $ref: '#/components/schemas/RunResponse'
+        session:
+          $ref: '#/components/schemas/SessionResponse'
     WorkflowPageResponse:
       type: object
       required:

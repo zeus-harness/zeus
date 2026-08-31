@@ -1,28 +1,19 @@
-pub mod agents;
-pub mod api_support;
-pub mod auth;
-pub mod config;
-pub mod crypto;
-pub mod database;
-pub mod error;
+pub mod collaboration;
+pub mod control_plane;
+pub mod execution;
 pub mod execution_api;
-pub mod experiences;
-pub mod federated_identity;
 pub mod http;
-pub mod idempotency;
-pub mod identity_maintenance;
-pub mod integrations;
-pub mod model;
-pub mod native_auth;
-pub mod native_identity;
-pub mod oidc;
-pub mod oidc_provider;
-pub mod organization;
-pub mod organization_identity;
-pub mod runtime;
-pub mod supervisor;
-pub mod telemetry;
-pub mod work_items;
+pub mod identity;
+pub mod platform;
+
+pub use collaboration::{experiences, work_items};
+pub use control_plane::{agents, integrations, organization};
+pub use execution::{model, runtime, supervisor};
+pub use identity::{
+    auth, federated_identity, maintenance as identity_maintenance, native_auth, native_identity,
+    oidc, oidc_provider, organization_identity,
+};
+pub use platform::{api_support, config, crypto, database, error, idempotency, telemetry};
 
 use std::{str::FromStr, sync::Arc, time::Duration};
 
@@ -40,25 +31,41 @@ use crate::{
     supervisor::SupervisorMetrics,
 };
 
-#[derive(Clone)]
-#[allow(clippy::struct_excessive_bools)] // Deployment and protocol switches are independent.
-pub struct AppState {
+pub struct PlatformServices {
     pub database: PgPool,
     pub envelope: Arc<dyn EnvelopeCipher>,
-    pub http_client: reqwest::Client,
     pub metrics: Arc<SupervisorMetrics>,
+    pub version: &'static str,
+}
+
+#[allow(clippy::struct_excessive_bools)] // Deployment and protocol switches are independent.
+pub struct IdentityRuntimeConfig {
     pub public_url: Url,
     pub session_idle_ttl: Duration,
     pub session_absolute_ttl: Duration,
     pub oidc_state_ttl: Duration,
     pub cookie_secure: bool,
     pub allow_private_oidc_issuers: bool,
-    pub allow_private_model_endpoints: bool,
     pub bootstrap_token: Option<SecretString>,
     pub identity_hash_key: SecretString,
     pub trust_proxy_headers: bool,
     pub password_executor: PasswordExecutor,
-    pub version: &'static str,
+}
+
+pub struct ExternalClients {
+    pub http: reqwest::Client,
+}
+
+pub struct ExecutionRuntimeConfig {
+    pub allow_private_model_endpoints: bool,
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    pub platform: Arc<PlatformServices>,
+    pub identity: Arc<IdentityRuntimeConfig>,
+    pub external: Arc<ExternalClients>,
+    pub execution: Arc<ExecutionRuntimeConfig>,
 }
 
 pub const HTTP_DATABASE_ROLE: &str = "zeus_http";
@@ -155,21 +162,27 @@ pub async fn build_state(config: &AppConfig) -> anyhow::Result<AppState> {
         .clone()
         .ok_or_else(|| anyhow::anyhow!("ZEUS_IDENTITY_HASH_KEY or an envelope key is required"))?;
     Ok(AppState {
-        database,
-        envelope: Arc::new(envelope),
-        http_client,
-        metrics: Arc::new(SupervisorMetrics::default()),
-        public_url: config.public_url.clone(),
-        session_idle_ttl: config.session_idle_ttl,
-        session_absolute_ttl: config.session_absolute_ttl,
-        oidc_state_ttl: config.oidc_state_ttl,
-        cookie_secure: config.cookie_secure,
-        allow_private_oidc_issuers: config.allow_private_oidc_issuers,
-        allow_private_model_endpoints: config.allow_private_model_endpoints,
-        bootstrap_token: config.bootstrap_token.clone(),
-        identity_hash_key,
-        trust_proxy_headers: config.trust_proxy_headers,
-        password_executor,
-        version: env!("CARGO_PKG_VERSION"),
+        platform: Arc::new(PlatformServices {
+            database,
+            envelope: Arc::new(envelope),
+            metrics: Arc::new(SupervisorMetrics::default()),
+            version: env!("CARGO_PKG_VERSION"),
+        }),
+        identity: Arc::new(IdentityRuntimeConfig {
+            public_url: config.public_url.clone(),
+            session_idle_ttl: config.session_idle_ttl,
+            session_absolute_ttl: config.session_absolute_ttl,
+            oidc_state_ttl: config.oidc_state_ttl,
+            cookie_secure: config.cookie_secure,
+            allow_private_oidc_issuers: config.allow_private_oidc_issuers,
+            bootstrap_token: config.bootstrap_token.clone(),
+            identity_hash_key,
+            trust_proxy_headers: config.trust_proxy_headers,
+            password_executor,
+        }),
+        external: Arc::new(ExternalClients { http: http_client }),
+        execution: Arc::new(ExecutionRuntimeConfig {
+            allow_private_model_endpoints: config.allow_private_model_endpoints,
+        }),
     })
 }

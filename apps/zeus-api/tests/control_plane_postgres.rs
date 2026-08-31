@@ -12,7 +12,8 @@ use tower::ServiceExt;
 use url::Url;
 use uuid::Uuid;
 use zeus_api::{
-    AppState, HTTP_DATABASE_ROLE, connect_pool, connect_pool_as_role,
+    AppState, ExecutionRuntimeConfig, ExternalClients, HTTP_DATABASE_ROLE, IdentityRuntimeConfig,
+    PlatformServices, connect_pool, connect_pool_as_role,
     crypto::{LocalEnvelopeCipher, hash_service_account_token, sha256},
     http, migrate,
     supervisor::SupervisorMetrics,
@@ -134,6 +135,30 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     .execute(&owner_pool)
     .await
     .expect("service account inserts");
+
+    let organization_service_account_id = Uuid::now_v7();
+    let organization_token_prefix = format!(
+        "zsa_{}",
+        &organization_service_account_id.simple().to_string()[..12]
+    );
+    let organization_token =
+        format!("{organization_token_prefix}.abcdefghijklmnopqrstuvwxyz1234567890WXYZ");
+    let organization_token_hash =
+        hash_service_account_token(&SecretString::from(organization_token.clone()))
+            .expect("organization service account token hashes");
+    sqlx::query(
+        "insert into service_accounts (
+            id, organization_id, name, token_prefix, token_hash, scopes
+         ) values ($1, $2, 'Organization Control Test', $3, $4, $5)",
+    )
+    .bind(organization_service_account_id)
+    .bind(organization_id)
+    .bind(&organization_token_prefix)
+    .bind(organization_token_hash)
+    .bind(vec!["organization:manage"])
+    .execute(&owner_pool)
+    .await
+    .expect("organization service account inserts");
 
     let http_pool = connect_pool_as_role(&database_url, 5, HTTP_DATABASE_ROLE)
         .await
@@ -347,26 +372,34 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     let envelope = LocalEnvelopeCipher::from_encoded("test-v1".to_owned(), &envelope_key)
         .expect("test envelope key is valid");
     let state = AppState {
-        database: http_pool,
-        envelope: Arc::new(envelope),
-        http_client: reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("HTTP client builds"),
-        metrics: Arc::new(SupervisorMetrics::default()),
-        public_url: Url::parse("http://127.0.0.1:8080").expect("public URL parses"),
-        session_idle_ttl: Duration::from_hours(2),
-        session_absolute_ttl: Duration::from_hours(12),
-        oidc_state_ttl: Duration::from_mins(10),
-        cookie_secure: false,
-        allow_private_oidc_issuers: false,
-        allow_private_model_endpoints: false,
-        bootstrap_token: None,
-        identity_hash_key: envelope_key,
-        trust_proxy_headers: false,
-        password_executor: PasswordExecutor::new(4, 4, PasswordPolicy::default())
-            .expect("password executor builds"),
-        version: "0.1.0-test",
+        platform: Arc::new(PlatformServices {
+            database: http_pool,
+            envelope: Arc::new(envelope),
+            metrics: Arc::new(SupervisorMetrics::default()),
+            version: "0.1.0-test",
+        }),
+        identity: Arc::new(IdentityRuntimeConfig {
+            public_url: Url::parse("http://127.0.0.1:8080").expect("public URL parses"),
+            session_idle_ttl: Duration::from_hours(2),
+            session_absolute_ttl: Duration::from_hours(12),
+            oidc_state_ttl: Duration::from_mins(10),
+            cookie_secure: false,
+            allow_private_oidc_issuers: false,
+            bootstrap_token: None,
+            identity_hash_key: envelope_key,
+            trust_proxy_headers: false,
+            password_executor: PasswordExecutor::new(4, 4, PasswordPolicy::default())
+                .expect("password executor builds"),
+        }),
+        external: Arc::new(ExternalClients {
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("HTTP client builds"),
+        }),
+        execution: Arc::new(ExecutionRuntimeConfig {
+            allow_private_model_endpoints: false,
+        }),
     };
     let app = http::router(state);
 
@@ -399,7 +432,7 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
         &app,
         Method::GET,
         &format!("/api/v1/organizations/{organization_id}/identity-providers"),
-        &token,
+        &organization_token,
         None,
         &[],
     )
@@ -513,7 +546,7 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
         &app,
         Method::POST,
         &format!("/api/v1/organizations/{organization_id}/capability-definitions"),
-        &token,
+        &organization_token,
         Some(json!({
             "registry_key": "test.echo",
             "display_name": "Echo",
@@ -540,7 +573,7 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
         &app,
         Method::PATCH,
         &format!("/api/v1/organizations/{organization_id}/capability-definitions/{capability_id}"),
-        &token,
+        &organization_token,
         Some(json!({ "display_name": "Echo API" })),
         &[(header::IF_MATCH.as_str(), revision_one.as_str())],
     )
@@ -552,7 +585,7 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
         &app,
         Method::PATCH,
         &format!("/api/v1/organizations/{organization_id}/capability-definitions/{capability_id}"),
-        &token,
+        &organization_token,
         Some(json!({ "display_name": "Stale write" })),
         &[(header::IF_MATCH.as_str(), revision_one.as_str())],
     )
@@ -639,6 +672,195 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     )
     .await;
     let _ = expect_json(activated, StatusCode::OK).await;
+
+    let work_item = send(
+        &app,
+        Method::POST,
+        &format!("/api/v1/workspaces/{workspace_id}/work-items"),
+        &token,
+        Some(json!({
+            "title": "Investigate a customer escalation",
+            "description": "Exercise the atomic WorkItem launch contract.",
+            "priority": "high",
+            "input": { "ticket": "TEST-42" }
+        })),
+        &[("idempotency-key", "control-work-item-1")],
+    )
+    .await;
+    let (_, work_item) = expect_json(work_item, StatusCode::CREATED).await;
+    let work_item_id = json_uuid(&work_item, "id");
+
+    let dormant_workflow = send(
+        &app,
+        Method::POST,
+        &format!("/api/v1/workspaces/{workspace_id}/workflows"),
+        &token,
+        Some(json!({
+            "name": "Dormant Workflow",
+            "description": "Has no active version"
+        })),
+        &[],
+    )
+    .await;
+    let (_, dormant_workflow) = expect_json(dormant_workflow, StatusCode::CREATED).await;
+    let dormant_workflow_id = json_uuid(&dormant_workflow, "id");
+    let sessions_before: i64 = sqlx::query_scalar("select count(*) from sessions")
+        .fetch_one(&owner_pool)
+        .await
+        .expect("session count reads");
+    let runs_before: i64 = sqlx::query_scalar("select count(*) from runs")
+        .fetch_one(&owner_pool)
+        .await
+        .expect("run count reads");
+    let missing_active_version = send(
+        &app,
+        Method::POST,
+        &format!("/api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/runs"),
+        &token,
+        Some(json!({
+            "workflow_id": dormant_workflow_id,
+            "input": {},
+            "message": "Start"
+        })),
+        &[("idempotency-key", "control-work-item-run-dormant")],
+    )
+    .await;
+    let (_, problem) = expect_json(missing_active_version, StatusCode::CONFLICT).await;
+    assert_eq!(problem["code"], "conflict");
+    let sessions_after: i64 = sqlx::query_scalar("select count(*) from sessions")
+        .fetch_one(&owner_pool)
+        .await
+        .expect("session count reads after rollback");
+    let runs_after: i64 = sqlx::query_scalar("select count(*) from runs")
+        .fetch_one(&owner_pool)
+        .await
+        .expect("run count reads after rollback");
+    assert_eq!(sessions_after, sessions_before);
+    assert_eq!(runs_after, runs_before);
+
+    let cross_workspace_launch = send(
+        &app,
+        Method::POST,
+        &format!("/api/v1/workspaces/{other_workspace_id}/work-items/{work_item_id}/runs"),
+        &token,
+        Some(json!({
+            "workflow_id": workflow_id,
+            "input": {},
+            "message": "Start"
+        })),
+        &[("idempotency-key", "control-work-item-run-cross-workspace")],
+    )
+    .await;
+    let _ = expect_json(cross_workspace_launch, StatusCode::FORBIDDEN).await;
+
+    let launch_body = json!({
+        "workflow_id": workflow_id,
+        "input": { "ticket": "TEST-42" },
+        "message": "Investigate the escalation"
+    });
+    let launched = send(
+        &app,
+        Method::POST,
+        &format!("/api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/runs"),
+        &token,
+        Some(launch_body.clone()),
+        &[("idempotency-key", "control-work-item-run-1")],
+    )
+    .await;
+    let (_, launched) = expect_json(launched, StatusCode::CREATED).await;
+    let linked_session_id = json_uuid(&launched["session"], "id");
+    let linked_run_id = json_uuid(&launched["run"], "id");
+    assert_eq!(
+        launched["session"]["work_item_id"],
+        work_item_id.to_string()
+    );
+    assert_eq!(launched["run"]["work_item_id"], work_item_id.to_string());
+
+    let replayed = send(
+        &app,
+        Method::POST,
+        &format!("/api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/runs"),
+        &token,
+        Some(launch_body),
+        &[("idempotency-key", "control-work-item-run-1")],
+    )
+    .await;
+    let (_, replayed) = expect_json(replayed, StatusCode::CREATED).await;
+    assert_eq!(json_uuid(&replayed["session"], "id"), linked_session_id);
+    assert_eq!(json_uuid(&replayed["run"], "id"), linked_run_id);
+
+    let filtered_runs = send(
+        &app,
+        Method::GET,
+        &format!(
+            "/api/v1/workspaces/{workspace_id}/runs?work_item_id={work_item_id}&status=queued"
+        ),
+        &token,
+        None,
+        &[],
+    )
+    .await;
+    let (_, filtered_runs) = expect_json(filtered_runs, StatusCode::OK).await;
+    assert_eq!(filtered_runs["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(filtered_runs["items"][0]["id"], linked_run_id.to_string());
+
+    let tool_call_id: Uuid = sqlx::query_scalar(
+        "insert into tool_calls (
+           organization_id, workspace_id, run_id, session_id, capability_id,
+           call_key, fence_token, status, input
+         ) values ($1, $2, $3, $4, $5, 'approval-test', 0, 'pending_approval', '{}')
+         returning id",
+    )
+    .bind(organization_id)
+    .bind(workspace_id)
+    .bind(linked_run_id)
+    .bind(linked_session_id)
+    .bind(capability_id)
+    .fetch_one(&owner_pool)
+    .await
+    .expect("pending tool call inserts");
+    sqlx::query(
+        "insert into approvals (
+           organization_id, workspace_id, run_id, tool_call_id
+         ) values ($1, $2, $3, $4)",
+    )
+    .bind(organization_id)
+    .bind(workspace_id)
+    .bind(linked_run_id)
+    .bind(tool_call_id)
+    .execute(&owner_pool)
+    .await
+    .expect("approval inserts");
+
+    let filtered_approvals = send(
+        &app,
+        Method::GET,
+        &format!(
+            "/api/v1/workspaces/{workspace_id}/approvals?work_item_id={work_item_id}&status=pending"
+        ),
+        &token,
+        None,
+        &[],
+    )
+    .await;
+    let (_, filtered_approvals) = expect_json(filtered_approvals, StatusCode::OK).await;
+    assert_eq!(filtered_approvals.as_array().map(Vec::len), Some(1));
+    assert_eq!(filtered_approvals[0]["run_id"], linked_run_id.to_string());
+
+    let unrelated_work_item_id = Uuid::now_v7();
+    let unrelated_approvals = send(
+        &app,
+        Method::GET,
+        &format!(
+            "/api/v1/workspaces/{workspace_id}/approvals?work_item_id={unrelated_work_item_id}&status=pending"
+        ),
+        &token,
+        None,
+        &[],
+    )
+    .await;
+    let (_, unrelated_approvals) = expect_json(unrelated_approvals, StatusCode::OK).await;
+    assert_eq!(unrelated_approvals, json!([]));
 
     let schedule = send(
         &app,

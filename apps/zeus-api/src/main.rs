@@ -76,7 +76,7 @@ async fn serve() -> anyhow::Result<()> {
         let executor = DurableRunExecutor::new(
             runtime_pool.clone(),
             config.node_id.clone(),
-            Arc::clone(&state.envelope),
+            Arc::clone(&state.platform.envelope),
         );
         let supervisor = ExecutionSupervisor::new(
             runtime_pool,
@@ -86,7 +86,7 @@ async fn serve() -> anyhow::Result<()> {
             config.poll_interval,
             config.run_concurrency,
             shutdown.child_token(),
-            Arc::clone(&state.metrics),
+            Arc::clone(&state.platform.metrics),
         );
         Some(tokio::spawn(supervisor.run()))
     } else {
@@ -104,8 +104,8 @@ async fn serve() -> anyhow::Result<()> {
             .as_deref()
             .expect("validated identity maintenance sender");
         let maintenance = IdentityMaintenance::new(
-            state.database.clone(),
-            Arc::clone(&state.envelope),
+            state.platform.database.clone(),
+            Arc::clone(&state.platform.envelope),
             smtp_url,
             mail_from,
             config.node_id.clone(),
@@ -119,9 +119,9 @@ async fn serve() -> anyhow::Result<()> {
         None
     };
     let oidc_maintenance_task = tokio::spawn(run_oidc_protocol_maintenance(
-        state.database.clone(),
-        Arc::clone(&state.envelope),
-        Arc::clone(&state.metrics),
+        state.platform.database.clone(),
+        Arc::clone(&state.platform.envelope),
+        Arc::clone(&state.platform.metrics),
         shutdown.child_token(),
     ));
 

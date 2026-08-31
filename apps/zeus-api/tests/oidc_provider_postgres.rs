@@ -13,7 +13,8 @@ use tower::ServiceExt;
 use url::Url;
 use uuid::Uuid;
 use zeus_api::{
-    AppState, HTTP_DATABASE_ROLE, connect_pool, connect_pool_as_role,
+    AppState, ExecutionRuntimeConfig, ExternalClients, HTTP_DATABASE_ROLE, IdentityRuntimeConfig,
+    PlatformServices, connect_pool, connect_pool_as_role,
     crypto::{LocalEnvelopeCipher, hash_service_account_token, sha256},
     http, migrate,
     supervisor::SupervisorMetrics,
@@ -147,26 +148,34 @@ async fn oidc_provider_supports_public_confidential_and_refresh_replay_protectio
         .expect("HTTP role database connects");
     let metrics = Arc::new(SupervisorMetrics::default());
     let state = AppState {
-        database: http_pool.clone(),
-        envelope: Arc::new(
-            LocalEnvelopeCipher::from_encoded("test-v1".to_owned(), &envelope_key)
-                .expect("test envelope key is valid"),
-        ),
-        http_client: reqwest::Client::new(),
-        metrics: Arc::clone(&metrics),
-        public_url: Url::parse(PUBLIC_URL).expect("public URL parses"),
-        session_idle_ttl: Duration::from_hours(2),
-        session_absolute_ttl: Duration::from_hours(12),
-        oidc_state_ttl: Duration::from_mins(10),
-        cookie_secure: false,
-        allow_private_oidc_issuers: false,
-        allow_private_model_endpoints: false,
-        bootstrap_token: None,
-        identity_hash_key: envelope_key,
-        trust_proxy_headers: false,
-        password_executor: PasswordExecutor::new(4, 4, PasswordPolicy::default())
-            .expect("password executor builds"),
-        version: "0.1.0-test",
+        platform: Arc::new(PlatformServices {
+            database: http_pool.clone(),
+            envelope: Arc::new(
+                LocalEnvelopeCipher::from_encoded("test-v1".to_owned(), &envelope_key)
+                    .expect("test envelope key is valid"),
+            ),
+            metrics: Arc::clone(&metrics),
+            version: "0.1.0-test",
+        }),
+        identity: Arc::new(IdentityRuntimeConfig {
+            public_url: Url::parse(PUBLIC_URL).expect("public URL parses"),
+            session_idle_ttl: Duration::from_hours(2),
+            session_absolute_ttl: Duration::from_hours(12),
+            oidc_state_ttl: Duration::from_mins(10),
+            cookie_secure: false,
+            allow_private_oidc_issuers: false,
+            bootstrap_token: None,
+            identity_hash_key: envelope_key,
+            trust_proxy_headers: false,
+            password_executor: PasswordExecutor::new(4, 4, PasswordPolicy::default())
+                .expect("password executor builds"),
+        }),
+        external: Arc::new(ExternalClients {
+            http: reqwest::Client::new(),
+        }),
+        execution: Arc::new(ExecutionRuntimeConfig {
+            allow_private_model_endpoints: false,
+        }),
     };
     let app = http::router(state);
     let challenge = pkce_s256_challenge(VERIFIER).expect("PKCE challenge computes");
