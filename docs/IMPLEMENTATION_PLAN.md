@@ -214,11 +214,12 @@ J 阶段把 WorkItem 设为 Workspace 的工作入口。`/` 保留为 Workspace 
 
 ### J1：拆分 Rust 单体内部结构
 
-状态：`pending`
+状态：`done`
 
 验收：
 
 - 保留单个 `zeus-api` crate。模块按 identity、control_plane、collaboration、execution、platform、http 组织。
+- `AppState` 只组合平台服务、身份运行配置、外部客户端和执行配置四组轻量共享状态。
 - 每个领域注册自己的路由、DTO 和 OpenAPI 片段。根 HTTP 模块只组合，不保存集中注册表。
 - `integrations.rs` 按 Connection、Model Profile、Capability、Schedule、Webhook 拆分。
 - `runtime.rs` 按执行循环、上下文恢复、工具、Child Run 和事件持久化拆分。
@@ -227,7 +228,7 @@ J 阶段把 WorkItem 设为 Workspace 的工作入口。`/` 保留为 Workspace 
 
 ### J2：整理 Web 工程
 
-状态：`pending`
+状态：`done`
 
 验收：
 
@@ -240,7 +241,7 @@ J 阶段把 WorkItem 设为 Workspace 的工作入口。`/` 保留为 Workspace 
 
 ### J3：WorkItem 执行契约
 
-状态：`pending`
+状态：`done`
 
 验收：
 
@@ -253,7 +254,7 @@ J 阶段把 WorkItem 设为 Workspace 的工作入口。`/` 保留为 Workspace 
 
 ### J4：WorkItem 完整流程
 
-状态：`pending`
+状态：`active`
 
 验收：
 
@@ -266,5 +267,13 @@ J 阶段把 WorkItem 设为 Workspace 的工作入口。`/` 保留为 Workspace 
 - 空、加载、断线、冲突、无权限和 API 失败都有可见状态。
 - 桌面 `1440×900`、平板 `1024×768`、移动 `390×844` 完成浏览器检查。
 - Rust、数据库、Web、UI 和 Apple `container` 全流程提供可执行验证证据。
+
+2026-09-01 验收记录：
+
+- Rust 格式、Clippy 和 workspace 测试通过。115 个单元测试通过；4 个需要数据库的测试在普通门禁中保持 ignored。
+- `control_plane_postgres` 在独立 PostgreSQL 18.6 临时数据库中通过，覆盖 WorkItem 启动事务、幂等、跨 Workspace 拒绝和筛选。测试库随后删除。
+- Web 104 个测试、UI 1 个测试、身份负载参数 3 个测试通过。Web、UI 和全 workspace 构建通过。
+- Apple `container` 中 PostgreSQL、Mailpit、API、Web、Gateway 均运行；live、ready、Setup 状态和登录页经同源 Gateway 检查通过。
+- 公共登录页完成 `1440×900`、`1024×768`、`390×844` 检查。认证后的工作台、WorkItem 和 Run 页面仍需带有效测试 Session 做最后一轮浏览器验收，因此 J4 保持 `active`。
 
 J1-J4 完成前，J 阶段不标记为整体完成。H 和 I5 的 OpenID Conformance、云 KMS、受控 SMTP、真实企业 IdP、托管 PostgreSQL 权限、生产规格容量和故障演练仍按各自外部清单执行。

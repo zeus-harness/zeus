@@ -284,6 +284,10 @@ WorkItem 是 Workspace 的工作入口。工作台汇总队列、活动 Run 和�
 
 ### 结构边界
 
+- `zeus-api` 仍是单个 crate。源码按 `identity`、`control_plane`、`collaboration`、`execution`、`platform`、`http` 分目录。根 `lib.rs` 只保留模块导出、兼容路径和状态构造。
+- `AppState` 由 `PlatformServices`、`IdentityRuntimeConfig`、`ExternalClients`、`ExecutionRuntimeConfig` 四个 `Arc` 组成。数据库、加密、指标、身份策略、HTTP Client 和模型端点策略不再平铺在根状态中。
+- `runtime` 按执行循环、上下文、工具、Child Run、事件、策略和类型拆分。`execution_api` 按 Session、Run、Approval、Event/Trace 和共享 DTO 拆分。
+- `integrations` 按 Connection、Model Profile、Capability、Schedule 和 Webhook 拆分。根 HTTP Router 只组合领域 Router。
 - 桌面使用工作队列/快捷动作、内容/动作栏、时间线/检查栏三种两列布局。
 - 平板把辅助列移到主内容后方，保留当前 Workspace、主动作和审批上下文。
 - 移动使用单列卡片、全屏或底部 Agent 面板、垂直时间线和纵向审批按钮。
@@ -296,12 +300,12 @@ WorkItem 是 Workspace 的工作入口。工作台汇总队列、活动 Run 和�
 | 阶段 | 验收边界 | 状态 |
 | --- | --- | --- |
 | J0 | 三张灰度 SVG、UX 基线和 WorkItem-first ADR 可读；SVG/XML 和文档范围检查通过。只验收文档。 | `done` |
-| J1 | `zeus-api` 在单 crate 内按领域拆分。公开路径、数据库和行为不变。 | `pending` |
-| J2 | Web route group、App Shell、API 客户端、业务组件和 `packages/ui` 导出边界收敛。 | `pending` |
-| J3 | WorkItem 原子启动 Run、Run/Approval WorkItem 筛选、OpenAPI 和生成类型完成。 | `pending` |
-| J4 | 工作台到结果查看的完整流程、SSE、审批、取消、重试和响应式故障状态完成可执行验收。 | `pending` |
+| J1 | `zeus-api` 在单 crate 内按领域拆分。公开路径、数据库和行为不变。 | `done` |
+| J2 | Web route group、App Shell、API 客户端、业务组件和 `packages/ui` 导出边界收敛。 | `done` |
+| J3 | WorkItem 原子启动 Run、Run/Approval WorkItem 筛选、OpenAPI 和生成类型完成。 | `done` |
+| J4 | 工作台到结果查看的完整流程、SSE、审批、取消、重试和响应式故障状态完成可执行验收。认证后页面的浏览器验收尚未完成。 | `active` |
 
-J0 的 `done` 只表示本次文档基线已验收。H 生产准备和 I5 安全与生产门禁的外部验收继续为 `active`，OpenID Conformance、真实 KMS/SMTP/企业 IdP、托管 PostgreSQL 权限、PITR、生产规格压力和故障演练仍未完成。
+J4 完成前，J 阶段不标记为整体完成。H 生产准备和 I5 安全与生产门禁的外部验收继续为 `active`，OpenID Conformance、真实 KMS/SMTP/企业 IdP、托管 PostgreSQL 权限、PITR、生产规格压力和故障演练仍未完成。
 
 ## 密钥
 
