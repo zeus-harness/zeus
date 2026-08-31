@@ -1,7 +1,7 @@
 <script lang="ts">
   import { Badge } from '@zeus/ui/components/ui/badge';
 
-  import type { WorkspaceStatus as ApiStatus } from '$lib/api/workspace';
+  import type { WorkspaceStatus as ApiStatus } from '$lib/api/client';
 
   let {
     status,

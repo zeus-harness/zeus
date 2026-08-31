@@ -1,11 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { actions as loginActions } from './login/+page.server';
-import { actions as registerActions } from './register/+page.server';
-import { actions as resendActions } from './verify-email/+page.server';
-import { actions as forgotActions } from './forgot-password/+page.server';
-import { actions as resetActions } from './reset-password/+page.server';
-import { actions as mfaActions } from './mfa/+page.server';
+import { actions as loginActions } from './(public)/login/+page.server';
+import { actions as registerActions } from './(public)/register/+page.server';
+import { actions as resendActions } from './(public)/verify-email/+page.server';
+import { actions as forgotActions } from './(public)/forgot-password/+page.server';
+import { actions as resetActions } from './(public)/reset-password/+page.server';
+import { actions as mfaActions } from './(public)/mfa/+page.server';
 import type { AuthActionEvent } from '$lib/server/auth';
 
 vi.mock('$env/dynamic/private', () => ({

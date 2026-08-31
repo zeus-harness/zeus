@@ -9,9 +9,10 @@
     "preview": "vite preview",
     "check": "pnpm generate:api && svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "test": "vitest run",
-    "generate:api": "openapi-typescript ../../openapi/zeus.v1.yaml -o src/lib/api/schema.d.ts"
+    "generate:api": "openapi-typescript ../../openapi/zeus.v1.yaml -o src/lib/api/generated/schema.d.ts"
   },
   "dependencies": {
+    "@lucide/svelte": "^1.35.0",
     "@zeus/ui": "workspace:*"
   },
   "devDependencies": {

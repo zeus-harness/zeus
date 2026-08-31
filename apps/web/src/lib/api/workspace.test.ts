@@ -1,17 +1,25 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  loadWorkspaceData,
+  type ApiFetcher as WorkspaceApiFetcher
+} from './client';
+import {
   createWorkItem,
+  listWorkItems,
+  updateWorkItem
+} from './work-items';
+import { listExperienceCandidates, listExperienceEntries, searchExperienceEntries } from './experiences';
+import {
+  cancelRun,
   decideApproval,
   getRunTrace,
-  listExperienceCandidates,
-  listExperienceEntries,
-  listWorkItems,
-  loadWorkspaceData,
-  searchExperienceEntries,
-  updateWorkItem,
-  type WorkspaceApiFetcher
-} from './workspace';
+  listApprovals,
+  listRuns,
+  retryRun,
+  startWorkItemRun
+} from './runs';
+import { listUserOrganizations } from './identity';
 
 function jsonResponse(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
@@ -122,5 +130,91 @@ describe('workspace API helpers', () => {
     expect(urls).toContain(
       '/api/v1/workspaces/ws-1/experience-entries/search?q=incident+response&limit=20'
     );
+  });
+
+  it('starts a WorkItem Run atomically and filters execution collections', async () => {
+    const fetcher = vi.fn<WorkspaceApiFetcher>().mockResolvedValue(
+      jsonResponse({ session: { id: 'session-1' }, run: { id: 'run-1' } }, 201)
+    );
+
+    await startWorkItemRun(
+      fetcher,
+      { workspaceId: 'ws-1' },
+      'work-item-1',
+      { workflow_id: 'workflow-1', input: {}, message: 'Investigate' },
+      'start-1'
+    );
+    const startInit = fetcher.mock.calls[0]?.[1];
+    expect(new Headers(startInit?.headers).get('idempotency-key')).toBe('start-1');
+    expect(fetcher.mock.calls[0]?.[0]).toBe(
+      '/api/v1/workspaces/ws-1/work-items/work-item-1/runs'
+    );
+
+    fetcher.mockResolvedValueOnce(jsonResponse({ items: [], next_cursor: null }));
+    await listRuns(fetcher, {
+      workspaceId: 'ws-1',
+      workItemId: 'work-item-1',
+      status: 'running'
+    });
+    expect(fetcher.mock.calls[1]?.[0]).toBe(
+      '/api/v1/workspaces/ws-1/runs?work_item_id=work-item-1&status=running'
+    );
+
+    fetcher.mockResolvedValueOnce(jsonResponse([]));
+    await listApprovals(fetcher, {
+      workspaceId: 'ws-1',
+      workItemId: 'work-item-1',
+      status: 'pending'
+    });
+    expect(fetcher.mock.calls[2]?.[0]).toBe(
+      '/api/v1/workspaces/ws-1/approvals?status=pending&work_item_id=work-item-1'
+    );
+  });
+
+  it('supports empty cancel responses and idempotent manual retries', async () => {
+    const fetcher = vi
+      .fn<WorkspaceApiFetcher>()
+      .mockResolvedValueOnce(new Response(null, { status: 202 }))
+      .mockResolvedValueOnce(jsonResponse({ id: 'retry-1' }, 201));
+
+    await expect(cancelRun(fetcher, { workspaceId: 'ws-1' }, 'run-1', 'operator request')).resolves.toBeUndefined();
+    await retryRun(fetcher, { workspaceId: 'ws-1' }, 'run-1', 'retry-request-1');
+
+    expect(fetcher.mock.calls[0]?.[0]).toBe('/api/v1/workspaces/ws-1/runs/run-1/cancel');
+    expect(new Headers(fetcher.mock.calls[1]?.[1]?.headers).get('idempotency-key')).toBe(
+      'retry-request-1'
+    );
+  });
+
+  it('normalizes user workspaces without exposing identity-provider payloads', async () => {
+    const fetcher = vi.fn<WorkspaceApiFetcher>().mockResolvedValue(
+      jsonResponse([
+        {
+          organization_id: 'org-1',
+          organization_slug: 'acme',
+          organization_name: 'Acme',
+          organization_status: 'active',
+          organization_role: 'owner',
+          workspaces: [
+            { id: 'ws-1', slug: 'platform', name: 'Platform', status: 'active', role: 'admin' },
+            { id: 42, name: 'invalid' }
+          ],
+          identity_providers: [{ id: 'provider-secret-metadata' }]
+        }
+      ])
+    );
+
+    await expect(listUserOrganizations(fetcher)).resolves.toEqual([
+      {
+        organization_id: 'org-1',
+        organization_slug: 'acme',
+        organization_name: 'Acme',
+        organization_status: 'active',
+        organization_role: 'owner',
+        workspaces: [
+          { id: 'ws-1', slug: 'platform', name: 'Platform', status: 'active', role: 'admin' }
+        ]
+      }
+    ]);
   });
 });

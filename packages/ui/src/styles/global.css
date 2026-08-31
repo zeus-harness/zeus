@@ -1,6 +1,10 @@
+@import "tailwindcss";
 @import "@fontsource-variable/jetbrains-mono";
 @import "tw-animate-css";
 @import "shadcn-svelte/tailwind.css";
+
+@source "../lib/**/*.{html,js,svelte,ts}";
+@source "../../../../apps/web/src/**/*.{html,js,svelte,ts}";
 
 @custom-variant dark (&:is(.dark *));
 
