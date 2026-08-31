@@ -84,7 +84,15 @@ cleanup_build_context() {
 
   case "${build_context}" in
     "${ZEUS_STATE_DIR}"/container-build.*)
-      /bin/rm -rf -- "${build_context}"
+      local attempt
+      for attempt in 1 2 3; do
+        if /bin/rm -rf -- "${build_context}" && [[ ! -e "${build_context}" ]]; then
+          return
+        fi
+        sleep 0.1
+      done
+      echo "Could not remove build context ${build_context}." >&2
+      return 1
       ;;
     *)
       echo "Refused to remove unexpected build context ${build_context}." >&2
