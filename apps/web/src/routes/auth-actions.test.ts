@@ -45,6 +45,12 @@ function jsonResponse(status: number, body: unknown): Response {
 }
 
 describe('native identity route actions', () => {
+  it('uses only named actions on the email verification page', () => {
+    expect(resendActions).toHaveProperty('confirm');
+    expect(resendActions).toHaveProperty('resend');
+    expect(resendActions).not.toHaveProperty('default');
+  });
+
   it('redirects a normal login to the root and forwards auth cookies', async () => {
     const response = jsonResponse(200, { mfa_required: false });
     response.headers.append('set-cookie', 'zeus_session=session-for-test; Path=/; HttpOnly; Max-Age=60');
@@ -92,7 +98,7 @@ describe('native identity route actions', () => {
       new Response(null, { status: 204 })
     );
 
-    await expect(actionHandler(resendActions.default)(event)).rejects.toMatchObject({
+    await expect(actionHandler(resendActions.confirm)(event)).rejects.toMatchObject({
       status: 303,
       location: '/login?verified=1'
     });

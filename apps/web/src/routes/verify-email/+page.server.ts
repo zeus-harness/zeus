@@ -21,7 +21,7 @@ export const load: PageServerLoad = ({ url }) => ({
 });
 
 export const actions: Actions = {
-  default: async (event) => {
+  confirm: async (event) => {
     const token = urlToken(event.url);
     if (!token) return actionError(400, '验证链接缺少 token，请从邮件中的完整链接打开。');
 

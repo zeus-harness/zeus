@@ -1,8 +1,13 @@
 <script lang="ts">
+  import { page } from '$app/state';
+
   import type { ActionData, PageData } from './$types';
 
   let { data, form } = $props<{ data: PageData; form: ActionData }>();
   let email = $derived(form?.values?.email ?? '');
+  let confirmAction = $derived(
+    `?/confirm&token=${encodeURIComponent(page.url.searchParams.get('token') ?? '')}`
+  );
 </script>
 
 <svelte:head>
@@ -28,7 +33,7 @@
     {/if}
 
     {#if data.tokenPresent}
-      <form method="POST" class="mt-6">
+      <form method="POST" action={confirmAction} class="mt-6">
         <button type="submit" class="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">
           确认邮箱
         </button>
