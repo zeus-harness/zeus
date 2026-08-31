@@ -7,6 +7,8 @@
 - `pending`：还未实现。
 - `external`：需要企业 IdP、云 KMS 或生产集群。
 
+H 和 I5 的外部门禁继续保持 `active`。本地静态检查、容器检查或 J0 文档验收都不能把它们标为 `done`。
+
 ## A：仓库基线
 
 状态：`done`
@@ -186,3 +188,83 @@
 - 生产 PostgreSQL 要核对 migration owner、HTTP 和 Runtime login 的真实 grant chain。
 
 这些外部结果齐备前，I5 不标记为 `done`。
+
+## J：WorkItem-first Web
+
+J 阶段把 WorkItem 设为 Workspace 的工作入口。`/` 保留为 Workspace 工作台；`/work-items`、`/work-items/{work_item_id}`、`/runs`、`/runs/{run_id}` 和 `/approvals` 保持兼容。服务端协议仍是 `/api/v1`。业务组件留在 `apps/web`，共享基础组件留在 `packages/ui/src/lib/components/ui`。
+
+### J0：文档与交互基线
+
+状态：`done`（文档基线）
+
+交付：
+
+- `docs/ui/workspace-workbench.svg`：Workspace 工作台灰度线框。
+- `docs/ui/workitem-detail-agent-launch.svg`：WorkItem 详情和 Agent 启动灰度线框。
+- `docs/ui/run-timeline-approvals.svg`：Run 时间线和审批灰度线框。
+- `docs/ui/WORKITEM_UX.md`：桌面、平板、移动布局；主要动作；空、加载、失败、断线、冲突、无权限状态；SSE 续传和审批交互。
+- `docs/adr/0007-workitem-first-information-architecture.md`：WorkItem-first、URL 兼容和 Web 组件归属决策。
+- `docs/TECHNICAL_SPEC.md`、`AGENTS.md` 和本计划记录 J 阶段边界与门禁。
+
+验收：
+
+- 三张 SVG 是有效 XML，带标题和说明，使用灰度。实现页面以 `packages/ui` 当前导出和 token 为准。
+- UX 文档能从 WorkItem 详情走到 Agent、Run、Approval，并写清服务端事实、权限、冲突和断线后的动作。
+- 只改 J0 文档范围。J0 不代表 Web 代码、API 契约、生产部署或 H/I5 外部门禁完成。
+
+### J1：拆分 Rust 单体内部结构
+
+状态：`pending`
+
+验收：
+
+- 保留单个 `zeus-api` crate。模块按 identity、control_plane、collaboration、execution、platform、http 组织。
+- 每个领域注册自己的路由、DTO 和 OpenAPI 片段。根 HTTP 模块只组合，不保存集中注册表。
+- `integrations.rs` 按 Connection、Model Profile、Capability、Schedule、Webhook 拆分。
+- `runtime.rs` 按执行循环、上下文恢复、工具、Child Run 和事件持久化拆分。
+- Session 和 Run 的事务命令可由现有接口和 WorkItem 启动接口复用。
+- 公开行为、数据库迁移和 OpenAPI 路径不变。不增加 DI 框架、crate、Redis 或 Worker。
+
+### J2：整理 Web 工程
+
+状态：`pending`
+
+验收：
+
+- SvelteKit 使用 `(public)`、`(app)`、`(account)`、`(admin)` route group，浏览器 URL 不变。
+- 登录后的 App Shell、Workspace 切换器、用户菜单、移动导航、账号导航和管理导航只有一份实现。
+- `$lib/api` 分为 client、generated、work-items、runs、identity、control-plane 等领域文件。
+- 删除聚合 `workspace.ts`。DTO 直接引用 OpenAPI 生成类型。
+- `features/*` 保存业务组件，`components/layout` 保存页面外壳。
+- `packages/ui` 导出共享基础组件。Web 从 `@zeus/ui` 使用，不复制基础控件。
+
+### J3：WorkItem 执行契约
+
+状态：`pending`
+
+验收：
+
+- 增加 `POST /api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/runs`。
+- 请求要求 `OperateRun` 和 `Idempotency-Key`，并校验 WorkItem、Workflow 和活动版本属于当前 Workspace。
+- 同一事务创建 Session、Run、用户消息和 `run_queued` 事件。幂等重放返回相同 Session 和 Run。
+- 没有活动 Workflow Version 返回稳定 `409`。事务失败不留下部分 Session、Run 或 Event。
+- Run 查询支持 `work_item_id`、`status`。Approval 查询支持 `work_item_id`、`status`。
+- 原有 Session、Run、Approval API 保持可用。OpenAPI 与 Web 生成类型同步。
+
+### J4：WorkItem 完整流程
+
+状态：`pending`
+
+验收：
+
+- `/` 展示我的开放 WorkItem、阻塞项、待审批和最近运行。
+- `/work-items` 使用可筛选列表和创建 Sheet。详情展示负责人、状态、附件、外部引用、关联运行和最终结果。
+- WorkItem 详情选择 Workflow，调用 J3 原子接口启动 Agent。
+- Run 页面先读 Trace 快照，再用 SSE 增量展示模型、工具、审批、Child Run 和结果。
+- SSE 按 sequence 去重，重连发送 `Last-Event-ID`，终态关闭连接。
+- 审批、取消和重试使用安全 SvelteKit Server Action。
+- 空、加载、断线、冲突、无权限和 API 失败都有可见状态。
+- 桌面 `1440×900`、平板 `1024×768`、移动 `390×844` 完成浏览器检查。
+- Rust、数据库、Web、UI 和 Apple `container` 全流程提供可执行验证证据。
+
+J1-J4 完成前，J 阶段不标记为整体完成。H 和 I5 的 OpenID Conformance、云 KMS、受控 SMTP、真实企业 IdP、托管 PostgreSQL 权限、生产规格容量和故障演练仍按各自外部清单执行。

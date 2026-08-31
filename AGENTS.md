@@ -30,6 +30,19 @@ Zeus 是面向企业团队的云端 Harness Agent。代码从 `0.1.0` 开始，H
 - 被两个以上模块复用。
 - 需要隔离安全能力或第三方依赖。
 
+## J：WorkItem-first Web 结构
+
+- J 阶段围绕 WorkItem 组织 Workspace 工作台、Agent 启动、Run 时间线和审批观察面。
+- `/` 保留为 Workspace 工作台；`/work-items`、`/work-items/{work_item_id}`、`/runs`、`/runs/{run_id}` 和 `/approvals` 保持可用。Web URL 不增加 Workspace 段，API 继续使用 `/api/v1`。
+- J0（本次文档基线，`done`）：`docs/ui/` 保存三张灰度 SVG 和 `WORKITEM_UX.md`；新增 WorkItem-first ADR；文档记录响应式布局、状态、SSE 续传和审批交互。
+- J1（`pending`）：只拆 `zeus-api` crate 内部结构。按 identity、control_plane、collaboration、execution、platform、http 组织，不增加 crate，不改公开路径和数据库。
+- J2（`pending`）：整理 SvelteKit route group、统一 App Shell、拆开 `$lib/api` 与 `features/*`。删除聚合 `workspace.ts` 和重复导航。
+- J3（`pending`）：增加 WorkItem 原子启动 Run 契约，并给 Run、Approval 查询增加 WorkItem 筛选。现有 API 保持可用。
+- J4（`pending`）：打通工作台、WorkItem、Agent 启动、Run Timeline、SSE、审批、取消、重试和结果查看，并完成桌面、平板、移动验收。
+- `apps/web` 保存路由、SvelteKit 服务端代码和 WorkItem/Run/Approval 业务组件。`packages/ui/src/lib/components/ui` 保存共享基础组件。不要把业务规则放入共享包，也不要在业务目录复制基础组件。
+- Web 以 `packages/ui` 的导出和 token 为基础。当前 shadcn-svelte 配置是 `lyra`、`neutral`、`phosphor`；业务页面不得复制这些基础组件。
+- J0 文档验收不等于 J1-J4、生产验收或安全门禁完成。H 和 I5 的外部门禁继续保持 `active`；本地检查不能把它们标为 `done`。
+
 ## Rust
 
 - Rust 版本由 `rust-toolchain.toml` 固定。

@@ -1,0 +1,107 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 900" role="img" aria-labelledby="title desc">
+  <title id="title">WorkItem 详情与 Agent 启动线框图</title>
+  <desc id="desc">灰度桌面线框：WorkItem 详情页和右侧启动 Agent 面板，包含工作项内容、revision、输入和启动 Run 动作。</desc>
+  <!-- Visual direction: existing Inter Variable font, neutral token palette, Lucide line icons. -->
+  <style>
+    text { font-family: "Inter Variable", Inter, ui-sans-serif, system-ui, sans-serif; fill: #171717; }
+    .muted { fill: #737373; }
+    .small { font-size: 12px; }
+    .body { font-size: 14px; }
+    .label { font-size: 13px; font-weight: 600; }
+    .title { font-size: 28px; font-weight: 650; letter-spacing: -0.02em; }
+    .section { font-size: 16px; font-weight: 650; }
+    .hairline { stroke: #e5e5e5; stroke-width: 1; }
+    .line { stroke: #a3a3a3; stroke-width: 1.5; }
+    .icon { fill: none; stroke: #525252; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  </style>
+  <defs>
+    <symbol id="play" viewBox="0 0 24 24"><path class="icon" d="m9 5 10 7-10 7z"/></symbol>
+    <symbol id="paperclip" viewBox="0 0 24 24"><path class="icon" d="m20 11-7.5 7.5a5 5 0 0 1-7-7L13 4a3.5 3.5 0 0 1 5 5l-7.5 7.5a2 2 0 0 1-3-3L14 7"/></symbol>
+    <symbol id="chevron" viewBox="0 0 24 24"><path class="icon" d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="x" viewBox="0 0 24 24"><path class="icon" d="m6 6 12 12M18 6 6 18"/></symbol>
+    <symbol id="info" viewBox="0 0 24 24"><circle class="icon" cx="12" cy="12" r="8"/><path class="icon" d="M12 11v5M12 8h.01"/></symbol>
+    <symbol id="arrow" viewBox="0 0 24 24"><path class="icon" d="M5 12h14M13 6l6 6-6 6"/></symbol>
+  </defs>
+
+  <rect width="1440" height="900" fill="#fafafa"/>
+  <rect width="1440" height="72" fill="#ffffff"/>
+  <path class="hairline" d="M0 72h1440"/>
+  <text x="32" y="31" class="label">Zeus</text>
+  <text x="32" y="51" class="small muted">Workspace</text>
+  <path class="hairline" d="M148 22v28"/>
+  <text x="180" y="42" class="body muted">概览</text>
+  <text x="246" y="42" class="body">WorkItems</text>
+  <text x="350" y="42" class="body muted">Runs</text>
+  <text x="412" y="42" class="body muted">Approvals</text>
+  <text x="522" y="42" class="body muted">Experience</text>
+  <rect x="1210" y="22" width="128" height="28" rx="6" fill="#f5f5f5" stroke="#d4d4d4"/>
+  <text x="1226" y="40" class="small">Workspace 7f2a…</text>
+  <text x="1360" y="42" class="body muted">林珊</text>
+
+  <text x="64" y="116" class="small muted">WorkItems / WI-0142</text>
+  <text x="64" y="163" class="title">同步采购供应商目录</text>
+  <text x="64" y="192" class="body muted">把供应商目录同步到内部采购系统，并记录失败原因。</text>
+  <rect x="64" y="218" width="90" height="28" rx="14" fill="#f5f5f5" stroke="#d4d4d4"/>
+  <text x="80" y="236" class="small">In progress</text>
+  <rect x="166" y="218" width="82" height="28" rx="14" fill="#fafafa" stroke="#d4d4d4"/>
+  <text x="182" y="236" class="small">rev 7</text>
+  <rect x="806" y="211" width="126" height="40" rx="7" fill="#171717"/>
+  <use href="#play" x="820" y="223" width="16" height="16"/>
+  <path class="icon" d="m826 223 10 8-10 8z" stroke="#ffffff"/>
+  <text x="846" y="237" class="body" fill="#ffffff" style="fill:#ffffff">启动 Agent</text>
+  <rect x="944" y="211" width="82" height="40" rx="7" fill="#ffffff" stroke="#d4d4d4"/>
+  <text x="965" y="237" class="body">编辑</text>
+
+  <rect x="64" y="282" width="914" height="522" rx="10" fill="#ffffff" stroke="#e5e5e5"/>
+  <text x="88" y="320" class="section">WorkItem 内容</text>
+  <text x="88" y="349" class="body muted">描述</text>
+  <text x="88" y="378" class="body">同步最近 30 天新增和变更的供应商记录。</text>
+  <text x="88" y="402" class="body">如果目标系统返回错误，保留 API 响应摘要。</text>
+  <path class="hairline" d="M88 432h866"/>
+  <text x="88" y="466" class="small muted">优先级</text>
+  <text x="88" y="490" class="body">High</text>
+  <text x="286" y="466" class="small muted">Assignee</text>
+  <text x="286" y="490" class="body">林珊</text>
+  <text x="484" y="466" class="small muted">更新时间</text>
+  <text x="484" y="490" class="body">2026-09-01 10:24 UTC</text>
+  <text x="752" y="466" class="small muted">外部引用</text>
+  <text x="752" y="490" class="body">采购系统 #4821</text>
+  <path class="hairline" d="M88 520h866"/>
+  <text x="88" y="553" class="section">输入</text>
+  <rect x="88" y="574" width="866" height="82" rx="7" fill="#f5f5f5"/>
+  <text x="108" y="600" class="small" style="font-family:ui-monospace, SFMono-Regular, monospace">{ "days": 30, "mode": "delta" }</text>
+  <text x="88" y="704" class="section">附件与外部引用</text>
+  <use href="#paperclip" x="88" y="726" width="16" height="16"/>
+  <text x="114" y="739" class="body">supplier-sync-spec.pdf</text>
+  <text x="330" y="739" class="small muted">2.1 MiB · SHA-256 已记录</text>
+  <use href="#arrow" x="888" y="725" width="18" height="18"/>
+
+  <rect x="1018" y="92" width="358" height="760" rx="12" fill="#ffffff" stroke="#a3a3a3"/>
+  <text x="1046" y="132" class="section">启动 Agent</text>
+  <use href="#x" x="1328" y="116" width="18" height="18"/>
+  <text x="1046" y="160" class="small muted">创建绑定当前 WorkItem 的 Session 和 queued Run。</text>
+  <path class="hairline" d="M1046 184h302"/>
+  <text x="1046" y="220" class="label">Workflow <tspan class="muted">必选</tspan></text>
+  <rect x="1046" y="234" width="302" height="42" rx="7" fill="#ffffff" stroke="#a3a3a3"/>
+  <text x="1062" y="260" class="body">供应商同步 · v3</text>
+  <use href="#chevron" x="1316" y="245" width="16" height="16"/>
+  <text x="1046" y="316" class="label">启动消息 <tspan class="muted">可选</tspan></text>
+  <rect x="1046" y="330" width="302" height="82" rx="7" fill="#ffffff" stroke="#d4d4d4"/>
+  <text x="1062" y="356" class="small muted">说明这次运行的目标或限制</text>
+  <text x="1046" y="454" class="label">Input JSON</text>
+  <rect x="1046" y="468" width="302" height="118" rx="7" fill="#f5f5f5" stroke="#d4d4d4"/>
+  <text x="1062" y="496" class="small" style="font-family:ui-monospace, SFMono-Regular, monospace">{</text>
+  <text x="1078" y="518" class="small" style="font-family:ui-monospace, SFMono-Regular, monospace">"days": 30,</text>
+  <text x="1078" y="540" class="small" style="font-family:ui-monospace, SFMono-Regular, monospace">"mode": "delta"</text>
+  <text x="1062" y="562" class="small" style="font-family:ui-monospace, SFMono-Regular, monospace">}</text>
+  <use href="#info" x="1046" y="612" width="16" height="16"/>
+  <text x="1070" y="625" class="small muted">提交会附带 Idempotency-Key。</text>
+  <text x="1070" y="644" class="small muted">成功后打开 /runs/{run_id}。</text>
+  <rect x="1046" y="704" width="144" height="42" rx="7" fill="#ffffff" stroke="#d4d4d4"/>
+  <text x="1090" y="730" class="body">取消</text>
+  <rect x="1204" y="704" width="144" height="42" rx="7" fill="#171717"/>
+  <use href="#play" x="1220" y="717" width="16" height="16"/>
+  <path class="icon" d="m1226 717 10 8-10 8z" stroke="#ffffff"/>
+  <text x="1246" y="730" class="body" fill="#ffffff" style="fill:#ffffff">启动 Run</text>
+  <text x="1046" y="790" class="small muted">发送中：按钮锁定，保留表单输入。</text>
+</svg>

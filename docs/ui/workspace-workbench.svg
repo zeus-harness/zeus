@@ -1,0 +1,151 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 900" role="img" aria-labelledby="title desc">
+  <title id="title">Workspace 工作台线框图</title>
+  <desc id="desc">灰度桌面线框：Workspace 概览、WorkItem 队列、运行状态、审批和快捷动作。</desc>
+  <!-- Visual direction: existing Inter Variable font, neutral token palette, Lucide line icons. -->
+  <style>
+    text { font-family: "Inter Variable", Inter, ui-sans-serif, system-ui, sans-serif; fill: #171717; }
+    .muted { fill: #737373; }
+    .small { font-size: 12px; }
+    .body { font-size: 14px; }
+    .label { font-size: 13px; font-weight: 600; }
+    .title { font-size: 28px; font-weight: 650; letter-spacing: -0.02em; }
+    .section { font-size: 16px; font-weight: 650; }
+    .hairline { stroke: #e5e5e5; stroke-width: 1; }
+    .line { stroke: #a3a3a3; stroke-width: 1.5; }
+    .icon { fill: none; stroke: #525252; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  </style>
+  <defs>
+    <symbol id="search" viewBox="0 0 24 24"><circle class="icon" cx="11" cy="11" r="7"/><path class="icon" d="m20 20-4-4"/></symbol>
+    <symbol id="plus" viewBox="0 0 24 24"><path class="icon" d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="play" viewBox="0 0 24 24"><path class="icon" d="m9 5 10 7-10 7z"/></symbol>
+    <symbol id="check" viewBox="0 0 24 24"><path class="icon" d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="clock" viewBox="0 0 24 24"><circle class="icon" cx="12" cy="12" r="8"/><path class="icon" d="M12 8v5l3 2"/></symbol>
+    <symbol id="filter" viewBox="0 0 24 24"><path class="icon" d="M4 6h16M7 12h10M10 18h4"/></symbol>
+    <symbol id="arrow" viewBox="0 0 24 24"><path class="icon" d="M5 12h14M13 6l6 6-6 6"/></symbol>
+    <symbol id="refresh" viewBox="0 0 24 24"><path class="icon" d="M20 11a8 8 0 0 0-14-4L4 9"/><path class="icon" d="M4 5v4h4"/><path class="icon" d="M4 13a8 8 0 0 0 14 4l2-2"/><path class="icon" d="M20 19v-4h-4"/></symbol>
+  </defs>
+
+  <rect width="1440" height="900" fill="#fafafa"/>
+  <rect width="1440" height="72" fill="#ffffff"/>
+  <path class="hairline" d="M0 72h1440"/>
+  <text x="32" y="31" class="label">Zeus</text>
+  <text x="32" y="51" class="small muted">Workspace</text>
+  <path class="hairline" d="M148 22v28"/>
+  <text x="180" y="42" class="body">概览</text>
+  <text x="246" y="42" class="body muted">WorkItems</text>
+  <text x="350" y="42" class="body muted">Runs</text>
+  <text x="412" y="42" class="body muted">Approvals</text>
+  <text x="522" y="42" class="body muted">Experience</text>
+  <rect x="1198" y="22" width="128" height="28" rx="6" fill="#f5f5f5" stroke="#d4d4d4"/>
+  <text x="1214" y="40" class="small">Workspace 7f2a…</text>
+  <rect x="1340" y="18" width="68" height="36" rx="7" fill="#171717"/>
+  <use href="#plus" x="1350" y="28" width="16" height="16"/>
+  <path class="icon" d="M1358 28v16M1350 36h16" stroke="#ffffff"/>
+  <text x="1370" y="41" class="small" fill="#ffffff" style="fill:#ffffff">新建</text>
+
+  <rect x="0" y="72" width="236" height="828" fill="#ffffff"/>
+  <path class="hairline" d="M236 72v828"/>
+  <text x="28" y="116" class="small muted">当前 Workspace</text>
+  <text x="28" y="145" class="section">平台工程</text>
+  <rect x="16" y="166" width="204" height="40" rx="7" fill="#f5f5f5"/>
+  <rect x="28" y="178" width="16" height="16" rx="3" fill="#d4d4d4"/>
+  <text x="56" y="191" class="body">工作台</text>
+  <text x="28" y="244" class="body muted">全部 WorkItems</text>
+  <text x="28" y="284" class="body muted">我的 WorkItems</text>
+  <text x="28" y="324" class="body muted">待我审批</text>
+  <path class="hairline" d="M28 354h180"/>
+  <text x="28" y="388" class="small muted">快捷筛选</text>
+  <text x="28" y="420" class="body muted">In progress</text>
+  <text x="28" y="460" class="body muted">Blocked</text>
+  <text x="28" y="500" class="body muted">最近运行</text>
+  <text x="28" y="848" class="small muted">数据范围：当前 Workspace</text>
+
+  <g>
+    <text x="276" y="126" class="small muted">Workspace / 概览</text>
+    <text x="276" y="170" class="title">Workspace 工作台</text>
+    <text x="276" y="198" class="body muted">从 WorkItem 进入执行、审批和结果。</text>
+    <rect x="1226" y="146" width="182" height="38" rx="7" fill="#ffffff" stroke="#a3a3a3"/>
+    <use href="#refresh" x="1240" y="157" width="16" height="16"/>
+    <text x="1264" y="170" class="body">刷新工作台</text>
+
+    <rect x="276" y="232" width="244" height="92" rx="9" fill="#ffffff" stroke="#e5e5e5"/>
+    <text x="296" y="260" class="small muted">Open WorkItems</text>
+    <text x="296" y="298" class="title" style="font-size:26px">12</text>
+    <text x="360" y="298" class="small muted">↑ 3 本周</text>
+    <use href="#arrow" x="472" y="260" width="18" height="18"/>
+    <rect x="536" y="232" width="244" height="92" rx="9" fill="#ffffff" stroke="#e5e5e5"/>
+    <text x="556" y="260" class="small muted">Active Runs</text>
+    <text x="556" y="298" class="title" style="font-size:26px">3</text>
+    <text x="620" y="298" class="small muted">2 queued</text>
+    <use href="#play" x="732" y="260" width="18" height="18"/>
+    <rect x="796" y="232" width="244" height="92" rx="9" fill="#ffffff" stroke="#e5e5e5"/>
+    <text x="816" y="260" class="small muted">Pending approvals</text>
+    <text x="816" y="298" class="title" style="font-size:26px">2</text>
+    <text x="880" y="298" class="small muted">需人工确认</text>
+    <use href="#clock" x="992" y="260" width="18" height="18"/>
+
+    <rect x="276" y="352" width="764" height="438" rx="10" fill="#ffffff" stroke="#e5e5e5"/>
+    <text x="300" y="388" class="section">WorkItem 队列</text>
+    <text x="300" y="414" class="small muted">按更新时间排列，打开详情继续工作。</text>
+    <rect x="774" y="374" width="104" height="32" rx="6" fill="#ffffff" stroke="#d4d4d4"/>
+    <use href="#filter" x="786" y="382" width="16" height="16"/>
+    <text x="810" y="395" class="small">筛选</text>
+    <rect x="886" y="374" width="130" height="32" rx="6" fill="#ffffff" stroke="#d4d4d4"/>
+    <use href="#search" x="898" y="382" width="16" height="16"/>
+    <text x="922" y="395" class="small muted">搜索标题</text>
+    <path class="hairline" d="M300 438h716M300 506h716M300 574h716M300 642h716M300 710h716"/>
+    <text x="300" y="460" class="small muted">标题</text>
+    <text x="676" y="460" class="small muted">状态</text>
+    <text x="782" y="460" class="small muted">负责人</text>
+    <text x="926" y="460" class="small muted">更新时间</text>
+    <text x="300" y="488" class="body">同步采购供应商目录</text>
+    <text x="300" y="501" class="small muted">WI-0142 · 外部引用 #4821</text>
+    <rect x="676" y="476" width="76" height="24" rx="12" fill="#f5f5f5" stroke="#d4d4d4"/>
+    <text x="690" y="492" class="small">In progress</text>
+    <text x="782" y="489" class="small">林珊</text>
+    <text x="926" y="489" class="small muted">4 分钟前</text>
+    <text x="300" y="556" class="body">检查账单导入失败</text>
+    <text x="300" y="569" class="small muted">WI-0139 · 有 1 个审批</text>
+    <rect x="676" y="544" width="66" height="24" rx="12" fill="#fafafa" stroke="#a3a3a3"/>
+    <text x="690" y="560" class="small">Blocked</text>
+    <text x="782" y="557" class="small">周宁</text>
+    <text x="926" y="557" class="small muted">18 分钟前</text>
+    <text x="300" y="624" class="body">更新运行手册</text>
+    <text x="300" y="637" class="small muted">WI-0136 · 无活动 Run</text>
+    <rect x="676" y="612" width="58" height="24" rx="12" fill="#fafafa" stroke="#d4d4d4"/>
+    <text x="690" y="628" class="small">Open</text>
+    <text x="782" y="625" class="small">—</text>
+    <text x="926" y="625" class="small muted">1 小时前</text>
+    <text x="300" y="692" class="body">归档旧连接</text>
+    <text x="300" y="705" class="small muted">WI-0128 · 已完成</text>
+    <rect x="676" y="680" width="74" height="24" rx="12" fill="#f5f5f5" stroke="#d4d4d4"/>
+    <use href="#check" x="684" y="684" width="16" height="16"/>
+    <text x="705" y="696" class="small">Completed</text>
+    <text x="782" y="693" class="small">王越</text>
+    <text x="926" y="693" class="small muted">昨天</text>
+    <text x="300" y="757" class="small muted">显示 4 / 12</text>
+    <text x="932" y="757" class="small">下一页</text>
+    <use href="#arrow" x="982" y="748" width="18" height="18"/>
+
+    <rect x="1064" y="352" width="344" height="208" rx="10" fill="#ffffff" stroke="#e5e5e5"/>
+    <text x="1088" y="388" class="section">快捷动作</text>
+    <rect x="1088" y="412" width="296" height="40" rx="7" fill="#171717"/>
+    <use href="#plus" x="1102" y="424" width="16" height="16"/>
+    <path class="icon" d="M1110 424v16M1102 432h16" stroke="#ffffff"/>
+    <text x="1128" y="438" class="body" fill="#ffffff" style="fill:#ffffff">创建 WorkItem</text>
+    <rect x="1088" y="464" width="296" height="40" rx="7" fill="#ffffff" stroke="#d4d4d4"/>
+    <use href="#clock" x="1102" y="476" width="16" height="16"/>
+    <text x="1128" y="490" class="body">处理待审批</text>
+    <rect x="1088" y="516" width="296" height="24" rx="5" fill="#fafafa"/>
+    <text x="1100" y="533" class="small muted">动作按当前 Workspace 权限显示</text>
+
+    <rect x="1064" y="580" width="344" height="210" rx="10" fill="#ffffff" stroke="#e5e5e5"/>
+    <text x="1088" y="616" class="section">实时状态</text>
+    <circle cx="1096" cy="648" r="5" fill="#737373"/>
+    <text x="1112" y="653" class="body">SSE 已连接</text>
+    <text x="1088" y="682" class="small muted">最近事件：evt_0142_08</text>
+    <text x="1088" y="706" class="small muted">队列：2 queued · 1 running</text>
+    <path class="hairline" d="M1088 728h296"/>
+    <text x="1088" y="756" class="small muted">只显示持久化事实，不填充 mock 数据。</text>
+  </g>
+</svg>

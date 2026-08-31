@@ -259,7 +259,49 @@ shadcn-svelte 在 `packages/ui` 初始化。组件固定位于：
 packages/ui/src/lib/components/ui
 ```
 
-业务组件留在 `apps/web`。OpenAPI 类型生成到 `apps/web/src/lib/api/schema.d.ts`。
+业务组件留在 `apps/web`。OpenAPI 类型生成到 `apps/web/src/lib/api/generated/schema.d.ts`。
+
+## J：WorkItem-first Web 结构
+
+J 阶段收敛 Rust 单体内部结构、Web 工程和 WorkItem 执行体验。它不改变 `0.1.0` 的 API 前缀、租户模型、Session Event 事实源或组件目录，也不增加 crate、package、Redis 或独立 Worker。
+
+### 信息架构
+
+WorkItem 是 Workspace 的工作入口。工作台汇总队列、活动 Run 和待审批项；WorkItem 详情承载状态、输入、附件、外部引用和 Agent 启动；Run 详情承载时间线、Tool Call、Approval、usage、Experience 注入和 Child Run。Run 与 Approval 保留直接导航，记录回链 WorkItem。
+
+浏览器 URL 保持兼容：
+
+```text
+/                         Workspace 工作台
+/work-items               WorkItem 列表和创建
+/work-items/{work_item_id} WorkItem 详情和启动 Agent
+/runs                     Run 列表
+/runs/{run_id}            Run Timeline 和 Trace
+/approvals                Approval 队列
+```
+
+现有 `status`、`cursor` 查询参数继续有效，`/work-items?create=1` 打开创建 Sheet。Web URL 不增加 Workspace 段。当前 Workspace 来自 Session 和 Workspace context。服务端调用继续使用 `/api/v1/workspaces/{workspace_id}/...`。需要破坏旧深链接时必须另开 ADR。
+
+### 结构边界
+
+- 桌面使用工作队列/快捷动作、内容/动作栏、时间线/检查栏三种两列布局。
+- 平板把辅助列移到主内容后方，保留当前 Workspace、主动作和审批上下文。
+- 移动使用单列卡片、全屏或底部 Agent 面板、垂直时间线和纵向审批按钮。
+- `apps/web` 保存路由、SvelteKit `load`/`action`、业务状态映射、权限判断以及 WorkItem/Run/Approval 组件。
+- `packages/ui/src/lib/components/ui` 保存共享基础组件。Web 从 `@zeus/ui` 子路径导入。当前 shadcn-svelte 配置使用 `lyra`、neutral base color、Phosphor 图标和 JetBrains Mono 字体资源。不创建第二套基础 UI 或品牌 token。
+- `docs/ui/WORKITEM_UX.md` 固定空、加载、失败、断线、冲突、无权限、SSE 续传和审批交互。J0 不修改 Rust、TypeScript、Svelte、package、lock 或 OpenAPI 文件。
+
+### J0-J4 验收
+
+| 阶段 | 验收边界 | 状态 |
+| --- | --- | --- |
+| J0 | 三张灰度 SVG、UX 基线和 WorkItem-first ADR 可读；SVG/XML 和文档范围检查通过。只验收文档。 | `done` |
+| J1 | `zeus-api` 在单 crate 内按领域拆分。公开路径、数据库和行为不变。 | `pending` |
+| J2 | Web route group、App Shell、API 客户端、业务组件和 `packages/ui` 导出边界收敛。 | `pending` |
+| J3 | WorkItem 原子启动 Run、Run/Approval WorkItem 筛选、OpenAPI 和生成类型完成。 | `pending` |
+| J4 | 工作台到结果查看的完整流程、SSE、审批、取消、重试和响应式故障状态完成可执行验收。 | `pending` |
+
+J0 的 `done` 只表示本次文档基线已验收。H 生产准备和 I5 安全与生产门禁的外部验收继续为 `active`，OpenID Conformance、真实 KMS/SMTP/企业 IdP、托管 PostgreSQL 权限、PITR、生产规格压力和故障演练仍未完成。
 
 ## 密钥
 
