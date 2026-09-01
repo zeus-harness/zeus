@@ -47,7 +47,7 @@ describe('login route actions', () => {
       jsonResponse(200, { totp_setup_required: true, mfa_required: true })
     );
 
-    await expect(actionHandler(actions.default)(event)).rejects.toMatchObject({
+    await expect(actionHandler(actions.login)(event)).rejects.toMatchObject({
       status: 303,
       location: '/account/security?setup_totp=1&return_to=%2F'
     });
@@ -60,7 +60,7 @@ describe('login route actions', () => {
       jsonResponse(200, { totp_setup_required: false, mfa_required: true })
     );
 
-    await expect(actionHandler(actions.default)(event)).rejects.toMatchObject({
+    await expect(actionHandler(actions.login)(event)).rejects.toMatchObject({
       status: 303,
       location: '/mfa?return_to=%2F'
     });
@@ -109,7 +109,7 @@ describe('login route actions', () => {
       jsonResponse(200, { totp_setup_required: false, mfa_required: false })
     );
 
-    await expect(actionHandler(actions.default)(event)).rejects.toMatchObject({
+    await expect(actionHandler(actions.login)(event)).rejects.toMatchObject({
       status: 303,
       location: '/oauth2/authorize?client_id=CLIENT_FOR_TEST'
     });
@@ -122,7 +122,7 @@ describe('login route actions', () => {
       jsonResponse(200, { totp_setup_required: false, mfa_required: false })
     );
 
-    await expect(actionHandler(actions.default)(event)).rejects.toMatchObject({
+    await expect(actionHandler(actions.login)(event)).rejects.toMatchObject({
       status: 303,
       location: '/'
     });

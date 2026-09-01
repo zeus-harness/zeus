@@ -303,9 +303,9 @@ WorkItem 是 Workspace 的工作入口。工作台汇总队列、活动 Run 和�
 | J1 | `zeus-api` 在单 crate 内按领域拆分。公开路径、数据库和行为不变。 | `done` |
 | J2 | Web route group、App Shell、API 客户端、业务组件和 `packages/ui` 导出边界收敛。 | `done` |
 | J3 | WorkItem 原子启动 Run、Run/Approval WorkItem 筛选、OpenAPI 和生成类型完成。 | `done` |
-| J4 | 工作台到结果查看的完整流程、SSE、审批、取消、重试和响应式故障状态完成可执行验收。认证后页面的浏览器验收尚未完成。 | `active` |
+| J4 | 工作台到结果查看的完整流程、SSE、审批、取消、重试和响应式故障状态完成 API、浏览器和三档视口验收。 | `done` |
 
-J4 完成前，J 阶段不标记为整体完成。H 生产准备和 I5 安全与生产门禁的外部验收继续为 `active`，OpenID Conformance、真实 KMS/SMTP/企业 IdP、托管 PostgreSQL 权限、PITR、生产规格压力和故障演练仍未完成。
+J0-J4 已完成。隔离 E2E profile 使用独立 Apple `container` 网络、容器和 PostgreSQL volume，覆盖原生身份、WorkItem 启动、模型工具循环、审批、SSE 续传和持久结果。H 生产准备和 I5 安全与生产门禁继续为 `active`；OpenID Conformance、真实 KMS/SMTP/企业 IdP、托管 PostgreSQL 权限、PITR、生产规格压力和故障演练仍未完成。
 
 ## 密钥
 

@@ -6,18 +6,40 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 ZEUS_STATE_DIR="${REPO_ROOT}/.zeus"
 ZEUS_ENV_FILE="${ZEUS_STATE_DIR}/local.env"
 
+ZEUS_PROFILE="local"
+ZEUS_PUBLIC_HOST="127.0.0.1"
+ZEUS_PUBLIC_PORT="3000"
+ZEUS_POSTGRES_HOST_PORT="5432"
+
 ZEUS_NETWORK="zeus-local"
 ZEUS_POSTGRES_CONTAINER="zeus-postgres"
 ZEUS_API_CONTAINER="zeus-api"
 ZEUS_WEB_CONTAINER="zeus-web"
 ZEUS_GATEWAY_CONTAINER="zeus-gateway"
 ZEUS_MAILPIT_CONTAINER="zeus-mailpit"
+ZEUS_E2E_OPENAI_CONTAINER="zeus-e2e-openai"
 ZEUS_POSTGRES_VOLUME="zeus-postgres-data"
 ZEUS_POSTGRES_IMAGE="docker.io/library/postgres:18.6"
 ZEUS_API_IMAGE="zeus-api:0.1.0"
 ZEUS_WEB_IMAGE="zeus-web:0.1.0"
 ZEUS_GATEWAY_IMAGE="zeus-gateway:0.1.0"
 ZEUS_MAILPIT_IMAGE="docker.io/axllent/mailpit:v1.30.0"
+ZEUS_E2E_OPENAI_IMAGE="zeus-e2e-openai:0.1.0"
+
+configure_e2e_profile() {
+  ZEUS_PROFILE="e2e"
+  ZEUS_STATE_DIR="${REPO_ROOT}/.zeus"
+  ZEUS_ENV_FILE="${ZEUS_STATE_DIR}/e2e.env"
+  ZEUS_PUBLIC_PORT="3100"
+  ZEUS_POSTGRES_HOST_PORT="55432"
+  ZEUS_NETWORK="zeus-e2e"
+  ZEUS_POSTGRES_CONTAINER="zeus-e2e-postgres"
+  ZEUS_API_CONTAINER="zeus-e2e-api"
+  ZEUS_WEB_CONTAINER="zeus-e2e-web"
+  ZEUS_GATEWAY_CONTAINER="zeus-e2e-gateway"
+  ZEUS_MAILPIT_CONTAINER="zeus-e2e-mailpit"
+  ZEUS_POSTGRES_VOLUME="zeus-e2e-postgres-data"
+}
 
 usage() {
   cat <<'EOF'
@@ -35,13 +57,27 @@ Commands:
                                    Show safe container list fields; default: all
   logs <service> [flags]           Show logs; supports --follow, --boot, and -n
   reset-db --yes                   Remove the local database container and volume
+  e2e <command>                    Use the isolated E2E stack on 127.0.0.1:3100
   help                             Show this help
+
+E2E commands:
+  e2e init-env                     Create .zeus/e2e.env with mode 0600
+  e2e build [api|web|gateway|openai|all]
+  e2e up [postgres|mailpit|openai|api|web|gateway|all]
+  e2e down [postgres|mailpit|openai|api|web|gateway|all]
+  e2e status [postgres|mailpit|openai|api|web|gateway|all]
+  e2e logs <service> [flags]
+  e2e seed                         Create the deterministic identity and workflow fixture
+  e2e run                          Execute the API WorkItem approval flow
+  e2e smoke                        Start, seed, and run the isolated stack
+  e2e reset-db --yes               Remove only E2E containers and the E2E database volume
 
 Examples:
   scripts/container up
   scripts/container build api
   scripts/container logs gateway -n 100
   scripts/container down all
+  scripts/container e2e smoke
 EOF
 }
 
@@ -127,13 +163,13 @@ init_env() {
     "POSTGRES_USER=zeus" \
     "POSTGRES_PASSWORD=${postgres_password}" \
     "POSTGRES_DB=zeus" \
-    "DATABASE_URL=postgres://zeus:${postgres_password}@127.0.0.1:5432/zeus" \
-    "RUNTIME_DATABASE_URL=postgres://zeus:${postgres_password}@127.0.0.1:5432/zeus" \
+    "DATABASE_URL=postgres://zeus:${postgres_password}@${ZEUS_PUBLIC_HOST}:${ZEUS_POSTGRES_HOST_PORT}/zeus" \
+    "RUNTIME_DATABASE_URL=postgres://zeus:${postgres_password}@${ZEUS_PUBLIC_HOST}:${ZEUS_POSTGRES_HOST_PORT}/zeus" \
     "ZEUS_LOCAL_MASTER_KEY=${master_key}" \
     "ZEUS_BOOTSTRAP_TOKEN=${bootstrap_token}" \
     "ZEUS_ENVELOPE_KEY_ID=local-v1" \
     "ZEUS_BIND_ADDRESS=127.0.0.1:8080" \
-    "ZEUS_PUBLIC_URL=http://127.0.0.1:3000" \
+    "ZEUS_PUBLIC_URL=http://${ZEUS_PUBLIC_HOST}:${ZEUS_PUBLIC_PORT}" \
     "ZEUS_API_URL=http://127.0.0.1:8080" \
     "ZEUS_COOKIE_SECURE=false" \
     "ZEUS_RUN_CONCURRENCY=4" \
@@ -141,6 +177,20 @@ init_env() {
     "ZEUS_TRUST_PROXY_HEADERS=true" \
     "ZEUS_IDENTITY_MAINTENANCE_ENABLED=true" \
     > "${ZEUS_ENV_FILE}"
+
+  if [[ "${ZEUS_PROFILE}" == "e2e" ]]; then
+    local e2e_password e2e_model_key
+    e2e_password="$(openssl rand -hex 16)"
+    e2e_model_key="$(openssl rand -hex 24)"
+    printf '%s\n' \
+      "ZEUS_ALLOW_PRIVATE_MODEL_ENDPOINTS=true" \
+      "ZEUS_E2E_PUBLIC_URL=http://${ZEUS_PUBLIC_HOST}:${ZEUS_PUBLIC_PORT}" \
+      "ZEUS_E2E_EMAIL=e2e-admin@zeus.local" \
+      "ZEUS_E2E_PASSWORD=${e2e_password}" \
+      "ZEUS_E2E_MODEL_API_KEY=${e2e_model_key}" \
+      >> "${ZEUS_ENV_FILE}"
+    unset e2e_password e2e_model_key
+  fi
   chmod 0600 "${ZEUS_ENV_FILE}"
 
   unset postgres_password master_key bootstrap_token
@@ -162,6 +212,27 @@ load_local_env() {
   : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required in .zeus/local.env}"
   : "${POSTGRES_DB:?POSTGRES_DB is required in .zeus/local.env}"
   : "${ZEUS_LOCAL_MASTER_KEY:?ZEUS_LOCAL_MASTER_KEY is required in .zeus/local.env}"
+}
+
+set_env_value() {
+  local key="$1"
+  local value="$2"
+  local temporary_env
+  temporary_env="$(mktemp "${ZEUS_STATE_DIR}/${ZEUS_PROFILE}.env.update.XXXXXX")"
+  chmod 0600 "${temporary_env}"
+
+  if grep -q "^${key}=" "${ZEUS_ENV_FILE}"; then
+    awk -v key="${key}" -v value="${value}" '
+      index($0, key "=") == 1 { print key "=" value; next }
+      { print }
+    ' "${ZEUS_ENV_FILE}" > "${temporary_env}"
+  else
+    cp "${ZEUS_ENV_FILE}" "${temporary_env}"
+    printf '%s=%s\n' "${key}" "${value}" >> "${temporary_env}"
+  fi
+
+  mv "${temporary_env}" "${ZEUS_ENV_FILE}"
+  chmod 0600 "${ZEUS_ENV_FILE}"
 }
 
 container_exists() {
@@ -307,7 +378,7 @@ start_postgres() {
       --env POSTGRES_USER \
       --env POSTGRES_PASSWORD \
       --env POSTGRES_DB \
-      --publish 127.0.0.1:5432:5432 \
+      --publish "${ZEUS_PUBLIC_HOST}:${ZEUS_POSTGRES_HOST_PORT}:5432" \
       --volume "${ZEUS_POSTGRES_VOLUME}:/var/lib/postgresql" \
       "${ZEUS_POSTGRES_IMAGE}" >/dev/null
   fi
@@ -317,7 +388,7 @@ start_postgres() {
     if container exec "${ZEUS_POSTGRES_CONTAINER}" \
       pg_isready -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" >/dev/null 2>&1; then
       sync_postgres_password
-      echo "PostgreSQL 18.6 is ready on 127.0.0.1:5432."
+      echo "PostgreSQL 18.6 is ready on ${ZEUS_PUBLIC_HOST}:${ZEUS_POSTGRES_HOST_PORT}."
       return
     fi
     sleep 1
@@ -448,6 +519,30 @@ build_gateway_image() (
   )
 )
 
+build_e2e_openai_image() (
+  if [[ "${ZEUS_PROFILE}" != "e2e" ]]; then
+    die "The deterministic OpenAI-compatible image is only available in the E2E profile."
+  fi
+  local build_context
+  build_context="$(create_build_context)"
+  trap 'cleanup_build_context "${build_context}"' EXIT
+
+  echo "Building ${ZEUS_E2E_OPENAI_IMAGE}."
+  cp "${REPO_ROOT}/scripts/e2e/fake-openai.mjs" "${build_context}/fake-openai.mjs"
+  cp \
+    "${REPO_ROOT}/deploy/container/e2e-openai.Containerfile" \
+    "${build_context}/Containerfile"
+
+  (
+    cd "${build_context}"
+    container build \
+      --tag "${ZEUS_E2E_OPENAI_IMAGE}" \
+      --label dev.zeus-harness.project=zeus-e2e \
+      --file Containerfile \
+      .
+  )
+)
+
 build_target() {
   local target="$1"
   require_container_cli
@@ -463,13 +558,19 @@ build_target() {
     gateway)
       build_gateway_image
       ;;
+    openai)
+      build_e2e_openai_image
+      ;;
     all)
       build_api_image
       build_web_image
       build_gateway_image
+      if [[ "${ZEUS_PROFILE}" == "e2e" ]]; then
+        build_e2e_openai_image
+      fi
       ;;
     *)
-      die "Build target must be api, web, gateway, or all."
+      die "Build target must be api, web, gateway, openai, or all."
       ;;
   esac
 }
@@ -489,6 +590,12 @@ ensure_web_image() {
 ensure_gateway_image() {
   if ! image_exists "${ZEUS_GATEWAY_IMAGE}"; then
     build_gateway_image
+  fi
+}
+
+ensure_e2e_openai_image() {
+  if ! image_exists "${ZEUS_E2E_OPENAI_IMAGE}"; then
+    build_e2e_openai_image
   fi
 }
 
@@ -531,6 +638,48 @@ wait_for_http() {
   exit 1
 }
 
+start_e2e_openai() {
+  if [[ "${ZEUS_PROFILE}" != "e2e" ]]; then
+    die "The deterministic OpenAI-compatible service is only available in the E2E profile."
+  fi
+  require_container_cli
+  ensure_container_system
+  ensure_network
+  ensure_e2e_openai_image
+  export PORT="4010"
+
+  recreate_stateless_container "${ZEUS_E2E_OPENAI_CONTAINER}" 10
+  container run \
+    --name "${ZEUS_E2E_OPENAI_CONTAINER}" \
+    --detach \
+    --init \
+    --network "${ZEUS_NETWORK}" \
+    --cpus 1 \
+    --memory 256M \
+    --label dev.zeus-harness.managed=true \
+    --label dev.zeus-harness.project=zeus-e2e \
+    --env PORT \
+    "${ZEUS_E2E_OPENAI_IMAGE}" >/dev/null
+
+  local attempt
+  for ((attempt = 1; attempt <= 30; attempt += 1)); do
+    if container exec "${ZEUS_E2E_OPENAI_CONTAINER}" \
+      node -e 'fetch("http://127.0.0.1:4010/health").then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))' \
+      >/dev/null 2>&1; then
+      local openai_ip
+      openai_ip="$(container_ipv4 "${ZEUS_E2E_OPENAI_CONTAINER}")"
+      set_env_value "ZEUS_E2E_MODEL_BASE_URL" "http://${openai_ip}:4010/v1"
+      echo "Deterministic OpenAI-compatible E2E service is ready."
+      return
+    fi
+    sleep 1
+  done
+
+  echo "Deterministic OpenAI-compatible E2E service did not become ready." >&2
+  container logs -n 100 "${ZEUS_E2E_OPENAI_CONTAINER}" >&2 || true
+  exit 1
+}
+
 start_api() {
   ensure_api_image
   bootstrap_database
@@ -544,7 +693,7 @@ start_api() {
   export DATABASE_URL="${database_url}"
   export RUNTIME_DATABASE_URL="${database_url}"
   export ZEUS_BIND_ADDRESS="0.0.0.0:8080"
-  export ZEUS_PUBLIC_URL="http://127.0.0.1:3000"
+  export ZEUS_PUBLIC_URL="http://${ZEUS_PUBLIC_HOST}:${ZEUS_PUBLIC_PORT}"
   export ZEUS_COOKIE_SECURE="false"
   export ZEUS_RUN_CONCURRENCY="${ZEUS_RUN_CONCURRENCY:-4}"
   export ZEUS_SUPERVISOR_ENABLED="true"
@@ -553,6 +702,7 @@ start_api() {
   export ZEUS_MAIL_FROM="noreply@zeus.local"
   export ZEUS_TRUST_PROXY_HEADERS="true"
   export ZEUS_IDENTITY_MAINTENANCE_ENABLED="true"
+  export ZEUS_ALLOW_PRIVATE_MODEL_ENDPOINTS="${ZEUS_ALLOW_PRIVATE_MODEL_ENDPOINTS:-false}"
 
   recreate_stateless_container "${ZEUS_API_CONTAINER}" 60
   container run \
@@ -578,6 +728,7 @@ start_api() {
     --env ZEUS_MAIL_FROM \
     --env ZEUS_TRUST_PROXY_HEADERS \
     --env ZEUS_IDENTITY_MAINTENANCE_ENABLED \
+    --env ZEUS_ALLOW_PRIVATE_MODEL_ENDPOINTS \
     "${ZEUS_API_IMAGE}" >/dev/null
 
   unset database_url
@@ -592,7 +743,7 @@ start_web() {
   export ZEUS_API_URL="http://${api_ip}:8080"
   export HOST="0.0.0.0"
   export PORT="3000"
-  export ORIGIN="http://127.0.0.1:3000"
+  export ORIGIN="http://${ZEUS_PUBLIC_HOST}:${ZEUS_PUBLIC_PORT}"
 
   recreate_stateless_container "${ZEUS_WEB_CONTAINER}" 10
   container run \
@@ -658,12 +809,12 @@ start_gateway() {
     --env ZEUS_API_UPSTREAM \
     --env ZEUS_WEB_UPSTREAM \
     --env ZEUS_MAILPIT_UPSTREAM \
-    --publish 127.0.0.1:3000:3000 \
+    --publish "${ZEUS_PUBLIC_HOST}:${ZEUS_PUBLIC_PORT}:3000" \
     "${ZEUS_GATEWAY_IMAGE}" >/dev/null
 
-  wait_for_http "${ZEUS_GATEWAY_CONTAINER}" "http://127.0.0.1:3000/health/ready" 90
-  wait_for_http "${ZEUS_GATEWAY_CONTAINER}" "http://127.0.0.1:3000/" 60
-  echo "Zeus is ready on http://127.0.0.1:3000. Mailpit is under /mailpit/."
+  wait_for_http "${ZEUS_GATEWAY_CONTAINER}" "http://${ZEUS_PUBLIC_HOST}:${ZEUS_PUBLIC_PORT}/health/ready" 90
+  wait_for_http "${ZEUS_GATEWAY_CONTAINER}" "http://${ZEUS_PUBLIC_HOST}:${ZEUS_PUBLIC_PORT}/" 60
+  echo "Zeus is ready on http://${ZEUS_PUBLIC_HOST}:${ZEUS_PUBLIC_PORT}. Mailpit is under /mailpit/."
 }
 
 up_target() {
@@ -675,6 +826,10 @@ up_target() {
     mailpit)
       start_mailpit
       ;;
+    openai)
+      ensure_network
+      start_e2e_openai
+      ;;
     api)
       local web_was_running=false gateway_was_running=false
       start_postgres
@@ -685,6 +840,9 @@ up_target() {
         gateway_was_running=true
       fi
       start_mailpit
+      if [[ "${ZEUS_PROFILE}" == "e2e" ]]; then
+        start_e2e_openai
+      fi
       start_api
       if [[ "${web_was_running}" == true || "${gateway_was_running}" == true ]]; then
         start_web
@@ -700,6 +858,9 @@ up_target() {
         gateway_was_running=true
       fi
       start_mailpit
+      if [[ "${ZEUS_PROFILE}" == "e2e" ]]; then
+        start_e2e_openai
+      fi
       start_api
       start_web
       if [[ "${gateway_was_running}" == true ]]; then
@@ -709,12 +870,15 @@ up_target() {
     gateway | all)
       start_postgres
       start_mailpit
+      if [[ "${ZEUS_PROFILE}" == "e2e" ]]; then
+        start_e2e_openai
+      fi
       start_api
       start_web
       start_gateway
       ;;
     *)
-      die "Up target must be postgres, mailpit, api, web, gateway, or all."
+      die "Up target must be postgres, mailpit, openai, api, web, gateway, or all."
       ;;
   esac
 }
@@ -730,6 +894,9 @@ down_target() {
     mailpit)
       stop_container "${ZEUS_MAILPIT_CONTAINER}" 10
       ;;
+    openai)
+      stop_container "${ZEUS_E2E_OPENAI_CONTAINER}" 10
+      ;;
     api)
       stop_container "${ZEUS_API_CONTAINER}" 60
       ;;
@@ -743,22 +910,30 @@ down_target() {
       stop_container "${ZEUS_GATEWAY_CONTAINER}" 10
       stop_container "${ZEUS_WEB_CONTAINER}" 10
       stop_container "${ZEUS_API_CONTAINER}" 60
+      if [[ "${ZEUS_PROFILE}" == "e2e" ]]; then
+        stop_container "${ZEUS_E2E_OPENAI_CONTAINER}" 10
+      fi
       stop_container "${ZEUS_MAILPIT_CONTAINER}" 10
       stop_container "${ZEUS_POSTGRES_CONTAINER}" 30
       ;;
     *)
-      die "Down target must be postgres, mailpit, api, web, gateway, or all."
+      die "Down target must be postgres, mailpit, openai, api, web, gateway, or all."
       ;;
   esac
 }
 
 status_target() {
   local target="$1"
+  local include_openai="false"
   require_container_cli
 
+  if [[ "${ZEUS_PROFILE}" == "e2e" ]]; then
+    include_openai="true"
+  fi
+
   case "${target}" in
-    postgres | mailpit | api | web | gateway | all) ;;
-    *) die "Status target must be postgres, mailpit, api, web, gateway, or all." ;;
+    postgres | mailpit | openai | api | web | gateway | all) ;;
+    *) die "Status target must be postgres, mailpit, openai, api, web, gateway, or all." ;;
   esac
 
   container list --all | awk \
@@ -767,11 +942,14 @@ status_target() {
     -v mailpit="${ZEUS_MAILPIT_CONTAINER}" \
     -v api="${ZEUS_API_CONTAINER}" \
     -v web="${ZEUS_WEB_CONTAINER}" \
-    -v gateway="${ZEUS_GATEWAY_CONTAINER}" '
+    -v gateway="${ZEUS_GATEWAY_CONTAINER}" \
+    -v openai="${ZEUS_E2E_OPENAI_CONTAINER}" \
+    -v include_openai="${include_openai}" '
       NR == 1 { print; next }
-      target == "all" && ($1 == postgres || $1 == mailpit || $1 == api || $1 == web || $1 == gateway) { print; next }
+      target == "all" && ($1 == postgres || $1 == mailpit || (include_openai == "true" && $1 == openai) || $1 == api || $1 == web || $1 == gateway) { print; next }
       target == "postgres" && $1 == postgres { print; next }
       target == "mailpit" && $1 == mailpit { print; next }
+      target == "openai" && $1 == openai { print; next }
       target == "api" && $1 == api { print; next }
       target == "web" && $1 == web { print; next }
       target == "gateway" && $1 == gateway { print }
@@ -782,10 +960,11 @@ container_for_target() {
   case "$1" in
     postgres) printf '%s\n' "${ZEUS_POSTGRES_CONTAINER}" ;;
     mailpit) printf '%s\n' "${ZEUS_MAILPIT_CONTAINER}" ;;
+    openai) printf '%s\n' "${ZEUS_E2E_OPENAI_CONTAINER}" ;;
     api) printf '%s\n' "${ZEUS_API_CONTAINER}" ;;
     web) printf '%s\n' "${ZEUS_WEB_CONTAINER}" ;;
     gateway) printf '%s\n' "${ZEUS_GATEWAY_CONTAINER}" ;;
-    *) die "Log target must be postgres, mailpit, api, web, or gateway." ;;
+    *) die "Log target must be postgres, mailpit, openai, api, web, or gateway." ;;
   esac
 }
 
@@ -858,8 +1037,12 @@ rotate_postgres_password() {
 
 reset_database() {
   if [[ "${1:-}" != "--yes" || "$#" -ne 1 ]]; then
-    echo "This removes local Zeus service containers and the zeus-postgres-data volume." >&2
-    echo "Run scripts/container reset-db --yes to continue." >&2
+    echo "This removes the ${ZEUS_PROFILE} Zeus service containers and ${ZEUS_POSTGRES_VOLUME} volume." >&2
+    if [[ "${ZEUS_PROFILE}" == "e2e" ]]; then
+      echo "Run scripts/container e2e reset-db --yes to continue." >&2
+    else
+      echo "Run scripts/container reset-db --yes to continue." >&2
+    fi
     exit 2
   fi
 
@@ -867,11 +1050,17 @@ reset_database() {
   stop_container "${ZEUS_GATEWAY_CONTAINER}" 10
   stop_container "${ZEUS_WEB_CONTAINER}" 10
   stop_container "${ZEUS_API_CONTAINER}" 60
+  if [[ "${ZEUS_PROFILE}" == "e2e" ]]; then
+    stop_container "${ZEUS_E2E_OPENAI_CONTAINER}" 10
+  fi
   stop_container "${ZEUS_MAILPIT_CONTAINER}" 10
   stop_container "${ZEUS_POSTGRES_CONTAINER}" 30
   delete_container "${ZEUS_GATEWAY_CONTAINER}"
   delete_container "${ZEUS_WEB_CONTAINER}"
   delete_container "${ZEUS_API_CONTAINER}"
+  if [[ "${ZEUS_PROFILE}" == "e2e" ]]; then
+    delete_container "${ZEUS_E2E_OPENAI_CONTAINER}"
+  fi
   delete_container "${ZEUS_MAILPIT_CONTAINER}"
   delete_container "${ZEUS_POSTGRES_CONTAINER}"
 
@@ -879,16 +1068,13 @@ reset_database() {
     container volume delete "${ZEUS_POSTGRES_VOLUME}" >/dev/null
   fi
 
-  echo "Removed local Zeus containers and PostgreSQL volume. Database contents are not recoverable without a backup."
+  echo "Removed ${ZEUS_PROFILE} Zeus containers and PostgreSQL volume. Database contents are not recoverable without a backup."
   echo "Local environment, images, and network were preserved."
 }
 
-main() {
-  local command_name="${1:-help}"
-  if [[ "$#" -gt 0 ]]; then
-    shift
-  fi
-
+dispatch_command() {
+  local command_name="$1"
+  shift
   case "${command_name}" in
     init-env)
       require_no_extra_args "$@"
@@ -924,7 +1110,7 @@ main() {
       ;;
     logs)
       if [[ "$#" -eq 0 ]]; then
-        die "Log target must be postgres, mailpit, api, web, or gateway."
+        die "Log target must be postgres, mailpit, openai, api, web, or gateway."
       fi
       local log_target_name="$1"
       shift
@@ -942,6 +1128,47 @@ main() {
       die "Unknown command: ${command_name}"
       ;;
   esac
+}
+
+run_e2e_command() {
+  local command_name="${1:-help}"
+  if [[ "$#" -gt 0 ]]; then
+    shift
+  fi
+
+  case "${command_name}" in
+    seed | run)
+      require_no_extra_args "$@"
+      require_command node
+      init_env
+      node "${REPO_ROOT}/scripts/e2e/work-item.mjs" "${command_name}"
+      ;;
+    smoke)
+      require_no_extra_args "$@"
+      require_command node
+      init_env
+      up_target all
+      node "${REPO_ROOT}/scripts/e2e/work-item.mjs" seed
+      node "${REPO_ROOT}/scripts/e2e/work-item.mjs" run
+      ;;
+    *)
+      dispatch_command "${command_name}" "$@"
+      ;;
+  esac
+}
+
+main() {
+  local command_name="${1:-help}"
+  if [[ "$#" -gt 0 ]]; then
+    shift
+  fi
+
+  if [[ "${command_name}" == "e2e" ]]; then
+    configure_e2e_profile
+    run_e2e_command "$@"
+  else
+    dispatch_command "${command_name}" "$@"
+  fi
 }
 
 main "$@"

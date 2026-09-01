@@ -51,6 +51,17 @@ scripts/container logs gateway -n 100
 scripts/container down all
 ```
 
+WorkItem 验收使用独立 E2E profile。它只操作 `zeus-e2e-*` 容器、`zeus-e2e` 网络、独立 PostgreSQL volume 和 `127.0.0.1:3100`，不会复用日常开发数据库：
+
+```bash
+scripts/container e2e build all
+scripts/container e2e smoke
+scripts/container e2e status all
+scripts/container e2e reset-db --yes
+```
+
+`smoke` 使用已经构建的镜像，启动 PostgreSQL 18.6、Mailpit、确定性 OpenAI-compatible fixture、API、Web 和 Gateway，再完成 Setup、邮箱验证、TOTP、Workspace 配置、WorkItem 启动、Capability 审批、Run 终态和 SSE 续传检查。源码变化后先运行 `e2e build all`。随机测试凭据只写入权限为 `0600` 且被 Git 忽略的 `.zeus/e2e.env`。测试脚本不会打印密码、TOTP Secret 或 Token。
+
 需要从宿主机运行数据库检查时再加载本地环境：
 
 ```bash

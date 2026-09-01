@@ -254,7 +254,7 @@ J 阶段把 WorkItem 设为 Workspace 的工作入口。`/` 保留为 Workspace 
 
 ### J4：WorkItem 完整流程
 
-状态：`active`
+状态：`done`
 
 验收：
 
@@ -270,10 +270,14 @@ J 阶段把 WorkItem 设为 Workspace 的工作入口。`/` 保留为 Workspace 
 
 2026-09-01 验收记录：
 
-- Rust 格式、Clippy 和 workspace 测试通过。115 个单元测试通过；4 个需要数据库的测试在普通门禁中保持 ignored。
+- Rust 格式、Clippy 和 workspace 测试通过。118 个单元测试通过；4 个需要真实 PostgreSQL 和测试 envelope key 的集成测试在普通门禁中保持 ignored，由隔离 E2E profile 补充本轮主链路验证。
 - `control_plane_postgres` 在独立 PostgreSQL 18.6 临时数据库中通过，覆盖 WorkItem 启动事务、幂等、跨 Workspace 拒绝和筛选。测试库随后删除。
-- Web 104 个测试、UI 1 个测试、身份负载参数 3 个测试通过。Web、UI 和全 workspace 构建通过。
-- Apple `container` 中 PostgreSQL、Mailpit、API、Web、Gateway 均运行；live、ready、Setup 状态和登录页经同源 Gateway 检查通过。
-- 公共登录页完成 `1440×900`、`1024×768`、`390×844` 检查。认证后的工作台、WorkItem 和 Run 页面仍需带有效测试 Session 做最后一轮浏览器验收，因此 J4 保持 `active`。
+- Web 105 个测试、UI 1 个测试、E2E 脚本 6 个测试、身份负载参数 3 个测试通过。Svelte check 为 0 error、0 warning，Web、UI 和 Rust workspace 构建通过。
+- 新增 Apple `container` 隔离 E2E profile。它使用 `zeus-e2e-*` 容器、独立网络、独立 PostgreSQL volume、`127.0.0.1:3100` 和确定性 OpenAI-compatible fixture，不触碰日常开发数据。
+- API 验收完成 Setup、Mailpit 邮箱验证、密码登录、TOTP、Workspace 配置、Connection、Model Profile、Capability、Agent、Workflow、WorkItem、Run、Approval、Trace、Usage 和 SSE 断点续传。WorkItem/Run 筛选与 RFC3339 时间格式同时检查。
+- 浏览器完成登录、MFA、Workspace 选择、WorkItem 创建、Agent 启动、SSE 自动刷新、审批和结果查看。最终 Run 为 `succeeded`，持久事件 17 条，工具调用 1 次，审批状态为 `approved`，浏览器控制台没有 warning 或 error。
+- Run 页面完成 `1440×900`、`1024×768`、`390×844` 响应式检查。桌面使用双栏时间线，平板摘要转为两列，移动端使用单列卡片和折叠导航，没有横向溢出。
+- 真实链路发现并修复四个问题：登录页 default/named action 冲突；Axum flatten query 在实际请求中返回 400；公开运行 DTO 未固定 RFC3339；SSE 新事件没有刷新 Trace 和 Approval 快照。
+- API 重启后的首个 TOTP 验证曾受容器时钟偏差影响。Session 轮换改用 PostgreSQL `now()` 作为权威时间，随后在全新 API 进程上首次验证通过。
 
-J1-J4 完成前，J 阶段不标记为整体完成。H 和 I5 的 OpenID Conformance、云 KMS、受控 SMTP、真实企业 IdP、托管 PostgreSQL 权限、生产规格容量和故障演练仍按各自外部清单执行。
+J0-J4 已完成。H 和 I5 仍为 `active`。OpenID Conformance、云 KMS、受控 SMTP、真实企业 IdP、托管 PostgreSQL 权限、生产规格容量和故障演练仍按各自外部清单执行。

@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { invalidateAll } from '$app/navigation';
+  import { onDestroy } from 'svelte';
   import { ArrowLeft, RotateCcw, Square } from '@lucide/svelte';
 
   import * as Alert from '@zeus/ui/components/ui/alert';
@@ -26,6 +28,19 @@
     trace ? ['queued', 'running', 'waiting_approval', 'waiting_child'].includes(trace.run.status) : false
   );
   let canRetry = $derived(trace ? ['failed', 'canceled'].includes(trace.run.status) : false);
+  let snapshotRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function scheduleSnapshotRefresh(): void {
+    if (snapshotRefreshTimer !== null) clearTimeout(snapshotRefreshTimer);
+    snapshotRefreshTimer = setTimeout(() => {
+      snapshotRefreshTimer = null;
+      void invalidateAll();
+    }, 100);
+  }
+
+  onDestroy(() => {
+    if (snapshotRefreshTimer !== null) clearTimeout(snapshotRefreshTimer);
+  });
 
   function dateLabel(value: string | null): string {
     return value ? value.replace('T', ' ').replace(/\.\d+Z$/, ' UTC').replace('Z', ' UTC') : '—';
@@ -154,6 +169,7 @@
             initialEvents={trace.run_events}
             initialStatus={trace.run.status}
             streamUrl={data.streamUrl}
+            onSnapshotChange={scheduleSnapshotRefresh}
           />
           <Separator />
           <div>

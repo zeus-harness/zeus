@@ -12,7 +12,7 @@ use zeus_core::Permission;
 
 use crate::{
     AppState,
-    api_support::ListCursor,
+    api_support::{ListCursor, PageQuery},
     auth::{AuthContext, insert_audit},
     database::begin_tenant,
     error::ApiError,
@@ -230,8 +230,12 @@ pub async fn list_runs(
 ) -> Result<Json<RunPageResponse>, ApiError> {
     auth.require_workspace(workspace_id, Permission::ReadWorkspace)?;
     validate_run_status_filter(query.status.as_deref())?;
-    let limit = query.page.limit()?;
-    let cursor = query.page.decoded_cursor()?;
+    let page = PageQuery {
+        cursor: query.cursor,
+        limit: query.limit,
+    };
+    let limit = page.limit()?;
+    let cursor = page.decoded_cursor()?;
     let mut transaction = begin_tenant(
         &state.platform.database,
         auth.tenant_scope(Some(workspace_id)),
@@ -563,4 +567,27 @@ pub(super) async fn load_run(
     .fetch_one(&mut **transaction)
     .await
     .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::extract::Query;
+    use http::Uri;
+
+    use super::RunQuery;
+
+    #[test]
+    fn run_query_accepts_filters_and_pagination() {
+        let work_item_id = uuid::Uuid::now_v7();
+        let uri: Uri =
+            format!("/runs?work_item_id={work_item_id}&status=waiting_approval&limit=10")
+                .parse()
+                .expect("query URI parses");
+        let Query(query) = Query::<RunQuery>::try_from_uri(&uri).expect("query parses");
+
+        assert_eq!(query.work_item_id, Some(work_item_id));
+        assert_eq!(query.status.as_deref(), Some("waiting_approval"));
+        assert_eq!(query.limit, Some(10));
+        assert!(query.cursor.is_none());
+    }
 }

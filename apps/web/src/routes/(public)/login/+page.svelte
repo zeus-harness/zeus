@@ -58,7 +58,7 @@
           <Card.Description>使用邮箱和密码登录你的 Zeus 账号。</Card.Description>
         </Card.Header>
         <Card.Content>
-          <form method="POST" class="space-y-5">
+          <form method="POST" action="?/login" class="space-y-5">
             <div>
               <label class="text-sm font-medium" for="email">Email</label>
               <Input

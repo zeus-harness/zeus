@@ -45,8 +45,11 @@ pub struct WorkItemResponse {
     pub output: Option<Value>,
     pub revision: i64,
     pub created_by: Option<Uuid>,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
     pub completed_at: Option<OffsetDateTime>,
 }
 
@@ -58,8 +61,8 @@ pub struct WorkItemPageResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct WorkItemQuery {
-    #[serde(flatten)]
-    pub page: PageQuery,
+    pub cursor: Option<String>,
+    pub limit: Option<u16>,
     pub status: Option<String>,
     pub assignee_user_id: Option<Uuid>,
 }
@@ -98,8 +101,12 @@ pub async fn list_work_items(
     Query(query): Query<WorkItemQuery>,
 ) -> Result<Json<WorkItemPageResponse>, ApiError> {
     auth.require_workspace(workspace_id, Permission::ReadWorkspace)?;
-    let limit = query.page.limit()?;
-    let cursor = query.page.decoded_cursor()?;
+    let page = PageQuery {
+        cursor: query.cursor,
+        limit: query.limit,
+    };
+    let limit = page.limit()?;
+    let cursor = page.decoded_cursor()?;
     if let Some(status) = query.status.as_deref() {
         parse_state(status)?;
     }
@@ -346,6 +353,7 @@ pub struct ExternalReferenceResponse {
     pub external_reference: String,
     pub metadata: Value,
     pub created_by: Option<Uuid>,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
 
@@ -457,6 +465,7 @@ pub struct AttachmentResponse {
     pub sha256_hex: String,
     pub size_bytes: i32,
     pub created_by: Option<Uuid>,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
 
@@ -916,9 +925,11 @@ fn empty_object() -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        CreateWorkItemRequest, UpdateWorkItemRequest, normalize_create_request,
+        CreateWorkItemRequest, UpdateWorkItemRequest, WorkItemQuery, normalize_create_request,
         normalize_update_request, validate_attachment_metadata,
     };
+    use axum::extract::Query;
+    use http::Uri;
     use serde_json::json;
 
     #[test]
@@ -953,5 +964,20 @@ mod tests {
         assert!(validate_attachment_metadata("report.pdf", "application/pdf").is_ok());
         assert!(validate_attachment_metadata("../secret", "text/plain").is_err());
         assert!(validate_attachment_metadata("report\r\nX-Test: 1", "text/plain").is_err());
+    }
+
+    #[test]
+    fn work_item_query_accepts_filters_and_pagination() {
+        let assignee_user_id = uuid::Uuid::now_v7();
+        let uri: Uri =
+            format!("/work-items?status=blocked&assignee_user_id={assignee_user_id}&limit=10")
+                .parse()
+                .expect("query URI parses");
+        let Query(query) = Query::<WorkItemQuery>::try_from_uri(&uri).expect("query parses");
+
+        assert_eq!(query.status.as_deref(), Some("blocked"));
+        assert_eq!(query.assignee_user_id, Some(assignee_user_id));
+        assert_eq!(query.limit, Some(10));
+        assert!(query.cursor.is_none());
     }
 }

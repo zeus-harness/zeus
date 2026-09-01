@@ -5,8 +5,6 @@ use time::OffsetDateTime;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::api_support::PageQuery;
-
 fn empty_object() -> Value {
     json!({})
 }
@@ -24,8 +22,11 @@ pub struct SessionResponse {
     pub title: String,
     pub status: String,
     pub created_by: Option<Uuid>,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
     pub closed_at: Option<OffsetDateTime>,
 }
 
@@ -66,6 +67,7 @@ pub struct SessionEventResponse {
     pub actor_kind: String,
     pub actor_id: Option<Uuid>,
     pub payload: Value,
+    #[serde(with = "time::serde::rfc3339")]
     pub occurred_at: OffsetDateTime,
 }
 
@@ -110,10 +112,15 @@ pub struct RunResponse {
     pub error_code: Option<String>,
     pub error_detail: Option<String>,
     pub attempt_count: i32,
+    #[serde(with = "time::serde::rfc3339::option")]
     pub cancel_requested_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
     pub started_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
     pub finished_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
 }
 
@@ -131,8 +138,8 @@ pub struct WorkItemRunStartResponse {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct RunQuery {
-    #[serde(flatten)]
-    pub page: PageQuery,
+    pub cursor: Option<String>,
+    pub limit: Option<u16>,
     pub work_item_id: Option<Uuid>,
     pub status: Option<String>,
 }
@@ -146,6 +153,7 @@ pub struct RunEventResponse {
     pub schema_version: i16,
     pub event_type: String,
     pub payload: Value,
+    #[serde(with = "time::serde::rfc3339")]
     pub occurred_at: OffsetDateTime,
 }
 
@@ -157,6 +165,7 @@ pub struct RunUsageResponse {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub cache_tokens: i64,
+    #[serde(with = "time::serde::rfc3339")]
     pub occurred_at: OffsetDateTime,
 }
 
@@ -174,8 +183,11 @@ pub struct ApprovalResponse {
     pub run_id: Uuid,
     pub tool_call_id: Uuid,
     pub status: String,
+    #[serde(with = "time::serde::rfc3339")]
     pub requested_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
     pub expires_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
     pub decided_at: Option<OffsetDateTime>,
     pub decided_by: Option<Uuid>,
     pub reason: Option<String>,
@@ -210,8 +222,11 @@ pub struct TraceToolCallResponse {
     pub result: Option<Value>,
     pub error_code: Option<String>,
     pub child_run_id: Option<Uuid>,
+    #[serde(with = "time::serde::rfc3339::option")]
     pub started_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
     pub finished_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
 
@@ -222,6 +237,7 @@ pub struct TraceRunLinkResponse {
     pub status: String,
     pub output: Option<Value>,
     pub error_code: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
 
@@ -237,7 +253,9 @@ pub struct ChildRunResponse {
     pub output: Option<Value>,
     pub error_code: Option<String>,
     pub error_detail: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
     pub finished_at: Option<OffsetDateTime>,
 }
 
@@ -248,6 +266,7 @@ pub struct TraceExperienceInjectionResponse {
     pub experience_version: i32,
     pub rank: f32,
     pub query_sha256: String,
+    #[serde(with = "time::serde::rfc3339")]
     pub injected_at: OffsetDateTime,
 }
 
@@ -261,4 +280,30 @@ pub struct RunTraceResponse {
     pub usage: RunUsageSummaryResponse,
     pub linked_runs: Vec<TraceRunLinkResponse>,
     pub experience_injections: Vec<TraceExperienceInjectionResponse>,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use time::OffsetDateTime;
+    use uuid::Uuid;
+
+    use super::RunEventResponse;
+
+    #[test]
+    fn public_event_timestamp_serializes_as_rfc3339() {
+        let event = RunEventResponse {
+            id: Uuid::now_v7(),
+            run_id: Uuid::now_v7(),
+            session_event_id: None,
+            sequence: 1,
+            schema_version: 1,
+            event_type: "run_queued".to_owned(),
+            payload: json!({}),
+            occurred_at: OffsetDateTime::UNIX_EPOCH,
+        };
+
+        let value = serde_json::to_value(event).expect("event serializes");
+        assert_eq!(value["occurred_at"], "1970-01-01T00:00:00Z");
+    }
 }

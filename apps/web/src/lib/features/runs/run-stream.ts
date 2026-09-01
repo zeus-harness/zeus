@@ -282,6 +282,24 @@ export function isTerminalRunEvent(
   return getTerminalRunStatus(event) !== null;
 }
 
+const SNAPSHOT_CHANGE_EVENTS = new Set([
+  'approval_resolved',
+  'model.completed',
+  'model.final',
+  'run.status_changed',
+  'tool.requested',
+  'tool.result'
+]);
+
+export function changesRunSnapshot(event: Pick<RunEvent, 'event_type' | 'payload'>): boolean {
+  const eventType = event.event_type.trim().toLowerCase();
+  return (
+    SNAPSHOT_CHANGE_EVENTS.has(eventType) ||
+    eventType.includes('child') ||
+    isTerminalRunEvent(event)
+  );
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

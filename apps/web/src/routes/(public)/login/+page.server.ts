@@ -49,7 +49,7 @@ function isTotpSetupRequired(payload: unknown): boolean {
 }
 
 export const actions: Actions = {
-  default: async (event) => {
+  login: async (event) => {
     const returnTo = safeReturnTo(event.url);
     const formData = await event.request.formData();
     const email = formValue(formData, 'email').toLowerCase();

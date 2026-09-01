@@ -471,14 +471,7 @@ pub async fn verify_mfa(
         Err(error) => return Err(error),
     };
     clear_throttle(&state, "totp_account", &account_key).await?;
-    let headers = rotate_authenticated_session(
-        &state,
-        session_id,
-        user_id,
-        Some(OffsetDateTime::now_utc()),
-        method,
-    )
-    .await?;
+    let headers = rotate_authenticated_session(&state, session_id, user_id, method).await?;
     Ok((
         headers,
         Json(MfaVerificationResponse {
@@ -725,14 +718,7 @@ pub async fn configure_totp(
                 "TOTP enrollment is no longer pending".to_owned(),
             ));
         }
-        let headers = rotate_authenticated_session(
-            &state,
-            session_id,
-            user_id,
-            Some(OffsetDateTime::now_utc()),
-            "totp",
-        )
-        .await?;
+        let headers = rotate_authenticated_session(&state, session_id, user_id, "totp").await?;
         return Ok((
             headers,
             Json(TotpSetupResponse {
@@ -1209,21 +1195,20 @@ async fn rotate_authenticated_session(
     state: &AppState,
     session_id: Uuid,
     user_id: Uuid,
-    mfa_satisfied_at: Option<OffsetDateTime>,
     method: &str,
 ) -> Result<HeaderMap, ApiError> {
     let session_token = random_token(32).map_err(|_| ApiError::Internal)?;
     let csrf_token = random_token(32).map_err(|_| ApiError::Internal)?;
-    let rotated: bool =
-        sqlx::query_scalar("select zeus_private.rotate_user_session_token($1, $2, $3, $4, $5, $6)")
-            .bind(session_id)
-            .bind(user_id)
-            .bind(sha256(session_token.expose_secret().as_bytes()))
-            .bind(sha256(csrf_token.expose_secret().as_bytes()))
-            .bind(mfa_satisfied_at)
-            .bind(method)
-            .fetch_one(&state.platform.database)
-            .await?;
+    let rotated: bool = sqlx::query_scalar(
+        "select zeus_private.rotate_user_session_token($1, $2, $3, $4, now(), $5)",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .bind(sha256(session_token.expose_secret().as_bytes()))
+    .bind(sha256(csrf_token.expose_secret().as_bytes()))
+    .bind(method)
+    .fetch_one(&state.platform.database)
+    .await?;
     if !rotated {
         return Err(ApiError::Unauthorized);
     }

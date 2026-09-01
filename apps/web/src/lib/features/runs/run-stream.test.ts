@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   appendRunEvent,
+  changesRunSnapshot,
   getTerminalRunStatus,
   isTerminalRunEvent,
   mergeRunEvents,
@@ -131,5 +132,22 @@ describe('terminal run events', () => {
     }
 
     expect(isTerminalRunEvent(runEvent(1, 'runtime.started'))).toBe(false);
+  });
+});
+
+describe('run snapshot changes', () => {
+  it('refreshes durable trace data for approvals, tools, children, usage, and status', () => {
+    for (const eventType of [
+      'tool.requested',
+      'approval_resolved',
+      'tool.result',
+      'model.completed',
+      'run.status_changed',
+      'child_run.created'
+    ]) {
+      expect(changesRunSnapshot(runEvent(1, eventType))).toBe(true);
+    }
+
+    expect(changesRunSnapshot(runEvent(1, 'runtime.started'))).toBe(false);
   });
 });

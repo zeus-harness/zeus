@@ -9,6 +9,7 @@
   import { TERMINAL_RUN_STATES } from '$lib/api/runs';
   import {
     getTerminalRunStatus,
+    changesRunSnapshot,
     mergeRunEvents,
     parseRunEvent,
     RunEventSseParser
@@ -19,11 +20,13 @@
   let {
     initialEvents,
     initialStatus,
-    streamUrl
+    streamUrl,
+    onSnapshotChange
   }: {
     initialEvents: RunEvent[];
     initialStatus: string;
     streamUrl: string | null;
+    onSnapshotChange?: () => void;
   } = $props();
 
   let streamedEvents = $state<RunEvent[]>([]);
@@ -134,6 +137,7 @@
       throw new Error(`事件序号缺口尚未恢复，当前到 #${recoveredSequence}。`);
     }
     streamedEvents = mergeRunEvents(streamedEvents, recovered);
+    if (recovered.some(changesRunSnapshot)) onSnapshotChange?.();
   }
 
   async function waitBeforeRetry(milliseconds: number, signal: AbortSignal): Promise<void> {
@@ -199,6 +203,7 @@
               await recoverGap(previous, event.sequence, controller.signal);
             }
             streamedEvents = mergeRunEvents(streamedEvents, [event]);
+            if (changesRunSnapshot(event)) onSnapshotChange?.();
             const terminalStatus = getTerminalRunStatus(event);
             if (terminalStatus) {
               liveRunStatus = terminalStatus;
