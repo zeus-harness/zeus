@@ -14,7 +14,9 @@ export const load: PageServerLoad = async ({ fetch, parent, url }) => {
   if (auth.status === 'unauthenticated') redirect(303, '/login');
   if (auth.status !== 'ready') return { unavailable: true };
 
-  const workspaces = auth.organizations.flatMap((organization) => organization.workspaces);
+  const workspaces = auth.organizations
+    .flatMap((organization) => organization.workspaces)
+    .filter((workspace) => workspace.status === 'active');
   const activeWorkspace = workspaces.find(
     (workspace) => workspace.id === auth.principal?.workspace_id && workspace.status === 'active'
   );

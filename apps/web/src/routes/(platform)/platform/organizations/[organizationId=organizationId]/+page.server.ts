@@ -87,7 +87,7 @@ export const actions: Actions = {
     const action = formValue(formData, 'transition');
     if (
       !revision ||
-      !['suspend', 'activate', 'archive', 'restore'].includes(action)
+      !['suspend', 'resume', 'archive', 'restore'].includes(action)
     ) {
       return fail(400, { type: 'error' as const, message: 'Organization 状态动作无效。' });
     }
@@ -101,7 +101,7 @@ export const actions: Actions = {
         apiFetch,
         event.params.organizationId,
         revision,
-        action as 'suspend' | 'activate' | 'archive' | 'restore',
+        action as 'suspend' | 'resume' | 'archive' | 'restore',
         env.ZEUS_API_URL
       );
     } catch (error) {

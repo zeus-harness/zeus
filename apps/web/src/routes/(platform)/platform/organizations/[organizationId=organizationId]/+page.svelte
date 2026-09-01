@@ -14,6 +14,26 @@
 
   let { data, form }: { data: PageData; form: ActionData } = $props();
   let organization = $derived(data.organization);
+  let lifecycleTransitions = $derived.by(() => {
+    switch (organization.status) {
+      case 'active':
+        return [
+          { action: 'suspend', label: '暂停' },
+          { action: 'archive', label: '归档', destructive: true }
+        ];
+      case 'suspended':
+        return [
+          { action: 'resume', label: '恢复服务' },
+          { action: 'archive', label: '归档', destructive: true }
+        ];
+      case 'provisioning':
+        return [{ action: 'archive', label: '归档', destructive: true }];
+      case 'archived':
+        return [{ action: 'restore', label: '恢复为暂停状态' }];
+      default:
+        return [];
+    }
+  });
 </script>
 
 <svelte:head><title>Zeus · {organization.name}</title></svelte:head>
@@ -55,11 +75,11 @@
     <Card.Root>
       <Card.Header><Card.Title>生命周期</Card.Title><Card.Description>恢复归档 Organization 后会先进入 suspended。</Card.Description></Card.Header>
       <Card.Content class="flex flex-wrap gap-2">
-        {#each ['activate', 'suspend', 'archive', 'restore'] as transition (transition)}
+        {#each lifecycleTransitions as transition (transition.action)}
           <form method="POST" action="?/transition">
             <input type="hidden" name="revision" value={organization.revision} />
-            <input type="hidden" name="transition" value={transition} />
-            <Button type="submit" variant={transition === 'archive' ? 'destructive' : 'outline'} size="sm">{transition}</Button>
+            <input type="hidden" name="transition" value={transition.action} />
+            <Button type="submit" variant={transition.destructive ? 'destructive' : 'outline'} size="sm">{transition.label}</Button>
           </form>
         {/each}
       </Card.Content>

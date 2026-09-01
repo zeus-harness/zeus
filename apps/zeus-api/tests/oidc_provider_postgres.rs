@@ -345,6 +345,26 @@ async fn oidc_provider_supports_public_confidential_and_refresh_replay_protectio
             .as_str()
             .is_some_and(|token| !token.is_empty())
     );
+    assert_eq!(form_post_tokens["expires_in"], 300);
+    let suspension_access_token = form_post_tokens["access_token"]
+        .as_str()
+        .expect("suspension Access Token is returned")
+        .to_owned();
+    let suspension_refresh_token = form_post_tokens["refresh_token"]
+        .as_str()
+        .expect("suspension Refresh Token is returned")
+        .to_owned();
+    let suspension_claims =
+        jsonwebtoken::dangerous::insecure_decode::<Value>(&suspension_access_token)
+            .expect("Access Token claims decode for lifetime assertion")
+            .claims;
+    let issued_at = suspension_claims["iat"]
+        .as_u64()
+        .expect("Access Token iat is present");
+    let expires_at = suspension_claims["exp"]
+        .as_u64()
+        .expect("Access Token exp is present");
+    assert_eq!(expires_at - issued_at, 300);
 
     let mixed_auth_location = authorize(
         &app,
@@ -471,6 +491,42 @@ async fn oidc_provider_supports_public_confidential_and_refresh_replay_protectio
     assert!(session_revoked);
 
     exercise_signing_key_rotation_pressure(&owner_pool).await;
+
+    sqlx::query("update organizations set status = 'suspended' where id = $1")
+        .bind(organization_id)
+        .execute(&owner_pool)
+        .await
+        .expect("Organization suspends for OIDC boundary checks");
+    let blocked_authorization = authorize_response(
+        &app,
+        &confidential_client_id,
+        CONFIDENTIAL_REDIRECT,
+        &challenge,
+        "suspended-authorization-state",
+    )
+    .await;
+    let blocked_authorization = expect_json(blocked_authorization, StatusCode::BAD_REQUEST).await;
+    assert_eq!(blocked_authorization["error"], "invalid_request");
+    let blocked_refresh = exchange_refresh_response(
+        &app,
+        &confidential_client_id,
+        Some(confidential_secret),
+        &suspension_refresh_token,
+    )
+    .await;
+    let blocked_refresh = expect_json(blocked_refresh, StatusCode::UNAUTHORIZED).await;
+    assert_eq!(blocked_refresh["error"], "invalid_client");
+    let access_token_revoked: bool =
+        sqlx::query_scalar("select zeus_private.oidc_access_token_is_revoked($1)")
+            .bind(
+                suspension_claims["jti"]
+                    .as_str()
+                    .expect("Access Token jti is present"),
+            )
+            .fetch_one(&owner_pool)
+            .await
+            .expect("Access Token revocation state reads");
+    assert!(!access_token_revoked);
 }
 
 async fn exercise_signing_key_rotation_pressure(pool: &sqlx::PgPool) {
@@ -577,30 +633,7 @@ async fn authorize(
     challenge: &str,
     state: &str,
 ) -> String {
-    let query = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("response_type", "code")
-        .append_pair("client_id", client_id)
-        .append_pair("redirect_uri", redirect_uri)
-        .append_pair(
-            "scope",
-            "openid profile email zeus.organization zeus.workspace",
-        )
-        .append_pair("state", state)
-        .append_pair("nonce", "integration-nonce")
-        .append_pair("code_challenge", challenge)
-        .append_pair("code_challenge_method", "S256")
-        .finish();
-    let response = send_public(
-        app,
-        Method::GET,
-        &format!("/oauth2/authorize?{query}"),
-        None,
-        &[(
-            header::COOKIE.as_str(),
-            &format!("zeus_session={}", SESSION_TOKEN.as_str()),
-        )],
-    )
-    .await;
+    let response = authorize_response(app, client_id, redirect_uri, challenge, state).await;
     if response.status() != StatusCode::SEE_OTHER {
         let status = response.status();
         let body = response
@@ -621,6 +654,39 @@ async fn authorize(
         .to_str()
         .expect("authorization redirect is valid")
         .to_owned()
+}
+
+async fn authorize_response(
+    app: &Router,
+    client_id: &str,
+    redirect_uri: &str,
+    challenge: &str,
+    state: &str,
+) -> Response<Body> {
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("response_type", "code")
+        .append_pair("client_id", client_id)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair(
+            "scope",
+            "openid profile email zeus.organization zeus.workspace",
+        )
+        .append_pair("state", state)
+        .append_pair("nonce", "integration-nonce")
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", "S256")
+        .finish();
+    send_public(
+        app,
+        Method::GET,
+        &format!("/oauth2/authorize?{query}"),
+        None,
+        &[(
+            header::COOKIE.as_str(),
+            &format!("zeus_session={}", SESSION_TOKEN.as_str()),
+        )],
+    )
+    .await
 }
 
 async fn exchange_code(

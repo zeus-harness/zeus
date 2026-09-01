@@ -57,10 +57,11 @@
 - Workspace URL 与 Session Context 不一致返回 `409 workspace_context_changed`。Web 跳转到 Workspace 选择页，不在 GET 请求中轮换 Session。
 - Context POST 校验 Membership 或有效平台 Grant、Origin 和 CSRF。成功后轮换 Session/CSRF Token，并以新 Cookie 继续。
 - 平台 Grant 缺失、到期、撤销、Session 不匹配或 Organization 不匹配返回 `403 platform_tenant_access_required`。
+- 有效平台 Grant 可以选择创建 Grant 时绑定的 active Workspace，不要求平台用户拥有 Membership。Grant 不能选择其它 Organization 的 Workspace。
 - 创建平台 Grant 时密码、TOTP、近期认证或原因不满足要求，分别返回现有认证错误或 `422 validation_failed`。
 - Grant 到期会关闭对应 SSE。已经开始的短数据库事务可以完成；后续请求和事件续传必须重新授权。
 - `provisioning` Organization 只接受平台控制和首位 Owner 邀请。普通租户 API 返回 `409 organization_provisioning`。
-- `suspended` Organization 的业务写入返回 `423 organization_suspended`。读请求按 RBAC 保留；Run、Schedule、Webhook、联合登录、OIDC Authorization 和 Refresh 被拒绝。
+- `suspended` Organization 的业务写入返回 `423 organization_suspended`。读请求按 RBAC 保留；Run claim、Schedule、Webhook、联合登录、OIDC Authorization 和 Refresh 被拒绝。已经 queued 的 Run 保留用于审计并收到取消请求；恢复 active 不会自动清除该请求，用户需要创建新 Run。
 - `archived` Organization 返回 `404` 给普通租户请求。平台恢复动作把它变为 `suspended`，不会直接激活。
 
 ## Zeus OIDC Provider
@@ -72,6 +73,7 @@
 - Authorization Code 只有一次 claim 机会。过期、重复、Client 不匹配、Redirect URI 不匹配或 PKCE 失败都不能签发 Token。
 - Refresh Token 每次成功使用后轮换。旧 Token 重放会撤销整个 Family，当前和后代 Token 都返回 `invalid_grant`。
 - Access Token、Authorization Code 和 ID Token 有效期为 5 分钟。Refresh Token idle expiry 为 7 天，absolute expiry 为 30 天。
+- Suspend 不伪造已经签发 JWT 的即时撤销。外部 Resource Server 只依赖签名和 `exp` 时，现有 Access Token 最多继续有效 5 分钟；需要即时阻断的部署必须增加受控的撤销查询或网关策略。
 - Token 签名只接受 RS256、固定 `kid` 和 `typ`。当前私钥缺失、解密失败或签名失败时返回 `server_error`，不会降级为无签名或对称算法。
 - 常规密钥轮换保留旧公钥 7 天。泄漏处置可以缩短该窗口；下游缓存仍需单独清理。
 - Revocation 对未知 Token 返回成功，避免泄漏 Token 存在性。Client 认证失败仍返回 `invalid_client`。

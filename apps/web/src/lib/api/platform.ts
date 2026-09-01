@@ -67,7 +67,7 @@ export function transitionPlatformOrganization(
   fetcher: ApiFetcher,
   organizationId: string,
   revision: number,
-  action: 'suspend' | 'activate' | 'archive' | 'restore',
+  action: 'suspend' | 'resume' | 'archive' | 'restore',
   apiBaseUrl?: string
 ): Promise<PlatformOrganizationMutation> {
   return requestJson<PlatformOrganizationMutation>(

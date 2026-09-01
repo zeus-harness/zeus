@@ -288,16 +288,18 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     let existing_csrf_token = format!("integration-user-csrf-{existing_session_id}");
     sqlx::query(
         "insert into web_sessions (
-           id, user_id, active_organization_id, token_hash, csrf_token_hash,
+           id, user_id, active_organization_id, active_workspace_id,
+           token_hash, csrf_token_hash,
            auth_methods, authenticated_at, idle_expires_at, absolute_expires_at
          ) values (
-           $1, $2, $3, $4, $5, array['password'], now(),
+           $1, $2, $3, $4, $5, $6, array['password'], now(),
            now() + interval '2 hours', now() + interval '12 hours'
          )",
     )
     .bind(existing_session_id)
     .bind(existing_user_id)
     .bind(organization_id)
+    .bind(workspace_id)
     .bind(sha256(existing_session_token.as_bytes()))
     .bind(sha256(existing_csrf_token.as_bytes()))
     .execute(&owner_pool)
@@ -508,6 +510,72 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
         external_identities["available_providers"][0]["provider_id"],
         federated_provider_id.to_string()
     );
+
+    let created_workspace_account = send_user(
+        &app,
+        Method::POST,
+        &format!("/api/v1/workspaces/{workspace_id}/service-accounts"),
+        &existing_session_token,
+        &existing_csrf_token,
+        Some(json!({
+            "name": "Workspace automation",
+            "scopes": ["workspace:read", "run:operate"],
+            "expires_at": null
+        })),
+        &[],
+    )
+    .await;
+    let (_, created_workspace_account) =
+        expect_json(created_workspace_account, StatusCode::CREATED).await;
+    let created_workspace_account_id = json_uuid(&created_workspace_account, "id");
+    assert_eq!(
+        created_workspace_account["workspace_id"],
+        workspace_id.to_string()
+    );
+    assert!(
+        created_workspace_account["token"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("zsa_"))
+    );
+
+    let workspace_accounts = send_user(
+        &app,
+        Method::GET,
+        &format!("/api/v1/workspaces/{workspace_id}/service-accounts"),
+        &existing_session_token,
+        &existing_csrf_token,
+        None,
+        &[],
+    )
+    .await;
+    let (_, workspace_accounts) = expect_json(workspace_accounts, StatusCode::OK).await;
+    assert!(
+        workspace_accounts
+            .as_array()
+            .is_some_and(|accounts| accounts.iter().any(|account| {
+                account["id"] == created_workspace_account_id.to_string()
+                    && account.get("token").is_none()
+            }))
+    );
+    assert!(workspace_accounts.as_array().is_some_and(|accounts| {
+        accounts
+            .iter()
+            .all(|account| account["workspace_id"] == workspace_id.to_string())
+    }));
+
+    let revoked_workspace_account = send_user(
+        &app,
+        Method::POST,
+        &format!(
+            "/api/v1/workspaces/{workspace_id}/service-accounts/{created_workspace_account_id}/revoke"
+        ),
+        &existing_session_token,
+        &existing_csrf_token,
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(revoked_workspace_account.status(), StatusCode::NO_CONTENT);
 
     let providers = send(
         &app,
@@ -1085,6 +1153,42 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     )
     .await;
     assert_eq!(linked_canceled.status(), StatusCode::ACCEPTED);
+
+    sqlx::query("update organizations set status = 'suspended' where id = $1")
+        .bind(organization_id)
+        .execute(&owner_pool)
+        .await
+        .expect("Organization suspends for tenant write guards");
+    let suspended_schedule = send(
+        &app,
+        Method::POST,
+        &format!("/api/v1/workspaces/{workspace_id}/schedules"),
+        &token,
+        Some(json!({
+            "workflow_id": workflow_id,
+            "name": "Blocked while suspended",
+            "cron_expression": "0 * * * *",
+            "timezone": "UTC",
+            "input": {},
+            "enabled": true,
+            "next_run_at": null
+        })),
+        &[],
+    )
+    .await;
+    let (_, suspended_schedule) = expect_json(suspended_schedule, StatusCode::LOCKED).await;
+    assert_eq!(suspended_schedule["code"], "organization_suspended");
+    let suspended_webhook = send(
+        &app,
+        Method::POST,
+        &format!("/api/v1/workspaces/{workspace_id}/webhook-endpoints"),
+        &token,
+        Some(json!({ "workflow_id": workflow_id, "enabled": true })),
+        &[("idempotency-key", "control-webhook-suspended")],
+    )
+    .await;
+    let (_, suspended_webhook) = expect_json(suspended_webhook, StatusCode::LOCKED).await;
+    assert_eq!(suspended_webhook["code"], "organization_suspended");
 }
 
 async fn send(

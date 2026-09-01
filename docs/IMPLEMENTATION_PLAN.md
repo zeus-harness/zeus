@@ -350,11 +350,15 @@ K 阶段使用 ADR 0008。版本保持 `0.1.0`，API 前缀保持 `/api/v1`。�
 
 ### K5：联调和门禁
 
-状态：`pending`
+状态：`done`
 
 - E2E 覆盖多个 Organization/Workspace、Owner 权限、Google 风格身份跨 Organization Binding、支持 Grant 和状态阻断。
 - 覆盖零、一个、多个 Workspace 的入口和三档响应式页面。
 - 验证 Suspend 的 Run 取消、Schedule/Webhook 阻断、OIDC Authorization/Refresh 阻断和 5 分钟 Access Token 边界。
 - 按 K0-K5 分段提交并推送。
+
+验收记录：新增 `0029_tenant_state_execution_guard.sql`，平台支持 Grant 可以保留选中的 active Workspace，Runtime claim 只领取 active Organization 的 Run。Workspace Service Account 补齐创建、列表和撤销 API。真实 PostgreSQL 18.6 空库迁移到 `29`，7 个 ignored 集成测试串行通过；测试覆盖多 Organization/Workspace、同一 Google 风格 `(issuer, subject)` 的独立 Binding、跨 Organization Context 拒绝、支持 Grant、Workspace Service Account、Suspend 写入和 claim 阻断、OIDC Authorization/Refresh 阻断及 5 分钟 Access Token 上界。
+
+Rust 单元测试 `77 + 23 + 22` 通过。Web `122`、UI `1`、Node 驱动 `9` 项测试通过。Rust 格式、Clippy、Svelte check、生产构建和 OpenAPI 确定性检查通过。入口测试覆盖零、一个、多个 active Workspace 和当前 Context。登录页在 `1440×900`、`1024×768`、`390×844` 下没有横向溢出，浏览器控制台为 0 error、0 warning。Apple `container` 空库 smoke 完成 Setup、确定性 fixture、WorkItem、Run 和模型工具循环，终态为 `succeeded`。真实 PostgreSQL 测试只启动数据库；同时运行指向同一测试库的 API 会让 Supervisor 正常领取 queued Run，不能作为测试前置环境。
 
 K 完成不能关闭 H 或 I5。OpenID Conformance、云 KMS、真实企业 IdP、受控 SMTP、托管 PostgreSQL 权限和生产容量仍需要外部证据。

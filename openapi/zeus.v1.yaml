@@ -4298,6 +4298,99 @@ paths:
       security:
       - sessionCookie: []
       - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/service-accounts:
+    get:
+      tags:
+      - identity
+      operationId: list_workspace_service_accounts
+      parameters:
+      - name: workspace_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Workspace service accounts without token hashes
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ServiceAccountResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - identity
+      operationId: create_workspace_service_account
+      parameters:
+      - name: workspace_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWorkspaceServiceAccountRequest'
+        required: true
+      responses:
+        '201':
+          description: Workspace service account and one-time token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedServiceAccountResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/service-accounts/{service_account_id}/revoke:
+    post:
+      tags:
+      - identity
+      operationId: revoke_workspace_service_account
+      parameters:
+      - name: workspace_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: service_account_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '204':
+          description: Workspace service account revoked
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
   /api/v1/workspaces/{workspace_id}/sessions:
     get:
       tags:
@@ -6596,6 +6689,22 @@ components:
           type: string
         slug:
           type: string
+    CreateWorkspaceServiceAccountRequest:
+      type: object
+      required:
+      - name
+      properties:
+        expires_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        name:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
     CreatedOidcClientResponse:
       allOf:
       - $ref: '#/components/schemas/OidcClientResponse'

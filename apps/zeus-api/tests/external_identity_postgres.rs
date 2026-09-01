@@ -1,6 +1,6 @@
 use serde_json::json;
 use uuid::Uuid;
-use zeus_api::{connect_pool, crypto::sha256, migrate};
+use zeus_api::{HTTP_DATABASE_ROLE, connect_pool, connect_pool_as_role, crypto::sha256, migrate};
 
 #[tokio::test]
 #[ignore = "requires ZEUS_TEST_DATABASE_URL"]
@@ -12,6 +12,9 @@ async fn one_external_identity_can_hold_independent_organization_bindings() {
         .await
         .expect("owner database connects");
     migrate(&pool).await.expect("test database migrates");
+    let http_pool = connect_pool_as_role(&database_url, 2, HTTP_DATABASE_ROLE)
+        .await
+        .expect("HTTP role connects");
 
     let user_id = Uuid::now_v7();
     let session_id = Uuid::now_v7();
@@ -146,6 +149,67 @@ async fn one_external_identity_can_hold_independent_organization_bindings() {
     .execute(&pool)
     .await
     .expect("session inserts");
+
+    let tenant_choices = sqlx::query_as::<_, (Uuid, Option<String>, serde_json::Value)>(
+        "select organization_id, organization_role, workspaces
+         from zeus_private.list_user_organizations($1, $2)",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_all(&http_pool)
+    .await
+    .expect("multi-Organization Workspace selector loads");
+    assert_eq!(tenant_choices.len(), 2);
+    for (organization_id, organization_role, workspaces) in &tenant_choices {
+        assert_eq!(organization_role.as_deref(), Some("owner"));
+        let workspaces = workspaces.as_array().expect("Workspaces are an array");
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0]["role"], "owner");
+        assert!(
+            [organization_a, organization_b].contains(organization_id),
+            "selector must not introduce an unrelated Organization"
+        );
+    }
+
+    let rotated_to_b: bool = sqlx::query_scalar(
+        "select zeus_private.rotate_user_session_context_with_access(
+           $1, $2, $3, $4, $5, $6, null
+         )",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .bind(organization_b)
+    .bind(workspace_b)
+    .bind(sha256(b"external-session-rotated-b"))
+    .bind(sha256(b"external-csrf-rotated-b"))
+    .fetch_one(&http_pool)
+    .await
+    .expect("user rotates to the second Organization Workspace");
+    assert!(rotated_to_b);
+    let cross_organization_context: bool = sqlx::query_scalar(
+        "select zeus_private.rotate_user_session_context_with_access(
+           $1, $2, $3, $4, $5, $6, null
+         )",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .bind(organization_a)
+    .bind(workspace_b)
+    .bind(sha256(b"external-session-cross-organization"))
+    .bind(sha256(b"external-csrf-cross-organization"))
+    .fetch_one(&http_pool)
+    .await
+    .expect("cross-Organization Workspace mismatch returns a stable result");
+    assert!(!cross_organization_context);
+    let selected_context: (Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+        "select active_organization_id, active_workspace_id
+         from web_sessions where id = $1",
+    )
+    .bind(session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("rotated multi-tenant Session reads");
+    assert_eq!(selected_context, (Some(organization_b), Some(workspace_b)));
 
     let linked = resolve(
         &pool,

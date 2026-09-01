@@ -339,7 +339,9 @@ Organization 身份设置模式为 `self_service | platform_managed`。后者拒
 
 Organization 状态固定为 `provisioning | active | suspended | archived`。Suspend 阻止新业务写入、Run claim、Schedule/Webhook 投递、联合登录、OIDC Authorization 和 Refresh，并为未完成 Run 请求取消。恢复先进入 `suspended`。已签发 Access Token 最多继续存活 5 分钟。
 
-K0-K4 已实现。`0025_tenant_owner_governance.sql`、`0026_global_external_identities.sql`、`0027_platform_tenant_access.sql` 和 `0028_web_tenant_navigation.sql` 已在 PostgreSQL 18.6 空库执行。Owner、Provisioning 邀请、`platform_managed` API 拒绝、跨 Organization Provider 拒绝、Binding 独立撤销、全局身份登录方式保护、平台 Organization 生命周期和限时支持 Grant 都有真实数据库测试。Grant 绑定平台用户、Web Session 和 Organization；创建时验证原生密码与 TOTP，逐请求从 PostgreSQL 校验，撤销和到期立即失效。Web 使用 Workspace URL、POST Context 选择、独立设置区域和限时支持入口。K5 的多租户 E2E、状态阻断和三档浏览器门禁仍待完成。
+K0-K5 已实现。`0025_tenant_owner_governance.sql`、`0026_global_external_identities.sql`、`0027_platform_tenant_access.sql`、`0028_web_tenant_navigation.sql` 和 `0029_tenant_state_execution_guard.sql` 已在 PostgreSQL 18.6 空库执行。Owner、Provisioning 邀请、`platform_managed` API 拒绝、跨 Organization Provider 拒绝、Binding 独立撤销、全局身份登录方式保护、平台 Organization 生命周期和限时支持 Grant 都有真实数据库测试。Grant 绑定平台用户、Web Session 和 Organization；Session Context 可以选择该 Organization 的 active Workspace。创建 Grant 时验证原生密码与 TOTP，逐请求从 PostgreSQL 校验，撤销和到期立即失效。Runtime claim 只领取 active Organization 的 Run。Web 使用 Workspace URL、POST Context 选择、独立设置区域和限时支持入口。
+
+K5 在空的 PostgreSQL 18.6 数据库上串行通过 7 个真实集成测试。Rust 单元测试为 `77 + 23 + 22`，Web 为 `122`，UI 为 `1`，Node 驱动为 `9`。OpenAPI 源码生成结果与提交文件 SHA-256 一致。Apple `container` 空库 smoke 的 WorkItem Run 到达 `succeeded`。登录入口在 `1440×900`、`1024×768` 和 `390×844` 下没有横向溢出，浏览器控制台没有 error 或 warning。H 和 I5 仍为 `active`；这些本地结果不替代 OpenID Conformance、真实 KMS/SMTP/企业 IdP、托管 PostgreSQL 权限和生产容量证据。
 
 ## 密钥
 

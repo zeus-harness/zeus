@@ -184,6 +184,9 @@ impl AuthContext {
     }
 
     fn allows_workspace(&self, permission: Permission) -> bool {
+        if self.tenant_access_grant_id.is_some() {
+            return true;
+        }
         match self.principal_kind {
             PrincipalKind::User => self
                 .workspace_role
@@ -278,7 +281,7 @@ impl FromRequestParts<AppState> for AuthContext {
         };
         match organization_status.as_str() {
             "provisioning" => return Err(ApiError::OrganizationProvisioning),
-            "suspended" if is_write && principal.tenant_access_grant_id.is_none() => {
+            "suspended" if is_write => {
                 return Err(ApiError::OrganizationSuspended);
             }
             "active" | "suspended" => {}
@@ -513,6 +516,7 @@ struct PlatformTenantAccessGrantRow {
     organization_status: String,
     reason: String,
     expires_at: OffsetDateTime,
+    workspace_id: Option<Uuid>,
 }
 
 #[derive(Debug, FromRow)]
@@ -604,7 +608,7 @@ async fn apply_platform_tenant_access_grant(
     principal.tenant_access_expires_at = Some(grant.expires_at);
     principal.organization_status = Some(grant.organization_status);
     principal.organization_id = Some(grant.organization_id);
-    principal.workspace_id = None;
+    principal.workspace_id = grant.workspace_id;
     principal.organization_role = None;
     principal.workspace_role = None;
     Ok(())
@@ -1065,6 +1069,15 @@ pub struct CreateServiceAccountRequest {
     pub expires_at: Option<OffsetDateTime>,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateWorkspaceServiceAccountRequest {
+    pub name: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub expires_at: Option<OffsetDateTime>,
+}
+
 #[derive(Serialize, ToSchema)]
 pub struct CreatedServiceAccountResponse {
     pub id: Uuid,
@@ -1109,6 +1122,40 @@ pub async fn create_service_account(
     auth.require_recent_authentication()?;
     validate_service_account_request(&request)?;
 
+    create_service_account_record(state, auth, organization_id, request).await
+}
+
+#[utoipa::path(post, path = "/api/v1/workspaces/{workspace_id}/service-accounts", tag = "identity",
+    params(("workspace_id" = Uuid, Path)),
+    request_body = CreateWorkspaceServiceAccountRequest,
+    responses((status = 201, description = "Workspace service account and one-time token", body = CreatedServiceAccountResponse))
+)]
+pub async fn create_workspace_service_account(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(workspace_id): Path<Uuid>,
+    Json(request): Json<CreateWorkspaceServiceAccountRequest>,
+) -> Result<(StatusCode, Json<CreatedServiceAccountResponse>), ApiError> {
+    auth.require_workspace(workspace_id, Permission::ManageWorkspace)?;
+    auth.require_recent_authentication()?;
+    let organization_id = auth.organization_id;
+    let request = CreateServiceAccountRequest {
+        name: request.name,
+        workspace_id: Some(workspace_id),
+        scopes: request.scopes,
+        expires_at: request.expires_at,
+    };
+    validate_service_account_request(&request)?;
+
+    create_service_account_record(state, auth, organization_id, request).await
+}
+
+async fn create_service_account_record(
+    state: AppState,
+    auth: AuthContext,
+    organization_id: Uuid,
+    request: CreateServiceAccountRequest,
+) -> Result<(StatusCode, Json<CreatedServiceAccountResponse>), ApiError> {
     let prefix_secret = random_token(9).map_err(|_| ApiError::Internal)?;
     let token_secret = random_token(32).map_err(|_| ApiError::Internal)?;
     let token_prefix = format!("{SERVICE_ACCOUNT_PREFIX}{}", prefix_secret.expose_secret());
@@ -1120,7 +1167,11 @@ pub async fn create_service_account(
         .await
         .map_err(|error| map_service_account_password_error(&state, error))?;
 
-    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
+    let mut transaction = begin_tenant(
+        &state.platform.database,
+        auth.tenant_scope(request.workspace_id),
+    )
+    .await?;
     let created = sqlx::query_as::<_, CreatedServiceAccountRow>(
         "insert into service_accounts (
             organization_id, workspace_id, name, token_prefix, token_hash, scopes, expires_at
@@ -1207,6 +1258,37 @@ pub async fn list_service_accounts(
     Ok(Json(accounts))
 }
 
+#[utoipa::path(get, path = "/api/v1/workspaces/{workspace_id}/service-accounts", tag = "identity",
+    params(("workspace_id" = Uuid, Path)),
+    responses((status = 200, description = "Workspace service accounts without token hashes", body = [ServiceAccountResponse]))
+)]
+pub async fn list_workspace_service_accounts(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(workspace_id): Path<Uuid>,
+) -> Result<Json<Vec<ServiceAccountResponse>>, ApiError> {
+    auth.require_workspace(workspace_id, Permission::ManageWorkspace)?;
+    let mut transaction = begin_tenant(
+        &state.platform.database,
+        auth.tenant_scope(Some(workspace_id)),
+    )
+    .await?;
+    let accounts = sqlx::query_as::<_, ServiceAccountResponse>(
+        "select id, organization_id, workspace_id, name, token_prefix, scopes,
+                created_at, expires_at, revoked_at, last_used_at
+         from service_accounts
+         where organization_id = $1 and workspace_id = $2
+         order by created_at desc, id desc
+         limit 200",
+    )
+    .bind(auth.organization_id)
+    .bind(workspace_id)
+    .fetch_all(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(accounts))
+}
+
 #[utoipa::path(post, path = "/api/v1/organizations/{organization_id}/service-accounts/{service_account_id}/revoke", tag = "identity",
     params(("organization_id" = Uuid, Path), ("service_account_id" = Uuid, Path)),
     responses((status = 204, description = "Service account revoked"))
@@ -1242,6 +1324,46 @@ pub async fn revoke_service_account(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(post, path = "/api/v1/workspaces/{workspace_id}/service-accounts/{service_account_id}/revoke", tag = "identity",
+    params(("workspace_id" = Uuid, Path), ("service_account_id" = Uuid, Path)),
+    responses((status = 204, description = "Workspace service account revoked"))
+)]
+pub async fn revoke_workspace_service_account(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path((workspace_id, service_account_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, ApiError> {
+    auth.require_workspace(workspace_id, Permission::ManageWorkspace)?;
+    let mut transaction = begin_tenant(
+        &state.platform.database,
+        auth.tenant_scope(Some(workspace_id)),
+    )
+    .await?;
+    let result = sqlx::query(
+        "update service_accounts set revoked_at = coalesce(revoked_at, now())
+         where id = $1 and organization_id = $2 and workspace_id = $3",
+    )
+    .bind(service_account_id)
+    .bind(auth.organization_id)
+    .bind(workspace_id)
+    .execute(&mut *transaction)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(ApiError::NotFound);
+    }
+    insert_audit(
+        &mut transaction,
+        &auth,
+        Some(workspace_id),
+        "service_account.revoked",
+        "service_account",
+        service_account_id,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route(
@@ -1265,6 +1387,14 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/v1/organizations/{organization_id}/service-accounts/{service_account_id}/revoke",
             post(revoke_service_account),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/service-accounts",
+            get(list_workspace_service_accounts).post(create_workspace_service_account),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/service-accounts/{service_account_id}/revoke",
+            post(revoke_workspace_service_account),
         )
 }
 
@@ -1802,6 +1932,37 @@ mod tests {
         assert!(
             context
                 .require_workspace(workspace_id, Permission::ManageWorkspace)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn platform_support_grant_uses_the_selected_workspace_without_membership() {
+        let organization_id = Uuid::now_v7();
+        let workspace_id = Uuid::now_v7();
+        let mut context = user_context(
+            organization_id,
+            workspace_id,
+            OrganizationRole::Member,
+            WorkspaceRole::Viewer,
+        );
+        context.organization_role = None;
+        context.workspace_role = None;
+        context.tenant_access_grant_id = Some(Uuid::now_v7());
+
+        assert!(
+            context
+                .require_organization(organization_id, Permission::ManageOrganization)
+                .is_ok()
+        );
+        assert!(
+            context
+                .require_workspace(workspace_id, Permission::ManageWorkspace)
+                .is_ok()
+        );
+        assert!(
+            context
+                .require_workspace(Uuid::now_v7(), Permission::ReadWorkspace)
                 .is_err()
         );
     }

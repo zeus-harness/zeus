@@ -40,12 +40,16 @@ describe('server API session forwarding', () => {
       'zeus_session=session-token; Path=/; HttpOnly; SameSite=Lax; Max-Age=7200; Secure'
     );
     headers.append('set-cookie', 'zeus_csrf=csrf-token; Path=/; SameSite=Lax; Max-Age=7200');
+    headers.append(
+      'set-cookie',
+      'zeus_tenant_access_grant=grant-id; Path=/; HttpOnly; SameSite=Lax; Max-Age=3600'
+    );
     headers.append('set-cookie', 'unrelated=value; Path=/');
     const set = vi.fn();
 
     expect(
       forwardZeusAuthCookies(new Response(null, { headers }), { set } as unknown as Cookies)
-    ).toBe(2);
+    ).toBe(3);
     expect(set).toHaveBeenNthCalledWith(1, 'zeus_session', 'session-token', {
       path: '/',
       httpOnly: true,
@@ -59,6 +63,13 @@ describe('server API session forwarding', () => {
       secure: false,
       sameSite: 'lax',
       maxAge: 7200
+    });
+    expect(set).toHaveBeenNthCalledWith(3, 'zeus_tenant_access_grant', 'grant-id', {
+      path: '/',
+      httpOnly: true,
+      secure: false,
+      sameSite: 'lax',
+      maxAge: 3600
     });
   });
 

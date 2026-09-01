@@ -41,6 +41,8 @@ Zeus 是面向企业团队的云端 Harness Agent。代码从 `0.1.0` 开始，H
 - K2 已完成。全局 `external_identities` 与 Organization 范围的 `organization_federated_bindings` 已分离。同邮箱账号不得自动合并。
 - K3 已完成。平台租户操作使用绑定 Web Session 的限时 Grant；Grant 逐请求校验，不生成 Membership，不绕过 RLS。
 - K4 已完成。Web 使用 Workspace URL、POST Context 选择和独立的 Workspace、Organization、Platform 设置区域；旧根路径与 `/admin/*` 已移除。
+- K5 已完成。Workspace Service Account、平台支持 Workspace Context、Organization Suspend 执行阻断、多 Organization 外部身份和入口分支已有真实 PostgreSQL、Web 和 Apple `container` 验证。
+- `0029_tenant_state_execution_guard.sql` 保证 Runtime 不领取非 active Organization 的 Run。Suspend 同时拒绝业务写入、Schedule/Webhook、联合登录和 OIDC Authorization/Refresh。
 - 平台支持 Grant 必须逐请求从 PostgreSQL 校验，保留真实 Actor、Grant ID 和原因，不写 Membership，不绕过 RLS。
 - `platform_managed` Organization 对 Owner 隐藏并拒绝身份设置的读写 API。
 - `apps/web` 保存业务路由和组件。`packages/ui/src/lib/components/ui` 保存共享基础组件。不要复制基础组件或新增视觉系统。
@@ -99,6 +101,7 @@ npx @sveltejs/mcp svelte-autofixer <file> --svelte-version 5
 - 版本表和事件表禁止原地修改。
 - 本地和新环境必须先运行 `pnpm db:bootstrap`，再运行 migration。
 - HTTP 池固定使用 `zeus_http`。Runtime 池固定使用 `zeus_runtime`。不要让服务以 migration owner 身份执行请求。
+- 运行 ignored PostgreSQL 集成测试时只启动隔离 PostgreSQL。不要同时运行指向同一测试库的 `zeus-api`，否则内嵌 Supervisor 会领取测试创建的 queued Run。
 
 ## API 契约
 
