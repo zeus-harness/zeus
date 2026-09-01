@@ -38,7 +38,7 @@ Zeus 是面向企业团队的云端 Harness Agent。代码从 `0.1.0` 开始，H
 - K1 已完成。Organization/Workspace 的 `admin` 已迁移为 `owner`。平台角色继续使用 `platform_admin`。
 - Organization 权限不能隐式授权 Workspace 动作。Workspace 请求需要 Workspace Membership 或有效平台支持 Grant。
 - 联合 JIT 默认角色是 `member`。不得因为角色迁移把普通 JIT 用户提升为 Owner。
-- K2 使用全局 `external_identities` 和 Organization 范围的 `organization_federated_bindings`。同邮箱账号不得自动合并。
+- K2 已完成。全局 `external_identities` 与 Organization 范围的 `organization_federated_bindings` 已分离。同邮箱账号不得自动合并。
 - 平台支持 Grant 必须逐请求从 PostgreSQL 校验，保留真实 Actor、Grant ID 和原因，不写 Membership，不绕过 RLS。
 - `platform_managed` Organization 对 Owner 隐藏并拒绝身份设置的读写 API。
 - `apps/web` 保存业务路由和组件。`packages/ui/src/lib/components/ui` 保存共享基础组件。不要复制基础组件或新增视觉系统。

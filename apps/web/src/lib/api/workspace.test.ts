@@ -186,7 +186,7 @@ describe('workspace API helpers', () => {
     );
   });
 
-  it('normalizes user workspaces without exposing identity-provider payloads', async () => {
+  it('normalizes user workspaces from the tenant selector response', async () => {
     const fetcher = vi.fn<WorkspaceApiFetcher>().mockResolvedValue(
       jsonResponse([
         {
@@ -198,8 +198,7 @@ describe('workspace API helpers', () => {
           workspaces: [
             { id: 'ws-1', slug: 'platform', name: 'Platform', status: 'active', role: 'owner' },
             { id: 42, name: 'invalid' }
-          ],
-          identity_providers: [{ id: 'provider-secret-metadata' }]
+          ]
         }
       ])
     );

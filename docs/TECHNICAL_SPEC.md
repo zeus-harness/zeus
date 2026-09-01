@@ -331,7 +331,7 @@ Organization 设置位于 `/organizations/:organizationId/settings/*`。平台�
 
 Organization Owner 管理 Organization 元数据、成员、邀请、Workspace 生命周期和 Capability Catalog。Workspace Owner 管理 Workspace 元数据、成员、模型、连接、Capability Policy 和 Service Account。Builder 保留构建与启动 Run 的能力；Operator 管理 WorkItem、Run 和 Approval；Auditor 只读 Organization Audit/Security Event。
 
-外部身份拆成两层。`external_identities` 以 `(issuer, subject)` 全局唯一绑定 Zeus 用户。`organization_federated_bindings` 表示 Organization Provider 对该身份的信任，使用 Organization/Provider 复合外键。Provider Token 完成完整 OIDC 校验后才能解析身份。显式绑定要求已验证 Session 和十分钟内认证；JIT 默认 `member`。
+外部身份拆成两层。`external_identities` 以 `(issuer, subject)` 全局唯一绑定 Zeus 用户。`organization_federated_bindings` 表示 Organization Provider 对该身份的信任，使用 Organization/Provider 复合外键。Provider Token 完成完整 OIDC 校验后才能解析身份。显式绑定要求已验证 Session 和十分钟内认证；JIT 默认 `member`。Binding 保存 Provider claims、绑定来源、状态、绑定时间和最后登录时间。解除一个 Binding 不影响其它 Organization。全局身份撤销要求所有 Binding 已解除，且用户仍有密码或另一个 active 外部身份。
 
 Organization 身份设置模式为 `self_service | platform_managed`。后者拒绝 Organization Owner 对 Identity Provider、Verified Domain、Identity Policy 和 OIDC Client 的读写。平台创建 Organization 时同时创建初始 Workspace 和单次 Owner 邀请；激活后 slug 不可修改。
 
@@ -339,7 +339,7 @@ Organization 身份设置模式为 `self_service | platform_managed`。后者拒
 
 Organization 状态固定为 `provisioning | active | suspended | archived`。Suspend 阻止新业务写入、Run claim、Schedule/Webhook 投递、联合登录、OIDC Authorization 和 Refresh，并为未完成 Run 请求取消。恢复先进入 `suspended`。已签发 Access Token 最多继续存活 5 分钟。
 
-K0-K1 已实现。`0025_tenant_owner_governance.sql` 已在 PostgreSQL 18.6 空库执行，Owner、Provisioning 邀请和 `platform_managed` API 拒绝已有真实数据库测试。K2-K5 仍是目标契约。
+K0-K2 已实现。`0025_tenant_owner_governance.sql` 和 `0026_global_external_identities.sql` 已在 PostgreSQL 18.6 空库执行。Owner、Provisioning 邀请、`platform_managed` API 拒绝、跨 Organization Provider 拒绝、Binding 独立撤销和全局身份登录方式保护都有真实数据库测试。K3-K5 仍是目标契约。
 
 ## 密钥
 

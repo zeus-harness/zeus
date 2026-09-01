@@ -7,121 +7,73 @@ import {
   serverApiFetcher,
   serverApiUrl
 } from '$lib/api/server';
+import type { components } from '$lib/api/generated/schema';
 
-export type FederatedIdentity = {
-  identity_id: string;
-  provider_id: string;
-  organization_id: string;
-  organization_name: string;
-  provider_slug: string;
-  issuer: string;
-  subject: string;
-  linked_at: string;
-  last_login_at: string;
-};
-
-export type FederatedIdentityProvider = {
-  id: string;
-  organization_id: string;
-  slug: string;
-  issuer_url: string;
-  enabled: boolean;
-};
-
-type UserOrganization = {
-  organization_id: string;
-  identity_providers: FederatedIdentityProvider[];
-};
+export type OrganizationFederatedBinding =
+  components['schemas']['OrganizationFederatedBindingResponse'];
+export type ExternalIdentity = components['schemas']['ExternalIdentityResponse'];
+export type AvailableFederatedProvider =
+  components['schemas']['AvailableFederatedProviderResponse'];
+type ExternalIdentityOverview = components['schemas']['ExternalIdentityOverviewResponse'];
 
 type JsonRecord = Record<string, unknown>;
-
-type CollectionResult<T> = {
-  data: T[];
-  error: string | null;
-};
 
 function isJsonRecord(value: unknown): value is JsonRecord {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function isFederatedIdentity(value: unknown): value is FederatedIdentity {
+function isOrganizationBinding(value: unknown): value is OrganizationFederatedBinding {
   return (
     isJsonRecord(value) &&
-    typeof value.identity_id === 'string' &&
-    typeof value.provider_id === 'string' &&
+    typeof value.binding_id === 'string' &&
     typeof value.organization_id === 'string' &&
     typeof value.organization_name === 'string' &&
+    typeof value.provider_id === 'string' &&
     typeof value.provider_slug === 'string' &&
-    typeof value.issuer === 'string' &&
-    typeof value.subject === 'string' &&
+    typeof value.status === 'string' &&
+    typeof value.binding_source === 'string' &&
     typeof value.linked_at === 'string' &&
     typeof value.last_login_at === 'string'
   );
 }
 
-function isFederatedIdentityProvider(value: unknown): value is FederatedIdentityProvider {
+function isExternalIdentity(value: unknown): value is ExternalIdentity {
   return (
     isJsonRecord(value) &&
-    typeof value.id === 'string' &&
-    typeof value.organization_id === 'string' &&
-    typeof value.slug === 'string' &&
-    typeof value.issuer_url === 'string' &&
-    typeof value.enabled === 'boolean'
+    typeof value.identity_id === 'string' &&
+    typeof value.issuer === 'string' &&
+    typeof value.subject === 'string' &&
+    typeof value.status === 'string' &&
+    typeof value.created_at === 'string' &&
+    typeof value.last_login_at === 'string' &&
+    Array.isArray(value.organization_bindings) &&
+    value.organization_bindings.every(isOrganizationBinding)
   );
 }
 
-function isUserOrganization(value: unknown): value is UserOrganization {
+function isAvailableProvider(value: unknown): value is AvailableFederatedProvider {
   return (
     isJsonRecord(value) &&
+    typeof value.provider_id === 'string' &&
     typeof value.organization_id === 'string' &&
-    Array.isArray(value.identity_providers) &&
-    value.identity_providers.every(isFederatedIdentityProvider)
+    typeof value.organization_name === 'string' &&
+    typeof value.provider_slug === 'string' &&
+    typeof value.issuer === 'string'
+  );
+}
+
+function isExternalIdentityOverview(value: unknown): value is ExternalIdentityOverview {
+  return (
+    isJsonRecord(value) &&
+    Array.isArray(value.identities) &&
+    value.identities.every(isExternalIdentity) &&
+    Array.isArray(value.available_providers) &&
+    value.available_providers.every(isAvailableProvider)
   );
 }
 
 function responseStatus(status: number): number {
   return status >= 400 && status <= 599 ? status : 502;
-}
-
-function collectionError(status: number, resource: string): string {
-  if (status === 403) return `当前账号无权读取${resource}。`;
-  if (status >= 500) return `${resource}服务暂时不可用，请稍后重试。`;
-  return `无法读取${resource}，请稍后重试。`;
-}
-
-async function loadCollection<T>(
-  apiFetch: typeof fetch,
-  path: string,
-  resource: string,
-  isItem: (value: unknown) => value is T
-): Promise<CollectionResult<T>> {
-  let response: Response;
-  try {
-    response = await apiFetch(serverApiUrl(env.ZEUS_API_URL, path), {
-      headers: { accept: 'application/json' }
-    });
-  } catch {
-    return { data: [], error: `无法连接${resource} API，请稍后重试。` };
-  }
-
-  if (response.status === 401) {
-    redirect(303, '/login');
-  }
-  if (!response.ok) {
-    return { data: [], error: collectionError(response.status, resource) };
-  }
-
-  let payload: unknown;
-  try {
-    payload = await response.json();
-  } catch {
-    return { data: [], error: `${resource} API 返回了无法识别的响应。` };
-  }
-  if (!Array.isArray(payload) || !payload.every(isItem)) {
-    return { data: [], error: `${resource} API 返回了无法识别的响应。` };
-  }
-
-  return { data: payload, error: null };
 }
 
 function formValue(formData: FormData, name: string): string {
@@ -148,16 +100,22 @@ async function responseJson(response: Response): Promise<unknown> {
 function linkErrorMessage(status: number): string {
   if (status === 403) return '当前账号无法绑定该企业身份。';
   if (status === 404) return '企业身份提供商不存在或已停用。';
-  if (status === 409) return '该企业身份已经绑定到其他账号。';
+  if (status === 409) return '该外部身份已经绑定到其他 Zeus 账号。';
   if (status >= 500) return '企业身份绑定服务暂时不可用，请稍后重试。';
   return '无法发起企业身份绑定，请稍后重试。';
 }
 
 function unlinkErrorMessage(status: number): string {
-  if (status === 404) return '该企业身份不存在或已经解绑。';
-  if (status === 409) return '至少需要保留一种登录方式。';
+  if (status === 404) return '该 Organization 信任绑定不存在或已经解除。';
   if (status >= 500) return '企业身份解绑服务暂时不可用，请稍后重试。';
-  return '无法解绑该企业身份，请稍后重试。';
+  return '无法解除该 Organization 信任绑定，请稍后重试。';
+}
+
+function revokeErrorMessage(status: number): string {
+  if (status === 404) return '该外部身份不存在或已经撤销。';
+  if (status === 409) return '请先解除全部 Organization 绑定，并保留另一种登录方式。';
+  if (status >= 500) return '外部身份撤销服务暂时不可用，请稍后重试。';
+  return '无法撤销该外部身份，请稍后重试。';
 }
 
 export const load: PageServerLoad = async ({ fetch, parent, request, url }) => {
@@ -165,39 +123,49 @@ export const load: PageServerLoad = async ({ fetch, parent, request, url }) => {
   if (auth.status === 'unauthenticated') {
     redirect(303, '/login');
   }
-
   if (auth.status !== 'ready') {
     return {
       identities: [],
-      identityLoadError: '无法确认当前登录状态，请稍后重试。',
       providers: [],
-      providerLoadError: null
+      loadError: '无法确认当前登录状态，请稍后重试。'
     };
   }
 
   const apiFetch = serverApiFetcher(fetch, request.headers.get('cookie'), url.origin);
-  const identitiesPromise = loadCollection(
-    apiFetch,
-    '/api/v1/users/me/federated-identities',
-    '已绑定企业身份',
-    isFederatedIdentity
-  );
-  const organizationsPromise = loadCollection(
-    apiFetch,
-    '/api/v1/users/me/organizations',
-    '企业登录配置',
-    isUserOrganization
-  );
-  const [identities, organizations] = await Promise.all([
-    identitiesPromise,
-    organizationsPromise
-  ]);
-
+  let response: Response;
+  try {
+    response = await apiFetch(
+      serverApiUrl(env.ZEUS_API_URL, '/api/v1/users/me/external-identities'),
+      { headers: { accept: 'application/json' } }
+    );
+  } catch {
+    return { identities: [], providers: [], loadError: '无法连接外部身份 API，请稍后重试。' };
+  }
+  if (response.status === 401) {
+    redirect(303, '/login');
+  }
+  if (!response.ok) {
+    return {
+      identities: [],
+      providers: [],
+      loadError:
+        response.status >= 500
+          ? '外部身份服务暂时不可用，请稍后重试。'
+          : '无法读取外部身份，请稍后重试。'
+    };
+  }
+  const payload = await responseJson(response);
+  if (!isExternalIdentityOverview(payload)) {
+    return {
+      identities: [],
+      providers: [],
+      loadError: '外部身份 API 返回了无法识别的响应。'
+    };
+  }
   return {
-    identities: identities.data,
-    identityLoadError: identities.error,
-    providers: organizations.data.flatMap((organization) => organization.identity_providers),
-    providerLoadError: organizations.error
+    identities: payload.identities,
+    providers: payload.available_providers,
+    loadError: null
   };
 };
 
@@ -214,13 +182,11 @@ export const actions: Actions = {
     let response: Response;
     try {
       response = await apiFetch(
-        serverApiUrl(
-          env.ZEUS_API_URL,
-          `/api/v1/users/me/federated-identities/${encodeURIComponent(providerId)}/link-intents`
-        ),
+        serverApiUrl(env.ZEUS_API_URL, '/api/v1/users/me/external-identities/link-intents'),
         {
           method: 'POST',
-          headers: { accept: 'application/json' }
+          headers: { accept: 'application/json', 'content-type': 'application/json' },
+          body: JSON.stringify({ provider_id: providerId })
         }
       );
     } catch {
@@ -228,13 +194,10 @@ export const actions: Actions = {
     }
 
     forwardZeusAuthCookies(response, event.cookies);
-    if (response.status === 401) {
-      redirect(303, '/login');
-    }
+    if (response.status === 401) redirect(303, '/login');
     if (!response.ok) {
       return actionError(responseStatus(response.status), linkErrorMessage(response.status));
     }
-
     const payload = await responseJson(response);
     if (!isLinkIntentResponse(payload)) {
       return actionError(502, '企业身份绑定 API 返回了无法识别的响应。');
@@ -252,9 +215,13 @@ export const actions: Actions = {
     redirect(303, authorizationUrl.toString());
   },
 
-  unlink: async (event) => {
-    const identityId = formValue(await event.request.formData(), 'identity_id');
-    if (!identityId) return actionError(400, '缺少要解绑的企业身份。');
+  unlinkBinding: async (event) => {
+    const formData = await event.request.formData();
+    const identityId = formValue(formData, 'identity_id');
+    const bindingId = formValue(formData, 'binding_id');
+    if (!identityId || !bindingId) {
+      return actionError(400, '缺少要解除的 Organization 信任绑定。');
+    }
 
     const apiFetch = serverApiFetcher(
       event.fetch,
@@ -266,25 +233,49 @@ export const actions: Actions = {
       response = await apiFetch(
         serverApiUrl(
           env.ZEUS_API_URL,
-          `/api/v1/users/me/federated-identities/${encodeURIComponent(identityId)}`
+          `/api/v1/users/me/external-identities/${encodeURIComponent(identityId)}/organization-bindings/${encodeURIComponent(bindingId)}`
         ),
-        {
-          method: 'DELETE',
-          headers: { accept: 'application/json' }
-        }
+        { method: 'DELETE', headers: { accept: 'application/json' } }
       );
     } catch {
       return actionError(503, '无法连接企业身份解绑 API，请稍后重试。');
     }
 
     forwardZeusAuthCookies(response, event.cookies);
-    if (response.status === 401) {
-      redirect(303, '/login');
-    }
+    if (response.status === 401) redirect(303, '/login');
     if (!response.ok) {
       return actionError(responseStatus(response.status), unlinkErrorMessage(response.status));
     }
+    return { type: 'success' as const, message: 'Organization 信任绑定已解除。' };
+  },
 
-    return { type: 'success' as const, message: '企业身份已解绑。' };
+  revokeIdentity: async (event) => {
+    const identityId = formValue(await event.request.formData(), 'identity_id');
+    if (!identityId) return actionError(400, '缺少要撤销的外部身份。');
+
+    const apiFetch = serverApiFetcher(
+      event.fetch,
+      event.request.headers.get('cookie'),
+      event.url.origin
+    );
+    let response: Response;
+    try {
+      response = await apiFetch(
+        serverApiUrl(
+          env.ZEUS_API_URL,
+          `/api/v1/users/me/external-identities/${encodeURIComponent(identityId)}`
+        ),
+        { method: 'DELETE', headers: { accept: 'application/json' } }
+      );
+    } catch {
+      return actionError(503, '无法连接外部身份撤销 API，请稍后重试。');
+    }
+
+    forwardZeusAuthCookies(response, event.cookies);
+    if (response.status === 401) redirect(303, '/login');
+    if (!response.ok) {
+      return actionError(responseStatus(response.status), revokeErrorMessage(response.status));
+    }
+    return { type: 'success' as const, message: '全局外部身份已撤销。' };
   }
 };

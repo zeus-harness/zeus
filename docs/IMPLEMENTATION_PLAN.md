@@ -312,13 +312,15 @@ K 阶段使用 ADR 0008。版本保持 `0.1.0`，API 前缀保持 `/api/v1`。�
 
 ### K2：全局外部身份
 
-状态：`pending`
+状态：`done`
 
 - 新增 `0026_global_external_identities.sql`。
 - 迁移为 `external_identities` 和 `organization_federated_bindings`，保留 claims、绑定时间和最后登录时间。
 - 使用 Organization/Provider 复合外键。旧表和函数只在停掉旧 API 后删除。
 - 重写登录、JIT、显式绑定、解绑和 Account Federation API。
 - 保留同邮箱不自动合并、近期认证、state/nonce/PKCE 和 Provider 精确校验。
+
+验收记录：PostgreSQL 18.6 空库迁移到 `26`。旧表数据升级时保留全局身份与 Binding 数量。真实数据库测试覆盖同一 `(issuer, subject)` 在两个 Organization 建立独立 Binding、复合外键拒绝跨 Organization Provider、单 Binding 撤销隔离、active Binding 阻止全局撤销和最后登录方式保护。Account Federation API、OpenAPI 与 Web 页面已切换到 `/api/v1/users/me/external-identities`，旧 `federated-identities` 路径已移除。H 和 I5 状态未变。
 
 ### K3：平台租户管理
 

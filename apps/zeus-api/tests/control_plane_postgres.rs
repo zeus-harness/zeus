@@ -217,7 +217,7 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
         .await
         .expect("organization activates after owners exist");
     let account_link_required = sqlx::query_as::<_, (String, Option<Uuid>, Uuid, Option<Uuid>)>(
-        "select * from zeus_private.resolve_federated_identity(
+        "select * from zeus_private.resolve_external_identity(
            $1, 'login', null, $2, $3, $4, $5, true, $6, $7
          )",
     )
@@ -234,7 +234,7 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     assert_eq!(account_link_required.0, "account_link_required");
     assert_eq!(account_link_required.1, None);
     let identity_count: i64 = sqlx::query_scalar(
-        "select count(*) from federated_identities
+        "select count(*) from external_identities
          where issuer = 'https://issuer.example.test' and subject = $1",
     )
     .bind(&existing_subject)
@@ -247,7 +247,7 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     );
 
     let linked = sqlx::query_as::<_, (String, Option<Uuid>, Uuid, Option<Uuid>)>(
-        "select * from zeus_private.resolve_federated_identity(
+        "select * from zeus_private.resolve_external_identity(
            $1, 'link', $2, $3, $4, $5, $6, true, $7, $8
          )",
     )
@@ -266,7 +266,7 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     assert_eq!(linked.1, Some(existing_user_id));
 
     let authenticated = sqlx::query_as::<_, (String, Option<Uuid>, Uuid, Option<Uuid>)>(
-        "select * from zeus_private.resolve_federated_identity(
+        "select * from zeus_private.resolve_external_identity(
            $1, 'login', null, $2, $3, $4, $5, true, $6, $7
          )",
     )
@@ -397,7 +397,7 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     let jit_subject = format!("control-subject-{organization_id}");
     let jit_email = format!("builder-{organization_id}@example.test");
     let jit_identity = sqlx::query_as::<_, (String, Option<Uuid>, Uuid, Option<Uuid>)>(
-        "select * from zeus_private.resolve_federated_identity(
+        "select * from zeus_private.resolve_external_identity(
            $1, 'login', null, $2, $3, $4, $5, $6, $7, $8
          )",
     )
@@ -484,8 +484,28 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
         user_organizations[0]["organization_id"],
         organization_id.to_string()
     );
+    assert!(
+        user_organizations[0].get("identity_providers").is_none(),
+        "tenant selection does not expose identity provider metadata"
+    );
+
+    let external_identities = send_user(
+        &app,
+        Method::GET,
+        "/api/v1/users/me/external-identities",
+        &existing_session_token,
+        &existing_csrf_token,
+        None,
+        &[],
+    )
+    .await;
+    let (_, external_identities) = expect_json(external_identities, StatusCode::OK).await;
     assert_eq!(
-        user_organizations[0]["identity_providers"][0]["id"],
+        external_identities["identities"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        external_identities["available_providers"][0]["provider_id"],
         federated_provider_id.to_string()
     );
 

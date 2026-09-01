@@ -1549,20 +1549,18 @@ paths:
                 $ref: '#/components/schemas/ProblemDetails'
       security:
       - {}
-  /api/v1/users/me/federated-identities:
+  /api/v1/users/me/external-identities:
     get:
       tags:
       - identity
-      operationId: list_federated_identities
+      operationId: list_external_identities
       responses:
         '200':
-          description: Federated identities linked to the current user
+          description: External identities and Organization trust bindings
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/FederatedIdentityResponse'
+                $ref: '#/components/schemas/ExternalIdentityOverviewResponse'
         default:
           description: Problem Details error
           content:
@@ -1572,11 +1570,38 @@ paths:
       security:
       - sessionCookie: []
       - serviceAccountBearer: []
-  /api/v1/users/me/federated-identities/{identity_id}:
+  /api/v1/users/me/external-identities/link-intents:
+    post:
+      tags:
+      - identity
+      operationId: create_external_identity_link_intent
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExternalIdentityLinkIntentRequest'
+        required: true
+      responses:
+        '200':
+          description: External identity link authorization URL
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExternalIdentityLinkIntentResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/users/me/external-identities/{identity_id}:
     delete:
       tags:
       - identity
-      operationId: unlink_federated_identity
+      operationId: revoke_external_identity
       parameters:
       - name: identity_id
         in: path
@@ -1586,7 +1611,7 @@ paths:
           format: uuid
       responses:
         '204':
-          description: Federated identity unlinked
+          description: Global external identity revoked
         default:
           description: Problem Details error
           content:
@@ -1596,25 +1621,27 @@ paths:
       security:
       - sessionCookie: []
       - serviceAccountBearer: []
-  /api/v1/users/me/federated-identities/{provider_id}/link-intents:
-    post:
+  /api/v1/users/me/external-identities/{identity_id}/organization-bindings/{binding_id}:
+    delete:
       tags:
       - identity
-      operationId: create_federated_link_intent
+      operationId: unlink_organization_federated_binding
       parameters:
-      - name: provider_id
+      - name: identity_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: binding_id
         in: path
         required: true
         schema:
           type: string
           format: uuid
       responses:
-        '200':
-          description: Federated link authorization URL
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/FederatedLinkIntentResponse'
+        '204':
+          description: Organization trust binding revoked
         default:
           description: Problem Details error
           content:
@@ -5527,6 +5554,27 @@ components:
           type: array
           items:
             type: string
+    AvailableFederatedProviderResponse:
+      type: object
+      required:
+      - provider_id
+      - organization_id
+      - organization_name
+      - provider_slug
+      - issuer
+      properties:
+        issuer:
+          type: string
+        organization_id:
+          type: string
+          format: uuid
+        organization_name:
+          type: string
+        provider_id:
+          type: string
+          format: uuid
+        provider_slug:
+          type: string
     CancelRunRequest:
       type: object
       properties:
@@ -6631,6 +6679,65 @@ components:
         version_number:
           type: integer
           format: int32
+    ExternalIdentityLinkIntentRequest:
+      type: object
+      required:
+      - provider_id
+      properties:
+        provider_id:
+          type: string
+          format: uuid
+    ExternalIdentityLinkIntentResponse:
+      type: object
+      required:
+      - authorization_url
+      properties:
+        authorization_url:
+          type: string
+    ExternalIdentityOverviewResponse:
+      type: object
+      required:
+      - identities
+      - available_providers
+      properties:
+        available_providers:
+          type: array
+          items:
+            $ref: '#/components/schemas/AvailableFederatedProviderResponse'
+        identities:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExternalIdentityResponse'
+    ExternalIdentityResponse:
+      type: object
+      required:
+      - identity_id
+      - issuer
+      - subject
+      - status
+      - created_at
+      - last_login_at
+      - organization_bindings
+      properties:
+        created_at:
+          type: string
+          format: date-time
+        identity_id:
+          type: string
+          format: uuid
+        issuer:
+          type: string
+        last_login_at:
+          type: string
+          format: date-time
+        organization_bindings:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrganizationFederatedBindingResponse'
+        status:
+          type: string
+        subject:
+          type: string
     ExternalReferenceResponse:
       type: object
       required:
@@ -6764,49 +6871,6 @@ components:
         updated_at:
           type: string
           format: date-time
-    FederatedIdentityResponse:
-      type: object
-      required:
-      - identity_id
-      - provider_id
-      - organization_id
-      - organization_name
-      - provider_slug
-      - issuer
-      - subject
-      - linked_at
-      - last_login_at
-      properties:
-        identity_id:
-          type: string
-          format: uuid
-        issuer:
-          type: string
-        last_login_at:
-          type: string
-          format: date-time
-        linked_at:
-          type: string
-          format: date-time
-        organization_id:
-          type: string
-          format: uuid
-        organization_name:
-          type: string
-        provider_id:
-          type: string
-          format: uuid
-        provider_slug:
-          type: string
-        subject:
-          type: string
-    FederatedLinkIntentResponse:
-      type: object
-      required:
-      - authorization_url
-      properties:
-        authorization_url:
-          type: string
     HealthResponse:
       type: object
       required:
@@ -7149,6 +7213,42 @@ components:
           - string
           - 'null'
           format: date-time
+    OrganizationFederatedBindingResponse:
+      type: object
+      required:
+      - binding_id
+      - organization_id
+      - organization_name
+      - provider_id
+      - provider_slug
+      - status
+      - binding_source
+      - linked_at
+      - last_login_at
+      properties:
+        binding_id:
+          type: string
+          format: uuid
+        binding_source:
+          type: string
+        last_login_at:
+          type: string
+          format: date-time
+        linked_at:
+          type: string
+          format: date-time
+        organization_id:
+          type: string
+          format: uuid
+        organization_name:
+          type: string
+        provider_id:
+          type: string
+          format: uuid
+        provider_slug:
+          type: string
+        status:
+          type: string
     OrganizationIdentityPolicyResponse:
       type: object
       required:
@@ -8334,9 +8434,7 @@ components:
       - organization_status
       - organization_role
       - workspaces
-      - identity_providers
       properties:
-        identity_providers: {}
         organization_id:
           type: string
           format: uuid

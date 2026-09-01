@@ -898,7 +898,6 @@ pub struct UserOrganizationResponse {
     pub organization_status: String,
     pub organization_role: String,
     pub workspaces: serde_json::Value,
-    pub identity_providers: serde_json::Value,
 }
 
 #[utoipa::path(
@@ -971,51 +970,171 @@ pub async fn accept_invitation(
     ))
 }
 
-#[derive(Debug, Serialize, ToSchema, FromRow)]
-pub struct FederatedIdentityResponse {
-    pub identity_id: Uuid,
-    pub provider_id: Uuid,
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OrganizationFederatedBindingResponse {
+    pub binding_id: Uuid,
     pub organization_id: Uuid,
     pub organization_name: String,
+    pub provider_id: Uuid,
     pub provider_slug: String,
-    pub issuer: String,
-    pub subject: String,
+    pub status: String,
+    pub binding_source: String,
     #[serde(with = "time::serde::rfc3339")]
     pub linked_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub last_login_at: OffsetDateTime,
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ExternalIdentityResponse {
+    pub identity_id: Uuid,
+    pub issuer: String,
+    pub subject: String,
+    pub status: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub last_login_at: OffsetDateTime,
+    pub organization_bindings: Vec<OrganizationFederatedBindingResponse>,
+}
+
+#[derive(Debug, Serialize, ToSchema, FromRow)]
+pub struct AvailableFederatedProviderResponse {
+    pub provider_id: Uuid,
+    pub organization_id: Uuid,
+    pub organization_name: String,
+    pub provider_slug: String,
+    pub issuer: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ExternalIdentityOverviewResponse {
+    pub identities: Vec<ExternalIdentityResponse>,
+    pub available_providers: Vec<AvailableFederatedProviderResponse>,
+}
+
+#[derive(Debug, FromRow)]
+struct ExternalIdentityBindingRow {
+    identity_id: Uuid,
+    issuer: String,
+    subject: String,
+    identity_status: String,
+    identity_created_at: OffsetDateTime,
+    identity_last_login_at: OffsetDateTime,
+    binding_id: Option<Uuid>,
+    organization_id: Option<Uuid>,
+    organization_name: Option<String>,
+    provider_id: Option<Uuid>,
+    provider_slug: Option<String>,
+    binding_status: Option<String>,
+    binding_source: Option<String>,
+    binding_linked_at: Option<OffsetDateTime>,
+    binding_last_login_at: Option<OffsetDateTime>,
+}
+
 #[utoipa::path(
     get,
-    path = "/api/v1/users/me/federated-identities",
+    path = "/api/v1/users/me/external-identities",
     tag = "identity",
-    responses((status = 200, description = "Federated identities linked to the current user", body = [FederatedIdentityResponse]))
+    responses((status = 200, description = "External identities and Organization trust bindings", body = ExternalIdentityOverviewResponse))
 )]
-pub async fn list_federated_identities(
+pub async fn list_external_identities(
     State(state): State<AppState>,
     principal: PrincipalContext,
-) -> Result<Json<Vec<FederatedIdentityResponse>>, ApiError> {
+) -> Result<Json<ExternalIdentityOverviewResponse>, ApiError> {
     let user_id = principal.user_id.ok_or(ApiError::Forbidden)?;
     let session_id = principal.session_id.ok_or(ApiError::Forbidden)?;
-    let identities = sqlx::query_as::<_, FederatedIdentityResponse>(
-        "select * from zeus_private.list_user_federated_identities($1, $2)",
+    let rows = sqlx::query_as::<_, ExternalIdentityBindingRow>(
+        "select * from zeus_private.list_user_external_identities($1, $2)",
     )
     .bind(user_id)
     .bind(session_id)
     .fetch_all(&state.platform.database)
     .await?;
-    Ok(Json(identities))
+    let mut identities: Vec<ExternalIdentityResponse> = Vec::new();
+    for row in rows {
+        let identity_index = identities
+            .iter()
+            .position(|identity| identity.identity_id == row.identity_id)
+            .unwrap_or_else(|| {
+                identities.push(ExternalIdentityResponse {
+                    identity_id: row.identity_id,
+                    issuer: row.issuer.clone(),
+                    subject: row.subject.clone(),
+                    status: row.identity_status.clone(),
+                    created_at: row.identity_created_at,
+                    last_login_at: row.identity_last_login_at,
+                    organization_bindings: Vec::new(),
+                });
+                identities.len() - 1
+            });
+        if let Some(binding_id) = row.binding_id {
+            identities[identity_index].organization_bindings.push(
+                OrganizationFederatedBindingResponse {
+                    binding_id,
+                    organization_id: row.organization_id.ok_or(ApiError::Internal)?,
+                    organization_name: row.organization_name.ok_or(ApiError::Internal)?,
+                    provider_id: row.provider_id.ok_or(ApiError::Internal)?,
+                    provider_slug: row.provider_slug.ok_or(ApiError::Internal)?,
+                    status: row.binding_status.ok_or(ApiError::Internal)?,
+                    binding_source: row.binding_source.ok_or(ApiError::Internal)?,
+                    linked_at: row.binding_linked_at.ok_or(ApiError::Internal)?,
+                    last_login_at: row.binding_last_login_at.ok_or(ApiError::Internal)?,
+                },
+            );
+        }
+    }
+    let available_providers = sqlx::query_as::<_, AvailableFederatedProviderResponse>(
+        "select * from zeus_private.list_user_available_federated_providers($1, $2)",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_all(&state.platform.database)
+    .await?;
+    Ok(Json(ExternalIdentityOverviewResponse {
+        identities,
+        available_providers,
+    }))
 }
 
 #[utoipa::path(
     delete,
-    path = "/api/v1/users/me/federated-identities/{identity_id}",
+    path = "/api/v1/users/me/external-identities/{identity_id}/organization-bindings/{binding_id}",
+    tag = "identity",
+    params(("identity_id" = Uuid, Path), ("binding_id" = Uuid, Path)),
+    responses((status = 204, description = "Organization trust binding revoked"))
+)]
+pub async fn unlink_organization_federated_binding(
+    State(state): State<AppState>,
+    principal: PrincipalContext,
+    Path((identity_id, binding_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, ApiError> {
+    require_recent_authentication(&principal)?;
+    let user_id = principal.user_id.ok_or(ApiError::Forbidden)?;
+    let session_id = principal.session_id.ok_or(ApiError::Forbidden)?;
+    let removed: bool = sqlx::query_scalar(
+        "select zeus_private.unlink_organization_federated_binding($1, $2, $3, $4)",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(identity_id)
+    .bind(binding_id)
+    .fetch_one(&state.platform.database)
+    .await?;
+    if !removed {
+        return Err(ApiError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/v1/users/me/external-identities/{identity_id}",
     tag = "identity",
     params(("identity_id" = Uuid, Path)),
-    responses((status = 204, description = "Federated identity unlinked"))
+    responses((status = 204, description = "Global external identity revoked"))
 )]
-pub async fn unlink_federated_identity(
+pub async fn revoke_external_identity(
     State(state): State<AppState>,
     principal: PrincipalContext,
     Path(identity_id): Path<Uuid>,
@@ -1023,17 +1142,24 @@ pub async fn unlink_federated_identity(
     require_recent_authentication(&principal)?;
     let user_id = principal.user_id.ok_or(ApiError::Forbidden)?;
     let session_id = principal.session_id.ok_or(ApiError::Forbidden)?;
-    let removed: bool =
-        sqlx::query_scalar("select zeus_private.unlink_federated_identity($1, $2, $3)")
+    let disposition: String =
+        sqlx::query_scalar("select zeus_private.revoke_external_identity($1, $2, $3)")
             .bind(user_id)
             .bind(session_id)
             .bind(identity_id)
             .fetch_one(&state.platform.database)
             .await?;
-    if !removed {
-        return Err(ApiError::NotFound);
+    match disposition.as_str() {
+        "revoked" => Ok(StatusCode::NO_CONTENT),
+        "not_found" => Err(ApiError::NotFound),
+        "active_bindings" => Err(ApiError::Conflict(
+            "revoke every Organization binding before revoking the external identity".to_owned(),
+        )),
+        "last_sign_in_method" => Err(ApiError::Conflict(
+            "cannot remove the last sign-in method".to_owned(),
+        )),
+        _ => Err(ApiError::Internal),
     }
-    Ok(StatusCode::NO_CONTENT)
 }
 
 pub fn routes() -> Router<AppState> {
@@ -1071,12 +1197,16 @@ pub fn routes() -> Router<AppState> {
             post(accept_invitation),
         )
         .route(
-            "/api/v1/users/me/federated-identities",
-            get(list_federated_identities),
+            "/api/v1/users/me/external-identities",
+            get(list_external_identities),
         )
         .route(
-            "/api/v1/users/me/federated-identities/{identity_id}",
-            delete(unlink_federated_identity),
+            "/api/v1/users/me/external-identities/{identity_id}/organization-bindings/{binding_id}",
+            delete(unlink_organization_federated_binding),
+        )
+        .route(
+            "/api/v1/users/me/external-identities/{identity_id}",
+            delete(revoke_external_identity),
         )
         .route(
             "/api/v1/users/me/totp",

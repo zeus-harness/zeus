@@ -644,14 +644,14 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/users/me/federated-identities": {
+    "/api/v1/users/me/external-identities": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get: operations["list_federated_identities"];
+        get: operations["list_external_identities"];
         put?: never;
         post?: never;
         delete?: never;
@@ -660,7 +660,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/users/me/federated-identities/{identity_id}": {
+    "/api/v1/users/me/external-identities/link-intents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["create_external_identity_link_intent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/users/me/external-identities/{identity_id}": {
         parameters: {
             query?: never;
             header?: never;
@@ -670,13 +686,13 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        delete: operations["unlink_federated_identity"];
+        delete: operations["revoke_external_identity"];
         options?: never;
         head?: never;
         patch?: never;
         trace?: never;
     };
-    "/api/v1/users/me/federated-identities/{provider_id}/link-intents": {
+    "/api/v1/users/me/external-identities/{identity_id}/organization-bindings/{binding_id}": {
         parameters: {
             query?: never;
             header?: never;
@@ -685,8 +701,8 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        post: operations["create_federated_link_intent"];
-        delete?: never;
+        post?: never;
+        delete: operations["unlink_organization_federated_binding"];
         options?: never;
         head?: never;
         patch?: never;
@@ -2099,6 +2115,15 @@ export interface components {
             request_id: string;
             scopes: string[];
         };
+        AvailableFederatedProviderResponse: {
+            issuer: string;
+            /** Format: uuid */
+            organization_id: string;
+            organization_name: string;
+            /** Format: uuid */
+            provider_id: string;
+            provider_slug: string;
+        };
         CancelRunRequest: {
             reason?: string | null;
         };
@@ -2550,6 +2575,29 @@ export interface components {
             /** Format: int32 */
             version_number: number;
         };
+        ExternalIdentityLinkIntentRequest: {
+            /** Format: uuid */
+            provider_id: string;
+        };
+        ExternalIdentityLinkIntentResponse: {
+            authorization_url: string;
+        };
+        ExternalIdentityOverviewResponse: {
+            available_providers: components["schemas"]["AvailableFederatedProviderResponse"][];
+            identities: components["schemas"]["ExternalIdentityResponse"][];
+        };
+        ExternalIdentityResponse: {
+            /** Format: date-time */
+            created_at: string;
+            /** Format: uuid */
+            identity_id: string;
+            issuer: string;
+            /** Format: date-time */
+            last_login_at: string;
+            organization_bindings: components["schemas"]["OrganizationFederatedBindingResponse"][];
+            status: string;
+            subject: string;
+        };
         ExternalReferenceResponse: {
             /** Format: date-time */
             created_at: string;
@@ -2602,25 +2650,6 @@ export interface components {
             trusted_amr: string[];
             /** Format: date-time */
             updated_at: string;
-        };
-        FederatedIdentityResponse: {
-            /** Format: uuid */
-            identity_id: string;
-            issuer: string;
-            /** Format: date-time */
-            last_login_at: string;
-            /** Format: date-time */
-            linked_at: string;
-            /** Format: uuid */
-            organization_id: string;
-            organization_name: string;
-            /** Format: uuid */
-            provider_id: string;
-            provider_slug: string;
-            subject: string;
-        };
-        FederatedLinkIntentResponse: {
-            authorization_url: string;
         };
         HealthResponse: {
             status: string;
@@ -2761,6 +2790,22 @@ export interface components {
             updated_at: string;
             /** Format: date-time */
             verified_at?: string | null;
+        };
+        OrganizationFederatedBindingResponse: {
+            /** Format: uuid */
+            binding_id: string;
+            binding_source: string;
+            /** Format: date-time */
+            last_login_at: string;
+            /** Format: date-time */
+            linked_at: string;
+            /** Format: uuid */
+            organization_id: string;
+            organization_name: string;
+            /** Format: uuid */
+            provider_id: string;
+            provider_slug: string;
+            status: string;
         };
         OrganizationIdentityPolicyResponse: {
             federated_required: boolean;
@@ -3222,7 +3267,6 @@ export interface components {
             status?: string | null;
         };
         UserOrganizationResponse: {
-            identity_providers: unknown;
             /** Format: uuid */
             organization_id: string;
             organization_name: string;
@@ -5170,7 +5214,7 @@ export interface operations {
             };
         };
     };
-    list_federated_identities: {
+    list_external_identities: {
         parameters: {
             query?: never;
             header?: never;
@@ -5179,13 +5223,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Federated identities linked to the current user */
+            /** @description External identities and Organization trust bindings */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["FederatedIdentityResponse"][];
+                    "application/json": components["schemas"]["ExternalIdentityOverviewResponse"];
                 };
             };
             /** @description Problem Details error */
@@ -5199,7 +5243,40 @@ export interface operations {
             };
         };
     };
-    unlink_federated_identity: {
+    create_external_identity_link_intent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExternalIdentityLinkIntentRequest"];
+            };
+        };
+        responses: {
+            /** @description External identity link authorization URL */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExternalIdentityLinkIntentResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    revoke_external_identity: {
         parameters: {
             query?: never;
             header?: never;
@@ -5210,7 +5287,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Federated identity unlinked */
+            /** @description Global external identity revoked */
             204: {
                 headers: {
                     [name: string]: unknown;
@@ -5228,25 +5305,24 @@ export interface operations {
             };
         };
     };
-    create_federated_link_intent: {
+    unlink_organization_federated_binding: {
         parameters: {
             query?: never;
             header?: never;
             path: {
-                provider_id: string;
+                identity_id: string;
+                binding_id: string;
             };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description Federated link authorization URL */
-            200: {
+            /** @description Organization trust binding revoked */
+            204: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content: {
-                    "application/json": components["schemas"]["FederatedLinkIntentResponse"];
-                };
+                content?: never;
             };
             /** @description Problem Details error */
             default: {

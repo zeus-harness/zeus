@@ -19,7 +19,7 @@ export type UserWorkspace = {
   role: string;
 };
 
-export type UserOrganization = Omit<UserOrganizationResponse, 'workspaces' | 'identity_providers'> & {
+export type UserOrganization = Omit<UserOrganizationResponse, 'workspaces'> & {
   workspaces: UserWorkspace[];
 };
 
@@ -49,7 +49,7 @@ export async function listUserOrganizations(
     fetcher,
     serverApiUrl(apiBaseUrl, '/api/v1/users/me/organizations')
   );
-  return organizations.map(({ identity_providers: _, workspaces, ...organization }) => ({
+  return organizations.map(({ workspaces, ...organization }) => ({
     ...organization,
     workspaces: userWorkspaces(workspaces)
   }));

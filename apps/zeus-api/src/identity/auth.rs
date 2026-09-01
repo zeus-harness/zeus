@@ -625,8 +625,13 @@ struct ResolvedFederatedIdentityRow {
     resolved_workspace_id: Option<Uuid>,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ExternalIdentityLinkIntentRequest {
+    pub provider_id: Uuid,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
-pub struct FederatedLinkIntentResponse {
+pub struct ExternalIdentityLinkIntentResponse {
     pub authorization_url: String,
 }
 
@@ -644,16 +649,16 @@ pub async fn federated_login(
 
 #[utoipa::path(
     post,
-    path = "/api/v1/users/me/federated-identities/{provider_id}/link-intents",
+    path = "/api/v1/users/me/external-identities/link-intents",
     tag = "identity",
-    params(("provider_id" = Uuid, Path)),
-    responses((status = 200, description = "Federated link authorization URL", body = FederatedLinkIntentResponse))
+    request_body = ExternalIdentityLinkIntentRequest,
+    responses((status = 200, description = "External identity link authorization URL", body = ExternalIdentityLinkIntentResponse))
 )]
-pub async fn create_federated_link_intent(
+pub async fn create_external_identity_link_intent(
     State(state): State<AppState>,
     principal: PrincipalContext,
-    Path(provider_id): Path<Uuid>,
-) -> Result<Json<FederatedLinkIntentResponse>, ApiError> {
+    Json(request): Json<ExternalIdentityLinkIntentRequest>,
+) -> Result<Json<ExternalIdentityLinkIntentResponse>, ApiError> {
     if principal.email_verified_at.is_none() {
         return Err(ApiError::EmailVerificationRequired);
     }
@@ -663,7 +668,7 @@ pub async fn create_federated_link_intent(
     let provider = sqlx::query_as::<_, FederatedProviderLoginRow>(
         "select * from zeus_private.get_federated_provider_for_link($1, $2, $3)",
     )
-    .bind(provider_id)
+    .bind(request.provider_id)
     .bind(user_id)
     .bind(session_id)
     .fetch_optional(&state.platform.database)
@@ -678,7 +683,7 @@ pub async fn create_federated_link_intent(
         "/account/federation".to_owned(),
     )
     .await?;
-    Ok(Json(FederatedLinkIntentResponse {
+    Ok(Json(ExternalIdentityLinkIntentResponse {
         authorization_url: authorization_url.into(),
     }))
 }
@@ -743,7 +748,7 @@ pub async fn federated_callback(
         ApiError::IdentityProvider
     })?;
     let resolved = sqlx::query_as::<_, ResolvedFederatedIdentityRow>(
-        "select * from zeus_private.resolve_federated_identity(
+        "select * from zeus_private.resolve_external_identity(
            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
          )",
     )
@@ -1132,8 +1137,8 @@ pub fn routes() -> Router<AppState> {
         .route("/auth/logout", post(logout))
         .route("/api/v1/auth/me", get(current_user))
         .route(
-            "/api/v1/users/me/federated-identities/{provider_id}/link-intents",
-            post(create_federated_link_intent),
+            "/api/v1/users/me/external-identities/link-intents",
+            post(create_external_identity_link_intent),
         )
         .route(
             "/api/v1/organizations/{organization_id}/service-accounts",
