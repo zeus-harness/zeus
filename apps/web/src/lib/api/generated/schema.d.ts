@@ -2659,6 +2659,7 @@ export interface components {
             has_native_password: boolean;
             /** Format: date-time */
             idle_expires_at?: string | null;
+            mfa_required: boolean;
             /** Format: date-time */
             mfa_satisfied_at?: string | null;
             /** Format: uuid */
@@ -2673,6 +2674,7 @@ export interface components {
             tenant_access_expires_at?: string | null;
             /** Format: uuid */
             tenant_access_grant_id?: string | null;
+            totp_enabled: boolean;
             /** Format: uuid */
             user_id?: string | null;
             /** Format: uuid */

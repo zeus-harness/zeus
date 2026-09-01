@@ -30,6 +30,8 @@ const principal = {
   platform_roles: [],
   auth_methods: ['password'],
   has_native_password: true,
+  totp_enabled: false,
+  mfa_required: false,
   authenticated_at: '2026-09-01T00:00:00Z',
   mfa_satisfied_at: null,
   idle_expires_at: '2026-09-01T02:00:00Z',

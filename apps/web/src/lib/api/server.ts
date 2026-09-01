@@ -15,6 +15,8 @@ export type CurrentPrincipal = {
   platform_roles: string[];
   auth_methods: string[];
   has_native_password: boolean;
+  totp_enabled: boolean;
+  mfa_required: boolean;
   authenticated_at: string | null;
   mfa_satisfied_at: string | null;
   idle_expires_at: string | null;

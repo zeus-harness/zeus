@@ -310,20 +310,29 @@ impl FromRequestParts<AppState> for AuthContext {
     }
 }
 
-pub(crate) async fn principal_requires_mfa(
+#[derive(Clone, Copy, Debug, Default)]
+struct PrincipalMfaStatus {
+    required: bool,
+    totp_enabled: bool,
+}
+
+async fn principal_mfa_status(
     state: &AppState,
     principal: &PrincipalContext,
-) -> Result<bool, ApiError> {
-    if principal.platform_roles.contains("platform_admin") {
-        return Ok(true);
-    }
+) -> Result<PrincipalMfaStatus, ApiError> {
     let user_id = principal.user_id.ok_or(ApiError::Forbidden)?;
-    let has_totp = user_has_totp(state, user_id).await?;
-    if has_totp {
-        return Ok(true);
+    let totp_enabled = user_has_totp(state, user_id).await?;
+    if principal.platform_roles.contains("platform_admin") || totp_enabled {
+        return Ok(PrincipalMfaStatus {
+            required: true,
+            totp_enabled,
+        });
     }
     let Some(organization_id) = principal.organization_id else {
-        return Ok(false);
+        return Ok(PrincipalMfaStatus {
+            required: false,
+            totp_enabled,
+        });
     };
     let mut transaction = crate::database::begin_tenant(
         &state.platform.database,
@@ -340,7 +349,17 @@ pub(crate) async fn principal_requires_mfa(
     .fetch_one(&mut *transaction)
     .await?;
     transaction.commit().await?;
-    Ok(required)
+    Ok(PrincipalMfaStatus {
+        required,
+        totp_enabled,
+    })
+}
+
+pub(crate) async fn principal_requires_mfa(
+    state: &AppState,
+    principal: &PrincipalContext,
+) -> Result<bool, ApiError> {
+    Ok(principal_mfa_status(state, principal).await?.required)
 }
 
 pub(crate) async fn user_has_totp(state: &AppState, user_id: Uuid) -> Result<bool, ApiError> {
@@ -1003,6 +1022,8 @@ pub struct CurrentUserResponse {
     pub platform_roles: Vec<String>,
     pub auth_methods: Vec<String>,
     pub has_native_password: bool,
+    pub totp_enabled: bool,
+    pub mfa_required: bool,
     #[serde(with = "time::serde::rfc3339::option")]
     pub authenticated_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
@@ -1021,6 +1042,11 @@ pub async fn current_user(
     State(state): State<AppState>,
     auth: PrincipalContext,
 ) -> Result<Json<CurrentUserResponse>, ApiError> {
+    let mfa_status = if auth.principal_kind == PrincipalKind::User {
+        principal_mfa_status(&state, &auth).await?
+    } else {
+        PrincipalMfaStatus::default()
+    };
     let has_native_password = match (auth.user_id, auth.session_id) {
         (Some(user_id), Some(session_id)) => {
             sqlx::query_scalar("select zeus_private.user_has_native_password($1, $2)")
@@ -1052,6 +1078,8 @@ pub async fn current_user(
         platform_roles: auth.platform_roles.into_iter().collect(),
         auth_methods: auth.auth_methods.into_iter().collect(),
         has_native_password,
+        totp_enabled: mfa_status.totp_enabled,
+        mfa_required: mfa_status.required,
         authenticated_at: auth.authenticated_at,
         mfa_satisfied_at: auth.mfa_satisfied_at,
         idle_expires_at: auth.idle_expires_at,
@@ -2062,6 +2090,8 @@ mod tests {
             platform_roles: Vec::new(),
             auth_methods: vec!["password".to_owned()],
             has_native_password: true,
+            totp_enabled: false,
+            mfa_required: false,
             authenticated_at: Some(OffsetDateTime::UNIX_EPOCH),
             mfa_satisfied_at: None,
             idle_expires_at: Some(OffsetDateTime::UNIX_EPOCH),

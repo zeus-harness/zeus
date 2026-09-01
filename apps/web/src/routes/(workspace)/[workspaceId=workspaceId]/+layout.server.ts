@@ -1,6 +1,7 @@
 import { error, redirect } from '@sveltejs/kit';
 import type { LayoutServerLoad } from './$types';
 
+import { mfaChallengeRedirect } from '$lib/server/auth';
 import { findWorkspaceOption, flattenWorkspaceOptions } from '$lib/tenancy/navigation';
 
 export const load: LayoutServerLoad = async ({ parent, params, url }) => {
@@ -26,6 +27,8 @@ export const load: LayoutServerLoad = async ({ parent, params, url }) => {
   ) {
     redirect(303, `/workspaces?return_to=${encodeURIComponent(returnTo)}`);
   }
+  const mfaRedirect = mfaChallengeRedirect(auth.principal, returnTo);
+  if (mfaRedirect) redirect(303, mfaRedirect);
 
   return {
     activeOrganization: selected.organization,

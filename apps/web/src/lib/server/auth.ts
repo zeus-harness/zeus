@@ -102,3 +102,21 @@ export function isMfaRequired(payload: unknown): boolean {
     (payload as Record<string, unknown>).mfa_required === true
   );
 }
+
+export function mfaChallengeRedirect(
+  principal: {
+    mfa_required: boolean;
+    mfa_satisfied_at: string | null;
+    totp_enabled: boolean;
+  },
+  returnTo: string
+): string | null {
+  if (!principal.mfa_required || principal.mfa_satisfied_at) {
+    return null;
+  }
+
+  return withReturnTo(
+    principal.totp_enabled ? '/mfa' : '/account/security?setup_totp=1',
+    returnTo
+  );
+}

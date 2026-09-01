@@ -6,7 +6,8 @@ import { getOrganization, updateOrganization } from '$lib/api/organizations';
 import { serverApiFetcher } from '$lib/api/server';
 import { requireOrganizationAction } from '$lib/server/organization-context';
 
-export const load: PageServerLoad = async ({ fetch, params, request, url }) => {
+export const load: PageServerLoad = async ({ fetch, params, parent, request, url }) => {
+  await parent();
   const apiFetch = serverApiFetcher(fetch, request.headers.get('cookie'), url.origin);
   return {
     organization: await getOrganization(apiFetch, params.organizationId, env.ZEUS_API_URL)

@@ -4,7 +4,8 @@ import type { PageServerLoad } from './$types';
 import { listPlatformOrganizations } from '$lib/api/platform';
 import { serverApiFetcher } from '$lib/api/server';
 
-export const load: PageServerLoad = async ({ fetch, request, url }) => {
+export const load: PageServerLoad = async ({ fetch, parent, request, url }) => {
+  await parent();
   const apiFetch = serverApiFetcher(fetch, request.headers.get('cookie'), url.origin);
   const organizations = await listPlatformOrganizations(apiFetch, env.ZEUS_API_URL);
   return {

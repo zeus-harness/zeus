@@ -1,6 +1,7 @@
 import { error, redirect } from '@sveltejs/kit';
 import type { LayoutServerLoad } from './$types';
 
+import { mfaChallengeRedirect } from '$lib/server/auth';
 import { canSeeIdentitySettings, hasValidTenantAccessGrant } from '$lib/tenancy/navigation';
 
 export const load: LayoutServerLoad = async ({ parent, params, url }) => {
@@ -23,6 +24,8 @@ export const load: LayoutServerLoad = async ({ parent, params, url }) => {
   if (organization.organization_role !== 'owner' && !supportAccess) {
     error(403, '只有 Organization Owner 可以进入 Organization 设置。');
   }
+  const mfaRedirect = mfaChallengeRedirect(auth.principal, returnTo);
+  if (mfaRedirect) redirect(303, mfaRedirect);
   return {
     activeOrganization: organization,
     supportAccess,

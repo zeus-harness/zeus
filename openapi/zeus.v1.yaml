@@ -6880,6 +6880,8 @@ components:
       - platform_roles
       - auth_methods
       - has_native_password
+      - totp_enabled
+      - mfa_required
       properties:
         absolute_expires_at:
           type:
@@ -6913,6 +6915,8 @@ components:
           - string
           - 'null'
           format: date-time
+        mfa_required:
+          type: boolean
         mfa_satisfied_at:
           type:
           - string
@@ -6950,6 +6954,8 @@ components:
           - string
           - 'null'
           format: uuid
+        totp_enabled:
+          type: boolean
         user_id:
           type:
           - string

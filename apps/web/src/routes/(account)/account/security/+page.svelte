@@ -8,7 +8,7 @@
 
   let { data, form } = $props<{ data: PageData; form: ActionData }>();
   let principal = $derived(data.principal);
-  let totpEnabled = $derived(principal?.auth_methods.includes('totp') ?? false);
+  let totpEnabled = $derived(principal?.totp_enabled ?? false);
   let hasNativePassword = $derived(principal?.has_native_password ?? false);
   let isPlatformAdmin = $derived(principal?.platform_roles.includes('platform_admin') ?? false);
   let returnTo = $derived(

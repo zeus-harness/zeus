@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   GENERIC_IDENTITY_MESSAGE,
   isMfaRequired,
+  mfaChallengeRedirect,
   postAuth,
   responseJson,
   responseOk,
@@ -62,6 +63,37 @@ describe('native identity server helpers', () => {
     expect(isMfaRequired({ mfa_required: true })).toBe(true);
     expect(isMfaRequired({ mfa_required: false })).toBe(false);
     expect(isMfaRequired({ mfa_required: 'true' })).toBe(false);
+  });
+
+  it('routes protected pages through TOTP setup or verification', () => {
+    expect(
+      mfaChallengeRedirect(
+        { mfa_required: true, mfa_satisfied_at: null, totp_enabled: false },
+        '/platform'
+      )
+    ).toBe('/account/security?setup_totp=1&return_to=%2Fplatform');
+    expect(
+      mfaChallengeRedirect(
+        { mfa_required: true, mfa_satisfied_at: null, totp_enabled: true },
+        '/workspace-1/settings/members'
+      )
+    ).toBe('/mfa?return_to=%2Fworkspace-1%2Fsettings%2Fmembers');
+    expect(
+      mfaChallengeRedirect(
+        {
+          mfa_required: true,
+          mfa_satisfied_at: '2026-09-02T00:00:00Z',
+          totp_enabled: true
+        },
+        '/platform'
+      )
+    ).toBeNull();
+    expect(
+      mfaChallengeRedirect(
+        { mfa_required: false, mfa_satisfied_at: null, totp_enabled: false },
+        '/workspace-1'
+      )
+    ).toBeNull();
   });
 
   it('keeps response parsing and generic identity copy safe for empty responses', async () => {
