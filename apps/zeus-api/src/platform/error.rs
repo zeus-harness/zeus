@@ -38,6 +38,12 @@ pub enum ApiError {
     FederatedAuthenticationRequired,
     #[error("organization identity settings are managed by the platform")]
     OrganizationIdentitySettingsManaged,
+    #[error("a valid platform tenant access grant is required")]
+    PlatformTenantAccessRequired,
+    #[error("the organization is still being provisioned")]
+    OrganizationProvisioning,
+    #[error("the organization is suspended")]
+    OrganizationSuspended,
     #[error("the request conflicts with current resource state: {0}")]
     Conflict(String),
     #[error("If-Match is required for this operation")]
@@ -122,6 +128,24 @@ impl IntoResponse for ApiError {
                 "Organization identity settings managed by platform",
                 None,
             ),
+            Self::PlatformTenantAccessRequired => (
+                StatusCode::FORBIDDEN,
+                "platform_tenant_access_required",
+                "Platform tenant access required",
+                None,
+            ),
+            Self::OrganizationProvisioning => (
+                StatusCode::CONFLICT,
+                "organization_provisioning",
+                "Organization provisioning",
+                None,
+            ),
+            Self::OrganizationSuspended => (
+                StatusCode::LOCKED,
+                "organization_suspended",
+                "Organization suspended",
+                None,
+            ),
             Self::Conflict(_) => (StatusCode::CONFLICT, "conflict", "Conflict", None),
             Self::PreconditionRequired => (
                 StatusCode::PRECONDITION_REQUIRED,
@@ -203,6 +227,10 @@ impl From<sqlx::Error> for ApiError {
                 Some("23514" | "22023") => {
                     Self::Validation("database constraint rejected the request".to_owned())
                 }
+                Some("ZX001") => Self::IdempotencyConflict,
+                Some("ZX002") => Self::PreconditionFailed,
+                Some("ZX003") => Self::Conflict("resource state rejected the request".to_owned()),
+                Some("P0002") => Self::NotFound,
                 Some("42501") => Self::Forbidden,
                 _ => Self::Internal,
             };

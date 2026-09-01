@@ -22,7 +22,7 @@ use crate::{
         require_self_service_identity_settings, session_cookie,
     },
     crypto::{random_token, sha256},
-    database::{TenantScope, begin_tenant},
+    database::begin_tenant,
     error::ApiError,
     oidc::validate_remote_url,
 };
@@ -166,11 +166,7 @@ pub async fn get_organization(
     Path(organization_id): Path<Uuid>,
 ) -> Result<(HeaderMap, Json<OrganizationResponse>), ApiError> {
     auth.require_organization(organization_id, Permission::ReadWorkspace)?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let organization = sqlx::query_as::<_, OrganizationResponse>(
         "select id, slug, name, status, revision, created_at, updated_at, archived_at
          from organizations where id = $1",
@@ -201,11 +197,7 @@ pub async fn update_organization(
     if let Some(name) = request.name.as_deref() {
         validate_name(name)?;
     }
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let updated = sqlx::query_as::<_, OrganizationResponse>(
         "update organizations
          set name = coalesce($1, name),
@@ -279,11 +271,7 @@ pub async fn list_workspaces(
     auth.require_organization(organization_id, Permission::ReadWorkspace)?;
     let limit = page.limit()?;
     let cursor = page.decoded_cursor()?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let mut items = sqlx::query_as::<_, WorkspaceResponse>(
         "select id, organization_id, slug, name, status, revision,
                 created_at, updated_at, archived_at
@@ -332,11 +320,7 @@ pub async fn create_workspace(
     let owner_user_id = auth.user_id.ok_or(ApiError::Forbidden)?;
     validate_slug(&request.slug)?;
     validate_name(&request.name)?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let workspace = sqlx::query_as::<_, WorkspaceResponse>(
         "insert into workspaces (organization_id, slug, name)
          values ($1, $2, $3)
@@ -534,11 +518,7 @@ pub async fn list_organization_members(
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<OrganizationMemberResponse>>, ApiError> {
     auth.require_organization(organization_id, Permission::ManageOrganization)?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let members = sqlx::query_as::<_, OrganizationMemberResponse>(
         "select m.user_id, u.email, u.display_name, m.role, m.status,
                 m.created_at, m.updated_at
@@ -562,11 +542,7 @@ pub async fn set_organization_member(
     auth.require_organization(organization_id, Permission::ManageOrganization)?;
     validate_organization_role(&request.role)?;
     validate_membership_status(&request.status)?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let target_is_owner: bool = sqlx::query_scalar(
         "select exists (
            select 1 from organization_memberships
@@ -749,11 +725,7 @@ pub async fn list_federated_identity_providers(
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<FederatedIdentityProviderResponse>>, ApiError> {
     require_self_service_identity_settings(&state, &auth, organization_id).await?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let providers = sqlx::query_as::<_, FederatedIdentityProviderResponse>(
         "select id, organization_id, slug, issuer_url, client_id, scopes, group_claim,
                 jit_enabled, trusted_acr, trusted_amr, enabled, revision, created_at, updated_at
@@ -790,11 +762,7 @@ pub async fn create_federated_identity_provider(
         .envelope
         .seal(request.client_secret.as_bytes(), aad.as_bytes())
         .map_err(|_| ApiError::Internal)?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let provider = sqlx::query_as::<_, FederatedIdentityProviderResponse>(
         "insert into federated_identity_providers (
             id, organization_id, slug, issuer_url, client_id, encrypted_client_secret,
@@ -875,11 +843,7 @@ pub async fn update_federated_identity_provider(
                 .map_err(|_| ApiError::Internal)
         })
         .transpose()?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let provider = sqlx::query_as::<_, FederatedIdentityProviderResponse>(
         "update federated_identity_providers
          set slug = coalesce($1, slug),
@@ -963,11 +927,7 @@ pub async fn list_federated_group_mappings(
     Path((organization_id, provider_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Vec<FederatedGroupMappingResponse>>, ApiError> {
     require_self_service_identity_settings(&state, &auth, organization_id).await?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let mappings = sqlx::query_as::<_, FederatedGroupMappingResponse>(
         "select id, organization_id, provider_id, group_value, organization_role,
                 workspace_id, workspace_role, created_at
@@ -1008,11 +968,7 @@ pub async fn create_federated_group_mapping(
             ));
         }
     }
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let mapping = sqlx::query_as::<_, FederatedGroupMappingResponse>(
         "insert into federated_group_mappings (
             organization_id, provider_id, group_value, organization_role,
@@ -1083,7 +1039,7 @@ pub fn routes() -> Router<AppState> {
         )
 }
 
-fn validate_slug(value: &str) -> Result<(), ApiError> {
+pub(crate) fn validate_slug(value: &str) -> Result<(), ApiError> {
     let bytes = value.as_bytes();
     if !(3..=63).contains(&bytes.len())
         || value != value.to_ascii_lowercase()
@@ -1100,7 +1056,7 @@ fn validate_slug(value: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn validate_name(value: &str) -> Result<(), ApiError> {
+pub(crate) fn validate_name(value: &str) -> Result<(), ApiError> {
     if value.trim().is_empty() || value.len() > 160 {
         return Err(ApiError::Validation(
             "name must contain between 1 and 160 characters".to_owned(),

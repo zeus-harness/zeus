@@ -33,6 +33,7 @@ use crate::{
 
 const SESSION_COOKIE: &str = "zeus_session";
 const CSRF_COOKIE: &str = "zeus_csrf";
+const TENANT_ACCESS_GRANT_COOKIE: &str = "zeus_tenant_access_grant";
 const CSRF_HEADER: &str = "x-zeus-csrf";
 const SERVICE_ACCOUNT_PREFIX: &str = "zsa_";
 const KNOWN_SERVICE_ACCOUNT_SCOPES: &[&str] = &[
@@ -58,6 +59,9 @@ pub struct AuthContext {
     pub principal_id: Uuid,
     pub user_id: Option<Uuid>,
     pub session_id: Option<Uuid>,
+    pub tenant_access_grant_id: Option<Uuid>,
+    pub tenant_access_reason: Option<String>,
+    pub tenant_access_expires_at: Option<OffsetDateTime>,
     pub organization_id: Uuid,
     pub workspace_id: Option<Uuid>,
     pub organization_role: Option<OrganizationRole>,
@@ -67,6 +71,7 @@ pub struct AuthContext {
     pub display_name: String,
     pub authenticated_at: Option<OffsetDateTime>,
     pub mfa_satisfied_at: Option<OffsetDateTime>,
+    pub platform_roles: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -75,6 +80,10 @@ pub struct PrincipalContext {
     pub principal_id: Uuid,
     pub user_id: Option<Uuid>,
     pub session_id: Option<Uuid>,
+    pub tenant_access_grant_id: Option<Uuid>,
+    pub tenant_access_reason: Option<String>,
+    pub tenant_access_expires_at: Option<OffsetDateTime>,
+    pub organization_status: Option<String>,
     pub organization_id: Option<Uuid>,
     pub workspace_id: Option<Uuid>,
     pub organization_role: Option<OrganizationRole>,
@@ -97,8 +106,10 @@ impl AuthContext {
     pub fn tenant_scope(&self, workspace_id: Option<Uuid>) -> TenantScope {
         TenantScope {
             user_id: self.user_id,
+            session_id: self.session_id,
             organization_id: self.organization_id,
             workspace_id,
+            tenant_access_grant_id: self.tenant_access_grant_id,
         }
     }
 
@@ -113,7 +124,11 @@ impl AuthContext {
         permission: Permission,
     ) -> Result<(), ApiError> {
         if self.organization_id != organization_id || !self.allows_organization(permission) {
-            return Err(ApiError::Forbidden);
+            return if self.platform_roles.contains("platform_admin") {
+                Err(ApiError::PlatformTenantAccessRequired)
+            } else {
+                Err(ApiError::Forbidden)
+            };
         }
         Ok(())
     }
@@ -155,6 +170,9 @@ impl AuthContext {
     }
 
     fn allows_organization(&self, permission: Permission) -> bool {
+        if self.tenant_access_grant_id.is_some() {
+            return true;
+        }
         match self.principal_kind {
             PrincipalKind::User => self
                 .organization_role
@@ -201,11 +219,7 @@ pub async fn require_self_service_identity_settings(
     organization_id: Uuid,
 ) -> Result<(), ApiError> {
     auth.require_organization(organization_id, Permission::ManageOrganization)?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let mode = sqlx::query_scalar::<_, String>(
         "select identity_settings_mode
          from organization_governance
@@ -216,7 +230,7 @@ pub async fn require_self_service_identity_settings(
     .await?
     .ok_or(ApiError::Internal)?;
     transaction.commit().await?;
-    if mode == "self_service" {
+    if mode == "self_service" || auth.tenant_access_grant_id.is_some() {
         Ok(())
     } else {
         Err(ApiError::OrganizationIdentitySettingsManaged)
@@ -230,6 +244,7 @@ impl FromRequestParts<AppState> for AuthContext {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        let is_write = !matches!(parts.method, Method::GET | Method::HEAD | Method::OPTIONS);
         let principal = PrincipalContext::from_request_parts(parts, state).await?;
         if principal.principal_kind == PrincipalKind::User {
             if principal.email_verified_at.is_none() {
@@ -240,7 +255,8 @@ impl FromRequestParts<AppState> for AuthContext {
             {
                 return Err(ApiError::MfaRequired);
             }
-            if let Some(provider_id) = required_federated_provider(state, &principal).await?
+            if principal.tenant_access_grant_id.is_none()
+                && let Some(provider_id) = required_federated_provider(state, &principal).await?
                 && !principal
                     .auth_methods
                     .contains(&format!("federated:{provider_id}"))
@@ -248,12 +264,35 @@ impl FromRequestParts<AppState> for AuthContext {
                 return Err(ApiError::FederatedAuthenticationRequired);
             }
         }
-        let organization_id = principal.organization_id.ok_or(ApiError::Forbidden)?;
+        let organization_id = principal.organization_id.ok_or_else(|| {
+            if principal.platform_roles.contains("platform_admin") {
+                ApiError::PlatformTenantAccessRequired
+            } else {
+                ApiError::Forbidden
+            }
+        })?;
+        let organization_status = if let Some(status) = principal.organization_status.as_deref() {
+            status.to_owned()
+        } else {
+            load_organization_status(state, &principal, organization_id).await?
+        };
+        match organization_status.as_str() {
+            "provisioning" => return Err(ApiError::OrganizationProvisioning),
+            "suspended" if is_write && principal.tenant_access_grant_id.is_none() => {
+                return Err(ApiError::OrganizationSuspended);
+            }
+            "active" | "suspended" => {}
+            "archived" => return Err(ApiError::NotFound),
+            _ => return Err(ApiError::Internal),
+        }
         Ok(Self {
             principal_kind: principal.principal_kind,
             principal_id: principal.principal_id,
             user_id: principal.user_id,
             session_id: principal.session_id,
+            tenant_access_grant_id: principal.tenant_access_grant_id,
+            tenant_access_reason: principal.tenant_access_reason,
+            tenant_access_expires_at: principal.tenant_access_expires_at,
             organization_id,
             workspace_id: principal.workspace_id,
             organization_role: principal.organization_role,
@@ -263,6 +302,7 @@ impl FromRequestParts<AppState> for AuthContext {
             display_name: principal.display_name,
             authenticated_at: principal.authenticated_at,
             mfa_satisfied_at: principal.mfa_satisfied_at,
+            platform_roles: principal.platform_roles,
         })
     }
 }
@@ -355,7 +395,9 @@ impl FromRequestParts<AppState> for PrincipalContext {
         }
 
         let token = cookie_value(&parts.headers, SESSION_COOKIE).ok_or(ApiError::Unauthorized)?;
-        authenticate_user_session(state, token).await
+        let mut principal = authenticate_user_session(state, token).await?;
+        apply_platform_tenant_access_grant(state, &parts.headers, &mut principal).await?;
+        Ok(principal)
     }
 }
 
@@ -465,6 +507,15 @@ struct WebSessionPrincipalRow {
 }
 
 #[derive(Debug, FromRow)]
+struct PlatformTenantAccessGrantRow {
+    grant_id: Uuid,
+    organization_id: Uuid,
+    organization_status: String,
+    reason: String,
+    expires_at: OffsetDateTime,
+}
+
+#[derive(Debug, FromRow)]
 struct ServiceAccountPrincipalRow {
     service_account_id: Uuid,
     organization_id: Uuid,
@@ -492,6 +543,10 @@ async fn authenticate_user_session(
         principal_id: row.user_id,
         user_id: Some(row.user_id),
         session_id: Some(row.session_id),
+        tenant_access_grant_id: None,
+        tenant_access_reason: None,
+        tenant_access_expires_at: None,
+        organization_status: None,
         organization_id: row.active_organization_id,
         workspace_id: row.active_workspace_id,
         organization_role: row
@@ -516,6 +571,68 @@ async fn authenticate_user_session(
         absolute_expires_at: Some(row.absolute_expires_at),
         csrf_token_hash: row.csrf_token_hash,
     })
+}
+
+async fn apply_platform_tenant_access_grant(
+    state: &AppState,
+    headers: &HeaderMap,
+    principal: &mut PrincipalContext,
+) -> Result<(), ApiError> {
+    if !principal.platform_roles.contains("platform_admin") {
+        return Ok(());
+    }
+    let Some(grant_id) = cookie_value(headers, TENANT_ACCESS_GRANT_COOKIE)
+        .and_then(|value| Uuid::parse_str(&value).ok())
+    else {
+        return Ok(());
+    };
+    let user_id = principal.user_id.ok_or(ApiError::Forbidden)?;
+    let session_id = principal.session_id.ok_or(ApiError::Forbidden)?;
+    let Some(grant) = sqlx::query_as::<_, PlatformTenantAccessGrantRow>(
+        "select * from zeus_private.validate_platform_tenant_access_grant($1, $2, $3)",
+    )
+    .bind(grant_id)
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_optional(&state.platform.database)
+    .await?
+    else {
+        return Ok(());
+    };
+    principal.tenant_access_grant_id = Some(grant.grant_id);
+    principal.tenant_access_reason = Some(grant.reason);
+    principal.tenant_access_expires_at = Some(grant.expires_at);
+    principal.organization_status = Some(grant.organization_status);
+    principal.organization_id = Some(grant.organization_id);
+    principal.workspace_id = None;
+    principal.organization_role = None;
+    principal.workspace_role = None;
+    Ok(())
+}
+
+async fn load_organization_status(
+    state: &AppState,
+    principal: &PrincipalContext,
+    organization_id: Uuid,
+) -> Result<String, ApiError> {
+    let mut transaction = begin_tenant(
+        &state.platform.database,
+        TenantScope {
+            user_id: principal.user_id,
+            session_id: principal.session_id,
+            organization_id,
+            workspace_id: principal.workspace_id,
+            tenant_access_grant_id: principal.tenant_access_grant_id,
+        },
+    )
+    .await?;
+    let status = sqlx::query_scalar::<_, String>("select status from organizations where id = $1")
+        .bind(organization_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    transaction.commit().await?;
+    Ok(status)
 }
 
 pub(crate) async fn authenticate_user_headers(
@@ -558,6 +675,10 @@ async fn authenticate_service_account(
         principal_id: row.service_account_id,
         user_id: None,
         session_id: None,
+        tenant_access_grant_id: None,
+        tenant_access_reason: None,
+        tenant_access_expires_at: None,
+        organization_status: None,
         organization_id: Some(row.organization_id),
         workspace_id: row.workspace_id,
         organization_role: None,
@@ -850,7 +971,11 @@ pub async fn logout(
             .execute(&state.platform.database)
             .await?;
     }
-    let cookies = vec![expired_session_cookie(&state), expired_csrf_cookie(&state)];
+    let cookies = vec![
+        expired_session_cookie(&state),
+        expired_csrf_cookie(&state),
+        expired_tenant_access_grant_cookie(&state),
+    ];
     redirect_response("/", &cookies)
 }
 
@@ -859,6 +984,9 @@ pub struct CurrentUserResponse {
     pub principal_kind: String,
     pub principal_id: Uuid,
     pub user_id: Option<Uuid>,
+    pub tenant_access_grant_id: Option<Uuid>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub tenant_access_expires_at: Option<OffsetDateTime>,
     pub organization_id: Option<Uuid>,
     pub workspace_id: Option<Uuid>,
     pub organization_role: Option<String>,
@@ -907,6 +1035,8 @@ pub async fn current_user(
         .to_owned(),
         principal_id: auth.principal_id,
         user_id: auth.user_id,
+        tenant_access_grant_id: auth.tenant_access_grant_id,
+        tenant_access_expires_at: auth.tenant_access_expires_at,
         organization_id: auth.organization_id,
         workspace_id: auth.workspace_id,
         organization_role: auth.organization_role.map(organization_role_name),
@@ -990,11 +1120,7 @@ pub async fn create_service_account(
         .await
         .map_err(|error| map_service_account_password_error(&state, error))?;
 
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let created = sqlx::query_as::<_, CreatedServiceAccountRow>(
         "insert into service_accounts (
             organization_id, workspace_id, name, token_prefix, token_hash, scopes, expires_at
@@ -1065,11 +1191,7 @@ pub async fn list_service_accounts(
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<ServiceAccountResponse>>, ApiError> {
     auth.require_organization(organization_id, Permission::ManageOrganization)?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let accounts = sqlx::query_as::<_, ServiceAccountResponse>(
         "select id, organization_id, workspace_id, name, token_prefix, scopes,
                 created_at, expires_at, revoked_at, last_used_at
@@ -1095,11 +1217,7 @@ pub async fn revoke_service_account(
     Path((organization_id, service_account_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
     auth.require_organization(organization_id, Permission::ManageOrganization)?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let result = sqlx::query(
         "update service_accounts set revoked_at = coalesce(revoked_at, now())
          where id = $1 and organization_id = $2",
@@ -1354,6 +1472,30 @@ pub(crate) fn expired_csrf_cookie(state: &AppState) -> String {
     format!("{CSRF_COOKIE}=; Path=/; SameSite=Lax; Max-Age=0{secure}")
 }
 
+pub(crate) fn tenant_access_grant_cookie(
+    state: &AppState,
+    grant_id: Uuid,
+    max_age_seconds: u64,
+) -> String {
+    let secure = if state.identity.cookie_secure {
+        "; Secure"
+    } else {
+        ""
+    };
+    format!(
+        "{TENANT_ACCESS_GRANT_COOKIE}={grant_id}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age_seconds}{secure}"
+    )
+}
+
+pub(crate) fn expired_tenant_access_grant_cookie(state: &AppState) -> String {
+    let secure = if state.identity.cookie_secure {
+        "; Secure"
+    } else {
+        ""
+    };
+    format!("{TENANT_ACCESS_GRANT_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}")
+}
+
 fn redirect_response(location: &str, cookies: &[String]) -> Result<Response, ApiError> {
     let mut response = StatusCode::SEE_OTHER.into_response();
     response.headers_mut().insert(
@@ -1452,8 +1594,9 @@ pub(crate) async fn insert_audit(
 ) -> Result<(), ApiError> {
     sqlx::query(
         "insert into audit_events (
-            organization_id, workspace_id, actor_kind, actor_id, action, target_type, target_id
-         ) values ($1, $2, $3, $4, $5, $6, $7)",
+            organization_id, workspace_id, actor_kind, actor_id, action, target_type, target_id,
+            metadata
+         ) values ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(auth.organization_id)
     .bind(workspace_id)
@@ -1465,8 +1608,45 @@ pub(crate) async fn insert_audit(
     .bind(action)
     .bind(target_type)
     .bind(target_id)
+    .bind(
+        match (
+            auth.tenant_access_grant_id,
+            auth.tenant_access_reason.as_deref(),
+        ) {
+            (Some(grant_id), Some(reason)) => serde_json::json!({
+                "platform_tenant_access_grant_id": grant_id,
+                "platform_tenant_access_reason": reason,
+            }),
+            _ => serde_json::json!({}),
+        },
+    )
     .execute(&mut **transaction)
     .await?;
+    if let (Some(grant_id), Some(session_id), Some(reason)) = (
+        auth.tenant_access_grant_id,
+        auth.session_id,
+        auth.tenant_access_reason.as_deref(),
+    ) {
+        let recorded: bool = sqlx::query_scalar(
+            "select zeus_private.record_platform_support_operation(
+               $1, $2, $3, $4, $5, $6, $7, $8, $9
+             )",
+        )
+        .bind(auth.user_id.ok_or(ApiError::Forbidden)?)
+        .bind(session_id)
+        .bind(grant_id)
+        .bind(auth.organization_id)
+        .bind(workspace_id)
+        .bind(action)
+        .bind(target_type)
+        .bind(target_id)
+        .bind(reason)
+        .fetch_one(&mut **transaction)
+        .await?;
+        if !recorded {
+            return Err(ApiError::PlatformTenantAccessRequired);
+        }
+    }
     Ok(())
 }
 
@@ -1708,6 +1888,8 @@ mod tests {
             principal_kind: "user".to_owned(),
             principal_id: Uuid::now_v7(),
             user_id: None,
+            tenant_access_grant_id: None,
+            tenant_access_expires_at: None,
             organization_id: None,
             workspace_id: None,
             organization_role: None,
@@ -1742,6 +1924,9 @@ mod tests {
             principal_id: Uuid::now_v7(),
             user_id: Some(Uuid::now_v7()),
             session_id: Some(Uuid::now_v7()),
+            tenant_access_grant_id: None,
+            tenant_access_reason: None,
+            tenant_access_expires_at: None,
             organization_id,
             workspace_id: Some(workspace_id),
             organization_role: Some(organization_role),
@@ -1751,6 +1936,7 @@ mod tests {
             display_name: "User".to_owned(),
             authenticated_at: Some(OffsetDateTime::now_utc()),
             mfa_satisfied_at: None,
+            platform_roles: BTreeSet::new(),
         }
     }
 
@@ -1764,6 +1950,9 @@ mod tests {
             principal_id: Uuid::now_v7(),
             user_id: None,
             session_id: None,
+            tenant_access_grant_id: None,
+            tenant_access_reason: None,
+            tenant_access_expires_at: None,
             organization_id,
             workspace_id,
             organization_role: None,
@@ -1773,6 +1962,7 @@ mod tests {
             display_name: "Service Account".to_owned(),
             authenticated_at: None,
             mfa_satisfied_at: None,
+            platform_roles: BTreeSet::new(),
         }
     }
 }

@@ -125,7 +125,7 @@ pub async fn complete<T: Serialize>(
     Ok(())
 }
 
-fn required_key(headers: &HeaderMap) -> Result<&str, ApiError> {
+pub(crate) fn required_key(headers: &HeaderMap) -> Result<&str, ApiError> {
     let value = headers
         .get("idempotency-key")
         .ok_or_else(|| ApiError::BadRequest("Idempotency-Key is required".to_owned()))?

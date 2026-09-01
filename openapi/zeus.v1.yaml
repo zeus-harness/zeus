@@ -1503,6 +1503,295 @@ paths:
       security:
       - sessionCookie: []
       - serviceAccountBearer: []
+  /api/v1/platform/organizations:
+    get:
+      tags:
+      - platform
+      operationId: list_platform_organizations
+      responses:
+        '200':
+          description: Organizations visible to the platform
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PlatformOrganizationResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - platform
+      operationId: create_platform_organization
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePlatformOrganizationRequest'
+        required: true
+      responses:
+        '201':
+          description: Provisioning Organization, initial Workspace, and Owner invitation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedPlatformOrganizationResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/platform/organizations/{organization_id}:
+    get:
+      tags:
+      - platform
+      operationId: get_platform_organization
+      parameters:
+      - name: organization_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Platform Organization detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlatformOrganizationResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    patch:
+      tags:
+      - platform
+      operationId: update_platform_organization
+      parameters:
+      - name: organization_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: If-Match
+        in: header
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdatePlatformOrganizationRequest'
+        required: true
+      responses:
+        '200':
+          description: Updated Organization
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlatformOrganizationMutationResponse'
+        '412':
+          description: Revision mismatch
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/platform/organizations/{organization_id}/owner-invitation/replace:
+    post:
+      tags:
+      - platform
+      operationId: replace_platform_owner_invitation
+      parameters:
+      - name: organization_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: If-Match
+        in: header
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReplacePlatformOwnerInvitationRequest'
+        required: true
+      responses:
+        '202':
+          description: Replacement initial Owner invitation queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlatformOwnerInvitationResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/platform/organizations/{organization_id}/owner-invitation/resend:
+    post:
+      tags:
+      - platform
+      operationId: resend_platform_owner_invitation
+      parameters:
+      - name: organization_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: If-Match
+        in: header
+        required: true
+        schema:
+          type: string
+      responses:
+        '202':
+          description: Initial Owner invitation resend queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlatformOwnerInvitationResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/platform/organizations/{organization_id}/status:
+    post:
+      tags:
+      - platform
+      operationId: transition_platform_organization
+      parameters:
+      - name: organization_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: If-Match
+        in: header
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransitionPlatformOrganizationRequest'
+        required: true
+      responses:
+        '200':
+          description: Transitioned Organization
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlatformOrganizationMutationResponse'
+        '409':
+          description: Invalid state transition
+        '412':
+          description: Revision mismatch
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/platform/tenant-access-grants:
+    post:
+      tags:
+      - platform
+      operationId: create_platform_tenant_access_grant
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePlatformTenantAccessGrantRequest'
+        required: true
+      responses:
+        '201':
+          description: Bounded platform tenant access Grant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlatformTenantAccessGrantResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/platform/tenant-access-grants/{grant_id}:
+    delete:
+      tags:
+      - platform
+      operationId: revoke_platform_tenant_access_grant
+      parameters:
+      - name: grant_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '204':
+          description: Platform tenant access Grant revoked
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
   /api/v1/setup:
     post:
       tags:
@@ -6074,6 +6363,54 @@ components:
           type: string
         slug:
           type: string
+    CreatePlatformOrganizationRequest:
+      type: object
+      required:
+      - slug
+      - name
+      - initial_workspace_slug
+      - initial_workspace_name
+      - owner_email
+      - identity_settings_mode
+      properties:
+        identity_settings_mode:
+          type: string
+        initial_workspace_name:
+          type: string
+        initial_workspace_slug:
+          type: string
+        name:
+          type: string
+        owner_email:
+          type: string
+        slug:
+          type: string
+    CreatePlatformTenantAccessGrantRequest:
+      type: object
+      required:
+      - organization_id
+      - reason
+      - password
+      - totp_code
+      properties:
+        duration_minutes:
+          type: integer
+          format: int32
+          maximum: 60
+          minimum: 1
+        organization_id:
+          type: string
+          format: uuid
+        password:
+          type: string
+          writeOnly: true
+        reason:
+          type: string
+          maxLength: 500
+          minLength: 10
+        totp_code:
+          type: string
+          writeOnly: true
     CreateRunRequest:
       type: object
       required:
@@ -6294,6 +6631,51 @@ components:
         workspace_id:
           type: string
           format: uuid
+    CreatedPlatformOrganizationResponse:
+      type: object
+      required:
+      - organization_id
+      - organization_slug
+      - organization_name
+      - organization_status
+      - organization_revision
+      - identity_settings_mode
+      - workspace_id
+      - workspace_slug
+      - workspace_name
+      - invitation_id
+      - owner_email
+      - invitation_expires_at
+      properties:
+        identity_settings_mode:
+          type: string
+        invitation_expires_at:
+          type: string
+          format: date-time
+        invitation_id:
+          type: string
+          format: uuid
+        organization_id:
+          type: string
+          format: uuid
+        organization_name:
+          type: string
+        organization_revision:
+          type: integer
+          format: int64
+        organization_slug:
+          type: string
+        organization_status:
+          type: string
+        owner_email:
+          type: string
+        workspace_id:
+          type: string
+          format: uuid
+        workspace_name:
+          type: string
+        workspace_slug:
+          type: string
     CreatedServiceAccountResponse:
       type: object
       required:
@@ -6449,6 +6831,16 @@ components:
           type: array
           items:
             type: string
+        tenant_access_expires_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        tenant_access_grant_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
         user_id:
           type:
           - string
@@ -7357,6 +7749,156 @@ components:
         token:
           type: string
           writeOnly: true
+    PlatformOrganizationMutationResponse:
+      type: object
+      required:
+      - id
+      - slug
+      - name
+      - status
+      - revision
+      - identity_settings_mode
+      - governance_revision
+      - created_at
+      - updated_at
+      properties:
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        governance_revision:
+          type: integer
+          format: int64
+        id:
+          type: string
+          format: uuid
+        identity_settings_mode:
+          type: string
+        name:
+          type: string
+        revision:
+          type: integer
+          format: int64
+        slug:
+          type: string
+        status:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+    PlatformOrganizationResponse:
+      type: object
+      required:
+      - id
+      - slug
+      - name
+      - status
+      - revision
+      - identity_settings_mode
+      - governance_revision
+      - workspace_count
+      - active_owner_count
+      - created_at
+      - updated_at
+      properties:
+        active_owner_count:
+          type: integer
+          format: int64
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        governance_revision:
+          type: integer
+          format: int64
+        id:
+          type: string
+          format: uuid
+        identity_settings_mode:
+          type: string
+        name:
+          type: string
+        pending_owner_email:
+          type:
+          - string
+          - 'null'
+        pending_owner_invitation_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        revision:
+          type: integer
+          format: int64
+        slug:
+          type: string
+        status:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+        workspace_count:
+          type: integer
+          format: int64
+    PlatformOwnerInvitationResponse:
+      type: object
+      required:
+      - organization_id
+      - organization_name
+      - organization_revision
+      - invitation_id
+      - owner_email
+      - invitation_expires_at
+      properties:
+        invitation_expires_at:
+          type: string
+          format: date-time
+        invitation_id:
+          type: string
+          format: uuid
+        organization_id:
+          type: string
+          format: uuid
+        organization_name:
+          type: string
+        organization_revision:
+          type: integer
+          format: int64
+        owner_email:
+          type: string
+    PlatformTenantAccessGrantResponse:
+      type: object
+      required:
+      - grant_id
+      - organization_id
+      - organization_name
+      - organization_status
+      - reason
+      - expires_at
+      properties:
+        expires_at:
+          type: string
+          format: date-time
+        grant_id:
+          type: string
+          format: uuid
+        organization_id:
+          type: string
+          format: uuid
+        organization_name:
+          type: string
+        organization_status:
+          type: string
+        reason:
+          type: string
     ProblemDetails:
       type: object
       required:
@@ -7404,6 +7946,13 @@ components:
           writeOnly: true
           maxLength: 128
           minLength: 15
+    ReplacePlatformOwnerInvitationRequest:
+      type: object
+      required:
+      - owner_email
+      properties:
+        owner_email:
+          type: string
     RetryRunRequest:
       type: object
     ReviewExperienceCandidateRequest:
@@ -8109,6 +8658,13 @@ components:
           format: date-time
         status:
           type: string
+    TransitionPlatformOrganizationRequest:
+      type: object
+      required:
+      - action
+      properties:
+        action:
+          type: string
     UpdateAgentRequest:
       type: object
       properties:
@@ -8300,6 +8856,21 @@ components:
       type: object
       properties:
         name:
+          type:
+          - string
+          - 'null'
+    UpdatePlatformOrganizationRequest:
+      type: object
+      properties:
+        identity_settings_mode:
+          type:
+          - string
+          - 'null'
+        name:
+          type:
+          - string
+          - 'null'
+        slug:
           type:
           - string
           - 'null'

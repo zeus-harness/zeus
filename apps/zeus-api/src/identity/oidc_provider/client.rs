@@ -19,7 +19,7 @@ use crate::{
     api_support::{required_revision, revision_etag},
     auth::{AuthContext, PrincipalContext, insert_audit, require_self_service_identity_settings},
     crypto::random_token,
-    database::{TenantScope, begin_tenant},
+    database::begin_tenant,
     error::ApiError,
 };
 
@@ -108,11 +108,7 @@ pub async fn list_clients(
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<OidcClientResponse>>, ApiError> {
     require_self_service_identity_settings(&state, &auth, organization_id).await?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let clients = sqlx::query_as::<_, OidcClientResponse>(
         "select c.id, c.organization_id, c.client_id, c.name, c.client_type,
                 c.trusted, c.allowed_scopes,
@@ -173,11 +169,7 @@ pub async fn create_client(
         (None, None)
     };
 
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let created_id: Uuid = sqlx::query_scalar(
         "insert into oidc_clients (
            organization_id, client_id, name, client_type, client_secret_hash,
@@ -257,11 +249,7 @@ pub async fn update_client(
         .as_deref()
         .map(|values| validate_redirect_uris(&state, values, true))
         .transpose()?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let updated = sqlx::query_scalar::<_, Uuid>(
         "update oidc_clients
          set name = coalesce($1, name),
@@ -324,11 +312,7 @@ pub async fn revoke_client(
 ) -> Result<StatusCode, ApiError> {
     require_self_service_identity_settings(&state, &auth, organization_id).await?;
     auth.require_recent_authentication()?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let result = sqlx::query(
         "update oidc_clients
          set status = 'revoked', revoked_at = now(), revision = revision + 1, updated_at = now()

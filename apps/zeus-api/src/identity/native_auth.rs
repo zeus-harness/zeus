@@ -23,7 +23,7 @@ use crate::{
     AppState,
     auth::{
         PrincipalContext, csrf_cookie, expired_csrf_cookie, expired_session_cookie,
-        required_federated_provider, session_cookie,
+        expired_tenant_access_grant_cookie, required_federated_provider, session_cookie,
     },
     crypto::{SealedSecret, privacy_digest, random_token, sha256},
     database::begin_user,
@@ -1253,7 +1253,7 @@ fn open_totp_secret(
         .map_err(|_| ApiError::Internal)
 }
 
-async fn verify_second_factor(
+pub(crate) async fn verify_second_factor(
     state: &AppState,
     user_id: Uuid,
     code: &str,
@@ -1296,7 +1296,7 @@ async fn verify_second_factor(
     }
 }
 
-async fn verify_current_password(
+pub(crate) async fn verify_current_password(
     state: &AppState,
     principal: &PrincipalContext,
     password: String,
@@ -1681,6 +1681,12 @@ fn expired_auth_cookie_headers(state: &AppState) -> Result<HeaderMap, ApiError> 
     headers.append(
         header::SET_COOKIE,
         expired_csrf_cookie(state)
+            .parse()
+            .map_err(|_| ApiError::Internal)?,
+    );
+    headers.append(
+        header::SET_COOKIE,
+        expired_tenant_access_grant_cookie(state)
             .parse()
             .map_err(|_| ApiError::Internal)?,
     );

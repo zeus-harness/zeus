@@ -7,7 +7,7 @@ pub mod identity;
 pub mod platform;
 
 pub use collaboration::{experiences, work_items};
-pub use control_plane::{agents, integrations, organization};
+pub use control_plane::{agents, integrations, organization, platform_tenants};
 pub use execution::{model, runtime, supervisor};
 pub use identity::{
     auth, federated_identity, maintenance as identity_maintenance, native_auth, native_identity,

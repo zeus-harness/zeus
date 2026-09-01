@@ -324,7 +324,7 @@ K 阶段使用 ADR 0008。版本保持 `0.1.0`，API 前缀保持 `/api/v1`。�
 
 ### K3：平台租户管理
 
-状态：`pending`
+状态：`done`
 
 - 新增 `0027_platform_tenant_access.sql`。
 - 实现平台 Organization 创建、修改、状态动作、初始 Owner 邀请重发/替换和治理模式。
@@ -332,6 +332,8 @@ K 阶段使用 ADR 0008。版本保持 `0.1.0`，API 前缀保持 `/api/v1`。�
 - 实现原生密码 + TOTP 重新认证和最多 60 分钟的支持 Grant。
 - Principal/AuthContext 携带 Grant ID。每个请求从 PostgreSQL 校验，不写 Membership，不绕过 RLS。
 - 平台和支持操作同时写 Organization Audit 与 Security Event。
+
+验收记录：PostgreSQL 18.6 空库迁移到 `27`。7 个真实 PostgreSQL 集成测试串行通过；平台测试覆盖 Organization 幂等创建、Provisioning Owner 邀请、revision 冲突、状态恢复、Grant 与 Web Session 绑定、跨 Session 拒绝、RLS、撤销、Audit 和 Security Event。Rust Clippy 与 Workspace 测试通过，单元测试为 `76 + 23 + 22`；Web `105`、UI `1`、Node `9` 项测试、静态检查和生产构建通过。H 和 I5 状态未变。
 
 ### K4：Web 路由与设置区域
 

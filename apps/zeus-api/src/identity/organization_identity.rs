@@ -19,7 +19,7 @@ use crate::{
     AppState,
     auth::AuthContext,
     crypto::{random_token, sha256},
-    database::{TenantScope, begin_tenant},
+    database::begin_tenant,
     error::ApiError,
     native_auth::{AcceptedIdentityResponse, queue_invitation_email_on},
 };
@@ -73,11 +73,7 @@ pub async fn list_invitations(
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<InvitationResponse>>, ApiError> {
     auth.require_organization(organization_id, Permission::ManageOrganization)?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     sqlx::query(
         "update organization_invitations
          set status = 'expired', updated_at = now()
@@ -121,11 +117,7 @@ pub async fn create_invitation(
     let token = random_token(32).map_err(|_| ApiError::Internal)?;
     let expires_at = OffsetDateTime::now_utc() + time::Duration::days(7);
 
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let created = sqlx::query_as::<_, CreatedInvitationRow>(
         "with created as (
            insert into organization_invitations (
@@ -203,11 +195,7 @@ pub async fn resend_invitation(
 ) -> Result<(StatusCode, Json<AcceptedIdentityResponse>), ApiError> {
     auth.require_organization(organization_id, Permission::ManageOrganization)?;
     let token = random_token(32).map_err(|_| ApiError::Internal)?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let invitation = sqlx::query_as::<_, PendingInvitationRow>(
         "update organization_invitations i
          set token_hash = $3, expires_at = now() + interval '7 days', updated_at = now()
@@ -247,11 +235,7 @@ pub async fn revoke_invitation(
     Path((organization_id, invitation_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
     auth.require_organization(organization_id, Permission::ManageOrganization)?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let result = sqlx::query(
         "update organization_invitations
          set status = 'revoked', revoked_at = now(), updated_at = now()

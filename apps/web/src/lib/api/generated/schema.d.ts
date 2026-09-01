@@ -612,6 +612,118 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/platform/organizations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_platform_organizations"];
+        put?: never;
+        post: operations["create_platform_organization"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/platform/organizations/{organization_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_platform_organization"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch: operations["update_platform_organization"];
+        trace?: never;
+    };
+    "/api/v1/platform/organizations/{organization_id}/owner-invitation/replace": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["replace_platform_owner_invitation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/platform/organizations/{organization_id}/owner-invitation/resend": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["resend_platform_owner_invitation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/platform/organizations/{organization_id}/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["transition_platform_organization"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/platform/tenant-access-grants": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["create_platform_tenant_access_grant"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/platform/tenant-access-grants/{grant_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["revoke_platform_tenant_access_grant"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/setup": {
         parameters: {
             query?: never;
@@ -2323,6 +2435,23 @@ export interface components {
             name: string;
             slug: string;
         };
+        CreatePlatformOrganizationRequest: {
+            identity_settings_mode: string;
+            initial_workspace_name: string;
+            initial_workspace_slug: string;
+            name: string;
+            owner_email: string;
+            slug: string;
+        };
+        CreatePlatformTenantAccessGrantRequest: {
+            /** Format: int32 */
+            duration_minutes?: number;
+            /** Format: uuid */
+            organization_id: string;
+            password: string;
+            reason: string;
+            totp_code: string;
+        };
         CreateRunRequest: {
             input?: unknown;
             message?: string | null;
@@ -2423,6 +2552,25 @@ export interface components {
             /** Format: uuid */
             workspace_id: string;
         };
+        CreatedPlatformOrganizationResponse: {
+            identity_settings_mode: string;
+            /** Format: date-time */
+            invitation_expires_at: string;
+            /** Format: uuid */
+            invitation_id: string;
+            /** Format: uuid */
+            organization_id: string;
+            organization_name: string;
+            /** Format: int64 */
+            organization_revision: number;
+            organization_slug: string;
+            organization_status: string;
+            owner_email: string;
+            /** Format: uuid */
+            workspace_id: string;
+            workspace_name: string;
+            workspace_slug: string;
+        };
         CreatedServiceAccountResponse: {
             /** Format: date-time */
             created_at: string;
@@ -2483,6 +2631,10 @@ export interface components {
             principal_id: string;
             principal_kind: string;
             scopes: string[];
+            /** Format: date-time */
+            tenant_access_expires_at?: string | null;
+            /** Format: uuid */
+            tenant_access_grant_id?: string | null;
             /** Format: uuid */
             user_id?: string | null;
             /** Format: uuid */
@@ -2852,6 +3004,72 @@ export interface components {
             password: string;
             token: string;
         };
+        PlatformOrganizationMutationResponse: {
+            /** Format: date-time */
+            archived_at?: string | null;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: int64 */
+            governance_revision: number;
+            /** Format: uuid */
+            id: string;
+            identity_settings_mode: string;
+            name: string;
+            /** Format: int64 */
+            revision: number;
+            slug: string;
+            status: string;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        PlatformOrganizationResponse: {
+            /** Format: int64 */
+            active_owner_count: number;
+            /** Format: date-time */
+            archived_at?: string | null;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: int64 */
+            governance_revision: number;
+            /** Format: uuid */
+            id: string;
+            identity_settings_mode: string;
+            name: string;
+            pending_owner_email?: string | null;
+            /** Format: uuid */
+            pending_owner_invitation_id?: string | null;
+            /** Format: int64 */
+            revision: number;
+            slug: string;
+            status: string;
+            /** Format: date-time */
+            updated_at: string;
+            /** Format: int64 */
+            workspace_count: number;
+        };
+        PlatformOwnerInvitationResponse: {
+            /** Format: date-time */
+            invitation_expires_at: string;
+            /** Format: uuid */
+            invitation_id: string;
+            /** Format: uuid */
+            organization_id: string;
+            organization_name: string;
+            /** Format: int64 */
+            organization_revision: number;
+            owner_email: string;
+        };
+        PlatformTenantAccessGrantResponse: {
+            /** Format: date-time */
+            expires_at: string;
+            /** Format: uuid */
+            grant_id: string;
+            /** Format: uuid */
+            organization_id: string;
+            organization_name: string;
+            organization_status: string;
+            reason: string;
+        };
         ProblemDetails: {
             code: string;
             detail: string;
@@ -2868,6 +3086,9 @@ export interface components {
             email: string;
             invitation_token?: string | null;
             password: string;
+        };
+        ReplacePlatformOwnerInvitationRequest: {
+            owner_email: string;
         };
         RetryRunRequest: Record<string, never>;
         ReviewExperienceCandidateRequest: {
@@ -3160,6 +3381,9 @@ export interface components {
             started_at?: string | null;
             status: string;
         };
+        TransitionPlatformOrganizationRequest: {
+            action: string;
+        };
         UpdateAgentRequest: {
             archived?: boolean | null;
             description?: string | null;
@@ -3219,6 +3443,11 @@ export interface components {
         };
         UpdateOrganizationRequest: {
             name?: string | null;
+        };
+        UpdatePlatformOrganizationRequest: {
+            identity_settings_mode?: string | null;
+            name?: string | null;
+            slug?: string | null;
         };
         UpdateScheduleRequest: {
             cron_expression?: string | null;
@@ -5140,6 +5369,328 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["WorkspaceResponse"];
                 };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    list_platform_organizations: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Organizations visible to the platform */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlatformOrganizationResponse"][];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    create_platform_organization: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreatePlatformOrganizationRequest"];
+            };
+        };
+        responses: {
+            /** @description Provisioning Organization, initial Workspace, and Owner invitation */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreatedPlatformOrganizationResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    get_platform_organization: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Platform Organization detail */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlatformOrganizationResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    update_platform_organization: {
+        parameters: {
+            query?: never;
+            header: {
+                "If-Match": string;
+            };
+            path: {
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdatePlatformOrganizationRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated Organization */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlatformOrganizationMutationResponse"];
+                };
+            };
+            /** @description Revision mismatch */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    replace_platform_owner_invitation: {
+        parameters: {
+            query?: never;
+            header: {
+                "If-Match": string;
+            };
+            path: {
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReplacePlatformOwnerInvitationRequest"];
+            };
+        };
+        responses: {
+            /** @description Replacement initial Owner invitation queued */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlatformOwnerInvitationResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    resend_platform_owner_invitation: {
+        parameters: {
+            query?: never;
+            header: {
+                "If-Match": string;
+            };
+            path: {
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Initial Owner invitation resend queued */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlatformOwnerInvitationResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    transition_platform_organization: {
+        parameters: {
+            query?: never;
+            header: {
+                "If-Match": string;
+            };
+            path: {
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TransitionPlatformOrganizationRequest"];
+            };
+        };
+        responses: {
+            /** @description Transitioned Organization */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlatformOrganizationMutationResponse"];
+                };
+            };
+            /** @description Invalid state transition */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Revision mismatch */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    create_platform_tenant_access_grant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreatePlatformTenantAccessGrantRequest"];
+            };
+        };
+        responses: {
+            /** @description Bounded platform tenant access Grant */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlatformTenantAccessGrantResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    revoke_platform_tenant_access_grant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                grant_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Platform tenant access Grant revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Problem Details error */
             default: {

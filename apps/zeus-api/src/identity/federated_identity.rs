@@ -19,7 +19,7 @@ use crate::{
     api_support::{required_revision, revision_etag},
     auth::{AuthContext, insert_audit, require_self_service_identity_settings},
     crypto::{random_token, sha256},
-    database::{TenantScope, begin_tenant},
+    database::begin_tenant,
     error::ApiError,
 };
 
@@ -73,11 +73,7 @@ pub async fn list_domains(
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<OrganizationDomainResponse>>, ApiError> {
     require_self_service_identity_settings(&state, &auth, organization_id).await?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let domains = sqlx::query_as::<_, OrganizationDomainResponse>(
         "select id, organization_id, domain, status, verified_at,
                 created_by, created_at, updated_at
@@ -110,11 +106,7 @@ pub async fn create_domain(
     let user_id = auth.user_id.ok_or(ApiError::Forbidden)?;
     let domain = normalize_domain(&request.domain)?;
     let token = random_token(32).map_err(|_| ApiError::Internal)?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let created = sqlx::query_as::<_, OrganizationDomainResponse>(
         "insert into organization_domains (
            organization_id, domain, verification_token_hash, created_by
@@ -161,11 +153,7 @@ pub async fn verify_domain(
     Path((organization_id, domain_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<OrganizationDomainResponse>, ApiError> {
     require_self_service_identity_settings(&state, &auth, organization_id).await?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let challenge = sqlx::query_as::<_, DomainVerificationRow>(
         "select domain, verification_token_hash
          from organization_domains
@@ -196,11 +184,7 @@ pub async fn verify_domain(
         ));
     }
 
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let domain = sqlx::query_as::<_, OrganizationDomainResponse>(
         "update organization_domains
          set status = 'verified', verified_at = now(), updated_at = now()
@@ -241,11 +225,7 @@ pub async fn revoke_domain(
     Path((organization_id, domain_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
     require_self_service_identity_settings(&state, &auth, organization_id).await?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let result = sqlx::query(
         "update organization_domains
          set status = 'revoked', verified_at = null, updated_at = now()
@@ -303,11 +283,7 @@ pub async fn get_identity_policy(
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<OrganizationIdentityPolicyResponse>, ApiError> {
     require_self_service_identity_settings(&state, &auth, organization_id).await?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let policy = sqlx::query_as::<_, OrganizationIdentityPolicyResponse>(
         "select organization_id, mfa_required, federated_required,
                 required_federated_provider_id, revision, updated_by, updated_at
@@ -343,11 +319,7 @@ pub async fn update_identity_policy(
     }
     let revision = required_revision(&headers)?;
     let user_id = auth.user_id.ok_or(ApiError::Forbidden)?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        TenantScope::organization(auth.user_id, organization_id),
-    )
-    .await?;
+    let mut transaction = begin_tenant(&state.platform.database, auth.tenant_scope(None)).await?;
     let policy = sqlx::query_as::<_, OrganizationIdentityPolicyResponse>(
         "update organization_identity_policies
          set mfa_required = $1, federated_required = $2,

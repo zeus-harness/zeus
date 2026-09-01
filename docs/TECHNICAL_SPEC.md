@@ -339,7 +339,7 @@ Organization 身份设置模式为 `self_service | platform_managed`。后者拒
 
 Organization 状态固定为 `provisioning | active | suspended | archived`。Suspend 阻止新业务写入、Run claim、Schedule/Webhook 投递、联合登录、OIDC Authorization 和 Refresh，并为未完成 Run 请求取消。恢复先进入 `suspended`。已签发 Access Token 最多继续存活 5 分钟。
 
-K0-K2 已实现。`0025_tenant_owner_governance.sql` 和 `0026_global_external_identities.sql` 已在 PostgreSQL 18.6 空库执行。Owner、Provisioning 邀请、`platform_managed` API 拒绝、跨 Organization Provider 拒绝、Binding 独立撤销和全局身份登录方式保护都有真实数据库测试。K3-K5 仍是目标契约。
+K0-K3 已实现。`0025_tenant_owner_governance.sql`、`0026_global_external_identities.sql` 和 `0027_platform_tenant_access.sql` 已在 PostgreSQL 18.6 空库执行。Owner、Provisioning 邀请、`platform_managed` API 拒绝、跨 Organization Provider 拒绝、Binding 独立撤销、全局身份登录方式保护、平台 Organization 生命周期和限时支持 Grant 都有真实数据库测试。Grant 绑定平台用户、Web Session 和 Organization；创建时验证原生密码与 TOTP，逐请求从 PostgreSQL 校验，撤销和到期立即失效。K4-K5 仍是目标契约。
 
 ## 密钥
 
