@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use axum::{
     Router,
@@ -21,8 +25,10 @@ use zeus_api::{
 };
 use zeus_identity::{PasswordExecutor, PasswordPolicy, pkce_s256_challenge};
 
-const SESSION_TOKEN: &str = "oidc-provider-integration-session-token";
-const CSRF_TOKEN: &str = "oidc-provider-integration-csrf-token";
+static SESSION_TOKEN: LazyLock<String> =
+    LazyLock::new(|| format!("oidc-provider-session-{}", Uuid::now_v7()));
+static CSRF_TOKEN: LazyLock<String> =
+    LazyLock::new(|| format!("oidc-provider-csrf-{}", Uuid::now_v7()));
 const PUBLIC_URL: &str = "http://127.0.0.1:3000";
 const PUBLIC_REDIRECT: &str = "http://127.0.0.1:43121/callback";
 const CONFIDENTIAL_REDIRECT: &str = "http://127.0.0.1:43122/callback";
@@ -46,13 +52,22 @@ async fn oidc_provider_supports_public_confidential_and_refresh_replay_protectio
     let organization_id = Uuid::now_v7();
     let workspace_id = Uuid::now_v7();
     let user_id = Uuid::now_v7();
+    let user_email = format!("oidc-user-{user_id}@example.test");
     let session_id = Uuid::now_v7();
-    sqlx::query("insert into organizations (id, slug, name) values ($1, $2, 'OIDC Test')")
+    sqlx::query(
+        "insert into organizations (id, slug, name, status)
+         values ($1, $2, 'OIDC Test', 'provisioning')",
+    )
+    .bind(organization_id)
+    .bind(format!("oidc-{organization_id}"))
+    .execute(&owner_pool)
+    .await
+    .expect("organization inserts");
+    sqlx::query("insert into organization_governance (organization_id) values ($1)")
         .bind(organization_id)
-        .bind(format!("oidc-{organization_id}"))
         .execute(&owner_pool)
         .await
-        .expect("organization inserts");
+        .expect("organization governance inserts");
     sqlx::query("insert into organization_identity_policies (organization_id) values ($1)")
         .bind(organization_id)
         .execute(&owner_pool)
@@ -70,9 +85,10 @@ async fn oidc_provider_supports_public_confidential_and_refresh_replay_protectio
     .expect("workspace inserts");
     sqlx::query(
         "insert into users (id, email, display_name, status, email_verified_at)
-         values ($1, 'oidc-user@example.test', 'OIDC User', 'active', now())",
+         values ($1, $2, 'OIDC User', 'active', now())",
     )
     .bind(user_id)
+    .bind(&user_email)
     .execute(&owner_pool)
     .await
     .expect("user inserts");
@@ -87,7 +103,7 @@ async fn oidc_provider_supports_public_confidential_and_refresh_replay_protectio
     .expect("organization membership inserts");
     sqlx::query(
         "insert into workspace_memberships (organization_id, workspace_id, user_id, role, status)
-         values ($1, $2, $3, 'admin', 'active')",
+         values ($1, $2, $3, 'owner', 'active')",
     )
     .bind(organization_id)
     .bind(workspace_id)
@@ -95,6 +111,11 @@ async fn oidc_provider_supports_public_confidential_and_refresh_replay_protectio
     .execute(&owner_pool)
     .await
     .expect("workspace membership inserts");
+    sqlx::query("update organizations set status = 'active' where id = $1")
+        .bind(organization_id)
+        .execute(&owner_pool)
+        .await
+        .expect("organization activates after owners exist");
     sqlx::query(
         "insert into web_sessions (
            id, user_id, active_organization_id, active_workspace_id,
@@ -115,7 +136,7 @@ async fn oidc_provider_supports_public_confidential_and_refresh_replay_protectio
     .await
     .expect("web session inserts");
 
-    let public_client_id = format!("zoc_{}", "P".repeat(32));
+    let public_client_id = format!("zoc_{}", organization_id.simple());
     let public_internal_id = insert_client(
         &owner_pool,
         organization_id,
@@ -127,7 +148,7 @@ async fn oidc_provider_supports_public_confidential_and_refresh_replay_protectio
         PUBLIC_REDIRECT,
     )
     .await;
-    let confidential_client_id = format!("zoc_{}", "C".repeat(32));
+    let confidential_client_id = format!("zoc_{}", user_id.simple());
     let confidential_secret = "zocs_confidential-test-secret-with-enough-entropy";
     let confidential_hash = hash_service_account_token(&SecretString::from(confidential_secret))
         .expect("client secret hashes");
@@ -246,7 +267,7 @@ async fn oidc_provider_supports_public_confidential_and_refresh_replay_protectio
     let userinfo = send_bearer(&app, Method::GET, "/oauth2/userinfo", access_token).await;
     let userinfo = expect_json(userinfo, StatusCode::OK).await;
     assert_eq!(userinfo["sub"].as_str().map(str::is_empty), Some(false));
-    assert_eq!(userinfo["email"], "oidc-user@example.test");
+    assert_eq!(userinfo["email"], user_email);
     assert_eq!(
         userinfo["zeus.organization"]["id"],
         organization_id.to_string()
@@ -416,7 +437,11 @@ async fn oidc_provider_supports_public_confidential_and_refresh_replay_protectio
     let logout_form = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("client_id", &public_client_id)
         .finish();
-    let session_cookie = format!("zeus_session={SESSION_TOKEN}; zeus_csrf={CSRF_TOKEN}");
+    let session_cookie = format!(
+        "zeus_session={}; zeus_csrf={}",
+        SESSION_TOKEN.as_str(),
+        CSRF_TOKEN.as_str()
+    );
     let logout = send_public(
         &app,
         Method::POST,
@@ -425,7 +450,7 @@ async fn oidc_provider_supports_public_confidential_and_refresh_replay_protectio
         &[
             (header::COOKIE.as_str(), &session_cookie),
             (header::ORIGIN.as_str(), PUBLIC_URL),
-            ("x-zeus-csrf", CSRF_TOKEN),
+            ("x-zeus-csrf", CSRF_TOKEN.as_str()),
         ],
     )
     .await;
@@ -572,7 +597,7 @@ async fn authorize(
         None,
         &[(
             header::COOKIE.as_str(),
-            &format!("zeus_session={SESSION_TOKEN}"),
+            &format!("zeus_session={}", SESSION_TOKEN.as_str()),
         )],
     )
     .await;
@@ -711,12 +736,16 @@ async fn send_json(app: &Router, method: Method, uri: &str, body: Option<Value>)
     let is_write = !matches!(method, Method::GET | Method::HEAD | Method::OPTIONS);
     let mut request = Request::builder().method(method).uri(uri).header(
         header::COOKIE,
-        format!("zeus_session={SESSION_TOKEN}; zeus_csrf={CSRF_TOKEN}"),
+        format!(
+            "zeus_session={}; zeus_csrf={}",
+            SESSION_TOKEN.as_str(),
+            CSRF_TOKEN.as_str()
+        ),
     );
     if is_write {
         request = request
             .header(header::ORIGIN, PUBLIC_URL)
-            .header("x-zeus-csrf", CSRF_TOKEN);
+            .header("x-zeus-csrf", CSRF_TOKEN.as_str());
     }
     let body = match body {
         Some(body) => {

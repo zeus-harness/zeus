@@ -167,13 +167,9 @@ impl AuthContext {
 
     fn allows_workspace(&self, permission: Permission) -> bool {
         match self.principal_kind {
-            PrincipalKind::User => {
-                self.organization_role
-                    .is_some_and(|role| role.allows(permission))
-                    || self
-                        .workspace_role
-                        .is_some_and(|role| role.allows(permission))
-            }
+            PrincipalKind::User => self
+                .workspace_role
+                .is_some_and(|role| role.allows(permission)),
             PrincipalKind::ServiceAccount => self.scope_allows(permission),
         }
     }
@@ -192,6 +188,38 @@ impl AuthContext {
             Permission::ReadWorkspace => "workspace:read",
         };
         self.scopes.contains(required)
+    }
+}
+
+/// Requires an Organization Owner whose identity settings are not platform-managed.
+///
+/// The database policies repeat this check so a concurrent governance change cannot
+/// authorize an identity write after this stable API error has been selected.
+pub async fn require_self_service_identity_settings(
+    state: &AppState,
+    auth: &AuthContext,
+    organization_id: Uuid,
+) -> Result<(), ApiError> {
+    auth.require_organization(organization_id, Permission::ManageOrganization)?;
+    let mut transaction = begin_tenant(
+        &state.platform.database,
+        TenantScope::organization(auth.user_id, organization_id),
+    )
+    .await?;
+    let mode = sqlx::query_scalar::<_, String>(
+        "select identity_settings_mode
+         from organization_governance
+         where organization_id = $1",
+    )
+    .bind(organization_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(ApiError::Internal)?;
+    transaction.commit().await?;
+    if mode == "self_service" {
+        Ok(())
+    } else {
+        Err(ApiError::OrganizationIdentitySettingsManaged)
     }
 }
 
@@ -1440,7 +1468,6 @@ pub(crate) async fn insert_audit(
 fn parse_organization_role(value: &str) -> Result<OrganizationRole, ApiError> {
     match value {
         "owner" => Ok(OrganizationRole::Owner),
-        "admin" => Ok(OrganizationRole::Admin),
         "member" => Ok(OrganizationRole::Member),
         "auditor" => Ok(OrganizationRole::Auditor),
         _ => Err(ApiError::Internal),
@@ -1449,7 +1476,7 @@ fn parse_organization_role(value: &str) -> Result<OrganizationRole, ApiError> {
 
 fn parse_workspace_role(value: &str) -> Result<WorkspaceRole, ApiError> {
     match value {
-        "admin" => Ok(WorkspaceRole::Admin),
+        "owner" => Ok(WorkspaceRole::Owner),
         "builder" => Ok(WorkspaceRole::Builder),
         "operator" => Ok(WorkspaceRole::Operator),
         "viewer" => Ok(WorkspaceRole::Viewer),
@@ -1460,7 +1487,6 @@ fn parse_workspace_role(value: &str) -> Result<WorkspaceRole, ApiError> {
 fn organization_role_name(role: OrganizationRole) -> String {
     match role {
         OrganizationRole::Owner => "owner",
-        OrganizationRole::Admin => "admin",
         OrganizationRole::Member => "member",
         OrganizationRole::Auditor => "auditor",
     }
@@ -1469,7 +1495,7 @@ fn organization_role_name(role: OrganizationRole) -> String {
 
 fn workspace_role_name(role: WorkspaceRole) -> String {
     match role {
-        WorkspaceRole::Admin => "admin",
+        WorkspaceRole::Owner => "owner",
         WorkspaceRole::Builder => "builder",
         WorkspaceRole::Operator => "operator",
         WorkspaceRole::Viewer => "viewer",
@@ -1539,7 +1565,7 @@ mod tests {
             organization_id,
             workspace_id,
             OrganizationRole::Member,
-            WorkspaceRole::Admin,
+            WorkspaceRole::Owner,
         );
 
         assert!(
@@ -1561,7 +1587,7 @@ mod tests {
         let context = user_context(
             organization_id,
             workspace_id,
-            OrganizationRole::Admin,
+            OrganizationRole::Owner,
             WorkspaceRole::Viewer,
         );
 
@@ -1569,6 +1595,29 @@ mod tests {
             context
                 .require_organization(organization_id, Permission::ManageOrganization)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn organization_owner_does_not_inherit_workspace_permissions() {
+        let organization_id = Uuid::now_v7();
+        let workspace_id = Uuid::now_v7();
+        let context = user_context(
+            organization_id,
+            workspace_id,
+            OrganizationRole::Owner,
+            WorkspaceRole::Viewer,
+        );
+
+        assert!(
+            context
+                .require_organization(organization_id, Permission::ManageOrganization)
+                .is_ok()
+        );
+        assert!(
+            context
+                .require_workspace(workspace_id, Permission::ManageWorkspace)
+                .is_err()
         );
     }
 
@@ -1618,8 +1667,8 @@ mod tests {
         let mut user = user_context(
             organization_id,
             workspace_id,
-            OrganizationRole::Admin,
-            WorkspaceRole::Admin,
+            OrganizationRole::Owner,
+            WorkspaceRole::Owner,
         );
         assert!(user.require_recent_authentication().is_ok());
 

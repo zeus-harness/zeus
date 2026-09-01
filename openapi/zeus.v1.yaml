@@ -8203,10 +8203,6 @@ components:
           type:
           - string
           - 'null'
-        status:
-          type:
-          - string
-          - 'null'
     UpdateScheduleRequest:
       type: object
       properties:

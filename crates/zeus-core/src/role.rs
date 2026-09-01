@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum OrganizationRole {
     Owner,
-    Admin,
     Member,
     Auditor,
 }
@@ -12,7 +11,7 @@ pub enum OrganizationRole {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceRole {
-    Admin,
+    Owner,
     Builder,
     Operator,
     Viewer,
@@ -36,7 +35,7 @@ impl OrganizationRole {
     #[must_use]
     pub const fn allows(self, permission: Permission) -> bool {
         match self {
-            Self::Owner | Self::Admin => true,
+            Self::Owner => true,
             Self::Member => matches!(permission, Permission::ReadWorkspace),
             Self::Auditor => matches!(
                 permission,
@@ -50,7 +49,7 @@ impl WorkspaceRole {
     #[must_use]
     pub const fn allows(self, permission: Permission) -> bool {
         match self {
-            Self::Admin => matches!(
+            Self::Owner => matches!(
                 permission,
                 Permission::ManageWorkspace
                     | Permission::BuildWorkflow
@@ -78,12 +77,22 @@ impl WorkspaceRole {
 
 #[cfg(test)]
 mod tests {
-    use super::{OrganizationRole, Permission};
+    use super::{OrganizationRole, Permission, WorkspaceRole};
 
     #[test]
-    fn organization_admins_can_manage_identity_and_membership_configuration() {
-        assert!(OrganizationRole::Admin.allows(Permission::ManageOrganization));
+    fn organization_owner_can_manage_identity_and_membership_configuration() {
+        assert!(OrganizationRole::Owner.allows(Permission::ManageOrganization));
         assert!(!OrganizationRole::Member.allows(Permission::ManageOrganization));
         assert!(!OrganizationRole::Auditor.allows(Permission::ManageOrganization));
+    }
+
+    #[test]
+    fn workspace_owner_and_builder_keep_distinct_boundaries() {
+        assert!(WorkspaceRole::Owner.allows(Permission::ManageWorkspace));
+        assert!(WorkspaceRole::Owner.allows(Permission::ApproveTool));
+        assert!(!WorkspaceRole::Builder.allows(Permission::ManageWorkspace));
+        assert!(!WorkspaceRole::Builder.allows(Permission::ApproveTool));
+        assert!(WorkspaceRole::Builder.allows(Permission::BuildWorkflow));
+        assert!(WorkspaceRole::Builder.allows(Permission::OperateRun));
     }
 }

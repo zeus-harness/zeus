@@ -3174,7 +3174,6 @@ export interface components {
         };
         UpdateOrganizationRequest: {
             name?: string | null;
-            status?: string | null;
         };
         UpdateScheduleRequest: {
             cron_expression?: string | null;

@@ -36,6 +36,8 @@ pub enum ApiError {
     ReauthenticationRequired,
     #[error("the organization requires its configured federated identity provider")]
     FederatedAuthenticationRequired,
+    #[error("organization identity settings are managed by the platform")]
+    OrganizationIdentitySettingsManaged,
     #[error("the request conflicts with current resource state: {0}")]
     Conflict(String),
     #[error("If-Match is required for this operation")]
@@ -112,6 +114,12 @@ impl IntoResponse for ApiError {
                 StatusCode::FORBIDDEN,
                 "federated_authentication_required",
                 "Federated authentication required",
+                None,
+            ),
+            Self::OrganizationIdentitySettingsManaged => (
+                StatusCode::FORBIDDEN,
+                "organization_identity_settings_managed",
+                "Organization identity settings managed by platform",
                 None,
             ),
             Self::Conflict(_) => (StatusCode::CONFLICT, "conflict", "Conflict", None),

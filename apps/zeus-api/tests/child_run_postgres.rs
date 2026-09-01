@@ -65,12 +65,21 @@ async fn child_run_uses_separate_session_budgets_and_durable_parent_resume() {
         .expect("fake provider serves");
     });
 
-    sqlx::query("insert into organizations (id, slug, name) values ($1, $2, 'Child Test')")
+    let owner_user_id = Uuid::now_v7();
+    sqlx::query(
+        "insert into organizations (id, slug, name, status)
+         values ($1, $2, 'Child Test', 'provisioning')",
+    )
+    .bind(organization_id)
+    .bind(format!("child-{organization_id}"))
+    .execute(&owner_pool)
+    .await
+    .expect("organization inserts");
+    sqlx::query("insert into organization_governance (organization_id) values ($1)")
         .bind(organization_id)
-        .bind(format!("child-{organization_id}"))
         .execute(&owner_pool)
         .await
-        .expect("organization inserts");
+        .expect("organization governance inserts");
     sqlx::query(
         "insert into workspaces (id, organization_id, slug, name)
          values ($1, $2, $3, 'Child Test')",
@@ -81,6 +90,40 @@ async fn child_run_uses_separate_session_budgets_and_durable_parent_resume() {
     .execute(&owner_pool)
     .await
     .expect("workspace inserts");
+    sqlx::query(
+        "insert into users (id, email, display_name, status, email_verified_at)
+         values ($1, $2, 'Child Owner', 'active', now())",
+    )
+    .bind(owner_user_id)
+    .bind(format!("child-owner-{owner_user_id}@example.test"))
+    .execute(&owner_pool)
+    .await
+    .expect("child owner inserts");
+    sqlx::query(
+        "insert into organization_memberships (organization_id, user_id, role, status)
+         values ($1, $2, 'owner', 'active')",
+    )
+    .bind(organization_id)
+    .bind(owner_user_id)
+    .execute(&owner_pool)
+    .await
+    .expect("child organization owner membership inserts");
+    sqlx::query(
+        "insert into workspace_memberships (
+           organization_id, workspace_id, user_id, role, status
+         ) values ($1, $2, $3, 'owner', 'active')",
+    )
+    .bind(organization_id)
+    .bind(workspace_id)
+    .bind(owner_user_id)
+    .execute(&owner_pool)
+    .await
+    .expect("child workspace owner membership inserts");
+    sqlx::query("update organizations set status = 'active' where id = $1")
+        .bind(organization_id)
+        .execute(&owner_pool)
+        .await
+        .expect("child organization activates");
     sqlx::query(
         "insert into connections (
             id, organization_id, workspace_id, name, provider_kind, configuration

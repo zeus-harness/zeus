@@ -12,13 +12,12 @@ use sqlx::FromRow;
 use time::OffsetDateTime;
 use utoipa::ToSchema;
 use uuid::Uuid;
-use zeus_core::Permission;
 use zeus_identity::OidcScopes;
 
 use crate::{
     AppState,
     api_support::{required_revision, revision_etag},
-    auth::{AuthContext, PrincipalContext, insert_audit},
+    auth::{AuthContext, PrincipalContext, insert_audit, require_self_service_identity_settings},
     crypto::random_token,
     database::{TenantScope, begin_tenant},
     error::ApiError,
@@ -108,7 +107,7 @@ pub async fn list_clients(
     auth: AuthContext,
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<OidcClientResponse>>, ApiError> {
-    auth.require_organization(organization_id, Permission::ManageOrganization)?;
+    require_self_service_identity_settings(&state, &auth, organization_id).await?;
     let mut transaction = begin_tenant(
         &state.platform.database,
         TenantScope::organization(auth.user_id, organization_id),
@@ -149,7 +148,7 @@ pub async fn create_client(
     Path(organization_id): Path<Uuid>,
     Json(request): Json<CreateOidcClientRequest>,
 ) -> Result<(StatusCode, Json<CreatedOidcClientResponse>), ApiError> {
-    auth.require_organization(organization_id, Permission::ManageOrganization)?;
+    require_self_service_identity_settings(&state, &auth, organization_id).await?;
     auth.require_recent_authentication()?;
     let user_id = auth.user_id.ok_or(ApiError::Forbidden)?;
     let name = validate_name(&request.name)?;
@@ -239,7 +238,7 @@ pub async fn update_client(
     headers: HeaderMap,
     Json(request): Json<UpdateOidcClientRequest>,
 ) -> Result<(HeaderMap, Json<OidcClientResponse>), ApiError> {
-    auth.require_organization(organization_id, Permission::ManageOrganization)?;
+    require_self_service_identity_settings(&state, &auth, organization_id).await?;
     auth.require_recent_authentication()?;
     let revision = required_revision(&headers)?;
     let name = request.name.as_deref().map(validate_name).transpose()?;
@@ -323,7 +322,7 @@ pub async fn revoke_client(
     auth: AuthContext,
     Path((organization_id, client_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
-    auth.require_organization(organization_id, Permission::ManageOrganization)?;
+    require_self_service_identity_settings(&state, &auth, organization_id).await?;
     auth.require_recent_authentication()?;
     let mut transaction = begin_tenant(
         &state.platform.database,

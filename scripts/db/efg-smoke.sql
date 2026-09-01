@@ -41,6 +41,8 @@ declare
 begin
   insert into organizations (id, slug, name)
   values (organization_id, 'efg-' || replace(organization_id::text, '-', ''), 'EFG smoke');
+  insert into organization_governance (organization_id)
+  values (organization_id);
   insert into workspaces (id, organization_id, slug, name)
   values (workspace_id, organization_id, 'efg-' || replace(workspace_id::text, '-', ''), 'EFG smoke');
   insert into users (id, email, display_name)
@@ -48,7 +50,7 @@ begin
   insert into organization_memberships (organization_id, user_id, role)
   values (organization_id, user_id, 'owner');
   insert into workspace_memberships (organization_id, workspace_id, user_id, role)
-  values (organization_id, workspace_id, user_id, 'admin');
+  values (organization_id, workspace_id, user_id, 'owner');
 
   insert into connections (
     id, organization_id, workspace_id, name, provider_kind, configuration

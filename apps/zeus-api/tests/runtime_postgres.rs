@@ -63,13 +63,22 @@ async fn durable_runtime_persists_tool_pair_final_message_and_usage() {
     let workflow_version_id = Uuid::now_v7();
     let session_id = Uuid::now_v7();
     let run_id = Uuid::now_v7();
+    let owner_user_id = Uuid::now_v7();
 
-    sqlx::query("insert into organizations (id, slug, name) values ($1, $2, 'Runtime Test')")
+    sqlx::query(
+        "insert into organizations (id, slug, name, status)
+         values ($1, $2, 'Runtime Test', 'provisioning')",
+    )
+    .bind(organization_id)
+    .bind(format!("runtime-{organization_id}"))
+    .execute(&pool)
+    .await
+    .expect("organization inserts");
+    sqlx::query("insert into organization_governance (organization_id) values ($1)")
         .bind(organization_id)
-        .bind(format!("runtime-{organization_id}"))
         .execute(&pool)
         .await
-        .expect("organization inserts");
+        .expect("organization governance inserts");
     sqlx::query(
         "insert into workspaces (id, organization_id, slug, name)
          values ($1, $2, $3, 'Runtime Test')",
@@ -80,6 +89,40 @@ async fn durable_runtime_persists_tool_pair_final_message_and_usage() {
     .execute(&pool)
     .await
     .expect("workspace inserts");
+    sqlx::query(
+        "insert into users (id, email, display_name, status, email_verified_at)
+         values ($1, $2, 'Runtime Owner', 'active', now())",
+    )
+    .bind(owner_user_id)
+    .bind(format!("runtime-owner-{owner_user_id}@example.test"))
+    .execute(&pool)
+    .await
+    .expect("runtime owner inserts");
+    sqlx::query(
+        "insert into organization_memberships (organization_id, user_id, role, status)
+         values ($1, $2, 'owner', 'active')",
+    )
+    .bind(organization_id)
+    .bind(owner_user_id)
+    .execute(&pool)
+    .await
+    .expect("runtime organization owner membership inserts");
+    sqlx::query(
+        "insert into workspace_memberships (
+           organization_id, workspace_id, user_id, role, status
+         ) values ($1, $2, $3, 'owner', 'active')",
+    )
+    .bind(organization_id)
+    .bind(workspace_id)
+    .bind(owner_user_id)
+    .execute(&pool)
+    .await
+    .expect("runtime workspace owner membership inserts");
+    sqlx::query("update organizations set status = 'active' where id = $1")
+        .bind(organization_id)
+        .execute(&pool)
+        .await
+        .expect("runtime organization activates");
     sqlx::query(
         "insert into connections (
             id, organization_id, workspace_id, name, provider_kind, configuration

@@ -18,7 +18,8 @@ use crate::{
     AppState,
     api_support::{ListCursor, PageQuery, required_revision, revision_etag},
     auth::{
-        AuthContext, PrincipalContext, PrincipalKind, csrf_cookie, insert_audit, session_cookie,
+        AuthContext, PrincipalContext, PrincipalKind, csrf_cookie, insert_audit,
+        require_self_service_identity_settings, session_cookie,
     },
     crypto::{random_token, sha256},
     database::{TenantScope, begin_tenant},
@@ -49,7 +50,6 @@ pub struct CreateOrganizationRequest {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateOrganizationRequest {
     pub name: Option<String>,
-    pub status: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -201,13 +201,6 @@ pub async fn update_organization(
     if let Some(name) = request.name.as_deref() {
         validate_name(name)?;
     }
-    if let Some(status) = request.status.as_deref()
-        && !matches!(status, "active" | "suspended" | "archived")
-    {
-        return Err(ApiError::Validation(
-            "unknown organization status".to_owned(),
-        ));
-    }
     let mut transaction = begin_tenant(
         &state.platform.database,
         TenantScope::organization(auth.user_id, organization_id),
@@ -216,15 +209,12 @@ pub async fn update_organization(
     let updated = sqlx::query_as::<_, OrganizationResponse>(
         "update organizations
          set name = coalesce($1, name),
-             status = coalesce($2, status),
-             archived_at = case when $2 = 'archived' then coalesce(archived_at, now()) else archived_at end,
              revision = revision + 1,
              updated_at = now()
-         where id = $3 and revision = $4
+         where id = $2 and revision = $3
          returning id, slug, name, status, revision, created_at, updated_at, archived_at",
     )
     .bind(request.name)
-    .bind(request.status)
     .bind(organization_id)
     .bind(revision)
     .fetch_optional(&mut *transaction)
@@ -336,6 +326,10 @@ pub async fn create_workspace(
     Json(request): Json<CreateWorkspaceRequest>,
 ) -> Result<(StatusCode, Json<WorkspaceResponse>), ApiError> {
     auth.require_organization(organization_id, Permission::ManageWorkspace)?;
+    if auth.principal_kind != PrincipalKind::User {
+        return Err(ApiError::Forbidden);
+    }
+    let owner_user_id = auth.user_id.ok_or(ApiError::Forbidden)?;
     validate_slug(&request.slug)?;
     validate_name(&request.name)?;
     let mut transaction = begin_tenant(
@@ -354,17 +348,15 @@ pub async fn create_workspace(
     .bind(request.name)
     .fetch_one(&mut *transaction)
     .await?;
-    if let Some(user_id) = auth.user_id {
-        sqlx::query(
-            "insert into workspace_memberships (organization_id, workspace_id, user_id, role)
-             values ($1, $2, $3, 'admin') on conflict (workspace_id, user_id) do nothing",
-        )
-        .bind(organization_id)
-        .bind(workspace.id)
-        .bind(user_id)
-        .execute(&mut *transaction)
-        .await?;
-    }
+    sqlx::query(
+        "insert into workspace_memberships (organization_id, workspace_id, user_id, role)
+         values ($1, $2, $3, 'owner') on conflict (workspace_id, user_id) do nothing",
+    )
+    .bind(organization_id)
+    .bind(workspace.id)
+    .bind(owner_user_id)
+    .execute(&mut *transaction)
+    .await?;
     insert_audit(
         &mut transaction,
         &auth,
@@ -756,7 +748,7 @@ pub async fn list_federated_identity_providers(
     auth: AuthContext,
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<FederatedIdentityProviderResponse>>, ApiError> {
-    auth.require_organization(organization_id, Permission::ManageOrganization)?;
+    require_self_service_identity_settings(&state, &auth, organization_id).await?;
     let mut transaction = begin_tenant(
         &state.platform.database,
         TenantScope::organization(auth.user_id, organization_id),
@@ -781,7 +773,7 @@ pub async fn create_federated_identity_provider(
     Path(organization_id): Path<Uuid>,
     Json(request): Json<CreateFederatedIdentityProviderRequest>,
 ) -> Result<(StatusCode, Json<FederatedIdentityProviderResponse>), ApiError> {
-    auth.require_organization(organization_id, Permission::ManageOrganization)?;
+    require_self_service_identity_settings(&state, &auth, organization_id).await?;
     validate_slug(&request.slug)?;
     validate_federated_provider_request(
         &request.issuer_url,
@@ -846,7 +838,7 @@ pub async fn update_federated_identity_provider(
     headers: HeaderMap,
     Json(request): Json<UpdateFederatedIdentityProviderRequest>,
 ) -> Result<(HeaderMap, Json<FederatedIdentityProviderResponse>), ApiError> {
-    auth.require_organization(organization_id, Permission::ManageOrganization)?;
+    require_self_service_identity_settings(&state, &auth, organization_id).await?;
     let revision = required_revision(&headers)?;
     if let Some(slug) = request.slug.as_deref() {
         validate_slug(slug)?;
@@ -970,7 +962,7 @@ pub async fn list_federated_group_mappings(
     auth: AuthContext,
     Path((organization_id, provider_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Vec<FederatedGroupMappingResponse>>, ApiError> {
-    auth.require_organization(organization_id, Permission::ManageOrganization)?;
+    require_self_service_identity_settings(&state, &auth, organization_id).await?;
     let mut transaction = begin_tenant(
         &state.platform.database,
         TenantScope::organization(auth.user_id, organization_id),
@@ -997,7 +989,7 @@ pub async fn create_federated_group_mapping(
     Path((organization_id, provider_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<CreateFederatedGroupMappingRequest>,
 ) -> Result<(StatusCode, Json<FederatedGroupMappingResponse>), ApiError> {
-    auth.require_organization(organization_id, Permission::ManageOrganization)?;
+    require_self_service_identity_settings(&state, &auth, organization_id).await?;
     if request.group_value.trim().is_empty() {
         return Err(ApiError::Validation(
             "group_value cannot be empty".to_owned(),
@@ -1118,7 +1110,7 @@ fn validate_name(value: &str) -> Result<(), ApiError> {
 }
 
 fn validate_organization_role(value: &str) -> Result<(), ApiError> {
-    if matches!(value, "owner" | "admin" | "member" | "auditor") {
+    if matches!(value, "owner" | "member" | "auditor") {
         Ok(())
     } else {
         Err(ApiError::Validation("unknown organization role".to_owned()))
@@ -1126,7 +1118,7 @@ fn validate_organization_role(value: &str) -> Result<(), ApiError> {
 }
 
 fn validate_workspace_role(value: &str) -> Result<(), ApiError> {
-    if matches!(value, "admin" | "builder" | "operator" | "viewer") {
+    if matches!(value, "owner" | "builder" | "operator" | "viewer") {
         Ok(())
     } else {
         Err(ApiError::Validation("unknown workspace role".to_owned()))
@@ -1216,6 +1208,7 @@ mod tests {
         assert!(validate_organization_role("owner").is_ok());
         assert!(validate_organization_role("builder").is_err());
         assert!(validate_workspace_role("builder").is_ok());
-        assert!(validate_workspace_role("owner").is_err());
+        assert!(validate_workspace_role("owner").is_ok());
+        assert!(validate_workspace_role("admin").is_err());
     }
 }

@@ -285,7 +285,7 @@ pub fn routes() -> Router<AppState> {
 }
 
 fn validate_organization_role(role: &str) -> Result<(), ApiError> {
-    if matches!(role, "owner" | "admin" | "member" | "auditor") {
+    if matches!(role, "owner" | "member" | "auditor") {
         Ok(())
     } else {
         Err(ApiError::Validation(
@@ -304,7 +304,7 @@ fn validate_workspace_grants(grants: &[InvitationWorkspaceRequest]) -> Result<()
     for grant in grants {
         if !matches!(
             grant.role.as_str(),
-            "admin" | "builder" | "operator" | "viewer"
+            "owner" | "builder" | "operator" | "viewer"
         ) {
             return Err(ApiError::Validation("workspace role is invalid".to_owned()));
         }
@@ -327,7 +327,8 @@ mod tests {
 
     #[test]
     fn invitation_roles_and_workspace_grants_are_bounded() {
-        assert!(validate_organization_role("admin").is_ok());
+        assert!(validate_organization_role("owner").is_ok());
+        assert!(validate_organization_role("admin").is_err());
         assert!(validate_organization_role("platform_admin").is_err());
         let duplicate = vec![
             InvitationWorkspaceRequest {

@@ -38,12 +38,20 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     let organization_id = Uuid::now_v7();
     let workspace_id = Uuid::now_v7();
     let other_workspace_id = Uuid::now_v7();
-    sqlx::query("insert into organizations (id, slug, name) values ($1, $2, 'Control Test')")
+    sqlx::query(
+        "insert into organizations (id, slug, name, status)
+         values ($1, $2, 'Control Test', 'provisioning')",
+    )
+    .bind(organization_id)
+    .bind(format!("control-{organization_id}"))
+    .execute(&owner_pool)
+    .await
+    .expect("organization inserts");
+    sqlx::query("insert into organization_governance (organization_id) values ($1)")
         .bind(organization_id)
-        .bind(format!("control-{organization_id}"))
         .execute(&owner_pool)
         .await
-        .expect("organization inserts");
+        .expect("organization governance inserts");
     sqlx::query(
         "insert into organization_identity_policies (organization_id)
          values ($1)",
@@ -89,7 +97,7 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     sqlx::query(
         "insert into federated_group_mappings (
             organization_id, provider_id, group_value, organization_role
-         ) values ($1, $2, 'zeus-admins', 'admin')",
+         ) values ($1, $2, 'zeus-owners', 'owner')",
     )
     .bind(organization_id)
     .bind(federated_provider_id)
@@ -170,23 +178,44 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     assert_eq!(current_role, HTTP_DATABASE_ROLE);
 
     let existing_user_id = Uuid::now_v7();
+    let existing_email = format!("existing-{existing_user_id}@example.test");
+    let existing_subject = format!("existing-subject-{existing_user_id}");
     sqlx::query(
         "insert into users (id, email, display_name, status, email_verified_at)
-         values ($1, 'existing@example.test', 'Existing User', 'active', now())",
+         values ($1, $2, 'Existing User', 'active', now())",
     )
     .bind(existing_user_id)
+    .bind(&existing_email)
     .execute(&owner_pool)
     .await
     .expect("existing Zeus user inserts");
     sqlx::query(
         "insert into organization_memberships (organization_id, user_id, role, status)
-         values ($1, $2, 'admin', 'active')",
+         values ($1, $2, 'owner', 'active')",
     )
     .bind(organization_id)
     .bind(existing_user_id)
     .execute(&owner_pool)
     .await
     .expect("existing Zeus user joins organization");
+    for target_workspace_id in [workspace_id, other_workspace_id] {
+        sqlx::query(
+            "insert into workspace_memberships (
+               organization_id, workspace_id, user_id, role, status
+             ) values ($1, $2, $3, 'owner', 'active')",
+        )
+        .bind(organization_id)
+        .bind(target_workspace_id)
+        .bind(existing_user_id)
+        .execute(&owner_pool)
+        .await
+        .expect("workspace owner membership inserts");
+    }
+    sqlx::query("update organizations set status = 'active' where id = $1")
+        .bind(organization_id)
+        .execute(&owner_pool)
+        .await
+        .expect("organization activates after owners exist");
     let account_link_required = sqlx::query_as::<_, (String, Option<Uuid>, Uuid, Option<Uuid>)>(
         "select * from zeus_private.resolve_federated_identity(
            $1, 'login', null, $2, $3, $4, $5, true, $6, $7
@@ -194,11 +223,11 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     )
     .bind(federated_provider_id)
     .bind("https://issuer.example.test")
-    .bind("existing-subject")
-    .bind("existing@example.test")
+    .bind(&existing_subject)
+    .bind(&existing_email)
     .bind("Existing User")
-    .bind(json!({ "groups": ["zeus-admins"] }))
-    .bind(vec!["zeus-admins"])
+    .bind(json!({ "groups": ["zeus-owners"] }))
+    .bind(vec!["zeus-owners"])
     .fetch_one(&http_pool)
     .await
     .expect("same-email federated login is resolved safely");
@@ -206,8 +235,9 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     assert_eq!(account_link_required.1, None);
     let identity_count: i64 = sqlx::query_scalar(
         "select count(*) from federated_identities
-         where issuer = 'https://issuer.example.test' and subject = 'existing-subject'",
+         where issuer = 'https://issuer.example.test' and subject = $1",
     )
+    .bind(&existing_subject)
     .fetch_one(&owner_pool)
     .await
     .expect("federated identity count reads");
@@ -224,11 +254,11 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     .bind(federated_provider_id)
     .bind(existing_user_id)
     .bind("https://issuer.example.test")
-    .bind("existing-subject")
-    .bind("existing@example.test")
+    .bind(&existing_subject)
+    .bind(&existing_email)
     .bind("Existing User")
-    .bind(json!({ "groups": ["zeus-admins"] }))
-    .bind(vec!["zeus-admins"])
+    .bind(json!({ "groups": ["zeus-owners"] }))
+    .bind(vec!["zeus-owners"])
     .fetch_one(&http_pool)
     .await
     .expect("explicit link binds the upstream identity");
@@ -242,11 +272,11 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     )
     .bind(federated_provider_id)
     .bind("https://issuer.example.test")
-    .bind("existing-subject")
-    .bind("existing@example.test")
+    .bind(&existing_subject)
+    .bind(&existing_email)
     .bind("Existing User")
-    .bind(json!({ "groups": ["zeus-admins"] }))
-    .bind(vec!["zeus-admins"])
+    .bind(json!({ "groups": ["zeus-owners"] }))
+    .bind(vec!["zeus-owners"])
     .fetch_one(&http_pool)
     .await
     .expect("linked upstream identity authenticates the Zeus user");
@@ -254,8 +284,8 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     assert_eq!(authenticated.1, Some(existing_user_id));
 
     let existing_session_id = Uuid::now_v7();
-    let existing_session_token = "integration-user-session-token";
-    let existing_csrf_token = "integration-user-csrf-token";
+    let existing_session_token = format!("integration-user-session-{existing_session_id}");
+    let existing_csrf_token = format!("integration-user-csrf-{existing_session_id}");
     sqlx::query(
         "insert into web_sessions (
            id, user_id, active_organization_id, token_hash, csrf_token_hash,
@@ -287,14 +317,43 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
 
     let other_organization_id = Uuid::now_v7();
     sqlx::query(
-        "insert into organizations (id, slug, name)
-         values ($1, $2, 'Other Federated Organization')",
+        "insert into organizations (id, slug, name, status)
+         values ($1, $2, 'Other Federated Organization', 'provisioning')",
     )
     .bind(other_organization_id)
     .bind(format!("federated-other-{other_organization_id}"))
     .execute(&owner_pool)
     .await
     .expect("other federated organization inserts");
+    sqlx::query("insert into organization_governance (organization_id) values ($1)")
+        .bind(other_organization_id)
+        .execute(&owner_pool)
+        .await
+        .expect("other organization governance inserts");
+    let other_owner_id = Uuid::now_v7();
+    sqlx::query(
+        "insert into users (id, email, display_name, status, email_verified_at)
+         values ($1, $2, 'Other Owner', 'active', now())",
+    )
+    .bind(other_owner_id)
+    .bind(format!("other-owner-{other_owner_id}@example.test"))
+    .execute(&owner_pool)
+    .await
+    .expect("other owner inserts");
+    sqlx::query(
+        "insert into organization_memberships (organization_id, user_id, role, status)
+         values ($1, $2, 'owner', 'active')",
+    )
+    .bind(other_organization_id)
+    .bind(other_owner_id)
+    .execute(&owner_pool)
+    .await
+    .expect("other organization owner membership inserts");
+    sqlx::query("update organizations set status = 'active' where id = $1")
+        .bind(other_organization_id)
+        .execute(&owner_pool)
+        .await
+        .expect("other organization activates");
     let other_provider_id = Uuid::now_v7();
     sqlx::query(
         "insert into federated_identity_providers (
@@ -335,6 +394,8 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
         Some(std::borrow::Cow::Borrowed("42501"))
     );
 
+    let jit_subject = format!("control-subject-{organization_id}");
+    let jit_email = format!("builder-{organization_id}@example.test");
     let jit_identity = sqlx::query_as::<_, (String, Option<Uuid>, Uuid, Option<Uuid>)>(
         "select * from zeus_private.resolve_federated_identity(
            $1, 'login', null, $2, $3, $4, $5, $6, $7, $8
@@ -342,12 +403,12 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     )
     .bind(federated_provider_id)
     .bind("https://issuer.example.test")
-    .bind("control-subject")
-    .bind("builder@example.test")
+    .bind(jit_subject)
+    .bind(jit_email)
     .bind("Control Builder")
     .bind(true)
-    .bind(json!({ "groups": ["zeus-admins", "zeus-builders"] }))
-    .bind(vec!["zeus-admins", "zeus-builders"])
+    .bind(json!({ "groups": ["zeus-owners", "zeus-builders"] }))
+    .bind(vec!["zeus-owners", "zeus-builders"])
     .fetch_one(&http_pool)
     .await
     .expect("federated identity is JIT provisioned through the HTTP role");
@@ -367,7 +428,7 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     .fetch_one(&owner_pool)
     .await
     .expect("JIT memberships read");
-    assert_eq!(roles, ("admin".to_owned(), "builder".to_owned()));
+    assert_eq!(roles, ("owner".to_owned(), "builder".to_owned()));
 
     let envelope = LocalEnvelopeCipher::from_encoded("test-v1".to_owned(), &envelope_key)
         .expect("test envelope key is valid");
@@ -412,8 +473,8 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
         &app,
         Method::GET,
         "/api/v1/users/me/organizations",
-        existing_session_token,
-        existing_csrf_token,
+        &existing_session_token,
+        &existing_csrf_token,
         None,
         &[],
     )
@@ -445,8 +506,8 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
         &app,
         Method::POST,
         &format!("/api/v1/organizations/{organization_id}/domains"),
-        existing_session_token,
-        existing_csrf_token,
+        &existing_session_token,
+        &existing_csrf_token,
         Some(json!({
             "domain": format!("control-{organization_id}.example.test")
         })),
@@ -465,8 +526,8 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
         &app,
         Method::GET,
         &format!("/api/v1/organizations/{organization_id}/identity-policy"),
-        existing_session_token,
-        existing_csrf_token,
+        &existing_session_token,
+        &existing_csrf_token,
         None,
         &[],
     )
@@ -477,8 +538,8 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
         &app,
         Method::PUT,
         &format!("/api/v1/organizations/{organization_id}/identity-policy"),
-        existing_session_token,
-        existing_csrf_token,
+        &existing_session_token,
+        &existing_csrf_token,
         Some(json!({
             "mfa_required": false,
             "federated_required": true,
@@ -492,6 +553,49 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     assert_eq!(
         policy["required_federated_provider_id"],
         federated_provider_id.to_string()
+    );
+
+    sqlx::query(
+        "update organization_governance
+         set identity_settings_mode = 'platform_managed', revision = revision + 1
+         where organization_id = $1",
+    )
+    .bind(organization_id)
+    .execute(&owner_pool)
+    .await
+    .expect("identity settings switch updates");
+    let managed_identity_settings = send(
+        &app,
+        Method::GET,
+        &format!("/api/v1/organizations/{organization_id}/identity-providers"),
+        &organization_token,
+        None,
+        &[],
+    )
+    .await;
+    let (_, managed_identity_settings) =
+        expect_json(managed_identity_settings, StatusCode::FORBIDDEN).await;
+    assert_eq!(
+        managed_identity_settings["code"],
+        "organization_identity_settings_managed"
+    );
+
+    let last_workspace_owner = sqlx::query(
+        "update workspace_memberships
+         set role = 'builder'
+         where organization_id = $1 and workspace_id = $2 and user_id = $3",
+    )
+    .bind(organization_id)
+    .bind(workspace_id)
+    .bind(existing_user_id)
+    .execute(&owner_pool)
+    .await
+    .expect_err("the last active workspace owner cannot be demoted");
+    assert_eq!(
+        last_workspace_owner
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code),
+        Some(std::borrow::Cow::Borrowed("23514"))
     );
 
     let forbidden = send(
@@ -950,6 +1054,17 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     )
     .await;
     assert_eq!(canceled.status(), StatusCode::ACCEPTED);
+
+    let linked_canceled = send(
+        &app,
+        Method::POST,
+        &format!("/api/v1/workspaces/{workspace_id}/runs/{linked_run_id}/cancel"),
+        &token,
+        Some(json!({ "reason": "integration test cleanup" })),
+        &[],
+    )
+    .await;
+    assert_eq!(linked_canceled.status(), StatusCode::ACCEPTED);
 }
 
 async fn send(

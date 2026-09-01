@@ -13,12 +13,11 @@ use sqlx::FromRow;
 use time::OffsetDateTime;
 use utoipa::ToSchema;
 use uuid::Uuid;
-use zeus_core::Permission;
 
 use crate::{
     AppState,
     api_support::{required_revision, revision_etag},
-    auth::{AuthContext, insert_audit},
+    auth::{AuthContext, insert_audit, require_self_service_identity_settings},
     crypto::{random_token, sha256},
     database::{TenantScope, begin_tenant},
     error::ApiError,
@@ -73,7 +72,7 @@ pub async fn list_domains(
     auth: AuthContext,
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<Vec<OrganizationDomainResponse>>, ApiError> {
-    auth.require_organization(organization_id, Permission::ManageOrganization)?;
+    require_self_service_identity_settings(&state, &auth, organization_id).await?;
     let mut transaction = begin_tenant(
         &state.platform.database,
         TenantScope::organization(auth.user_id, organization_id),
@@ -107,7 +106,7 @@ pub async fn create_domain(
     Path(organization_id): Path<Uuid>,
     Json(request): Json<CreateOrganizationDomainRequest>,
 ) -> Result<(StatusCode, Json<CreatedOrganizationDomainResponse>), ApiError> {
-    auth.require_organization(organization_id, Permission::ManageOrganization)?;
+    require_self_service_identity_settings(&state, &auth, organization_id).await?;
     let user_id = auth.user_id.ok_or(ApiError::Forbidden)?;
     let domain = normalize_domain(&request.domain)?;
     let token = random_token(32).map_err(|_| ApiError::Internal)?;
@@ -161,7 +160,7 @@ pub async fn verify_domain(
     auth: AuthContext,
     Path((organization_id, domain_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<OrganizationDomainResponse>, ApiError> {
-    auth.require_organization(organization_id, Permission::ManageOrganization)?;
+    require_self_service_identity_settings(&state, &auth, organization_id).await?;
     let mut transaction = begin_tenant(
         &state.platform.database,
         TenantScope::organization(auth.user_id, organization_id),
@@ -241,7 +240,7 @@ pub async fn revoke_domain(
     auth: AuthContext,
     Path((organization_id, domain_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
-    auth.require_organization(organization_id, Permission::ManageOrganization)?;
+    require_self_service_identity_settings(&state, &auth, organization_id).await?;
     let mut transaction = begin_tenant(
         &state.platform.database,
         TenantScope::organization(auth.user_id, organization_id),
@@ -303,7 +302,7 @@ pub async fn get_identity_policy(
     auth: AuthContext,
     Path(organization_id): Path<Uuid>,
 ) -> Result<Json<OrganizationIdentityPolicyResponse>, ApiError> {
-    auth.require_organization(organization_id, Permission::ManageOrganization)?;
+    require_self_service_identity_settings(&state, &auth, organization_id).await?;
     let mut transaction = begin_tenant(
         &state.platform.database,
         TenantScope::organization(auth.user_id, organization_id),
@@ -336,7 +335,7 @@ pub async fn update_identity_policy(
     headers: HeaderMap,
     Json(request): Json<UpdateOrganizationIdentityPolicyRequest>,
 ) -> Result<(HeaderMap, Json<OrganizationIdentityPolicyResponse>), ApiError> {
-    auth.require_organization(organization_id, Permission::ManageOrganization)?;
+    require_self_service_identity_settings(&state, &auth, organization_id).await?;
     if request.federated_required != request.required_federated_provider_id.is_some() {
         return Err(ApiError::Validation(
             "federated_required requires exactly one organization provider".to_owned(),

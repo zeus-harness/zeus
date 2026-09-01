@@ -196,7 +196,7 @@ describe('workspace API helpers', () => {
           organization_status: 'active',
           organization_role: 'owner',
           workspaces: [
-            { id: 'ws-1', slug: 'platform', name: 'Platform', status: 'active', role: 'admin' },
+            { id: 'ws-1', slug: 'platform', name: 'Platform', status: 'active', role: 'owner' },
             { id: 42, name: 'invalid' }
           ],
           identity_providers: [{ id: 'provider-secret-metadata' }]
@@ -212,7 +212,7 @@ describe('workspace API helpers', () => {
         organization_status: 'active',
         organization_role: 'owner',
         workspaces: [
-          { id: 'ws-1', slug: 'platform', name: 'Platform', status: 'active', role: 'admin' }
+          { id: 'ws-1', slug: 'platform', name: 'Platform', status: 'active', role: 'owner' }
         ]
       }
     ]);

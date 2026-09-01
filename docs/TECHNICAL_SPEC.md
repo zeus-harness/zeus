@@ -339,7 +339,7 @@ Organization 身份设置模式为 `self_service | platform_managed`。后者拒
 
 Organization 状态固定为 `provisioning | active | suspended | archived`。Suspend 阻止新业务写入、Run claim、Schedule/Webhook 投递、联合登录、OIDC Authorization 和 Refresh，并为未完成 Run 请求取消。恢复先进入 `suspended`。已签发 Access Token 最多继续存活 5 分钟。
 
-K0 是文档基线。K1-K5 完成前，本节描述的是目标契约，不代表代码或数据库已经实现。
+K0-K1 已实现。`0025_tenant_owner_governance.sql` 已在 PostgreSQL 18.6 空库执行，Owner、Provisioning 邀请和 `platform_managed` API 拒绝已有真实数据库测试。K2-K5 仍是目标契约。
 
 ## 密钥
 

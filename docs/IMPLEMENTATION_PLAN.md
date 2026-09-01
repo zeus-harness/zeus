@@ -298,7 +298,7 @@ K 阶段使用 ADR 0008。版本保持 `0.1.0`，API 前缀保持 `/api/v1`。�
 
 ### K1：Owner 和治理
 
-状态：`pending`
+状态：`done`
 
 - 新增 `0025_tenant_owner_governance.sql`。
 - 原子迁移 Membership、Invitation 和 Group Mapping 中的 `admin`。
@@ -307,6 +307,8 @@ K 阶段使用 ADR 0008。版本保持 `0.1.0`，API 前缀保持 `/api/v1`。�
 - 增加 Workspace 最后 Owner、用户停用和角色降级保护。
 - 增加 `organization_governance`、`provisioning` 和平台唯一的 Organization 状态动作。
 - 更新 Rust DTO、OpenAPI、Web 类型和 PostgreSQL 矩阵测试。
+
+验收记录：PostgreSQL 18.6 空库迁移到 `25`。5 个真实 PostgreSQL 集成测试串行通过；Rust Clippy、Workspace 测试、Web 检查和生产构建通过。H 和 I5 状态未变。
 
 ### K2：全局外部身份
 
