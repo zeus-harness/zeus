@@ -48,6 +48,20 @@
 - JIT 未命中邀请、已验证企业域名或 Group Mapping 时跳转到 `federated_not_allowed`。
 - Provider 与 Organization 不匹配时返回 `401`。强制企业登录的 Organization 对只有密码认证的 Session 返回 `403 federated_authentication_required`。
 - 只有可信 ACR/AMR 命中时，联合登录才满足 Zeus MFA。其他 Session 继续进入 TOTP。
+- Provider Token 完成签名、issuer、audience、nonce 和时间校验后，才查询全局 `(issuer, subject)`。校验失败不能创建全局身份或 Organization Binding。
+- 显式绑定要求已验证 Session 和十分钟内认证。Binding 冲突返回 `409 external_identity_conflict`，不会改绑已有 Zeus 用户。
+- `platform_managed` Organization 对 Owner 的身份设置读写统一返回 `403 organization_identity_settings_managed`。
+
+## 租户 Context 与平台支持
+
+- Workspace URL 与 Session Context 不一致返回 `409 workspace_context_changed`。Web 跳转到 Workspace 选择页，不在 GET 请求中轮换 Session。
+- Context POST 校验 Membership 或有效平台 Grant、Origin 和 CSRF。成功后轮换 Session/CSRF Token，并以新 Cookie 继续。
+- 平台 Grant 缺失、到期、撤销、Session 不匹配或 Organization 不匹配返回 `403 platform_tenant_access_required`。
+- 创建平台 Grant 时密码、TOTP、近期认证或原因不满足要求，分别返回现有认证错误或 `422 validation_failed`。
+- Grant 到期会关闭对应 SSE。已经开始的短数据库事务可以完成；后续请求和事件续传必须重新授权。
+- `provisioning` Organization 只接受平台控制和首位 Owner 邀请。普通租户 API 返回 `409 organization_provisioning`。
+- `suspended` Organization 的业务写入返回 `423 organization_suspended`。读请求按 RBAC 保留；Run、Schedule、Webhook、联合登录、OIDC Authorization 和 Refresh 被拒绝。
+- `archived` Organization 返回 `404` 给普通租户请求。平台恢复动作把它变为 `suspended`，不会直接激活。
 
 ## Zeus OIDC Provider
 

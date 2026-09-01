@@ -281,3 +281,72 @@ J 阶段把 WorkItem 设为 Workspace 的工作入口。`/` 保留为 Workspace 
 - API 重启后的首个 TOTP 验证曾受容器时钟偏差影响。Session 轮换改用 PostgreSQL `now()` 作为权威时间，随后在全新 API 进程上首次验证通过。
 
 J0-J4 已完成。H 和 I5 仍为 `active`。OpenID Conformance、云 KMS、受控 SMTP、真实企业 IdP、托管 PostgreSQL 权限、生产规格容量和故障演练仍按各自外部清单执行。
+
+## K：租户导航、Owner 角色与身份信任
+
+K 阶段使用 ADR 0008。版本保持 `0.1.0`，API 前缀保持 `/api/v1`。不增加 crate、package、Redis 或独立 Worker。
+
+### K0：契约和文档
+
+状态：`done`
+
+- Workspace URL 统一为 `/:workspaceId`。Context 只通过带 CSRF 的 POST 切换。
+- 平台角色保留 `platform_admin`。Organization/Workspace 的 `admin` 迁移为 `owner`。
+- 固定 Organization 状态、角色矩阵、平台支持 Grant、外部身份两层模型和 Provisioning 邀请边界。
+- ADR 0008 覆盖 ADR 0007 的 URL 决策。
+- H 和 I5 保持 `active`。
+
+### K1：Owner 和治理
+
+状态：`pending`
+
+- 新增 `0025_tenant_owner_governance.sql`。
+- 原子迁移 Membership、Invitation 和 Group Mapping 中的 `admin`。
+- Setup、创建函数和校验器改用新角色。JIT 默认保持 `member`。
+- Organization 权限不再参与 Workspace Permission 求值。
+- 增加 Workspace 最后 Owner、用户停用和角色降级保护。
+- 增加 `organization_governance`、`provisioning` 和平台唯一的 Organization 状态动作。
+- 更新 Rust DTO、OpenAPI、Web 类型和 PostgreSQL 矩阵测试。
+
+### K2：全局外部身份
+
+状态：`pending`
+
+- 新增 `0026_global_external_identities.sql`。
+- 迁移为 `external_identities` 和 `organization_federated_bindings`，保留 claims、绑定时间和最后登录时间。
+- 使用 Organization/Provider 复合外键。旧表和函数只在停掉旧 API 后删除。
+- 重写登录、JIT、显式绑定、解绑和 Account Federation API。
+- 保留同邮箱不自动合并、近期认证、state/nonce/PKCE 和 Provider 精确校验。
+
+### K3：平台租户管理
+
+状态：`pending`
+
+- 新增 `0027_platform_tenant_access.sql`。
+- 实现平台 Organization 创建、修改、状态动作、初始 Owner 邀请重发/替换和治理模式。
+- Organization 创建要求 `Idempotency-Key`；可变配置要求 `revision` 与 `If-Match`。
+- 实现原生密码 + TOTP 重新认证和最多 60 分钟的支持 Grant。
+- Principal/AuthContext 携带 Grant ID。每个请求从 PostgreSQL 校验，不写 Membership，不绕过 RLS。
+- 平台和支持操作同时写 Organization Audit 与 Security Event。
+
+### K4：Web 路由与设置区域
+
+状态：`pending`
+
+- 新增 `/workspaces` 和 `/:workspaceId` 路由树。
+- 拆开 Agent Studio、Workspace Settings、Organization Settings 和 Platform Console。
+- Workspace 切换只使用 Server Action POST。旧标签页收到 BroadcastChannel 后停止写入。
+- `platform_managed` 身份设置不渲染入口，服务端 load 也不读取受限资源。
+- 删除旧 Workspace 根路径和 `/admin/*`，不保留重定向。
+- Svelte 页面继续使用 `@zeus/ui` 和 Svelte 5 runes。
+
+### K5：联调和门禁
+
+状态：`pending`
+
+- E2E 覆盖多个 Organization/Workspace、Owner 权限、Google 风格身份跨 Organization Binding、支持 Grant 和状态阻断。
+- 覆盖零、一个、多个 Workspace 的入口和三档响应式页面。
+- 验证 Suspend 的 Run 取消、Schedule/Webhook 阻断、OIDC Authorization/Refresh 阻断和 5 分钟 Access Token 边界。
+- 按 K0-K5 分段提交并推送。
+
+K 完成不能关闭 H 或 I5。OpenID Conformance、云 KMS、真实企业 IdP、受控 SMTP、托管 PostgreSQL 权限和生产容量仍需要外部证据。

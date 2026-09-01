@@ -64,6 +64,7 @@ Third-party OIDC Client ◄── Zeus OIDC Provider
 - 原生密码、OIDC Client Secret 和 Service Account Token 共用 Argon2 有界执行器。活跃任务最多四个，等待队列满载时返回限流错误。实现见 `crates/zeus-identity/src/password_executor.rs`、`apps/zeus-api/src/auth.rs` 和 `apps/zeus-api/src/native_auth.rs`。
 - PHC 校验在执行 Argon2 前拒绝高于 Zeus 当前内存、迭代或并行度上限的参数。生产 API 还必须挂载 `ZEUS_WEAK_PASSWORD_FILE`；文件大小和条目数有界。实现见 `crates/zeus-identity/src/password.rs` 和 `apps/zeus-api/src/config.rs`。
 - Organization 与 Workspace 权限分开求值。Workspace 角色和 Workspace 级 Service Account scope 不能授权 Organization 路由。实现见 `apps/zeus-api/src/auth.rs`。
+- K 目标契约进一步移除 Organization 角色对 Workspace 动作的隐式授权。平台支持使用限时 Grant，不生成 Membership，也不切换到高权限数据库角色。K1-K3 完成前该控制仍是待实现项。
 - TOTP 接受当前窗口前后各一步，并返回准确 counter 供数据库原子防重放。实现见 `crates/zeus-identity/src/totp.rs:125`。
 - OIDC 协议表不给 `zeus_http` 直接读取敏感列，通过用途明确的函数访问。实现见 `db/migrations/0023_identity_role_contract.sql:1`。
 - 身份运维指标只返回聚合值，不带用户、邮箱、Provider 或 key id。实现见 `db/migrations/0024_identity_observability.sql:1`。
@@ -106,6 +107,11 @@ Third-party OIDC Client ◄── Zeus OIDC Provider
 | ZI-20 | Critical | 部署把 migration owner URI 同时注入 API，RLS 和数据库函数授权被 owner 权限绕过。 | 基础清单把 Migration Job 指向 `zeus-migration` Secret，API 只引用 `zeus-runtime`。`deploy/kubernetes/zeus.yaml` | 在真实数据库核对 login、membership、`SET ROLE` 和 `BYPASSRLS`；发布证据不能只检查 Secret 名。 |
 | ZI-21 | Medium | 错误代理配置信任客户端伪造 IP，导致 IP 限流失效；或把 `/metrics` 暴露到公网。 | proxy header 信任默认关闭；生产 Ingress 没有 `/metrics` 路由，采集使用集群内 Service。 | 每个环境验证代理覆盖规则、来源网段和公网路由表。 |
 | ZI-22 | Medium | Organization 管理员误把外部 OIDC Client 标记为 trusted，用户不经 Consent 获得预批准 Scope。 | Client 创建、修改和撤销要求十分钟内的用户认证；Service Account 不能执行；只跳过预批准 Scope；新增 Scope 仍需重新授权。 | trusted Client 的审计告警和双人复核仍需由生产变更流程落实。 |
+| ZI-23 | Critical | 平台角色伪造租户 Context，绕过 Membership 或长期保留对租户数据的访问。 | K 只允许绑定 Web Session 的 60 分钟 Grant；每个请求校验 PostgreSQL 状态；Actor、Grant ID 和原因进入审计；租户 SQL 继续使用 `zeus_http` 与 RLS。 | K3 完成数据库、AuthContext、到期和跨租户负面测试前，不开放平台租户访问。 |
+| ZI-24 | High | JIT 角色迁移把普通联合用户错误提升为 Organization/Workspace Owner。 | K 契约规定 JIT 默认 `member`，只有邀请或 Group Mapping 可以指定角色；`admin` 数据迁移不改变无映射默认值。 | K1/K2 增加默认 JIT、恶意 Group Claim 和跨 Organization Provider 测试。 |
+| ZI-25 | High | Binding 的 Organization 与 Provider 不一致，攻击者借另一个租户的 Provider 建立信任。 | K2 使用 `(organization_id, provider_id)` 复合外键；Provider Token 完整校验后才解析全局身份。 | 数据库约束、登录回调和显式绑定都要覆盖交叉引用负面测试。 |
+| ZI-26 | High | 外部链接触发 GET Workspace 切换，轮换用户 Session 并让旧标签页向错误租户提交数据。 | K 只允许带 Origin/CSRF 的 Context POST；URL 不一致返回稳定冲突；BroadcastChannel 只做 UX 通知。 | K4 浏览器测试覆盖外部链接、双标签页和旧 Cookie 写入。 |
+| ZI-27 | High | `platform_managed` 只隐藏导航，Organization Owner 仍能直接调用身份设置 API。 | K3 在服务端拒绝对应读写 API，不依赖 Web 菜单；平台使用独立接口并写 Audit/Security Event。 | 对 Provider、Domain、Identity Policy 和 OIDC Client 全部执行直接 API 负面测试。 |
 
 本轮源码审查确认了 ZI-17 的权限混淆路径，并在同一变更中修复。ZI-18 的无界哈希路径也已收口。其余场景是代码审查和架构分析得到的攻击假设；只有复现、影响证明和独立验证齐备后，才记为安全发现。
 

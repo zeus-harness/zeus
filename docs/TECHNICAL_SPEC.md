@@ -67,16 +67,17 @@ Access Token 是 5 分钟有效的 RS256 `at+jwt`。Authorization Code 和 ID To
 Organization 角色：
 
 - `owner`
-- `admin`
 - `member`
 - `auditor`
 
 Workspace 角色：
 
-- `admin`
+- `owner`
 - `builder`
 - `operator`
 - `viewer`
+
+`platform_admin` 是独立平台角色，不改名为租户 Owner。Organization Owner 不隐式获得 Workspace 权限。Workspace 业务请求需要 Workspace Membership；平台支持会话使用独立、限时且可审计的 Grant。
 
 应用在事务中设置：
 
@@ -306,6 +307,39 @@ WorkItem 是 Workspace 的工作入口。工作台汇总队列、活动 Run 和�
 | J4 | 工作台到结果查看的完整流程、SSE、审批、取消、重试和响应式故障状态完成 API、浏览器和三档视口验收。 | `done` |
 
 J0-J4 已完成。隔离 E2E profile 使用独立 Apple `container` 网络、容器和 PostgreSQL volume，覆盖原生身份、WorkItem 启动、模型工具循环、审批、SSE 续传和持久结果。H 生产准备和 I5 安全与生产门禁继续为 `active`；OpenID Conformance、真实 KMS/SMTP/企业 IdP、托管 PostgreSQL 权限、PITR、生产规格压力和故障演练仍未完成。
+
+## K：租户导航、Owner 与身份信任
+
+ADR 0008 覆盖 ADR 0007 的无 Workspace URL 决策。Workspace 页面统一为：
+
+```text
+/:workspaceId
+/:workspaceId/work-items
+/:workspaceId/work-items/:workItemId
+/:workspaceId/runs
+/:workspaceId/runs/:runId
+/:workspaceId/approvals
+/:workspaceId/experience
+/:workspaceId/agents
+/:workspaceId/workflows
+/:workspaceId/schedules
+/:workspaceId/webhooks
+/:workspaceId/settings/*
+```
+
+Organization 设置位于 `/organizations/:organizationId/settings/*`。平台控制面位于 `/platform/*`。旧的 Workspace 根路径和 `/admin/*` 在 `0.1.0` 发布前移除。GET 请求不切换 Session；Workspace 选择通过带 CSRF 的 POST 完成。
+
+Organization Owner 管理 Organization 元数据、成员、邀请、Workspace 生命周期和 Capability Catalog。Workspace Owner 管理 Workspace 元数据、成员、模型、连接、Capability Policy 和 Service Account。Builder 保留构建与启动 Run 的能力；Operator 管理 WorkItem、Run 和 Approval；Auditor 只读 Organization Audit/Security Event。
+
+外部身份拆成两层。`external_identities` 以 `(issuer, subject)` 全局唯一绑定 Zeus 用户。`organization_federated_bindings` 表示 Organization Provider 对该身份的信任，使用 Organization/Provider 复合外键。Provider Token 完成完整 OIDC 校验后才能解析身份。显式绑定要求已验证 Session 和十分钟内认证；JIT 默认 `member`。
+
+Organization 身份设置模式为 `self_service | platform_managed`。后者拒绝 Organization Owner 对 Identity Provider、Verified Domain、Identity Policy 和 OIDC Client 的读写。平台创建 Organization 时同时创建初始 Workspace 和单次 Owner 邀请；激活后 slug 不可修改。
+
+`platform_tenant_access_grants` 提供 60 分钟支持会话。Grant 绑定平台用户、Web Session 和 Organization。每个请求重新校验 Grant，不生成 Membership，不改变 OIDC Subject，不能用于下游 OIDC 授权。租户 SQL 继续使用 `zeus_http` 和 RLS。审计保存 Grant ID、原因和真实平台 Actor。
+
+Organization 状态固定为 `provisioning | active | suspended | archived`。Suspend 阻止新业务写入、Run claim、Schedule/Webhook 投递、联合登录、OIDC Authorization 和 Refresh，并为未完成 Run 请求取消。恢复先进入 `suspended`。已签发 Access Token 最多继续存活 5 分钟。
+
+K0 是文档基线。K1-K5 完成前，本节描述的是目标契约，不代表代码或数据库已经实现。
 
 ## 密钥
 
