@@ -19,6 +19,8 @@ export type CurrentPrincipal = {
   mfa_satisfied_at: string | null;
   idle_expires_at: string | null;
   absolute_expires_at: string | null;
+  tenant_access_grant_id: string | null;
+  tenant_access_expires_at: string | null;
 };
 
 export type PrincipalResult = {
@@ -66,7 +68,11 @@ export function forwardZeusAuthCookies(response: Response, cookies: Cookies): nu
     if (!pair || separator < 1) continue;
 
     const name = pair.slice(0, separator);
-    if (name !== 'zeus_session' && name !== 'zeus_csrf') continue;
+    if (
+      name !== 'zeus_session' &&
+      name !== 'zeus_csrf' &&
+      name !== 'zeus_tenant_access_grant'
+    ) continue;
 
     const value = pair.slice(separator + 1);
     const attributes = new Map<string, string | true>();
@@ -79,7 +85,7 @@ export function forwardZeusAuthCookies(response: Response, cookies: Cookies): nu
     const maxAge = typeof rawMaxAge === 'string' ? Number.parseInt(rawMaxAge, 10) : undefined;
     cookies.set(name, value, {
       path: '/',
-      httpOnly: name === 'zeus_session',
+      httpOnly: name !== 'zeus_csrf',
       secure: attributes.has('secure'),
       sameSite: 'lax',
       ...(Number.isSafeInteger(maxAge) ? { maxAge } : {})

@@ -195,6 +195,10 @@ describe('workspace API helpers', () => {
           organization_name: 'Acme',
           organization_status: 'active',
           organization_role: 'owner',
+          identity_settings_mode: 'organization_managed',
+          support_access: false,
+          can_manage_organization: true,
+          can_manage_identity_settings: true,
           workspaces: [
             { id: 'ws-1', slug: 'platform', name: 'Platform', status: 'active', role: 'owner' },
             { id: 42, name: 'invalid' }
@@ -210,8 +214,19 @@ describe('workspace API helpers', () => {
         organization_name: 'Acme',
         organization_status: 'active',
         organization_role: 'owner',
+        identity_settings_mode: 'organization_managed',
+        support_access: false,
+        can_manage_organization: true,
+        can_manage_identity_settings: true,
         workspaces: [
-          { id: 'ws-1', slug: 'platform', name: 'Platform', status: 'active', role: 'owner' }
+          {
+            id: 'ws-1',
+            slug: 'platform',
+            name: 'Platform',
+            status: 'active',
+            role: 'owner',
+            support_access: false
+          }
         ]
       }
     ]);

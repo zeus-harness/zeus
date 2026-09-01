@@ -9003,20 +9003,33 @@ components:
       - organization_slug
       - organization_name
       - organization_status
-      - organization_role
+      - identity_settings_mode
+      - support_access
+      - can_manage_organization
+      - can_manage_identity_settings
       - workspaces
       properties:
+        can_manage_identity_settings:
+          type: boolean
+        can_manage_organization:
+          type: boolean
+        identity_settings_mode:
+          type: string
         organization_id:
           type: string
           format: uuid
         organization_name:
           type: string
         organization_role:
-          type: string
+          type:
+          - string
+          - 'null'
         organization_slug:
           type: string
         organization_status:
           type: string
+        support_access:
+          type: boolean
         workspaces: {}
     WebSessionResponse:
       type: object

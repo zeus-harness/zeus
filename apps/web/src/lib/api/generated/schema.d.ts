@@ -3496,12 +3496,16 @@ export interface components {
             status?: string | null;
         };
         UserOrganizationResponse: {
+            can_manage_identity_settings: boolean;
+            can_manage_organization: boolean;
+            identity_settings_mode: string;
             /** Format: uuid */
             organization_id: string;
             organization_name: string;
-            organization_role: string;
+            organization_role?: string | null;
             organization_slug: string;
             organization_status: string;
+            support_access: boolean;
             workspaces: unknown;
         };
         WebSessionResponse: {

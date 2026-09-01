@@ -17,6 +17,7 @@ export type UserWorkspace = {
   name: string;
   status: string;
   role: string;
+  support_access: boolean;
 };
 
 export type UserOrganization = Omit<UserOrganizationResponse, 'workspaces'> & {
@@ -37,7 +38,14 @@ function userWorkspaces(value: unknown): UserWorkspace[] {
     ) {
       return [];
     }
-    return [{ id: item.id, slug: item.slug, name: item.name, status: item.status, role: item.role }];
+    return [{
+      id: item.id,
+      slug: item.slug,
+      name: item.name,
+      status: item.status,
+      role: item.role,
+      support_access: item.support_access === true
+    }];
   });
 }
 

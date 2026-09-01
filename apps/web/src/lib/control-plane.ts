@@ -1,11 +1,14 @@
 export type ManagementResourceSlug =
   | 'agents'
   | 'workflows'
+  | 'members'
+  | 'workspaces'
   | 'model-profiles'
   | 'connections'
   | 'capabilities'
   | 'schedules'
-  | 'webhooks';
+  | 'webhooks'
+  | 'service-accounts';
 
 export type ManagementColumn = {
   label: string;
@@ -110,3 +113,80 @@ export const managementResources: readonly ManagementResource[] = [
 export function getManagementResource(slug: string): ManagementResource | undefined {
   return managementResources.find((resource) => resource.slug === slug);
 }
+
+export const agentStudioResources = managementResources.filter((resource) =>
+  ['agents', 'workflows', 'schedules', 'webhooks'].includes(resource.slug)
+);
+
+export const workspaceSettingResources: readonly ManagementResource[] = [
+  {
+    slug: 'members',
+    label: 'Members',
+    description: '管理 Workspace 成员和角色。',
+    endpoint: 'members',
+    columns: [
+      { label: '成员', key: 'display_name' },
+      { label: '邮箱', key: 'email' },
+      { label: '角色', key: 'role' },
+      { label: '状态', key: 'status' }
+    ]
+  },
+  ...managementResources.filter((resource) =>
+    ['model-profiles', 'connections', 'capabilities'].includes(resource.slug)
+  ),
+  {
+    slug: 'service-accounts',
+    label: 'Service Accounts',
+    description: '管理仅属于此 Workspace 的机器身份。',
+    endpoint: 'service-accounts',
+    columns: [
+      { label: '名称', key: 'name' },
+      { label: 'Token Prefix', key: 'token_prefix' },
+      { label: 'Scopes', key: 'scopes' },
+      { label: '最后使用', key: 'last_used_at' }
+    ]
+  }
+];
+
+export function getWorkspaceSettingResource(slug: string): ManagementResource | undefined {
+  return workspaceSettingResources.find((resource) => resource.slug === slug);
+}
+
+export const organizationSettingResources: readonly ManagementResource[] = [
+  {
+    slug: 'members',
+    label: 'Members',
+    description: '管理 Organization Owner、成员和 Auditor。',
+    endpoint: 'members',
+    columns: [
+      { label: '成员', key: 'display_name' },
+      { label: '邮箱', key: 'email' },
+      { label: '角色', key: 'role' },
+      { label: '状态', key: 'status' }
+    ]
+  },
+  {
+    slug: 'workspaces',
+    label: 'Workspaces',
+    description: '查看 Organization 下的 Workspace 生命周期。',
+    endpoint: 'workspaces',
+    columns: [
+      { label: '名称', key: 'name' },
+      { label: 'Slug', key: 'slug' },
+      { label: '状态', key: 'status' },
+      { label: 'Revision', key: 'revision' }
+    ]
+  },
+  {
+    slug: 'capabilities',
+    label: 'Capability Catalog',
+    description: '管理 Organization 可分配的企业 Capability 定义。',
+    endpoint: 'capability-definitions',
+    columns: [
+      { label: '名称', key: 'display_name' },
+      { label: 'Registry Key', key: 'registry_key' },
+      { label: '风险', key: 'risk_level' },
+      { label: '幂等模式', key: 'idempotency_mode' }
+    ]
+  }
+];

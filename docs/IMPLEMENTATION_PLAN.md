@@ -337,7 +337,7 @@ K 阶段使用 ADR 0008。版本保持 `0.1.0`，API 前缀保持 `/api/v1`。�
 
 ### K4：Web 路由与设置区域
 
-状态：`pending`
+状态：`done`
 
 - 新增 `/workspaces` 和 `/:workspaceId` 路由树。
 - 拆开 Agent Studio、Workspace Settings、Organization Settings 和 Platform Console。
@@ -345,6 +345,8 @@ K 阶段使用 ADR 0008。版本保持 `0.1.0`，API 前缀保持 `/api/v1`。�
 - `platform_managed` 身份设置不渲染入口，服务端 load 也不读取受限资源。
 - 删除旧 Workspace 根路径和 `/admin/*`，不保留重定向。
 - Svelte 页面继续使用 `@zeus/ui` 和 Svelte 5 runes。
+
+验收记录：新增 `0028_web_tenant_navigation.sql`，平台支持 Grant 可以在不创建 Membership 的前提下选择目标 Organization 的 active Workspace；Grant 撤销会清空对应 Session Context。Web 已迁移到 `/:workspaceId`、`/organizations/:organizationId/settings/*` 和 `/platform/*`，旧根路径已删除。Workspace 选择只走带 CSRF 的 Server Action POST，URL 与 Session 不一致时返回选择页，旧标签页写入由服务端 `409 workspace_context_changed` 拒绝。30 个新增或移动后的 Svelte 文件通过 Svelte 5 autofixer；Rust Clippy、Workspace 单元测试、Web `107` 项测试、静态检查、OpenAPI 确定性检查和生产构建通过。三档浏览器与多租户 E2E 留在 K5。
 
 ### K5：联调和门禁
 

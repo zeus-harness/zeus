@@ -110,8 +110,8 @@ Third-party OIDC Client ◄── Zeus OIDC Provider
 | ZI-23 | Critical | 平台角色伪造租户 Context，绕过 Membership 或长期保留对租户数据的访问。 | K3 只允许绑定 Web Session 的 60 分钟 Grant；每个请求校验 PostgreSQL 状态；Actor、Grant ID 和原因进入 Audit 与 Security Event；租户 SQL 继续使用 `zeus_http` 与 RLS。真实数据库测试覆盖错误 Session、撤销和 RLS。 | K5 增加浏览器双 Session、到期和跨 Organization E2E；生产数据库继续执行角色链负面测试。 |
 | ZI-24 | High | JIT 角色迁移把普通联合用户错误提升为 Organization/Workspace Owner。 | K 契约规定 JIT 默认 `member`，只有邀请或 Group Mapping 可以指定角色；`admin` 数据迁移不改变无映射默认值。 | K1/K2 增加默认 JIT、恶意 Group Claim 和跨 Organization Provider 测试。 |
 | ZI-25 | High | Binding 的 Organization 与 Provider 不一致，攻击者借另一个租户的 Provider 建立信任。 | K2 使用 `(organization_id, provider_id)` 复合外键；Provider Token 完整校验后才解析全局身份。 | 数据库约束、登录回调和显式绑定都要覆盖交叉引用负面测试。 |
-| ZI-26 | High | 外部链接触发 GET Workspace 切换，轮换用户 Session 并让旧标签页向错误租户提交数据。 | K 只允许带 Origin/CSRF 的 Context POST；URL 不一致返回稳定冲突；BroadcastChannel 只做 UX 通知。 | K4 浏览器测试覆盖外部链接、双标签页和旧 Cookie 写入。 |
-| ZI-27 | High | `platform_managed` 只隐藏导航，Organization Owner 仍能直接调用身份设置 API。 | 服务端权限与 RLS 拒绝 Owner 的受管身份设置访问；平台支持路径要求有效 Grant，并写 Audit 与 Security Event。真实数据库测试覆盖受管 Provider 的 Grant/RLS 访问和错误 Session 拒绝。 | K4 验证服务端 load 不读取受限资源；K5 对 Provider、Domain、Identity Policy 和 OIDC Client 执行直接 API 与浏览器负面测试。 |
+| ZI-26 | High | 外部链接触发 GET Workspace 切换，轮换用户 Session 并让旧标签页向错误租户提交数据。 | K4 只允许带 Origin/CSRF 的 Context POST；URL 不一致进入选择页；写操作返回稳定冲突；BroadcastChannel 只做 UX 通知。 | K5 浏览器测试覆盖外部链接、双标签页和旧 Cookie 写入；生产 HTTPS 下复测 Cookie 与代理行为。 |
+| ZI-27 | High | `platform_managed` 只隐藏导航，Organization Owner 仍能直接调用身份设置 API。 | 服务端权限与 RLS 拒绝 Owner 的受管身份设置访问；K4 的 Organization 身份设置 layout 在加载子资源前拒绝访问；平台支持路径要求有效 Grant，并写 Audit 与 Security Event。真实数据库测试覆盖受管 Provider 的 Grant/RLS 访问和错误 Session 拒绝。 | K5 对 Provider、Domain、Identity Policy 和 OIDC Client 执行直接 API 与浏览器负面测试。 |
 
 本轮源码审查确认了 ZI-17 的权限混淆路径，并在同一变更中修复。ZI-18 的无界哈希路径也已收口。其余场景是代码审查和架构分析得到的攻击假设；只有复现、影响证明和独立验证齐备后，才记为安全发现。
 

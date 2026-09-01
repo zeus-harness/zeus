@@ -871,7 +871,9 @@ pub async fn select_identity_context(
     let session_token = random_token(32).map_err(|_| ApiError::Internal)?;
     let csrf_token = random_token(32).map_err(|_| ApiError::Internal)?;
     let selected: bool = sqlx::query_scalar(
-        "select zeus_private.rotate_user_session_context($1, $2, $3, $4, $5, $6)",
+        "select zeus_private.rotate_user_session_context_with_access(
+           $1, $2, $3, $4, $5, $6, $7
+         )",
     )
     .bind(session_id)
     .bind(user_id)
@@ -879,6 +881,7 @@ pub async fn select_identity_context(
     .bind(request.workspace_id)
     .bind(sha256(session_token.expose_secret().as_bytes()))
     .bind(sha256(csrf_token.expose_secret().as_bytes()))
+    .bind(principal.tenant_access_grant_id)
     .fetch_one(&state.platform.database)
     .await?;
     if !selected {
@@ -896,7 +899,11 @@ pub struct UserOrganizationResponse {
     pub organization_slug: String,
     pub organization_name: String,
     pub organization_status: String,
-    pub organization_role: String,
+    pub organization_role: Option<String>,
+    pub identity_settings_mode: String,
+    pub support_access: bool,
+    pub can_manage_organization: bool,
+    pub can_manage_identity_settings: bool,
     pub workspaces: serde_json::Value,
 }
 
