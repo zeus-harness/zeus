@@ -313,7 +313,7 @@ mod tests {
     fn invitation_roles_and_workspace_grants_are_bounded() {
         assert!(validate_organization_role("owner").is_ok());
         assert!(validate_organization_role("admin").is_err());
-        assert!(validate_organization_role("platform_admin").is_err());
+        assert!(validate_organization_role("platform_owner").is_err());
         let duplicate = vec![
             InvitationWorkspaceRequest {
                 workspace_id: Uuid::nil(),

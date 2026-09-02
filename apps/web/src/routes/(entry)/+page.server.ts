@@ -22,7 +22,7 @@ export const load: PageServerLoad = async ({ fetch, parent, url }) => {
   );
   if (activeWorkspace) redirect(303, `/${activeWorkspace.id}`);
 
-  if (workspaces.length === 0 && auth.principal?.platform_roles.includes('platform_admin')) {
+  if (workspaces.length === 0 && auth.principal?.platform_roles.includes('platform_owner')) {
     redirect(303, '/platform');
   }
   if (workspaces.length === 1) {

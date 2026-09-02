@@ -24,13 +24,13 @@ function organization(workspaces: ReturnType<typeof workspace>[]) {
 
 function auth(
   workspaces: ReturnType<typeof workspace>[],
-  options: { selected?: string | null; platformAdmin?: boolean } = {}
+  options: { selected?: string | null; platformOwner?: boolean } = {}
 ) {
   return {
     status: 'ready',
     principal: {
       workspace_id: options.selected ?? null,
-      platform_roles: options.platformAdmin ? ['platform_admin'] : []
+      platform_roles: options.platformOwner ? ['platform_owner'] : []
     },
     organizations: workspaces.length > 0 ? [organization(workspaces)] : []
   };
@@ -58,8 +58,8 @@ describe('tenant entry resolver', () => {
     });
   });
 
-  it('sends a platform administrator without Workspaces to the platform console', async () => {
-    await expect(entryLoad(event(auth([], { platformAdmin: true })))).rejects.toMatchObject({
+  it('sends a platform owner without Workspaces to the platform console', async () => {
+    await expect(entryLoad(event(auth([], { platformOwner: true })))).rejects.toMatchObject({
       status: 303,
       location: '/platform'
     });

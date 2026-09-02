@@ -10,7 +10,7 @@
   let principal = $derived(data.principal);
   let totpEnabled = $derived(principal?.totp_enabled ?? false);
   let hasNativePassword = $derived(principal?.has_native_password ?? false);
-  let isPlatformAdmin = $derived(principal?.platform_roles.includes('platform_admin') ?? false);
+  let isPlatformOwner = $derived(principal?.platform_roles.includes('platform_owner') ?? false);
   let returnTo = $derived(
     form?.type === 'totp_setup' || form?.type === 'totp_confirmed'
       ? form.return_to
@@ -172,9 +172,9 @@
               <p class="text-sm leading-6 text-muted-foreground">
                 TOTP 已保护当前账号。关闭前需要输入当前密码和身份验证器验证码。
               </p>
-              {#if isPlatformAdmin}
+              {#if isPlatformOwner}
                 <p class="rounded-lg border border-border bg-muted/40 p-3 text-sm" role="note">
-                  平台管理员必须保持 TOTP 启用。
+                  平台 Owner 必须保持 TOTP 启用。
                 </p>
               {:else}
                 <form method="POST" action="?/disableTotp" class="space-y-4">

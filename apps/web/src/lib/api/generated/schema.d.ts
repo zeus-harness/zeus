@@ -5760,7 +5760,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Platform admin and first tenant created */
+            /** @description Platform owner and first tenant created */
             201: {
                 headers: {
                     [name: string]: unknown;

@@ -25,7 +25,7 @@ export type OrganizationIdentitySettingsTarget = Pick<UserOrganization, 'organiz
 export type NavigationRequirement =
   | 'organization_owner'
   | 'workspace_owner'
-  | 'platform_admin'
+  | 'platform_owner'
   | 'tenant_access_grant';
 
 export type NavigationVisibilityContext = {
@@ -117,8 +117,8 @@ export function isWorkspaceOwner(
   );
 }
 
-export function isPlatformAdmin(principal: NavigationPrincipal | null | undefined): boolean {
-  return principal?.platform_roles.includes('platform_admin') ?? false;
+export function isPlatformOwner(principal: NavigationPrincipal | null | undefined): boolean {
+  return principal?.platform_roles.includes('platform_owner') ?? false;
 }
 
 export function hasValidTenantAccessGrant(
@@ -126,7 +126,7 @@ export function hasValidTenantAccessGrant(
   organizationId?: string,
   now = new Date()
 ): boolean {
-  if (!isPlatformAdmin(principal) || !principal?.organization_id) return false;
+  if (!isPlatformOwner(principal) || !principal?.organization_id) return false;
   if (organizationId !== undefined && principal.organization_id !== organizationId) return false;
 
   const grantId = principal.tenant_access_grant_id;
@@ -148,8 +148,8 @@ export function isNavigationItemVisible(
       return isOrganizationOwner(principal, context.organizationId);
     case 'workspace_owner':
       return isWorkspaceOwner(principal, context.workspaceId);
-    case 'platform_admin':
-      return isPlatformAdmin(principal);
+    case 'platform_owner':
+      return isPlatformOwner(principal);
     case 'tenant_access_grant':
       return hasValidTenantAccessGrant(principal, context.organizationId, context.now);
   }

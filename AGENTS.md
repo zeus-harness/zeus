@@ -35,7 +35,7 @@ Zeus 是面向企业团队的云端 Harness Agent。代码从 `0.1.0` 开始，H
 - J0-J4 已完成。WorkItem、Run、Approval 和共享 UI 的现有行为不得在 K 阶段回退。
 - K 使用 `/:workspaceId` 作为 Workspace 根路径。`/` 只解析入口，`/workspaces` 负责安全的 POST Context 选择。
 - GET 页面不得切换 Session。URL 与 Session 不一致时进入 Workspace 选择；Context POST 校验 Origin/CSRF 并轮换 Cookie。
-- K1 已完成。Organization/Workspace 的 `admin` 已迁移为 `owner`。平台角色继续使用 `platform_admin`。
+- K1 已完成。Organization/Workspace 的 `admin` 已迁移为 `owner`。全局平台治理角色使用 `platform_owner`。
 - Organization 权限不能隐式授权 Workspace 动作。Workspace 请求需要 Workspace Membership 或有效平台支持 Grant。
 - 联合 JIT 默认角色是 `member`。不得因为角色迁移把普通 JIT 用户提升为 Owner。
 - K2 已完成。全局 `external_identities` 与 Organization 范围的 `organization_federated_bindings` 已分离。同邮箱账号不得自动合并。

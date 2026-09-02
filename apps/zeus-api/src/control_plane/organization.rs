@@ -94,7 +94,7 @@ pub async fn create_organization(
     .bind(user_id)
     .fetch_one(&state.platform.database)
     .await?;
-    if (mfa_enabled || auth.platform_roles.contains("platform_admin"))
+    if (mfa_enabled || auth.platform_roles.contains("platform_owner"))
         && auth.mfa_satisfied_at.is_none()
     {
         return Err(ApiError::MfaRequired);

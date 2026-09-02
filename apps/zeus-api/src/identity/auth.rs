@@ -124,7 +124,7 @@ impl AuthContext {
         permission: Permission,
     ) -> Result<(), ApiError> {
         if self.organization_id != organization_id || !self.allows_organization(permission) {
-            return if self.platform_roles.contains("platform_admin") {
+            return if self.platform_roles.contains("platform_owner") {
                 Err(ApiError::PlatformTenantAccessRequired)
             } else {
                 Err(ApiError::Forbidden)
@@ -268,7 +268,7 @@ impl FromRequestParts<AppState> for AuthContext {
             }
         }
         let organization_id = principal.organization_id.ok_or_else(|| {
-            if principal.platform_roles.contains("platform_admin") {
+            if principal.platform_roles.contains("platform_owner") {
                 ApiError::PlatformTenantAccessRequired
             } else {
                 ApiError::Forbidden
@@ -322,7 +322,7 @@ async fn principal_mfa_status(
 ) -> Result<PrincipalMfaStatus, ApiError> {
     let user_id = principal.user_id.ok_or(ApiError::Forbidden)?;
     let totp_enabled = user_has_totp(state, user_id).await?;
-    if principal.platform_roles.contains("platform_admin") || totp_enabled {
+    if principal.platform_roles.contains("platform_owner") || totp_enabled {
         return Ok(PrincipalMfaStatus {
             required: true,
             totp_enabled,
@@ -601,7 +601,7 @@ async fn apply_platform_tenant_access_grant(
     headers: &HeaderMap,
     principal: &mut PrincipalContext,
 ) -> Result<(), ApiError> {
-    if !principal.platform_roles.contains("platform_admin") {
+    if !principal.platform_roles.contains("platform_owner") {
         return Ok(());
     }
     let Some(grant_id) = cookie_value(headers, TENANT_ACCESS_GRANT_COOKIE)

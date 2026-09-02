@@ -138,7 +138,7 @@ H 和 I5 的外部门禁继续保持 `active`。本地静态检查、容器检�
 
 状态：`done`
 
-- 增加 `zeus-identity`，完成 Setup、平台管理员、用户级 Session 和租户 Context 分离。
+- 增加 `zeus-identity`，完成 Setup、平台 Owner、用户级 Session 和租户 Context 分离。
 - Apple `container` 通过一个脚本管理 PostgreSQL、Mailpit、API、Web 和同源 Gateway。
 - 浏览器只访问 `http://127.0.0.1:3000`。API 与 Web 不发布宿主机端口。
 
@@ -291,7 +291,7 @@ K 阶段使用 ADR 0008。版本保持 `0.1.0`，API 前缀保持 `/api/v1`。�
 状态：`done`
 
 - Workspace URL 统一为 `/:workspaceId`。Context 只通过带 CSRF 的 POST 切换。
-- 平台角色保留 `platform_admin`。Organization/Workspace 的 `admin` 迁移为 `owner`。
+- 全局平台治理角色使用 `platform_owner`。Organization/Workspace 的 `admin` 迁移为 `owner`。
 - 固定 Organization 状态、角色矩阵、平台支持 Grant、外部身份两层模型和 Provisioning 邀请边界。
 - ADR 0008 覆盖 ADR 0007 的 URL 决策。
 - H 和 I5 保持 `active`。

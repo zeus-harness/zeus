@@ -20,7 +20,7 @@
 
 ### 角色
 
-- 平台角色继续命名为 `platform_admin`。它不属于 Organization/Workspace 角色体系。
+- 全局平台治理角色命名为 `platform_owner`。它不属于 Organization/Workspace 角色体系。
 - Organization 角色为 `owner | member | auditor`。
 - Workspace 角色为 `owner | builder | operator | viewer`。
 - Organization Owner 不再给 Workspace 动作提供隐式权限。Workspace 业务请求必须有活动 Workspace Membership，平台支持会话除外。
@@ -66,12 +66,12 @@ Suspend 会阻止新的 Run、Schedule 和 Webhook 投递。queued、running、w
 
 ### 平台支持会话
 
-- `platform_admin` 使用原生密码、TOTP 和十分钟内的重新认证创建 Grant。有效期为 60 分钟，但不能超过 Web Session 的 idle/absolute expiry。
+- `platform_owner` 使用原生密码、TOTP 和十分钟内的重新认证创建 Grant。有效期为 60 分钟，但不能超过 Web Session 的 idle/absolute expiry。
 - 一个 Web Session 同时最多一个未撤销 Grant。创建新 Grant 时先在同一事务结束过期 Grant。
 - Grant 不写入 Membership。Principal 和 AuthContext 携带 `tenant_access_grant_id`，每个租户请求都从 PostgreSQL 校验 Session、平台角色、Organization、到期和撤销状态。
 - 支持会话可绕过目标 Organization 的 `federated_required`，不能绕过邮箱验证、平台 TOTP、Organization 状态、RLS 或资源 Workspace 边界。
 - 租户 SQL 仍使用 `zeus_http` 和 Organization/Workspace RLS Context。不得为支持会话切换到 migration owner 或 `BYPASSRLS` 角色。
-- Audit Actor 始终是平台管理员。Audit 和 Security Event 保存 Grant ID 与创建时的原因快照。
+- Audit Actor 始终是平台 Owner。Audit 和 Security Event 保存 Grant ID 与创建时的原因快照。
 - SSE 在 Grant 到期时关闭。退出、Session 撤销或到期后，新请求立即失权。
 
 ## Consequences
@@ -81,4 +81,4 @@ Suspend 会阻止新的 Run、Schedule 和 Webhook 投递。queued、running、w
 - Organization 与 Workspace 权限完全分开。平台访问有时间、原因和真实 Actor，不产生虚假 Membership。
 - 外部账号可以被多个 Organization 信任，同时保持 Zeus 用户和 OIDC Subject 的事实边界。
 - K2 在正式生产前完成。`0026` 不支持旧 API Pod 与新 Schema 混跑；执行迁移前必须停止旧版本并确认没有生产滚动升级窗口。
-
+- `0030` 将 `platform_admin` 硬切换为 `platform_owner`。旧 API Pod 不兼容新角色值和私有函数名，部署时必须先停止旧版本。

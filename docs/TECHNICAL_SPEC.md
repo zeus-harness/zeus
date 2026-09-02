@@ -43,7 +43,7 @@ Zeus 管理全局用户、凭据、Session、平台角色和 Organization/Worksp
 - RFC 6238 TOTP、十个单次恢复码、账号/IP/PostgreSQL 持久限流。
 - 2 小时 idle、12 小时 absolute 的用户级 Session。数据库只保存 Session 与 CSRF Token 摘要。
 - Organization、Workspace、邀请、成员角色、MFA 策略和企业 IdP 强制策略。
-- 独立的 `platform_admin`。平台角色不提供租户业务数据读取权限。
+- 独立的 `platform_owner`。平台角色不提供租户业务数据读取权限。
 
 联合登录入口固定为：
 
@@ -77,7 +77,7 @@ Workspace 角色：
 - `operator`
 - `viewer`
 
-`platform_admin` 是独立平台角色，不改名为租户 Owner。Organization Owner 不隐式获得 Workspace 权限。Workspace 业务请求需要 Workspace Membership；平台支持会话使用独立、限时且可审计的 Grant。
+`platform_owner` 是独立的全局平台治理角色，不属于 Organization/Workspace 角色层级。Organization Owner 不隐式获得 Workspace 权限。Workspace 业务请求需要 Workspace Membership；平台支持会话使用独立、限时且可审计的 Grant。
 
 应用在事务中设置：
 

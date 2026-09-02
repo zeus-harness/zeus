@@ -69,11 +69,11 @@ struct SetupRow {
 pub async fn setup_status(
     State(state): State<AppState>,
 ) -> Result<Json<SetupStatusResponse>, ApiError> {
-    let has_platform_admin: bool = sqlx::query_scalar("select zeus_private.has_platform_admin()")
+    let has_platform_owner: bool = sqlx::query_scalar("select zeus_private.has_platform_owner()")
         .fetch_one(&state.platform.database)
         .await?;
     Ok(Json(SetupStatusResponse {
-        setup_required: !has_platform_admin,
+        setup_required: !has_platform_owner,
         bootstrap_token_configured: state.identity.bootstrap_token.is_some(),
     }))
 }
@@ -84,7 +84,7 @@ pub async fn setup_status(
     tag = "identity",
     request_body = SetupRequest,
     responses(
-        (status = 201, description = "Platform admin and first tenant created", body = SetupResponse),
+        (status = 201, description = "Platform owner and first tenant created", body = SetupResponse),
         (status = 409, description = "Setup was already completed", body = crate::error::ProblemDetails, content_type = "application/problem+json")
     )
 )]
@@ -92,10 +92,10 @@ pub async fn setup(
     State(state): State<AppState>,
     Json(request): Json<SetupRequest>,
 ) -> Result<(StatusCode, HeaderMap, Json<SetupResponse>), ApiError> {
-    let has_platform_admin: bool = sqlx::query_scalar("select zeus_private.has_platform_admin()")
+    let has_platform_owner: bool = sqlx::query_scalar("select zeus_private.has_platform_owner()")
         .fetch_one(&state.platform.database)
         .await?;
-    if has_platform_admin {
+    if has_platform_owner {
         return Err(ApiError::Conflict("setup is already complete".to_owned()));
     }
     verify_bootstrap_token(&state, &request.bootstrap_token)?;

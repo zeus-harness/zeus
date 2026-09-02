@@ -17,7 +17,7 @@
     <p class="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Zeus identity</p>
     <h1 class="mt-3 text-3xl font-semibold tracking-tight sm:text-4xl">完成初始设置</h1>
     <p class="mt-3 max-w-2xl text-sm leading-6 text-muted-foreground">
-      创建第一个平台管理员、组织和 Workspace。完成后会建立当前 Session，并前往邮箱验证步骤。
+      创建第一个平台 Owner、组织和 Workspace。完成后会建立当前 Session，并前往邮箱验证步骤。
     </p>
   </div>
 
@@ -55,7 +55,7 @@
       <section class="space-y-5" aria-labelledby="account-heading">
         <div>
           <h2 id="account-heading" class="text-lg font-semibold">管理员账号</h2>
-          <p class="mt-1 text-sm text-muted-foreground">这个账号会获得平台管理员权限。</p>
+          <p class="mt-1 text-sm text-muted-foreground">这个账号会获得平台 Owner 权限。</p>
         </div>
 
         <div class="grid gap-5 sm:grid-cols-2">
@@ -117,7 +117,7 @@
       <section class="space-y-5 border-t border-border pt-8" aria-labelledby="tenant-heading">
         <div>
           <h2 id="tenant-heading" class="text-lg font-semibold">组织与 Workspace</h2>
-          <p class="mt-1 text-sm text-muted-foreground">为第一个平台管理员创建默认租户上下文。</p>
+          <p class="mt-1 text-sm text-muted-foreground">为第一个平台 Owner 创建默认租户上下文。</p>
         </div>
 
         <div class="grid gap-5 sm:grid-cols-2">

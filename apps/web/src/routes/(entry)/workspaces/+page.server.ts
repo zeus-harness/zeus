@@ -35,7 +35,7 @@ export const load: PageServerLoad = async ({ parent, url }) => {
         ? onlyWorkspace.id
         : null,
     returnTo: url.searchParams.get('return_to') ?? '',
-    isPlatformAdmin: auth.principal?.platform_roles.includes('platform_admin') ?? false
+    isPlatformOwner: auth.principal?.platform_roles.includes('platform_owner') ?? false
   };
 };
 

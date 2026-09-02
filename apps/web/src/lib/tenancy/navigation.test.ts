@@ -9,7 +9,7 @@ import {
   hasValidTenantAccessGrant,
   isNavigationItemVisible,
   isOrganizationOwner,
-  isPlatformAdmin,
+  isPlatformOwner,
   isWorkspaceOwner,
   type NavigationPrincipal,
   workspacePath,
@@ -128,18 +128,18 @@ describe('tenant navigation helpers', () => {
     );
   });
 
-  it('recognizes only a platform admin with an unexpired tenant access grant', () => {
+  it('recognizes only a platform owner with an unexpired tenant access grant', () => {
     const supportPrincipal = principal({
       organization_id: 'org-2',
       workspace_id: null,
       organization_role: null,
       workspace_role: null,
-      platform_roles: ['platform_admin'],
+      platform_roles: ['platform_owner'],
       tenant_access_grant_id: 'grant-1',
       tenant_access_expires_at: '2026-09-01T00:30:00.000Z'
     });
 
-    expect(isPlatformAdmin(supportPrincipal)).toBe(true);
+    expect(isPlatformOwner(supportPrincipal)).toBe(true);
     expect(hasValidTenantAccessGrant(supportPrincipal, 'org-2', now)).toBe(true);
     expect(hasValidTenantAccessGrant(supportPrincipal, 'org-1', now)).toBe(false);
     expect(
@@ -168,7 +168,7 @@ describe('tenant navigation helpers', () => {
       workspace_id: null,
       organization_role: null,
       workspace_role: null,
-      platform_roles: ['platform_admin'],
+      platform_roles: ['platform_owner'],
       tenant_access_grant_id: 'grant-1',
       tenant_access_expires_at: '2026-09-01T00:30:00.000Z'
     });
@@ -177,7 +177,7 @@ describe('tenant navigation helpers', () => {
       true
     );
     expect(isNavigationItemVisible('workspace_owner', owner, { workspaceId: 'ws-1' })).toBe(true);
-    expect(isNavigationItemVisible('platform_admin', support)).toBe(true);
+    expect(isNavigationItemVisible('platform_owner', support)).toBe(true);
     expect(
       isNavigationItemVisible('tenant_access_grant', support, {
         organizationId: 'org-2',

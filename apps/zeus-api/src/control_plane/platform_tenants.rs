@@ -194,7 +194,7 @@ pub async fn list_platform_organizations(
     State(state): State<AppState>,
     principal: PrincipalContext,
 ) -> Result<Json<Vec<PlatformOrganizationResponse>>, ApiError> {
-    let (user_id, session_id) = require_platform_admin(&principal, false)?;
+    let (user_id, session_id) = require_platform_owner(&principal, false)?;
     let organizations = sqlx::query_as::<_, PlatformOrganizationResponse>(
         "select * from zeus_private.list_platform_organizations($1, $2)",
     )
@@ -217,7 +217,7 @@ pub async fn get_platform_organization(
     principal: PrincipalContext,
     Path(organization_id): Path<Uuid>,
 ) -> Result<(HeaderMap, Json<PlatformOrganizationResponse>), ApiError> {
-    let (user_id, session_id) = require_platform_admin(&principal, false)?;
+    let (user_id, session_id) = require_platform_owner(&principal, false)?;
     let organization = sqlx::query_as::<_, PlatformOrganizationResponse>(
         "select * from zeus_private.load_platform_organization($1, $2, $3)",
     )
@@ -246,7 +246,7 @@ pub async fn create_platform_organization(
     headers: HeaderMap,
     Json(request): Json<CreatePlatformOrganizationRequest>,
 ) -> Result<(StatusCode, Json<CreatedPlatformOrganizationResponse>), ApiError> {
-    let (user_id, session_id) = require_platform_admin(&principal, true)?;
+    let (user_id, session_id) = require_platform_owner(&principal, true)?;
     validate_slug(&request.slug)?;
     validate_name(&request.name)?;
     validate_slug(&request.initial_workspace_slug)?;
@@ -305,7 +305,7 @@ pub async fn update_platform_organization(
     headers: HeaderMap,
     Json(request): Json<UpdatePlatformOrganizationRequest>,
 ) -> Result<(HeaderMap, Json<PlatformOrganizationMutationResponse>), ApiError> {
-    let (user_id, session_id) = require_platform_admin(&principal, true)?;
+    let (user_id, session_id) = require_platform_owner(&principal, true)?;
     let revision = required_revision(&headers)?;
     if request.name.is_none() && request.slug.is_none() && request.identity_settings_mode.is_none()
     {
@@ -356,7 +356,7 @@ pub async fn transition_platform_organization(
     headers: HeaderMap,
     Json(request): Json<TransitionPlatformOrganizationRequest>,
 ) -> Result<(HeaderMap, Json<PlatformOrganizationMutationResponse>), ApiError> {
-    let (user_id, session_id) = require_platform_admin(&principal, true)?;
+    let (user_id, session_id) = require_platform_owner(&principal, true)?;
     let revision = required_revision(&headers)?;
     if !matches!(
         request.action.as_str(),
@@ -441,7 +441,7 @@ async fn rotate_owner_invitation(
     mode: &str,
     replacement_email: Option<String>,
 ) -> Result<(StatusCode, HeaderMap, Json<PlatformOwnerInvitationResponse>), ApiError> {
-    let (user_id, session_id) = require_platform_admin(principal, true)?;
+    let (user_id, session_id) = require_platform_owner(principal, true)?;
     let revision = required_revision(headers)?;
     let invitation_token = random_token(32).map_err(|_| ApiError::Internal)?;
     let mut transaction = state.platform.database.begin().await?;
@@ -495,7 +495,7 @@ pub async fn create_platform_tenant_access_grant(
     ),
     ApiError,
 > {
-    let (user_id, session_id) = require_platform_admin_without_mfa(&principal)?;
+    let (user_id, session_id) = require_platform_owner_without_mfa(&principal)?;
     let reason = request.reason.trim();
     if !(10..=500).contains(&reason.len()) {
         return Err(ApiError::Validation(
@@ -561,14 +561,14 @@ pub async fn revoke_platform_tenant_access_grant(
     principal: PrincipalContext,
     Path(grant_id): Path<Uuid>,
 ) -> Result<(HeaderMap, StatusCode), ApiError> {
-    let (user_id, session_id) = require_platform_admin(&principal, false)?;
+    let (user_id, session_id) = require_platform_owner(&principal, false)?;
     let revoked: bool = sqlx::query_scalar(
         "select zeus_private.revoke_platform_tenant_access_grant($1, $2, $3, $4)",
     )
     .bind(user_id)
     .bind(session_id)
     .bind(grant_id)
-    .bind("revoked by platform administrator")
+    .bind("revoked by platform owner")
     .fetch_one(&state.platform.database)
     .await?;
     if !revoked {
@@ -616,11 +616,11 @@ pub fn routes() -> Router<AppState> {
         )
 }
 
-fn require_platform_admin(
+fn require_platform_owner(
     principal: &PrincipalContext,
     require_recent_mfa: bool,
 ) -> Result<(Uuid, Uuid), ApiError> {
-    let ids = require_platform_admin_without_mfa(principal)?;
+    let ids = require_platform_owner_without_mfa(principal)?;
     let Some(mfa_satisfied_at) = principal.mfa_satisfied_at else {
         return Err(ApiError::MfaRequired);
     };
@@ -633,12 +633,12 @@ fn require_platform_admin(
     Ok(ids)
 }
 
-fn require_platform_admin_without_mfa(
+fn require_platform_owner_without_mfa(
     principal: &PrincipalContext,
 ) -> Result<(Uuid, Uuid), ApiError> {
     if principal.principal_kind != PrincipalKind::User
         || principal.email_verified_at.is_none()
-        || !principal.platform_roles.contains("platform_admin")
+        || !principal.platform_roles.contains("platform_owner")
     {
         return Err(ApiError::Forbidden);
     }

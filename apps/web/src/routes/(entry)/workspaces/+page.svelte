@@ -39,7 +39,7 @@
         </p>
       </div>
       <div class="flex gap-2">
-        {#if data.isPlatformAdmin}<Button href="/platform" variant="outline">平台控制台</Button>{/if}
+        {#if data.isPlatformOwner}<Button href="/platform" variant="outline">平台控制台</Button>{/if}
         <Button href="/account/profile" variant="ghost">账号设置</Button>
       </div>
     </div>

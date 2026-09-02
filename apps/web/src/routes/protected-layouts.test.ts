@@ -43,7 +43,7 @@ function parentData() {
       email: 'owner@example.test',
       display_name: 'Owner',
       email_verified_at: '2026-09-01T00:00:00Z',
-      platform_roles: ['platform_admin'],
+      platform_roles: ['platform_owner'],
       auth_methods: ['password'],
       has_native_password: true,
       totp_enabled: false,

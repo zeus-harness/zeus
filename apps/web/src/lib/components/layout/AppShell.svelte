@@ -33,7 +33,7 @@
     flattenWorkspaceOptions,
     hasValidTenantAccessGrant,
     isOrganizationOwner,
-    isPlatformAdmin,
+    isPlatformOwner,
     isWorkspaceOwner,
     workspacePath,
     workspaceRootPath
@@ -90,7 +90,7 @@
     (currentOrganization && hasValidTenantAccessGrant(principal, currentOrganization.organization_id)) ||
       isOrganizationOwner(principal, currentOrganization?.organization_id)
   );
-  let platformAdmin = $derived(isPlatformAdmin(principal));
+  let platformOwner = $derived(isPlatformOwner(principal));
   let primaryNavigation = $derived<NavigationItem[]>(
     workspaceBase
       ? [
@@ -117,7 +117,7 @@
         icon: Building2
       });
     }
-    if (platformAdmin) {
+    if (platformOwner) {
       items.push({ href: '/platform', label: '平台控制台', icon: ShieldCheck });
     }
     items.push({ href: '/account/profile', label: '账号设置', icon: Settings });

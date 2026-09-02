@@ -24,6 +24,42 @@ async fn platform_tenant_access_is_session_bound_audited_and_membership_free() {
         .await
         .expect("Runtime role connects");
 
+    let role_constraint: String = sqlx::query_scalar(
+        "select pg_get_constraintdef(c.oid)
+         from pg_constraint c
+         where c.conrelid = 'public.platform_role_assignments'::regclass
+           and c.conname = 'platform_role_assignments_role_check'",
+    )
+    .fetch_one(&owner_pool)
+    .await
+    .expect("platform role constraint loads");
+    assert!(role_constraint.contains("platform_owner"));
+    assert!(!role_constraint.contains("platform_admin"));
+
+    let function_contract = sqlx::query_as::<_, (bool, bool, bool, bool)>(
+        "select
+           to_regprocedure('zeus_private.has_platform_owner()') is not null,
+           to_regprocedure('zeus_private.has_platform_admin()') is null,
+           to_regprocedure('zeus_private.platform_session_is_owner(uuid,uuid,boolean)') is not null,
+           to_regprocedure('zeus_private.platform_session_is_admin(uuid,uuid,boolean)') is null",
+    )
+    .fetch_one(&owner_pool)
+    .await
+    .expect("platform owner function contract loads");
+    assert_eq!(function_contract, (true, true, true, true));
+
+    let legacy_function_body_count: i64 = sqlx::query_scalar(
+        "select count(*)
+         from pg_proc p
+         join pg_namespace n on n.oid = p.pronamespace
+         where n.nspname = 'zeus_private'
+           and position('platform_admin' in p.prosrc) > 0",
+    )
+    .fetch_one(&owner_pool)
+    .await
+    .expect("private function bodies inspect");
+    assert_eq!(legacy_function_body_count, 0);
+
     let platform_user_id = Uuid::now_v7();
     let platform_session_id = Uuid::now_v7();
     let tenant_owner_id = Uuid::now_v7();
@@ -34,7 +70,7 @@ async fn platform_tenant_access_is_session_bound_audited_and_membership_free() {
     sqlx::query(
         "insert into users (id, email, display_name, status, email_verified_at)
          values
-           ($1, $2, 'Platform Admin', 'active', now()),
+           ($1, $2, 'Platform Owner', 'active', now()),
            ($3, $4, 'Tenant Owner', 'active', now())",
     )
     .bind(platform_user_id)
@@ -46,7 +82,7 @@ async fn platform_tenant_access_is_session_bound_audited_and_membership_free() {
     .expect("users insert");
     sqlx::query(
         "insert into platform_role_assignments (user_id, role, assigned_by)
-         values ($1, 'platform_admin', $1)",
+         values ($1, 'platform_owner', $1)",
     )
     .bind(platform_user_id)
     .execute(&owner_pool)

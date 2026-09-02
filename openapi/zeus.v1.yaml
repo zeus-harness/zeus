@@ -1805,7 +1805,7 @@ paths:
         required: true
       responses:
         '201':
-          description: Platform admin and first tenant created
+          description: Platform owner and first tenant created
           content:
             application/json:
               schema:

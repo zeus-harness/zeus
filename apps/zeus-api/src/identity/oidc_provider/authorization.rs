@@ -185,7 +185,7 @@ async fn authorize_inner(
     let account_mfa_required = principal_requires_mfa(state, &principal).await?;
     if (policy.mfa_required
         || account_mfa_required
-        || principal.platform_roles.contains("platform_admin"))
+        || principal.platform_roles.contains("platform_owner"))
         && principal.mfa_satisfied_at.is_none()
     {
         if prompt.none {

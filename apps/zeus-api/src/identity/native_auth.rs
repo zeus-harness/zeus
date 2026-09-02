@@ -279,7 +279,7 @@ pub async fn native_login(
     .bind(session_digest)
     .fetch_one(&state.platform.database)
     .await?;
-    let is_platform_admin = platform_roles.iter().any(|role| role == "platform_admin");
+    let is_platform_owner = platform_roles.iter().any(|role| role == "platform_owner");
 
     let mut headers = auth_cookie_headers(&state, &session_token, &csrf_token)?;
     headers.insert(
@@ -292,8 +292,8 @@ pub async fn native_login(
             user_id: row.user_id,
             session_id,
             email_verification_required: row.email_verified_at.is_none(),
-            mfa_required: row.totp_enabled || is_platform_admin,
-            totp_setup_required: is_platform_admin && !row.totp_enabled,
+            mfa_required: row.totp_enabled || is_platform_owner,
+            totp_setup_required: is_platform_owner && !row.totp_enabled,
         }),
     ))
 }
@@ -786,9 +786,9 @@ pub async fn disable_totp(
     Json(request): Json<DisableTotpRequest>,
 ) -> Result<(HeaderMap, StatusCode), ApiError> {
     require_recent_authentication(&principal)?;
-    if principal.platform_roles.contains("platform_admin") {
+    if principal.platform_roles.contains("platform_owner") {
         return Err(ApiError::Conflict(
-            "platform administrators must keep TOTP enabled".to_owned(),
+            "platform owners must keep TOTP enabled".to_owned(),
         ));
     }
     let user_id = principal.user_id.ok_or(ApiError::Forbidden)?;
