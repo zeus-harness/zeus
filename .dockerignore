@@ -1,0 +1,10 @@
+.git
+.idea
+.zeus
+.turbo
+node_modules
+target
+build
+.svelte-kit
+coverage
+*.log

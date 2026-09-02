@@ -1,0 +1,26 @@
+{
+  "name": "zeus",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": "24.18.0",
+    "pnpm": "10.33.0"
+  },
+  "scripts": {
+    "build": "turbo run build && cargo build --workspace",
+    "check": "turbo run check && node --check scripts/load/identity.mjs && cargo check --workspace",
+    "test": "turbo run test && node --test scripts/load/identity.test.mjs scripts/e2e/*.test.mjs && cargo test --workspace",
+    "dev:web": "pnpm --filter @zeus/web dev",
+    "dev:api": "cargo run -p zeus-api -- serve",
+    "load:capacity": "node scripts/load/capacity.mjs",
+    "load:identity": "node scripts/load/identity.mjs",
+    "e2e:seed": "node scripts/e2e/work-item.mjs seed",
+    "e2e:run": "node scripts/e2e/work-item.mjs run",
+    "db:bootstrap": "psql \"$DATABASE_URL\" --no-psqlrc --set ON_ERROR_STOP=1 --file scripts/db/bootstrap-roles.sql",
+    "db:migrate": "cargo run -p zeus-api -- db migrate"
+  },
+  "devDependencies": {
+    "turbo": "^2.8.0"
+  }
+}
