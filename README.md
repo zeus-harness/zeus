@@ -85,6 +85,12 @@ set +a
 
 Kubernetes 基线要求平台创建两个独立 Secret：`zeus-migration` 只保存 migration owner 的 `database-url`，`zeus-runtime` 保存 API 的受限 `database-url`、`runtime-database-url` 和 envelope key。平台还要创建 `zeus-password-policy` ConfigMap，其中 `weak-passwords.txt` 每行一个弱密码。不要把 owner URI 放进 `zeus-runtime`。
 
+### 升级已有环境
+
+`0026` 身份拆分和 `0030` 平台角色改名不支持旧 API 与新 Schema 混跑。升级前记录镜像版本、备份恢复点及对应 envelope key，关闭入口并停止旧 API（包括内嵌 Supervisor），确认 HPA 不会重新拉起旧副本，再用独立 migration owner 执行迁移。迁移成功后启动匹配的新 API/Web，检查 readiness、登录、Workspace 权限与合成 Run，再恢复入口。不能用一次对整份 Kubernetes 基线的 apply 来保证 Migration Job 与 Deployment 的执行顺序。
+
+迁移后不要仅回滚旧 API 镜像；优先前向修复，需要恢复数据库时按 [备份恢复手册](docs/runbooks/backup-restore.md) 处理密钥及身份撤销风险。升级约束见 [ADR 0008](docs/adr/0008-tenant-navigation-owner-and-identity-trust.md)。现有 CI 证明空库和 `0029 → 0030` 升级，不代表任意历史版本均有升级路径。
+
 数据库冒烟测试：
 
 ```bash
