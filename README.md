@@ -32,6 +32,8 @@ http://127.0.0.1:3000/mailpit/
 
 API 和 Web 不发布宿主机端口。Gateway 把 `/api`、`/auth`、`/oauth2`、`/.well-known`、`/health` 和 `/metrics` 转给 API，其余请求转给 Web。
 
+若宿主机能访问模型服务，但 API 容器无法解析公共域名，可在对应的 `.zeus/local.env` 或 `.zeus/e2e.env` 设置 `ZEUS_API_DNS` 为当前网络可访问的 DNS 服务器 IP，再运行 `scripts/container up all` 或 `scripts/container e2e up all`。该配置仅覆盖 API 容器的 DNS；未设置时保留 Apple `container` 默认行为。
+
 空数据库会从 `/` 跳到 `/setup`。在页面中创建平台 Owner、首个 Organization 和 Workspace。Bootstrap token 保存在本机 `.zeus/local.env` 的 `ZEUS_BOOTSTRAP_TOKEN`，只在 Setup 表单中使用，不要复制到终端记录或聊天。Setup 完成后使用 `/login` 登录；邮件验证、密码找回和邀请邮件在 `/mailpit/` 查看。
 
 `init-env` 会生成本地 Bootstrap token、数据库密码和 envelope key，写入权限为 `0600` 的 `.zeus/local.env`，不会打印这些值。代码变化后重新构建并启动：

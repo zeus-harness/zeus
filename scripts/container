@@ -705,8 +705,13 @@ start_api() {
   export ZEUS_IDENTITY_MAINTENANCE_ENABLED="true"
   export ZEUS_ALLOW_PRIVATE_MODEL_ENDPOINTS="${ZEUS_ALLOW_PRIVATE_MODEL_ENDPOINTS:-false}"
 
+  set --
+  if [[ -n "${ZEUS_API_DNS:-}" ]]; then
+    set -- --dns "${ZEUS_API_DNS}"
+  fi
   recreate_stateless_container "${ZEUS_API_CONTAINER}" 60
   container run \
+    "$@" \
     --name "${ZEUS_API_CONTAINER}" \
     --detach \
     --init \

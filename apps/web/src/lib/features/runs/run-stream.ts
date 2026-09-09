@@ -267,11 +267,14 @@ const TERMINAL_STATUSES = new Set<TerminalRunStatus>(['succeeded', 'failed', 'ca
 export function getTerminalRunStatus(
   event: Pick<RunEvent, 'event_type' | 'payload'>
 ): TerminalRunStatus | null {
-  const explicitStatus = TERMINAL_EVENT_STATUS[event.event_type.trim().toLowerCase()];
+  const eventType = event.event_type.trim().toLowerCase();
+  const explicitStatus = TERMINAL_EVENT_STATUS[eventType];
   if (explicitStatus !== undefined) {
     return explicitStatus;
   }
 
+  // Tool and child results have their own status; the parent Run may still be active.
+  if (eventType !== 'run.status_changed') return null;
   const payload = isRecord(event.payload) ? event.payload.status : undefined;
   return isTerminalRunStatus(payload) ? payload : null;
 }

@@ -107,6 +107,15 @@ describe('run event merging', () => {
 });
 
 describe('terminal run events', () => {
+  it('keeps streaming after tool and child results until the Run itself terminates', () => {
+    for (const eventType of ['tool.result', 'child_run.completed', 'model.completed']) {
+      for (const status of ['succeeded', 'failed', 'canceled']) {
+        expect(getTerminalRunStatus(runEvent(1, eventType, { status }))).toBeNull();
+      }
+    }
+    expect(changesRunSnapshot(runEvent(1, 'tool.result', { status: 'succeeded' }))).toBe(true);
+  });
+
   it('recognizes terminal payload statuses', () => {
     const statuses: TerminalRunStatus[] = ['succeeded', 'failed', 'canceled'];
 

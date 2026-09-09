@@ -386,3 +386,32 @@ K 完成不能关闭 H 或 I5。OpenID Conformance、云 KMS、真实企业 IdP�
 - 更新后的 Apple `container` 隔离 E2E 冒烟通过。2 条 Chromium 自动回归在 51.9 秒内通过，覆盖原有主链路，以及从零配置模型/Agent/Workflow 后读取工作项。Agent、Workflow、Run 页在 `1440×900`、`1024×768`、`390×844` 无横向溢出；浏览器控制台 0 warning、0 error。截图仅在登录后保存至系统临时目录。
 
 以上是本轮未提交工作区的本地证据，模型为确定性 fixture。L 继续保持 `active`，等待 GitHub CI 实跑与真实模型验收；H/I5 的外部门禁不变。
+
+### GitHub CI 核实（2026-09-09）
+
+- 提交 `fac9d9755ae9c5ed80986cfdfa916801a3af94f8` 已有两次成功 CI：[运行 34310669233](https://github.com/zeus-harness/zeus/actions/runs/34310669233)、[运行 34310665814](https://github.com/zeus-harness/zeus/actions/runs/34310665814)。PR #1 的检查也对应这个提交。
+- 两次运行中的 Rust/Web/OpenAPI、PostgreSQL isolation and upgrade、Production images and browser flow 三组 Job 均为 `SUCCESS`。这补齐了上述本地记录中待确认的 GitHub CI 证据。
+- 真实模型验收尚未执行，按 [真实模型验收手册](runbooks/real-model-acceptance.md) 推进。L、H 和 I5 保持 `active`；确定性 CI 不能替代模型质量或生产环境验收。
+
+### 隔离 E2E 复验（2026-09-09）
+
+- 使用既有本地镜像，在 `127.0.0.1:3100` 执行 `scripts/container e2e smoke`，专用测试账号与确定性模型链路通过；本次未重新构建镜像。
+- Run `01a085a8-19a8-738b-84e3-27cdc0b0029e` 为 `succeeded`。脚本验证工作项筛选、审批、工具配对结果、模型最终消息、用量和 SSE 断点续传。
+- `pnpm test:browser` 的两条 Chromium 回归在 16.7 秒内通过，覆盖登录/MFA、Workspace POST 选择、审批与实时结果，以及模型配置、Agent/Workflow 发布和当前工作项读取；三档响应式与页面控制台断言通过。首次执行缺少 Chromium，安装后又受到沙箱 MachPort 权限限制，改为获准的沙箱外执行后通过，无业务代码修改。
+- 开发环境 `127.0.0.1:3000` 的 readiness 和登录页均返回 HTTP 200；同一 E2E 账号的登录请求返回 401，不能据此复用隔离环境的账号配置。
+- 本轮模型仍为确定性 fixture；真实模型兼容性、回答质量及真实服务故障场景保持未验收。
+
+### 真实模型验收（2026-09-09）
+
+- DeepSeek `deepseek-v4-flash` 的非思考模式已完成正常审批、拒绝审批、等待审批时取消、SSE 续传和客户端超时验证，具体 Run 与用量见 [实跑记录](runbooks/real-model-acceptance.md#deepseek-实跑记录2026-09-09)。正常回答识别合成需求的事实与缺失信息，拒绝时未编造工具内容。
+- 实跑发现 Apple container 默认 DNS 无法解析外网域名。启动脚本增加可选的 API DNS 配置，在隔离 E2E 环境验证解析恢复及确定性冒烟通过。
+- 实际页面暴露最终回答以 JSON 显示的问题；Run 页改为优先显示转义后的文本正文，保留折叠的原始 JSON，非文本输出保持原有展示。
+- 本轮修改通过 Svelte autofixer、Web check（0 error / 0 warning）、139 项 Web 测试、7 项 E2E 脚本测试、Web 构建与镜像构建、更新后的确定性 API 冒烟及 2 条浏览器回归（56.9 秒）。已保存的真实模型回答在三档页面复验通过，控制台无 warning/error；正文展示修复没有再次调用模型。
+- 本次新增修改尚未提交或执行 GitHub CI；已有 CI 成功证据仍只对应 `fac9d97`。L 保持 `active`，等待本轮修改的 CI 收尾；H/I5 不变，真实服务故障演练和思考模式不在本次已验收范围内。
+- 用户现有 `127.0.0.1:3000` 页面已完成第 2 版 Workflow 发布、合成 WorkItem 启动、批准读取和真实模型结果持久化。Run `01a085d5-ddd5-7464-95bf-f29eba689ad2` 成功，工具调用 1 次，刷新后可见 17 条事件及最终正文。严格 350 字与事实表述要求未完全满足；事件流终态与摘要自动刷新的不一致待复现。详见手册“本机用户页面复验（3000）”，不将此标为全部质量门禁通过。
+
+### 自动刷新收尾（2026-09-10）
+
+- 已复现并修复工具成功被误判为 Run 终态、导致 SSE 提前关闭的问题。仅 Run 自身终态关闭事件流；工具和子运行结果不再终止订阅。
+- 140 项 Web 测试、1 项 UI 测试、7 项 E2E 驱动测试、静态检查及构建通过。带 1.5 秒最终回答延迟的两条浏览器流程通过；旧 fixture 地址失效的用例重新 seed 后单独重跑通过。
+- 新验收指令明确事实与建议边界、350 字符硬验收标准；3000 用户会话过期，等待登录后发布和真实模型复验。L、H/I5 保持 `active`。

@@ -124,6 +124,10 @@ export function createFakeOpenAiServer() {
       return;
     }
 
+    // Keep tool completion separate from Run completion, as with a real model.
+    if (payload.messages.some((message) => message.role === 'tool')) {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
     response.writeHead(200, {
       'content-type': 'text/event-stream',
       'cache-control': 'no-store',

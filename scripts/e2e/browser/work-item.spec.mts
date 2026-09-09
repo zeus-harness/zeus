@@ -66,7 +66,12 @@ test('login, MFA, Workspace POST selection, WorkItem approval and live result', 
   // No reload: the result must arrive through the page's SSE refresh path.
   await expect(page.getByText('succeeded', { exact: true }).first()).toBeVisible();
   await expect(page.getByText('approved', { exact: true }).first()).toBeVisible();
-  await expect(page.getByText(/测试运行已完成/).first()).toBeVisible();
+  await expect(page.getByTestId('run-output-content')).toContainText('测试运行已完成');
+  const rawOutput = page.locator('details').filter({ has: page.getByText('查看原始 JSON', { exact: true }) });
+  await expect(rawOutput.locator('pre')).toBeHidden();
+  await rawOutput.locator('summary').click();
+  await expect(rawOutput.locator('pre')).toContainText('"content"');
+  await rawOutput.locator('summary').click();
 
   await checkResponsive(page, testInfo, 'run');
   expect(await page.locator('vite-error-overlay').count()).toBe(0);

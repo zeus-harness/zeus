@@ -20,6 +20,14 @@
 
   let { data, form } = $props<{ data: PageData; form: ActionData }>();
   let trace = $derived(data.trace.data);
+  let outputText = $derived.by(() => {
+    const output = trace?.run.output;
+    if (typeof output === 'string') return output;
+    if (output && typeof output === 'object' && 'content' in output && typeof output.content === 'string') {
+      return output.content;
+    }
+    return null;
+  });
   let workspaceBase = $derived(`/${data.workspaceId}`);
   let childRuns = $derived(data.childRuns.data ?? []);
   let pendingApprovals = $derived(
@@ -152,7 +160,15 @@
           <Card.Description>这是该 Run 已持久化的最终输出。</Card.Description>
         </Card.Header>
         <Card.Content>
-          <pre class="max-h-[32rem] overflow-auto rounded-lg bg-muted p-4 font-mono text-xs leading-5">{formatJson(trace.run.output)}</pre>
+          {#if outputText !== null}
+            <div data-testid="run-output-content" class="whitespace-pre-wrap break-words text-sm leading-7">{outputText}</div>
+            <details class="mt-4">
+              <summary class="cursor-pointer text-xs text-muted-foreground">查看原始 JSON</summary>
+              <pre class="mt-2 max-h-[32rem] overflow-auto rounded-lg bg-muted p-4 font-mono text-xs leading-5">{formatJson(trace.run.output)}</pre>
+            </details>
+          {:else}
+            <pre class="max-h-[32rem] overflow-auto rounded-lg bg-muted p-4 font-mono text-xs leading-5">{formatJson(trace.run.output)}</pre>
+          {/if}
         </Card.Content>
       </Card.Root>
     {:else if ['succeeded', 'failed', 'canceled'].includes(trace.run.status)}
