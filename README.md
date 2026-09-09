@@ -56,11 +56,20 @@ WorkItem 验收使用独立 E2E profile。它只操作 `zeus-e2e-*` 容器、`ze
 ```bash
 scripts/container e2e build all
 scripts/container e2e smoke
+scripts/container e2e test-db
+pnpm exec playwright install chromium
+pnpm test:browser
 scripts/container e2e status all
 scripts/container e2e reset-db --yes
 ```
 
 `smoke` 使用已经构建的镜像，启动 PostgreSQL 18.6、Mailpit、确定性 OpenAI-compatible fixture、API、Web 和 Gateway，再完成 Setup、邮箱验证、TOTP、Workspace 配置、WorkItem 启动、Capability 审批、Run 终态和 SSE 续传检查。源码变化后先运行 `e2e build all`。随机测试凭据只写入权限为 `0600` 且被 Git 忽略的 `.zeus/e2e.env`。测试脚本不会打印密码、TOTP Secret 或 Token。
+
+`test-db` 在 E2E PostgreSQL 中为每组集成测试创建独立临时数据库，不会清空现有库，也没有 API 连接这些临时库。它覆盖空库迁移、带数据的 `0029 → 0030` 升级、权限与 Runtime，完成或测试失败后删除本次数据库。已有本机 PostgreSQL 时，可在环境中提供 `ZEUS_TEST_DATABASE_URL` 后运行 `pnpm test:postgres`；该连接必须指向回环地址，并有建库、建角色和迁移权限。不要把连接凭据写入命令行。
+
+`test:browser` 在 `smoke` 之后运行，使用隔离测试账号，覆盖登录、MFA、Workspace POST 选择、配置发布、工作项工具、审批与 SSE 结果。测试不保存登录态、视频或包含凭据的 trace；登录后的截图写入系统临时目录，可用 `ZEUS_BROWSER_OUTPUT_DIR` 指定位置。
+
+`.github/workflows/ci.yml` 在 PR 和主干/`codex/**` 推送时执行 Rust/Web/OpenAPI、隔离 PostgreSQL，以及生产镜像和浏览器验收。CI 使用独立的临时 PostgreSQL 和确定性模型，不读取部署密钥。
 
 需要从宿主机运行数据库检查时再加载本地环境：
 
@@ -103,9 +112,22 @@ Web SSR 通过 `ZEUS_API_URL` 请求 API。Apple `container` 1.0.0 本地脚本�
 - Zeus OIDC Provider，覆盖 Authorization Code + S256 PKCE、Refresh、UserInfo、JWKS、Revocation 和 Logout。
 - WorkItem 创建、分配、状态更新、外部引用和附件。
 - Session、Run、Trace、Approval 与 SSE。
+- Web 模型连接、模型配置、Agent 不可变版本、Workflow 发布和当前工作项读取工具。
 - Experience Candidate 审阅、发布、撤回、PostgreSQL FTS 和运行时注入记录。
 - 持久化 Child Run，包含独立 Session、权限与预算收窄、父子恢复和取消传播。
 - Kubernetes API/Web/Migration、OpenTelemetry Collector、HPA 基线和故障手册。
+
+## 配置内置 Agent
+
+1. Workspace Owner 在 `/:workspaceId/settings/connections` 创建 OpenAI-compatible 连接并写入 API Key；随后在 `settings/model-profiles` 填写 API Base URL、模型 ID 和超时。生产地址遵循 HTTPS 和模型出口策略。
+2. Owner 或 Builder 在 `/:workspaceId/agents` 创建 Agent，编写指令、保存新版本并发布。
+3. 需要读取工作项时，在 `settings/capabilities` 启用“读取当前工作项”。首次注册目录项需要 Organization Owner，Workspace 启用独立要求 Workspace Owner；默认要求审批。
+4. 在 `/:workspaceId/workflows` 创建 Workflow，选择已发布 Agent、模型、允许工具和步数/时间/Token 预算，保存并发布版本。发布使用 revision 检查，冲突时刷新后重试。
+5. 在工作项中选择 Workflow 并启动；需要时完成审批，在 Run 页面查看事件和结果。更新 Agent 后需创建并发布新的 Workflow 版本，已有运行保留原版本。
+
+`builtin.work_item_read` 只接收空对象，返回当前 Run 所关联工作项的标题、描述、状态、优先级和输入；没有任意 ID 查询或附件/文件读取能力。工具返回内容仍是不可信业务数据。模型密钥不提供原文读取接口。当前页面覆盖首次接入与版本发布；连接密钥轮换和模型配置更新仍通过已有 API 完成。
+
+确定性 fixture 证明配置、工具和持久化链路可执行；真实模型兼容性、成本和业务回答质量需要部署方配置真实连接后另行验收。H/I5 外部门禁保持 `active`。
 
 容量驱动默认要求 1,000 个用户 Session、100 个 Workspace、200 个并发 Run 和 1,800 秒测试窗口：
 

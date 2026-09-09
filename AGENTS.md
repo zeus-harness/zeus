@@ -47,6 +47,7 @@ Zeus 是面向企业团队的云端 Harness Agent。代码从 `0.1.0` 开始，H
 - `platform_managed` Organization 对 Owner 隐藏并拒绝身份设置的读写 API。
 - `apps/web` 保存业务路由和组件。`packages/ui/src/lib/components/ui` 保存共享基础组件。不要复制基础组件或新增视觉系统。
 - H 和 I5 的外部门禁继续保持 `active`；本地 K 验收不能把它们标为 `done`。
+- L 补齐内置 Agent 配置发布和验收自动化。`builtin.work_item_read` 只能读取当前 Run 关联的 WorkItem，拒绝任意 ID 参数；保留租户、Session、fence、租约、审批和事件边界。确定性模型回归不能替代真实模型或 H/I5 外部验收。
 
 ## Rust
 
@@ -102,6 +103,7 @@ npx @sveltejs/mcp svelte-autofixer <file> --svelte-version 5
 - 本地和新环境必须先运行 `pnpm db:bootstrap`，再运行 migration。
 - HTTP 池固定使用 `zeus_http`。Runtime 池固定使用 `zeus_runtime`。不要让服务以 migration owner 身份执行请求。
 - 运行 ignored PostgreSQL 集成测试时只启动隔离 PostgreSQL。不要同时运行指向同一测试库的 `zeus-api`，否则内嵌 Supervisor 会领取测试创建的 queued Run。
+- 优先使用 `scripts/container e2e test-db`，它为每组测试创建独立数据库并清理；已有回环 PostgreSQL 可通过环境变量 `ZEUS_TEST_DATABASE_URL` 运行 `pnpm test:postgres`。不得让 API 指向这些临时库。
 
 ## API 契约
 

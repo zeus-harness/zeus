@@ -37,6 +37,16 @@ test('returns a final answer after the tool result is visible', () => {
   assert.equal(framePayload(frames.at(-1)), '[DONE]');
 });
 
+test('reads a no-argument WorkItem capability and uses its persisted result', () => {
+  const tools = [{ function: { name: 'cap_read', parameters: { type: 'object', properties: {}, additionalProperties: false } } }];
+  const call = JSON.parse(framePayload(buildCompletionFrames({ messages: [], tools })[0]));
+  assert.equal(call.choices[0].delta.tool_calls[0].function.arguments, '{}');
+  const result = JSON.parse(framePayload(buildCompletionFrames({
+    messages: [{ role: 'tool', content: JSON.stringify({ title: 'Invoice review', description: 'Check the invoice.' }) }], tools
+  })[0]));
+  assert.match(result.choices[0].delta.content, /已读取工作项：Invoice review/);
+});
+
 test('serves health and requires bearer authentication for completions', async () => {
   const server = createFakeOpenAiServer();
   server.listen(0, '127.0.0.1');

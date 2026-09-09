@@ -182,7 +182,11 @@ validate
 
 输入和输出使用 JSON Schema 校验。Schema 创建时会校验元 Schema，并拒绝外部 `$ref`。验证器关闭 HTTP 和文件引用解析，Schema 不能触发 SSRF 或服务器文件读取。
 
-服务端注册表包含 `builtin.echo` 测试执行器和 `builtin.child_run` 平台执行器。`builtin.child_run` 只能由已启用、要求幂等的 `zeus.child-run` Capability 使用。企业 Capability 需要显式加入注册表后才能执行。
+服务端注册表包含 `builtin.echo` 测试执行器、`builtin.child_run` 平台执行器和 `builtin.work_item_read` 只读业务执行器。`builtin.child_run` 只能由已启用、要求幂等的 `zeus.child-run` Capability 使用。企业 Capability 需要显式加入注册表后才能执行。
+
+`builtin.work_item_read` 只接受空对象，即使目录 Schema 被放宽也拒绝额外参数。服务端通过当前 Run → Session → WorkItem 读取 `id/title/description/status/priority/input`，同时限定 Organization、Workspace、Session、fence、有效租约、running 状态和未取消条件。它不读取附件，不接受调用方提供的工作项 ID。返回结果继续经过输出 Schema、脱敏、append-only 事件和审计管线；读取失败不返回内部 SQL。
+
+Web 在 Workspace 设置中提供模型连接与模型配置创建入口；API Key 只发送到现有加密存储 API，表单失败不回显密钥。Agent Studio 保存不可变 Agent/Workflow 版本，发布使用 `If-Match` 检查 revision。Workflow 显式绑定 Agent 版本、模型配置、允许工具和执行预算。工具目录注册与 Workspace 启用分别校验 Organization、Workspace 权限。连接轮换与模型更新继续由现有 API 提供。
 
 ## 数据
 

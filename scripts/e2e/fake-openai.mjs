@@ -27,6 +27,8 @@ export function buildCompletionFrames(request) {
   const tools = Array.isArray(request?.tools) ? request.tools : [];
   const hasToolResult = messages.some((message) => message?.role === 'tool');
   const toolName = tools[0]?.function?.name;
+  const noArguments = tools[0]?.function?.parameters?.additionalProperties === false &&
+    Object.keys(tools[0]?.function?.parameters?.properties ?? {}).length === 0;
 
   if (!hasToolResult && typeof toolName === 'string' && toolName.length > 0) {
     return [
@@ -41,7 +43,7 @@ export function buildCompletionFrames(request) {
                   id: 'call_e2e_echo_1',
                   function: {
                     name: toolName,
-                    arguments: JSON.stringify({ message: 'Zeus E2E approval path' })
+                    arguments: JSON.stringify(noArguments ? {} : { message: 'Zeus E2E approval path' })
                   }
                 }
               ]
@@ -54,8 +56,19 @@ export function buildCompletionFrames(request) {
     ];
   }
 
+  let content = FINAL_CONTENT;
+  for (const message of messages.filter((entry) => entry?.role === 'tool')) {
+    try {
+      const result = JSON.parse(message.content);
+      if (typeof result.title === 'string' && typeof result.description === 'string') {
+        content = `已读取工作项：${result.title}。处理建议：根据工作项描述核对需求，并记录后续动作。`;
+      }
+    } catch {
+      // A malformed tool result must not be logged by the fixture.
+    }
+  }
   return [
-    sseFrame({ choices: [{ index: 0, delta: { content: FINAL_CONTENT } }] }),
+    sseFrame({ choices: [{ index: 0, delta: { content } }] }),
     sseFrame(usageFrame(36, 18)),
     sseFrame('[DONE]')
   ];

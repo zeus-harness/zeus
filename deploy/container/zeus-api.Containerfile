@@ -2,6 +2,7 @@ FROM docker.io/library/rust:1.97.1-bookworm AS build
 WORKDIR /workspace
 COPY Cargo.toml Cargo.lock ./
 COPY crates/zeus-core crates/zeus-core
+COPY crates/zeus-identity crates/zeus-identity
 COPY apps/zeus-api apps/zeus-api
 COPY db/migrations db/migrations
 RUN cargo build --locked --release -p zeus-api

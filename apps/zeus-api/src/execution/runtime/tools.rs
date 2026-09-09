@@ -154,7 +154,7 @@ impl DurableRunExecutor {
                     () = cancellation.cancelled() => return Err(super::types::RuntimeControl::Canceled),
                     result = tokio::time::timeout(
                         timeout,
-                        execute_registered_capability(capability, &call.input),
+                        execute_registered_capability(&self.pool, run, capability, &call.input),
                     ) => match result {
                         Ok(result) => result,
                         Err(_) => Err(ToolExecutionError::Timeout),
@@ -297,14 +297,52 @@ impl DurableRunExecutor {
 }
 
 async fn execute_registered_capability(
+    pool: &sqlx::PgPool,
+    run: &ClaimedRun,
     capability: &RuntimeCapability,
     input: &Value,
 ) -> Result<Value, ToolExecutionError> {
     tokio::task::yield_now().await;
     match capability.executor_key.as_str() {
         "builtin.echo" => Ok(json!({ "echo": input })),
+        "builtin.work_item_read" => read_current_work_item(pool, run, input).await,
         _ => Err(ToolExecutionError::ExecutorUnavailable),
     }
+}
+
+async fn read_current_work_item(
+    pool: &sqlx::PgPool,
+    run: &ClaimedRun,
+    input: &Value,
+) -> Result<Value, ToolExecutionError> {
+    // The executor enforces its own boundary even if an Organization changes its Schema.
+    if !input.as_object().is_some_and(serde_json::Map::is_empty) {
+        return Err(ToolExecutionError::InputSchemaViolation);
+    }
+    sqlx::query_scalar(
+        "select jsonb_build_object(
+            'id', w.id, 'title', w.title, 'description', w.description,
+            'status', w.status, 'priority', w.priority, 'input', w.input
+         )
+         from runs r
+         join sessions s on s.id = r.session_id
+           and s.organization_id = r.organization_id and s.workspace_id = r.workspace_id
+         join work_items w on w.id = s.work_item_id
+           and w.organization_id = s.organization_id and w.workspace_id = s.workspace_id
+         where r.id = $1 and r.organization_id = $2 and r.workspace_id = $3
+           and r.session_id = $4 and r.fence_token = $5
+           and r.status = 'running' and r.cancel_requested_at is null
+           and r.lease_expires_at > now()",
+    )
+    .bind(run.run_id)
+    .bind(run.organization_id)
+    .bind(run.workspace_id)
+    .bind(run.session_id)
+    .bind(run.fence_token)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| ToolExecutionError::WorkItemReadFailed)?
+    .ok_or(ToolExecutionError::WorkItemUnavailable)
 }
 
 pub(super) fn normalize_tool_result(mut value: Value) -> Value {
@@ -363,6 +401,8 @@ impl ToolExecutionError {
             Self::ExecutorUnavailable => "capability_executor_unavailable",
             Self::OutcomeUnknown => "capability_outcome_unknown",
             Self::Timeout => "capability_timeout",
+            Self::WorkItemUnavailable => "capability_work_item_unavailable",
+            Self::WorkItemReadFailed => "capability_work_item_read_failed",
             Self::ChildRunRejected(code) => code,
         }
     }

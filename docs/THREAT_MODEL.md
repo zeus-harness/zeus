@@ -4,6 +4,8 @@
 
 本模型覆盖 Zeus Web、API、原生账号、企业联合登录、Zeus OIDC Provider、PostgreSQL、邮件投递、Agent Runtime、Capability 和审计。0.1.0 不运行用户代码，也不开放 shell 或服务器文件系统工具。
 
+内置工作项读取工具新增的数据出口由 `apps/zeus-api/src/execution/runtime/tools.rs` 限定到当前 Run 关联的 WorkItem，并校验租户、Session、fence、状态、取消与租约；目录配置不能放宽其空参数约束。工作项描述和输入仍视为不可信模型内容，不授予额外工具权限。Web 工具注册使用认证上下文中的 Organization，Workspace 启用独立授权；模型密钥不回显到表单错误、测试截图或 trace。真实业务工具继续需要目标与输出级负面测试。
+
 | 组件 | 职责 | 代码依据 |
 | --- | --- | --- |
 | Gateway / Web | 同源入口、SSR 页面、Cookie 转发 | `scripts/container:579`、`scripts/container:629` |

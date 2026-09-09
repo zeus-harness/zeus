@@ -118,6 +118,7 @@
 - 工具超时也写入配对结果。
 - 输入不符合 Capability Schema 时，调用不会越过校验边界。
 - 输出不符合 Capability Schema 时，写入 `capability_output_schema_violation` 配对结果。
+- `builtin.work_item_read` 拒绝任何非空对象参数，写入 `capability_input_schema_violation`。当前 Run 没有可读取的关联工作项，或状态、取消、租约、fence 条件不满足时返回 `capability_work_item_unavailable`；数据库读取失败返回 `capability_work_item_read_failed`。不回退到其他工作项，不暴露 SQL。
 - Schema 无效时 Run 以 `invalid_capability_schema` 失败，不执行 Capability。
 - 外部系统已经执行但响应丢失时，Zeus 记录 `outcome_unknown`，不猜测成功或失败。
 
@@ -126,6 +127,7 @@
 - 连接失败、限流和 5xx 可以按 Workflow 策略重试。
 - 无效响应和安全策略错误不自动重试。
 - 流式响应中断时不写入不完整助手消息。
+- Web 创建模型连接失败时不回显 API Key 或 API 错误正文；Agent/Workflow 发布 revision 冲突返回可见错误，不自动覆盖或重试发布。已保存的资源与不可变版本保留。
 - 已写入工具调用后发生取消，必须补写合成工具结果。
 
 ## 数据库

@@ -362,3 +362,27 @@ K 阶段使用 ADR 0008。版本保持 `0.1.0`，API 前缀保持 `/api/v1`。�
 Rust 单元测试 `77 + 23 + 22` 通过。Web `122`、UI `1`、Node 驱动 `9` 项测试通过。Rust 格式、Clippy、Svelte check、生产构建和 OpenAPI 确定性检查通过。入口测试覆盖零、一个、多个 active Workspace 和当前 Context。登录页在 `1440×900`、`1024×768`、`390×844` 下没有横向溢出，浏览器控制台为 0 error、0 warning。Apple `container` 空库 smoke 完成 Setup、确定性 fixture、WorkItem、Run 和模型工具循环，终态为 `succeeded`。真实 PostgreSQL 测试只启动数据库；同时运行指向同一测试库的 API 会让 Supervisor 正常领取 queued Run，不能作为测试前置环境。
 
 K 完成不能关闭 H 或 I5。OpenID Conformance、云 KMS、真实企业 IdP、受控 SMTP、托管 PostgreSQL 权限和生产容量仍需要外部证据。
+
+## L：Alpha 验收自动化与内置 Agent 接入
+
+状态：`active`
+
+按以下顺序执行。H/I5 保持 `active`，真实外部服务的结果单独记录。
+
+1. 固化隔离数据库验收：每个 PostgreSQL 集成测试使用新建临时数据库，包含空库迁移与带数据的 `0029 → 0030` 升级；测试结束删除本次创建的数据库。
+2. 加入 Rust/Web、OpenAPI、数据库和生产镜像 CI；将登录、MFA、Workspace 选择、WorkItem、审批和 SSE 固化为浏览器回归。
+3. 完善内置 Agent 接入：模型连接与密钥写入、Agent 不可变版本、Workflow 发布、工具选择、WorkItem 启动和可追溯结果。使用现有 Runtime 和权限边界。
+4. 增加一个受 Workspace 限制的只读业务 Capability，验证真实业务数据进入模型工具循环。确定性模型用于自动回归；真实模型验收需要部署方配置连接。
+
+本阶段不接入外部 Codex/Claude Code 进程或远程 Agent，不增加任意 shell、用户代码执行、独立 Worker 或新视觉系统。
+
+### 本地验收记录（2026-09-09）
+
+- 隔离数据库驱动已完成。PostgreSQL 18.6 的 8 组 ignored 集成测试全部通过，每组独立新建数据库并在结束后删除，包含带 `platform_admin` 赋权数据的 `0029 → 0030` 升级和重复迁移。
+- CI 配置已加入，覆盖 Rust/Web/OpenAPI、PostgreSQL、生产 Containerfile 和浏览器链路；actionlint 1.7.12 通过。修复生产 API Containerfile 缺少 `zeus-identity` 的构建输入。GitHub 执行结果仍待推送后确认，不能用本地镜像构建替代。
+- 内置 Agent 首次接入已贯通：Web 创建连接与模型配置，保存/发布 Agent 和 Workflow 不可变版本，显式选择工具和预算，WorkItem 启动、审批、SSE 与持久结果。连接密钥轮换、模型配置更新仍使用已有 API；真实模型连接与业务回答质量尚未验收。
+- `builtin.work_item_read` 已完成。测试证明只能读取当前 Run 关联工作项，目录 Schema 被放宽时仍拒绝指定其他工作项；合法与拒绝调用均保留配对事件。Web 测试覆盖 revision 冲突、密钥不回显、Workspace Context 变化、Organization/Workspace 独立授权。
+- 本轮工作区通过 Rust 格式、Clippy、`pnpm check/test/build`、OpenAPI 确定性与生成类型检查；Rust `77 + 23 + 22`、Web `139`、UI `1`、Node `13` 项测试通过。共享 UI 打包曾因并行命令争用临时目录失败，改为串行并强制重跑后通过。
+- 更新后的 Apple `container` 隔离 E2E 冒烟通过。2 条 Chromium 自动回归在 51.9 秒内通过，覆盖原有主链路，以及从零配置模型/Agent/Workflow 后读取工作项。Agent、Workflow、Run 页在 `1440×900`、`1024×768`、`390×844` 无横向溢出；浏览器控制台 0 warning、0 error。截图仅在登录后保存至系统临时目录。
+
+以上是本轮未提交工作区的本地证据，模型为确定性 fixture。L 继续保持 `active`，等待 GitHub CI 实跑与真实模型验收；H/I5 的外部门禁不变。

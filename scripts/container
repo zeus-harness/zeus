@@ -70,6 +70,7 @@ E2E commands:
   e2e seed                         Create the deterministic identity and workflow fixture
   e2e run                          Execute the API WorkItem approval flow
   e2e smoke                        Start, seed, and run the isolated stack
+  e2e test-db                      Run each PostgreSQL integration target in a fresh temporary database
   e2e reset-db --yes               Remove only E2E containers and the E2E database volume
 
 Examples:
@@ -1137,6 +1138,14 @@ run_e2e_command() {
   fi
 
   case "${command_name}" in
+    test-db)
+      require_no_extra_args "$@"
+      require_command node
+      require_command psql
+      up_target postgres
+      load_local_env
+      ZEUS_TEST_DATABASE_URL="${DATABASE_URL}" node "${REPO_ROOT}/scripts/db/test-postgres.mjs"
+      ;;
     seed | run)
       require_no_extra_args "$@"
       require_command node

@@ -249,6 +249,8 @@ pub(super) enum ToolExecutionError {
     InputSchemaViolation,
     OutputSchemaViolation,
     ExecutorUnavailable,
+    WorkItemUnavailable,
+    WorkItemReadFailed,
     OutcomeUnknown,
     Timeout,
     ChildRunRejected(&'static str),

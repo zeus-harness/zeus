@@ -33,7 +33,7 @@ export function parseEnvFile(source) {
   return values;
 }
 
-async function loadEnvironment() {
+export async function loadEnvironment() {
   const source = await readFile(ENV_PATH, 'utf8').catch(() => {
     throw new Error('Missing .zeus/e2e.env. Run scripts/container e2e init-env.');
   });
@@ -50,7 +50,7 @@ async function loadEnvironment() {
   return environment;
 }
 
-async function setEnvironmentValue(key, value) {
+export async function setEnvironmentValue(key, value) {
   const source = await readFile(ENV_PATH, 'utf8');
   const replacement = `${key}=${value}`;
   const lines = source.split(/\r?\n/u);
@@ -176,7 +176,7 @@ export function totpAt(secret, unixSeconds = Math.floor(Date.now() / 1000)) {
   return { code: String(binary % 1_000_000).padStart(6, '0'), counter };
 }
 
-async function freshTotp(environment) {
+export async function freshTotp(environment) {
   const secret = required(environment, 'ZEUS_E2E_TOTP_SECRET');
   const lastCounter = Number.parseInt(environment.ZEUS_E2E_TOTP_LAST_COUNTER ?? '-1', 10);
   let current = totpAt(secret);

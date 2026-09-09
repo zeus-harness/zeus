@@ -33,6 +33,9 @@ async fn durable_runtime_persists_tool_pair_final_message_and_usage() {
     migrate(&pool).await.expect("test database migrates");
 
     let capability_id = Uuid::now_v7();
+    let read_capability_id = Uuid::now_v7();
+    let work_item_id = Uuid::now_v7();
+    let other_work_item_id = Uuid::now_v7();
     let capability_registry_key = "test.echo".to_owned();
     let model_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -41,6 +44,8 @@ async fn durable_runtime_persists_tool_pair_final_message_and_usage() {
     let provider_state = Arc::new(FakeProviderState {
         request_count: AtomicUsize::new(0),
         model_tool_name: format!("cap_{}", capability_id.simple()),
+        read_tool_name: format!("cap_{}", read_capability_id.simple()),
+        other_work_item_id,
     });
     let model_server = tokio::spawn(async move {
         axum::serve(
@@ -204,6 +209,28 @@ async fn durable_runtime_persists_tool_pair_final_message_and_usage() {
     .await
     .expect("workspace capability inserts");
     sqlx::query(
+        "insert into capability_definitions (
+            id, organization_id, registry_key, display_name, description,
+            input_schema, output_schema, idempotency_mode, risk_level, executor_key
+         ) values ($1, $2, 'zeus.work-item-read', 'Current WorkItem', 'Read the linked WorkItem',
+                   '{}'::jsonb, '{}'::jsonb, 'supported', 'low', 'builtin.work_item_read')",
+    )
+    .bind(read_capability_id)
+    .bind(organization_id)
+    .execute(&pool)
+    .await
+    .expect("read capability inserts with deliberately permissive catalog schema");
+    sqlx::query(
+        "insert into workspace_capabilities (organization_id, workspace_id, capability_id)
+         values ($1, $2, $3)",
+    )
+    .bind(organization_id)
+    .bind(workspace_id)
+    .bind(read_capability_id)
+    .execute(&pool)
+    .await
+    .expect("read capability enables");
+    sqlx::query(
         "insert into agents (id, organization_id, workspace_id, name)
          values ($1, $2, $3, 'Runtime agent')",
     )
@@ -248,17 +275,30 @@ async fn durable_runtime_persists_tool_pair_final_message_and_usage() {
     .bind(workflow_id)
     .bind(agent_version_id)
     .bind(model_profile_id)
-    .bind(json!({ "allowed": [capability_registry_key] }))
+    .bind(json!({ "allowed": [capability_registry_key, "zeus.work-item-read"] }))
     .execute(&pool)
     .await
     .expect("workflow version inserts");
     sqlx::query(
-        "insert into sessions (id, organization_id, workspace_id, title)
-         values ($1, $2, $3, 'Runtime session')",
+        "insert into work_items (id, organization_id, workspace_id, title, description, input)
+         values ($1, $2, $3, 'Linked task', 'The current task', '{\"topic\":\"invoicing\"}'::jsonb),
+                ($4, $2, $3, 'Unrelated task', 'Must not reach the model', '{}'::jsonb)",
+    )
+    .bind(work_item_id)
+    .bind(organization_id)
+    .bind(workspace_id)
+    .bind(other_work_item_id)
+    .execute(&pool)
+    .await
+    .expect("linked and unrelated work items insert");
+    sqlx::query(
+        "insert into sessions (id, organization_id, workspace_id, title, work_item_id)
+         values ($1, $2, $3, 'Runtime session', $4)",
     )
     .bind(session_id)
     .bind(organization_id)
     .bind(workspace_id)
+    .bind(work_item_id)
     .execute(&pool)
     .await
     .expect("session inserts");
@@ -356,7 +396,37 @@ async fn durable_runtime_persists_tool_pair_final_message_and_usage() {
     assert_eq!(assistant_count, 1);
     assert_eq!(usage, (8, 5, 2));
     assert_eq!(final_count, 1);
-    assert_eq!(tool_pair, (1, 1, 1));
+    assert_eq!(tool_pair, (3, 3, 1));
+    let read_result: serde_json::Value = sqlx::query_scalar(
+        "select payload -> 'result' from session_events
+         where run_id = $1 and event_type = 'tool_result'
+           and payload -> 'result' ->> 'title' = 'Linked task'",
+    )
+    .bind(run_id)
+    .fetch_one(&pool)
+    .await
+    .expect("current work item reaches the persistent tool result");
+    assert_eq!(read_result["id"], work_item_id.to_string());
+    assert_eq!(read_result["input"]["topic"], "invoicing");
+    let denied: i64 = sqlx::query_scalar(
+        "select count(*) from tool_calls
+         where run_id = $1 and error_code = 'capability_input_schema_violation'",
+    )
+    .bind(run_id)
+    .fetch_one(&pool)
+    .await
+    .expect("arbitrary work item selection is rejected");
+    assert_eq!(denied, 1);
+    let leaked: bool = sqlx::query_scalar(
+        "select exists(select 1 from session_events
+         where run_id = $1 and event_type = 'tool_result'
+           and payload::text like '%Must not reach the model%')",
+    )
+    .bind(run_id)
+    .fetch_one(&pool)
+    .await
+    .expect("unrelated content remains absent");
+    assert!(!leaked);
 
     model_server.abort();
 }
@@ -364,6 +434,8 @@ async fn durable_runtime_persists_tool_pair_final_message_and_usage() {
 struct FakeProviderState {
     request_count: AtomicUsize,
     model_tool_name: String,
+    read_tool_name: String,
+    other_work_item_id: Uuid,
 }
 
 async fn fake_completion(
@@ -382,6 +454,17 @@ async fn fake_completion(
                         "function": {
                             "name": state.model_tool_name,
                             "arguments": "{\"message\":\"hello\"}",
+                        },
+                    }, {
+                        "index": 1,
+                        "id": "call_read_work_item",
+                        "function": { "name": state.read_tool_name, "arguments": "{}" },
+                    }, {
+                        "index": 2,
+                        "id": "call_read_unrelated",
+                        "function": {
+                            "name": state.read_tool_name,
+                            "arguments": json!({ "work_item_id": state.other_work_item_id }).to_string(),
                         },
                     }],
                 },
