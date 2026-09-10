@@ -1,0 +1,139 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, 'codex/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Rust, Web and OpenAPI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RUST_TEST_THREADS: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.18.0'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: pnpm check
+      - run: pnpm test
+      - run: pnpm build
+      - name: Check generated API contract
+        run: |
+          cargo run --locked --quiet -p zeus-api -- openapi > "$RUNNER_TEMP/zeus.v1.yaml"
+          cmp openapi/zeus.v1.yaml "$RUNNER_TEMP/zeus.v1.yaml"
+          git diff --exit-code -- apps/web/src/lib/api/generated/schema.d.ts
+
+  postgres:
+    name: PostgreSQL isolation and upgrade
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:18.6
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      ZEUS_TEST_DATABASE_URL: postgres://postgres@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.18.0'
+      - run: node scripts/db/test-postgres.mjs
+
+  images:
+    name: Production images and browser flow
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.18.0'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: docker build --file deploy/container/zeus-api.Containerfile --tag zeus-api:ci .
+      - run: docker build --file deploy/container/web.Containerfile --tag zeus-web:ci .
+      - name: Start isolated acceptance stack
+        shell: bash
+        run: |
+          scripts/container e2e init-env
+          set -a
+          source .zeus/e2e.env
+          set +a
+          docker network create zeus-ci >/dev/null
+          docker run -d --name zeus-ci-postgres --network zeus-ci \
+            -e POSTGRES_HOST_AUTH_METHOD=trust postgres:18.6 >/dev/null
+          for attempt in {1..60}; do
+            if docker exec zeus-ci-postgres pg_isready -U postgres >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          docker exec -i zeus-ci-postgres psql -U postgres --no-psqlrc --set ON_ERROR_STOP=1 \
+            < scripts/db/bootstrap-roles.sql >/dev/null
+          export DATABASE_URL=postgres://postgres@zeus-ci-postgres:5432/postgres
+          export RUNTIME_DATABASE_URL="$DATABASE_URL"
+          docker run --rm --network zeus-ci -e DATABASE_URL -e RUNTIME_DATABASE_URL zeus-api:ci db migrate
+          docker run -d --name zeus-ci-mailpit --network zeus-ci \
+            -e MP_WEBROOT=/mailpit/ axllent/mailpit:v1.30.0 >/dev/null
+          docker run -d --name zeus-ci-openai --network zeus-ci \
+            -v "$PWD/scripts/e2e/fake-openai.mjs:/app/fake-openai.mjs:ro" \
+            node:24.18.0-bookworm-slim node /app/fake-openai.mjs >/dev/null
+          export ZEUS_BIND_ADDRESS=0.0.0.0:8080
+          export ZEUS_SMTP_URL=smtp://zeus-ci-mailpit:1025
+          export ZEUS_MAIL_FROM=noreply@zeus.local
+          docker run -d --name zeus-ci-api --network zeus-ci \
+            -e DATABASE_URL -e RUNTIME_DATABASE_URL -e ZEUS_BIND_ADDRESS \
+            -e ZEUS_PUBLIC_URL -e ZEUS_COOKIE_SECURE -e ZEUS_RUN_CONCURRENCY \
+            -e ZEUS_SUPERVISOR_ENABLED -e ZEUS_LOCAL_MASTER_KEY -e ZEUS_ENVELOPE_KEY_ID \
+            -e ZEUS_BOOTSTRAP_TOKEN -e ZEUS_SMTP_URL -e ZEUS_MAIL_FROM \
+            -e ZEUS_TRUST_PROXY_HEADERS -e ZEUS_IDENTITY_MAINTENANCE_ENABLED \
+            -e ZEUS_ALLOW_PRIVATE_MODEL_ENDPOINTS zeus-api:ci >/dev/null
+          docker run -d --name zeus-ci-web --network zeus-ci \
+            -e ZEUS_API_URL=http://zeus-ci-api:8080 -e HOST=0.0.0.0 -e PORT=3000 \
+            -e ORIGIN=http://127.0.0.1:3100 zeus-web:ci >/dev/null
+          mkdir -p "$RUNNER_TEMP/zeus-gateway"
+          cp deploy/container/Caddyfile.local "$RUNNER_TEMP/zeus-gateway/Caddyfile"
+          docker build --file deploy/container/gateway.local.Containerfile \
+            --tag zeus-gateway:ci "$RUNNER_TEMP/zeus-gateway"
+          docker run -d --name zeus-ci-gateway --network zeus-ci -p 127.0.0.1:3100:3000 \
+            -e ZEUS_API_UPSTREAM=zeus-ci-api:8080 -e ZEUS_WEB_UPSTREAM=zeus-ci-web:3000 \
+            -e ZEUS_MAILPIT_UPSTREAM=zeus-ci-mailpit:8025 zeus-gateway:ci >/dev/null
+          for attempt in {1..90}; do
+            if curl --silent --fail http://127.0.0.1:3100/health/ready >/dev/null; then break; fi
+            sleep 1
+          done
+          curl --silent --fail http://127.0.0.1:3100/health/ready >/dev/null
+          node --input-type=module -e "import { setEnvironmentValue } from './scripts/e2e/work-item.mjs'; await setEnvironmentValue('ZEUS_E2E_MODEL_BASE_URL', 'http://zeus-ci-openai:4010/v1');"
+      - run: pnpm e2e:seed
+      - run: pnpm e2e:run
+      - run: pnpm test:browser
+      - name: Remove acceptance stack
+        if: always()
+        run: |
+          docker rm -f zeus-ci-gateway zeus-ci-web zeus-ci-api zeus-ci-openai zeus-ci-mailpit zeus-ci-postgres || true
+          docker network rm zeus-ci || true

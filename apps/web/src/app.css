@@ -1,0 +1,17 @@
+@import '@zeus/ui/styles.css';
+
+html {
+  color-scheme: dark;
+  background: var(--background);
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+}
+
+button,
+a {
+  -webkit-tap-highlight-color: transparent;
+}

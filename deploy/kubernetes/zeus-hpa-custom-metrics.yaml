@@ -1,0 +1,67 @@
+# Optional overlay for the CPU-only HPA in zeus.yaml.
+# Apply only after both custom.metrics.k8s.io and external.metrics.k8s.io are
+# served by an approved adapter and all three metric series are populated.
+# This keeps one HPA per Deployment; do not install a second HPA for zeus-api.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: zeus-api
+  namespace: zeus
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: zeus-api
+  minReplicas: 7
+  maxReplicas: 30
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 60
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    # Per-pod HTTP pressure. The metrics scraper and adapter must retain the
+    # target Pod identity when mapping this series.
+    - type: Pods
+      pods:
+        metric:
+          name: zeus_http_inflight_requests
+        target:
+          type: AverageValue
+          averageValue: "50"
+    # Per-pod active run count. The adapter must expose this name from the
+    # zeus-api Prometheus series for each pod. Confirm the adapter mapping and
+    # populated series before applying this overlay.
+    - type: Pods
+      pods:
+        metric:
+          name: zeus_active_runs
+        target:
+          type: AverageValue
+          averageValue: "20"
+    # Queue depth is a namespace-wide value, not a per-pod average.
+    - type: External
+      external:
+        metric:
+          name: zeus_queue_depth
+          selector:
+            matchLabels:
+              namespace: zeus
+              deployment: zeus-api
+        target:
+          type: Value
+          value: "100"

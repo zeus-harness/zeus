@@ -1,0 +1,110 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 900" role="img" aria-labelledby="title desc">
+  <title id="title">Run 时间线与审批线框图</title>
+  <desc id="desc">灰度桌面线框：Run 状态、append-only 事件时间线、SSE 状态和审批请求面板。</desc>
+  <!-- Visual direction: existing Inter Variable font, neutral token palette, Lucide line icons. -->
+  <style>
+    text { font-family: "Inter Variable", Inter, ui-sans-serif, system-ui, sans-serif; fill: #171717; }
+    .muted { fill: #737373; }
+    .small { font-size: 12px; }
+    .body { font-size: 14px; }
+    .label { font-size: 13px; font-weight: 600; }
+    .title { font-size: 28px; font-weight: 650; letter-spacing: -0.02em; }
+    .section { font-size: 16px; font-weight: 650; }
+    .hairline { stroke: #e5e5e5; stroke-width: 1; }
+    .timeline { stroke: #a3a3a3; stroke-width: 2; }
+    .icon { fill: none; stroke: #525252; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  </style>
+  <defs>
+    <symbol id="play" viewBox="0 0 24 24"><path class="icon" d="m9 5 10 7-10 7z"/></symbol>
+    <symbol id="check" viewBox="0 0 24 24"><path class="icon" d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="clock" viewBox="0 0 24 24"><circle class="icon" cx="12" cy="12" r="8"/><path class="icon" d="M12 8v5l3 2"/></symbol>
+    <symbol id="shield" viewBox="0 0 24 24"><path class="icon" d="M12 4 19 7v5c0 4-2.8 6.8-7 8-4.2-1.2-7-4-7-8V7z"/><path class="icon" d="m9 12 2 2 4-4"/></symbol>
+    <symbol id="arrow" viewBox="0 0 24 24"><path class="icon" d="M5 12h14M13 6l6 6-6 6"/></symbol>
+    <symbol id="x" viewBox="0 0 24 24"><path class="icon" d="m6 6 12 12M18 6 6 18"/></symbol>
+  </defs>
+
+  <rect width="1440" height="900" fill="#fafafa"/>
+  <rect width="1440" height="72" fill="#ffffff"/>
+  <path class="hairline" d="M0 72h1440"/>
+  <text x="32" y="31" class="label">Zeus</text>
+  <text x="32" y="51" class="small muted">Workspace</text>
+  <path class="hairline" d="M148 22v28"/>
+  <text x="180" y="42" class="body muted">概览</text>
+  <text x="246" y="42" class="body muted">WorkItems</text>
+  <text x="350" y="42" class="body">Runs</text>
+  <text x="412" y="42" class="body muted">Approvals</text>
+  <text x="522" y="42" class="body muted">Experience</text>
+  <rect x="1210" y="22" width="128" height="28" rx="6" fill="#f5f5f5" stroke="#d4d4d4"/>
+  <text x="1226" y="40" class="small">Workspace 7f2a…</text>
+  <text x="1360" y="42" class="body muted">林珊</text>
+
+  <text x="64" y="116" class="small muted">WorkItems / WI-0142 / Run run_8a6e</text>
+  <text x="64" y="163" class="title">Run 时间线</text>
+  <text x="64" y="192" class="body muted">供应商同步 · Workflow v3 · attempt 1</text>
+  <rect x="64" y="218" width="126" height="28" rx="14" fill="#f5f5f5" stroke="#a3a3a3"/>
+  <use href="#clock" x="76" y="224" width="16" height="16"/>
+  <text x="100" y="236" class="small">waiting_approval</text>
+  <rect x="1008" y="211" width="116" height="40" rx="7" fill="#ffffff" stroke="#d4d4d4"/>
+  <use href="#x" x="1022" y="223" width="16" height="16"/>
+  <text x="1046" y="237" class="body">取消 Run</text>
+  <rect x="1136" y="211" width="112" height="40" rx="7" fill="#ffffff" stroke="#d4d4d4"/>
+  <text x="1163" y="237" class="body">打开 WorkItem</text>
+
+  <rect x="64" y="282" width="864" height="548" rx="10" fill="#ffffff" stroke="#e5e5e5"/>
+  <text x="88" y="320" class="section">Timeline</text>
+  <text x="88" y="347" class="small muted">按 event sequence 展示持久化事件。</text>
+  <rect x="756" y="302" width="142" height="28" rx="14" fill="#f5f5f5" stroke="#d4d4d4"/>
+  <circle cx="774" cy="316" r="5" fill="#737373"/>
+  <text x="788" y="320" class="small">SSE connected</text>
+  <path class="timeline" d="M126 390v356"/>
+  <circle cx="126" cy="398" r="8" fill="#ffffff" stroke="#737373" stroke-width="2"/>
+  <text x="158" y="396" class="label">Run queued</text>
+  <text x="158" y="418" class="small muted">09:40:11 UTC · sequence 1</text>
+  <path class="hairline" d="M158 436h704"/>
+  <circle cx="126" cy="470" r="8" fill="#737373"/>
+  <use href="#play" x="118" y="462" width="16" height="16"/>
+  <text x="158" y="468" class="label">Agent turn started</text>
+  <text x="158" y="490" class="small muted">09:40:13 UTC · session event linked</text>
+  <path class="hairline" d="M158 508h704"/>
+  <circle cx="126" cy="548" r="8" fill="#ffffff" stroke="#737373" stroke-width="2"/>
+  <text x="158" y="546" class="label">Tool call · connection.lookup</text>
+  <text x="158" y="568" class="small muted">09:40:22 UTC · risk high · awaiting decision</text>
+  <rect x="158" y="586" width="704" height="106" rx="8" fill="#fafafa" stroke="#a3a3a3"/>
+  <use href="#shield" x="180" y="608" width="20" height="20"/>
+  <text x="214" y="622" class="label">Approval pending</text>
+  <text x="214" y="646" class="small muted">读取生产连接 · 过期时间 09:50 UTC</text>
+  <text x="214" y="668" class="small muted">输入已按权限脱敏，等待 Workspace operator。</text>
+  <rect x="694" y="610" width="72" height="30" rx="6" fill="#171717"/>
+  <use href="#check" x="704" y="617" width="16" height="16"/>
+  <text x="726" y="630" class="small" fill="#ffffff" style="fill:#ffffff">批准</text>
+  <rect x="776" y="610" width="72" height="30" rx="6" fill="#ffffff" stroke="#a3a3a3"/>
+  <text x="800" y="630" class="small">拒绝</text>
+  <circle cx="126" cy="756" r="8" fill="#ffffff" stroke="#d4d4d4" stroke-width="2"/>
+  <text x="158" y="754" class="label muted">Tool result / Run resumed</text>
+  <text x="158" y="776" class="small muted">等待审批后追加；当前尚未发生</text>
+
+  <rect x="952" y="282" width="424" height="548" rx="10" fill="#ffffff" stroke="#e5e5e5"/>
+  <text x="978" y="320" class="section">Approval 请求</text>
+  <rect x="1208" y="302" width="142" height="28" rx="14" fill="#f5f5f5" stroke="#d4d4d4"/>
+  <text x="1230" y="320" class="small">pending</text>
+  <path class="hairline" d="M978 348h372"/>
+  <text x="978" y="382" class="small muted">Capability</text>
+  <text x="978" y="407" class="body">connection.lookup</text>
+  <text x="978" y="444" class="small muted">请求原因</text>
+  <text x="978" y="469" class="body">读取供应商同步所需的生产连接。</text>
+  <text x="978" y="494" class="body">结果会写入当前 Run。</text>
+  <text x="978" y="531" class="small muted">输入摘要</text>
+  <rect x="978" y="546" width="372" height="64" rx="7" fill="#f5f5f5"/>
+  <text x="994" y="572" class="small" style="font-family:ui-monospace, SFMono-Regular, monospace">{ "connection": "prod-…" }</text>
+  <text x="978" y="648" class="small muted">决定人</text>
+  <text x="978" y="672" class="body">需要 Workspace operator</text>
+  <text x="978" y="709" class="small muted">过期时间</text>
+  <text x="978" y="733" class="body">2026-09-01 09:50 UTC</text>
+  <path class="hairline" d="M978 758h372"/>
+  <rect x="978" y="780" width="178" height="36" rx="7" fill="#171717"/>
+  <use href="#check" x="992" y="790" width="16" height="16"/>
+  <text x="1018" y="803" class="body" fill="#ffffff" style="fill:#ffffff">批准</text>
+  <rect x="1168" y="780" width="182" height="36" rx="7" fill="#ffffff" stroke="#a3a3a3"/>
+  <text x="1232" y="803" class="body">拒绝</text>
+  <text x="978" y="858" class="small muted">Last-Event-ID：evt_0142_03 · 自动续传</text>
+</svg>

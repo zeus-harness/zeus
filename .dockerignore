@@ -1,0 +1,14 @@
+.git
+.idea
+.zeus
+.env
+.env.*
+.cargo-home
+.pnpm-store
+.turbo
+node_modules
+target
+build
+.svelte-kit
+coverage
+*.log

@@ -1,0 +1,13 @@
+:3000 {
+	encode zstd gzip
+
+	redir /mailpit /mailpit/ 308
+	reverse_proxy /mailpit/* {$ZEUS_MAILPIT_UPSTREAM}
+	reverse_proxy /api/* {$ZEUS_API_UPSTREAM}
+	reverse_proxy /auth/* {$ZEUS_API_UPSTREAM}
+	reverse_proxy /oauth2/* {$ZEUS_API_UPSTREAM}
+	reverse_proxy /.well-known/* {$ZEUS_API_UPSTREAM}
+	reverse_proxy /health/* {$ZEUS_API_UPSTREAM}
+	reverse_proxy /metrics {$ZEUS_API_UPSTREAM}
+	reverse_proxy {$ZEUS_WEB_UPSTREAM}
+}
