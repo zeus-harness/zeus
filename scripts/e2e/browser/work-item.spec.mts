@@ -46,9 +46,9 @@ test('login, MFA, Workspace POST selection, WorkItem approval and live result', 
 
   await login(page);
   await page.goto('/workspaces');
-  await expect(page.getByRole('heading', { name: '选择 Workspace' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '选择工作空间' })).toBeVisible();
   await page.locator('form').filter({ has: page.locator(`input[value="${state.workspaceId}"]`) })
-    .getByRole('button', { name: '进入 Workspace' }).click();
+    .getByRole('button', { name: '进入工作空间' }).click();
   await expect(page).toHaveURL(new RegExp(`/${state.workspaceId}$`));
   expect(contextPosts).toBeGreaterThan(0);
 
@@ -59,7 +59,7 @@ test('login, MFA, Workspace POST selection, WorkItem approval and live result', 
   await page.getByLabel('描述', { exact: true }).fill('Verify the browser Agent approval flow.');
   await page.locator('form[action="?/create"]').getByRole('button', { name: /创建/ }).click();
   await expect(page.getByRole('heading', { name: title, exact: true })).toBeVisible();
-  await page.getByLabel('Workflow', { exact: true }).selectOption(state.workflowId);
+  await page.getByLabel('流程', { exact: true }).selectOption(state.workflowId);
   await page.getByLabel('给 Agent 的消息').fill('Run the approval fixture and report the result.');
   await page.getByRole('button', { name: '启动运行', exact: true }).click();
   await expect(page).toHaveURL(new RegExp(`/${state.workspaceId}/runs/`));
@@ -73,6 +73,41 @@ test('login, MFA, Workspace POST selection, WorkItem approval and live result', 
   await rawOutput.locator('summary').click();
   await expect(rawOutput.locator('pre')).toContainText('"content"');
   await rawOutput.locator('summary').click();
+
+  const originalRunUrl = page.url();
+  const originalRunId = new URL(originalRunUrl).pathname.split('/').at(-1)!;
+  await page.getByRole('link', { name: '返回关联 WorkItem', exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`/${state.workspaceId}/work-items/[0-9a-f-]+$`));
+  const workItemUrl = page.url();
+  await page.getByLabel('验收的运行', { exact: true }).selectOption(originalRunId);
+  await page.getByLabel('验收决定', { exact: true }).selectOption('needs_changes');
+  const changeReason = '请补充验收标准并保留原有事实。';
+  await page.getByLabel('验收原因', { exact: true }).fill(changeReason);
+  await page.getByRole('button', { name: '保存验收记录', exact: true }).click();
+  await expect(page.getByText('验收已保存。工作项状态保持不变，需要时请单独更新。')).toBeVisible();
+  const reprocess = page.getByRole('button', { name: '按此意见重新处理', exact: true });
+  await expect(reprocess).toHaveCount(1);
+  await reprocess.click();
+  await expect(page).toHaveURL(new RegExp(`/${state.workspaceId}/runs/`));
+  expect(page.url()).not.toBe(originalRunUrl);
+  const newRunId = new URL(page.url()).pathname.split('/').at(-1)!;
+  const basis = page.getByRole('region', { name: '重新处理依据' });
+  await expect(basis).toContainText(changeReason);
+  await expect(basis.getByRole('link', { name: '查看原运行与结果' })).toHaveAttribute('href', `/${state.workspaceId}/runs/${originalRunId}`);
+  await page.getByRole('button', { name: '批准', exact: true }).click();
+  await expect(page.getByText('succeeded', { exact: true }).first()).toBeVisible();
+  await expect(page.getByTestId('run-output-content')).toContainText('测试运行已完成');
+  await page.screenshot({ path: testInfo.outputPath('reprocessed-run.png') });
+  await page.goto(workItemUrl);
+  await page.getByLabel('验收的运行', { exact: true }).selectOption(newRunId);
+  await page.getByLabel('验收决定', { exact: true }).selectOption('accepted');
+  await page.getByLabel('验收原因', { exact: true }).fill('已核对新运行与修改意见的关联，确定性流程验收通过。');
+  await page.getByRole('button', { name: '保存验收记录', exact: true }).click();
+  await expect(page.getByText('验收已保存。工作项状态保持不变，需要时请单独更新。')).toBeVisible();
+  await expect(page.getByRole('link', { name: '查看本次验收的运行' })).toHaveCount(2);
+  await expect(page.getByRole('button', { name: '按此意见重新处理', exact: true })).toHaveCount(1);
+  await page.screenshot({ path: testInfo.outputPath('reprocessed-acceptance.png') });
+  await page.goto(`/${state.workspaceId}/runs/${newRunId}`);
 
   await checkResponsive(page, testInfo, 'run');
   expect(await page.locator('vite-error-overlay').count()).toBe(0);
@@ -140,8 +175,8 @@ test('configure a model, publish an Agent and Workflow, and read the linked Work
   await expect(page).toHaveURL(/capabilities\?saved=1/);
 
   await page.goto(`${base}/agents`);
-  await page.getByLabel('Agent 名称', { exact: true }).fill(agentName);
-  await page.getByRole('button', { name: '创建 Agent', exact: true }).click();
+  await page.getByLabel('智能体 名称', { exact: true }).fill(agentName);
+  await page.getByRole('button', { name: '创建 智能体', exact: true }).click();
   await expect(page).toHaveURL(/agents\?selected=/);
   await page.getByLabel('模型', { exact: true }).selectOption({ label: `${modelName} · zeus-e2e` });
   await expect(page.getByText('模型连接', { exact: true })).toHaveCount(0);
@@ -152,8 +187,8 @@ test('configure a model, publish an Agent and Workflow, and read the linked Work
   await checkResponsive(page, testInfo, 'agent-published');
 
   await page.goto(`${base}/workflows`);
-  await page.getByLabel('Workflow 名称', { exact: true }).fill(workflowName);
-  await page.getByRole('button', { name: '创建 Workflow', exact: true }).click();
+  await page.getByLabel('流程 名称', { exact: true }).fill(workflowName);
+  await page.getByRole('button', { name: '创建 流程', exact: true }).click();
   await expect(page).toHaveURL(/workflows\?selected=/);
   await page.getByLabel('已发布的 Agent', { exact: true }).selectOption({ label: agentName });
   await expect(page.getByLabel('模型配置', { exact: true })).toHaveCount(0);

@@ -1,3 +1,4 @@
+import { workItemListReturn } from '$lib/work-item-list-return';
 import { fail, redirect } from '@sveltejs/kit';
 import { env } from '$env/dynamic/private';
 import type { Actions, PageServerLoad } from './$types';
@@ -99,6 +100,13 @@ export const load: PageServerLoad = async ({ fetch, parent, request, params, url
   };
 };
 
+function detailReturn(event: Parameters<NonNullable<Actions['edit']>>[0], suffix = ''): string {
+  const url = new URL(`/${event.params.workspaceId}/work-items/${event.params.work_item_id}${suffix}`, event.url.origin);
+  const target = event.url.searchParams.get('list_return');
+  if (target) url.searchParams.set('list_return', workItemListReturn(target, event.params.workspaceId));
+  return url.pathname + url.search + url.hash;
+}
+
 export const actions: Actions = {
   reprocess: async (event) => {
     const context = await actionWorkspace(event);
@@ -143,7 +151,7 @@ export const actions: Actions = {
       const status = cause instanceof ZeusApiError ? cause.status : 502;
       return failure(status, status === 412 ? '工作项已被修改。你的输入已保留，请刷新核对最新内容后再编辑。' : status === 403 ? '当前会话无权编辑此工作项。' : '未能保存，请检查输入或稍后重试。');
     }
-    redirect(303, `/${event.params.workspaceId}/work-items/${event.params.work_item_id}?saved=1`);
+    redirect(303, detailReturn(event, '?saved=1'));
   },
   review: async (event) => {
     const context = await actionWorkspace(event);
@@ -162,7 +170,7 @@ export const actions: Actions = {
       const status = error instanceof ZeusApiError ? error.status : 502;
       return actionError(status, status === 412 ? '工作项已更新，请刷新并重新核对结果后提交。' : '验收未保存，请确认运行已成功、属于当前工作项且你有操作权限。');
     }
-    redirect(303, `/${event.params.workspaceId}/work-items/${event.params.work_item_id}?reviewed=1#acceptance`);
+    redirect(303, detailReturn(event, '?reviewed=1#acceptance'));
   },
   update: async (event) => {
     const context = await actionWorkspace(event);
@@ -192,7 +200,7 @@ export const actions: Actions = {
       const status = error instanceof ZeusApiError && error.status === 412 ? 412 : 502;
       return actionError(status, error instanceof Error ? error.message : 'WorkItem 更新失败。');
     }
-    redirect(303, `/${event.params.workspaceId}/work-items/${event.params.work_item_id}`);
+    redirect(303, detailReturn(event));
   },
   start: async (event) => {
     const context = await actionWorkspace(event);

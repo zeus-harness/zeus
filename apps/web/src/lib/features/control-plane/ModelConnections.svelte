@@ -1,4 +1,5 @@
 <script lang="ts">
+  import SetupJourney from './SetupJourney.svelte';
   import { enhance } from '$app/forms';
   let testingModel = $state<string | null>(null);
   import { page } from '$app/state';
@@ -28,20 +29,11 @@
 
 <main class="space-y-6 px-5 py-7 lg:px-8 lg:py-9">
   <PageHeader title={isConnection ? '模型供应商' : '模型目录'} eyebrow="Organization settings"
-    description={isConnection ? '创建 OpenAI-compatible 连接。密钥加密保存，仅用于服务端模型调用。' : '为模型指定连接、API 地址和模型 ID，同一供应商可添加多个模型，供组织内所有 Workspace 的 Agent 使用。'} />
+    description={isConnection ? '连接兼容 OpenAI API 的模型服务。先保存供应商密钥，再填写模型地址并检查连接。密钥加密保存。' : '为模型指定连接、API 地址和模型 ID，同一供应商可添加多个模型，供组织内所有工作空间的智能体使用。'} />
   {#if returnTo}<Button href={returnTo} variant="outline">返回原工作项继续处理</Button>{/if}
-  <nav class="flex flex-wrap gap-3 text-sm" aria-label="模型接入导航">
-    <a class="underline underline-offset-4" href={withTaskReturn(`${base}/settings/connections`, returnTo)}>模型供应商</a>
-    <a class="underline underline-offset-4" href={withTaskReturn(`${base}/settings/model-profiles`, returnTo)}>模型目录</a>
-  </nav>
-  {#if taskWorkspace && models.modelProfiles.length > 0}
-    <div class="flex flex-wrap gap-3 text-sm" aria-label="继续任务配置"><Button href={withTaskReturn(`/${taskWorkspace}/agents?template=requirements`, returnTo)} variant="outline">下一步：配置 Agent</Button><Button href={withTaskReturn(`/${taskWorkspace}/workflows`, returnTo)} variant="ghost">配置流程</Button></div>
-  {/if}
-  <ol class="flex flex-wrap gap-3 text-sm" aria-label="模型接入进度">
-    <li>1. 保存供应商密钥 · {models.connections.length ? '已配置' : '待配置'}</li>
-    <li>2. 配置地址与模型 · {models.modelProfiles.length ? '已配置' : '待配置'}</li>
-    <li>3. 测试模型连接</li>
-  </ol>
+  <SetupJourney {organizationId} workspaceId={taskWorkspace} current={resource} {returnTo} configured={[...(models.connections.length ? ['connections'] : []), ...(models.modelProfiles.length ? ['model-profiles'] : [])]} />
+  {#if isConnection && models.connections.length > 0}<Button href={withTaskReturn(`${base}/settings/model-profiles`, returnTo)}>继续：配置模型与检查连接</Button>{/if}
+  {#if !isConnection && taskWorkspace && models.modelProfiles.length > 0}<Button href={withTaskReturn(`/${taskWorkspace}/agents?template=requirements`, returnTo)}>连接检查完成后：配置智能体</Button>{/if}
   <p class="text-xs text-muted-foreground">保存配置不会发起模型调用，不代表密钥或模型已经通过连接验证。保存后可在模型卡片中单独测试连接；业务结果仍需通过实际任务验证。</p>
   {#if form?.type === 'error'}<p class="rounded-lg border border-destructive p-4 text-sm text-destructive" role="alert">{form.message}</p>{/if}
   {#if form?.type === 'success'}<p role="status" class="rounded-lg border border-border p-4 text-sm">{form.message}</p>{/if}
@@ -65,7 +57,7 @@
                 <NativeSelectOption value="" disabled>选择供应商</NativeSelectOption>
                 {#each models.connections as connection (connection.id)}<NativeSelectOption value={connection.id}>{connection.name}</NativeSelectOption>{/each}
               </NativeSelect></div>
-              <div class="space-y-2"><Label for="base_url">API Base URL</Label><Input id="base_url" name="base_url" type="url" required placeholder="https://api.example.com/v1" value={form?.values?.base_url ?? ''} /></div>
+              <div class="space-y-2"><Label for="base_url">模型服务地址</Label><Input id="base_url" name="base_url" type="url" required placeholder="https://api.example.com/v1" value={form?.values?.base_url ?? ''} /></div>
               <div class="space-y-2"><Label for="model">模型 ID</Label><Input id="model" name="model" required maxlength={160} value={form?.values?.model ?? ''} /></div>
               <div class="space-y-2"><Label for="timeout_seconds">单次请求超时（秒）</Label><Input id="timeout_seconds" name="timeout_seconds" type="number" min={1} max={300} value={60} required /></div>
             {/if}
@@ -120,7 +112,7 @@
                   <NativeSelect id={`connection-${model.id}`} name="connection_id" value={model.connection_id} required class="w-full">
                     {#each models.connections as connection (connection.id)}<NativeSelectOption value={connection.id}>{connection.name}</NativeSelectOption>{/each}
                   </NativeSelect>
-                  <Label for={`url-${model.id}`}>API Base URL</Label><Input id={`url-${model.id}`} name="base_url" type="url" value={model.base_url} required />
+                  <Label for={`url-${model.id}`}>模型服务地址</Label><Input id={`url-${model.id}`} name="base_url" type="url" value={model.base_url} required />
                   <Label for={`model-${model.id}`}>模型 ID</Label><Input id={`model-${model.id}`} name="model" value={model.model} required maxlength={256} />
                   <Label for={`timeout-${model.id}`}>单次请求超时（秒）</Label><Input id={`timeout-${model.id}`} name="timeout_seconds" type="number" min={1} max={300} value={model.configuration && typeof model.configuration === 'object' && !Array.isArray(model.configuration) && 'timeout_seconds' in model.configuration && typeof model.configuration.timeout_seconds === 'number' ? model.configuration.timeout_seconds : 60} required />
                   <p class="text-xs text-muted-foreground">影响引用此配置的新运行及后续恢复；其他模型参数会保留。需隔离影响时请创建新配置。</p>

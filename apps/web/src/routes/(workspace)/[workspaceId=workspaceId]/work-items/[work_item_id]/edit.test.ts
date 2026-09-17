@@ -6,9 +6,24 @@ vi.mock('$lib/server/workspace-context', () => ({ requireWorkspaceAction: async 
 type Event = Parameters<NonNullable<Actions['edit']>>[0];
 function event(status = 200) {
   const fetcher = vi.fn().mockResolvedValue(Response.json(status === 200 ? { id: 'item' } : { code: 'precondition_failed' }, { status }));
-  return { fetcher, event: { params: { workspaceId: 'workspace', work_item_id: 'item' }, fetch: fetcher, request: new Request('http://web.test', { method: 'POST', body: new URLSearchParams({ title: '新标题', description: '新描述', priority: 'high', assignee_user_id: '', revision: '3' }) }) } as unknown as Event };
+  return { fetcher, event: { url: new URL('http://web.test/workspace/work-items/item?/edit'), params: { workspaceId: 'workspace', work_item_id: 'item' }, fetch: fetcher, request: new Request('http://web.test', { method: 'POST', body: new URLSearchParams({ title: '新标题', description: '新描述', priority: 'high', assignee_user_id: '', revision: '3' }) }) } as unknown as Event };
 }
 describe('work item editing', () => {
+  it('preserves the safe list context after saving', async () => {
+    const input = event();
+    const target = '/workspace/work-items?view=created&q=客户&status=canceled&cursor=opaque';
+    input.event.url.searchParams.set('list_return', target);
+    try {
+      await actions.edit!(input.event);
+      expect.fail('expected redirect');
+    } catch (error) {
+      expect(error).toMatchObject({ status: 303 });
+      const location = new URL((error as { location: string }).location, 'http://web.test');
+      expect(location.searchParams.get('saved')).toBe('1');
+      expect(new URL(location.searchParams.get('list_return')!, 'http://web.test').searchParams.get('q')).toBe('客户');
+      expect(location.searchParams.get('list_return')).toContain('cursor=opaque');
+    }
+  });
   it('sends visible revision and explicitly clears the assignee without changing status', async () => {
     const input = event();
     await expect(actions.edit!(input.event)).rejects.toMatchObject({ status: 303 });

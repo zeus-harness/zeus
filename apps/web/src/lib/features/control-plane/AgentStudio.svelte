@@ -1,4 +1,5 @@
 <script lang="ts">
+  import SetupJourney from './SetupJourney.svelte';
   import { page } from '$app/state';
   import { taskReturnTo, withTaskReturn } from '$lib/task-return';
   let returnTo = $derived(taskReturnTo(page.url.searchParams.get('return_to')));
@@ -23,7 +24,7 @@
     form?: StudioFeedback | null;
   } = $props();
   let isAgent = $derived(resource === 'agents');
-  let label = $derived(isAgent ? 'Agent' : 'Workflow');
+  let label = $derived(isAgent ? '智能体' : '流程');
   let selected = $derived(studio.selected);
   let versions = $derived(isAgent ? studio.agentVersions : studio.workflowVersions);
   let publishedWorkflow = $derived(studio.workflowVersions.find((version) => version.id === selected?.active_version_id));
@@ -39,14 +40,11 @@
   <PageHeader title={isAgent ? '智能体（Agent）' : '流程（Workflow）'} eyebrow="Agent Studio"
     description={isAgent ? '选择组织提供的模型并编写指令，保存版本后发布。' : '选择 Agent 和工具；模型沿用 Agent 版本，保存版本后发布，即可从工作项启动。'} />
   {#if returnTo}<Button href={returnTo} variant="outline">返回原工作项继续处理</Button>{/if}
-  <nav class="flex flex-wrap gap-3 text-sm" aria-label="Agent 接入步骤">
-    {#if canManageOrganization}<a class="underline underline-offset-4" href={withTaskReturn(`/organizations/${organizationId}/settings/model-profiles`, returnTo)}>模型接入与检查</a>{/if}
-    <a class="underline underline-offset-4" href={withTaskReturn(`${base}/agents`, returnTo)}>1. Agent 与模型</a>
-    <a class="underline underline-offset-4" href={withTaskReturn(`${base}/workflows`, returnTo)}>2. 发布 Workflow</a>
-    <a class="underline underline-offset-4" href={withTaskReturn(`${base}/work-items`, returnTo)}>3. 运行工作项</a>
-  </nav>
+  <SetupJourney {organizationId} {workspaceId} current={resource} {returnTo} {canManageOrganization} configured={[...(studio.modelProfiles.length ? ['model-profiles'] : []), ...((isAgent ? studio.resources : studio.agents).some(agent => agent.active_version_id) ? ['agents'] : []), ...(!isAgent && studio.resources.some(workflow => workflow.active_version_id) ? ['workflows'] : [])]} />
+  {#if isAgent && studio.resources.some(agent => agent.active_version_id)}<Button href={withTaskReturn(`${base}/workflows`, returnTo)}>下一步：发布流程</Button>{/if}
+  {#if !isAgent && studio.resources.some(workflow => workflow.active_version_id)}<Button href={returnTo || `${base}/work-items`}>下一步：返回任务运行与验收</Button>{/if}
   {#if studio.modelProfiles.length === 0}
-    <div class="space-y-3 rounded-lg border border-border p-4"><p class="text-sm">当前最早的前置步骤：配置组织模型。完成模型连接检查后，再发布 Agent 和流程。可以先保存草稿。</p>{#if canManageOrganization}<Button href={withTaskReturn(`/organizations/${organizationId}/settings/model-profiles`, returnTo)} variant="outline">配置组织模型</Button>{:else}<p class="text-sm text-muted-foreground">请联系组织 Owner 配置模型。</p>{/if}</div>
+    <div class="space-y-3 rounded-lg border border-border p-4"><p class="text-sm">尚无可用模型。先接入模型供应商，再配置模型和检查连接；完成后沿上方步骤发布智能体与流程。</p>{#if canManageOrganization}<Button href={withTaskReturn(`/organizations/${organizationId}/settings/connections`, returnTo)} variant="outline">开始接入模型</Button>{:else}<p class="text-sm text-muted-foreground">请联系组织 Owner 配置模型。</p>{/if}</div>
   {:else if !isAgent && studio.agents.length === 0}
     <div class="space-y-3 rounded-lg border border-border p-4"><p class="text-sm">还没有已发布的 Agent，流程暂时无法运行。</p><Button href={withTaskReturn(`${base}/agents?template=requirements`, returnTo)} variant="outline">配置需求整理 Agent</Button></div>
   {/if}

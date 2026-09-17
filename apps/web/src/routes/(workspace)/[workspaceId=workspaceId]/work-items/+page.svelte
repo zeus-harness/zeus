@@ -1,4 +1,7 @@
 <script lang="ts">
+  import { beforeNavigate } from '$app/navigation';
+  import { enhance } from '$app/forms';
+  import { page } from '$app/state';
   import type { MemberOption } from '$lib/server/member-options';
   import { statusLabel } from '$lib/features/status-labels';
   import { Filter, Plus } from '@lucide/svelte';
@@ -28,6 +31,43 @@
     createOpenOverride ?? (data.openCreate || form?.type === 'error')
   );
 
+  let draft = $state<Record<string, string>>({});
+  let draftDirty = $state(false);
+  let submitting = $state(false);
+  let draftVersion = $state(0);
+  let feedbackDismissed = $state(false);
+  function captureDraft(event: Event) {
+    draft = Object.fromEntries(Array.from(new FormData(event.currentTarget as HTMLFormElement)).map(([key, value]) => [key, String(value)]));
+    draftDirty = true;
+  }
+  function changeCreateOpen(open: boolean) {
+    if (!open && draftDirty && !window.confirm('收起新建表单？本页会保留草稿，重新打开可继续填写。')) return;
+    createOpenOverride = open;
+  }
+  function discardDraft() {
+    if (draftDirty && !window.confirm('确定放弃这份未保存的草稿吗？')) return;
+    draft = {};
+    feedbackDismissed = true;
+    draftDirty = false;
+    draftVersion += 1;
+    createOpenOverride = false;
+  }
+  beforeNavigate((navigation) => {
+    if (submitting || !draftDirty) return;
+    if (!window.confirm('新建工作项尚未保存，离开后草稿会丢失。确定离开吗？')) { navigation.cancel(); return; }
+    draft = {};
+    draftDirty = false;
+    draftVersion += 1;
+    createOpenOverride = false;
+  });
+  function detailHref(id: string, layout: 'mobile' | 'desktop'): string {
+    const target = new URL(page.url);
+    target.searchParams.delete('create');
+    target.searchParams.delete('template');
+    target.hash = `${layout}-${id}`;
+    return `${workspaceBase}/work-items/${id}?list_return=${encodeURIComponent(target.pathname + target.search + target.hash)}`;
+  }
+
   function dateLabel(value: string): string {
     return new Intl.DateTimeFormat('zh-CN', {
       month: 'short',
@@ -54,6 +94,7 @@
   }
 </script>
 
+<svelte:window onbeforeunload={(event) => { if (draftDirty && !submitting) { event.preventDefault(); event.returnValue = ''; } }} />
 <svelte:head><title>Zeus · 工作项</title></svelte:head>
 
 <main class="px-5 py-7 lg:px-8 lg:py-9">
@@ -67,7 +108,7 @@
     {/snippet}
   </PageHeader>
 
-  {#if form?.type === 'error'}
+  {#if form?.type === 'error' && !feedbackDismissed}
     <div class="mt-5 rounded-xl border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive" role="alert">{form.message}</div>
   {/if}
 
@@ -100,16 +141,16 @@
       </Card.Header>
       <Card.Content class="pt-0">
         {#if items.length > 0}
-          <ul class="divide-y divide-border sm:hidden" aria-label="工作项列表">
+          <ul class="divide-y divide-border xl:hidden" aria-label="工作项列表">
             {#each items as item (item.id)}
               <li class="space-y-2 py-4">
-                <a class="block break-words font-medium underline-offset-4 hover:underline" href={`${workspaceBase}/work-items/${item.id}`}>{item.title}</a>
+                <a class="block scroll-mt-24 break-words font-medium underline-offset-4 hover:underline" id={`mobile-${item.id}`} href={detailHref(item.id, 'mobile')}>{item.title}</a>
                 <div class="flex flex-wrap items-center gap-2 text-sm"><Badge variant={statusVariant(item.status)}>{statusLabel(item.status)}</Badge><span>{statusLabel(item.priority)}</span><span>{data.members.find((member: MemberOption) => member.user_id === item.assignee_user_id)?.display_name || (item.assignee_user_id ? '已分配成员' : '未分配')}</span></div>
                 <p class="text-xs text-muted-foreground">更新于 {dateLabel(item.updated_at)}</p>
               </li>
             {/each}
           </ul>
-          <div class="hidden overflow-x-auto sm:block">
+          <div class="hidden overflow-x-auto xl:block">
             <Table.Root>
               <Table.Header>
                 <Table.Row><Table.Head>工作项</Table.Head><Table.Head>负责人</Table.Head><Table.Head>状态</Table.Head><Table.Head>优先级</Table.Head><Table.Head>更新时间</Table.Head></Table.Row>
@@ -118,7 +159,7 @@
                 {#each items as item (item.id)}
                   <Table.Row>
                     <Table.Cell class="min-w-72">
-                  <a class="font-medium hover:underline" href={`${workspaceBase}/work-items/${item.id}`}>{item.title}</a>
+                  <a class="font-medium hover:underline" id={`desktop-${item.id}`} href={detailHref(item.id, 'desktop')}>{item.title}</a>
                       {#if item.description}<p class="mt-1 max-w-xl truncate text-xs text-muted-foreground">{item.description}</p>{/if}
                     </Table.Cell>
                     <Table.Cell class="max-w-40 truncate text-xs text-muted-foreground">{data.members.find((member: MemberOption) => member.user_id === item.assignee_user_id)?.display_name || (item.assignee_user_id ? '已分配成员' : '未分配')}</Table.Cell>
@@ -145,38 +186,45 @@
   {/if}
 </main>
 
-<Sheet.Root open={createOpen} onOpenChange={(open) => (createOpenOverride = open)}>
+<Sheet.Root open={createOpen} onOpenChange={changeCreateOpen}>
   <Sheet.Content class="overflow-y-auto sm:max-w-xl">
     <Sheet.Header>
       <Sheet.Title>新建工作项</Sheet.Title>
-      <Sheet.Description>创建成功后进入详情页，再选择 Workflow 启动 Agent。</Sheet.Description>
+      <Sheet.Description>创建后进入任务详情，选择已发布流程处理任务。收起表单会保留本页草稿。</Sheet.Description>
     </Sheet.Header>
-    <form method="POST" action="?/create" class="space-y-5 px-4 pb-6">
-      <div class="space-y-2"><Label for="title">标题</Label><Input id="title" name="title" required maxlength={500} value={data.requirementsTemplate ? '需求整理示例' : ''} /></div>
-      <div class="space-y-2"><Label for="description">描述</Label><Textarea id="description" name="description" rows={5} maxlength={50000} value={data.requirementsTemplate ? '请整理以下需求中的已知事实、缺失信息和建议，结果由我确认。\n\n业务目标：\n使用者：\n当前问题：\n验收标准：' : ''} /></div>
+    {#key draftVersion}
+    <form method="POST" action="?/create" class="space-y-5 px-4 pb-6" oninput={captureDraft} onchange={captureDraft} use:enhance={() => {
+      submitting = true;
+      feedbackDismissed = false;
+      return async ({ update }) => { try { await update({ reset: false }); } finally { submitting = false; } };
+    }}>
+      <div class="space-y-2"><Label for="title">标题</Label><Input id="title" name="title" required maxlength={500} value={draft.title ?? (data.requirementsTemplate ? '需求整理示例' : '')} /></div>
+      <div class="space-y-2"><Label for="description">描述</Label><Textarea id="description" name="description" rows={5} maxlength={50000} value={draft.description ?? (data.requirementsTemplate ? '请整理以下需求中的已知事实、缺失信息和建议，结果由我确认。\n\n业务目标：\n使用者：\n当前问题：\n验收标准：' : '')} /></div>
       <div class="grid gap-4 sm:grid-cols-2">
         <div class="space-y-2">
           <Label for="priority">优先级</Label>
-          <NativeSelect id="priority" name="priority" value="normal" class="w-full">
+          <NativeSelect id="priority" name="priority" value={draft.priority ?? 'normal'} class="w-full">
             <NativeSelectOption value="low">低</NativeSelectOption>
             <NativeSelectOption value="normal">普通</NativeSelectOption>
             <NativeSelectOption value="high">高</NativeSelectOption>
             <NativeSelectOption value="urgent">紧急</NativeSelectOption>
           </NativeSelect>
         </div>
-        <div class="space-y-2"><Label for="assignee_user_id">负责人</Label><MemberPicker id="assignee_user_id" members={data.members} limited={data.memberOptionsLimited} /></div>
+        <div class="space-y-2"><Label for="assignee_user_id">负责人</Label><MemberPicker id="assignee_user_id" value={draft.assignee_user_id ?? ''} members={data.members} limited={data.memberOptionsLimited} /></div>
       </div>
       {#if data.memberOptionsLimited}<p class="text-xs text-muted-foreground">成员选项受当前权限或列表范围限制。找不到成员时请联系工作空间 Owner。</p>{/if}
       <details class="space-y-4 rounded-lg border border-border p-4">
         <summary class="cursor-pointer text-sm font-medium">高级设置（外部来源与结构化输入）</summary>
       <div class="grid gap-4 sm:grid-cols-2">
-        <div class="space-y-2"><Label for="source_kind">来源类型</Label><Input id="source_kind" name="source_kind" placeholder="jira" /></div>
-        <div class="space-y-2"><Label for="external_reference">外部引用</Label><Input id="external_reference" name="external_reference" placeholder="PROJ-42" /></div>
+        <div class="space-y-2"><Label for="source_kind">来源类型</Label><Input id="source_kind" name="source_kind" value={draft.source_kind ?? ''} placeholder="jira" /></div>
+        <div class="space-y-2"><Label for="external_reference">外部引用</Label><Input id="external_reference" name="external_reference" value={draft.external_reference ?? ''} placeholder="PROJ-42" /></div>
       </div>
       <p class="text-xs text-muted-foreground">来源类型与外部引用需要同时填写，手动创建可全部留空。</p>
-      <div class="space-y-2"><Label for="input">结构化输入（JSON）</Label><Textarea id="input" name="input" rows={6} class="font-mono text-xs" value={'{}'} /></div>
+      <div class="space-y-2"><Label for="input">结构化输入（JSON）</Label><Textarea id="input" name="input" rows={6} class="font-mono text-xs" value={draft.input ?? '{}'} /></div>
       </details>
-      <Sheet.Footer><Button type="submit" class="w-full sm:w-auto">创建并打开</Button></Sheet.Footer>
+      {#if form?.type === 'error' && !feedbackDismissed}<p role="alert" class="text-sm text-destructive">{form.message}</p>{/if}
+      <Sheet.Footer><Button type="submit" disabled={submitting} class="w-full sm:w-auto">{submitting ? '正在创建…' : '创建并打开'}</Button><Button type="button" variant="outline" onclick={discardDraft}>放弃草稿</Button></Sheet.Footer>
     </form>
+    {/key}
   </Sheet.Content>
 </Sheet.Root>
