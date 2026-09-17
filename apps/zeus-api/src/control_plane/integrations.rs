@@ -24,9 +24,9 @@ pub use connection::{
     list_connection_secrets, list_connections, rotate_connection_secret, update_connection,
 };
 pub use model_profile::{
-    CreateModelProfileRequest, ModelProfilePageResponse, ModelProfileResponse,
-    UpdateModelProfileRequest, archive_model_profile, create_model_profile, get_model_profile,
-    list_model_profiles, update_model_profile,
+    CreateModelProfileRequest, ModelConnectionTestResponse, ModelProfilePageResponse,
+    ModelProfileResponse, UpdateModelProfileRequest, archive_model_profile, create_model_profile,
+    get_model_profile, list_model_profiles, test_model_connection, update_model_profile,
 };
 pub use schedule::{
     CreateScheduleRequest, SchedulePageResponse, ScheduleResponse, UpdateScheduleRequest,
@@ -57,6 +57,15 @@ use crate::{AppState, api_support::revision_etag, error::ApiError, oidc::validat
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/api/v1/organizations/{organization_id}/model-providers", get(list_connections).post(create_connection))
+        .route("/api/v1/organizations/{organization_id}/model-providers/{connection_id}", get(get_connection).patch(update_connection))
+        .route("/api/v1/organizations/{organization_id}/model-providers/{connection_id}/archive", post(archive_connection))
+        .route("/api/v1/organizations/{organization_id}/model-providers/{connection_id}/secrets", get(list_connection_secrets).post(create_connection_secret))
+        .route("/api/v1/organizations/{organization_id}/model-providers/{connection_id}/secrets/{secret_name}", post(create_named_connection_secret).put(rotate_connection_secret))
+        .route("/api/v1/organizations/{organization_id}/model-profiles", get(list_model_profiles).post(create_model_profile))
+        .route("/api/v1/organizations/{organization_id}/model-profiles/{model_profile_id}", get(get_model_profile).patch(update_model_profile))
+        .route("/api/v1/organizations/{organization_id}/model-profiles/{model_profile_id}/test", post(test_model_connection))
+        .route("/api/v1/organizations/{organization_id}/model-profiles/{model_profile_id}/archive", post(archive_model_profile))
         .route(
             "/api/v1/workspaces/{workspace_id}/connections",
             get(list_connections).post(create_connection),
@@ -79,15 +88,11 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/api/v1/workspaces/{workspace_id}/model-profiles",
-            get(list_model_profiles).post(create_model_profile),
+            get(list_model_profiles),
         )
         .route(
             "/api/v1/workspaces/{workspace_id}/model-profiles/{model_profile_id}",
-            get(get_model_profile).patch(update_model_profile),
-        )
-        .route(
-            "/api/v1/workspaces/{workspace_id}/model-profiles/{model_profile_id}/archive",
-            post(archive_model_profile),
+            get(get_model_profile),
         )
         .route(
             "/api/v1/organizations/{organization_id}/capability-definitions",
@@ -149,6 +154,59 @@ pub fn routes() -> Router<AppState> {
             "/api/v1/workspaces/{workspace_id}/webhook-endpoints/{endpoint_id}/disable",
             post(disable_webhook_endpoint),
         )
+}
+
+// The path is the router-selected OriginalUri; both branches validate the path ID.
+fn integration_scope(
+    auth: &crate::auth::AuthContext,
+    uri: &axum::http::Uri,
+    scope_id: Uuid,
+    write: bool,
+    model: bool,
+) -> Result<Option<Uuid>, ApiError> {
+    use zeus_core::Permission;
+    if uri.path().starts_with("/api/v1/organizations/") {
+        auth.require_organization(
+            scope_id,
+            if write {
+                Permission::ManageOrganization
+            } else {
+                Permission::ReadWorkspace
+            },
+        )?;
+        Ok(None)
+    } else {
+        if model && write {
+            return Err(ApiError::Forbidden);
+        }
+        auth.require_workspace(
+            scope_id,
+            if write {
+                Permission::ManageWorkspace
+            } else {
+                Permission::ReadWorkspace
+            },
+        )?;
+        Ok(if model { None } else { Some(scope_id) })
+    }
+}
+
+async fn ensure_active_model_connection(
+    transaction: &mut Transaction<'_, Postgres>,
+    organization_id: Uuid,
+    _workspace_id: Option<Uuid>,
+    connection_id: Uuid,
+) -> Result<(), ApiError> {
+    let exists: bool = sqlx::query_scalar(
+        "select exists(select 1 from connections where id = $1 and organization_id = $2 and workspace_id is null and archived_at is null)"
+    ).bind(connection_id).bind(organization_id).fetch_one(&mut **transaction).await?;
+    if exists {
+        Ok(())
+    } else {
+        Err(ApiError::Validation(
+            "model provider is outside the organization or unavailable".to_owned(),
+        ))
+    }
 }
 
 async fn ensure_active_connection(

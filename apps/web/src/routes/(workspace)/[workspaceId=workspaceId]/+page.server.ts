@@ -2,6 +2,7 @@ import { redirect } from '@sveltejs/kit';
 import { env } from '$env/dynamic/private';
 import type { PageServerLoad } from './$types';
 
+import { loadOnboarding } from '$lib/server/onboarding';
 import { loadSetupStatus } from '$lib/api/setup';
 import { loadWorkspaceData } from '$lib/api/client';
 import { listApprovals, listRuns } from '$lib/api/runs';
@@ -27,7 +28,7 @@ export const load: PageServerLoad = async ({ fetch, parent, params, request, url
     apiBaseUrl: env.ZEUS_API_URL,
     workspaceId: params.workspaceId
   };
-  const [myWorkItems, blockedWorkItems, approvals, recentRuns] = await Promise.all([
+  const [myWorkItems, blockedWorkItems, approvals, recentRuns, onboarding] = await Promise.all([
     loadWorkspaceData(apiFetch, workspaceContext, (workspaceFetch, workspaceId) =>
       listWorkItems(workspaceFetch, {
         ...requestOptions,
@@ -49,8 +50,9 @@ export const load: PageServerLoad = async ({ fetch, parent, params, request, url
     ),
     loadWorkspaceData(apiFetch, workspaceContext, (workspaceFetch, workspaceId) =>
       listRuns(workspaceFetch, { ...requestOptions, workspaceId, limit: 10 })
-    )
+    ),
+    loadOnboarding(apiFetch, requestOptions)
   ]);
 
-  return { myWorkItems, blockedWorkItems, approvals, recentRuns, workspaceId: params.workspaceId };
+  return { onboarding, myWorkItems, blockedWorkItems, approvals, recentRuns, workspaceId: params.workspaceId };
 };

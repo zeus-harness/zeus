@@ -700,8 +700,8 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     let connection = send(
         &app,
         Method::POST,
-        &format!("/api/v1/workspaces/{workspace_id}/connections"),
-        &token,
+        &format!("/api/v1/organizations/{organization_id}/model-providers"),
+        &organization_token,
         Some(json!({
             "name": "OpenAI compatible",
             "provider_kind": "openai_compatible",
@@ -718,8 +718,8 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     let profile = send(
         &app,
         Method::POST,
-        &format!("/api/v1/workspaces/{workspace_id}/model-profiles"),
-        &token,
+        &format!("/api/v1/organizations/{organization_id}/model-profiles"),
+        &organization_token,
         Some(json!({
             "connection_id": connection_id,
             "name": "Primary model",
@@ -733,6 +733,125 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     .await;
     let (_, profile) = expect_json(profile, StatusCode::CREATED).await;
     let model_profile_id = json_uuid(&profile, "id");
+    let diagnostic_url =
+        format!("/api/v1/organizations/{organization_id}/model-profiles/{model_profile_id}/test");
+    let denied = send(
+        &app,
+        Method::POST,
+        &diagnostic_url,
+        &token,
+        None,
+        &[("if-match", "\"revision-1\"")],
+    )
+    .await;
+    let _ = expect_json(denied, StatusCode::FORBIDDEN).await;
+    let outdated_response = send(
+        &app,
+        Method::POST,
+        &diagnostic_url,
+        &organization_token,
+        None,
+        &[("if-match", "\"revision-999\"")],
+    )
+    .await;
+    let _ = expect_json(outdated_response, StatusCode::PRECONDITION_FAILED).await;
+    // The provider is a loopback-only fixture; no real model or credential is used.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("fixture listener");
+    let fixture_url = format!(
+        "http://{}/v1",
+        listener.local_addr().expect("fixture address")
+    );
+    let fixture = Router::new().route(
+        "/v1/models",
+        axum::routing::get(|| async { axum::Json(json!({ "data": [{ "id": "test-model" }] })) }),
+    );
+    let fixture_task = tokio::spawn(async move {
+        axum::serve(listener, fixture)
+            .await
+            .expect("fixture server");
+    });
+    sqlx::query("update model_profiles set base_url=$1 where id=$2")
+        .bind(&fixture_url)
+        .bind(model_profile_id)
+        .execute(&owner_pool)
+        .await
+        .expect("test-only endpoint");
+    let tested = send(
+        &app,
+        Method::POST,
+        &diagnostic_url,
+        &organization_token,
+        None,
+        &[("if-match", "\"revision-1\"")],
+    )
+    .await;
+    let (_, tested) = expect_json(tested, StatusCode::OK).await;
+    assert_eq!(tested["success"], true);
+    assert_eq!(tested["code"], "ok");
+    assert!(tested.get("assistant_text").is_none());
+    assert!(!tested.to_string().contains("integration-test-only"));
+    fixture_task.abort();
+    sqlx::query("update model_profiles set base_url='https://models.example.test/v1' where id=$1")
+        .bind(model_profile_id)
+        .execute(&owner_pool)
+        .await
+        .expect("restore fixture endpoint");
+
+    // Organization ownership is independent of Workspace management scopes.
+    for endpoint in [
+        format!("/api/v1/organizations/{organization_id}/model-providers"),
+        format!("/api/v1/organizations/{organization_id}/model-profiles"),
+    ] {
+        let denied = send(&app, Method::POST, &endpoint, &token,
+            Some(json!({ "name": "Denied", "provider_kind": "openai_compatible", "connection_id": connection_id,
+                "base_url": "https://models.example.test/v1", "model": "test" })), &[]).await;
+        let _ = expect_json(denied, StatusCode::FORBIDDEN).await;
+    }
+    let second_profile = send(&app, Method::POST,
+        &format!("/api/v1/organizations/{organization_id}/model-profiles"), &organization_token,
+        Some(json!({ "connection_id": connection_id, "name": "Second model", "base_url": "https://models.example.test/v1", "model": "second-model" })), &[]).await;
+    let (_, second_profile) = expect_json(second_profile, StatusCode::CREATED).await;
+    let second_model_id = json_uuid(&second_profile, "id");
+    assert_eq!(second_profile["connection_id"], connection_id.to_string());
+    assert!(second_profile["workspace_id"].is_null());
+    for selected_workspace in [workspace_id, other_workspace_id] {
+        sqlx::query("update service_accounts set workspace_id = $1 where id = $2")
+            .bind(selected_workspace)
+            .bind(service_account_id)
+            .execute(&owner_pool)
+            .await
+            .expect("test account context");
+        let directory = send(
+            &app,
+            Method::GET,
+            &format!("/api/v1/workspaces/{selected_workspace}/model-profiles"),
+            &token,
+            None,
+            &[],
+        )
+        .await;
+        let (_, directory) = expect_json(directory, StatusCode::OK).await;
+        assert_eq!(directory["items"].as_array().expect("directory").len(), 2);
+    }
+    sqlx::query("update service_accounts set workspace_id = $1 where id = $2")
+        .bind(workspace_id)
+        .bind(service_account_id)
+        .execute(&owner_pool)
+        .await
+        .expect("restore test context");
+    let other_organization = Uuid::now_v7();
+    let cross_tenant = send(
+        &app,
+        Method::GET,
+        &format!("/api/v1/organizations/{other_organization}/model-profiles"),
+        &organization_token,
+        None,
+        &[],
+    )
+    .await;
+    let _ = expect_json(cross_tenant, StatusCode::FORBIDDEN).await;
 
     let capability = send(
         &app,
@@ -819,7 +938,7 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
         Method::POST,
         &format!("/api/v1/workspaces/{workspace_id}/agents/{agent_id}/versions"),
         &token,
-        Some(json!({ "instructions": "Reply briefly.", "configuration": {} })),
+        Some(json!({ "instructions": "Reply briefly.", "configuration": {}, "model_profile_id": model_profile_id })),
         &[],
     )
     .await;
@@ -838,6 +957,16 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     let (_, workflow) = expect_json(workflow, StatusCode::CREATED).await;
     let workflow_id = json_uuid(&workflow, "id");
 
+    let override_model = send(
+        &app,
+        Method::POST,
+        &format!("/api/v1/workspaces/{workspace_id}/workflows/{workflow_id}/versions"),
+        &token,
+        Some(json!({ "agent_version_id": agent_version_id, "model_profile_id": second_model_id })),
+        &[],
+    )
+    .await;
+    let _ = expect_json(override_model, StatusCode::UNPROCESSABLE_ENTITY).await;
     let workflow_version = send(
         &app,
         Method::POST,
@@ -845,7 +974,6 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
         &token,
         Some(json!({
             "agent_version_id": agent_version_id,
-            "model_profile_id": model_profile_id,
             "capability_policy": { "allowed": ["test.echo"] }
         })),
         &[],
@@ -881,6 +1009,64 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     .await;
     let (_, work_item) = expect_json(work_item, StatusCode::CREATED).await;
     let work_item_id = json_uuid(&work_item, "id");
+    let unassigned = send(
+        &app,
+        Method::GET,
+        &format!("/api/v1/workspaces/{workspace_id}/work-items?unassigned=true"),
+        &token,
+        None,
+        &[],
+    )
+    .await;
+    let (_, unassigned) = expect_json(unassigned, StatusCode::OK).await;
+    assert!(
+        unassigned["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .any(|item| item["id"] == work_item_id.to_string())
+    );
+    let not_created = send(
+        &app,
+        Method::GET,
+        &format!(
+            "/api/v1/workspaces/{workspace_id}/work-items?created_by={}",
+            Uuid::now_v7()
+        ),
+        &token,
+        None,
+        &[],
+    )
+    .await;
+    let (_, not_created) = expect_json(not_created, StatusCode::OK).await;
+    assert!(not_created["items"].as_array().expect("items").is_empty());
+
+    for (search, should_match) in [
+        ("CUSTOMER", true),
+        ("not-a-matching-title", false),
+        ("%25", false),
+    ] {
+        let response = send(
+            &app,
+            Method::GET,
+            &format!(
+                "/api/v1/workspaces/{workspace_id}/work-items?q={search}&unassigned=true&limit=1"
+            ),
+            &token,
+            None,
+            &[],
+        )
+        .await;
+        let (_, result) = expect_json(response, StatusCode::OK).await;
+        assert_eq!(
+            result["items"]
+                .as_array()
+                .expect("items")
+                .iter()
+                .any(|item| item["id"] == work_item_id.to_string()),
+            should_match
+        );
+    }
 
     let dormant_workflow = send(
         &app,
@@ -1053,6 +1239,284 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     .await;
     let (_, unrelated_approvals) = expect_json(unrelated_approvals, StatusCode::OK).await;
     assert_eq!(unrelated_approvals, json!([]));
+
+    // Human result acceptance is tenant-scoped, append-only, and revision protected.
+    let review_url = format!("/api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/reviews");
+    let review_body =
+        json!({"run_id": linked_run_id, "decision": "accepted", "reason": "Synthetic review"});
+    let service_review = send(
+        &app,
+        Method::POST,
+        &review_url,
+        &token,
+        Some(review_body.clone()),
+        &[("if-match", "\"revision-1\"")],
+    )
+    .await;
+    assert_eq!(service_review.status(), StatusCode::FORBIDDEN);
+    let running_review = send_user(
+        &app,
+        Method::POST,
+        &review_url,
+        &existing_session_token,
+        &existing_csrf_token,
+        Some(review_body),
+        &[("if-match", "\"revision-1\"")],
+    )
+    .await;
+    assert_eq!(running_review.status(), StatusCode::CONFLICT);
+    let review_run = Uuid::now_v7();
+    sqlx::query("insert into runs (id, organization_id, workspace_id, workflow_version_id, work_item_id, session_id, status, output, idempotency_key, finished_at)
+      select $1, organization_id, workspace_id, workflow_version_id, work_item_id, session_id, 'succeeded', '{\"content\":\"Synthetic result\"}'::jsonb, $2, now() from runs where id = $3")
+      .bind(review_run).bind(format!("review-{review_run}")).bind(linked_run_id).execute(&owner_pool).await.expect("completed review fixture");
+    let body = json!({"run_id": review_run, "decision": "accepted", "reason": "Facts checked"});
+    let accepted = send_user(
+        &app,
+        Method::POST,
+        &review_url,
+        &existing_session_token,
+        &existing_csrf_token,
+        Some(body.clone()),
+        &[("if-match", "\"revision-1\"")],
+    )
+    .await;
+    let (_, accepted) = expect_json(accepted, StatusCode::CREATED).await;
+    assert_eq!(accepted["run_id"], review_run.to_string());
+    assert_eq!(accepted["work_item_revision"], 1);
+    let duplicate = send_user(
+        &app,
+        Method::POST,
+        &review_url,
+        &existing_session_token,
+        &existing_csrf_token,
+        Some(body.clone()),
+        &[("if-match", "\"revision-1\"")],
+    )
+    .await;
+    assert_eq!(duplicate.status(), StatusCode::PRECONDITION_FAILED);
+    let invalid = send_user(
+        &app,
+        Method::POST,
+        &review_url,
+        &existing_session_token,
+        &existing_csrf_token,
+        Some(json!({"run_id":review_run,"decision":"accepted","reason":" "})),
+        &[("if-match", "\"revision-2\"")],
+    )
+    .await;
+    assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let other_item_review = send_user(
+        &app,
+        Method::POST,
+        &format!("/api/v1/workspaces/{workspace_id}/work-items/{unrelated_work_item_id}/reviews"),
+        &existing_session_token,
+        &existing_csrf_token,
+        Some(body.clone()),
+        &[("if-match", "\"revision-1\"")],
+    )
+    .await;
+    assert_eq!(other_item_review.status(), StatusCode::NOT_FOUND);
+    let cross_workspace = send_user(
+        &app,
+        Method::POST,
+        &format!("/api/v1/workspaces/{other_workspace_id}/work-items/{work_item_id}/reviews"),
+        &existing_session_token,
+        &existing_csrf_token,
+        Some(body),
+        &[("if-match", "\"revision-2\"")],
+    )
+    .await;
+    assert_ne!(cross_workspace.status(), StatusCode::CREATED);
+    let listed = send(&app, Method::GET, &review_url, &token, None, &[]).await;
+    let (_, listed) = expect_json(listed, StatusCode::OK).await;
+    assert_eq!(listed["items"].as_array().map(Vec::len), Some(1));
+    assert!(
+        sqlx::query("update work_item_reviews set reason = 'changed' where id = $1")
+            .bind(json_uuid(&accepted, "id"))
+            .execute(&owner_pool)
+            .await
+            .is_err()
+    );
+    let item_after = send(
+        &app,
+        Method::GET,
+        &format!("/api/v1/workspaces/{workspace_id}/work-items/{work_item_id}"),
+        &token,
+        None,
+        &[],
+    )
+    .await;
+    let (_, item_after) = expect_json(item_after, StatusCode::OK).await;
+    assert_eq!(item_after["status"], work_item["status"]);
+
+    // Reprocessing resolves immutable review data server-side and creates a separate Run.
+    let accepted_url = format!("{review_url}/{}/runs", json_uuid(&accepted, "id"));
+    let rejected = send_user(
+        &app,
+        Method::POST,
+        &accepted_url,
+        &existing_session_token,
+        &existing_csrf_token,
+        None,
+        &[
+            ("if-match", "\"revision-2\""),
+            ("idempotency-key", "accepted-reprocess"),
+        ],
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::CONFLICT);
+    let changes = send_user(&app, Method::POST, &review_url, &existing_session_token,
+        &existing_csrf_token, Some(json!({"run_id": review_run, "decision": "needs_changes", "reason": "Add missing acceptance criteria"})),
+        &[("if-match", "\"revision-2\"")]).await;
+    let (_, changes) = expect_json(changes, StatusCode::CREATED).await;
+    let reprocess_url = format!("{review_url}/{}/runs", json_uuid(&changes, "id"));
+    let outdated_reprocess = send_user(
+        &app,
+        Method::POST,
+        &reprocess_url,
+        &existing_session_token,
+        &existing_csrf_token,
+        None,
+        &[
+            ("if-match", "\"revision-2\""),
+            ("idempotency-key", "stale-reprocess"),
+        ],
+    )
+    .await;
+    assert_eq!(outdated_reprocess.status(), StatusCode::PRECONDITION_FAILED);
+    let service = send(
+        &app,
+        Method::POST,
+        &reprocess_url,
+        &token,
+        None,
+        &[
+            ("if-match", "\"revision-3\""),
+            ("idempotency-key", "service-reprocess"),
+        ],
+    )
+    .await;
+    assert_eq!(service.status(), StatusCode::FORBIDDEN);
+    let wrong_item_url = format!(
+        "/api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/reviews/{}/runs",
+        Uuid::now_v7()
+    );
+    let missing = send_user(
+        &app,
+        Method::POST,
+        &wrong_item_url,
+        &existing_session_token,
+        &existing_csrf_token,
+        None,
+        &[
+            ("if-match", "\"revision-3\""),
+            ("idempotency-key", "missing-reprocess"),
+        ],
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::CONFLICT);
+    let other_item_id = Uuid::now_v7();
+    sqlx::query("insert into work_items (id, organization_id, workspace_id, title) values ($1, $2, $3, 'Other synthetic item')")
+        .bind(other_item_id).bind(organization_id).bind(workspace_id).execute(&owner_pool).await.expect("other work item");
+    let other_item_url = format!(
+        "/api/v1/workspaces/{workspace_id}/work-items/{other_item_id}/reviews/{}/runs",
+        json_uuid(&changes, "id")
+    );
+    let other_item_attempt = send_user(
+        &app,
+        Method::POST,
+        &other_item_url,
+        &existing_session_token,
+        &existing_csrf_token,
+        None,
+        &[
+            ("if-match", "\"revision-1\""),
+            ("idempotency-key", "other-item-reprocess"),
+        ],
+    )
+    .await;
+    assert_eq!(other_item_attempt.status(), StatusCode::CONFLICT);
+    let other_workspace_url = format!(
+        "/api/v1/workspaces/{other_workspace_id}/work-items/{work_item_id}/reviews/{}/runs",
+        json_uuid(&changes, "id")
+    );
+    let other_workspace_attempt = send_user(
+        &app,
+        Method::POST,
+        &other_workspace_url,
+        &existing_session_token,
+        &existing_csrf_token,
+        None,
+        &[
+            ("if-match", "\"revision-3\""),
+            ("idempotency-key", "other-workspace-reprocess"),
+        ],
+    )
+    .await;
+    assert_ne!(other_workspace_attempt.status(), StatusCode::CREATED);
+    let new_run = send_user(
+        &app,
+        Method::POST,
+        &reprocess_url,
+        &existing_session_token,
+        &existing_csrf_token,
+        None,
+        &[
+            ("if-match", "\"revision-3\""),
+            ("idempotency-key", "review-reprocess"),
+        ],
+    )
+    .await;
+    let (_, new_run) = expect_json(new_run, StatusCode::CREATED).await;
+    assert_ne!(new_run["run"]["id"], review_run.to_string());
+    assert_eq!(
+        new_run["run"]["input"]["work_item"]["input"],
+        work_item["input"]
+    );
+    assert_eq!(
+        new_run["run"]["input"]["work_item"]["title"],
+        work_item["title"]
+    );
+    assert_ne!(new_run["session"]["id"], linked_session_id.to_string());
+    assert_eq!(
+        new_run["run"]["workflow_version_id"],
+        changes["workflow_version_id"]
+    );
+    assert_eq!(
+        new_run["run"]["input"]["reprocessing"]["review_id"],
+        changes["id"]
+    );
+    assert_eq!(
+        new_run["run"]["input"]["reprocessing"]["source_run_id"],
+        review_run.to_string()
+    );
+    assert_eq!(
+        new_run["run"]["input"]["reprocessing"]["work_item_revision"],
+        3
+    );
+    assert_eq!(
+        new_run["run"]["input"]["original_output"]["content"],
+        "Synthetic result"
+    );
+    let replay = send_user(
+        &app,
+        Method::POST,
+        &reprocess_url,
+        &existing_session_token,
+        &existing_csrf_token,
+        None,
+        &[
+            ("if-match", "\"revision-3\""),
+            ("idempotency-key", "review-reprocess"),
+        ],
+    )
+    .await;
+    let (_, replay) = expect_json(replay, StatusCode::CREATED).await;
+    assert_eq!(new_run["run"]["id"], replay["run"]["id"]);
+    let message: String = sqlx::query_scalar("select payload ->> 'content' from session_events where run_id = $1 and event_type = 'user_message'")
+        .bind(json_uuid(&new_run["run"], "id")).fetch_one(&owner_pool).await.expect("reprocessing message saved");
+    assert!(message.contains("Add missing acceptance criteria"));
+    assert!(message.contains("Synthetic result"));
 
     let schedule = send(
         &app,

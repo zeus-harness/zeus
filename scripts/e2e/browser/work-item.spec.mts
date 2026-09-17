@@ -1,5 +1,6 @@
 import { expect, test, type Locator, type Page, type TestInfo } from '@playwright/test';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { loadEnvironment, freshTotp, setEnvironmentValue } from '../work-item.mjs';
 
 async function fillSecret(locator: Locator, value: string) {
@@ -82,25 +83,57 @@ test('configure a model, publish an Agent and Workflow, and read the linked Work
   const state = JSON.parse(await readFile('.zeus/e2e-state.json', 'utf8'));
   const environment = await loadEnvironment();
   const base = `/${state.workspaceId}`;
+  const organizationBase = `/organizations/${state.organizationId}`;
   const suffix = Date.now();
   const agentName = `Review Agent ${suffix}`;
   const workflowName = `Review Workflow ${suffix}`;
   const modelName = `Review Model ${suffix}`;
+  const connectionName = `Review connection ${suffix}`;
   let issues = 0;
   page.on('console', (message) => { if (['warning', 'error'].includes(message.type())) issues += 1; });
   page.on('pageerror', () => { issues += 1; });
   await login(page);
 
-  await page.goto(`${base}/settings/connections`);
-  await page.getByLabel('连接名称', { exact: true }).fill(`Review connection ${suffix}`);
+  await page.goto(`${organizationBase}/settings`);
+  await page.getByRole('navigation', { name: 'Organization 设置导航' }).getByRole('link', { name: '模型供应商', exact: true }).click();
+  await page.getByLabel('供应商名称', { exact: true }).fill(connectionName);
   await fillSecret(page.getByLabel('API Key', { exact: true }), environment.ZEUS_E2E_MODEL_API_KEY);
-  await page.getByRole('button', { name: '保存连接', exact: true }).click();
+  await page.getByRole('button', { name: '保存供应商', exact: true }).click();
   await expect(page).toHaveURL(/settings\/model-profiles\?connection=/);
-  await page.getByLabel('配置名称', { exact: true }).fill(modelName);
-  await page.getByLabel('API Base URL', { exact: true }).fill(environment.ZEUS_E2E_MODEL_BASE_URL);
-  await page.getByLabel('模型 ID', { exact: true }).fill('zeus-e2e');
+  const modelCreationUrl = page.url();
+  await page.goto(`${organizationBase}/settings/connections`);
+  const connectionCard = page.locator('div.rounded-lg').filter({ has: page.getByText(connectionName, { exact: true }) });
+  await connectionCard.getByText('轮换 API Key', { exact: true }).click();
+  await fillSecret(connectionCard.getByLabel('新的 API Key', { exact: true }), randomUUID());
+  await connectionCard.getByRole('button', { name: '保存新密钥', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('连接密钥已更新');
+  await expect(connectionCard.locator('input[name="api_key"]')).toHaveValue('');
+  await checkResponsive(page, testInfo, 'connection-rotated');
+  await page.goto(modelCreationUrl);
+  const createModel = page.locator('form').filter({ has: page.locator('input[name="intent"][value="create"]') });
+  await createModel.getByLabel('配置名称', { exact: true }).fill(modelName);
+  await createModel.getByLabel('API Base URL', { exact: true }).fill(environment.ZEUS_E2E_MODEL_BASE_URL);
+  await createModel.getByLabel('模型 ID', { exact: true }).fill('zeus-e2e');
   await page.getByRole('button', { name: '保存模型配置', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('模型配置已保存');
+  const modelCard = page.locator('div.rounded-lg').filter({ has: page.getByText(modelName, { exact: true }) });
+  await modelCard.getByText('编辑模型配置', { exact: true }).click();
+  await modelCard.getByLabel('单次请求超时（秒）', { exact: true }).fill('45');
+  await modelCard.getByRole('button', { name: '保存修改', exact: true }).click();
+  await page.reload();
+  await modelCard.getByText('编辑模型配置', { exact: true }).click();
+  await expect(modelCard.getByLabel('单次请求超时（秒）', { exact: true })).toHaveValue('45');
+  await checkResponsive(page, testInfo, 'model-edited');
+
+  await page.goto(modelCreationUrl);
+  await createModel.getByLabel('配置名称', { exact: true }).fill(`${modelName} alternative`);
+  await createModel.getByLabel('API Base URL', { exact: true }).fill(environment.ZEUS_E2E_MODEL_BASE_URL);
+  await createModel.getByLabel('模型 ID', { exact: true }).fill('zeus-e2e-alternative');
+  await page.getByRole('button', { name: '保存模型配置', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('模型配置已保存');
+  await page.goto(`${organizationBase}/settings/connections`);
+  await expect(connectionCard).toContainText(`${modelName} · zeus-e2e`);
+  await expect(connectionCard).toContainText(`${modelName} alternative · zeus-e2e-alternative`);
 
   await page.goto(`${base}/settings/capabilities`);
   await page.getByRole('button', { name: '启用工作项读取', exact: true }).click();
@@ -110,6 +143,8 @@ test('configure a model, publish an Agent and Workflow, and read the linked Work
   await page.getByLabel('Agent 名称', { exact: true }).fill(agentName);
   await page.getByRole('button', { name: '创建 Agent', exact: true }).click();
   await expect(page).toHaveURL(/agents\?selected=/);
+  await page.getByLabel('模型', { exact: true }).selectOption({ label: `${modelName} · zeus-e2e` });
+  await expect(page.getByText('模型连接', { exact: true })).toHaveCount(0);
   await page.getByLabel('Agent 指令', { exact: true }).fill('Read the current WorkItem using the available tool, then provide a concise recommendation.');
   await page.getByRole('button', { name: '保存新版本', exact: true }).click();
   await page.getByRole('button', { name: '发布版本 1', exact: true }).click();
@@ -121,7 +156,7 @@ test('configure a model, publish an Agent and Workflow, and read the linked Work
   await page.getByRole('button', { name: '创建 Workflow', exact: true }).click();
   await expect(page).toHaveURL(/workflows\?selected=/);
   await page.getByLabel('已发布的 Agent', { exact: true }).selectOption({ label: agentName });
-  await page.getByLabel('模型配置', { exact: true }).selectOption({ label: `${modelName} · zeus-e2e` });
+  await expect(page.getByLabel('模型配置', { exact: true })).toHaveCount(0);
   await page.getByRole('checkbox', { name: /读取当前工作项/ }).check();
   await page.getByRole('button', { name: '保存新版本', exact: true }).click();
   await page.getByRole('button', { name: '发布版本 1', exact: true }).click();
@@ -142,5 +177,27 @@ test('configure a model, publish an Agent and Workflow, and read the linked Work
   await expect(page.getByText('succeeded', { exact: true }).first()).toBeVisible();
   await expect(page.getByText(`已读取工作项：${task}`, { exact: false }).first()).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath('agent-work-item-result.png') });
+  expect(issues).toBe(0);
+});
+
+test('failed and canceled pilot runs show recovery guidance', async ({ page }, testInfo) => {
+  const reports = (await readdir('.zeus')).filter((name) => /^pilot-report-\d+\.json$/u.test(name)).sort();
+  expect(reports.length).toBeGreaterThan(0);
+  const report = JSON.parse(await readFile(`.zeus/${reports.at(-1)}`, 'utf8'));
+  const state = JSON.parse(await readFile('.zeus/e2e-state.json', 'utf8'));
+  let issues = 0;
+  page.on('console', (message) => { if (['warning', 'error'].includes(message.type())) issues += 1; });
+  page.on('pageerror', () => { issues += 1; });
+  await login(page);
+  for (const id of ['timeout', 'canceled']) {
+    const entry = report.cases.find((item: { case_id: string }) => item.case_id === id);
+    expect(entry.passed).toBe(true);
+    await page.goto(`/${state.workspaceId}/runs/${entry.run_id}`);
+    await expect(page).toHaveTitle('Zeus · Run Trace');
+    await expect(page.getByRole('region', { name: '恢复指引' })).toContainText(id === 'timeout' ? '部分用量' : '原运行记录保留');
+    await expect(page.getByRole('button', { name: '创建重试 Run' })).toBeVisible();
+    await page.screenshot({ path: testInfo.outputPath(`recovery-${id}.png`) });
+  }
+  expect(await page.locator('vite-error-overlay').count()).toBe(0);
   expect(issues).toBe(0);
 });

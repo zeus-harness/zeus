@@ -41,6 +41,33 @@ function jsonResponse(status: number, body: unknown): Response {
 }
 
 describe('account security actions', () => {
+  it.each(['startTotp', 'confirmTotp', 'disableTotp'] as const)(
+    '%s explains expired recent authentication and offers reauthentication', async (action) => {
+      const { event } = actionEvent(
+        { code: '123456', password: 'PASSWORD_FOR_TEST' },
+        jsonResponse(403, { code: 'reauthentication_required' })
+      );
+      await expect(handler(actions[action])(event)).resolves.toMatchObject({
+        status: 403,
+        data: { type: 'error', reauthenticate: true, message: expect.stringContaining('10 分钟') }
+      });
+    }
+  );
+
+  it('distinguishes email verification from recent authentication', async () => {
+    const { event } = actionEvent({}, jsonResponse(403, { code: 'email_verification_required' }));
+    await expect(handler(actions.startTotp)(event)).resolves.toMatchObject({
+      status: 403, data: { message: '请先完成邮箱验证，再设置 TOTP。' }
+    });
+  });
+
+  it('does not expose unknown API error details', async () => {
+    const { event } = actionEvent({}, jsonResponse(403, { code: 'forbidden', detail: 'PRIVATE_DETAIL' }));
+    const result = await handler(actions.startTotp)(event);
+    expect(result).toMatchObject({ status: 403, data: { message: '当前账号暂时不满足 TOTP 操作条件。' } });
+    expect(JSON.stringify(result)).not.toContain('PRIVATE_DETAIL');
+  });
+
   it('validates the NFC Unicode code-point password length before calling the API', async () => {
     const { event, fetcher } = actionEvent(
       {
@@ -120,7 +147,7 @@ describe('account security actions', () => {
     await expect(handler(actions.startTotp)(event)).resolves.toEqual({
       type: 'totp_setup',
       secret: 'TEST_TOTP_SECRET',
-      provisioning_uri: 'otpauth://totp/Zeus:test?secret=TEST_TOTP_SECRET',
+      qr_data_url: expect.stringMatching(/^data:image\/png;base64,/),
       return_to: '/account/security'
     });
     expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({ code: null });

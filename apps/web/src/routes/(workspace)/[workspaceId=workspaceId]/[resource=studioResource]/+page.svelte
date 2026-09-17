@@ -19,7 +19,7 @@
 
 <SectionNav label="Agent Studio 导航" items={navigation} />
 {#if data.studio && (data.resource.slug === 'agents' || data.resource.slug === 'workflows')}
-  <AgentStudio studio={data.studio} resource={data.resource.slug} workspaceId={data.workspaceId} {form} />
+  <AgentStudio studio={data.studio} resource={data.resource.slug} workspaceId={data.workspaceId} organizationId={data.activeOrganization.organization_id} canManageOrganization={data.canManageOrganization} requirementsTemplate={data.requirementsTemplate ?? false} {form} />
 {:else if data.collection}
 <ResourceCollection
   resource={data.resource}

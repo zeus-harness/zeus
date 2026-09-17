@@ -2,6 +2,7 @@ FROM docker.io/library/node:24.18.0-bookworm-slim
 WORKDIR /app
 ENV NODE_ENV=production
 COPY fake-openai.mjs ./fake-openai.mjs
+COPY requirements-cases.mjs ./requirements-cases.mjs
 RUN chown node:node ./fake-openai.mjs && chmod 0444 ./fake-openai.mjs
 USER node
 EXPOSE 4010

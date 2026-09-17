@@ -135,7 +135,7 @@ async fn durable_runtime_persists_tool_pair_final_message_and_usage() {
     )
     .bind(connection_id)
     .bind(organization_id)
-    .bind(workspace_id)
+    .bind(Option::<Uuid>::None)
     .bind(json!({ "api_key_secret_name": "api_key" }))
     .execute(&pool)
     .await
@@ -156,7 +156,7 @@ async fn durable_runtime_persists_tool_pair_final_message_and_usage() {
          ) values ($1, $2, $3, 'api_key', $4, $5, $6)",
     )
     .bind(organization_id)
-    .bind(workspace_id)
+    .bind(Option::<Uuid>::None)
     .bind(connection_id)
     .bind(sealed.ciphertext)
     .bind(sealed.nonce)
@@ -172,7 +172,7 @@ async fn durable_runtime_persists_tool_pair_final_message_and_usage() {
     )
     .bind(model_profile_id)
     .bind(organization_id)
-    .bind(workspace_id)
+    .bind(Option::<Uuid>::None)
     .bind(connection_id)
     .bind(format!("http://{model_address}/v1"))
     .bind(json!({ "timeout_seconds": 5 }))

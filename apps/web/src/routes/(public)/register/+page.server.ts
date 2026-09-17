@@ -20,11 +20,10 @@ function actionError(status: number, message: string, values: RegistrationValues
   return fail(status, { type: 'error' as const, message, values });
 }
 
-export const load: PageServerLoad = ({ url }) => ({
-  invitationPresent: Boolean(
-    urlToken(url, 'invitation_token') ?? urlToken(url, 'invite_token') ?? urlToken(url, 'token')
-  )
-});
+export const load: PageServerLoad = ({ url }) => {
+  const token = urlToken(url, 'invitation_token') ?? urlToken(url, 'invite_token') ?? urlToken(url, 'token');
+  return { invitationPresent: Boolean(token), joinHref: token ? `/join?token=${encodeURIComponent(token)}` : null };
+};
 
 export const actions: Actions = {
   default: async (event) => {
@@ -69,6 +68,8 @@ export const actions: Actions = {
       return actionError(503, '注册服务暂时不可用，请稍后重试。', values);
     }
 
+    if (response.status === 429) return actionError(429, '请求过于频繁，请稍后重试。', values);
+    if (!response.ok) return actionError(response.status, '注册请求未通过校验，请检查邮箱、显示名称和密码要求。', values);
     return { type: 'success' as const, message: GENERIC_IDENTITY_MESSAGE, values };
   }
 };

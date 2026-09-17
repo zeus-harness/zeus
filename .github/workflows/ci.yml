@@ -100,8 +100,9 @@ jobs:
           docker run --rm --network zeus-ci -e DATABASE_URL -e RUNTIME_DATABASE_URL zeus-api:ci db migrate
           docker run -d --name zeus-ci-mailpit --network zeus-ci \
             -e MP_WEBROOT=/mailpit/ axllent/mailpit:v1.30.0 >/dev/null
-          docker run -d --name zeus-ci-openai --network zeus-ci \
+          docker run -d --name zeus-ci-openai --network zeus-ci -p 127.0.0.1:4010:4010 \
             -v "$PWD/scripts/e2e/fake-openai.mjs:/app/fake-openai.mjs:ro" \
+            -v "$PWD/scripts/e2e/requirements-cases.mjs:/app/requirements-cases.mjs:ro" \
             node:24.18.0-bookworm-slim node /app/fake-openai.mjs >/dev/null
           export ZEUS_BIND_ADDRESS=0.0.0.0:8080
           export ZEUS_SMTP_URL=smtp://zeus-ci-mailpit:1025
@@ -131,6 +132,7 @@ jobs:
           node --input-type=module -e "import { setEnvironmentValue } from './scripts/e2e/work-item.mjs'; await setEnvironmentValue('ZEUS_E2E_MODEL_BASE_URL', 'http://zeus-ci-openai:4010/v1');"
       - run: pnpm e2e:seed
       - run: pnpm e2e:run
+      - run: pnpm e2e:pilot
       - run: pnpm test:browser
       - name: Remove acceptance stack
         if: always()

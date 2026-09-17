@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { statusLabel } from '$lib/features/status-labels';
   import { ArrowLeft, RefreshCcw } from '@lucide/svelte';
 
   import { Badge } from '@zeus/ui/components/ui/badge';
@@ -48,14 +49,14 @@
   </a>
   <PageHeader eyebrow="Control plane" title={resource.label} description={resource.description}>
     {#snippet actions()}
-      <Badge variant={collection.status === 'ready' ? 'secondary' : 'outline'}>{collection.status}</Badge>
+      <Badge variant={collection.status === 'ready' ? 'secondary' : 'outline'}>{statusLabel(collection.status)}</Badge>
       <Button href={refreshHref} variant="outline" size="sm"><RefreshCcw class="size-4" />刷新</Button>
     {/snippet}
   </PageHeader>
 
   {#if collection.status === 'ready' && collection.records.length > 0}
     <Card.Root class="mt-7">
-      <Card.Header><Card.Title>当前记录</Card.Title><Card.Description>{collection.records.length} records</Card.Description></Card.Header>
+      <Card.Header><Card.Title>当前记录</Card.Title><Card.Description>{collection.records.length} 条记录</Card.Description></Card.Header>
       <Card.Content class="overflow-x-auto">
         <Table.Root class="min-w-[42rem]">
           <Table.Header><Table.Row>{#each resource.columns as column (column.key)}<Table.Head>{column.label}</Table.Head>{/each}</Table.Row></Table.Header>
@@ -72,8 +73,10 @@
       <Card.Content class="py-10">
         <EmptyState
           title={collection.status === 'ready' ? `暂无 ${resource.label}` : '暂时无法加载'}
-          description={collection.status === 'ready' ? '当前 Workspace 还没有记录。' : collection.message ?? '请求失败。'}
-        />
+          description={collection.status === 'ready' ? (backHref.startsWith('/organizations/') ? '当前组织还没有此类记录。请返回组织设置查看配置入口。' : '当前工作空间还没有此类记录。请返回工作台查看准备步骤。') : collection.message ?? '请求失败。'}
+        >
+          {#snippet action()}<Button href={collection.status === 'ready' ? backHref : refreshHref} variant="outline">{collection.status === 'ready' ? '查看配置指引' : '重试加载'}</Button>{/snippet}
+        </EmptyState>
       </Card.Content>
     </Card.Root>
   {/if}

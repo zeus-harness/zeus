@@ -1,6 +1,5 @@
 <script lang="ts">
   import ResourceCollection from '$lib/features/control-plane/ResourceCollection.svelte';
-  import ModelConnections from '$lib/features/control-plane/ModelConnections.svelte';
   import { Button } from '@zeus/ui/components/ui/button';
   import * as Card from '@zeus/ui/components/ui/card';
   import type { ActionData, PageData } from './$types';
@@ -10,9 +9,7 @@
 
 <svelte:head><title>Zeus · {data.resource.label}</title></svelte:head>
 
-{#if data.models && (data.resource.slug === 'connections' || data.resource.slug === 'model-profiles')}
-  <ModelConnections models={data.models} resource={data.resource.slug} workspaceId={data.workspaceId} selectedConnection={data.selectedConnection} saved={data.saved} {form} />
-{:else if data.collection}
+{#if data.collection}
 {#if data.resource.slug === 'capabilities'}
   <section class="px-5 pt-7 lg:px-8">
     <Card.Root>

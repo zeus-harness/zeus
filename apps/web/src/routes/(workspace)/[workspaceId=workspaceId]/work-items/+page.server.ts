@@ -9,6 +9,7 @@ import {
 } from '$lib/api/work-items';
 import { loadWorkspaceData } from '$lib/api/client';
 import { serverApiFetcher } from '$lib/api/server';
+import { loadMemberOptions } from '$lib/server/member-options';
 import { requireWorkspaceAction } from '$lib/server/workspace-context';
 
 function formValue(formData: FormData, name: string): string {
@@ -36,10 +37,12 @@ async function actionWorkspace(event: Parameters<NonNullable<Actions['create']>>
 }
 
 export const load: PageServerLoad = async ({ fetch, parent, params, request, url }) => {
-  const { status: authStatus } = await parent();
+  const { status: authStatus, canManageWorkspace, principal } = await parent();
   const apiFetch = serverApiFetcher(fetch, request.headers.get('cookie'), url.origin);
+  const search = (url.searchParams.get('q') ?? '').trim();
   const status = url.searchParams.get('status') || undefined;
   const assigneeUserId = url.searchParams.get('assignee_user_id') || undefined;
+  const view = url.searchParams.get('view') ?? '';
   const cursor = url.searchParams.get('cursor') || undefined;
   const result = await loadWorkspaceData(
     apiFetch,
@@ -49,14 +52,22 @@ export const load: PageServerLoad = async ({ fetch, parent, params, request, url
         apiBaseUrl: env.ZEUS_API_URL,
         workspaceId,
         status,
+        q: search || undefined,
         assigneeUserId,
+        createdBy: view === 'created' ? principal?.user_id ?? undefined : undefined,
+        unassigned: view === 'unassigned',
         cursor,
         limit: 50
       })
   );
 
+  const memberOptions = await loadMemberOptions(apiFetch, { apiBaseUrl: env.ZEUS_API_URL, workspaceId: params.workspaceId }, canManageWorkspace, principal);
   return {
+    ...memberOptions,
+    requirementsTemplate: url.searchParams.get('template') === 'requirements',
     result,
+    view,
+    search,
     filterStatus: status ?? '',
     filterAssigneeUserId: assigneeUserId ?? '',
     openCreate: url.searchParams.get('create') === '1',

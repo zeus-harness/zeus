@@ -4,6 +4,8 @@
   import * as Card from '@zeus/ui/components/ui/card';
   import { Input } from '@zeus/ui/components/ui/input';
 
+  import TotpEnrollment from '$lib/features/account/TotpEnrollment.svelte';
+
   import type { ActionData, PageData } from './$types';
 
   let { data, form } = $props<{ data: PageData; form: ActionData }>();
@@ -37,6 +39,11 @@
       {#if form?.type === 'error'}
         <div class="rounded-xl border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive" role="alert">
           {form.message}
+          {#if 'reauthenticate' in form && form.reauthenticate}
+            <div class="mt-3">
+              <Button href="/login?return_to=%2Faccount%2Fsecurity">重新登录并返回安全设置</Button>
+            </div>
+          {/if}
         </div>
       {:else if form?.type === 'success'}
         <div class="rounded-xl border border-border bg-muted/40 p-4 text-sm" role="status" aria-live="polite">
@@ -138,18 +145,10 @@
             <div class="space-y-4">
               <div>
                 <h2 class="font-medium">在身份验证器中添加 Zeus</h2>
-                <p class="mt-2 text-sm leading-6 text-muted-foreground">
-                  手动输入下面的密钥，或使用身份验证器支持的方式导入 URI。密钥只在当前设置流程中显示。
-                </p>
               </div>
-              <div>
-                <p class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Secret</p>
-                <code class="mt-2 block break-all rounded-lg border border-border bg-muted/40 p-3 font-mono text-sm">{form.secret}</code>
-              </div>
-              <div>
-                <p class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Provisioning URI</p>
-                <code class="mt-2 block break-all rounded-lg border border-border bg-muted/40 p-3 font-mono text-xs leading-5">{form.provisioning_uri}</code>
-              </div>
+              {#key form.secret}
+                <TotpEnrollment secret={form.secret} qrDataUrl={form.qr_data_url} />
+              {/key}
               <form method="POST" action="?/confirmTotp" class="space-y-4">
                 <input type="hidden" name="return_to" value={returnTo} />
                 <div>

@@ -186,7 +186,9 @@ validate
 
 `builtin.work_item_read` 只接受空对象，即使目录 Schema 被放宽也拒绝额外参数。服务端通过当前 Run → Session → WorkItem 读取 `id/title/description/status/priority/input`，同时限定 Organization、Workspace、Session、fence、有效租约、running 状态和未取消条件。它不读取附件，不接受调用方提供的工作项 ID。返回结果继续经过输出 Schema、脱敏、append-only 事件和审计管线；读取失败不返回内部 SQL。
 
-Web 在 Workspace 设置中提供模型连接与模型配置创建入口；API Key 只发送到现有加密存储 API，表单失败不回显密钥。Agent Studio 保存不可变 Agent/Workflow 版本，发布使用 `If-Match` 检查 revision。Workflow 显式绑定 Agent 版本、模型配置、允许工具和执行预算。工具目录注册与 Workspace 启用分别校验 Organization、Workspace 权限。连接轮换与模型更新继续由现有 API 提供。
+Web 在 Organization 设置中提供模型供应商与模型目录的创建、编辑和密钥轮换入口；一个供应商连接可被多个模型配置引用，模型目录供组织内所有 Workspace 使用；API Key 只发送到现有加密存储 API，表单失败不回显密钥。编辑保留未修改的模型参数，轮换使用连接中配置的密钥名称；两者用 `If-Match` 检查页面 revision，冲突不自动覆盖。Agent Studio 保存不可变 Agent/Workflow 版本，发布也检查 revision。Agent 版本选择组织模型，Workflow 绑定 Agent 版本、允许工具和执行预算，并固化该 Agent 版本选择的模型；不允许覆盖成其他模型。旧 Agent 版本没有模型字段时，已有 API 可显式提供原 Workflow 模型，历史版本不重写。Runtime 执行与恢复时读取当前模型配置和密钥，配置不是 Workflow 版本内的快照。工具目录注册与 Workspace 启用分别校验 Organization、Workspace 权限。
+
+需求整理试点只读取当前 WorkItem，返回事实、缺失信息和建议，由人在现有工作项流程确认。Run 成功不表示业务质量通过。七类合成确定性回归记录状态、耗时、Token 与机械规则结果，人工质量验收单独记录。Run 失败和取消页面根据稳定错误码给出恢复指引，重试保留原记录。详见 `docs/runbooks/requirements-pilot.md`。
 
 ## 数据
 
@@ -387,3 +389,19 @@ HTTP 边界只接受 UUIDv7 格式的 `x-request-id`，无效或缺失时由服�
 Kubernetes 基线启用非 root、只读根文件系统、capability drop、默认拒绝 NetworkPolicy、PDB、拓扑分散和 CPU HPA。API 必须挂载平台维护的 `zeus-password-policy/weak-passwords.txt`。HTTPS 目的地由云环境 egress gateway 或 overlay 收窄。仓库中的通用 TCP 443 规则不等于生产 allowlist。生产 Ingress 不路由 `/metrics`，指标只通过集群内 headless Service 抓取。
 
 数据库角色必须在 migration 前创建。`scripts/db/bootstrap-roles.sql` 只创建固定角色和默认权限，不创建带密码的生产登录账号。
+
+## 人工结果验收与运行展示
+
+`0032_work_item_reviews.sql` 增加租户范围的追加式验收记录。`GET/POST /api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/reviews` 分别读取游标分页记录和保存决定。POST 要求当前工作项 `If-Match`、Workspace `OperateRun` 权限和真实用户；Run 必须成功、有输出，并通过 Run/Session 同时关联该工作项。记录绑定 Run、Workflow 版本、提交前工作项 revision、操作者和时间；保存记录与递增 revision 在同一事务，写入审计。决定为 `accepted` 或 `needs_changes`，原因必填。验收不自动完成工作项，也不覆盖 Run 输出。
+
+WorkItem 默认展示结果和人工验收；Workflow 概览展示已发布配置而非 BPM 节点；Run 将工具审批、结果与可折叠执行记录分开，中间模型/工具完成不等同于 Run 终态。
+
+### 平台用户目录
+
+`GET /api/v1/platform/users` 使用有效的 platform_owner 用户会话与 MFA 校验，通过专用数据库函数分页读取全局账号，包括未验证邮箱且无组织成员关系的账号。只返回身份摘要与验证状态，不返回密码、TOTP 密钥或验证令牌。注册为 invite_only 时，无邀请请求不会创建账号或生成邮件；通用 202 回应不等于注册成功。
+
+### 自主注册与邀请绑定（0034）
+
+默认注册策略为 open，0034 将旧 invite_only 配置转换为 open，显式 disabled 保留。自主注册原子创建个人 Organization、默认 Workspace、双 Owner 成员关系、治理与身份策略，并在同一事务排入邮箱验证邮件。账号保持 pending_verification，不授予平台权限。带邀请的新账号只加入指定组织；已有账号从邀请页登录后 POST 接受邀请，保留已有组织关系。
+
+平台目录改用表格；按 `(created_at DESC, id DESC)` 索引游标分页，完整邮箱使用 `lower(email)` 唯一索引精确查找，不扫描全量计数、不使用 OFFSET。大规模容量承诺仍需真实负载验证。

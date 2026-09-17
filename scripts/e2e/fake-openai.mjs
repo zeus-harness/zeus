@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { createServer as createHttpServer } from 'node:http';
 import { pathToFileURL } from 'node:url';
+import { PILOT_CASES } from './requirements-cases.mjs';
 
 const MAX_REQUEST_BYTES = 1024 * 1024;
 const FINAL_CONTENT = '测试运行已完成，审批后的企业能力调用结果已写入运行记录。';
@@ -57,6 +58,7 @@ export function buildCompletionFrames(request) {
   }
 
   let content = FINAL_CONTENT;
+  const pilotCase = PILOT_CASES.find((entry) => request.model === `zeus-pilot-${entry.id}`);
   for (const message of messages.filter((entry) => entry?.role === 'tool')) {
     try {
       const result = JSON.parse(message.content);
@@ -67,6 +69,7 @@ export function buildCompletionFrames(request) {
       // A malformed tool result must not be logged by the fixture.
     }
   }
+  if (pilotCase) content = pilotCase.answer ?? FINAL_CONTENT;
   return [
     sseFrame({ choices: [{ index: 0, delta: { content } }] }),
     sseFrame(usageFrame(36, 18)),
@@ -99,7 +102,7 @@ export function createFakeOpenAiServer() {
   return createHttpServer(async (request, response) => {
     if (request.method === 'GET' && request.url === '/health') {
       response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-      response.end('{"status":"ok"}');
+      response.end('{"status":"ok","fixture":"zeus-deterministic-pilot-v1"}');
       return;
     }
 
@@ -121,6 +124,12 @@ export function createFakeOpenAiServer() {
     }
     if (payload?.stream !== true || !Array.isArray(payload.messages)) {
       jsonError(response, 400, 'streaming_request_required');
+      return;
+    }
+
+    if (payload.model === 'zeus-pilot-timeout') {
+      const timer = setTimeout(() => response.end(), 5000);
+      response.on('close', () => clearTimeout(timer));
       return;
     }
 

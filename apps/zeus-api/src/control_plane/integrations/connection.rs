@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{OriginalUri, Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
 use serde::{Deserialize, Serialize};
@@ -25,13 +25,12 @@ use super::{
     validate_connection_provider_kind, validate_connection_secrets, validate_name,
     validate_secret_name, validate_secret_value,
 };
-use zeus_core::Permission;
 
 #[derive(Debug, Serialize, ToSchema, FromRow)]
 pub struct ConnectionResponse {
     pub id: Uuid,
     pub organization_id: Uuid,
-    pub workspace_id: Uuid,
+    pub workspace_id: Option<Uuid>,
     pub name: String,
     pub provider_kind: String,
     pub configuration: Value,
@@ -70,7 +69,7 @@ pub struct UpdateConnectionRequest {
 pub struct ConnectionSecretResponse {
     pub id: Uuid,
     pub organization_id: Uuid,
-    pub workspace_id: Uuid,
+    pub workspace_id: Option<Uuid>,
     pub connection_id: Uuid,
     pub secret_name: String,
     pub created_at: OffsetDateTime,
@@ -104,22 +103,20 @@ struct ConnectionRevisionRow {
 pub async fn list_connections(
     State(state): State<AppState>,
     auth: AuthContext,
+    OriginalUri(uri): OriginalUri,
     Path(workspace_id): Path<Uuid>,
     Query(page): Query<PageQuery>,
 ) -> Result<Json<ConnectionPageResponse>, ApiError> {
-    auth.require_workspace(workspace_id, Permission::ReadWorkspace)?;
+    let workspace_id = super::integration_scope(&auth, &uri, workspace_id, false, false)?;
     let limit = page.limit()?;
     let cursor = page.decoded_cursor()?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        auth.tenant_scope(Some(workspace_id)),
-    )
-    .await?;
+    let mut transaction =
+        begin_tenant(&state.platform.database, auth.tenant_scope(workspace_id)).await?;
     let mut items = sqlx::query_as::<_, ConnectionResponse>(
         "select id, organization_id, workspace_id, name, provider_kind,
                 configuration, revision, created_at, updated_at, archived_at
          from connections
-         where organization_id = $1 and workspace_id = $2
+         where organization_id = $1 and workspace_id is not distinct from $2
            and ($3::timestamptz is null or (created_at, id) < ($3, $4))
          order by created_at desc, id desc
          limit $5",
@@ -151,21 +148,24 @@ pub async fn list_connections(
 pub async fn create_connection(
     State(state): State<AppState>,
     auth: AuthContext,
+    OriginalUri(uri): OriginalUri,
     Path(workspace_id): Path<Uuid>,
     Json(request): Json<CreateConnectionRequest>,
 ) -> Result<(StatusCode, HeaderMap, Json<ConnectionResponse>), ApiError> {
-    auth.require_workspace(workspace_id, Permission::ManageWorkspace)?;
+    let workspace_id = super::integration_scope(&auth, &uri, workspace_id, true, false)?;
     validate_name(&request.name, "name", 160)?;
     validate_connection_provider_kind(&request.provider_kind)?;
+    if workspace_id.is_some() && request.provider_kind == "openai_compatible" {
+        return Err(ApiError::Validation(
+            "model providers must be managed by the organization".to_owned(),
+        ));
+    }
     require_object(&request.configuration, "configuration")?;
     validate_connection_secrets(&request.secrets)?;
 
     let connection_id = Uuid::now_v7();
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        auth.tenant_scope(Some(workspace_id)),
-    )
-    .await?;
+    let mut transaction =
+        begin_tenant(&state.platform.database, auth.tenant_scope(workspace_id)).await?;
     let connection = sqlx::query_as::<_, ConnectionResponse>(
         "insert into connections (
             id, organization_id, workspace_id, name, provider_kind, configuration
@@ -185,7 +185,7 @@ pub async fn create_connection(
     insert_audit(
         &mut transaction,
         &auth,
-        Some(workspace_id),
+        workspace_id,
         "connection.created",
         "connection",
         connection.id,
@@ -213,7 +213,7 @@ pub async fn create_connection(
         insert_audit(
             &mut transaction,
             &auth,
-            Some(workspace_id),
+            workspace_id,
             "connection_secret.created",
             "connection_secret",
             secret_row.id,
@@ -232,19 +232,17 @@ pub async fn create_connection(
 pub async fn get_connection(
     State(state): State<AppState>,
     auth: AuthContext,
+    OriginalUri(uri): OriginalUri,
     Path((workspace_id, connection_id)): Path<(Uuid, Uuid)>,
 ) -> Result<(HeaderMap, Json<ConnectionResponse>), ApiError> {
-    auth.require_workspace(workspace_id, Permission::ReadWorkspace)?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        auth.tenant_scope(Some(workspace_id)),
-    )
-    .await?;
+    let workspace_id = super::integration_scope(&auth, &uri, workspace_id, false, false)?;
+    let mut transaction =
+        begin_tenant(&state.platform.database, auth.tenant_scope(workspace_id)).await?;
     let connection = sqlx::query_as::<_, ConnectionResponse>(
         "select id, organization_id, workspace_id, name, provider_kind,
                 configuration, revision, created_at, updated_at, archived_at
          from connections
-         where id = $1 and organization_id = $2 and workspace_id = $3",
+         where id = $1 and organization_id = $2 and workspace_id is not distinct from $3",
     )
     .bind(connection_id)
     .bind(auth.organization_id)
@@ -258,27 +256,30 @@ pub async fn get_connection(
 pub async fn update_connection(
     State(state): State<AppState>,
     auth: AuthContext,
+    OriginalUri(uri): OriginalUri,
     Path((workspace_id, connection_id)): Path<(Uuid, Uuid)>,
     headers: HeaderMap,
     Json(request): Json<UpdateConnectionRequest>,
 ) -> Result<(HeaderMap, Json<ConnectionResponse>), ApiError> {
-    auth.require_workspace(workspace_id, Permission::ManageWorkspace)?;
+    let workspace_id = super::integration_scope(&auth, &uri, workspace_id, true, false)?;
     let revision = required_revision(&headers)?;
     if let Some(name) = request.name.as_deref() {
         validate_name(name, "name", 160)?;
     }
     if let Some(provider_kind) = request.provider_kind.as_deref() {
         validate_connection_provider_kind(provider_kind)?;
+        if workspace_id.is_some() && provider_kind == "openai_compatible" {
+            return Err(ApiError::Validation(
+                "model providers must be managed by the organization".to_owned(),
+            ));
+        }
     }
     if let Some(configuration) = request.configuration.as_ref() {
         require_object(configuration, "configuration")?;
     }
 
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        auth.tenant_scope(Some(workspace_id)),
-    )
-    .await?;
+    let mut transaction =
+        begin_tenant(&state.platform.database, auth.tenant_scope(workspace_id)).await?;
     let connection = sqlx::query_as::<_, ConnectionResponse>(
         "update connections
          set name = coalesce($1, name),
@@ -288,7 +289,7 @@ pub async fn update_connection(
                                 when $4 = false then null else archived_at end,
              revision = revision + 1,
              updated_at = now()
-         where id = $5 and organization_id = $6 and workspace_id = $7 and revision = $8
+         where id = $5 and organization_id = $6 and workspace_id is not distinct from $7 and revision = $8
          returning id, organization_id, workspace_id, name, provider_kind,
                    configuration, revision, created_at, updated_at, archived_at",
     )
@@ -306,7 +307,7 @@ pub async fn update_connection(
     insert_audit(
         &mut transaction,
         &auth,
-        Some(workspace_id),
+        workspace_id,
         "connection.updated",
         "connection",
         connection_id,
@@ -319,22 +320,20 @@ pub async fn update_connection(
 pub async fn archive_connection(
     State(state): State<AppState>,
     auth: AuthContext,
+    OriginalUri(uri): OriginalUri,
     Path((workspace_id, connection_id)): Path<(Uuid, Uuid)>,
     headers: HeaderMap,
 ) -> Result<(HeaderMap, Json<ConnectionResponse>), ApiError> {
-    auth.require_workspace(workspace_id, Permission::ManageWorkspace)?;
+    let workspace_id = super::integration_scope(&auth, &uri, workspace_id, true, false)?;
     let revision = required_revision(&headers)?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        auth.tenant_scope(Some(workspace_id)),
-    )
-    .await?;
+    let mut transaction =
+        begin_tenant(&state.platform.database, auth.tenant_scope(workspace_id)).await?;
     let connection = sqlx::query_as::<_, ConnectionResponse>(
         "update connections
          set archived_at = coalesce(archived_at, now()),
              revision = revision + 1,
              updated_at = now()
-         where id = $1 and organization_id = $2 and workspace_id = $3 and revision = $4
+         where id = $1 and organization_id = $2 and workspace_id is not distinct from $3 and revision = $4
          returning id, organization_id, workspace_id, name, provider_kind,
                    configuration, revision, created_at, updated_at, archived_at",
     )
@@ -348,7 +347,7 @@ pub async fn archive_connection(
     insert_audit(
         &mut transaction,
         &auth,
-        Some(workspace_id),
+        workspace_id,
         "connection.archived",
         "connection",
         connection_id,
@@ -361,23 +360,21 @@ pub async fn archive_connection(
 pub async fn list_connection_secrets(
     State(state): State<AppState>,
     auth: AuthContext,
+    OriginalUri(uri): OriginalUri,
     Path((workspace_id, connection_id)): Path<(Uuid, Uuid)>,
     Query(page): Query<PageQuery>,
 ) -> Result<Json<ConnectionSecretPageResponse>, ApiError> {
-    auth.require_workspace(workspace_id, Permission::ReadWorkspace)?;
+    let workspace_id = super::integration_scope(&auth, &uri, workspace_id, false, false)?;
     let limit = page.limit()?;
     let cursor = page.decoded_cursor()?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        auth.tenant_scope(Some(workspace_id)),
-    )
-    .await?;
+    let mut transaction =
+        begin_tenant(&state.platform.database, auth.tenant_scope(workspace_id)).await?;
     let mut items = sqlx::query_as::<_, ConnectionSecretResponse>(
         "select id, organization_id, workspace_id, connection_id, secret_name,
                 created_at, rotated_at
          from connection_secrets
          where id is not null and connection_id = $1
-           and organization_id = $2 and workspace_id = $3
+           and organization_id = $2 and workspace_id is not distinct from $3
            and ($4::timestamptz is null or (created_at, id) < ($4, $5))
          order by created_at desc, id desc
          limit $6",
@@ -410,9 +407,11 @@ pub async fn list_connection_secrets(
 pub async fn create_connection_secret(
     State(state): State<AppState>,
     auth: AuthContext,
+    OriginalUri(uri): OriginalUri,
     Path((workspace_id, connection_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<CreateConnectionSecretRequest>,
 ) -> Result<(StatusCode, HeaderMap, Json<ConnectionSecretResponse>), ApiError> {
+    let workspace_id = super::integration_scope(&auth, &uri, workspace_id, true, false)?;
     create_connection_secret_value(
         state,
         auth,
@@ -427,24 +426,20 @@ pub async fn create_connection_secret(
 async fn create_connection_secret_value(
     state: AppState,
     auth: AuthContext,
-    workspace_id: Uuid,
+    workspace_id: Option<Uuid>,
     connection_id: Uuid,
     secret_name: String,
     secret: String,
 ) -> Result<(StatusCode, HeaderMap, Json<ConnectionSecretResponse>), ApiError> {
-    auth.require_workspace(workspace_id, Permission::ManageWorkspace)?;
     validate_secret_name(&secret_name)?;
     validate_secret_value(&secret)?;
     let sealed = seal_connection_secret(&state, connection_id, &secret_name, &secret)?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        auth.tenant_scope(Some(workspace_id)),
-    )
-    .await?;
+    let mut transaction =
+        begin_tenant(&state.platform.database, auth.tenant_scope(workspace_id)).await?;
     let _connection = sqlx::query_as::<_, ConnectionRevisionRow>(
         "select revision
          from connections
-         where id = $1 and organization_id = $2 and workspace_id = $3
+         where id = $1 and organization_id = $2 and workspace_id is not distinct from $3
            and archived_at is null
          for update",
     )
@@ -474,7 +469,7 @@ async fn create_connection_secret_value(
     let new_revision: i64 = sqlx::query_scalar(
         "update connections
          set revision = revision + 1, updated_at = now()
-         where id = $1 and organization_id = $2 and workspace_id = $3
+         where id = $1 and organization_id = $2 and workspace_id is not distinct from $3
          returning revision",
     )
     .bind(connection_id)
@@ -485,7 +480,7 @@ async fn create_connection_secret_value(
     insert_audit(
         &mut transaction,
         &auth,
-        Some(workspace_id),
+        workspace_id,
         "connection_secret.created",
         "connection_secret",
         secret_row.id,
@@ -502,9 +497,11 @@ async fn create_connection_secret_value(
 pub async fn create_named_connection_secret(
     State(state): State<AppState>,
     auth: AuthContext,
+    OriginalUri(uri): OriginalUri,
     Path((workspace_id, connection_id, secret_name)): Path<(Uuid, Uuid, String)>,
     Json(request): Json<ConnectionSecretValueRequest>,
 ) -> Result<(StatusCode, HeaderMap, Json<ConnectionSecretResponse>), ApiError> {
+    let workspace_id = super::integration_scope(&auth, &uri, workspace_id, true, false)?;
     create_connection_secret_value(
         state,
         auth,
@@ -519,24 +516,22 @@ pub async fn create_named_connection_secret(
 pub async fn rotate_connection_secret(
     State(state): State<AppState>,
     auth: AuthContext,
+    OriginalUri(uri): OriginalUri,
     Path((workspace_id, connection_id, secret_name)): Path<(Uuid, Uuid, String)>,
     headers: HeaderMap,
     Json(request): Json<ConnectionSecretValueRequest>,
 ) -> Result<(HeaderMap, Json<ConnectionSecretResponse>), ApiError> {
-    auth.require_workspace(workspace_id, Permission::ManageWorkspace)?;
+    let workspace_id = super::integration_scope(&auth, &uri, workspace_id, true, false)?;
     let expected_revision = required_revision(&headers)?;
     validate_secret_name(&secret_name)?;
     validate_secret_value(&request.secret)?;
     let sealed = seal_connection_secret(&state, connection_id, &secret_name, &request.secret)?;
-    let mut transaction = begin_tenant(
-        &state.platform.database,
-        auth.tenant_scope(Some(workspace_id)),
-    )
-    .await?;
+    let mut transaction =
+        begin_tenant(&state.platform.database, auth.tenant_scope(workspace_id)).await?;
     let connection = sqlx::query_as::<_, ConnectionRevisionRow>(
         "select revision
          from connections
-         where id = $1 and organization_id = $2 and workspace_id = $3
+         where id = $1 and organization_id = $2 and workspace_id is not distinct from $3
            and archived_at is null
          for update",
     )
@@ -552,7 +547,7 @@ pub async fn rotate_connection_secret(
     let secret_row = sqlx::query_as::<_, ConnectionSecretResponse>(
         "update connection_secrets
          set ciphertext = $1, nonce = $2, key_id = $3, rotated_at = now()
-         where connection_id = $4 and organization_id = $5 and workspace_id = $6
+         where connection_id = $4 and organization_id = $5 and workspace_id is not distinct from $6
            and secret_name = $7
          returning id, organization_id, workspace_id, connection_id,
                    secret_name, created_at, rotated_at",
@@ -570,7 +565,7 @@ pub async fn rotate_connection_secret(
     let new_revision: i64 = sqlx::query_scalar(
         "update connections
          set revision = revision + 1, updated_at = now()
-         where id = $1 and organization_id = $2 and workspace_id = $3
+         where id = $1 and organization_id = $2 and workspace_id is not distinct from $3
            and revision = $4
          returning revision",
     )
@@ -583,7 +578,7 @@ pub async fn rotate_connection_secret(
     insert_audit(
         &mut transaction,
         &auth,
-        Some(workspace_id),
+        workspace_id,
         "connection_secret.rotated",
         "connection_secret",
         secret_row.id,

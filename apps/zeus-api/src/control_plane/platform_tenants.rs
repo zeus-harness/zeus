@@ -2,7 +2,7 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     routing::{delete, get, post},
 };
@@ -16,7 +16,7 @@ use zeus_identity::normalize_email;
 
 use crate::{
     AppState,
-    api_support::{required_revision, revision_etag},
+    api_support::{ListCursor, PageQuery, required_revision, revision_etag},
     auth::{
         PrincipalContext, PrincipalKind, csrf_cookie, expired_tenant_access_grant_cookie,
         session_cookie, tenant_access_grant_cookie,
@@ -29,6 +29,76 @@ use crate::{
 };
 
 const PLATFORM_REAUTHENTICATION_SECONDS: i64 = 600;
+
+#[derive(Debug, Serialize, ToSchema, FromRow)]
+pub struct PlatformUserResponse {
+    pub id: Uuid,
+    pub email: String,
+    pub display_name: String,
+    pub status: String,
+    pub email_verified: bool,
+    pub mfa_enabled: bool,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PlatformUserPageResponse {
+    pub items: Vec<PlatformUserResponse>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PlatformUserQuery {
+    #[serde(flatten)]
+    pub page: PageQuery,
+    pub email: Option<String>,
+}
+
+#[utoipa::path(get, path = "/api/v1/platform/users", tag = "platform",
+    params(("cursor" = Option<String>, Query), ("limit" = Option<u16>, Query), ("email" = Option<String>, Query)),
+    responses((status = 200, description = "Global users visible to platform owners", body = PlatformUserPageResponse))
+)]
+pub async fn list_platform_users(
+    State(state): State<AppState>,
+    principal: PrincipalContext,
+    Query(query): Query<PlatformUserQuery>,
+) -> Result<Json<PlatformUserPageResponse>, ApiError> {
+    let (user_id, session_id) = require_platform_owner(&principal, false)?;
+    let limit = query.page.limit()?;
+    let cursor = query.page.decoded_cursor()?;
+    let email = query
+        .email
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            normalize_email(&value).map_err(|_| ApiError::Validation("email is invalid".to_owned()))
+        })
+        .transpose()?;
+    let mut items = sqlx::query_as::<_, PlatformUserResponse>(
+        "select * from zeus_private.list_platform_users($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(cursor.map(ListCursor::created_at))
+    .bind(cursor.map(ListCursor::id))
+    .bind(i32::try_from(limit + 1).map_err(|_| ApiError::Internal)?)
+    .bind(email)
+    .fetch_all(&state.platform.database)
+    .await?;
+    let has_more = i64::try_from(items.len()).unwrap_or(i64::MAX) > limit;
+    if has_more {
+        items.pop();
+    }
+    let next_cursor = if has_more {
+        items
+            .last()
+            .map(|item| ListCursor::new(item.created_at, item.id).encode())
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(Json(PlatformUserPageResponse { items, next_cursor }))
+}
 
 #[derive(Debug, Serialize, ToSchema, FromRow)]
 pub struct PlatformOrganizationResponse {
@@ -586,6 +656,7 @@ pub async fn revoke_platform_tenant_access_grant(
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/api/v1/platform/users", get(list_platform_users))
         .route(
             "/api/v1/platform/organizations",
             get(list_platform_organizations).post(create_platform_organization),

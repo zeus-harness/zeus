@@ -65,6 +65,7 @@ Third-party OIDC Client ◄── Zeus OIDC Provider
 - Zeus `users` 是账号、成员关系、审计 actor 和 OIDC Subject 的事实来源。联合 IdP 只提供登录证明。
 - 原生密码、OIDC Client Secret 和 Service Account Token 共用 Argon2 有界执行器。活跃任务最多四个，等待队列满载时返回限流错误。实现见 `crates/zeus-identity/src/password_executor.rs`、`apps/zeus-api/src/auth.rs` 和 `apps/zeus-api/src/native_auth.rs`。
 - PHC 校验在执行 Argon2 前拒绝高于 Zeus 当前内存、迭代或并行度上限的参数。生产 API 还必须挂载 `ZEUS_WEAK_PASSWORD_FILE`；文件大小和条目数有界。实现见 `crates/zeus-identity/src/password.rs` 和 `apps/zeus-api/src/config.rs`。
+- 模型供应商、密钥和模型目录由 Organization 管理，同组织 Workspace 只读选用。Workspace Owner 和 Workspace Service Account 不得修改组织模型。Agent 版本保存模型引用，Workflow 不得覆盖；运行时按 Organization 读取模型凭据，通用工具连接仍保留 Workspace 隔离。组织级配置和密钥轮换影响所有引用它的 Workspace，写入继续要求 revision 和审计。
 - Organization 与 Workspace 权限分开求值。Workspace 角色和 Workspace 级 Service Account scope 不能授权 Organization 路由。实现见 `apps/zeus-api/src/auth.rs`。
 - Organization 角色不再对 Workspace 动作提供隐式授权。平台支持使用绑定 Web Session 的限时 Grant，不生成 Membership，也不切换到高权限数据库角色。Grant 创建验证原生密码与 TOTP；每个请求从 PostgreSQL 校验用户、Session、Organization、撤销状态和到期时间。
 - TOTP 接受当前窗口前后各一步，并返回准确 counter 供数据库原子防重放。实现见 `crates/zeus-identity/src/totp.rs:125`。
@@ -128,3 +129,7 @@ Third-party OIDC Client ◄── Zeus OIDC Provider
 | Low | 不直接破坏保密性、完整性或核心可用性，影响局部且容易恢复。 | 记录原因、测试和修复窗口。 |
 
 关闭一项风险需要四类证据：触发条件、代码或配置控制、负面测试、生产形态结果。仓库测试能证明协议和数据库语义，不能代替 TLS、KMS、企业 IdP、SMTP、托管 PostgreSQL、OpenID Suite 或云网络策略的外部证据。
+
+## 人工验收边界
+
+人工验收使用 Workspace 操作权限和真实用户身份，组织权限不隐式授权；服务账号不能提交。服务端从关联 Run 获取 Workflow 版本，不信任客户端提供版本或操作者。租户事务、RLS 和 Run/Session 工作项关联校验阻止跨租户/跨任务引用；`If-Match` 与行锁阻止并发覆盖和同 revision 重放。历史记录禁止 UPDATE/DELETE，原因只作为转义文本展示。工具授权审批、Run 成功和人工接受是三个不同事实。

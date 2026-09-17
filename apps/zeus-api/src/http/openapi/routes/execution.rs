@@ -2,6 +2,16 @@ use super::super::{BodySchema, PublicRoute, public_route};
 
 pub(crate) const ROUTES: &[PublicRoute] = &[
     public_route(
+        "/api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/reviews/{review_id}/runs",
+        "POST",
+        "reprocess_work_item_review",
+        "execution",
+        201,
+        None,
+        BodySchema::Object("WorkItemRunStartResponse"),
+        true,
+    ),
+    public_route(
         "/api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/runs",
         "POST",
         "start_work_item_run",

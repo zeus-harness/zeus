@@ -1,3 +1,4 @@
+import QRCode from 'qrcode';
 import { fail, redirect } from '@sveltejs/kit';
 import { env } from '$env/dynamic/private';
 import type { Actions, PageServerLoad } from './$types';
@@ -106,6 +107,22 @@ function totpErrorMessage(status: number, operation: 'enable' | 'disable'): stri
   return operation === 'disable' ? 'TOTP 关闭失败，请稍后重试。' : 'TOTP 设置失败，请稍后重试。';
 }
 
+async function totpActionError(response: Response, operation: 'enable' | 'disable') {
+  const payload = await responseJson(response);
+  const code = isJsonRecord(payload) ? payload.code : null;
+  if (response.status === 403 && code === 'reauthentication_required') {
+    return fail(403, {
+      type: 'error' as const,
+      message: 'TOTP 操作需要在最近 10 分钟内完成身份认证。请重新登录后回到安全设置继续。',
+      reauthenticate: true
+    });
+  }
+  if (response.status === 403 && code === 'email_verification_required') {
+    return actionError(403, '请先完成邮箱验证，再设置 TOTP。');
+  }
+  return actionError(responseStatus(response.status), totpErrorMessage(response.status, operation));
+}
+
 export const load: PageServerLoad = async ({ parent, url }) => {
   const auth = await parent();
   if (auth.status === 'unauthenticated') {
@@ -163,7 +180,7 @@ export const actions: Actions = {
 
     forwardZeusAuthCookies(response, event.cookies);
     if (!response.ok) {
-      return actionError(responseStatus(response.status), totpErrorMessage(response.status, 'enable'));
+      return totpActionError(response, 'enable');
     }
 
     const payload = await responseJson(response);
@@ -177,10 +194,13 @@ export const actions: Actions = {
       return actionError(502, 'TOTP API 未返回完整的设置资料。');
     }
 
+    const qrDataUrl = await QRCode.toDataURL(payload.provisioning_uri, {
+      errorCorrectionLevel: 'M', margin: 4, width: 256
+    }).catch(() => null);
     return {
       type: 'totp_setup' as const,
       secret: payload.secret,
-      provisioning_uri: payload.provisioning_uri,
+      qr_data_url: qrDataUrl,
       return_to: returnTo
     };
   },
@@ -204,7 +224,7 @@ export const actions: Actions = {
 
     forwardZeusAuthCookies(response, event.cookies);
     if (!response.ok) {
-      return actionError(responseStatus(response.status), totpErrorMessage(response.status, 'enable'));
+      return totpActionError(response, 'enable');
     }
 
     const payload = await responseJson(response);
@@ -239,7 +259,7 @@ export const actions: Actions = {
 
     forwardZeusAuthCookies(response, event.cookies);
     if (!response.ok) {
-      return actionError(responseStatus(response.status), totpErrorMessage(response.status, 'disable'));
+      return totpActionError(response, 'disable');
     }
 
     return { type: 'success' as const, message: 'TOTP 已关闭。' };

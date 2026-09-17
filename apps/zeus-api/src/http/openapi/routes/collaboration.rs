@@ -2,6 +2,26 @@ use super::super::{BodySchema, PublicRoute, public_route};
 
 pub(crate) const ROUTES: &[PublicRoute] = &[
     public_route(
+        "/api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/reviews",
+        "GET",
+        "list_work_item_reviews",
+        "collaboration",
+        200,
+        None,
+        BodySchema::Object("WorkItemReviewPageResponse"),
+        true,
+    ),
+    public_route(
+        "/api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/reviews",
+        "POST",
+        "create_work_item_review",
+        "collaboration",
+        201,
+        Some("CreateWorkItemReviewRequest"),
+        BodySchema::Object("WorkItemReviewResponse"),
+        true,
+    ),
+    public_route(
         "/api/v1/workspaces/{workspace_id}/work-items",
         "GET",
         "list_work_items",

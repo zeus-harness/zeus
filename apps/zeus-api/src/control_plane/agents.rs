@@ -63,6 +63,7 @@ pub struct AgentVersionResponse {
     pub workspace_id: Uuid,
     pub agent_id: Uuid,
     pub version_number: i32,
+    pub model_profile_id: Option<Uuid>,
     pub instructions: String,
     pub configuration: Value,
     pub created_by: Option<Uuid>,
@@ -71,6 +72,7 @@ pub struct AgentVersionResponse {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateAgentVersionRequest {
+    pub model_profile_id: Option<Uuid>,
     pub instructions: String,
     #[serde(default = "empty_object")]
     pub configuration: Value,
@@ -263,7 +265,7 @@ pub async fn list_agent_versions(
     .await?;
     let versions = sqlx::query_as::<_, AgentVersionResponse>(
         "select id, organization_id, workspace_id, agent_id, version_number,
-                instructions, configuration, created_by, created_at
+                model_profile_id, instructions, configuration, created_by, created_at
          from agent_versions
          where organization_id = $1 and workspace_id = $2 and agent_id = $3
          order by version_number desc limit 200",
@@ -304,6 +306,15 @@ pub async fn create_agent_version(
     .bind(workspace_id)
     .fetch_one(&mut *transaction)
     .await?;
+    if let Some(model_id) = request.model_profile_id {
+        let valid: bool = sqlx::query_scalar("select exists(select 1 from model_profiles m join connections c on c.id = m.connection_id and c.organization_id = m.organization_id where m.id = $1 and m.organization_id = $2 and m.archived_at is null and c.archived_at is null)")
+            .bind(model_id).bind(auth.organization_id).fetch_one(&mut *transaction).await?;
+        if !valid {
+            return Err(ApiError::Validation(
+                "model is outside the organization or unavailable".to_owned(),
+            ));
+        }
+    }
     let version_number: i32 = sqlx::query_scalar(
         "select coalesce(max(version_number), 0) + 1 from agent_versions where agent_id = $1",
     )
@@ -313,10 +324,10 @@ pub async fn create_agent_version(
     let version = sqlx::query_as::<_, AgentVersionResponse>(
         "insert into agent_versions (
             organization_id, workspace_id, agent_id, version_number,
-            instructions, configuration, created_by
-         ) values ($1, $2, $3, $4, $5, $6, $7)
+            instructions, configuration, created_by, model_profile_id
+         ) values ($1, $2, $3, $4, $5, $6, $7, $8)
          returning id, organization_id, workspace_id, agent_id, version_number,
-                   instructions, configuration, created_by, created_at",
+                   model_profile_id, instructions, configuration, created_by, created_at",
     )
     .bind(auth.organization_id)
     .bind(workspace_id)
@@ -325,6 +336,7 @@ pub async fn create_agent_version(
     .bind(request.instructions)
     .bind(request.configuration)
     .bind(auth.user_id)
+    .bind(request.model_profile_id)
     .fetch_one(&mut *transaction)
     .await?;
     insert_audit(
@@ -353,7 +365,7 @@ pub async fn get_agent_version(
     .await?;
     let version = sqlx::query_as::<_, AgentVersionResponse>(
         "select id, organization_id, workspace_id, agent_id, version_number,
-                instructions, configuration, created_by, created_at
+                model_profile_id, instructions, configuration, created_by, created_at
          from agent_versions
          where id = $1 and agent_id = $2 and organization_id = $3 and workspace_id = $4",
     )
@@ -469,7 +481,7 @@ pub struct WorkflowVersionResponse {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateWorkflowVersionRequest {
     pub agent_version_id: Uuid,
-    pub model_profile_id: Uuid,
+    pub model_profile_id: Option<Uuid>,
     #[serde(default = "empty_object")]
     pub input_schema: Value,
     #[serde(default = "empty_object")]
@@ -687,6 +699,20 @@ pub async fn list_workflow_versions(
     Ok(Json(versions))
 }
 
+fn workflow_model(
+    agent_model: Option<Uuid>,
+    requested_model: Option<Uuid>,
+) -> Result<Uuid, ApiError> {
+    if agent_model.is_some() && requested_model.is_some() && agent_model != requested_model {
+        return Err(ApiError::Validation(
+            "workflow must use the Agent version model".to_owned(),
+        ));
+    }
+    agent_model
+        .or(requested_model)
+        .ok_or_else(|| ApiError::Validation("select a model on the Agent version".to_owned()))
+}
+
 pub async fn create_workflow_version(
     State(state): State<AppState>,
     auth: AuthContext,
@@ -710,23 +736,29 @@ pub async fn create_workflow_version(
     .bind(workspace_id)
     .fetch_one(&mut *transaction)
     .await?;
+    let agent_model: Option<Uuid> = sqlx::query_scalar(
+        "select model_profile_id from agent_versions where id = $1 and organization_id = $2 and workspace_id = $3"
+    ).bind(request.agent_version_id).bind(auth.organization_id).bind(workspace_id)
+        .fetch_one(&mut *transaction).await?;
+    let model_profile_id = workflow_model(agent_model, request.model_profile_id)?;
     let dependencies_valid: bool = sqlx::query_scalar(
         "select exists(
            select 1 from agent_versions a, model_profiles m
            where a.id = $1 and m.id = $2
              and a.organization_id = $3 and a.workspace_id = $4
-             and m.organization_id = $3 and m.workspace_id = $4 and m.archived_at is null
+             and m.organization_id = $3 and m.archived_at is null
+             and exists (select 1 from connections c where c.id = m.connection_id and c.organization_id = $3 and c.archived_at is null)
          )",
     )
     .bind(request.agent_version_id)
-    .bind(request.model_profile_id)
+    .bind(model_profile_id)
     .bind(auth.organization_id)
     .bind(workspace_id)
     .fetch_one(&mut *transaction)
     .await?;
     if !dependencies_valid {
         return Err(ApiError::Validation(
-            "agent_version_id or model_profile_id is outside the workspace".to_owned(),
+            "Agent version or organization model is unavailable".to_owned(),
         ));
     }
     let version_number: i32 = sqlx::query_scalar(
@@ -752,7 +784,7 @@ pub async fn create_workflow_version(
     .bind(workflow_id)
     .bind(version_number)
     .bind(request.agent_version_id)
-    .bind(request.model_profile_id)
+    .bind(model_profile_id)
     .bind(request.input_schema)
     .bind(request.output_schema)
     .bind(request.capability_policy)
@@ -1014,7 +1046,7 @@ mod tests {
     fn workflow_limits_are_rejected_before_database_work() {
         let request = CreateWorkflowVersionRequest {
             agent_version_id: uuid::Uuid::now_v7(),
-            model_profile_id: uuid::Uuid::now_v7(),
+            model_profile_id: Some(uuid::Uuid::now_v7()),
             input_schema: json!({}),
             output_schema: json!({}),
             capability_policy: json!({}),

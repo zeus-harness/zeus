@@ -79,6 +79,7 @@ mod routes;
         organization::get_workspace,
         organization::update_workspace,
         organization::select_workspace,
+        platform_tenants::list_platform_users,
         platform_tenants::list_platform_organizations,
         platform_tenants::get_platform_organization,
         platform_tenants::create_platform_organization,
@@ -90,6 +91,7 @@ mod routes;
         platform_tenants::revoke_platform_tenant_access_grant,
         execution_api::create_run,
         execution_api::start_work_item_run,
+        execution_api::reprocess_work_item_review,
         execution_api::list_runs,
         execution_api::list_approvals
     ),
@@ -163,6 +165,8 @@ mod routes;
         organization::UpdateFederatedIdentityProviderRequest,
         organization::FederatedGroupMappingResponse,
         organization::CreateFederatedGroupMappingRequest,
+        platform_tenants::PlatformUserResponse,
+        platform_tenants::PlatformUserPageResponse,
         platform_tenants::PlatformOrganizationResponse,
         platform_tenants::CreatePlatformOrganizationRequest,
         platform_tenants::CreatedPlatformOrganizationResponse,
@@ -195,6 +199,7 @@ mod routes;
         integrations::CreateConnectionSecretRequest,
         integrations::ConnectionSecretValueRequest,
         integrations::ModelProfileResponse,
+        integrations::ModelConnectionTestResponse,
         integrations::ModelProfilePageResponse,
         integrations::CreateModelProfileRequest,
         integrations::UpdateModelProfileRequest,
@@ -239,6 +244,9 @@ mod routes;
         execution_api::ChildRunResponse,
         execution_api::RunTraceResponse,
         work_items::WorkItemResponse,
+        work_items::WorkItemReviewResponse,
+        work_items::WorkItemReviewPageResponse,
+        work_items::CreateWorkItemReviewRequest,
         work_items::WorkItemPageResponse,
         work_items::CreateWorkItemRequest,
         work_items::UpdateWorkItemRequest,
@@ -386,7 +394,7 @@ impl Modify for OpenApiModifier {
                 operation.tags = Some(vec![route.tag.to_owned()]);
             }
             if operation.parameters.is_none() {
-                let parameters = path_parameters(route.path);
+                let parameters = route_parameters(route);
                 if !parameters.is_empty() {
                     operation.parameters = Some(parameters);
                 }
@@ -453,7 +461,7 @@ fn operation_for(route: &PublicRoute) -> Operation {
     let mut operation = Operation::new();
     operation.operation_id = Some(route.operation_id.to_owned());
     operation.tags = Some(vec![route.tag.to_owned()]);
-    let parameters = path_parameters(route.path);
+    let parameters = route_parameters(route);
     if !parameters.is_empty() {
         operation.parameters = Some(parameters);
     }
@@ -469,6 +477,35 @@ fn operation_for(route: &PublicRoute) -> Operation {
         .insert("default".to_owned(), RefOr::T(problem_response()));
     operation.security = Some(security_requirements(route.requires_auth));
     operation
+}
+
+fn route_parameters(route: &PublicRoute) -> Vec<Parameter> {
+    let mut parameters = path_parameters(route.path);
+    if matches!(
+        route.operation_id,
+        "create_work_item_review" | "test_model_connection"
+    ) {
+        parameters.push(ParameterBuilder::new().name("If-Match").parameter_in(ParameterIn::Header)
+            .required(Required::True).description(Some("Current resource ETag, e.g. revision-1 in double quotes. A stale revision returns 412."))
+            .schema(Some(ObjectBuilder::new().schema_type(Type::String))).build());
+    }
+    if route.operation_id == "list_work_items" {
+        parameters.extend(work_item_filter_parameters());
+    }
+    if route.operation_id == "list_work_item_reviews" {
+        for name in ["cursor", "limit"] {
+            parameters.push(
+                ParameterBuilder::new()
+                    .name(name)
+                    .parameter_in(ParameterIn::Query)
+                    .required(Required::False)
+                    .description(Some("Opaque pagination cursor or page size (1-100)."))
+                    .schema(Some(ObjectBuilder::new().schema_type(Type::String)))
+                    .build(),
+            );
+        }
+    }
+    parameters
 }
 
 fn path_parameters(path: &str) -> Vec<Parameter> {
@@ -597,4 +634,25 @@ impl PublicRoute {
             _ => panic!("unsupported HTTP method in PUBLIC_ROUTES: {}", self.method),
         }
     }
+}
+
+fn work_item_filter_parameters() -> Vec<Parameter> {
+    ["created_by", "unassigned", "q"]
+        .into_iter()
+        .map(|name| {
+            ParameterBuilder::new()
+                .name(name)
+                .parameter_in(ParameterIn::Query)
+                .description(if name == "q" { Some("Case-insensitive literal title substring, at most 200 characters; combined with other filters before cursor pagination.") } else { None })
+                .required(Required::False)
+                .schema(Some(ObjectBuilder::new().schema_type(
+                    if name == "unassigned" {
+                        Type::Boolean
+                    } else {
+                        Type::String
+                    },
+                )))
+                .build()
+        })
+        .collect()
 }

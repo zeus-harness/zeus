@@ -46,7 +46,7 @@
 				{#snippet child({ props })}
 					<Button variant="ghost" class="absolute top-3 right-3" size="icon-sm" {...props}>
 						<XIcon  />
-						<span class="sr-only">Close</span>
+						<span class="sr-only">关闭</span>
 					</Button>
 				{/snippet}
 			</SheetPrimitive.Close>

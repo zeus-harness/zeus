@@ -18,6 +18,8 @@
     "load:identity": "node scripts/load/identity.mjs",
     "e2e:seed": "node scripts/e2e/work-item.mjs seed",
     "e2e:run": "node scripts/e2e/work-item.mjs run",
+    "test:pilot": "node --test scripts/e2e/requirements-cases.test.mjs",
+    "e2e:pilot": "node scripts/e2e/requirements-pilot.mjs",
     "test:browser": "playwright test",
     "db:bootstrap": "psql \"$DATABASE_URL\" --no-psqlrc --set ON_ERROR_STOP=1 --file scripts/db/bootstrap-roles.sql",
     "db:migrate": "cargo run -p zeus-api -- db migrate"

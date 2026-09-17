@@ -94,7 +94,7 @@ class CookieJar {
   }
 }
 
-class ZeusClient {
+export class ZeusClient {
   constructor(origin) {
     const parsed = new URL(origin);
     if (!['127.0.0.1', 'localhost', '[::1]'].includes(parsed.hostname)) {
@@ -240,7 +240,7 @@ async function completeMfa(client, environment) {
   environment.ZEUS_E2E_TOTP_LAST_COUNTER = String(current.counter);
 }
 
-async function login(client, environment) {
+export async function login(client, environment) {
   const result = await client.json(
     '/api/v1/auth/login',
     {
@@ -312,7 +312,7 @@ async function setupIdentity(client, environment) {
   environment.ZEUS_E2E_TOTP_LAST_COUNTER = String(current.counter);
 }
 
-async function selectWorkspace(client) {
+export async function selectWorkspace(client) {
   const organizations = await client.json('/api/v1/users/me/organizations');
   const organization = organizations.find(
     (item) => item.organization_slug === 'e2e-organization'
@@ -336,21 +336,30 @@ async function selectWorkspace(client) {
   return { organizationId: organization.organization_id, workspaceId: workspace.id };
 }
 
-async function listItems(client, pathname) {
-  const result = await client.json(pathname);
-  return Array.isArray(result) ? result : result.items ?? [];
+export async function listItems(client, pathname) {
+  const items = [];
+  let cursor;
+  do {
+    const query = new URLSearchParams({ limit: '100' });
+    if (cursor) query.set('cursor', cursor);
+    const result = await client.json(`${pathname}?${query}`);
+    if (Array.isArray(result)) return result;
+    items.push(...(result.items ?? []));
+    cursor = result.next_cursor;
+  } while (cursor);
+  return items;
 }
 
 async function ensureControlPlane(client, environment, tenant) {
   const workspacePath = `/api/v1/workspaces/${tenant.workspaceId}`;
   const organizationPath = `/api/v1/organizations/${tenant.organizationId}`;
 
-  let connection = (await listItems(client, `${workspacePath}/connections`)).find(
+  let connection = (await listItems(client, `${organizationPath}/model-providers`)).find(
     (item) => item.name === 'E2E Deterministic Model'
   );
   if (!connection) {
     connection = await client.json(
-      `${workspacePath}/connections`,
+      `${organizationPath}/model-providers`,
       {
         method: 'POST',
         body: {
@@ -364,10 +373,10 @@ async function ensureControlPlane(client, environment, tenant) {
     );
   }
 
-  const secrets = await listItems(client, `${workspacePath}/connections/${connection.id}/secrets`);
+  const secrets = await listItems(client, `${organizationPath}/model-providers/${connection.id}/secrets`);
   if (!secrets.some((item) => item.secret_name === 'api_key')) {
     await client.json(
-      `${workspacePath}/connections/${connection.id}/secrets`,
+      `${organizationPath}/model-providers/${connection.id}/secrets`,
       {
         method: 'POST',
         body: {
@@ -379,13 +388,13 @@ async function ensureControlPlane(client, environment, tenant) {
     );
   }
 
-  let modelProfile = (await listItems(client, `${workspacePath}/model-profiles`)).find(
+  let modelProfile = (await listItems(client, `${organizationPath}/model-profiles`)).find(
     (item) => item.name === 'E2E Deterministic Model'
   );
   const modelBaseUrl = required(environment, 'ZEUS_E2E_MODEL_BASE_URL');
   if (!modelProfile) {
     modelProfile = await client.json(
-      `${workspacePath}/model-profiles`,
+      `${organizationPath}/model-profiles`,
       {
         method: 'POST',
         body: {
@@ -401,7 +410,7 @@ async function ensureControlPlane(client, environment, tenant) {
     );
   } else if (modelProfile.base_url !== modelBaseUrl || modelProfile.connection_id !== connection.id) {
     modelProfile = await client.json(
-      `${workspacePath}/model-profiles/${modelProfile.id}`,
+      `${organizationPath}/model-profiles/${modelProfile.id}`,
       {
         method: 'PATCH',
         headers: { 'if-match': `"revision-${modelProfile.revision}"` },
@@ -489,6 +498,7 @@ async function ensureControlPlane(client, environment, tenant) {
         method: 'POST',
         body: {
           instructions: 'Call the available E2E capability once, then return a concise result.',
+          model_profile_id: modelProfile.id,
           configuration: {}
         }
       },
@@ -586,7 +596,7 @@ async function loadState() {
   );
 }
 
-async function waitForRunStatus(client, workspaceId, runId, expected, timeoutMilliseconds) {
+export async function waitForRunStatus(client, workspaceId, runId, expected, timeoutMilliseconds) {
   const deadline = Date.now() + timeoutMilliseconds;
   let lastStatus = 'unknown';
   while (Date.now() < deadline) {

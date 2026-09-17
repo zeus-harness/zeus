@@ -51,6 +51,21 @@ export function startWorkItemRun(
   );
 }
 
+export function reprocessWorkItemReview(
+  fetcher: ApiFetcher,
+  options: WorkspaceRequestOptions,
+  workItemId: string,
+  reviewId: string,
+  revision: number
+): Promise<WorkItemRunStart> {
+  return requestWorkspaceJson<WorkItemRunStart>(fetcher, options,
+    `/work-items/${encodeURIComponent(workItemId)}/reviews/${encodeURIComponent(reviewId)}/runs`,
+    jsonRequest('POST', {}, {
+      'If-Match': `"revision-${revision}"`,
+      'Idempotency-Key': `review-reprocess-${reviewId}-${revision}`
+    }));
+}
+
 export function getRun(
   fetcher: ApiFetcher,
   options: WorkspaceRequestOptions,

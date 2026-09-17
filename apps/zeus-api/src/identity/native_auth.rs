@@ -125,6 +125,7 @@ pub async fn register(
         .filter(|value| !value.is_empty())
         .map(|value| sha256(value.as_bytes()));
 
+    let mut transaction = state.platform.database.begin().await?;
     let registration = sqlx::query_as::<_, RegistrationRow>(
         "select * from zeus_private.create_native_registration($1, $2, $3, $4)",
     )
@@ -132,17 +133,20 @@ pub async fn register(
     .bind(request.display_name.trim())
     .bind(password_hash)
     .bind(invitation_hash)
-    .fetch_one(&state.platform.database)
+    .fetch_one(&mut *transaction)
     .await;
 
     match registration {
         Ok(row) => {
             if !row.email_verified {
-                queue_email_verification(&state, row.user_id, &email).await?;
+                queue_email_verification_on(&state, &mut transaction, row.user_id, &email).await?;
             }
             let _ = (row.organization_id, row.workspace_id);
+            transaction.commit().await?;
         }
-        Err(error) if has_database_code(&error, "23505") || has_database_code(&error, "42501") => {}
+        Err(error) if has_database_code(&error, "23505") || has_database_code(&error, "42501") => {
+            transaction.rollback().await?;
+        }
         Err(error) => return Err(error.into()),
     }
 

@@ -532,6 +532,150 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/organizations/{organization_id}/model-profiles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["organization_list_model_profiles"];
+        put?: never;
+        post: operations["organization_create_model_profile"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/organizations/{organization_id}/model-profiles/{model_profile_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["organization_get_model_profile"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch: operations["organization_update_model_profile"];
+        trace?: never;
+    };
+    "/api/v1/organizations/{organization_id}/model-profiles/{model_profile_id}/archive": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["organization_archive_model_profile"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/organizations/{organization_id}/model-profiles/{model_profile_id}/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["test_model_connection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/organizations/{organization_id}/model-providers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["organization_list_connections"];
+        put?: never;
+        post: operations["organization_create_connection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/organizations/{organization_id}/model-providers/{connection_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["organization_get_connection"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch: operations["organization_update_connection"];
+        trace?: never;
+    };
+    "/api/v1/organizations/{organization_id}/model-providers/{connection_id}/archive": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["organization_archive_connection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/organizations/{organization_id}/model-providers/{connection_id}/secrets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["organization_list_connection_secrets"];
+        put?: never;
+        post: operations["organization_create_connection_secret"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/organizations/{organization_id}/model-providers/{connection_id}/secrets/{secret_name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["organization_rotate_connection_secret"];
+        post: operations["organization_create_named_connection_secret"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/organizations/{organization_id}/oidc-clients": {
         parameters: {
             query?: never;
@@ -719,6 +863,22 @@ export interface paths {
         put?: never;
         post?: never;
         delete: operations["revoke_platform_tenant_access_grant"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/platform/users": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_platform_users"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -1357,7 +1517,7 @@ export interface paths {
         };
         get: operations["list_model_profiles"];
         put?: never;
-        post: operations["create_model_profile"];
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1374,22 +1534,6 @@ export interface paths {
         get: operations["get_model_profile"];
         put?: never;
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch: operations["update_model_profile"];
-        trace?: never;
-    };
-    "/api/v1/workspaces/{workspace_id}/model-profiles/{model_profile_id}/archive": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["archive_model_profile"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1860,6 +2004,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/reviews": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_work_item_reviews"];
+        put?: never;
+        post: operations["create_work_item_review"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/reviews/{review_id}/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["reprocess_work_item_review"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/runs": {
         parameters: {
             query?: never;
@@ -2196,6 +2372,8 @@ export interface components {
             id: string;
             instructions: string;
             /** Format: uuid */
+            model_profile_id?: string | null;
+            /** Format: uuid */
             organization_id: string;
             /** Format: int32 */
             version_number: number;
@@ -2344,7 +2522,7 @@ export interface components {
             /** Format: date-time */
             updated_at: string;
             /** Format: uuid */
-            workspace_id: string;
+            workspace_id?: string | null;
         };
         ConnectionSecretPageResponse: {
             items: components["schemas"]["ConnectionSecretResponse"][];
@@ -2363,7 +2541,7 @@ export interface components {
             rotated_at?: string | null;
             secret_name: string;
             /** Format: uuid */
-            workspace_id: string;
+            workspace_id?: string | null;
         };
         ConnectionSecretValueRequest: {
             secret: string;
@@ -2375,6 +2553,8 @@ export interface components {
         CreateAgentVersionRequest: {
             configuration?: unknown;
             instructions: string;
+            /** Format: uuid */
+            model_profile_id?: string | null;
         };
         CreateAttachmentRequest: {
             content_base64: string;
@@ -2534,6 +2714,12 @@ export interface components {
             source_kind?: string | null;
             title: string;
         };
+        CreateWorkItemReviewRequest: {
+            decision: string;
+            reason: string;
+            /** Format: uuid */
+            run_id: string;
+        };
         CreateWorkflowRequest: {
             description?: string;
             name: string;
@@ -2550,7 +2736,7 @@ export interface components {
             /** Format: int32 */
             max_steps?: number;
             /** Format: uuid */
-            model_profile_id: string;
+            model_profile_id?: string | null;
             output_schema?: unknown;
             retry_policy?: unknown;
             /** Format: int64 */
@@ -2887,6 +3073,14 @@ export interface components {
             method: string;
             verified: boolean;
         };
+        ModelConnectionTestResponse: {
+            /** Format: date-time */
+            checked_at: string;
+            code: string;
+            /** Format: int64 */
+            model_revision: number;
+            success: boolean;
+        };
         ModelProfilePageResponse: {
             items: components["schemas"]["ModelProfileResponse"][];
             next_cursor?: string | null;
@@ -2912,7 +3106,7 @@ export interface components {
             /** Format: date-time */
             updated_at: string;
             /** Format: uuid */
-            workspace_id: string;
+            workspace_id?: string | null;
         };
         NativeLoginRequest: {
             email: string;
@@ -3109,6 +3303,21 @@ export interface components {
             organization_name: string;
             organization_status: string;
             reason: string;
+        };
+        PlatformUserPageResponse: {
+            items: components["schemas"]["PlatformUserResponse"][];
+            next_cursor?: string | null;
+        };
+        PlatformUserResponse: {
+            /** Format: date-time */
+            created_at: string;
+            display_name: string;
+            email: string;
+            email_verified: boolean;
+            /** Format: uuid */
+            id: string;
+            mfa_enabled: boolean;
+            status: string;
         };
         ProblemDetails: {
             code: string;
@@ -3624,6 +3833,28 @@ export interface components {
             updated_at: string;
             /** Format: uuid */
             workspace_id: string;
+        };
+        WorkItemReviewPageResponse: {
+            items: components["schemas"]["WorkItemReviewResponse"][];
+            next_cursor?: string | null;
+        };
+        WorkItemReviewResponse: {
+            /** Format: date-time */
+            created_at: string;
+            decision: string;
+            /** Format: uuid */
+            id: string;
+            reason: string;
+            /** Format: uuid */
+            reviewed_by: string;
+            /** Format: uuid */
+            run_id: string;
+            /** Format: uuid */
+            work_item_id: string;
+            /** Format: int64 */
+            work_item_revision: number;
+            /** Format: uuid */
+            workflow_version_id: string;
         };
         WorkItemRunStartResponse: {
             run: components["schemas"]["RunResponse"];
@@ -5120,6 +5351,550 @@ export interface operations {
             };
         };
     };
+    organization_list_model_profiles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelProfilePageResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    organization_create_model_profile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        /** @description JSON request body */
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateModelProfileRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelProfileResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    organization_get_model_profile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+                /** @description Path identifier */
+                model_profile_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelProfileResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    organization_update_model_profile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+                /** @description Path identifier */
+                model_profile_id: string;
+            };
+            cookie?: never;
+        };
+        /** @description JSON request body */
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateModelProfileRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelProfileResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    organization_archive_model_profile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+                /** @description Path identifier */
+                model_profile_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelProfileResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    test_model_connection: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current resource ETag, e.g. revision-1 in double quotes. A stale revision returns 412. */
+                "If-Match": string;
+            };
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+                /** @description Path identifier */
+                model_profile_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelConnectionTestResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    organization_list_connections: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectionPageResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    organization_create_connection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        /** @description JSON request body */
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateConnectionRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectionResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    organization_get_connection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+                /** @description Path identifier */
+                connection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectionResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    organization_update_connection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+                /** @description Path identifier */
+                connection_id: string;
+            };
+            cookie?: never;
+        };
+        /** @description JSON request body */
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateConnectionRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectionResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    organization_archive_connection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+                /** @description Path identifier */
+                connection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectionResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    organization_list_connection_secrets: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+                /** @description Path identifier */
+                connection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectionSecretPageResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    organization_create_connection_secret: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+                /** @description Path identifier */
+                connection_id: string;
+            };
+            cookie?: never;
+        };
+        /** @description JSON request body */
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateConnectionSecretRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectionSecretResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    organization_rotate_connection_secret: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+                /** @description Path identifier */
+                connection_id: string;
+                /** @description Path identifier */
+                secret_name: string;
+            };
+            cookie?: never;
+        };
+        /** @description JSON request body */
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConnectionSecretValueRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectionSecretResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    organization_create_named_connection_secret: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+                /** @description Path identifier */
+                connection_id: string;
+                /** @description Path identifier */
+                secret_name: string;
+            };
+            cookie?: never;
+        };
+        /** @description JSON request body */
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConnectionSecretValueRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectionSecretResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
     list_oidc_clients: {
         parameters: {
             query?: never;
@@ -5735,6 +6510,39 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    list_platform_users: {
+        parameters: {
+            query?: {
+                cursor?: string;
+                limit?: number;
+                email?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Global users visible to platform owners */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlatformUserPageResponse"];
+                };
             };
             /** @description Problem Details error */
             default: {
@@ -7606,117 +8414,7 @@ export interface operations {
             };
         };
     };
-    create_model_profile: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Path identifier */
-                workspace_id: string;
-            };
-            cookie?: never;
-        };
-        /** @description JSON request body */
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["CreateModelProfileRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful response */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ModelProfileResponse"];
-                };
-            };
-            /** @description Problem Details error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/problem+json": components["schemas"]["ProblemDetails"];
-                };
-            };
-        };
-    };
     get_model_profile: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Path identifier */
-                workspace_id: string;
-                /** @description Path identifier */
-                model_profile_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ModelProfileResponse"];
-                };
-            };
-            /** @description Problem Details error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/problem+json": components["schemas"]["ProblemDetails"];
-                };
-            };
-        };
-    };
-    update_model_profile: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Path identifier */
-                workspace_id: string;
-                /** @description Path identifier */
-                model_profile_id: string;
-            };
-            cookie?: never;
-        };
-        /** @description JSON request body */
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["UpdateModelProfileRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ModelProfileResponse"];
-                };
-            };
-            /** @description Problem Details error */
-            default: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/problem+json": components["schemas"]["ProblemDetails"];
-                };
-            };
-        };
-    };
-    archive_model_profile: {
         parameters: {
             query?: never;
             header?: never;
@@ -8835,7 +9533,12 @@ export interface operations {
     };
     list_work_items: {
         parameters: {
-            query?: never;
+            query?: {
+                created_by?: string;
+                unassigned?: boolean;
+                /** @description Case-insensitive literal title substring, at most 200 characters; combined with other filters before cursor pagination. */
+                q?: string;
+            };
             header?: never;
             path: {
                 /** @description Path identifier */
@@ -9143,6 +9846,137 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["ExternalReferenceResponse"];
                 };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    list_work_item_reviews: {
+        parameters: {
+            query?: {
+                /** @description Opaque pagination cursor or page size (1-100). */
+                cursor?: string;
+                /** @description Opaque pagination cursor or page size (1-100). */
+                limit?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                workspace_id: string;
+                /** @description Path identifier */
+                work_item_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkItemReviewPageResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    create_work_item_review: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current resource ETag, e.g. revision-1 in double quotes. A stale revision returns 412. */
+                "If-Match": string;
+            };
+            path: {
+                /** @description Path identifier */
+                workspace_id: string;
+                /** @description Path identifier */
+                work_item_id: string;
+            };
+            cookie?: never;
+        };
+        /** @description JSON request body */
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateWorkItemReviewRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkItemReviewResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    reprocess_work_item_review: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+                "If-Match": string;
+            };
+            path: {
+                workspace_id: string;
+                work_item_id: string;
+                review_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description New Run based on human change request */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkItemRunStartResponse"];
+                };
+            };
+            /** @description Review or workflow unavailable */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Work item changed */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Problem Details error */
             default: {

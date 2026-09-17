@@ -35,6 +35,7 @@ export async function loadAgentStudio(
   let modelProfiles: ModelProfile[] = [];
   let capabilities: WorkspaceCapability[] = [];
   let catalog: CapabilityDefinition[] = [];
+  if (resource === 'agents') modelProfiles = (await requestWorkspaceJson<{ items: ModelProfile[] }>(fetcher, options, '/model-profiles', undefined, { limit: 100 })).items.filter((profile) => !profile.archived_at);
   if (resource === 'agents' && selected) {
     agentVersions = await requestWorkspaceJson(fetcher, options, `/agents/${selected.id}/versions`);
   }
@@ -60,10 +61,10 @@ export async function loadAgentStudio(
 
 export type AgentStudioData = Awaited<ReturnType<typeof loadAgentStudio>>;
 
-export async function loadModelConnections(fetcher: ApiFetcher, options: WorkspaceRequestOptions) {
+export async function loadModelConnections(fetcher: ApiFetcher, options: { apiBaseUrl?: string; organizationId: string }) {
   const [connections, models] = await Promise.all([
-    requestWorkspaceJson<{ items: Connection[] }>(fetcher, options, '/connections', undefined, { limit: 100 }),
-    requestWorkspaceJson<{ items: ModelProfile[] }>(fetcher, options, '/model-profiles', undefined, { limit: 100 })
+    requestJson<{ items: Connection[] }>(fetcher, serverApiUrl(options.apiBaseUrl, `/api/v1/organizations/${options.organizationId}/model-providers?limit=100`)),
+    requestJson<{ items: ModelProfile[] }>(fetcher, serverApiUrl(options.apiBaseUrl, `/api/v1/organizations/${options.organizationId}/model-profiles?limit=100`))
   ]);
   return {
     connections: connections.items.filter((connection) => !connection.archived_at && connection.provider_kind === 'openai_compatible'),

@@ -5,6 +5,7 @@
   import { Badge } from '@zeus/ui/components/ui/badge';
   import { Button } from '@zeus/ui/components/ui/button';
 
+  import { eventLabel } from './event-presentation';
   import type { RunEvent } from '$lib/api/runs';
   import { TERMINAL_RUN_STATES } from '$lib/api/runs';
   import {
@@ -55,20 +56,6 @@
     } catch {
       return '—';
     }
-  }
-
-  function eventLabel(event: RunEvent): string {
-    const kind = event.event_type.toLowerCase();
-    if (kind.includes('approval')) return '人工审批';
-    if (kind.includes('tool')) return '工具调用';
-    if (kind.includes('child')) return 'Child Run';
-    if (kind.includes('model') || kind.includes('assistant')) return '模型响应';
-    if (kind.includes('cancel')) return '取消运行';
-    if (kind.includes('fail')) return '运行失败';
-    if (kind.includes('succeed') || kind.includes('complete')) return '运行完成';
-    if (kind.includes('queued')) return '进入队列';
-    if (kind.includes('start') || kind.includes('running')) return '开始执行';
-    return event.event_type;
   }
 
   function eventSummary(event: RunEvent): string | null {
@@ -261,27 +248,33 @@
   {#if events.length === 0}
     <div class="rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted-foreground">Run 已创建，正在等待第一条事件。</div>
   {:else}
-    <ol class="relative ml-3 border-l border-border pl-6">
-      {#each events as event (event.sequence)}
-        {@const Icon = eventIcon(event)}
-        <li class="relative pb-6 last:pb-0">
-          <span class="absolute -left-[2.35rem] grid size-7 place-items-center rounded-full border border-border bg-background"><Icon class="size-3.5" /></span>
-          <div class="rounded-lg border border-border p-4">
-            <div class="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <p class="text-sm font-medium">{eventLabel(event)}</p>
-                <p class="mt-1 text-xs text-muted-foreground">#{event.sequence} · {event.event_type}</p>
+    <details class="rounded-lg border border-border">
+      <summary class="cursor-pointer rounded-lg px-4 py-3 text-sm font-medium focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">
+        执行过程 · {events.length} 条事件
+        <span class="ml-2 text-xs font-normal text-muted-foreground">模型调用、工具执行与审批记录</span>
+      </summary>
+      <ol class="relative mx-4 mb-4 mt-2 ml-7 border-l border-border pl-6">
+        {#each events as event (event.sequence)}
+          {@const Icon = eventIcon(event)}
+          <li class="relative pb-6 last:pb-0">
+            <span class="absolute -left-[2.35rem] grid size-7 place-items-center rounded-full border border-border bg-background"><Icon class="size-3.5" /></span>
+            <div class="rounded-lg border border-border p-4">
+              <div class="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <p class="text-sm font-medium">{eventLabel(event)}</p>
+                  <p class="mt-1 text-xs text-muted-foreground">#{event.sequence} · {event.event_type}</p>
+                </div>
+                <time class="text-xs text-muted-foreground" datetime={event.occurred_at}>{dateLabel(event.occurred_at)}</time>
               </div>
-              <time class="text-xs text-muted-foreground" datetime={event.occurred_at}>{dateLabel(event.occurred_at)}</time>
+              {#if eventSummary(event)}<p class="mt-3 text-sm text-muted-foreground">{eventSummary(event)}</p>{/if}
+              <details class="mt-3">
+                <summary class="cursor-pointer text-xs text-muted-foreground">原始事件</summary>
+                <pre class="mt-2 max-h-56 overflow-auto rounded bg-muted p-3 font-mono text-xs leading-5">{formatJson(event.payload)}</pre>
+              </details>
             </div>
-            {#if eventSummary(event)}<p class="mt-3 text-sm text-muted-foreground">{eventSummary(event)}</p>{/if}
-            <details class="mt-3">
-              <summary class="cursor-pointer text-xs text-muted-foreground">原始事件</summary>
-              <pre class="mt-2 max-h-56 overflow-auto rounded bg-muted p-3 font-mono text-xs leading-5">{formatJson(event.payload)}</pre>
-            </details>
-          </div>
-        </li>
-      {/each}
-    </ol>
+          </li>
+        {/each}
+      </ol>
+    </details>
   {/if}
 </div>

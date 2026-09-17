@@ -16,15 +16,21 @@ export type WorkItemAttachment = components['schemas']['AttachmentResponse'];
 export function listWorkItems(
   fetcher: ApiFetcher,
   options: WorkspaceRequestOptions & {
+    q?: string;
     status?: string;
     assigneeUserId?: string;
+    createdBy?: string;
+    unassigned?: boolean;
     cursor?: string;
     limit?: number;
   }
 ): Promise<WorkItemPage> {
   return requestWorkspaceJson<WorkItemPage>(fetcher, options, '/work-items', undefined, {
+    q: options.q,
     status: options.status,
     assignee_user_id: options.assigneeUserId,
+    created_by: options.createdBy,
+    unassigned: options.unassigned,
     cursor: options.cursor,
     limit: options.limit
   });
@@ -93,4 +99,16 @@ export function listWorkItemAttachments(
     options,
     `/work-items/${encodeURIComponent(workItemId)}/attachments`
   );
+}
+
+export type WorkItemReview = components['schemas']['WorkItemReviewResponse'];
+export type WorkItemReviewPage = components['schemas']['WorkItemReviewPageResponse'];
+
+export function listWorkItemReviews(fetcher: ApiFetcher, options: WorkspaceRequestOptions, workItemId: string, cursor?: string): Promise<WorkItemReviewPage> {
+  return requestWorkspaceJson(fetcher, options, `/work-items/${encodeURIComponent(workItemId)}/reviews`, undefined, { limit: 50, cursor });
+}
+
+export function createWorkItemReview(fetcher: ApiFetcher, options: WorkspaceRequestOptions, workItemId: string, revision: number, input: components['schemas']['CreateWorkItemReviewRequest']): Promise<WorkItemReview> {
+  return requestWorkspaceJson(fetcher, options, `/work-items/${encodeURIComponent(workItemId)}/reviews`,
+    jsonRequest('POST', input, { 'If-Match': `"revision-${revision}"` }));
 }

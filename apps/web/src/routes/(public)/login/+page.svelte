@@ -1,5 +1,6 @@
 <script lang="ts">
   import { page } from '$app/state';
+  import { loginAction } from '$lib/login-action';
 
   import { Button } from '@zeus/ui/components/ui/button';
   import * as Card from '@zeus/ui/components/ui/card';
@@ -18,7 +19,7 @@
           ? '该企业邮箱已经对应一个 Zeus 账号。请先用原生账号登录，再到“联合身份”页显式绑定。'
           : federatedError === 'federated_not_allowed'
             ? '当前企业身份不符合该组织的加入规则。请联系组织管理员确认邀请、域名或 Group Mapping。'
-            : null
+            : page.url.searchParams.has('return_to') ? '请登录以继续访问刚才的页面；登录后会返回原位置。' : null
   );
   let email = $derived(form?.type === 'error' && 'email' in form.values ? form.values.email : '');
   let organizationSlug = $derived(
@@ -58,7 +59,7 @@
           <Card.Description>使用邮箱和密码登录你的 Zeus 账号。</Card.Description>
         </Card.Header>
         <Card.Content>
-          <form method="POST" action="?/login" class="space-y-5">
+          <form method="POST" action={loginAction('login', page.url)} class="space-y-5">
             <div>
               <label class="text-sm font-medium" for="email">Email</label>
               <Input
@@ -109,7 +110,7 @@
           <Card.Description>输入组织和身份提供商的 slug，前往企业单点登录。</Card.Description>
         </Card.Header>
         <Card.Content>
-          <form method="POST" action="?/federated" class="space-y-5">
+          <form method="POST" action={loginAction('federated', page.url)} class="space-y-5">
             <div>
               <label class="text-sm font-medium" for="organization_slug">Organization slug</label>
               <Input

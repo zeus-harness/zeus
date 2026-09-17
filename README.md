@@ -59,6 +59,7 @@ WorkItem 验收使用独立 E2E profile。它只操作 `zeus-e2e-*` 容器、`ze
 scripts/container e2e build all
 scripts/container e2e smoke
 scripts/container e2e test-db
+pnpm e2e:pilot
 pnpm exec playwright install chromium
 pnpm test:browser
 scripts/container e2e status all
@@ -69,7 +70,7 @@ scripts/container e2e reset-db --yes
 
 `test-db` 在 E2E PostgreSQL 中为每组集成测试创建独立临时数据库，不会清空现有库，也没有 API 连接这些临时库。它覆盖空库迁移、带数据的 `0029 → 0030` 升级、权限与 Runtime，完成或测试失败后删除本次数据库。已有本机 PostgreSQL 时，可在环境中提供 `ZEUS_TEST_DATABASE_URL` 后运行 `pnpm test:postgres`；该连接必须指向回环地址，并有建库、建角色和迁移权限。不要把连接凭据写入命令行。
 
-`test:browser` 在 `smoke` 之后运行，使用隔离测试账号，覆盖登录、MFA、Workspace POST 选择、配置发布、工作项工具、审批与 SSE 结果。测试不保存登录态、视频或包含凭据的 trace；登录后的截图写入系统临时目录，可用 `ZEUS_BROWSER_OUTPUT_DIR` 指定位置。
+`test:browser` 在 `smoke` 和 `e2e:pilot` 之后运行，使用隔离测试账号，覆盖登录、MFA、Workspace POST 选择、配置发布、模型编辑、密钥轮换、工作项工具、审批、SSE 结果与失败恢复指引。测试不保存登录态、视频或包含凭据的 trace；登录后的截图写入系统临时目录，可用 `ZEUS_BROWSER_OUTPUT_DIR` 指定位置。
 
 `.github/workflows/ci.yml` 在 PR 和主干/`codex/**` 推送时执行 Rust/Web/OpenAPI、隔离 PostgreSQL，以及生产镜像和浏览器验收。CI 使用独立的临时 PostgreSQL 和确定性模型，不读取部署密钥。
 
@@ -87,7 +88,7 @@ Kubernetes 基线要求平台创建两个独立 Secret：`zeus-migration` 只保
 
 ### 升级已有环境
 
-`0026` 身份拆分和 `0030` 平台角色改名不支持旧 API 与新 Schema 混跑。升级前记录镜像版本、备份恢复点及对应 envelope key，关闭入口并停止旧 API（包括内嵌 Supervisor），确认 HPA 不会重新拉起旧副本，再用独立 migration owner 执行迁移。迁移成功后启动匹配的新 API/Web，检查 readiness、登录、Workspace 权限与合成 Run，再恢复入口。不能用一次对整份 Kubernetes 基线的 apply 来保证 Migration Job 与 Deployment 的执行顺序。
+`0026` 身份拆分、`0030` 平台角色改名和 `0031` 组织模型共享不支持旧 API 与新 Schema 混跑。升级前记录镜像版本、备份恢复点及对应 envelope key，关闭入口并停止旧 API（包括内嵌 Supervisor），确认 HPA 不会重新拉起旧副本，再用独立 migration owner 执行迁移。迁移成功后启动匹配的新 API/Web，检查 readiness、登录、Workspace 权限与合成 Run，再恢复入口。不能用一次对整份 Kubernetes 基线的 apply 来保证 Migration Job 与 Deployment 的执行顺序。
 
 迁移后不要仅回滚旧 API 镜像；优先前向修复，需要恢复数据库时按 [备份恢复手册](docs/runbooks/backup-restore.md) 处理密钥及身份撤销风险。升级约束见 [ADR 0008](docs/adr/0008-tenant-navigation-owner-and-identity-trust.md)。现有 CI 证明空库和 `0029 → 0030` 升级，不代表任意历史版本均有升级路径。
 
@@ -127,13 +128,15 @@ Web SSR 通过 `ZEUS_API_URL` 请求 API。Apple `container` 1.0.0 本地脚本�
 
 ## 配置内置 Agent
 
-1. Workspace Owner 在 `/:workspaceId/settings/connections` 创建 OpenAI-compatible 连接并写入 API Key；随后在 `settings/model-profiles` 填写 API Base URL、模型 ID 和超时。生产地址遵循 HTTPS 和模型出口策略。
-2. Owner 或 Builder 在 `/:workspaceId/agents` 创建 Agent，编写指令、保存新版本并发布。
+1. Organization Owner 在 `/organizations/:organizationId/settings/connections` 管理模型供应商和 API Key；在组织的 `settings/model-profiles` 为供应商添加一个或多个模型，填写 API Base URL、模型 ID 和超时。可接入多家 OpenAI-compatible 供应商，组织内所有 Workspace 共用模型目录。生产地址遵循 HTTPS 和模型出口策略。
+2. Workspace Owner 或 Builder 在 `/:workspaceId/agents` 创建 Agent，选择组织模型并编写指令，保存新版本后发布；无需配置供应商或密钥。
 3. 需要读取工作项时，在 `settings/capabilities` 启用“读取当前工作项”。首次注册目录项需要 Organization Owner，Workspace 启用独立要求 Workspace Owner；默认要求审批。
-4. 在 `/:workspaceId/workflows` 创建 Workflow，选择已发布 Agent、模型、允许工具和步数/时间/Token 预算，保存并发布版本。发布使用 revision 检查，冲突时刷新后重试。
+4. 在 `/:workspaceId/workflows` 创建 Workflow，选择已发布 Agent、允许工具和步数/时间/Token 预算，保存并发布版本；模型沿用 Agent 版本，不再重复选择。发布使用 revision 检查，冲突时刷新后重试。
 5. 在工作项中选择 Workflow 并启动；需要时完成审批，在 Run 页面查看事件和结果。更新 Agent 后需创建并发布新的 Workflow 版本，已有运行保留原版本。
 
-`builtin.work_item_read` 只接收空对象，返回当前 Run 所关联工作项的标题、描述、状态、优先级和输入；没有任意 ID 查询或附件/文件读取能力。工具返回内容仍是不可信业务数据。模型密钥不提供原文读取接口。当前页面覆盖首次接入与版本发布；连接密钥轮换和模型配置更新仍通过已有 API 完成。
+`builtin.work_item_read` 只接收空对象，返回当前 Run 所关联工作项的标题、描述、状态、优先级和输入；没有任意 ID 查询或附件/文件读取能力。工具返回内容仍是不可信业务数据。模型密钥不提供原文读取接口。组织供应商列表支持轮换 API Key，组织模型目录支持编辑地址、模型、供应商和超时；其他模型参数保留，revision 冲突要求刷新后重试。配置及密钥更新会影响后续加载配置的运行，包括恢复中的运行。
+
+需求整理试点的范围、指令、七类合成回归和人工接受标准见 [试点手册](docs/runbooks/requirements-pilot.md)。运行失败或取消时，Run 页面提供对应恢复指引；恢复操作保留原记录。生产环境执行顺序与证据要求见 [生产验收清单](docs/runbooks/production-acceptance.md)。
 
 确定性 fixture 证明配置、工具和持久化链路可执行；真实模型兼容性、成本和业务回答质量需要部署方配置真实连接后另行验收。H/I5 外部门禁保持 `active`。
 
@@ -152,6 +155,8 @@ pnpm load:identity -- --base-url http://127.0.0.1:3000 --allow-http
 ```
 
 它只用于隔离环境。判定和留存要求见 `docs/runbooks/identity-load-test.md`。OpenID Foundation Suite 的当前状态见 `docs/runbooks/openid-conformance.md`。
+
+旧 Workspace 模型经 `0031` 上移到 Organization，保留模型 ID、密钥和历史运行；跨 Workspace 重名记录添加标识后缀，不自动合并供应商。旧 Agent 版本仍沿用原 Workflow 模型；要使用新的创建流程需保存一个选择了模型的 Agent 版本。普通 Workspace 工具连接不迁移。
 
 ## 验证
 

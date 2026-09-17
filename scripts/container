@@ -530,6 +530,7 @@ build_e2e_openai_image() (
 
   echo "Building ${ZEUS_E2E_OPENAI_IMAGE}."
   cp "${REPO_ROOT}/scripts/e2e/fake-openai.mjs" "${build_context}/fake-openai.mjs"
+  cp "${REPO_ROOT}/scripts/e2e/requirements-cases.mjs" "${build_context}/requirements-cases.mjs"
   cp \
     "${REPO_ROOT}/deploy/container/e2e-openai.Containerfile" \
     "${build_context}/Containerfile"

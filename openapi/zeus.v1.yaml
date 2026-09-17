@@ -1203,6 +1203,553 @@ paths:
       security:
       - sessionCookie: []
       - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/model-profiles:
+    get:
+      tags:
+      - models-and-tools
+      operationId: organization_list_model_profiles
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelProfilePageResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - models-and-tools
+      operationId: organization_create_model_profile
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateModelProfileRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelProfileResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/model-profiles/{model_profile_id}:
+    get:
+      tags:
+      - models-and-tools
+      operationId: organization_get_model_profile
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: model_profile_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelProfileResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    patch:
+      tags:
+      - models-and-tools
+      operationId: organization_update_model_profile
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: model_profile_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateModelProfileRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelProfileResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/model-profiles/{model_profile_id}/archive:
+    post:
+      tags:
+      - models-and-tools
+      operationId: organization_archive_model_profile
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: model_profile_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelProfileResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/model-profiles/{model_profile_id}/test:
+    post:
+      tags:
+      - integrations
+      operationId: test_model_connection
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: model_profile_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: If-Match
+        in: header
+        description: Current resource ETag, e.g. revision-1 in double quotes. A stale revision returns 412.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelConnectionTestResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/model-providers:
+    get:
+      tags:
+      - models-and-tools
+      operationId: organization_list_connections
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionPageResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - models-and-tools
+      operationId: organization_create_connection
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateConnectionRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/model-providers/{connection_id}:
+    get:
+      tags:
+      - models-and-tools
+      operationId: organization_get_connection
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: connection_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    patch:
+      tags:
+      - models-and-tools
+      operationId: organization_update_connection
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: connection_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateConnectionRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/model-providers/{connection_id}/archive:
+    post:
+      tags:
+      - models-and-tools
+      operationId: organization_archive_connection
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: connection_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/model-providers/{connection_id}/secrets:
+    get:
+      tags:
+      - models-and-tools
+      operationId: organization_list_connection_secrets
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: connection_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionSecretPageResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - models-and-tools
+      operationId: organization_create_connection_secret
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: connection_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateConnectionSecretRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionSecretResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/model-providers/{connection_id}/secrets/{secret_name}:
+    put:
+      tags:
+      - models-and-tools
+      operationId: organization_rotate_connection_secret
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: connection_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: secret_name
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConnectionSecretValueRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionSecretResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - models-and-tools
+      operationId: organization_create_named_connection_secret
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: connection_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: secret_name
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConnectionSecretValueRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionSecretResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
   /api/v1/organizations/{organization_id}/oidc-clients:
     get:
       tags:
@@ -1783,6 +2330,45 @@ paths:
       responses:
         '204':
           description: Platform tenant access Grant revoked
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/platform/users:
+    get:
+      tags:
+      - platform
+      operationId: list_platform_users
+      parameters:
+      - name: cursor
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int32
+          minimum: 0
+      - name: email
+        in: query
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Global users visible to platform owners
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlatformUserPageResponse'
         default:
           description: Problem Details error
           content:
@@ -3551,119 +4137,11 @@ paths:
       security:
       - sessionCookie: []
       - serviceAccountBearer: []
-    post:
-      tags:
-      - models-and-tools
-      operationId: create_model_profile
-      parameters:
-      - name: workspace_id
-        in: path
-        description: Path identifier
-        required: true
-        schema:
-          type: string
-      requestBody:
-        description: JSON request body
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/CreateModelProfileRequest'
-        required: true
-      responses:
-        '201':
-          description: Successful response
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ModelProfileResponse'
-        default:
-          description: Problem Details error
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/ProblemDetails'
-      security:
-      - sessionCookie: []
-      - serviceAccountBearer: []
   /api/v1/workspaces/{workspace_id}/model-profiles/{model_profile_id}:
     get:
       tags:
       - models-and-tools
       operationId: get_model_profile
-      parameters:
-      - name: workspace_id
-        in: path
-        description: Path identifier
-        required: true
-        schema:
-          type: string
-      - name: model_profile_id
-        in: path
-        description: Path identifier
-        required: true
-        schema:
-          type: string
-      responses:
-        '200':
-          description: Successful response
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ModelProfileResponse'
-        default:
-          description: Problem Details error
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/ProblemDetails'
-      security:
-      - sessionCookie: []
-      - serviceAccountBearer: []
-    patch:
-      tags:
-      - models-and-tools
-      operationId: update_model_profile
-      parameters:
-      - name: workspace_id
-        in: path
-        description: Path identifier
-        required: true
-        schema:
-          type: string
-      - name: model_profile_id
-        in: path
-        description: Path identifier
-        required: true
-        schema:
-          type: string
-      requestBody:
-        description: JSON request body
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/UpdateModelProfileRequest'
-        required: true
-      responses:
-        '200':
-          description: Successful response
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ModelProfileResponse'
-        default:
-          description: Problem Details error
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/ProblemDetails'
-      security:
-      - sessionCookie: []
-      - serviceAccountBearer: []
-  /api/v1/workspaces/{workspace_id}/model-profiles/{model_profile_id}/archive:
-    post:
-      tags:
-      - models-and-tools
-      operationId: archive_model_profile
       parameters:
       - name: workspace_id
         in: path
@@ -4780,6 +5258,22 @@ paths:
         required: true
         schema:
           type: string
+      - name: created_by
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: unassigned
+        in: query
+        required: false
+        schema:
+          type: boolean
+      - name: q
+        in: query
+        description: Case-insensitive literal title substring, at most 200 characters; combined with other filters before cursor pagination.
+        required: false
+        schema:
+          type: string
       responses:
         '200':
           description: Successful response
@@ -5083,6 +5577,152 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ExternalReferenceResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/reviews:
+    get:
+      tags:
+      - collaboration
+      operationId: list_work_item_reviews
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: work_item_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: Opaque pagination cursor or page size (1-100).
+        required: false
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Opaque pagination cursor or page size (1-100).
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkItemReviewPageResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - collaboration
+      operationId: create_work_item_review
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: work_item_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: If-Match
+        in: header
+        description: Current resource ETag, e.g. revision-1 in double quotes. A stale revision returns 412.
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWorkItemReviewRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkItemReviewResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/reviews/{review_id}/runs:
+    post:
+      tags:
+      - execution
+      operationId: reprocess_work_item_review
+      parameters:
+      - name: workspace_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: work_item_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: review_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+      - name: If-Match
+        in: header
+        required: true
+        schema:
+          type: string
+      responses:
+        '201':
+          description: New Run based on human change request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkItemRunStartResponse'
+        '409':
+          description: Review or workflow unavailable
+        '412':
+          description: Work item changed
         default:
           description: Problem Details error
           content:
@@ -5794,6 +6434,11 @@ components:
           format: uuid
         instructions:
           type: string
+        model_profile_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
         organization_id:
           type: string
           format: uuid
@@ -6110,7 +6755,6 @@ components:
       required:
       - id
       - organization_id
-      - workspace_id
       - name
       - provider_kind
       - configuration
@@ -6144,7 +6788,9 @@ components:
           type: string
           format: date-time
         workspace_id:
-          type: string
+          type:
+          - string
+          - 'null'
           format: uuid
     ConnectionSecretPageResponse:
       type: object
@@ -6164,7 +6810,6 @@ components:
       required:
       - id
       - organization_id
-      - workspace_id
       - connection_id
       - secret_name
       - created_at
@@ -6189,7 +6834,9 @@ components:
         secret_name:
           type: string
         workspace_id:
-          type: string
+          type:
+          - string
+          - 'null'
           format: uuid
     ConnectionSecretValueRequest:
       type: object
@@ -6216,6 +6863,11 @@ components:
         configuration: {}
         instructions:
           type: string
+        model_profile_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
     CreateAttachmentRequest:
       type: object
       required:
@@ -6620,6 +7272,20 @@ components:
           - 'null'
         title:
           type: string
+    CreateWorkItemReviewRequest:
+      type: object
+      required:
+      - run_id
+      - decision
+      - reason
+      properties:
+        decision:
+          type: string
+        reason:
+          type: string
+        run_id:
+          type: string
+          format: uuid
     CreateWorkflowRequest:
       type: object
       required:
@@ -6633,7 +7299,6 @@ components:
       type: object
       required:
       - agent_version_id
-      - model_profile_id
       properties:
         agent_version_id:
           type: string
@@ -6649,7 +7314,9 @@ components:
           type: integer
           format: int32
         model_profile_id:
-          type: string
+          type:
+          - string
+          - 'null'
           format: uuid
         output_schema: {}
         retry_policy: {}
@@ -7486,6 +8153,24 @@ components:
           type: string
         verified:
           type: boolean
+    ModelConnectionTestResponse:
+      type: object
+      required:
+      - success
+      - code
+      - checked_at
+      - model_revision
+      properties:
+        checked_at:
+          type: string
+          format: date-time
+        code:
+          type: string
+        model_revision:
+          type: integer
+          format: int64
+        success:
+          type: boolean
     ModelProfilePageResponse:
       type: object
       required:
@@ -7504,7 +8189,6 @@ components:
       required:
       - id
       - organization_id
-      - workspace_id
       - connection_id
       - name
       - provider_kind
@@ -7548,7 +8232,9 @@ components:
           type: string
           format: date-time
         workspace_id:
-          type: string
+          type:
+          - string
+          - 'null'
           format: uuid
     NativeLoginRequest:
       type: object
@@ -8013,6 +8699,46 @@ components:
         organization_status:
           type: string
         reason:
+          type: string
+    PlatformUserPageResponse:
+      type: object
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlatformUserResponse'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+    PlatformUserResponse:
+      type: object
+      required:
+      - id
+      - email
+      - display_name
+      - status
+      - email_verified
+      - mfa_enabled
+      - created_at
+      properties:
+        created_at:
+          type: string
+          format: date-time
+        display_name:
+          type: string
+        email:
+          type: string
+        email_verified:
+          type: boolean
+        id:
+          type: string
+          format: uuid
+        mfa_enabled:
+          type: boolean
+        status:
           type: string
     ProblemDetails:
       type: object
@@ -9328,6 +10054,57 @@ components:
           type: string
           format: date-time
         workspace_id:
+          type: string
+          format: uuid
+    WorkItemReviewPageResponse:
+      type: object
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkItemReviewResponse'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+    WorkItemReviewResponse:
+      type: object
+      required:
+      - id
+      - work_item_id
+      - run_id
+      - workflow_version_id
+      - work_item_revision
+      - decision
+      - reason
+      - reviewed_by
+      - created_at
+      properties:
+        created_at:
+          type: string
+          format: date-time
+        decision:
+          type: string
+        id:
+          type: string
+          format: uuid
+        reason:
+          type: string
+        reviewed_by:
+          type: string
+          format: uuid
+        run_id:
+          type: string
+          format: uuid
+        work_item_id:
+          type: string
+          format: uuid
+        work_item_revision:
+          type: integer
+          format: int64
+        workflow_version_id:
           type: string
           format: uuid
     WorkItemRunStartResponse:

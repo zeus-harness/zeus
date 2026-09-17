@@ -55,12 +55,12 @@ begin
   insert into connections (
     id, organization_id, workspace_id, name, provider_kind, configuration
   ) values (
-    connection_id, organization_id, workspace_id, 'EFG model', 'openai_compatible', '{}'::jsonb
+    connection_id, organization_id, null, 'EFG model', 'openai_compatible', '{}'::jsonb
   );
   insert into model_profiles (
     id, organization_id, workspace_id, connection_id, name, base_url, model
   ) values (
-    model_profile_id, organization_id, workspace_id, connection_id,
+    model_profile_id, organization_id, null, connection_id,
     'EFG model', 'https://models.example.test/v1', 'test-model'
   );
   insert into agents (id, organization_id, workspace_id, name)

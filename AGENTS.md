@@ -105,6 +105,12 @@ npx @sveltejs/mcp svelte-autofixer <file> --svelte-version 5
 - 运行 ignored PostgreSQL 集成测试时只启动隔离 PostgreSQL。不要同时运行指向同一测试库的 `zeus-api`，否则内嵌 Supervisor 会领取测试创建的 queued Run。
 - 优先使用 `scripts/container e2e test-db`，它为每组测试创建独立数据库并清理；已有回环 PostgreSQL 可通过环境变量 `ZEUS_TEST_DATABASE_URL` 运行 `pnpm test:postgres`。不得让 API 指向这些临时库。
 
+## 模型管理
+
+- 模型供应商和模型目录由 Organization 管理，同一供应商可配置多个模型，供组织内所有 Workspace 使用。
+- Agent 版本选择组织模型，Workflow 沿用该选择；Workspace 不能管理组织模型或密钥。普通工具连接保留 Workspace 范围。
+- `0031` 保留旧模型 ID、密钥和历史版本，不支持旧 API 与新 Schema 混跑。
+
 ## API 契约
 
 - Rust 路由和 DTO 注解是 OpenAPI 来源。
@@ -123,3 +129,14 @@ npx @sveltejs/mcp svelte-autofixer <file> --svelte-version 5
 - 本地密码由 `scripts/container init-env` 生成到 `.zeus/local.env`。
 - Apple `container` 生命周期统一通过单文件 `scripts/container` 管理。不要再增加一命令一文件的容器脚本。
 - `.zeus/local.env` 权限必须是 `0600`，脚本和日志不得打印密码。
+
+## 人工结果验收
+
+- `work_item_reviews` 追加保存指定成功 Run 的人工接受/修改意见，绑定 Workflow 版本、工作项 revision、真实用户和时间。
+- 验收与工具审批分离；服务账号不得代替人验收。`If-Match` 冲突返回 412，验收不自动修改工作项状态。
+
+## 自主注册与邀请
+
+- 自主注册在同一事务内创建账号、个人 Organization、默认 Workspace、Owner 成员关系和验证邮件任务；邮箱验证仍是访问门禁。
+- 邀请新用户只加入受邀组织；已有用户使用本人会话 POST 接受邀请，GET 不改变成员关系或 Session。
+- 平台用户目录使用游标和索引分页，完整邮箱精确查找，不加载全量用户或使用大 OFFSET。

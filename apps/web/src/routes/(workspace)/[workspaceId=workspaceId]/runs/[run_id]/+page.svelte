@@ -13,6 +13,7 @@
 
   import EmptyState from '$lib/components/layout/EmptyState.svelte';
   import RunTimeline from '$lib/features/runs/RunTimeline.svelte';
+  import { runRecovery } from '$lib/features/runs/recovery';
   import WorkspaceStatus from '$lib/components/WorkspaceStatus.svelte';
   import type { Approval } from '$lib/api/runs';
 
@@ -20,6 +21,15 @@
 
   let { data, form } = $props<{ data: PageData; form: ActionData }>();
   let trace = $derived(data.trace.data);
+  let reprocessing = $derived.by(() => {
+    const input = trace?.run.input;
+    if (!input || typeof input !== 'object' || !('reprocessing' in input)) return null;
+    const value = input.reprocessing;
+    if (!value || typeof value !== 'object' || !('source_run_id' in value) || !('review_id' in value) || !('reason' in value) || !('work_item_revision' in value)) return null;
+    if (typeof value.source_run_id !== 'string' || typeof value.review_id !== 'string' || typeof value.reason !== 'string' || typeof value.work_item_revision !== 'number') return null;
+    return value;
+  });
+  let recovery = $derived(trace ? runRecovery(trace.run.status, trace.run.error_code) : null);
   let outputText = $derived.by(() => {
     const output = trace?.run.output;
     if (typeof output === 'string') return output;
@@ -91,7 +101,7 @@
       <div class="min-w-0">
         <div class="flex flex-wrap items-center gap-2">
           <Badge variant={statusVariant(trace.run.status)}>{trace.run.status}</Badge>
-          <span class="text-xs text-muted-foreground">attempt {trace.run.attempt_count}</span>
+          <span class="text-xs text-muted-foreground">执行尝试 {trace.run.attempt_count}</span>
         </div>
         <h1 class="mt-3 text-2xl font-semibold tracking-tight sm:text-3xl">Agent 运行</h1>
         {#if trace.run.work_item_id}
@@ -99,10 +109,21 @@
         {:else}
           <p class="mt-2 text-sm text-muted-foreground">该 Run 没有关联 WorkItem。</p>
         {/if}
+        {#if reprocessing && trace.run.work_item_id}
+          <section class="mt-3 space-y-2 rounded-lg border p-3" aria-label="重新处理依据">
+            <p class="text-sm font-medium">按修改意见重新处理 · 工作项版本 {reprocessing.work_item_revision}</p>
+            <p class="whitespace-pre-wrap text-sm">{reprocessing.reason}</p>
+            <div class="flex gap-3 text-sm">
+              <a class="underline" href={`${workspaceBase}/runs/${encodeURIComponent(reprocessing.source_run_id)}`}>查看原运行与结果</a>
+              <a class="underline" href={`${workspaceBase}/work-items/${trace.run.work_item_id}?view=result#acceptance`}>查看验收记录</a>
+            </div>
+            <p class="text-xs text-muted-foreground">修改意见 ID：{reprocessing.review_id}</p>
+          </section>
+        {/if}
         <details class="mt-3 text-xs text-muted-foreground">
           <summary class="cursor-pointer">内部标识</summary>
           <p class="mt-2 break-all font-mono">Run {trace.run.id}</p>
-          <p class="mt-1 break-all font-mono">Session {trace.run.session_id}</p>
+          <p class="mt-1 break-all font-mono">Session {trace.run.session_id}</p><p class="mt-1 break-all font-mono">Workflow 版本 {trace.run.workflow_version_id}</p>
         </details>
       </div>
       <div class="flex flex-col gap-2 sm:min-w-64">
@@ -131,16 +152,16 @@
         <Card.Header><Card.Description>状态</Card.Description><Card.Title>{trace.run.status}</Card.Title></Card.Header>
       </Card.Root>
       <Card.Root size="sm">
-        <Card.Header><Card.Description>Attempts</Card.Description><Card.Title>{trace.run.attempt_count}</Card.Title></Card.Header>
+        <Card.Header><Card.Description>执行尝试</Card.Description><Card.Title>{trace.run.attempt_count}</Card.Title></Card.Header>
       </Card.Root>
       <Card.Root size="sm">
-        <Card.Header><Card.Description>Run events</Card.Description><Card.Title>{trace.run_events.length}</Card.Title></Card.Header>
+        <Card.Header><Card.Description>执行事件</Card.Description><Card.Title>{trace.run_events.length}</Card.Title></Card.Header>
       </Card.Root>
       <Card.Root size="sm">
-        <Card.Header><Card.Description>Tool calls</Card.Description><Card.Title>{trace.tool_calls.length}</Card.Title></Card.Header>
+        <Card.Header><Card.Description>工具调用</Card.Description><Card.Title>{trace.tool_calls.length}</Card.Title></Card.Header>
       </Card.Root>
       <Card.Root size="sm">
-        <Card.Header><Card.Description>Child runs</Card.Description><Card.Title>{childRuns.length}</Card.Title></Card.Header>
+        <Card.Header><Card.Description>子运行</Card.Description><Card.Title>{childRuns.length}</Card.Title></Card.Header>
       </Card.Root>
     </section>
 
@@ -150,6 +171,12 @@
         {#if trace.run.error_detail}
           <p class="mt-2 text-sm leading-6 text-destructive/90">{trace.run.error_detail}</p>
         {/if}
+      </section>
+    {/if}
+
+    {#if recovery}
+      <section class="mt-4 rounded-xl border border-border p-4 text-sm leading-6" aria-label="恢复指引">
+        <p class="font-semibold">下一步</p><p>{recovery}</p>
       </section>
     {/if}
 
@@ -175,89 +202,10 @@
       <div class="mt-6"><EmptyState title="Run 已结束，但没有输出" description="检查错误信息和事件时间线，确认终态原因。" /></div>
     {/if}
 
-    <div class="mt-8 grid gap-6 xl:grid-cols-2">
+    <section class="mt-6" aria-label="工具审批">
       <Card.Root>
         <Card.Header>
-          <Card.Title>运行时间线</Card.Title>
-          <Card.Description>先显示持久快照，再通过 SSE 追加事件。</Card.Description>
-        </Card.Header>
-        <Card.Content class="space-y-6">
-          <RunTimeline
-            initialEvents={trace.run_events}
-            initialStatus={trace.run.status}
-            streamUrl={data.streamUrl}
-            onSnapshotChange={scheduleSnapshotRefresh}
-          />
-          <Separator />
-          <div>
-            <details>
-              <summary class="cursor-pointer text-sm font-medium">查看模型上下文事件（{trace.session_events.length}）</summary>
-              {#if trace.session_events.length > 0}
-                <div class="mt-3 space-y-2">
-                  {#each trace.session_events as event (event.id)}
-                    <details class="rounded-lg border border-border p-3">
-                      <summary class="flex cursor-pointer list-none items-center justify-between gap-3 text-sm">
-                        <span><span class="font-mono text-xs text-muted-foreground">#{event.sequence}</span> {event.event_type}</span>
-                        <span class="text-xs text-muted-foreground">{dateLabel(event.occurred_at)}</span>
-                      </summary>
-                      <p class="mt-2 text-xs text-muted-foreground">actor: {event.actor_kind} {event.actor_id ?? ''}</p>
-                      <pre class="mt-3 max-h-56 overflow-auto rounded bg-muted p-3 font-mono text-xs leading-5">{formatJson(event.payload)}</pre>
-                    </details>
-                  {/each}
-                </div>
-              {:else}
-                <p class="mt-3 text-sm text-muted-foreground">暂无 Session events。</p>
-              {/if}
-            </details>
-          </div>
-        </Card.Content>
-      </Card.Root>
-
-      <Card.Root>
-        <Card.Header>
-          <Card.Title>Tool calls</Card.Title>
-          <Card.Description>工具输入、结果、错误和关联的 Child Run。</Card.Description>
-        </Card.Header>
-        <Card.Content>
-          {#if trace.tool_calls.length > 0}
-            <div class="space-y-3">
-              {#each trace.tool_calls as call (call.id)}
-                <details class="rounded-lg border border-border p-3">
-                  <summary class="flex cursor-pointer list-none items-center justify-between gap-3">
-                    <span class="min-w-0 truncate text-sm font-medium">{call.call_key}</span>
-                    <Badge variant={statusVariant(call.status)}>{call.status}</Badge>
-                  </summary>
-                  <div class="mt-3 space-y-3 text-xs">
-                    <p class="font-mono text-muted-foreground">Capability {call.capability_id}</p>
-                    {#if call.child_run_id}
-                      <a class="font-mono text-primary hover:underline" href={`${workspaceBase}/runs/${call.child_run_id}`}>Child Run {call.child_run_id}</a>
-                    {/if}
-                    <div>
-                      <p class="font-semibold">Input</p>
-                      <pre class="mt-1 max-h-40 overflow-auto rounded bg-muted p-2 font-mono leading-5">{formatJson(call.input)}</pre>
-                    </div>
-                    {#if call.result !== null}
-                      <div>
-                        <p class="font-semibold">Result</p>
-                        <pre class="mt-1 max-h-40 overflow-auto rounded bg-muted p-2 font-mono leading-5">{formatJson(call.result)}</pre>
-                      </div>
-                    {/if}
-                    {#if call.error_code}
-                      <p class="text-destructive">{call.error_code}</p>
-                    {/if}
-                  </div>
-                </details>
-              {/each}
-            </div>
-          {:else}
-            <p class="text-sm text-muted-foreground">暂无 Tool calls。</p>
-          {/if}
-        </Card.Content>
-      </Card.Root>
-
-      <Card.Root>
-        <Card.Header>
-          <Card.Title>审批</Card.Title>
+          <Card.Title><span id="run-approvals">工具审批</span></Card.Title>
           <Card.Description>{pendingApprovals.length} 条等待处理。HTTP 结果决定最终状态。</Card.Description>
         </Card.Header>
         <Card.Content>
@@ -298,10 +246,100 @@
           {/if}
         </Card.Content>
       </Card.Root>
+    </section>
+
+    <nav aria-label="运行操作导航" class="mt-6 flex flex-wrap gap-4 text-sm">
+      <a class="underline" href="#run-execution">执行步骤</a>
+      <a class="underline" href="#run-approvals">工具审批（{pendingApprovals.length} 待处理）</a>
+      {#if trace.run.work_item_id}<a class="underline" href={`${workspaceBase}/work-items/${trace.run.work_item_id}#acceptance`}>返回工作项验收结果</a>{/if}
+    </nav>
+    <p class="mt-3 text-xs text-muted-foreground">审批或等待恢复可能产生新的执行尝试；人工重试会创建另一条 Run。业务验收在工作项中单独记录。</p>
+    <div id="run-execution" class="mt-6 grid items-start gap-6 xl:grid-cols-2">
+      <Card.Root>
+        <Card.Header>
+          <Card.Title>执行步骤</Card.Title>
+          <Card.Description>执行记录实时更新，调用细节默认收起。</Card.Description>
+        </Card.Header>
+        <Card.Content class="space-y-6">
+          <RunTimeline
+            initialEvents={trace.run_events}
+            initialStatus={trace.run.status}
+            streamUrl={data.streamUrl}
+            onSnapshotChange={scheduleSnapshotRefresh}
+          />
+          <Separator />
+          <div>
+            <details>
+              <summary class="cursor-pointer text-sm font-medium">查看模型上下文事件（{trace.session_events.length}）</summary>
+              {#if trace.session_events.length > 0}
+                <div class="mt-3 space-y-2">
+                  {#each trace.session_events as event (event.id)}
+                    <details class="rounded-lg border border-border p-3">
+                      <summary class="flex cursor-pointer list-none items-center justify-between gap-3 text-sm">
+                        <span><span class="font-mono text-xs text-muted-foreground">#{event.sequence}</span> {event.event_type}</span>
+                        <span class="text-xs text-muted-foreground">{dateLabel(event.occurred_at)}</span>
+                      </summary>
+                      <p class="mt-2 text-xs text-muted-foreground">actor: {event.actor_kind} {event.actor_id ?? ''}</p>
+                      <pre class="mt-3 max-h-56 overflow-auto rounded bg-muted p-3 font-mono text-xs leading-5">{formatJson(event.payload)}</pre>
+                    </details>
+                  {/each}
+                </div>
+              {:else}
+                <p class="mt-3 text-sm text-muted-foreground">暂无 Session events。</p>
+              {/if}
+            </details>
+          </div>
+        </Card.Content>
+      </Card.Root>
 
       <Card.Root>
         <Card.Header>
-          <Card.Title>Usage</Card.Title>
+          <Card.Title>工具调用</Card.Title>
+          <Card.Description>工具输入、结果、错误和关联的 Child Run。</Card.Description>
+        </Card.Header>
+        <Card.Content>
+          {#if trace.tool_calls.length > 0}
+            <div class="space-y-3">
+              {#each trace.tool_calls as call (call.id)}
+                <details class="rounded-lg border border-border p-3">
+                  <summary class="flex cursor-pointer list-none items-center justify-between gap-3">
+                    <span class="min-w-0 truncate text-sm font-medium">{call.call_key}</span>
+                    <Badge variant={statusVariant(call.status)}>{call.status}</Badge>
+                  </summary>
+                  <div class="mt-3 space-y-3 text-xs">
+                    <p class="font-mono text-muted-foreground">Capability {call.capability_id}</p>
+                    {#if call.child_run_id}
+                      <a class="font-mono text-primary hover:underline" href={`${workspaceBase}/runs/${call.child_run_id}`}>Child Run {call.child_run_id}</a>
+                    {/if}
+                    <div>
+                      <p class="font-semibold">Input</p>
+                      <pre class="mt-1 max-h-40 overflow-auto rounded bg-muted p-2 font-mono leading-5">{formatJson(call.input)}</pre>
+                    </div>
+                    {#if call.result !== null}
+                      <div>
+                        <p class="font-semibold">Result</p>
+                        <pre class="mt-1 max-h-40 overflow-auto rounded bg-muted p-2 font-mono leading-5">{formatJson(call.result)}</pre>
+                      </div>
+                    {/if}
+                    {#if call.error_code}
+                      <p class="text-destructive">{call.error_code}</p>
+                    {/if}
+                  </div>
+                </details>
+              {/each}
+            </div>
+          {:else}
+            <p class="text-sm text-muted-foreground">暂无 Tool calls。</p>
+          {/if}
+        </Card.Content>
+      </Card.Root>
+
+
+
+      <details class="rounded-lg border border-border p-4 xl:col-span-2"><summary class="cursor-pointer text-sm font-medium">用量、关联运行与经验详情</summary><div class="mt-4 grid gap-4 md:grid-cols-2">
+      <Card.Root>
+        <Card.Header>
+          <Card.Title>模型用量</Card.Title>
           <Card.Description>模型 token 使用摘要和每次 provider request。</Card.Description>
         </Card.Header>
         <Card.Content class="space-y-4">
@@ -330,7 +368,7 @@
 
       <Card.Root>
         <Card.Header>
-          <Card.Title>Linked runs</Card.Title>
+          <Card.Title>关联运行</Card.Title>
           <Card.Description>父子关系及其他 Run link。</Card.Description>
         </Card.Header>
         <Card.Content>
@@ -351,7 +389,7 @@
 
       <Card.Root>
         <Card.Header>
-          <Card.Title>Experience injections</Card.Title>
+          <Card.Title>经验引用</Card.Title>
           <Card.Description>该 Run 实际注入上下文的经验条目。</Card.Description>
         </Card.Header>
         <Card.Content>
@@ -374,6 +412,7 @@
           {/if}
         </Card.Content>
       </Card.Root>
+      </div></details>
     </div>
 
     <section class="mt-6" aria-label="Child Runs">

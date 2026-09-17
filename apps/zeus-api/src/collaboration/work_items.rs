@@ -61,6 +61,9 @@ pub struct WorkItemPageResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct WorkItemQuery {
+    pub q: Option<String>,
+    pub created_by: Option<Uuid>,
+    pub unassigned: Option<bool>,
     pub cursor: Option<String>,
     pub limit: Option<u16>,
     pub status: Option<String>,
@@ -110,6 +113,16 @@ pub async fn list_work_items(
     if let Some(status) = query.status.as_deref() {
         parse_state(status)?;
     }
+    let search = query
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if search.is_some_and(|value| value.chars().count() > 200) {
+        return Err(ApiError::Validation(
+            "search text must not exceed 200 characters".to_owned(),
+        ));
+    }
     let mut transaction = begin_tenant(
         &state.platform.database,
         auth.tenant_scope(Some(workspace_id)),
@@ -124,6 +137,9 @@ pub async fn list_work_items(
            and ($3::text is null or status = $3)
            and ($4::uuid is null or assignee_user_id = $4)
            and ($5::timestamptz is null or (created_at, id) < ($5, $6))
+           and ($8::uuid is null or created_by = $8)
+           and (not $9 or assignee_user_id is null)
+           and ($10::text is null or strpos(lower(title), lower($10)) > 0)
          order by created_at desc, id desc limit $7",
     )
     .bind(auth.organization_id)
@@ -133,6 +149,9 @@ pub async fn list_work_items(
     .bind(cursor.map(ListCursor::created_at))
     .bind(cursor.map(ListCursor::id))
     .bind(limit + 1)
+    .bind(query.created_by)
+    .bind(query.unassigned.unwrap_or(false))
+    .bind(search)
     .fetch_all(&mut *transaction)
     .await?;
     transaction.commit().await?;
@@ -657,8 +676,172 @@ pub async fn download_attachment(
     Ok(response)
 }
 
+#[derive(Debug, Serialize, ToSchema, FromRow)]
+pub struct WorkItemReviewResponse {
+    pub id: Uuid,
+    pub work_item_id: Uuid,
+    pub run_id: Uuid,
+    pub workflow_version_id: Uuid,
+    pub work_item_revision: i64,
+    pub decision: String,
+    pub reason: String,
+    pub reviewed_by: Uuid,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateWorkItemReviewRequest {
+    pub run_id: Uuid,
+    pub decision: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WorkItemReviewPageResponse {
+    pub items: Vec<WorkItemReviewResponse>,
+    pub next_cursor: Option<String>,
+}
+
+pub async fn list_work_item_reviews(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path((workspace_id, work_item_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<PageQuery>,
+) -> Result<Json<WorkItemReviewPageResponse>, ApiError> {
+    auth.require_workspace(workspace_id, Permission::ReadWorkspace)?;
+    let limit = query.limit()?;
+    let cursor = query.decoded_cursor()?;
+    let mut tx = begin_tenant(
+        &state.platform.database,
+        auth.tenant_scope(Some(workspace_id)),
+    )
+    .await?;
+    ensure_work_item_exists(&mut tx, auth.organization_id, workspace_id, work_item_id).await?;
+    let mut items = sqlx::query_as::<_, WorkItemReviewResponse>(
+        "select id, work_item_id, run_id, workflow_version_id, work_item_revision,
+                decision, reason, reviewed_by, created_at from work_item_reviews
+         where organization_id = $1 and workspace_id = $2 and work_item_id = $3
+           and ($4::timestamptz is null or (created_at, id) < ($4, $5))
+         order by created_at desc, id desc limit $6",
+    )
+    .bind(auth.organization_id)
+    .bind(workspace_id)
+    .bind(work_item_id)
+    .bind(cursor.map(ListCursor::created_at))
+    .bind(cursor.map(ListCursor::id))
+    .bind(limit + 1)
+    .fetch_all(&mut *tx)
+    .await?;
+    let has_more = i64::try_from(items.len()).unwrap_or(i64::MAX) > limit;
+    if has_more {
+        items.pop();
+    }
+    let next_cursor = if has_more {
+        items
+            .last()
+            .map(|item| ListCursor::new(item.created_at, item.id).encode())
+            .transpose()?
+    } else {
+        None
+    };
+    tx.commit().await?;
+    Ok(Json(WorkItemReviewPageResponse { items, next_cursor }))
+}
+
+pub async fn create_work_item_review(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path((workspace_id, work_item_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+    Json(request): Json<CreateWorkItemReviewRequest>,
+) -> Result<(StatusCode, Json<WorkItemReviewResponse>), ApiError> {
+    auth.require_workspace(workspace_id, Permission::OperateRun)?;
+    let reviewer = auth.user_id.ok_or(ApiError::Forbidden)?;
+    let revision = required_revision(&headers)?;
+    validate_review(&request)?;
+    let mut tx = begin_tenant(
+        &state.platform.database,
+        auth.tenant_scope(Some(workspace_id)),
+    )
+    .await?;
+    let item = load_work_item(
+        &mut tx,
+        auth.organization_id,
+        workspace_id,
+        work_item_id,
+        true,
+    )
+    .await?;
+    if item.revision != revision {
+        return Err(ApiError::PreconditionFailed);
+    }
+    let version: Option<Uuid> = sqlx::query_scalar(
+        "select r.workflow_version_id from runs r join sessions s on s.id = r.session_id
+           and s.organization_id = r.organization_id and s.workspace_id = r.workspace_id
+         where r.id = $1 and r.organization_id = $2 and r.workspace_id = $3
+           and r.work_item_id = $4 and s.work_item_id = $4 and r.status = 'succeeded'
+           and r.output is not null and r.output <> 'null'::jsonb",
+    )
+    .bind(request.run_id)
+    .bind(auth.organization_id)
+    .bind(workspace_id)
+    .bind(work_item_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let version = version.ok_or_else(|| {
+        ApiError::Conflict(
+            "review requires a successful Run with output linked to this work item".to_owned(),
+        )
+    })?;
+    let review = sqlx::query_as::<_, WorkItemReviewResponse>(
+        "insert into work_item_reviews (organization_id, workspace_id, work_item_id, run_id,
+           workflow_version_id, work_item_revision, decision, reason, reviewed_by)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         returning id, work_item_id, run_id, workflow_version_id, work_item_revision,
+                   decision, reason, reviewed_by, created_at",
+    )
+    .bind(auth.organization_id)
+    .bind(workspace_id)
+    .bind(work_item_id)
+    .bind(request.run_id)
+    .bind(version)
+    .bind(revision)
+    .bind(request.decision)
+    .bind(request.reason.trim())
+    .bind(reviewer)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query("update work_items set revision = revision + 1, updated_at = now() where id = $1 and organization_id = $2 and workspace_id = $3")
+        .bind(work_item_id).bind(auth.organization_id).bind(workspace_id).execute(&mut *tx).await?;
+    insert_audit(
+        &mut tx,
+        &auth,
+        Some(workspace_id),
+        "work_item.reviewed",
+        "work_item_review",
+        review.id,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok((StatusCode::CREATED, Json(review)))
+}
+
+fn validate_review(request: &CreateWorkItemReviewRequest) -> Result<(), ApiError> {
+    if !matches!(request.decision.as_str(), "accepted" | "needs_changes") {
+        return Err(ApiError::Validation("invalid review decision".to_owned()));
+    }
+    if request.reason.trim().is_empty() || request.reason.chars().count() > 4000 {
+        return Err(ApiError::Validation(
+            "review reason must contain 1 to 4000 characters".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/reviews", get(list_work_item_reviews).post(create_work_item_review))
         .route(
             "/api/v1/workspaces/{workspace_id}/work-items",
             get(list_work_items).post(create_work_item),

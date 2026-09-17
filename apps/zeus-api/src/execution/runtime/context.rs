@@ -37,8 +37,8 @@ impl DurableRunExecutor {
              where wv.id = $1
                and wv.organization_id = $2 and wv.workspace_id = $3
                and av.organization_id = $2 and av.workspace_id = $3
-               and mp.organization_id = $2 and mp.workspace_id = $3
-               and c.organization_id = $2 and c.workspace_id = $3
+               and mp.organization_id = $2 and mp.workspace_id is null
+               and c.organization_id = $2 and c.workspace_id is null
                and current_run.organization_id = $2 and current_run.workspace_id = $3
                and mp.archived_at is null and c.archived_at is null",
         )
@@ -71,11 +71,10 @@ impl DurableRunExecutor {
         let row = sqlx::query_as::<_, SecretRow>(
             "select secret_name, ciphertext, nonce, key_id
              from connection_secrets
-             where organization_id = $1 and workspace_id = $2
-               and connection_id = $3 and secret_name = $4",
+             where organization_id = $1 and workspace_id is null
+               and connection_id = $2 and secret_name = $3",
         )
         .bind(run.organization_id)
-        .bind(run.workspace_id)
         .bind(plan.model_connection_id)
         .bind(secret_name)
         .fetch_optional(&self.pool)

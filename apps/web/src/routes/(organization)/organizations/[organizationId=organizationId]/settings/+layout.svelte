@@ -10,14 +10,16 @@
   let navigation = $derived([
     { href: base, label: '概览' },
     { href: `${base}/members`, label: '成员' },
-    { href: `${base}/workspaces`, label: 'Workspaces' },
-    { href: `${base}/capabilities`, label: 'Capability Catalog' },
+    { href: `${base}/workspaces`, label: '工作空间' },
+    { href: `${base}/capabilities`, label: '能力目录' },
+    { href: `${base}/connections`, label: '模型供应商' },
+    { href: `${base}/model-profiles`, label: '模型目录' },
     ...(data.canManageIdentity
       ? [
           { href: `${base}/identity-providers`, label: '身份提供商' },
           { href: `${base}/verified-domains`, label: '已验证域名' },
           { href: `${base}/security`, label: '身份安全' },
-          { href: `${base}/oidc-clients`, label: 'OIDC Clients' }
+          { href: `${base}/oidc-clients`, label: 'OIDC 客户端' }
         ]
       : [])
   ]);

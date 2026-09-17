@@ -174,6 +174,49 @@ impl OpenAiCompatibleAdapter {
         })
     }
 
+    /// Checks authenticated model-directory access without sending model-visible messages.
+    ///
+    /// # Errors
+    /// Returns a stable transport/protocol error. Some providers do not expose a models endpoint.
+    pub async fn check_connection(&self) -> Result<bool, ModelError> {
+        let mut endpoint = self.endpoint.clone();
+        let path = endpoint
+            .path()
+            .strip_suffix("/chat/completions")
+            .ok_or(ModelError::InvalidConfiguration)?;
+        let path = format!("{path}/models");
+        endpoint.set_path(&path);
+        let response = self
+            .client
+            .get(endpoint)
+            .header(AUTHORIZATION, authorization_header(&self.api_key)?)
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    ModelError::Timeout
+                } else {
+                    ModelError::Transport
+                }
+            })?;
+        if !response.status().is_success() {
+            return Err(ModelError::HttpStatus {
+                status: response.status().as_u16(),
+            });
+        }
+        let payload: Value = response
+            .json()
+            .await
+            .map_err(|_| ModelError::InvalidResponse)?;
+        let models = payload
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or(ModelError::InvalidResponse)?;
+        Ok(models
+            .iter()
+            .any(|model| model.get("id").and_then(Value::as_str) == Some(self.model.as_str())))
+    }
+
     #[must_use]
     pub fn endpoint(&self) -> &Url {
         &self.endpoint

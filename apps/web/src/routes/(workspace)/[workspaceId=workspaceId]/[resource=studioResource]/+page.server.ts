@@ -27,7 +27,7 @@ export const load: PageServerLoad = async ({ fetch, parent, params, request, url
       const studio = await loadAgentStudio(apiFetch, {
         apiBaseUrl: env.ZEUS_API_URL, workspaceId: params.workspaceId
       }, resource.slug, selected, context.activeOrganization.organization_id);
-      return { resource, studio, collection: null, workspaceId: params.workspaceId };
+      return { resource, studio, collection: null, workspaceId: params.workspaceId, requirementsTemplate: url.searchParams.get('template') === 'requirements' };
     } catch (cause) {
       error(cause instanceof ZeusApiError && cause.status >= 400 && cause.status < 500 ? cause.status : 502,
         '无法读取 Agent Studio 配置，请检查当前权限或稍后重试。');

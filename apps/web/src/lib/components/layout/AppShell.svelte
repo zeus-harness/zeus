@@ -1,5 +1,8 @@
 <script lang="ts">
   import { enhance } from '$app/forms';
+  import { afterNavigate } from '$app/navigation';
+  let navigationOpen = $state(false);
+  afterNavigate(() => { navigationOpen = false; });
   import { page } from '$app/state';
   import type { Component, Snippet } from 'svelte';
   import {
@@ -146,7 +149,7 @@
 <div class="min-h-screen bg-muted/20 text-foreground">
   <header class="sticky top-0 z-40 border-b border-border bg-background/95 backdrop-blur">
     <div class="flex h-16 items-center gap-3 px-4 lg:px-6">
-      <Sheet.Root>
+      <Sheet.Root bind:open={navigationOpen}>
         <Sheet.Trigger>
           {#snippet child({ props })}
             <Button {...props} variant="ghost" size="icon" class="lg:hidden" aria-label="打开主导航">

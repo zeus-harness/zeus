@@ -2,6 +2,7 @@ import { env } from '$env/dynamic/private';
 import type { PageServerLoad } from './$types';
 
 import { loadWorkspaceData } from '$lib/api/client';
+import { listWorkItems } from '$lib/api/work-items';
 import { listRuns } from '$lib/api/runs';
 import { serverApiFetcher } from '$lib/api/server';
 
@@ -25,7 +26,10 @@ export const load: PageServerLoad = async ({ fetch, parent, params, request, url
       })
   );
 
+  const workItems = await loadWorkspaceData(apiFetch, { authStatus, workspaceId: params.workspaceId },
+    workspaceFetch => listWorkItems(workspaceFetch, { apiBaseUrl: env.ZEUS_API_URL, workspaceId: params.workspaceId, limit: 50 }));
   return {
+    workItems,
     result,
     filterStatus: status ?? '',
     filterWorkItemId: workItemId ?? '',

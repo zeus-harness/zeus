@@ -127,3 +127,11 @@ export function revokePlatformTenantAccessGrantResponse(
     { method: 'DELETE', headers: { accept: 'application/json' } }
   );
 }
+
+export function listPlatformUsers(fetcher: ApiFetcher, apiBaseUrl?: string, cursor?: string | null, email?: string): Promise<components['schemas']['PlatformUserPageResponse']> {
+  const params = new URLSearchParams();
+  if (cursor) params.set('cursor', cursor);
+  if (email) params.set('email', email);
+  const query = params.size ? `?${params}` : '';
+  return requestJson(fetcher, serverApiUrl(apiBaseUrl, `/api/v1/platform/users${query}`));
+}

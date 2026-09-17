@@ -17,8 +17,9 @@ pub use event_trace::{
     stream_run_events,
 };
 pub use run::{
-    __path_create_run, __path_list_runs, __path_start_work_item_run, cancel_run, create_run,
-    get_run, list_runs, retry_run, start_work_item_run,
+    __path_create_run, __path_list_runs, __path_reprocess_work_item_review,
+    __path_start_work_item_run, cancel_run, create_run, get_run, list_runs,
+    reprocess_work_item_review, retry_run, start_work_item_run,
 };
 pub use session::{create_session, get_session, list_sessions, submit_message};
 pub use shared::types::{

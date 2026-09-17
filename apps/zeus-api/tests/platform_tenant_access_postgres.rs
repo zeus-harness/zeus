@@ -118,6 +118,84 @@ async fn platform_tenant_access_is_session_bound_audited_and_membership_free() {
     .await
     .expect("platform session inserts");
 
+    let pending_user_id = Uuid::now_v7();
+    sqlx::query("insert into users (id, email, display_name, status) values ($1, $2, 'Pending signup', 'pending_verification')")
+        .bind(pending_user_id).bind(format!("pending-{pending_user_id}@example.test"))
+        .execute(&owner_pool).await.expect("unaffiliated pending user inserts");
+    let directory = sqlx::query_as::<_, (Uuid, bool)>(
+        "select id, email_verified from zeus_private.list_platform_users($1, $2, null, null, 101)",
+    )
+    .bind(platform_user_id)
+    .bind(platform_session_id)
+    .fetch_all(&http_pool)
+    .await
+    .expect("directory loads");
+    assert!(directory.contains(&(pending_user_id, false)));
+    assert!(directory.contains(&(tenant_owner_id, true)));
+    for (actor, session) in [
+        (tenant_owner_id, platform_session_id),
+        (platform_user_id, Uuid::nil()),
+    ] {
+        let count: i64 = sqlx::query_scalar(
+            "select count(*) from zeus_private.list_platform_users($1, $2, null, null, 101)",
+        )
+        .bind(actor)
+        .bind(session)
+        .fetch_one(&http_pool)
+        .await
+        .expect("unauthorized directory is empty");
+        assert_eq!(count, 0);
+    }
+    let first = sqlx::query_as::<_, (Uuid, time::OffsetDateTime)>(
+        "select id, created_at from zeus_private.list_platform_users($1, $2, null, null, 1)",
+    )
+    .bind(platform_user_id)
+    .bind(platform_session_id)
+    .fetch_one(&http_pool)
+    .await
+    .expect("first page");
+    let later: Vec<Uuid> =
+        sqlx::query_scalar("select id from zeus_private.list_platform_users($1, $2, $3, $4, 101)")
+            .bind(platform_user_id)
+            .bind(platform_session_id)
+            .bind(first.1)
+            .bind(first.0)
+            .fetch_all(&http_pool)
+            .await
+            .expect("next page");
+    assert!(!later.contains(&first.0));
+    assert_eq!(later.len() + 1, directory.len());
+
+    let searched: Vec<Uuid> = sqlx::query_scalar(
+        "select id from zeus_private.list_platform_users($1,$2,null,null,51,$3)",
+    )
+    .bind(platform_user_id)
+    .bind(platform_session_id)
+    .bind(format!("pending-{pending_user_id}@example.test"))
+    .fetch_all(&http_pool)
+    .await
+    .expect("indexed email lookup");
+    assert_eq!(searched, vec![pending_user_id]);
+    let page: Vec<Uuid> = sqlx::query_scalar(
+        "select id from zeus_private.list_platform_users($1,$2,null,null,1,null)",
+    )
+    .bind(platform_user_id)
+    .bind(platform_session_id)
+    .fetch_all(&http_pool)
+    .await
+    .expect("bounded indexed list");
+    assert_eq!(page.len(), 1);
+    let forbidden: Vec<Uuid> = sqlx::query_scalar(
+        "select id from zeus_private.list_platform_users($1,$2,null,null,51,$3)",
+    )
+    .bind(tenant_owner_id)
+    .bind(platform_session_id)
+    .bind(format!("pending-{pending_user_id}@example.test"))
+    .fetch_all(&http_pool)
+    .await
+    .expect("email lookup enforces owner");
+    assert!(forbidden.is_empty());
+
     let provision_slug = format!("provision-{platform_session_id}");
     let provision_workspace_slug = format!("initial-{platform_session_id}");
     let provision_owner_email = format!("provision-owner-{platform_session_id}@example.test");
@@ -692,7 +770,7 @@ async fn insert_queued_run(
     )
     .bind(connection_id)
     .bind(organization_id)
-    .bind(workspace_id)
+    .bind(Option::<Uuid>::None)
     .bind(format!("tenant-state-{connection_id}"))
     .execute(pool)
     .await
@@ -705,7 +783,7 @@ async fn insert_queued_run(
     )
     .bind(model_profile_id)
     .bind(organization_id)
-    .bind(workspace_id)
+    .bind(Option::<Uuid>::None)
     .bind(connection_id)
     .bind(format!("tenant-state-{model_profile_id}"))
     .execute(pool)

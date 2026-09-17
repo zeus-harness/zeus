@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { parseEnvFile, totpAt, verificationTokenFromMessage } from './work-item.mjs';
+import { listItems, parseEnvFile, totpAt, verificationTokenFromMessage } from './work-item.mjs';
 
 test('parses the ignored E2E environment format without evaluating shell syntax', () => {
   assert.deepEqual(parseEnvFile('ONE=value\nTWO=value with spaces\n# ignored\ninvalid=value\n'), {
@@ -23,4 +23,18 @@ test('extracts only an opaque verification token from Mailpit content', () => {
     token
   );
   assert.equal(verificationTokenFromMessage({ Text: 'No verification link.' }), null);
+});
+
+
+test('finds an existing shared model beyond the first directory page', async () => {
+  const paths = [];
+  const client = { json: async (pathname) => {
+    paths.push(pathname);
+    return paths.length === 1
+      ? { items: [{ name: 'Other model' }], next_cursor: 'opaque+/=' }
+      : { items: [{ name: 'E2E Deterministic Model' }], next_cursor: null };
+  } };
+  const items = await listItems(client, '/models');
+  assert.equal(items.find((item) => item.name === 'E2E Deterministic Model')?.name, 'E2E Deterministic Model');
+  assert.equal(new URL(paths[1], 'https://example.test').searchParams.get('cursor'), 'opaque+/=');
 });

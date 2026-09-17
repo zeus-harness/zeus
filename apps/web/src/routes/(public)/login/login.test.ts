@@ -1,3 +1,4 @@
+import { loginAction } from '$lib/login-action';
 import { describe, expect, it, vi } from 'vitest';
 
 import { actions } from './+page.server';
@@ -128,3 +129,13 @@ describe('login route actions', () => {
     });
   });
 });
+
+ it('carries the submitted filtered destination into MFA', async () => {
+    const target = '/019f0000-0000-7000-8000-000000000001/work-items?view=created&q=feedback';
+    const page = new URL('http://web.test/login');
+    page.searchParams.set('return_to', target);
+    const { event } = actionEvent(new URL(loginAction('login', page), page).href,
+      { email: 'person@example.test', password: 'YOUR_PASSWORD_HERE' },
+      jsonResponse(200, { mfa_required: true }));
+    await expect(actionHandler(actions.login)(event)).rejects.toMatchObject({ status: 303, location: `/mfa?return_to=${encodeURIComponent(target)}` });
+ });
