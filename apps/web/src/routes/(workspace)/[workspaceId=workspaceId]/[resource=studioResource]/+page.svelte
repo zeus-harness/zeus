@@ -7,7 +7,7 @@
 
   let { data, form }: { data: PageData; form: ActionData } = $props();
   let navigation = $derived(
-    agentStudioResources.map((resource) => ({
+    agentStudioResources.filter(resource => data.resource.slug === 'agents' ? resource.slug === 'agents' : resource.slug !== 'agents').map((resource) => ({
       href: `/${data.workspaceId}/${resource.slug}`,
       label: resource.label,
       description: resource.description
@@ -17,7 +17,8 @@
 
 <svelte:head><title>Zeus · {data.resource.label}</title></svelte:head>
 
-<SectionNav label="Agent Studio 导航" items={navigation} />
+<nav class="px-5 pt-4 text-sm" aria-label="当前位置"><a class="underline" href={data.resource.slug === 'agents' ? '/management' : `/${data.workspaceId}`}>{data.resource.slug === 'agents' ? 'Management Terminal' : 'Business Studio'}</a> / {data.resource.label}</nav>
+<SectionNav label="配置导航" items={navigation} />
 {#if data.studio && (data.resource.slug === 'agents' || data.resource.slug === 'workflows')}
   <AgentStudio studio={data.studio} resource={data.resource.slug} workspaceId={data.workspaceId} organizationId={data.activeOrganization.organization_id} canManageOrganization={data.canManageOrganization} requirementsTemplate={data.requirementsTemplate ?? false} {form} />
 {:else if data.collection}

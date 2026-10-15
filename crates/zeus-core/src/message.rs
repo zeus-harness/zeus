@@ -80,6 +80,8 @@ pub enum ModelMessage {
     },
     Assistant {
         content: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<String>,
         tool_calls: Vec<ToolCall>,
     },
     Tool {
@@ -111,6 +113,7 @@ impl ModelMessage {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self::Assistant {
             content: Some(content.into()),
+            reasoning_content: None,
             tool_calls: Vec::new(),
         }
     }
@@ -119,6 +122,7 @@ impl ModelMessage {
     pub fn assistant_with_tool_calls(tool_calls: Vec<ToolCall>) -> Self {
         Self::Assistant {
             content: None,
+            reasoning_content: None,
             tool_calls,
         }
     }

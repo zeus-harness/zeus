@@ -21,7 +21,7 @@ Zeus 是面向企业团队的云端 Harness Agent。代码从 `0.1.0` 开始，H
 - shadcn-svelte 组件固定放在 `packages/ui/src/lib/components/ui`。
 - 不创建 `zeus-worker`。`ExecutionSupervisor` 运行在 `zeus-api` 内。
 - 当前架构不使用 Redis、NATS、PGMQ 扩展、pgvector或对象存储。
-- 不提供任意 shell、用户代码执行或服务器文件系统工具。
+- 允许部署端登记仓库及 Runtime 内部的受控 worktree/检查点操作，目录必须按租户、Run 和 fence 隔离。脚本仅通过独立 Alpine 沙箱的 builtin.sandbox_exec 执行，强制审批、固定镜像、断网和资源限制；API 禁止直接执行用户脚本，worktree 不作为安全沙箱。
 
 增加 crate 或 package 前，至少满足一项：
 

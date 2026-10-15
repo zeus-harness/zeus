@@ -1,4 +1,5 @@
 <script lang="ts">
+  import OrganizationInvitations from '$lib/features/control-plane/OrganizationInvitations.svelte';
   import ModelConnections from '$lib/features/control-plane/ModelConnections.svelte';
   import ResourceCollection from '$lib/features/control-plane/ResourceCollection.svelte';
   import type { ActionData, PageData } from './$types';
@@ -18,4 +19,8 @@
   refreshHref={`/organizations/${data.organizationId}/settings/${data.resource.slug}`}
 />
 
+{/if}
+
+{#if data.resource.slug === 'members' && data.canInvite}
+  <OrganizationInvitations invitations={data.invitations ?? []} loadError={data.invitationError ?? ''} message={form && 'message' in form ? String(form.message) : ''} />
 {/if}

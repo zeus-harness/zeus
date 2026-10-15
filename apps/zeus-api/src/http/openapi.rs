@@ -18,6 +18,7 @@ use crate::{
 };
 
 use super::operations;
+use crate::collaboration::im;
 
 mod routes;
 
@@ -93,10 +94,14 @@ mod routes;
         execution_api::start_work_item_run,
         execution_api::reprocess_work_item_review,
         execution_api::list_runs,
-        execution_api::list_approvals
+        execution_api::list_approvals,
+        execution_api::revoke
     ),
     modifiers(&OpenApiModifier),
     components(schemas(
+        crate::collaboration::im_agents::ImAgentMember, crate::collaboration::im_agents::ImAgentCall,
+        crate::collaboration::im_agents::ImAgentInvocation, crate::collaboration::im_agents::ImAddAgent, crate::collaboration::im_agents::ImInvokeAgent,
+        im::ImConversation, im::ImMessage, im::ImPerson, im::ImParticipant, im::ImConversations, im::ImMessages, im::ImPeople, im::ImDetail, im::ImId, im::ImCreate, im::ImSend, im::ImChange,
         HealthResponse,
         MetaResponse,
         FeatureStatus,
@@ -243,6 +248,8 @@ mod routes;
         execution_api::TraceExperienceInjectionResponse,
         execution_api::ChildRunResponse,
         execution_api::RunTraceResponse,
+        crate::collaboration::work_item_archive::WorkItemArchiveResponse,
+        crate::collaboration::work_item_archive::ArchiveWorkItemRequest,
         work_items::WorkItemResponse,
         work_items::WorkItemReviewResponse,
         work_items::WorkItemReviewPageResponse,
@@ -483,16 +490,34 @@ fn route_parameters(route: &PublicRoute) -> Vec<Parameter> {
     let mut parameters = path_parameters(route.path);
     if matches!(
         route.operation_id,
-        "create_work_item_review" | "test_model_connection"
+        "create_work_item_review" | "test_model_connection" | "archive_work_item"
     ) {
         parameters.push(ParameterBuilder::new().name("If-Match").parameter_in(ParameterIn::Header)
             .required(Required::True).description(Some("Current resource ETag, e.g. revision-1 in double quotes. A stale revision returns 412."))
             .schema(Some(ObjectBuilder::new().schema_type(Type::String))).build());
     }
+    if route.operation_id == "im_invoke_agent" {
+        parameters.push(ParameterBuilder::new().name("Idempotency-Key").parameter_in(ParameterIn::Header)
+            .required(Required::True).description(Some("im:<agent_member_id>:<source_message_id>; one invocation per Agent and source message."))
+            .schema(Some(ObjectBuilder::new().schema_type(Type::String))).build());
+    }
+    if route.operation_id == "archive_work_item" {
+        parameters.push(
+            ParameterBuilder::new()
+                .name("Idempotency-Key")
+                .parameter_in(ParameterIn::Header)
+                .required(Required::True)
+                .schema(Some(ObjectBuilder::new().schema_type(Type::String)))
+                .build(),
+        );
+    }
     if route.operation_id == "list_work_items" {
         parameters.extend(work_item_filter_parameters());
     }
-    if route.operation_id == "list_work_item_reviews" {
+    if matches!(
+        route.operation_id,
+        "list_work_item_reviews" | "im_list" | "im_messages"
+    ) {
         for name in ["cursor", "limit"] {
             parameters.push(
                 ParameterBuilder::new()
@@ -500,6 +525,19 @@ fn route_parameters(route: &PublicRoute) -> Vec<Parameter> {
                     .parameter_in(ParameterIn::Query)
                     .required(Required::False)
                     .description(Some("Opaque pagination cursor or page size (1-100)."))
+                    .schema(Some(ObjectBuilder::new().schema_type(Type::String)))
+                    .build(),
+            );
+        }
+    }
+    if route.operation_id == "im_directory" {
+        for name in ["q", "cursor"] {
+            parameters.push(
+                ParameterBuilder::new()
+                    .name(name)
+                    .parameter_in(ParameterIn::Query)
+                    .required(Required::False)
+                    .description(Some("Display name prefix or opaque pagination cursor."))
                     .schema(Some(ObjectBuilder::new().schema_type(Type::String)))
                     .build(),
             );

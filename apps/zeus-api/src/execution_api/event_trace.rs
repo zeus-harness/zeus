@@ -18,8 +18,8 @@ use crate::{AppState, auth::AuthContext, database::begin_tenant, error::ApiError
 use super::{
     run,
     shared::types::{
-        ApprovalResponse, ChildRunResponse, EventQuery, RunEventResponse, RunTraceResponse,
-        RunUsageResponse, RunUsageSummaryResponse, SessionEventResponse,
+        ApprovalResponse, ChildRunResponse, CodeCheckpointResponse, EventQuery, RunEventResponse,
+        RunTraceResponse, RunUsageResponse, RunUsageSummaryResponse, SessionEventResponse,
         TraceExperienceInjectionResponse, TraceRunLinkResponse, TraceToolCallResponse,
     },
 };
@@ -114,9 +114,9 @@ pub async fn get_run_trace(
     .bind(workspace_id)
     .fetch_all(&mut *transaction)
     .await?;
-    let approvals = sqlx::query_as::<_, ApprovalResponse>(
+    let mut approvals = sqlx::query_as::<_, ApprovalResponse>(
         "select id, run_id, tool_call_id, status, requested_at, expires_at,
-                decided_at, decided_by, reason
+                decided_at, decided_by, reason, kind, requested_by, authorized_until, revoked_at
          from approvals
          where run_id = $1 and organization_id = $2 and workspace_id = $3
          order by requested_at, id limit 1000",
@@ -126,6 +126,7 @@ pub async fn get_run_trace(
     .bind(workspace_id)
     .fetch_all(&mut *transaction)
     .await?;
+    super::approval::set_decision_permissions(&auth, &mut approvals);
     let usage_entries = sqlx::query_as::<_, RunUsageResponse>(
         "select id, run_id, provider_request_id, prompt_tokens,
                 completion_tokens, cache_tokens, occurred_at
@@ -173,9 +174,27 @@ pub async fn get_run_trace(
         injected_at: item.injected_at,
     })
     .collect();
+    let code_checkpoints = sqlx::query_as::<_, CodeCheckpointResponse>(
+        "select id, repository_id, base_commit, checkpoint_commit, fence_token, created_at
+         from run_code_checkpoints where run_id = $1 and organization_id = $2 and workspace_id = $3
+         order by created_at desc, id desc limit 100",
+    )
+    .bind(run_id)
+    .bind(auth.organization_id)
+    .bind(workspace_id)
+    .fetch_all(&mut *transaction)
+    .await?;
+    // Conversation RLS hides the origin from Workspace readers who are not chat members.
+    let conversation_id =
+        sqlx::query_scalar("select conversation_id from im_agent_runs where run_id=$1")
+            .bind(run_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
     transaction.commit().await?;
     let usage = usage_summary(usage_entries);
     Ok(Json(RunTraceResponse {
+        conversation_id,
+        code_checkpoints,
         run,
         run_events,
         session_events,

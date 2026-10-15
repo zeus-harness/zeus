@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { displayTimestamp } from '$lib/display-timestamp';
   import { statusLabel } from '$lib/features/status-labels';
   import { ArrowLeft, RefreshCcw } from '@lucide/svelte';
 
@@ -62,7 +63,7 @@
           <Table.Header><Table.Row>{#each resource.columns as column (column.key)}<Table.Head>{column.label}</Table.Head>{/each}</Table.Row></Table.Header>
           <Table.Body>
             {#each collection.records as record, index (recordKey(record, index))}
-              <Table.Row>{#each resource.columns as column (column.key)}<Table.Cell class="max-w-80 truncate">{formatValue(record[column.key])}</Table.Cell>{/each}</Table.Row>
+              <Table.Row>{#each resource.columns as column (column.key)}<Table.Cell class="max-w-80 truncate">{column.key.endsWith('_at') ? displayTimestamp(record[column.key]) : formatValue(record[column.key])}</Table.Cell>{/each}</Table.Row>
             {/each}
           </Table.Body>
         </Table.Root>

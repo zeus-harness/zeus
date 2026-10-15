@@ -1,10 +1,10 @@
 <script lang="ts">
+  import WorkItemSearch from '$lib/features/runs/WorkItemSearch.svelte';
   import type { WorkItem } from '$lib/api/work-items';
   import { statusLabel } from '$lib/features/status-labels';
   import { Badge } from '@zeus/ui/components/ui/badge';
   import { Button } from '@zeus/ui/components/ui/button';
   import * as Card from '@zeus/ui/components/ui/card';
-  import { Input } from '@zeus/ui/components/ui/input';
   import { Label } from '@zeus/ui/components/ui/label';
   import { NativeSelect, NativeSelectOption } from '@zeus/ui/components/ui/native-select';
   import * as Table from '@zeus/ui/components/ui/table';
@@ -17,8 +17,7 @@
 
   let { data } = $props<{ data: PageData }>();
   let runs = $derived(data.result.data?.items ?? []);
-  let itemQuery = $state('');
-  let workItemOptions = $derived((data.workItems.data?.items ?? []).filter((item: WorkItem) => item.id === data.filterWorkItemId || item.title.toLowerCase().includes(itemQuery.toLowerCase())));
+  let workItemOptions = $derived(data.workItems.data?.items ?? []);
   let workspaceBase = $derived(`/${data.workspaceId}`);
 
   function dateLabel(value: string | null): string {
@@ -60,7 +59,9 @@
   {:else}
     <Card.Root class="mt-8">
       <Card.Header class="gap-4 border-b border-border">
+        <WorkItemSearch query={data.itemQuery} status={data.filterStatus} selected={data.filterWorkItemId} nextCursor={data.workItems.data?.next_cursor} />
         <form method="GET" class="grid gap-3 sm:grid-cols-[12rem_minmax(16rem,1fr)_auto] sm:items-end">
+          <input type="hidden" name="item_q" value={data.itemQuery} />
           <div class="space-y-2">
             <Label for="run-status">状态</Label>
             <NativeSelect id="run-status" name="status" value={data.filterStatus} class="w-full">
@@ -75,13 +76,12 @@
             </NativeSelect>
           </div>
           <div class="space-y-2"><Label for="work-item-filter">工作项</Label>
-            <Input aria-label="搜索最近工作项标题" placeholder="搜索最近 50 个工作项的标题" bind:value={itemQuery} />
             <NativeSelect id="work-item-filter" name="work_item_id" value={data.filterWorkItemId} class="w-full">
               <NativeSelectOption value="">全部工作项</NativeSelectOption>
               {#if data.filterWorkItemId && !data.workItems.data?.items.some((item: WorkItem) => item.id === data.filterWorkItemId)}<NativeSelectOption value={data.filterWorkItemId}>当前筛选的工作项</NativeSelectOption>{/if}
               {#each workItemOptions as item (item.id)}<NativeSelectOption value={item.id}>{item.title}</NativeSelectOption>{/each}
             </NativeSelect>
-            <p class="text-xs text-muted-foreground">{data.workItems.status !== 'ready' ? '暂时无法加载工作项选项。' : '仅搜索最近 50 项；更早任务请从工作项详情查看关联运行。'}</p>
+            <p class="text-xs text-muted-foreground">{data.workItems.status !== 'ready' ? '暂时无法加载工作项选项。' : '从匹配的工作项中选择，再点击筛选。'}</p>
           </div>
           <Button type="submit" variant="outline">筛选</Button>
         </form>

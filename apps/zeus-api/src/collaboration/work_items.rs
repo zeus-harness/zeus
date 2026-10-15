@@ -51,6 +51,8 @@ pub struct WorkItemResponse {
     pub updated_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339::option")]
     pub completed_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub archived_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -131,7 +133,7 @@ pub async fn list_work_items(
     let mut items = sqlx::query_as::<_, WorkItemResponse>(
         "select id, organization_id, workspace_id, title, description, status, priority,
                 assignee_user_id, source_kind, external_reference, input, output, revision,
-                created_by, created_at, updated_at, completed_at
+                created_by, created_at, updated_at, completed_at, archived_at
          from work_items
          where organization_id = $1 and workspace_id = $2
            and ($3::text is null or status = $3)
@@ -220,7 +222,7 @@ pub async fn create_work_item(
          ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          returning id, organization_id, workspace_id, title, description, status, priority,
                    assignee_user_id, source_kind, external_reference, input, output, revision,
-                   created_by, created_at, updated_at, completed_at",
+                   created_by, created_at, updated_at, completed_at, archived_at",
     )
     .bind(auth.organization_id)
     .bind(workspace_id)
@@ -300,6 +302,16 @@ pub async fn update_work_item(
     if current.revision != revision {
         return Err(ApiError::PreconditionFailed);
     }
+    if current.archived_at.is_some() {
+        return Err(ApiError::Conflict("work item is archived".to_owned()));
+    }
+    if current.source_kind.as_deref() == Some("im_agent")
+        && request.status.as_deref() == Some("completed")
+    {
+        return Err(ApiError::Conflict(
+            "chat goals require accepted results and Owner archival".to_owned(),
+        ));
+    }
     if let Some(status) = request.status.as_deref() {
         parse_state(&current.status)?
             .transition(parse_state(status)?)
@@ -334,7 +346,7 @@ pub async fn update_work_item(
          where id = $9 and organization_id = $10 and workspace_id = $11 and revision = $12
          returning id, organization_id, workspace_id, title, description, status, priority,
                    assignee_user_id, source_kind, external_reference, input, output, revision,
-                   created_by, created_at, updated_at, completed_at",
+                   created_by, created_at, updated_at, completed_at, archived_at",
     )
     .bind(request.title)
     .bind(request.description)
@@ -1066,7 +1078,7 @@ async fn load_work_item(
     let query = format!(
         "select id, organization_id, workspace_id, title, description, status, priority,
                 assignee_user_id, source_kind, external_reference, input, output, revision,
-                created_by, created_at, updated_at, completed_at
+                created_by, created_at, updated_at, completed_at, archived_at
          from work_items where id = $1 and organization_id = $2 and workspace_id = $3{suffix}"
     );
     sqlx::query_as::<_, WorkItemResponse>(&query)

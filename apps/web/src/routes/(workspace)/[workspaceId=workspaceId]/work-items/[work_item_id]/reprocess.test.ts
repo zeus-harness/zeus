@@ -7,13 +7,13 @@ type Event = Parameters<NonNullable<Actions['reprocess']>>[0];
 const reviewId = '01900000-0000-7000-8000-000000000001';
 function event(status = 201, revision = '3', review = reviewId) {
   const fetcher = vi.fn().mockResolvedValue(Response.json(status === 201 ? { run: { id: 'new-run' } } : { detail: 'internal detail' }, { status }));
-  return { fetcher, event: { params: { workspaceId: 'workspace', work_item_id: 'item' }, fetch: fetcher, request: new Request('http://web.test', { method: 'POST', body: new URLSearchParams({ review_id: review, revision, reason: 'forged', workflow_id: 'forged' }) }) } as unknown as Event };
+  return { fetcher, event: { params: { workspaceId: 'workspace', work_item_id: 'item' }, url: new URL('http://web.test/workspace/work-items/item'), fetch: fetcher, request: new Request('http://web.test', { method: 'POST', body: new URLSearchParams({ review_id: review, revision, reason: 'forged', workflow_id: 'forged' }) }) } as unknown as Event };
 }
 describe('reprocess a human change request', () => {
   it('sends only the review reference, revision and a stable idempotency key', async () => {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const input = event();
-      await expect(actions.reprocess!(input.event)).rejects.toMatchObject({ status: 303, location: '/workspace/runs/new-run' });
+      await expect(actions.reprocess!(input.event)).rejects.toMatchObject({ status: 303, location: '/workspace/work-items/item' });
       const [url, init] = input.fetcher.mock.calls[0];
       expect(String(url)).toContain(`/work-items/item/reviews/${reviewId}/runs`);
       expect(new Headers(init.headers).get('if-match')).toBe('"revision-3"');

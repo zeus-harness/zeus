@@ -1,5 +1,10 @@
 <script lang="ts">
+  import TaskWorkspace from '$lib/features/work-items/TaskWorkspace.svelte';
+  import { discussionSource } from '$lib/plan-draft';
+  import ResultContent from '$lib/features/results/ResultContent.svelte';
+  import { displayTimestamp } from '$lib/display-timestamp';
   import { workItemNextAction } from '$lib/features/work-items/next-action';
+  import { withTaskReturn } from '$lib/task-return';
   import { page } from '$app/state';
   import { workItemListReturn } from '$lib/work-item-list-return';
   import { beforeNavigate } from '$app/navigation';
@@ -28,6 +33,7 @@
 
   import { Input } from '@zeus/ui/components/ui/input';
   import MemberPicker from '$lib/features/work-items/MemberPicker.svelte';
+  import WorkItemClosure from '$lib/features/work-items/WorkItemClosure.svelte';
   import type { MemberOption } from '$lib/server/member-options';
   import { statusLabel } from '$lib/features/status-labels';
   import { ArrowLeft, Bot, ExternalLink, FileText, Play, UserRound } from '@lucide/svelte';
@@ -46,6 +52,7 @@
   import EmptyState from '$lib/components/layout/EmptyState.svelte';
   import WorkspaceStatus from '$lib/components/WorkspaceStatus.svelte';
   import type { Workflow } from '$lib/api/control-plane';
+  import type { components } from '$lib/api/generated/schema';
   import type { Run } from '$lib/api/runs';
   import type { ActionData, PageData } from './$types';
 
@@ -72,24 +79,22 @@
       null
   );
 
-  let reviewableRuns = $derived(runs.filter((run: Run) => run.status === 'succeeded' && run.output !== null));
-  let latestRun = $derived(runs[0]);
-  let nextAction = $derived(workItemNextAction(item?.status ?? 'open', latestRun?.status, activeWorkflows.length > 0, data.canEdit));
+  let reviewableRuns = $derived([...runs.filter((run: Run) => run.status === 'succeeded' && run.output !== null), ...(data.requestedRun && !runs.some((run: Run) => run.id === data.requestedRun?.id) ? [data.requestedRun] : [])]);
+  let selectedReviewId = $derived(data.requestedRunId ?? reviewableRuns[0]?.id ?? '');
+  let selectedReview = $derived(reviewableRuns.find(run => run.id === selectedReviewId));
+  let latestRun = $derived(runs.find((run: Run) => run.parent_run_id === null));
   let activeTab = $derived(item?.status === 'canceled' ? 'details' : latestRun && ['queued', 'running', 'waiting_approval', 'waiting_child'].includes(latestRun.status) ? 'activity' : latestResult !== null ? 'result' : 'details');
   let resultText = $derived(typeof latestResult === 'string' ? latestResult : latestResult && typeof latestResult === 'object' && 'content' in latestResult && typeof latestResult.content === 'string' ? latestResult.content : null);
   let reviewRecords = $derived(data.reviews.data?.items ?? []);
+  let latestReview = $derived(reviewRecords.find((review: components['schemas']['WorkItemReviewResponse']) => review.run_id === latestRun?.id));
+  let closureReview = $derived(reviewRecords[0]);
+  let closureRun = $derived(runs.find((run: Run) => run.parent_run_id === null));
+  let closureEligible = $derived(data.reviews.status === 'ready' && data.runs.status === 'ready' && !data.reviewCursor && closureReview?.decision === 'accepted' && closureReview.run_id === closureRun?.id && closureRun?.status === 'succeeded' && closureRun.output !== null && closureReview.work_item_revision === (item?.revision ?? 0) - 1 && !runs.some((run: Run) => !['succeeded', 'failed', 'canceled'].includes(run.status)) && item?.status !== 'canceled' && item?.status !== 'blocked');
+  let nextAction = $derived(workItemNextAction(item?.status ?? 'open', latestRun?.status, activeWorkflows.length > 0, data.canEdit, latestReview?.decision));
+  let selectedAccepted = $derived(reviewRecords.find((review: components['schemas']['WorkItemReviewResponse']) => review.run_id === selectedReviewId)?.decision === 'accepted');
   const workItemLabels: Record<string, string> = { open: '待处理', in_progress: '处理中', blocked: '已阻塞', completed: '已完成', canceled: '已取消' };
 
-  function dateLabel(value: string | null): string {
-    return value
-      ? new Intl.DateTimeFormat('zh-CN', {
-          month: 'short',
-          day: 'numeric',
-          hour: '2-digit',
-          minute: '2-digit'
-        }).format(new Date(value))
-      : '—';
-  }
+  const dateLabel = displayTimestamp;
 
   function formatJson(value: unknown): string {
     try {
@@ -113,13 +118,15 @@
 <main class="px-5 py-7 lg:px-8 lg:py-9">
   {#if data.result.status !== 'ready' || !item}
     <WorkspaceStatus status={data.result.status} message={data.result.message} httpStatus={data.result.httpStatus} title="工作项详情" />
+  {:else if page.url.searchParams.get('view') !== 'advanced' && !editValues && !data.reviewCursor && (!data.requestedRunId || data.requestedRunId === latestRun?.id)}
+    <TaskWorkspace {data} {form} {closureEligible} />
   {:else}
     <a class="inline-flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground" href={workItemListReturn(page.url.searchParams.get('list_return'), data.workspaceId)}><ArrowLeft class="size-4" />返回工作项</a>
     <header class="mt-5 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
       <div class="min-w-0">
-        <div class="flex flex-wrap items-center gap-2"><Badge variant={statusVariant(item.status)}>{workItemLabels[item.status] ?? item.status}</Badge><Badge variant="outline" class="capitalize">{statusLabel(item.priority)}</Badge></div>
+        <div class="flex flex-wrap items-center gap-2"><Badge variant={statusVariant(item.status)}>{item.archived_at ? '已归档' : workItemLabels[item.status] ?? item.status}</Badge><Badge variant="outline" class="capitalize">{statusLabel(item.priority)}</Badge></div>
         <h1 class="mt-3 text-2xl font-semibold tracking-tight sm:text-3xl">{item.title}</h1>
-        <p class="mt-2 max-w-3xl whitespace-pre-wrap text-sm leading-6 text-muted-foreground">{item.description || '没有补充描述。'}</p>
+        <details class="mt-3 max-w-3xl"><summary class="cursor-pointer text-sm">查看目标、计划与待确认事项</summary><ResultContent text={item.description || '没有补充描述。'} actions={false} /></details>{#if discussionSource(data.workspaceId, item)}<a class="text-sm underline" href={discussionSource(data.workspaceId, item)!}>查看来源讨论</a>{/if}
       </div>
       <div class="flex items-center gap-2 text-sm text-muted-foreground"><UserRound class="size-4" />{data.members.find((member: MemberOption) => member.user_id === item.assignee_user_id)?.display_name || (item.assignee_user_id ? '已分配成员' : '未分配')}</div>
     </header>
@@ -142,6 +149,7 @@
         </form>
       {/key}
     {/if}
+    <div class="mt-4"><Button href={`${workspaceBase}/studio?work_item=${item.id}`} variant="outline">继续此工作项的对话</Button></div>
     <section aria-label="任务下一步" class="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border p-4">
       <div><p class="font-medium">{nextAction.title}</p><p class="mt-1 text-sm text-muted-foreground">{nextAction.description}</p></div>
       {#if nextAction.action}<Button href={nextAction.href} variant="outline" onclick={() => { if (nextAction.href === '#execution') activeTab = 'activity'; if (nextAction.href === '#acceptance') activeTab = 'result'; }}>{nextAction.action}</Button>{/if}
@@ -149,7 +157,7 @@
     <section aria-label="业务进度" class="mt-6 grid gap-3 sm:grid-cols-3">
       <div class="rounded-lg border border-border p-4"><p class="text-xs text-muted-foreground">工作项</p><p class="mt-2 font-medium">{workItemLabels[item.status] ?? item.status}</p><p class="mt-1 text-xs text-muted-foreground">业务状态由负责人更新</p></div>
       <div class="rounded-lg border border-border p-4"><p class="text-xs text-muted-foreground">最近运行</p><p class="mt-2 font-medium">{latestRun ? statusLabel(latestRun.status) : '尚未启动'}</p>{#if latestRun}<a class="mt-1 inline-block text-sm underline" href={`${workspaceBase}/runs/${latestRun.id}`}>查看执行过程</a>{/if}</div>
-      <div class="rounded-lg border border-border p-4"><p class="text-xs text-muted-foreground">结果验收</p><p class="mt-2 font-medium">{reviewableRuns.length ? '可查看验收记录' : '暂不可验收'}</p>{#if reviewableRuns.length}<a class="mt-1 inline-block text-sm underline" href="#acceptance" onclick={() => activeTab = 'result'}>查看结果与验收</a>{:else}<p class="mt-1 text-xs text-muted-foreground">成功运行并产生结果后可验收</p>{/if}</div>
+      <div class="rounded-lg border border-border p-4"><p class="text-xs text-muted-foreground">结果验收</p><p class="mt-2 font-medium">{data.reviews.status !== 'ready' ? '验收记录暂不可用' : latestReview ? (latestReview.decision === 'accepted' ? '最新结果已接受' : '最新结果需要修改') : reviewableRuns.length ? '结果待验收' : '暂不可验收'}</p>{#if reviewableRuns.length}<a class="mt-1 inline-block text-sm underline" href="#acceptance" onclick={() => activeTab = 'result'}>查看结果与验收</a>{:else}<p class="mt-1 text-xs text-muted-foreground">成功运行并产生结果后可验收</p>{/if}</div>
     </section>
     <div class="mt-7 grid gap-6 xl:grid-cols-[minmax(0,1fr)_22rem]">
       <Tabs.Root bind:value={activeTab} class="min-w-0">
@@ -189,7 +197,7 @@
 
           {#if approvals.length > 0}
             <Card.Root>
-              <Card.Header><Card.Title>审批记录</Card.Title><Card.Description>待审批项应尽快处理，避免 Run 长时间占用上下文。</Card.Description></Card.Header>
+              <Card.Header><Card.Title>审批记录</Card.Title><Card.Description>核对具体操作后处理审批，运行将从持久记录恢复。</Card.Description></Card.Header>
               <Card.Content class="space-y-2">
                 {#each approvals as approval (approval.id)}
                   <a class="flex items-center justify-between gap-4 rounded-lg border border-border p-3 hover:bg-accent" href={`${workspaceBase}/runs/${approval.run_id}`}>
@@ -206,7 +214,7 @@
           <Card.Root><Card.Header><Card.Title>任务上下文</Card.Title><Card.Description>协作者可读信息保持在前，内部 ID 放到末尾。</Card.Description></Card.Header><Card.Content class="space-y-5">
             <dl class="grid gap-5 sm:grid-cols-2">
               <div><dt class="text-xs font-medium text-muted-foreground">负责人</dt><dd class="mt-1 break-all text-sm">{data.members.find((member: MemberOption) => member.user_id === item.assignee_user_id)?.display_name || (item.assignee_user_id ? '已分配成员' : '未分配')}</dd></div>
-              <div><dt class="text-xs font-medium text-muted-foreground">来源</dt><dd class="mt-1 text-sm">{item.source_kind ?? '手工创建'}</dd></div>
+              <div><dt class="text-xs font-medium text-muted-foreground">来源</dt><dd class="mt-1 text-sm">{item.source_kind === 'im_agent' ? '群聊 Agent 调用' : item.source_kind === 'studio_discussion' ? 'Agent Studio 对话' : item.source_kind ?? '手工创建'}</dd></div>
               <div><dt class="text-xs font-medium text-muted-foreground">创建时间</dt><dd class="mt-1 text-sm">{dateLabel(item.created_at)}</dd></div>
               <div><dt class="text-xs font-medium text-muted-foreground">更新时间</dt><dd class="mt-1 text-sm">{dateLabel(item.updated_at)}</dd></div>
             </dl>
@@ -232,7 +240,7 @@
         <Tabs.Content value="result" class="mt-4">
           <Card.Root><Card.Header><Card.Title>最终结果</Card.Title><Card.Description>查看已保存的工作项结果，或最近一次成功运行的回答。运行成功不等于业务验收通过。</Card.Description></Card.Header><Card.Content>
             {#if latestResult !== null}
-              {#if resultText !== null}<div class="whitespace-pre-wrap break-words text-sm leading-7">{resultText}</div>{/if}
+              {#if resultText !== null}<ResultContent text={resultText} />{/if}
               <details open={resultText === null} class="mt-4"><summary class="cursor-pointer text-sm text-muted-foreground">查看原始结果</summary><pre class="mt-3 max-h-[32rem] overflow-auto rounded-lg bg-muted p-4 font-mono text-xs leading-5">{formatJson(latestResult)}</pre></details>
               <p class="mt-3 text-xs text-muted-foreground">结果可能来自较早的成功运行；验收时请核对所选 Run，不代表最近运行已成功。</p>
             {:else}<EmptyState title="还没有结果" description={nextAction.description} />{/if}
@@ -244,11 +252,15 @@
         <Card.Root>
           <Card.Header><Card.Title class="flex items-center gap-2"><span id="launch-run" class="scroll-mt-20"><Bot class="inline size-4" /> 启动智能体</span></Card.Title><Card.Description>选择已发布流程处理这项工作。完成后查看结果，并在下方进行人工验收。</Card.Description></Card.Header>
           <Card.Content>
-            {#if data.workflows.status !== 'ready'}
+            {#if item.archived_at}
+              <p class="text-sm text-muted-foreground">目标已封闭，无法启动新的运行。历史尝试和归档证据保留。</p>
+            {:else if !data.canEdit}
+              <p class="text-sm text-muted-foreground">需要当前 Workspace 的运行权限才能启动尝试。</p>
+            {:else if data.workflows.status !== 'ready'}
               <p class="text-sm text-destructive">{data.workflows.message}</p>
             {:else if activeWorkflows.length === 0}
               <EmptyState title="没有可运行的流程" description="请工作空间 Owner 或 Builder 配置 Agent，并发布流程版本。">
-                {#snippet action()}<Button href={`${workspaceBase}/workflows?return_to=${encodeURIComponent(`${workspaceBase}/work-items/${data.workItemId}`)}`} variant="outline" size="sm">配置流程</Button>{/snippet}
+                {#snippet action()}<Button href={withTaskReturn(`${workspaceBase}/workflows`, `${workspaceBase}/work-items/${data.workItemId}${page.url.searchParams.has('list_return') ? `?list_return=${encodeURIComponent(workItemListReturn(page.url.searchParams.get('list_return'), data.workspaceId))}` : ''}`)} variant="outline" size="sm">配置流程</Button>{/snippet}
               </EmptyState>
             {:else}
               <form method="POST" action="?/start" class="space-y-4">
@@ -261,29 +273,60 @@
           </Card.Content>
         </Card.Root>
 
-        <Card.Root>
-          <Card.Header><Card.Title><span id="update-status" class="scroll-mt-20">更新状态</span></Card.Title><Card.Description>多人协作时会检查版本，避免覆盖他人的更新。</Card.Description></Card.Header>
-          <Card.Content><form method="POST" action={taskAction('update')} class="space-y-4"><input type="hidden" name="revision" value={item.revision} /><div class="space-y-2"><Label for="status">状态</Label><NativeSelect id="status" name="status" value={item.status} class="w-full"><NativeSelectOption value="open">待处理</NativeSelectOption><NativeSelectOption value="in_progress">处理中</NativeSelectOption><NativeSelectOption value="blocked">已阻塞</NativeSelectOption><NativeSelectOption value="completed">已完成</NativeSelectOption><NativeSelectOption value="canceled">已取消</NativeSelectOption></NativeSelect></div><Button type="submit" variant="outline" class="w-full">保存状态</Button></form></Card.Content>
-        </Card.Root>
+        {#if !item.archived_at}
+          <Card.Root>
+            <Card.Header><Card.Title><span id="update-status" class="scroll-mt-20">更新状态</span></Card.Title><Card.Description>{latestReview?.decision === 'accepted' ? item.source_kind === 'im_agent' ? '最新结果已接受。请由 Owner 在“验证与归档”中核实目标达成。' : '最新结果已接受。如业务也已完成，请在此明确选择“已完成”并保存。' : '多人协作时会检查版本，避免覆盖他人的更新。'}</Card.Description></Card.Header>
+            <Card.Content><form method="POST" action={taskAction('update')} class="space-y-4"><input type="hidden" name="revision" value={item.revision} /><div class="space-y-2"><Label for="status">状态</Label><NativeSelect id="status" name="status" value={item.status} disabled={!data.canEdit} class="w-full"><NativeSelectOption value="open">待处理</NativeSelectOption><NativeSelectOption value="in_progress">处理中</NativeSelectOption><NativeSelectOption value="blocked">已阻塞</NativeSelectOption>{#if item.source_kind !== 'im_agent'}<NativeSelectOption value="completed">已完成</NativeSelectOption>{/if}<NativeSelectOption value="canceled">已取消</NativeSelectOption></NativeSelect></div><Button type="submit" variant="outline" class="w-full" disabled={!data.canEdit}>保存状态</Button></form></Card.Content>
+          </Card.Root>
+        {/if}
       </aside>
     </div>
-    <section id="acceptance" aria-label="人工验收" class="mt-6 scroll-mt-6">
+    <section id="acceptance" aria-label="人工验收" class="mt-6 scroll-mt-24">
       <Card.Root>
         <Card.Header><Card.Title>人工验收</Card.Title><Card.Description>核对指定运行的结果，记录接受或修改意见。工具审批仅授权执行，不代表业务验收。</Card.Description></Card.Header>
         <Card.Content class="space-y-5">
           {#if data.reviewed}<p role="status" class="text-sm">验收已保存。工作项状态保持不变，需要时请单独更新。</p>{/if}
           {#if data.reviews.status !== 'ready'}<p role="alert" class="text-sm text-destructive">验收记录暂时无法读取，请刷新后重试。</p>{/if}
           {#if reviewableRuns.length > 0}
+            {#if selectedAccepted && selectedReview}
+              <section class="space-y-3 rounded-lg border p-4" aria-label="已接受的结果">
+                <p class="font-medium">此结果已验收通过 · {dateLabel(selectedReview.created_at)}</p>
+                <ResultContent text={typeof selectedReview.output === 'string' ? selectedReview.output : selectedReview.output && typeof selectedReview.output === 'object' && 'content' in selectedReview.output ? String(selectedReview.output.content) : formatJson(selectedReview.output)} />
+                {#if latestRun?.id === selectedReview.id && data.canEdit && item.source_kind !== 'im_agent' && !['completed', 'canceled'].includes(item.status)}
+                  <form method="POST" action={taskAction('update')} class="space-y-3">
+                    <input type="hidden" name="revision" value={item.revision} /><input type="hidden" name="status" value="completed" />
+                    <p class="text-sm">结果验收已完成。如业务工作也已结束，可单独更新工作项状态。</p>
+                    <Button type="submit">标记工作已完成</Button>
+                  </form>
+                {/if}
+              </section>
+            {/if}
+            {#if !item.archived_at}
+            <details open={!selectedAccepted || form?.type === 'error'} class="space-y-4">
+              <summary class="cursor-pointer text-sm font-medium">{selectedAccepted ? '重新验收或选择其他运行' : '记录人工验收'}</summary>
             <form method="POST" action={taskAction('review')} class="space-y-4">
               <input type="hidden" name="revision" value={item.revision} />
               <div class="grid gap-4 md:grid-cols-2">
-                <div class="space-y-2"><Label for="review-run">验收的运行</Label><NativeSelect id="review-run" name="run_id" required><NativeSelectOption value="" disabled selected>选择已成功的运行</NativeSelectOption>{#each reviewableRuns as run (run.id)}<NativeSelectOption value={run.id}>{dateLabel(run.created_at)} · {run.id}</NativeSelectOption>{/each}</NativeSelect></div>
-                <div class="space-y-2"><Label for="review-decision">验收决定</Label><NativeSelect id="review-decision" name="decision" required><NativeSelectOption value="" disabled selected>请选择</NativeSelectOption><NativeSelectOption value="accepted">接受结果</NativeSelectOption><NativeSelectOption value="needs_changes">需要修改</NativeSelectOption></NativeSelect></div>
+                <div class="space-y-2"><Label for="review-run">验收的运行</Label><NativeSelect id="review-run" name="run_id" required bind:value={selectedReviewId}><NativeSelectOption value="" disabled>选择已成功的运行</NativeSelectOption>{#each reviewableRuns as run (run.id)}<NativeSelectOption value={run.id}>{dateLabel(run.created_at)} · {run.id.slice(-8)}</NativeSelectOption>{/each}</NativeSelect></div>
+                {#key selectedReviewId}<div class="space-y-2"><Label for="review-decision">验收决定</Label><NativeSelect id="review-decision" name="decision" required><NativeSelectOption value="" disabled selected>请选择</NativeSelectOption><NativeSelectOption value="accepted">接受结果</NativeSelectOption><NativeSelectOption value="needs_changes">需要修改</NativeSelectOption></NativeSelect></div>{/key}
               </div>
-              <div class="flex flex-wrap gap-3 text-sm">{#each reviewableRuns as run (run.id)}<a class="underline" href={`${workspaceBase}/runs/${run.id}`}>核对运行 {dateLabel(run.created_at)}</a>{/each}</div>
+              {#if selectedReview}
+                <section aria-label="本次验收的结果" class="rounded-lg border border-border p-4 space-y-3">
+                  <h3 class="font-medium">本次验收：{dateLabel(selectedReview.created_at)}</h3>
+                  <p class="break-all text-xs text-muted-foreground">运行 {selectedReview.id} · 流程版本 {selectedReview.workflow_version_id}</p>
+                  <ResultContent text={typeof selectedReview.output === 'object' && selectedReview.output && 'content' in selectedReview.output ? String(selectedReview.output.content) : formatJson(selectedReview.output)} />
+                  <a class="text-sm underline" href={`${workspaceBase}/runs/${selectedReview.id}`}>查看这次运行的执行过程</a>
+                  {#each reviewRecords.filter((review: components['schemas']['WorkItemReviewResponse']) => review.run_id === selectedReview.id) as review (review.id)}<p class="text-sm">已有验收：{review.decision === 'accepted' ? '接受结果' : '需要修改'} · {dateLabel(review.created_at)} · {review.reason}</p>{/each}
+                </section>
+              {:else}<p role="alert">所选结果不可用，请选择本工作项中已成功的运行。</p>{/if}
+              {#key selectedReviewId}
               <Label for="review-reason">验收原因</Label><Textarea id="review-reason" name="reason" required maxlength={4000} rows={3} placeholder="说明已核对的事实、缺失信息或需要修改的内容。" />
-              <Button type="submit">保存验收记录</Button>
+              <label class="flex items-center gap-2 text-sm"><input type="checkbox" required />我已核对上方所选运行的结果</label>
+              <Button type="submit" disabled={!selectedReview || !data.canEdit}>保存验收记录</Button>
+              {/key}
             </form>
+            </details>
+            {/if}
           {:else}<p class="text-sm text-muted-foreground">当前加载的运行中没有可验收结果。请先完成一次成功运行。</p>{/if}
           <div class="space-y-3">
             {#each reviewRecords as review (review.id)}
@@ -307,5 +350,6 @@
         </Card.Content>
       </Card.Root>
     </section>
+    <WorkItemClosure {item} review={closureReview} archive={data.archive.data ?? null} canArchive={data.canArchive} eligible={closureEligible} report={form && 'archiveValues' in form ? form.archiveValues : ''} />
   {/if}
 </main>

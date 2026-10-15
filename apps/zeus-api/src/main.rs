@@ -33,6 +33,19 @@ enum Command {
         command: DatabaseCommand,
     },
     Openapi,
+    /// Deployment-operator registration into tenant-scoped managed Git storage.
+    ImportCodeRepository {
+        #[arg(long)]
+        root: std::path::PathBuf,
+        #[arg(long)]
+        organization_id: uuid::Uuid,
+        #[arg(long)]
+        workspace_id: uuid::Uuid,
+        #[arg(long)]
+        repository_id: uuid::Uuid,
+        #[arg(long)]
+        source: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -45,6 +58,30 @@ async fn main() -> anyhow::Result<()> {
     let telemetry = telemetry::init()?;
     let result = match Cli::parse().command {
         Command::Serve => serve().await,
+        Command::ImportCodeRepository {
+            root,
+            organization_id,
+            workspace_id,
+            repository_id,
+            source,
+        } => {
+            use zeus_api::execution::code_workspace::{CodeScope, CodeStorage};
+            let storage = CodeStorage::new(&root).await?;
+            storage
+                .import(
+                    CodeScope {
+                        organization_id,
+                        workspace_id,
+                        run_id: uuid::Uuid::nil(),
+                        fence: 1,
+                    },
+                    repository_id,
+                    &source,
+                )
+                .await?;
+            println!("Registered repository {repository_id}");
+            Ok(())
+        }
         Command::Db {
             command: DatabaseCommand::Migrate,
         } => migrate_command().await,
@@ -73,11 +110,19 @@ async fn serve() -> anyhow::Result<()> {
             RUNTIME_DATABASE_ROLE,
         )
         .await?;
-        let executor = DurableRunExecutor::new(
+        let mut executor = DurableRunExecutor::new(
             runtime_pool.clone(),
             config.node_id.clone(),
             Arc::clone(&state.platform.envelope),
         );
+        if let Some(root) = &config.code_storage_root {
+            executor = executor.with_code_storage(Arc::new(
+                zeus_api::execution::code_workspace::CodeStorage::new(root).await?,
+            ));
+        }
+        if let Some(sandbox) = zeus_api::execution::sandbox::SandboxClient::from_env()? {
+            executor = executor.with_sandbox(sandbox);
+        }
         let supervisor = ExecutionSupervisor::new(
             runtime_pool,
             Arc::new(executor),

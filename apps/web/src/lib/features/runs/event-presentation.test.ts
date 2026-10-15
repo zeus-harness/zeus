@@ -4,6 +4,9 @@ import { eventLabel } from './event-presentation';
 
 const event = (event_type: string, payload: Record<string, unknown> = {}) => ({ event_type, payload } as RunEvent);
 describe('execution labels', () => {
+  it('explains durable deadline expiry', () => {
+    expect(eventLabel(event('run.deadline_exceeded'))).toBe('等待或流程期限已到');
+  });
   it('does not present intermediate completions as Run completion', () => {
     expect(eventLabel(event('experience.selection_completed'))).toBe('经验选择完成');
     expect(eventLabel(event('model.completed'))).toBe('模型响应完成');

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import UpdateNotice from '$lib/components/UpdateNotice.svelte';
   import type { Snippet } from 'svelte';
 
   import '../app.css';
@@ -11,4 +12,5 @@
   <meta name="description" content="Zeus enterprise Harness Agent control plane" />
 </svelte:head>
 
+<UpdateNotice />
 {@render children()}

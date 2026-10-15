@@ -1016,6 +1016,312 @@ paths:
       security:
       - sessionCookie: []
       - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/im/conversations:
+    get:
+      tags:
+      - im
+      operationId: im_list
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: Opaque pagination cursor or page size (1-100).
+        required: false
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Opaque pagination cursor or page size (1-100).
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImConversations'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - im
+      operationId: im_create
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImCreate'
+        required: true
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImId'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/im/conversations/{conversation_id}:
+    get:
+      tags:
+      - im
+      operationId: im_detail
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: conversation_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImDetail'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    patch:
+      tags:
+      - im
+      operationId: im_change
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: conversation_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImChange'
+        required: true
+      responses:
+        '204':
+          description: Successful response
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/im/conversations/{conversation_id}/agents/{agent_member_id}:
+    delete:
+      tags:
+      - im
+      operationId: im_remove_agent
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: conversation_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: agent_member_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '204':
+          description: Successful response
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/im/conversations/{conversation_id}/messages:
+    get:
+      tags:
+      - im
+      operationId: im_messages
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: conversation_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: Opaque pagination cursor or page size (1-100).
+        required: false
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Opaque pagination cursor or page size (1-100).
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImMessages'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - im
+      operationId: im_send
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: conversation_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImSend'
+        required: true
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImId'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/organizations/{organization_id}/im/people:
+    get:
+      tags:
+      - im
+      operationId: im_directory
+      parameters:
+      - name: organization_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: q
+        in: query
+        description: Display name prefix or opaque pagination cursor.
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: Display name prefix or opaque pagination cursor.
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImPeople'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
   /api/v1/organizations/{organization_id}/invitations:
     get:
       tags:
@@ -3208,6 +3514,42 @@ paths:
       security:
       - sessionCookie: []
       - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/approvals/{approval_id}/revoke:
+    post:
+      tags:
+      - approvals
+      operationId: revoke_resource_authorization
+      parameters:
+      - name: workspace_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: approval_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DecideApprovalRequest'
+        required: true
+      responses:
+        '204':
+          description: Resource authorization revoked before execution
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
   /api/v1/workspaces/{workspace_id}/capabilities:
     get:
       tags:
@@ -4040,6 +4382,94 @@ paths:
       responses:
         '204':
           description: Successful response
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/im/conversations/{conversation_id}/agent-calls:
+    post:
+      tags:
+      - im
+      operationId: im_invoke_agent
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: conversation_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: Idempotency-Key
+        in: header
+        description: im:<agent_member_id>:<source_message_id>; one invocation per Agent and source message.
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImInvokeAgent'
+        required: true
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImAgentInvocation'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/im/conversations/{conversation_id}/agents:
+    post:
+      tags:
+      - im
+      operationId: im_add_agent
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: conversation_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImAddAgent'
+        required: true
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImId'
         default:
           description: Problem Details error
           content:
@@ -5398,6 +5828,91 @@ paths:
       security:
       - sessionCookie: []
       - serviceAccountBearer: []
+  /api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/archive:
+    get:
+      tags:
+      - collaboration
+      operationId: get_work_item_archive
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: work_item_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkItemArchiveResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
+    post:
+      tags:
+      - collaboration
+      operationId: archive_work_item
+      parameters:
+      - name: workspace_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: work_item_id
+        in: path
+        description: Path identifier
+        required: true
+        schema:
+          type: string
+      - name: If-Match
+        in: header
+        description: Current resource ETag, e.g. revision-1 in double quotes. A stale revision returns 412.
+        required: true
+        schema:
+          type: string
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: JSON request body
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ArchiveWorkItemRequest'
+        required: true
+      responses:
+        '201':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkItemArchiveResponse'
+        default:
+          description: Problem Details error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+      security:
+      - sessionCookie: []
+      - serviceAccountBearer: []
   /api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/attachments:
     get:
       tags:
@@ -6463,12 +6978,21 @@ components:
     ApprovalResponse:
       type: object
       required:
+      - kind
+      - can_decide
       - id
       - run_id
       - tool_call_id
       - status
       - requested_at
       properties:
+        authorized_until:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        can_decide:
+          type: boolean
         decided_at:
           type:
           - string
@@ -6487,6 +7011,8 @@ components:
         id:
           type: string
           format: uuid
+        kind:
+          type: string
         reason:
           type:
           - string
@@ -6494,12 +7020,33 @@ components:
         requested_at:
           type: string
           format: date-time
+        requested_by:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        revoked_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
         run_id:
           type: string
           format: uuid
         status:
           type: string
         tool_call_id:
+          type: string
+          format: uuid
+    ArchiveWorkItemRequest:
+      type: object
+      required:
+      - review_id
+      - resolution_summary
+      properties:
+        resolution_summary:
+          type: string
+        review_id:
           type: string
           format: uuid
     AttachmentResponse:
@@ -6735,6 +7282,32 @@ components:
           type: integer
           format: int64
         workflow_version_id:
+          type: string
+          format: uuid
+    CodeCheckpointResponse:
+      type: object
+      required:
+      - id
+      - repository_id
+      - base_commit
+      - checkpoint_commit
+      - fence_token
+      - created_at
+      properties:
+        base_commit:
+          type: string
+        checkpoint_commit:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        fence_token:
+          type: integer
+          format: int64
+        id:
+          type: string
+          format: uuid
+        repository_id:
           type: string
           format: uuid
     ConnectionPageResponse:
@@ -7305,6 +7878,11 @@ components:
           format: uuid
         approval_policy: {}
         capability_policy: {}
+        code_repository: {}
+        execution_environment:
+          type:
+          - string
+          - 'null'
         experience_policy: {}
         input_schema: {}
         max_runtime_seconds:
@@ -7320,6 +7898,7 @@ components:
           format: uuid
         output_schema: {}
         retry_policy: {}
+        time_policy: {}
         token_budget:
           type:
           - integer
@@ -8052,6 +8631,329 @@ components:
       properties:
         status:
           type: string
+    ImAddAgent:
+      type: object
+      required:
+      - workflow_version_id
+      properties:
+        workflow_version_id:
+          type: string
+          format: uuid
+    ImAgentCall:
+      type: object
+      required:
+      - run_id
+      - agent_member_id
+      - source_message_id
+      - workspace_id
+      - status
+      properties:
+        agent_member_id:
+          type: string
+          format: uuid
+        run_id:
+          type: string
+          format: uuid
+        source_message_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+        work_item_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        workspace_id:
+          type: string
+          format: uuid
+    ImAgentInvocation:
+      type: object
+      required:
+      - id
+      properties:
+        id:
+          type: string
+          format: uuid
+        work_item_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+    ImAgentMember:
+      type: object
+      required:
+      - id
+      - display_name
+      - workspace_id
+      - workflow_version_id
+      - joined_sequence
+      properties:
+        display_name:
+          type: string
+        id:
+          type: string
+          format: uuid
+        joined_sequence:
+          type: integer
+          format: int64
+        workflow_version_id:
+          type: string
+          format: uuid
+        workspace_id:
+          type: string
+          format: uuid
+    ImChange:
+      type: object
+      required:
+      - operation
+      properties:
+        operation:
+          type: string
+        target:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        value:
+          type:
+          - string
+          - 'null'
+    ImConversation:
+      type: object
+      required:
+      - id
+      - organization_id
+      - kind
+      - title
+      - unread
+      - created_at
+      properties:
+        created_at:
+          type: string
+          format: date-time
+        id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+        organization_id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        unread:
+          type: integer
+          format: int64
+    ImConversations:
+      type: object
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImConversation'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+    ImCreate:
+      type: object
+      required:
+      - kind
+      - title
+      - participants
+      - request_id
+      properties:
+        kind:
+          type: string
+        participants:
+          type: array
+          items:
+            type: string
+            format: uuid
+        request_id:
+          type: string
+          format: uuid
+        title:
+          type: string
+    ImDetail:
+      type: object
+      required:
+      - conversation
+      - members
+      - agents
+      - calls
+      properties:
+        agents:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImAgentMember'
+        calls:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImAgentCall'
+        conversation:
+          $ref: '#/components/schemas/ImConversation'
+        members:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImParticipant'
+    ImId:
+      type: object
+      required:
+      - id
+      properties:
+        id:
+          type: string
+          format: uuid
+    ImInvokeAgent:
+      type: object
+      required:
+      - agent_member_id
+      - source_message_id
+      properties:
+        agent_member_id:
+          type: string
+          format: uuid
+        create_work_item:
+          type: boolean
+          description: Create a persistent business goal, independent of this execution attempt.
+        source_message_id:
+          type: string
+          format: uuid
+    ImMessage:
+      type: object
+      required:
+      - id
+      - sequence
+      - sender_organization_id
+      - sender_name
+      - organization_name
+      - content
+      - mentions
+      - created_at
+      properties:
+        agent_run_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        content:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        id:
+          type: string
+          format: uuid
+        mentions:
+          type: array
+          items:
+            type: string
+            format: uuid
+        organization_name:
+          type: string
+        reply_to:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        sender_agent_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        sender_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        sender_name:
+          type: string
+        sender_organization_id:
+          type: string
+          format: uuid
+        sequence:
+          type: integer
+          format: int64
+    ImMessages:
+      type: object
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImMessage'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+    ImParticipant:
+      type: object
+      required:
+      - id
+      - display_name
+      - organization_id
+      - role
+      properties:
+        display_name:
+          type: string
+        id:
+          type: string
+          format: uuid
+        organization_id:
+          type: string
+          format: uuid
+        role:
+          type: string
+    ImPeople:
+      type: object
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImPerson'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+    ImPerson:
+      type: object
+      required:
+      - id
+      - display_name
+      properties:
+        display_name:
+          type: string
+        id:
+          type: string
+          format: uuid
+    ImSend:
+      type: object
+      required:
+      - content
+      - request_id
+      properties:
+        content:
+          type: string
+        mentions:
+          type: array
+          items:
+            type: string
+            format: uuid
+        reply_to:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        request_id:
+          type: string
+          format: uuid
     InvitationResponse:
       type: object
       required:
@@ -8879,6 +9781,11 @@ components:
         created_at:
           type: string
           format: date-time
+        deadline_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
         error_code:
           type:
           - string
@@ -8923,6 +9830,11 @@ components:
         updated_at:
           type: string
           format: date-time
+        wait_expires_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
         work_item_id:
           type:
           - string
@@ -8950,6 +9862,15 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ApprovalResponse'
+        code_checkpoints:
+          type: array
+          items:
+            $ref: '#/components/schemas/CodeCheckpointResponse'
+        conversation_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
         experience_injections:
           type: array
           items:
@@ -9977,6 +10898,45 @@ components:
       properties:
         reason:
           type: string
+    WorkItemArchiveResponse:
+      type: object
+      required:
+      - id
+      - work_item_id
+      - run_id
+      - review_id
+      - workflow_version_id
+      - work_item_revision
+      - resolution_summary
+      - archived_by
+      - created_at
+      properties:
+        archived_by:
+          type: string
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+        id:
+          type: string
+          format: uuid
+        resolution_summary:
+          type: string
+        review_id:
+          type: string
+          format: uuid
+        run_id:
+          type: string
+          format: uuid
+        work_item_id:
+          type: string
+          format: uuid
+        work_item_revision:
+          type: integer
+          format: int64
+        workflow_version_id:
+          type: string
+          format: uuid
     WorkItemPageResponse:
       type: object
       required:
@@ -10005,6 +10965,11 @@ components:
       - created_at
       - updated_at
       properties:
+        archived_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
         assignee_user_id:
           type:
           - string
@@ -10199,6 +11164,7 @@ components:
           format: uuid
         approval_policy: {}
         capability_policy: {}
+        code_repository: {}
         created_at:
           type: string
           format: date-time
@@ -10207,6 +11173,10 @@ components:
           - string
           - 'null'
           format: uuid
+        execution_environment:
+          type:
+          - string
+          - 'null'
         experience_policy: {}
         id:
           type: string
@@ -10226,6 +11196,7 @@ components:
           format: uuid
         output_schema: {}
         retry_policy: {}
+        time_policy: {}
         token_budget:
           type:
           - integer

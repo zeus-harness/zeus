@@ -283,6 +283,8 @@ where
 
     pub async fn run(self) {
         let mut tasks = JoinSet::new();
+        let mut maintenance = tokio::time::interval(Duration::from_secs(5));
+        maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         info!(node_id = %self.node_id, "execution supervisor started");
 
         loop {
@@ -291,6 +293,13 @@ where
                 Some(result) = tasks.join_next(), if !tasks.is_empty() => {
                     if let Err(error) = result {
                         error!(%error, "run task crashed");
+                    }
+                }
+                _ = maintenance.tick() => {
+                    if let Err(error) = sqlx::query_scalar::<_, i32>(
+                        "select zeus_private.expire_run_waits(100)"
+                    ).fetch_one(&self.pool).await {
+                        warn!(%error, "run deadline maintenance failed");
                     }
                 }
                 () = tokio::time::sleep(self.poll_interval) => {

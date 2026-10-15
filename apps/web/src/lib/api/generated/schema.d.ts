@@ -468,6 +468,86 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/organizations/{organization_id}/im/conversations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["im_list"];
+        put?: never;
+        post: operations["im_create"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/organizations/{organization_id}/im/conversations/{conversation_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["im_detail"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch: operations["im_change"];
+        trace?: never;
+    };
+    "/api/v1/organizations/{organization_id}/im/conversations/{conversation_id}/agents/{agent_member_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["im_remove_agent"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/organizations/{organization_id}/im/conversations/{conversation_id}/messages": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["im_messages"];
+        put?: never;
+        post: operations["im_send"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/organizations/{organization_id}/im/people": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["im_directory"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/organizations/{organization_id}/invitations": {
         parameters: {
             query?: never;
@@ -1220,6 +1300,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/approvals/{approval_id}/revoke": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["revoke_resource_authorization"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/capabilities": {
         parameters: {
             query?: never;
@@ -1486,6 +1582,38 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["withdraw_experience_entry"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/im/conversations/{conversation_id}/agent-calls": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["im_invoke_agent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/im/conversations/{conversation_id}/agents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["im_add_agent"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1956,6 +2084,22 @@ export interface paths {
         patch: operations["update_work_item"];
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/archive": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_work_item_archive"];
+        put?: never;
+        post: operations["archive_work_item"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/attachments": {
         parameters: {
             query?: never;
@@ -2388,6 +2532,9 @@ export interface components {
         };
         ApprovalResponse: {
             /** Format: date-time */
+            authorized_until?: string | null;
+            can_decide: boolean;
+            /** Format: date-time */
             decided_at?: string | null;
             /** Format: uuid */
             decided_by?: string | null;
@@ -2395,14 +2542,24 @@ export interface components {
             expires_at?: string | null;
             /** Format: uuid */
             id: string;
+            kind: string;
             reason?: string | null;
             /** Format: date-time */
             requested_at: string;
+            /** Format: uuid */
+            requested_by?: string | null;
+            /** Format: date-time */
+            revoked_at?: string | null;
             /** Format: uuid */
             run_id: string;
             status: string;
             /** Format: uuid */
             tool_call_id: string;
+        };
+        ArchiveWorkItemRequest: {
+            resolution_summary: string;
+            /** Format: uuid */
+            review_id: string;
         };
         AttachmentResponse: {
             content_type: string;
@@ -2500,6 +2657,18 @@ export interface components {
             token_budget: number;
             /** Format: uuid */
             workflow_version_id: string;
+        };
+        CodeCheckpointResponse: {
+            base_commit: string;
+            checkpoint_commit: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: int64 */
+            fence_token: number;
+            /** Format: uuid */
+            id: string;
+            /** Format: uuid */
+            repository_id: string;
         };
         ConnectionPageResponse: {
             items: components["schemas"]["ConnectionResponse"][];
@@ -2729,6 +2898,8 @@ export interface components {
             agent_version_id: string;
             approval_policy?: unknown;
             capability_policy?: unknown;
+            code_repository?: unknown;
+            execution_environment?: string | null;
             experience_policy?: unknown;
             input_schema?: unknown;
             /** Format: int32 */
@@ -2739,6 +2910,7 @@ export interface components {
             model_profile_id?: string | null;
             output_schema?: unknown;
             retry_policy?: unknown;
+            time_policy?: unknown;
             /** Format: int64 */
             token_budget?: number | null;
         };
@@ -3031,6 +3203,138 @@ export interface components {
         };
         HealthResponse: {
             status: string;
+        };
+        ImAddAgent: {
+            /** Format: uuid */
+            workflow_version_id: string;
+        };
+        ImAgentCall: {
+            /** Format: uuid */
+            agent_member_id: string;
+            /** Format: uuid */
+            run_id: string;
+            /** Format: uuid */
+            source_message_id: string;
+            status: string;
+            /** Format: uuid */
+            work_item_id?: string | null;
+            /** Format: uuid */
+            workspace_id: string;
+        };
+        ImAgentInvocation: {
+            /** Format: uuid */
+            id: string;
+            /** Format: uuid */
+            work_item_id?: string | null;
+        };
+        ImAgentMember: {
+            display_name: string;
+            /** Format: uuid */
+            id: string;
+            /** Format: int64 */
+            joined_sequence: number;
+            /** Format: uuid */
+            workflow_version_id: string;
+            /** Format: uuid */
+            workspace_id: string;
+        };
+        ImChange: {
+            operation: string;
+            /** Format: uuid */
+            target?: string | null;
+            value?: string | null;
+        };
+        ImConversation: {
+            /** Format: date-time */
+            created_at: string;
+            /** Format: uuid */
+            id: string;
+            kind: string;
+            /** Format: uuid */
+            organization_id: string;
+            title: string;
+            /** Format: int64 */
+            unread: number;
+        };
+        ImConversations: {
+            items: components["schemas"]["ImConversation"][];
+            next_cursor?: string | null;
+        };
+        ImCreate: {
+            kind: string;
+            participants: string[];
+            /** Format: uuid */
+            request_id: string;
+            title: string;
+        };
+        ImDetail: {
+            agents: components["schemas"]["ImAgentMember"][];
+            calls: components["schemas"]["ImAgentCall"][];
+            conversation: components["schemas"]["ImConversation"];
+            members: components["schemas"]["ImParticipant"][];
+        };
+        ImId: {
+            /** Format: uuid */
+            id: string;
+        };
+        ImInvokeAgent: {
+            /** Format: uuid */
+            agent_member_id: string;
+            /** @description Create a persistent business goal, independent of this execution attempt. */
+            create_work_item?: boolean;
+            /** Format: uuid */
+            source_message_id: string;
+        };
+        ImMessage: {
+            /** Format: uuid */
+            agent_run_id?: string | null;
+            content: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: uuid */
+            id: string;
+            mentions: string[];
+            organization_name: string;
+            /** Format: uuid */
+            reply_to?: string | null;
+            /** Format: uuid */
+            sender_agent_id?: string | null;
+            /** Format: uuid */
+            sender_id?: string | null;
+            sender_name: string;
+            /** Format: uuid */
+            sender_organization_id: string;
+            /** Format: int64 */
+            sequence: number;
+        };
+        ImMessages: {
+            items: components["schemas"]["ImMessage"][];
+            next_cursor?: string | null;
+        };
+        ImParticipant: {
+            display_name: string;
+            /** Format: uuid */
+            id: string;
+            /** Format: uuid */
+            organization_id: string;
+            role: string;
+        };
+        ImPeople: {
+            items: components["schemas"]["ImPerson"][];
+            next_cursor?: string | null;
+        };
+        ImPerson: {
+            display_name: string;
+            /** Format: uuid */
+            id: string;
+        };
+        ImSend: {
+            content: string;
+            mentions?: string[];
+            /** Format: uuid */
+            reply_to?: string | null;
+            /** Format: uuid */
+            request_id: string;
         };
         InvitationResponse: {
             /** Format: date-time */
@@ -3371,6 +3675,8 @@ export interface components {
             cancel_requested_at?: string | null;
             /** Format: date-time */
             created_at: string;
+            /** Format: date-time */
+            deadline_at?: string | null;
             error_code?: string | null;
             error_detail?: string | null;
             /** Format: date-time */
@@ -3392,6 +3698,8 @@ export interface components {
             status: string;
             /** Format: date-time */
             updated_at: string;
+            /** Format: date-time */
+            wait_expires_at?: string | null;
             /** Format: uuid */
             work_item_id?: string | null;
             /** Format: uuid */
@@ -3401,6 +3709,9 @@ export interface components {
         };
         RunTraceResponse: {
             approvals: components["schemas"]["ApprovalResponse"][];
+            code_checkpoints?: components["schemas"]["CodeCheckpointResponse"][];
+            /** Format: uuid */
+            conversation_id?: string | null;
             experience_injections: components["schemas"]["TraceExperienceInjectionResponse"][];
             linked_runs: components["schemas"]["TraceRunLinkResponse"][];
             run: components["schemas"]["RunResponse"];
@@ -3802,11 +4113,32 @@ export interface components {
         WithdrawExperienceRequest: {
             reason: string;
         };
+        WorkItemArchiveResponse: {
+            /** Format: uuid */
+            archived_by: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: uuid */
+            id: string;
+            resolution_summary: string;
+            /** Format: uuid */
+            review_id: string;
+            /** Format: uuid */
+            run_id: string;
+            /** Format: uuid */
+            work_item_id: string;
+            /** Format: int64 */
+            work_item_revision: number;
+            /** Format: uuid */
+            workflow_version_id: string;
+        };
         WorkItemPageResponse: {
             items: components["schemas"]["WorkItemResponse"][];
             next_cursor?: string | null;
         };
         WorkItemResponse: {
+            /** Format: date-time */
+            archived_at?: string | null;
             /** Format: uuid */
             assignee_user_id?: string | null;
             /** Format: date-time */
@@ -3889,10 +4221,12 @@ export interface components {
             agent_version_id: string;
             approval_policy: unknown;
             capability_policy: unknown;
+            code_repository?: unknown;
             /** Format: date-time */
             created_at: string;
             /** Format: uuid */
             created_by?: string | null;
+            execution_environment?: string | null;
             experience_policy: unknown;
             /** Format: uuid */
             id: string;
@@ -3907,6 +4241,7 @@ export interface components {
             organization_id: string;
             output_schema: unknown;
             retry_policy: unknown;
+            time_policy?: unknown;
             /** Format: int64 */
             token_budget?: number | null;
             /** Format: int32 */
@@ -5143,6 +5478,300 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["FederatedGroupMappingResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    im_list: {
+        parameters: {
+            query?: {
+                /** @description Opaque pagination cursor or page size (1-100). */
+                cursor?: string;
+                /** @description Opaque pagination cursor or page size (1-100). */
+                limit?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImConversations"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    im_create: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        /** @description JSON request body */
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ImCreate"];
+            };
+        };
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImId"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    im_detail: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+                /** @description Path identifier */
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImDetail"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    im_change: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+                /** @description Path identifier */
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        /** @description JSON request body */
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ImChange"];
+            };
+        };
+        responses: {
+            /** @description Successful response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    im_remove_agent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+                /** @description Path identifier */
+                conversation_id: string;
+                /** @description Path identifier */
+                agent_member_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    im_messages: {
+        parameters: {
+            query?: {
+                /** @description Opaque pagination cursor or page size (1-100). */
+                cursor?: string;
+                /** @description Opaque pagination cursor or page size (1-100). */
+                limit?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+                /** @description Path identifier */
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImMessages"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    im_send: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+                /** @description Path identifier */
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        /** @description JSON request body */
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ImSend"];
+            };
+        };
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImId"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    im_directory: {
+        parameters: {
+            query?: {
+                /** @description Display name prefix or opaque pagination cursor. */
+                q?: string;
+                /** @description Display name prefix or opaque pagination cursor. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                organization_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImPeople"];
                 };
             };
             /** @description Problem Details error */
@@ -7463,6 +8092,40 @@ export interface operations {
             };
         };
     };
+    revoke_resource_authorization: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: string;
+                approval_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DecideApprovalRequest"];
+            };
+        };
+        responses: {
+            /** @description Resource authorization revoked before execution */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
     list_workspace_capabilities: {
         parameters: {
             query?: never;
@@ -8303,6 +8966,87 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    im_invoke_agent: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description im:<agent_member_id>:<source_message_id>; one invocation per Agent and source message. */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description Path identifier */
+                workspace_id: string;
+                /** @description Path identifier */
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        /** @description JSON request body */
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ImInvokeAgent"];
+            };
+        };
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImAgentInvocation"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    im_add_agent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                workspace_id: string;
+                /** @description Path identifier */
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        /** @description JSON request body */
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ImAddAgent"];
+            };
+        };
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImId"];
+                };
             };
             /** @description Problem Details error */
             default: {
@@ -9665,6 +10409,83 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["WorkItemResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    get_work_item_archive: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Path identifier */
+                workspace_id: string;
+                /** @description Path identifier */
+                work_item_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkItemArchiveResponse"];
+                };
+            };
+            /** @description Problem Details error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    archive_work_item: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current resource ETag, e.g. revision-1 in double quotes. A stale revision returns 412. */
+                "If-Match": string;
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description Path identifier */
+                workspace_id: string;
+                /** @description Path identifier */
+                work_item_id: string;
+            };
+            cookie?: never;
+        };
+        /** @description JSON request body */
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ArchiveWorkItemRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkItemArchiveResponse"];
                 };
             };
             /** @description Problem Details error */

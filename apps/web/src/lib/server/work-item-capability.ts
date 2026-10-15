@@ -13,8 +13,27 @@ export const workItemReadDefinition = {
   idempotency_mode: 'supported', risk_level: 'low', executor_key: 'builtin.work_item_read'
 } satisfies components['schemas']['CreateCapabilityDefinitionRequest'];
 
-export async function enableWorkItemRead(
-  event: Pick<RequestEvent, 'fetch' | 'request' | 'url'> & { params: { workspaceId?: string } },
+export const sandboxExecDefinition = {
+  registry_key: 'zeus.sandbox-exec', display_name: 'Alpine 隔离脚本',
+  description: 'Run a reviewed script in the Workflow pinned offline Alpine environment. Requires a code repository and human approval.',
+  input_schema: { type: 'object', properties: { script: { type: 'string', minLength: 1, maxLength: 16384 } }, required: ['script'], additionalProperties: false },
+  output_schema: { type: 'object', required: ['exit_code', 'output', 'environment'] },
+  idempotency_mode: 'unavailable', risk_level: 'high', executor_key: 'builtin.sandbox_exec'
+} satisfies components['schemas']['CreateCapabilityDefinitionRequest'];
+
+type SetupEvent = Pick<RequestEvent, 'fetch' | 'request' | 'url'> & { params: { workspaceId?: string } };
+
+export function enableWorkItemRead(event: SetupEvent, apiBaseUrl?: string) {
+  return enableBuiltin(event, workItemReadDefinition, apiBaseUrl);
+}
+
+export function enableSandboxExec(event: SetupEvent, apiBaseUrl?: string) {
+  return enableBuiltin(event, sandboxExecDefinition, apiBaseUrl);
+}
+
+async function enableBuiltin(
+  event: SetupEvent,
+  builtin: components['schemas']['CreateCapabilityDefinitionRequest'],
   apiBaseUrl?: string
 ) {
   const context = await requireWorkspaceAction(event, apiBaseUrl, event.params.workspaceId);
@@ -25,27 +44,27 @@ export async function enableWorkItemRead(
   const options = { apiBaseUrl, workspaceId: context.workspaceId };
   try {
     const catalog = await loadCapabilityCatalog(context.apiFetch, apiBaseUrl, organizationId);
-    let definition = catalog.items.find((item) => item.registry_key === workItemReadDefinition.registry_key);
+    let definition = catalog.items.find((item) => item.registry_key === builtin.registry_key);
     if (!definition) {
       // Organization and Workspace permissions are independently enforced by their APIs.
       definition = await requestJson<CapabilityDefinition>(context.apiFetch,
         serverApiUrl(apiBaseUrl, `/api/v1/organizations/${organizationId}/capability-definitions`),
-        jsonRequest('POST', workItemReadDefinition));
+        jsonRequest('POST', builtin));
     }
-    if (definition.archived_at || definition.executor_key !== workItemReadDefinition.executor_key) {
+    if (definition.archived_at || definition.executor_key !== builtin.executor_key) {
       return fail(409, { type: 'error' as const, message: '目录中的工具已归档或执行器不匹配，请联系 Organization Owner。' });
     }
     const capabilities = await requestWorkspaceJson<{ items: WorkspaceCapability[] }>(context.apiFetch, options, '/capabilities', undefined, { limit: 100 });
     const existing = capabilities.items.find((item) => item.capability_id === definition.id);
     const form = await event.request.formData();
-    const approvalRequired = form.get('approval_required') === 'on';
+    const approvalRequired = builtin.executor_key === 'builtin.sandbox_exec' || form.get('approval_required') === 'on';
     if (existing) {
       await requestWorkspaceJson(context.apiFetch, options, `/capabilities/${existing.capability_id}`,
         jsonRequest('PATCH', { enabled: true, approval_required: approvalRequired }, { 'if-match': `"revision-${existing.revision}"` }));
     } else {
       const payload: components['schemas']['CreateWorkspaceCapabilityRequest'] = {
         capability_id: definition.id, connection_id: null, enabled: true,
-        approval_required: approvalRequired, timeout_seconds: 10, policy: {}
+        approval_required: approvalRequired, timeout_seconds: builtin.executor_key === 'builtin.sandbox_exec' ? 60 : 10, policy: {}
       };
       await requestWorkspaceJson(context.apiFetch, options, '/capabilities', jsonRequest('POST', payload));
     }

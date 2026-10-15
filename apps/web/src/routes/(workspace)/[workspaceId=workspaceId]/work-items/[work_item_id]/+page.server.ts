@@ -1,3 +1,4 @@
+import { taskAttemptAction } from '$lib/server/task-attempt';
 import { workItemListReturn } from '$lib/work-item-list-return';
 import { fail, redirect } from '@sveltejs/kit';
 import { env } from '$env/dynamic/private';
@@ -5,11 +6,13 @@ import type { Actions, PageServerLoad } from './$types';
 
 import { loadWorkspaceData, ZeusApiError } from '$lib/api/client';
 import { listWorkflows } from '$lib/api/control-plane';
-import { listApprovals, listRuns, startWorkItemRun, reprocessWorkItemReview } from '$lib/api/runs';
+import { getRun, getRunTrace, listApprovals, listRuns, startWorkItemRun, reprocessWorkItemReview } from '$lib/api/runs';
 import {
   getWorkItem,
   listWorkItemReviews,
   createWorkItemReview,
+  getWorkItemArchive,
+  archiveWorkItem,
   listWorkItemAttachments,
   listWorkItemExternalReferences,
   updateWorkItem
@@ -39,7 +42,7 @@ export const load: PageServerLoad = async ({ fetch, parent, request, params, url
   const { status: authStatus, principal, canManageWorkspace, activeWorkspace } = await parent();
   const apiFetch = serverApiFetcher(fetch, request.headers.get('cookie'), url.origin);
   const workspaceContext = { authStatus, workspaceId: params.workspaceId };
-  const [result, workflows, runs, approvals, attachments, externalReferences, reviews] = await Promise.all([
+  const [result, workflows, runs, approvals, attachments, externalReferences, reviews, archive] = await Promise.all([
     loadWorkspaceData(apiFetch, workspaceContext, (workspaceFetch, workspaceId) =>
       getWorkItem(workspaceFetch, { apiBaseUrl: env.ZEUS_API_URL, workspaceId }, params.work_item_id)
     ),
@@ -78,13 +81,30 @@ export const load: PageServerLoad = async ({ fetch, parent, request, params, url
     ),
     loadWorkspaceData(apiFetch, workspaceContext, (workspaceFetch, workspaceId) =>
       listWorkItemReviews(workspaceFetch, { apiBaseUrl: env.ZEUS_API_URL, workspaceId }, params.work_item_id, url.searchParams.get('review_cursor') ?? undefined)
+    ),
+    loadWorkspaceData(apiFetch, workspaceContext, (workspaceFetch, workspaceId) =>
+      getWorkItemArchive(workspaceFetch, { apiBaseUrl: env.ZEUS_API_URL, workspaceId }, params.work_item_id)
     )
   ]);
 
+  const latestRun = runs.data?.items.find(run => run.parent_run_id === null);
+  const trace = latestRun ? await loadWorkspaceData(apiFetch, workspaceContext, workspaceFetch => getRunTrace(workspaceFetch, { apiBaseUrl: env.ZEUS_API_URL, workspaceId: params.workspaceId }, latestRun.id)) : null;
+  const requestedRunId = url.searchParams.get('review_run');
+  let requestedRun = null;
+  if (requestedRunId) {
+    const loaded = await loadWorkspaceData(apiFetch, workspaceContext, workspaceFetch =>
+      getRun(workspaceFetch, { apiBaseUrl: env.ZEUS_API_URL, workspaceId: params.workspaceId }, requestedRunId));
+    if (loaded.data?.work_item_id === params.work_item_id && loaded.data.status === 'succeeded' && loaded.data.output !== null) requestedRun = loaded.data;
+  }
   const memberOptions = await loadMemberOptions(apiFetch, { apiBaseUrl: env.ZEUS_API_URL, workspaceId: params.workspaceId }, canManageWorkspace, principal);
   return {
     ...memberOptions,
-    canEdit: canManageWorkspace || ['builder', 'operator'].includes(activeWorkspace.role),
+    trace,
+    launchRequestId: crypto.randomUUID(),
+    requestedRunId, requestedRun,
+    canEdit: !result.data?.archived_at && (canManageWorkspace || ['builder', 'operator'].includes(activeWorkspace.role)),
+    canArchive: principal?.workspace_role === 'owner' && !principal?.tenant_access_grant_id,
+    archive,
     saved: url.searchParams.get('saved') === '1',
     result,
     reviews,
@@ -108,6 +128,28 @@ function detailReturn(event: Parameters<NonNullable<Actions['edit']>>[0], suffix
 }
 
 export const actions: Actions = {
+  decide: event => taskAttemptAction(event, 'decide', env.ZEUS_API_URL),
+  retry: event => taskAttemptAction(event, 'retry', env.ZEUS_API_URL),
+  archive: async (event) => {
+    const context = await actionWorkspace(event);
+    if (context.error) return context.error;
+    const form = await event.request.formData();
+    const review_id = String(form.get('review_id') ?? '').trim();
+    const resolution_summary = String(form.get('resolution_summary') ?? '').trim();
+    const revision = Number(form.get('revision'));
+    const failure = (status: number, message: string) => fail(status, { type: 'error' as const, message, archiveValues: resolution_summary });
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(review_id) || !Number.isSafeInteger(revision) || revision < 1 || !resolution_summary || [...resolution_summary].length > 4000) {
+      return failure(400, '请核对最新验收，并填写 1–4000 字的问题解决验证报告。');
+    }
+    if (form.get('verified') !== 'yes') return failure(400, '请明确确认已验证目标达成。');
+    try {
+      await archiveWorkItem(context.apiFetch, { apiBaseUrl: env.ZEUS_API_URL, workspaceId: context.workspaceId }, event.params.work_item_id, revision, { review_id, resolution_summary }, `archive-${review_id}-${revision}`);
+    } catch (cause) {
+      const status = cause instanceof ZeusApiError ? cause.status : 502;
+      return failure(status, status === 412 ? '工作项已更新。报告已保留，请刷新并重新验收当前目标。' : status === 403 ? '只有当前 Workspace Owner 可以归档已验收的目标。' : status === 409 ? '需由 Owner 接受最新成功结果，且不能有未结束的运行。报告已保留。' : '归档未确认，报告已保留。请刷新核对状态后重试。');
+    }
+    redirect(303, detailReturn(event, '#closure'));
+  },
   reprocess: async (event) => {
     const context = await actionWorkspace(event);
     if (context.error) return context.error;
@@ -117,12 +159,10 @@ export const actions: Actions = {
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(reviewId) || !Number.isSafeInteger(revision) || revision < 1) {
       return actionError(400, '修改意见或工作项版本无效，请刷新后重试。');
     }
-    let runId: string;
     try {
-      const started = await reprocessWorkItemReview(context.apiFetch,
+      await reprocessWorkItemReview(context.apiFetch,
         { apiBaseUrl: env.ZEUS_API_URL, workspaceId: context.workspaceId },
         event.params.work_item_id, reviewId, revision);
-      runId = started.run.id;
     } catch (error) {
       const status = error instanceof ZeusApiError ? error.status : 502;
       return actionError(status, status === 412 ? '工作项已更新，请刷新并核对内容后重新处理。'
@@ -131,7 +171,7 @@ export const actions: Actions = {
         : status === 422 ? '原运行上下文过大或无效，无法重新处理。'
         : '未能重新处理，请稍后重试。');
     }
-    redirect(303, `/${event.params.workspaceId}/runs/${runId}`);
+    redirect(303, detailReturn(event));
   },
   edit: async (event) => {
     const context = await actionWorkspace(event);
@@ -218,20 +258,18 @@ export const actions: Actions = {
       return actionError(400, error instanceof Error ? error.message : 'Run input 无效。');
     }
 
-    let runId: string;
     try {
-      const started = await startWorkItemRun(
+      await startWorkItemRun(
         context.apiFetch,
         { apiBaseUrl: env.ZEUS_API_URL, workspaceId: context.workspaceId },
         event.params.work_item_id,
         { workflow_id: workflowId, input, message: message || null },
-        crypto.randomUUID()
+        /^[0-9a-f-]{36}$/i.test(String(formData.get('request_id') ?? '')) ? String(formData.get('request_id')) : crypto.randomUUID()
       );
-      runId = started.run.id;
     } catch (error) {
       const status = error instanceof ZeusApiError && error.status === 409 ? 409 : 502;
       return actionError(status, error instanceof Error ? error.message : 'Agent 启动失败。');
     }
-    redirect(303, `/${event.params.workspaceId}/runs/${runId}`);
+    redirect(303, detailReturn(event));
   }
 };

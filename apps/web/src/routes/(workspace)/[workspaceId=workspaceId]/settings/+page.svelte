@@ -43,6 +43,7 @@
     </Card.Content>
   </Card.Root>
   <div class="mt-7 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+    <a href={`/${data.workspaceId}/settings/studio`} class="group"><Card.Root class="h-full"><Card.Header><Card.Title>聊天助手设置</Card.Title><Card.Description>聊天助手、模型来源和自动创建工作的权限。</Card.Description></Card.Header></Card.Root></a>
     {#each data.resources as resource (resource.slug)}
       <a href={`/${data.workspaceId}/settings/${resource.slug}`} class="group">
         <Card.Root class="h-full transition-colors group-hover:border-foreground/30">

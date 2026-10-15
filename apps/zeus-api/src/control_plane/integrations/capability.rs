@@ -20,9 +20,8 @@ use crate::{
 
 use super::{
     default_enabled, empty_object, ensure_active_capability, ensure_active_connection,
-    etag_headers, require_object, validate_capability_definition_request,
-    validate_capability_definition_update, validate_timeout_seconds,
-    validate_workspace_capability_request,
+    etag_headers, validate_capability_definition_request, validate_capability_definition_update,
+    validate_timeout_seconds, validate_workspace_capability_request,
 };
 use zeus_core::Permission;
 
@@ -523,7 +522,7 @@ pub async fn update_workspace_capability(
         validate_timeout_seconds(timeout_seconds)?;
     }
     if let Some(policy) = request.policy.as_ref() {
-        require_object(policy, "policy")?;
+        validate_workspace_capability_request(request.timeout_seconds.unwrap_or(60), policy)?;
     }
     if let Some(Some(connection_id)) = request.connection_id {
         let mut transaction = begin_tenant(

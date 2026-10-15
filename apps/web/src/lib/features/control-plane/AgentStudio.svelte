@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { workflowTimeSummary } from '$lib/workflow-time';
   import SetupJourney from './SetupJourney.svelte';
   import { page } from '$app/state';
   import { taskReturnTo, withTaskReturn } from '$lib/task-return';
@@ -37,9 +38,9 @@
 </script>
 
 <main class="space-y-6 px-5 py-7 lg:px-8 lg:py-9">
-  <PageHeader title={isAgent ? '智能体（Agent）' : '流程（Workflow）'} eyebrow="Agent Studio"
+  <PageHeader title={isAgent ? '智能体（Agent）' : '流程（Workflow）'} eyebrow={isAgent ? 'Management Terminal · Agent 配置' : 'Business Studio · 工作流'}
     description={isAgent ? '选择组织提供的模型并编写指令，保存版本后发布。' : '选择 Agent 和工具；模型沿用 Agent 版本，保存版本后发布，即可从工作项启动。'} />
-  {#if returnTo}<Button href={returnTo} variant="outline">返回原工作项继续处理</Button>{/if}
+  {#if returnTo}<Button href={returnTo} variant="outline">{returnTo.includes('/studio') ? '返回原会话继续处理' : '返回原工作项继续处理'}</Button>{/if}
   <SetupJourney {organizationId} {workspaceId} current={resource} {returnTo} {canManageOrganization} configured={[...(studio.modelProfiles.length ? ['model-profiles'] : []), ...((isAgent ? studio.resources : studio.agents).some(agent => agent.active_version_id) ? ['agents'] : []), ...(!isAgent && studio.resources.some(workflow => workflow.active_version_id) ? ['workflows'] : [])]} />
   {#if isAgent && studio.resources.some(agent => agent.active_version_id)}<Button href={withTaskReturn(`${base}/workflows`, returnTo)}>下一步：发布流程</Button>{/if}
   {#if !isAgent && studio.resources.some(workflow => workflow.active_version_id)}<Button href={returnTo || `${base}/work-items`}>下一步：返回任务运行与验收</Button>{/if}
@@ -93,7 +94,7 @@
                 <ol class="grid gap-3 md:grid-cols-3" aria-label="Workflow 配置关系">
                   <li class="min-w-0 rounded-lg border border-border p-4"><p class="text-xs text-muted-foreground">1 · Agent 与模型</p><p class="mt-2 break-words font-medium">{studio.agents.find((agent) => agent.active_version_id === publishedWorkflow.agent_version_id)?.name ?? '已绑定的 Agent 版本'}</p><p class="mt-1 text-sm text-muted-foreground">{studio.modelProfiles.find((model) => model.id === publishedWorkflow.model_profile_id)?.name ?? '已绑定的模型'}</p><details class="mt-2 text-xs"><summary class="cursor-pointer">版本标识</summary><p class="mt-2 break-all">{publishedWorkflow.agent_version_id}</p></details></li>
                   <li class="min-w-0 rounded-lg border border-border p-4"><p class="text-xs text-muted-foreground">2 · 工具与审批</p>{#each allowedTools as id (id)}<p class="mt-2 break-words text-sm">{studio.catalog.find((entry) => entry.id === id)?.display_name ?? id}</p>{:else}<p class="mt-2 text-sm">未允许工具</p>{/each}<p class="mt-2 text-xs text-muted-foreground">调用时按 Workspace 要求和该版本的审批策略检查。</p></li>
-                  <li class="min-w-0 rounded-lg border border-border p-4"><p class="text-xs text-muted-foreground">3 · 执行与结果</p><p class="mt-2 text-sm">最多 {publishedWorkflow.max_steps} 步 · {publishedWorkflow.max_runtime_seconds} 秒</p><p class="mt-1 text-sm">{publishedWorkflow.token_budget ?? '未设置'} Token</p><a class="mt-3 inline-block text-sm underline" href={withTaskReturn(`${base}/work-items`, returnTo)}>选择工作项并运行</a></li>
+                  <li class="min-w-0 rounded-lg border border-border p-4"><p class="text-xs text-muted-foreground">3 · 执行与结果</p><p class="mt-2 text-sm">最多 {publishedWorkflow.max_steps} 步 · {workflowTimeSummary(publishedWorkflow.time_policy, publishedWorkflow.max_runtime_seconds)}</p><p class="mt-1 text-sm">{publishedWorkflow.token_budget ?? '未设置'} Token</p><a class="mt-3 inline-block text-sm underline" href={withTaskReturn(`${base}/work-items`, returnTo)}>选择工作项并运行</a></li>
                 </ol>
                 <p class="mt-3 text-xs text-muted-foreground">此处展示执行配置；实际模型和工具调用顺序以 Run 记录为准。</p>
               {/if}
@@ -114,7 +115,7 @@
                 <input type="hidden" name="resource_id" value={selected.id} />
                 {#if isAgent}
                     <div class="space-y-2"><Label for="model_profile_id">模型</Label>
-                      <NativeSelect id="model_profile_id" name="model_profile_id" required class="w-full" value={form?.values?.model_profile_id || studio.agentVersions[0]?.model_profile_id || ''}>
+                      <NativeSelect id="model_profile_id" name="model_profile_id" required class="w-full" value={form?.values?.model_profile_id || studio.agentVersions[0]?.model_profile_id || (studio.modelProfiles.length === 1 ? studio.modelProfiles[0].id : '')}>
                         <NativeSelectOption value="" disabled>选择模型</NativeSelectOption>
                         {#each studio.modelProfiles as model (model.id)}<NativeSelectOption value={model.id}>{model.name} · {model.model}</NativeSelectOption>{/each}
                       </NativeSelect>
@@ -125,7 +126,7 @@
                 {:else}
                   <div class="grid gap-4 md:grid-cols-2">
                     <div class="space-y-2"><Label for="agent_version_id">已发布的 Agent</Label>
-                      <NativeSelect id="agent_version_id" name="agent_version_id" required class="w-full" value={form?.values?.agent_version_id || ''}>
+                      <NativeSelect id="agent_version_id" name="agent_version_id" required class="w-full" value={form?.values?.agent_version_id || (studio.agents.length === 1 ? studio.agents[0].active_version_id ?? '' : '')}>
                         <NativeSelectOption value="" disabled>选择 Agent</NativeSelectOption>
                         {#each studio.agents as agent (agent.id)}<NativeSelectOption value={agent.active_version_id ?? ''}>{agent.name}</NativeSelectOption>{/each}
                       </NativeSelect>
@@ -144,10 +145,22 @@
                   </fieldset>
                   <div class="grid gap-4 sm:grid-cols-3">
                     <div class="space-y-2"><Label for="max_steps">最大模型步数</Label><Input id="max_steps" name="max_steps" type="number" min={1} max={1024} value={form?.values?.max_steps ?? 16} required /></div>
-                    <div class="space-y-2"><Label for="max_runtime_seconds">运行时限（秒）</Label><Input id="max_runtime_seconds" name="max_runtime_seconds" type="number" min={1} max={86400} value={form?.values?.max_runtime_seconds ?? 300} required /></div>
+                    <div class="space-y-2"><Label for="max_runtime_seconds">执行预算（秒）</Label><Input id="max_runtime_seconds" name="max_runtime_seconds" type="number" min={1} max={86400} value={form?.values?.max_runtime_seconds ?? 300} required /></div>
+                    <div class="space-y-2"><Label for="wait_timeout_seconds">单次等待期限（秒）</Label><Input id="wait_timeout_seconds" name="wait_timeout_seconds" type="number" min={1} max={31536000} value={form?.values?.wait_timeout_seconds ?? 604800} required /></div>
+                    <div class="space-y-2"><Label for="business_timeout_seconds">流程总期限（秒）</Label><Input id="business_timeout_seconds" name="business_timeout_seconds" type="number" min={1} max={31536000} value={form?.values?.business_timeout_seconds ?? 2592000} required /></div>
                     <div class="space-y-2"><Label for="token_budget">Token 预算</Label><Input id="token_budget" name="token_budget" type="number" min={1} max={10000000} value={form?.values?.token_budget ?? 16000} required /></div>
                   </div>
                 {/if}
+                {#if !isAgent}
+                  <details class="rounded-lg border border-border p-4">
+                    <summary class="cursor-pointer text-sm font-medium">代码仓库（可选）</summary>
+                    <p class="mt-2 text-xs text-muted-foreground">由部署管理员登记仓库并启用持久代码存储后填写。固定 commit 可在不同工作项中复用；每次运行拥有独立代码检查点。脚本工具需另外启用，且每次执行前必须审批。</p>
+                    <div class="mt-3 space-y-2"><Label for="repository_id">仓库 ID</Label><Input id="repository_id" name="repository_id" value={form?.values?.repository_id ?? ''} /></div>
+                    <div class="mt-3 space-y-2"><Label for="repository_commit">固定 commit（40 位）</Label><Input id="repository_commit" name="repository_commit" value={form?.values?.repository_commit ?? ''} /></div>
+                    <div class="mt-3 space-y-2"><Label for="execution_environment">Alpine 执行环境（可选）</Label><Input id="execution_environment" name="execution_environment" placeholder="sha256:…" value={form?.values?.execution_environment ?? ''} /><p class="text-xs text-muted-foreground">填写部署管理员提供的固定镜像摘要。内含 Git、Node、Python、Rust；默认断网、非 root、1 CPU、512 MiB 内存，单次脚本最多 300 秒。</p></div>
+                  </details>
+                {/if}
+                {#if !isAgent}<p class="text-sm text-muted-foreground">发布后可在多个工作项中重复使用。每次运行独立记录进度与预算；等待审批或子任务不消耗执行预算，总期限从创建运行开始计算。修改配置需保存并发布新版本，不影响已有运行。</p>{/if}
                 <Button type="submit">保存新版本</Button>
               </form>
             {/if}
@@ -173,7 +186,7 @@
                   <details><summary class="cursor-pointer text-sm">查看指令</summary><pre class="mt-3 max-h-64 overflow-auto whitespace-pre-wrap break-words text-xs">{version.instructions}</pre></details>
                 {:else}
                   <p class="break-all text-xs text-muted-foreground">Agent 版本：{version.agent_version_id}<br />模型配置：{version.model_profile_id}</p>
-                  <p class="text-xs text-muted-foreground">最多 {version.max_steps} 步 · {version.max_runtime_seconds} 秒 · {version.token_budget ?? '未设置'} Token</p>
+                  <p class="text-xs text-muted-foreground">最多 {version.max_steps} 步 · {workflowTimeSummary(version.time_policy, version.max_runtime_seconds)} · {version.token_budget ?? '未设置'} Token</p>
                 {/if}
               </section>
             {:else}<p class="text-sm text-muted-foreground">还没有版本。先保存配置，再发布。</p>{/each}

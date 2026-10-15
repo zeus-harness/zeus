@@ -27,8 +27,9 @@ export const load: PageServerLoad = async ({ fetch, parent, params, request, url
   );
 
   const workItems = await loadWorkspaceData(apiFetch, { authStatus, workspaceId: params.workspaceId },
-    workspaceFetch => listWorkItems(workspaceFetch, { apiBaseUrl: env.ZEUS_API_URL, workspaceId: params.workspaceId, limit: 50 }));
+    workspaceFetch => listWorkItems(workspaceFetch, { apiBaseUrl: env.ZEUS_API_URL, workspaceId: params.workspaceId, limit: 50, q: url.searchParams.get('item_q') || undefined, cursor: url.searchParams.get('item_cursor') || undefined }));
   return {
+    itemQuery: url.searchParams.get('item_q') ?? '',
     workItems,
     result,
     filterStatus: status ?? '',

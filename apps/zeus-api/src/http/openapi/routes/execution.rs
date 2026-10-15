@@ -151,4 +151,14 @@ pub(crate) const ROUTES: &[PublicRoute] = &[
         BodySchema::None,
         true,
     ),
+    public_route(
+        "/api/v1/workspaces/{workspace_id}/approvals/{approval_id}/revoke",
+        "POST",
+        "revoke_resource_authorization",
+        "approvals",
+        204,
+        Some("DecideApprovalRequest"),
+        BodySchema::None,
+        true,
+    ),
 ];

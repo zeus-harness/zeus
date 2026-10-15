@@ -78,7 +78,7 @@ export const managementResources: readonly ManagementResource[] = [
     description: '查看能力目录与审批边界。',
     endpoint: 'capabilities',
     columns: [
-      { label: 'Capability', key: 'capability_id' },
+      { label: '工具名称', key: 'display_name' },
       { label: '启用', key: 'enabled' },
       { label: '需要审批', key: 'approval_required' },
       { label: '更新时间', key: 'updated_at' }

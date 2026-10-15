@@ -53,7 +53,8 @@ impl RuntimeCapability {
     }
 
     pub(super) fn needs_approval(&self, approval_policy: &Value) -> bool {
-        self.approval_required
+        self.executor_key == "builtin.sandbox_exec"
+            || self.approval_required
             || (self.risk_level == "high"
                 && approval_policy
                     .get("require_high_risk")
@@ -62,7 +63,8 @@ impl RuntimeCapability {
     }
 
     pub(super) fn supports_idempotency(&self) -> bool {
-        matches!(self.idempotency_mode.as_str(), "required" | "supported")
+        self.executor_key != "builtin.sandbox_exec"
+            && matches!(self.idempotency_mode.as_str(), "required" | "supported")
     }
 }
 
@@ -75,7 +77,8 @@ impl DurableRunExecutor {
         let mut capabilities = sqlx::query_as::<_, RuntimeCapability>(
             "select d.id, d.registry_key, d.display_name, d.description,
                     d.input_schema, d.output_schema, d.idempotency_mode, d.risk_level,
-                    d.executor_key, c.approval_required, c.timeout_seconds
+                    d.executor_key, c.approval_required, c.timeout_seconds, d.revision as capability_revision, c.revision as binding_revision,
+                    coalesce(c.policy->>'resource_authorization_required', 'false') <> 'false' as resource_authorization_required
              from workspace_capabilities c
              join capability_definitions d on d.id = c.capability_id
              where c.organization_id = $1 and c.workspace_id = $2
@@ -154,7 +157,7 @@ impl DurableRunExecutor {
                     () = cancellation.cancelled() => return Err(super::types::RuntimeControl::Canceled),
                     result = tokio::time::timeout(
                         timeout,
-                        execute_registered_capability(&self.pool, run, capability, &call.input),
+                        self.execute_tool(run, plan, &call, capability),
                     ) => match result {
                         Ok(result) => result,
                         Err(_) => Err(ToolExecutionError::Timeout),
@@ -178,6 +181,15 @@ impl DurableRunExecutor {
         capability: &RuntimeCapability,
     ) -> Result<(), RuntimeFailure> {
         let mut transaction = self.begin_fenced(run).await?;
+        let authorized: bool = sqlx::query_scalar("select zeus_private.tool_authority_valid($1)")
+            .bind(call.id)
+            .fetch_one(&mut *transaction)
+            .await?;
+        if !authorized {
+            return Err(RuntimeFailure::InvalidConfiguration(
+                "tool_authorization_invalid",
+            ));
+        }
         let affected = sqlx::query(
             "update tool_calls
              set status = 'running', fence_token = $1, started_at = coalesce(started_at, now())
@@ -296,7 +308,7 @@ impl DurableRunExecutor {
     }
 }
 
-async fn execute_registered_capability(
+pub(super) async fn execute_registered_capability(
     pool: &sqlx::PgPool,
     run: &ClaimedRun,
     capability: &RuntimeCapability,

@@ -9,7 +9,9 @@ COPY apps/zeus-api apps/zeus-api
 COPY db/migrations db/migrations
 RUN cargo build --locked --offline --release -p zeus-api
 
-FROM docker.io/library/debian:bookworm-slim AS runtime
+# The local runtime needs Git and procps for managed worktrees and cancellation.
+# Use the prebuilt official SCM image so builds need no package-network access.
+FROM docker.io/library/buildpack-deps:bookworm-scm AS runtime
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /workspace/target/release/zeus-api /usr/local/bin/zeus-api
 USER 10001:10001

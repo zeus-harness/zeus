@@ -134,7 +134,9 @@ Web SSR 通过 `ZEUS_API_URL` 请求 API。Apple `container` 1.0.0 本地脚本�
 4. 在 `/:workspaceId/workflows` 创建 Workflow，选择已发布 Agent、允许工具和步数/时间/Token 预算，保存并发布版本；模型沿用 Agent 版本，不再重复选择。发布使用 revision 检查，冲突时刷新后重试。
 5. 在工作项中选择 Workflow 并启动；需要时完成审批，在 Run 页面查看事件和结果。更新 Agent 后需创建并发布新的 Workflow 版本，已有运行保留原版本。
 
-`builtin.work_item_read` 只接收空对象，返回当前 Run 所关联工作项的标题、描述、状态、优先级和输入；没有任意 ID 查询或附件/文件读取能力。工具返回内容仍是不可信业务数据。模型密钥不提供原文读取接口。组织供应商列表支持轮换 API Key，组织模型目录支持编辑地址、模型、供应商和超时；其他模型参数保留，revision 冲突要求刷新后重试。配置及密钥更新会影响后续加载配置的运行，包括恢复中的运行。
+`builtin.work_item_read` 只接收空对象，返回当前 Run 所关联工作项的标题、描述、状态、优先级和输入；没有任意 ID 查询或附件/文件读取能力。工具返回内容仍是不可信业务数据。模型密钥不提供原文读取接口。组织供应商列表支持轮换 API Key，组织模型目录支持编辑地址、模型、供应商和超时；其他模型参数保留，revision 冲突要求刷新后重试。Run 创建时追加绑定模型及供应商配置的 revision 和指纹，不复制密钥；恢复时发现配置改变则停止，由新尝试使用新配置。密钥轮换和撤销仍使用当前密钥状态。
+
+群聊创建持久工作项、跨 Run 重试、Owner 验收和验证归档的首版操作及验证范围见 [企业 Agent 工作流首版](docs/runbooks/enterprise-agent-milestone.md)。
 
 需求整理试点的范围、指令、七类合成回归和人工接受标准见 [试点手册](docs/runbooks/requirements-pilot.md)。运行失败或取消时，Run 页面提供对应恢复指引；恢复操作保留原记录。生产环境执行顺序与证据要求见 [生产验收清单](docs/runbooks/production-acceptance.md)。
 

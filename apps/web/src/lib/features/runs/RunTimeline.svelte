@@ -22,8 +22,10 @@
     initialEvents,
     initialStatus,
     streamUrl,
-    onSnapshotChange
+    onSnapshotChange,
+    compact = false
   }: {
+    compact?: boolean;
     initialEvents: RunEvent[];
     initialStatus: string;
     streamUrl: string | null;
@@ -231,6 +233,7 @@
 </script>
 
 <div class="space-y-4">
+  {#if !compact}
   <div class="flex flex-wrap items-center justify-between gap-3" aria-live="polite">
     <div>
       <p class="text-sm font-medium">{events.length} 条持久事件</p>
@@ -245,14 +248,17 @@
     </div>
   </div>
 
+  {/if}
+  {#if compact && ['retrying', 'disconnected', 'unavailable'].includes(connectionState)}<p role="status" class="text-sm">进度同步暂时中断。<button type="button" class="underline" onclick={reconnect}>重新连接</button></p>{/if}
   {#if events.length === 0}
-    <div class="rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted-foreground">Run 已创建，正在等待第一条事件。</div>
+    <div class="rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted-foreground">{compact ? '正在准备处理…' : 'Run 已创建，正在等待第一条事件。'}</div>
   {:else}
     <details class="rounded-lg border border-border">
       <summary class="cursor-pointer rounded-lg px-4 py-3 text-sm font-medium focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">
-        执行过程 · {events.length} 条事件
+        执行过程{#if !compact} · {events.length} 条事件{/if}
         <span class="ml-2 text-xs font-normal text-muted-foreground">模型调用、工具执行与审批记录</span>
       </summary>
+      {#if compact}<p class="px-4 py-2 text-xs text-muted-foreground">{connectionMessage} · {currentRunStatus}</p>{/if}
       <ol class="relative mx-4 mb-4 mt-2 ml-7 border-l border-border pl-6">
         {#each events as event (event.sequence)}
           {@const Icon = eventIcon(event)}

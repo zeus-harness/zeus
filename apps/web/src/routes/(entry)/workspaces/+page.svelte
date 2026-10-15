@@ -46,6 +46,15 @@
       </div>
     </div>
 
+    {#if data.chatOrganizations.length > 0}
+      <section class="mt-6 space-y-3" aria-label="组织聊天">
+        <h2 class="text-lg font-semibold">进入组织聊天</h2>
+        <p class="text-sm text-muted-foreground">组织成员可以使用 IM，无需工作空间权限。</p>
+        <div class="flex flex-wrap gap-3">{#each data.chatOrganizations as organization (organization.organization_id)}
+          <form method="POST" action="?/select"><input type="hidden" name="organization_id" value={organization.organization_id} /><input type="hidden" name="organization_only" value="yes" /><Button type="submit" variant="outline">{organization.organization_name} · IM Studio</Button></form>
+        {/each}</div>
+      </section>
+    {/if}
     {#if data.workspaces.length === 0}
       <Card.Root class="mt-8">
         <Card.Header>

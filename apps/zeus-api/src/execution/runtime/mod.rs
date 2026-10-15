@@ -1,8 +1,10 @@
 mod child_runs;
+mod code;
 mod context;
 mod events;
 mod execution;
 mod policy;
+mod sandbox;
 mod tools;
 mod types;
 
@@ -13,6 +15,8 @@ use sqlx::PgPool;
 use crate::crypto::EnvelopeCipher;
 
 pub struct DurableRunExecutor {
+    sandbox: Option<Arc<crate::execution::sandbox::SandboxClient>>,
+    code_storage: Option<Arc<crate::execution::code_workspace::CodeStorage>>,
     pool: PgPool,
     node_id: String,
     envelope: Arc<dyn EnvelopeCipher>,
@@ -22,10 +26,25 @@ impl DurableRunExecutor {
     #[must_use]
     pub fn new(pool: PgPool, node_id: String, envelope: Arc<dyn EnvelopeCipher>) -> Self {
         Self {
+            code_storage: None,
+            sandbox: None,
             pool,
             node_id,
             envelope,
         }
+    }
+    #[must_use]
+    pub fn with_sandbox(mut self, sandbox: crate::execution::sandbox::SandboxClient) -> Self {
+        self.sandbox = Some(Arc::new(sandbox));
+        self
+    }
+    #[must_use]
+    pub fn with_code_storage(
+        mut self,
+        storage: Arc<crate::execution::code_workspace::CodeStorage>,
+    ) -> Self {
+        self.code_storage = Some(storage);
+        self
     }
 }
 
@@ -57,6 +76,9 @@ mod tests {
             risk_level: "low".to_owned(),
             executor_key: "builtin.echo".to_owned(),
             approval_required: false,
+            resource_authorization_required: false,
+            capability_revision: 1,
+            binding_revision: 1,
             timeout_seconds: 30,
         }
     }
@@ -73,6 +95,15 @@ mod tests {
             &json!({ "allow_all": true }),
             &capability,
         ));
+    }
+
+    #[test]
+    fn sandbox_requires_approval_and_disallows_replay_despite_catalog_settings() {
+        let mut capability = capability();
+        capability.executor_key = "builtin.sandbox_exec".to_owned();
+        capability.idempotency_mode = "required".to_owned();
+        assert!(capability.needs_approval(&json!({"require_high_risk":false})));
+        assert!(!capability.supports_idempotency());
     }
 
     #[test]

@@ -5,6 +5,7 @@ import { vitePreprocess } from '@sveltejs/vite-plugin-svelte';
 const config = {
   preprocess: vitePreprocess(),
   kit: {
+    version: { pollInterval: 60000 },
     adapter: adapter({
       out: 'build'
     })

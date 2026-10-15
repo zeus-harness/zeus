@@ -8,7 +8,6 @@
   import {
     Activity,
     BookOpen,
-    Bot,
     Building2,
     Check,
     CheckSquare,
@@ -16,6 +15,7 @@
     ClipboardList,
     LayoutDashboard,
     Menu,
+    MessagesSquare,
     Settings,
     ShieldCheck,
     UserRound,
@@ -80,11 +80,6 @@
       null
   );
   let workspaceBase = $derived(currentWorkspace ? workspaceRootPath(currentWorkspace.id) : null);
-  let canBuild = $derived(
-    currentWorkspace?.support_access === true ||
-      currentWorkspace?.role === 'owner' ||
-      currentWorkspace?.role === 'builder'
-  );
   let canManageWorkspace = $derived(
     currentWorkspace?.support_access === true ||
       isWorkspaceOwner(principal, currentWorkspace?.id)
@@ -94,29 +89,33 @@
       isOrganizationOwner(principal, currentOrganization?.organization_id)
   );
   let platformOwner = $derived(isPlatformOwner(principal));
-  let primaryNavigation = $derived<NavigationItem[]>(
-    workspaceBase
-      ? [
-          { href: workspaceBase, label: '工作台', icon: LayoutDashboard },
-          { href: `${workspaceBase}/work-items`, label: '工作项', icon: ClipboardList },
-          { href: `${workspaceBase}/runs`, label: '运行', icon: Activity },
-          { href: `${workspaceBase}/approvals`, label: '审批', icon: CheckSquare },
-          { href: `${workspaceBase}/experience`, label: '经验', icon: BookOpen }
-        ]
-      : []
-  );
+  let businessNavigation = $derived<NavigationItem[]>(workspaceBase ? [
+    { href: `${workspaceBase}/work-items`, label: '任务', icon: ClipboardList },
+    { href: `${workspaceBase}/workflows`, label: '工作流', icon: Activity },
+    { href: `${workspaceBase}/runs`, label: '运行', icon: Activity },
+    { href: `${workspaceBase}/approvals`, label: '审批', icon: CheckSquare },
+    { href: `${workspaceBase}/experience`, label: '经验', icon: BookOpen },
+    { href: `${workspaceBase}/schedules`, label: '定时任务', icon: Activity },
+    { href: `${workspaceBase}/webhooks`, label: '触发器', icon: Activity }
+  ] : []);
+  let primaryNavigation = $derived<NavigationItem[]>([
+    ...(workspaceBase ? [
+      { href: workspaceBase, label: '工作台', icon: LayoutDashboard },
+      { href: `${workspaceBase}/work-items`, label: '任务', icon: ClipboardList },
+      { href: `${workspaceBase}/approvals`, label: '审批', icon: CheckSquare }
+    ] : []),
+    ...(currentOrganization ? [{ href: `/organizations/${currentOrganization.organization_id}/im`, label: '团队消息', icon: MessagesSquare }] : [])
+  ]);
   let secondaryNavigation = $derived.by<NavigationItem[]>(() => {
-    const items: NavigationItem[] = [];
-    if (workspaceBase && canBuild) {
-      items.push({ href: `${workspaceBase}/agents`, label: 'Agent Studio', icon: Bot });
-    }
+    const items: NavigationItem[] = [{ href: '/management', label: '设置中心', icon: Settings }];
+    if (!isActive('/management')) return items;
     if (workspaceBase && canManageWorkspace) {
-      items.push({ href: `${workspaceBase}/settings`, label: 'Workspace 设置', icon: Wrench });
+      items.push({ href: `${workspaceBase}/settings`, label: '工作空间设置', icon: Wrench });
     }
     if (currentOrganization && canManageOrganization) {
       items.push({
         href: `/organizations/${currentOrganization.organization_id}/settings`,
-        label: 'Organization 设置',
+        label: '组织设置',
         icon: Building2
       });
     }
@@ -126,9 +125,10 @@
     items.push({ href: '/account/profile', label: '账号设置', icon: Settings });
     return items;
   });
-  let workspaceLabel = $derived(currentWorkspace?.name ?? '选择 Workspace');
+  let workspaceLabel = $derived(currentWorkspace?.name ?? '选择工作空间');
 
   function isActive(href: string): boolean {
+    if (href === '/management') return pathname === href || pathname.startsWith('/account/') || pathname.startsWith('/platform') || /^\/organizations\/[^/]+\/settings/.test(pathname) || (!!workspaceBase && (pathname.startsWith(`${workspaceBase}/settings`) || pathname === `${workspaceBase}/agents`));
     if (workspaceBase && href === workspaceBase) return pathname === href;
     return pathname === href || pathname.startsWith(`${href}/`);
   }
@@ -171,6 +171,7 @@
                 aria-current={isActive(item.href) ? 'page' : undefined}
               ><Icon class="size-4" />{item.label}</a>
             {/each}
+            {#if workspaceBase}<details class="p-3 text-sm"><summary class="cursor-pointer">高级工具</summary><a class="block py-2" href={`${workspaceBase}/studio`}>助手讨论</a>{#each businessNavigation.filter(item => !item.href.endsWith('/work-items') && !item.href.endsWith('/approvals')) as item (item.href)}<a class="block py-2" href={item.href}>{item.label}</a>{/each}</details>{/if}
             {#if primaryNavigation.length > 0}<Separator class="my-3" />{/if}
             {#each secondaryNavigation as item (item.href)}
               {@const Icon = item.icon}
@@ -183,7 +184,7 @@
         </Sheet.Content>
       </Sheet.Root>
 
-      <a class="flex items-center gap-2.5 font-semibold tracking-tight" href="/" aria-label="返回 Zeus 入口">
+      <a class="flex shrink-0 items-center gap-2.5 font-semibold tracking-tight" href="/" aria-label="返回 Zeus 入口">
         <span class="grid size-8 place-items-center rounded-lg bg-foreground text-sm text-background">Z</span>
         <span>Zeus</span>
       </a>
@@ -192,13 +193,13 @@
       <DropdownMenu.Root>
         <DropdownMenu.Trigger>
           {#snippet child({ props })}
-            <Button {...props} variant="ghost" size="sm" class="max-w-[18rem] gap-2">
-              <Building2 class="size-4 text-muted-foreground" />
+            <Button {...props} variant="ghost" size="sm" class="min-w-0 max-w-[18rem] shrink gap-2">
+              <Building2 class="size-4 shrink-0 text-muted-foreground" />
               <span class="min-w-0 text-left">
                 <span class="block truncate">{workspaceLabel}</span>
                 {#if currentOrganization}<span class="block truncate text-[0.625rem] font-normal text-muted-foreground">{currentOrganization.organization_name}</span>{/if}
               </span>
-              <ChevronDown class="size-3.5 text-muted-foreground" />
+              <ChevronDown class="size-3.5 shrink-0 text-muted-foreground" />
             </Button>
           {/snippet}
         </DropdownMenu.Trigger>
@@ -233,9 +234,9 @@
         </DropdownMenu.Content>
       </DropdownMenu.Root>
 
-      <div class="ml-auto flex items-center gap-2">
+      <div class="ml-auto flex shrink-0 items-center gap-2">
         {#if authStatus === 'unavailable'}<Badge variant="destructive">API 断开</Badge>{/if}
-        {#if workspaceBase}<Button href={`${workspaceBase}/work-items?create=1`} size="sm" class="hidden sm:inline-flex">新建工作项</Button>{/if}
+        {#if workspaceBase && pathname !== workspaceBase && pathname !== `${workspaceBase}/new`}<Button href={`${workspaceBase}/new`} size="sm" class="hidden min-h-10 rounded-md px-4 sm:inline-flex">发起任务</Button>{/if}
         <DropdownMenu.Root>
           <DropdownMenu.Trigger>
             {#snippet child({ props })}<Button {...props} variant="outline" size="icon" aria-label="打开用户菜单"><UserRound class="size-4" /></Button>{/snippet}
@@ -261,12 +262,13 @@
         </form>
       </div>
     {/if}
+    <nav class="flex gap-2 overflow-x-auto border-t px-3 py-2 lg:hidden" aria-label="模块切换">{#each primaryNavigation as item (item.href)}<a href={item.href} aria-current={isActive(item.href) ? 'page' : undefined} class="shrink-0 rounded px-3 py-2 text-sm" class:bg-muted={isActive(item.href)}>{item.label}</a>{/each}</nav>
   </header>
 
   <div class="mx-auto grid min-h-[calc(100vh-4rem)] max-w-[1680px] lg:grid-cols-[15rem_minmax(0,1fr)]">
     <aside class="hidden border-r border-border bg-background lg:flex lg:flex-col">
       {#if primaryNavigation.length > 0}
-        <nav class="space-y-1 p-3" aria-label="Workspace 导航">
+        <nav class="space-y-1 p-3" aria-label="主导航">
           {#each primaryNavigation as item (item.href)}
             {@const Icon = item.icon}
             <a
@@ -277,9 +279,19 @@
           {/each}
         </nav>
       {/if}
+      {#if workspaceBase}
+        <details class="mx-3 mt-3 rounded-lg p-3 text-sm text-muted-foreground">
+          <summary class="cursor-pointer">高级工具</summary>
+          <nav aria-label="高级工具" class="mt-2 space-y-1">
+            <a class="block rounded-lg px-3 py-2 hover:bg-accent" href={`${workspaceBase}/studio`}>助手讨论</a>
+            {#each businessNavigation.filter(item => !item.href.endsWith('/work-items') && !item.href.endsWith('/approvals')) as item (item.href)}<a class="block rounded-lg px-3 py-2 hover:bg-accent" href={item.href}>{item.label}</a>{/each}
+          </nav>
+        </details>
+      {/if}
+      {#if secondaryNavigation.length > 0}
       <div class="mt-auto p-3">
         <Separator class="mb-3" />
-        <p class="px-3 pb-2 text-[0.6875rem] font-semibold uppercase tracking-[0.12em] text-muted-foreground">设置与构建</p>
+        <p class="px-3 pb-2 text-[0.6875rem] font-semibold uppercase tracking-[0.12em] text-muted-foreground">设置</p>
         {#each secondaryNavigation as item (item.href)}
           {@const Icon = item.icon}
           <a
@@ -288,6 +300,7 @@
           ><Icon class="size-4" />{item.label}</a>
         {/each}
       </div>
+      {/if}
     </aside>
     <div class="min-w-0">{@render children()}</div>
   </div>

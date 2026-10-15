@@ -28,6 +28,7 @@ export const load: PageServerLoad = async ({ parent, url }) => {
   const onlyWorkspace = workspaces.length === 1 ? workspaces[0] : null;
   return {
     workspaces,
+    chatOrganizations: auth.organizations.filter(organization => organization.organization_status === 'active' && organization.organization_role && !organization.support_access),
     autoSelect:
       url.searchParams.get('auto') === '1' &&
       onlyWorkspace?.status === 'active' &&
@@ -44,7 +45,8 @@ export const actions: Actions = {
     const formData = await request.formData();
     const organizationId = formValue(formData, 'organization_id');
     const workspaceId = formValue(formData, 'workspace_id');
-    if (!organizationId || !workspaceId) error(400, 'Organization 和 Workspace 不能为空。');
+    const organizationOnly = formValue(formData, 'organization_only') === 'yes';
+    if (!organizationId || (!workspaceId && !organizationOnly)) error(400, 'Organization 和 Workspace 不能为空。');
 
     const apiFetch = serverApiFetcher(fetch, request.headers.get('cookie'), url.origin);
     const auth = await loadCurrentPrincipal(apiFetch, env.ZEUS_API_URL);
@@ -60,9 +62,9 @@ export const actions: Actions = {
     const allowed = organizations.some(
       (organization) =>
         organization.organization_id === organizationId &&
-        organization.workspaces.some(
-          (workspace) => workspace.id === workspaceId && workspace.status === 'active'
-        )
+        (organizationOnly
+          ? organization.organization_status === 'active' && Boolean(organization.organization_role) && !organization.support_access
+          : organization.workspaces.some((workspace) => workspace.id === workspaceId && workspace.status === 'active'))
     );
     if (!allowed) error(403, '当前身份不能选择该 Workspace。');
 
@@ -73,7 +75,7 @@ export const actions: Actions = {
         {
           method: 'POST',
           headers: { accept: 'application/json', 'content-type': 'application/json' },
-          body: JSON.stringify({ organization_id: organizationId, workspace_id: workspaceId })
+          body: JSON.stringify({ organization_id: organizationId, workspace_id: organizationOnly ? null : workspaceId })
         }
       );
     } catch {
@@ -94,6 +96,7 @@ export const actions: Actions = {
     if (forwardZeusAuthCookies(response, cookies) < 2) {
       error(502, 'Workspace 切换响应缺少新的 Session 凭据。');
     }
+    if (organizationOnly) redirect(303, `/organizations/${organizationId}/im`);
     redirect(303, selectedTarget(formValue(formData, 'return_to'), workspaceId, url.origin));
   }
 };

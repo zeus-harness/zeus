@@ -109,7 +109,13 @@ pub(super) struct RunPlan {
     pub(super) max_runtime_seconds: i32,
     pub(super) token_budget: Option<i64>,
     pub(super) retry_policy: Value,
+    pub(super) code_repository: Option<Value>,
+    pub(super) execution_environment: Option<String>,
     pub(super) started_at: OffsetDateTime,
+    pub(super) active_started_at: Option<OffsetDateTime>,
+    pub(super) active_elapsed_ms: i64,
+    pub(super) time_policy: Value,
+    pub(super) deadline_at: Option<OffsetDateTime>,
 }
 
 impl RunPlan {
@@ -150,14 +156,28 @@ impl RunPlan {
     }
 
     pub(super) fn remaining_runtime(&self) -> Result<Duration, RuntimeFailure> {
-        let elapsed = OffsetDateTime::now_utc() - self.started_at;
-        let elapsed_seconds = elapsed.whole_seconds().max(0);
-        let remaining = i64::from(self.max_runtime_seconds).saturating_sub(elapsed_seconds);
-        if remaining <= 0 {
+        let now = OffsetDateTime::now_utc();
+        let elapsed_ms = if self.time_policy["runtime_clock"] == "active" {
+            self.active_elapsed_ms
+                .saturating_add(self.active_started_at.map_or(0, |started| {
+                    i64::try_from((now - started).whole_milliseconds().max(0)).unwrap_or(i64::MAX)
+                }))
+        } else {
+            i64::try_from((now - self.started_at).whole_milliseconds().max(0)).unwrap_or(i64::MAX)
+        };
+        let mut remaining_ms = i64::from(self.max_runtime_seconds) * 1000 - elapsed_ms;
+        if let Some(deadline) = self.deadline_at {
+            let business_ms = i64::try_from((deadline - now).whole_milliseconds()).unwrap_or(0);
+            if business_ms <= 0 {
+                return Err(RuntimeFailure::Limit("business_deadline_exceeded"));
+            }
+            remaining_ms = remaining_ms.min(business_ms);
+        }
+        if remaining_ms <= 0 {
             return Err(RuntimeFailure::Limit("run_timeout"));
         }
-        Ok(Duration::from_secs(
-            u64::try_from(remaining).map_err(|_| RuntimeFailure::Limit("run_timeout"))?,
+        Ok(Duration::from_millis(
+            u64::try_from(remaining_ms).map_err(|_| RuntimeFailure::Limit("run_timeout"))?,
         ))
     }
 }
@@ -241,6 +261,9 @@ pub(super) struct RuntimeCapability {
     pub(super) risk_level: String,
     pub(super) executor_key: String,
     pub(super) approval_required: bool,
+    pub(super) resource_authorization_required: bool,
+    pub(super) capability_revision: i64,
+    pub(super) binding_revision: i64,
     pub(super) timeout_seconds: i32,
 }
 
@@ -271,4 +294,67 @@ pub(super) enum ToolResume {
     Ready,
     WaitingApproval,
     WaitingChild,
+}
+
+#[cfg(test)]
+mod time_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn plan() -> RunPlan {
+        RunPlan {
+            instructions: String::new(),
+            model_profile_id: Uuid::nil(),
+            model_profile_revision: 1,
+            model_connection_id: Uuid::nil(),
+            model_connection_configuration: json!({}),
+            model_base_url: String::new(),
+            model: String::new(),
+            model_configuration: json!({}),
+            capability_policy: json!({}),
+            approval_policy: json!({}),
+            experience_policy: json!({}),
+            max_steps: 10,
+            max_runtime_seconds: 900,
+            token_budget: None,
+            retry_policy: json!({}),
+            code_repository: None,
+            execution_environment: None,
+            started_at: OffsetDateTime::now_utc() - time::Duration::days(3),
+            active_started_at: None,
+            active_elapsed_ms: 60_000,
+            time_policy: json!({"runtime_clock":"active"}),
+            deadline_at: None,
+        }
+    }
+
+    #[test]
+    fn waiting_days_preserves_remaining_active_budget() {
+        assert_eq!(plan().remaining_runtime().unwrap(), Duration::from_mins(14));
+        let mut running = plan();
+        running.active_started_at = Some(OffsetDateTime::now_utc() - time::Duration::seconds(10));
+        assert!((829..=830).contains(&running.remaining_runtime().unwrap().as_secs()));
+    }
+
+    #[test]
+    fn legacy_versions_and_business_deadlines_keep_their_limits() {
+        let mut legacy = plan();
+        legacy.time_policy = json!({});
+        assert_eq!(
+            legacy.remaining_runtime().unwrap_err().code(),
+            "run_timeout"
+        );
+        let mut expired = plan();
+        expired.deadline_at = Some(OffsetDateTime::now_utc() - time::Duration::seconds(1));
+        assert_eq!(
+            expired.remaining_runtime().unwrap_err().code(),
+            "business_deadline_exceeded"
+        );
+        let mut exhausted = plan();
+        exhausted.active_elapsed_ms = 900_000;
+        assert_eq!(
+            exhausted.remaining_runtime().unwrap_err().code(),
+            "run_timeout"
+        );
+    }
 }

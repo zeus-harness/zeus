@@ -21,6 +21,8 @@ ZEUS_E2E_OPENAI_CONTAINER="zeus-e2e-openai"
 ZEUS_POSTGRES_VOLUME="zeus-postgres-data"
 ZEUS_POSTGRES_IMAGE="docker.io/library/postgres:18.6"
 ZEUS_API_IMAGE="zeus-api:0.1.0"
+ZEUS_SANDBOX_IMAGE="zeus-sandbox:0.1.0"
+ZEUS_SANDBOX_CONTAINER="zeus-sandbox"
 ZEUS_WEB_IMAGE="zeus-web:0.1.0"
 ZEUS_GATEWAY_IMAGE="zeus-gateway:0.1.0"
 ZEUS_MAILPIT_IMAGE="docker.io/axllent/mailpit:v1.30.0"
@@ -35,6 +37,7 @@ configure_e2e_profile() {
   ZEUS_NETWORK="zeus-e2e"
   ZEUS_POSTGRES_CONTAINER="zeus-e2e-postgres"
   ZEUS_API_CONTAINER="zeus-e2e-api"
+  ZEUS_SANDBOX_CONTAINER="zeus-e2e-sandbox"
   ZEUS_WEB_CONTAINER="zeus-e2e-web"
   ZEUS_GATEWAY_CONTAINER="zeus-e2e-gateway"
   ZEUS_MAILPIT_CONTAINER="zeus-e2e-mailpit"
@@ -48,7 +51,7 @@ Usage: scripts/container <command> [target] [options]
 Commands:
   init-env                         Create .zeus/local.env with mode 0600
   rotate-postgres-password        Rotate the local PostgreSQL password
-  build [api|web|gateway|all]      Build local OCI images; default: all
+  build [api|web|gateway|sandbox|all]      Build local OCI images; default: all
   up [postgres|mailpit|api|web|gateway|all]
                                    Start a service and its dependencies; default: all
   down [postgres|mailpit|api|web|gateway|all]
@@ -71,6 +74,7 @@ E2E commands:
   e2e run                          Execute the API WorkItem approval flow
   e2e smoke                        Start, seed, and run the isolated stack
   e2e test-db                      Run each PostgreSQL integration target in a fresh temporary database
+  e2e test-sandbox                 Run isolated Linux sandbox acceptance (build sandbox first)
   e2e reset-db --yes               Remove only E2E containers and the E2E database volume
 
 Examples:
@@ -469,6 +473,17 @@ build_api_image() (
   )
 )
 
+build_sandbox_image() (
+  require_command python3
+  local build_context
+  build_context="$(create_build_context)"
+  trap 'cleanup_build_context "${build_context}"' EXIT
+  python3 "${REPO_ROOT}/apps/zeus-api/sandbox/prepare-build.py" "${build_context}"
+  cp -R "${REPO_ROOT}/apps/zeus-api/sandbox" "${build_context}/sandbox"
+  cp "${REPO_ROOT}/deploy/container/zeus-sandbox.local.Containerfile" "${build_context}/Containerfile"
+  (cd "${build_context}" && container build --tag "${ZEUS_SANDBOX_IMAGE}" --file Containerfile .)
+)
+
 build_web_image() (
   require_command pnpm
   local build_context
@@ -551,6 +566,9 @@ build_target() {
   ensure_container_system
 
   case "${target}" in
+    sandbox)
+      build_sandbox_image
+      ;;
     api)
       build_api_image
       ;;
@@ -682,6 +700,73 @@ start_e2e_openai() {
   exit 1
 }
 
+start_sandbox() {
+  [[ "${ZEUS_CODE_STORAGE_ENABLED:-false}" == "true" ]] || die "Sandbox requires ZEUS_CODE_STORAGE_ENABLED=true."
+  local digest image_alias state_volume sandbox_ip attempt
+  digest="$(container image inspect "${ZEUS_SANDBOX_IMAGE}" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["configuration"]["descriptor"]["digest"])')"
+  [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]] || die "Invalid sandbox image digest."
+  image_alias="zeus-sandbox:sha256-${digest#sha256:}"
+  container image tag "${ZEUS_SANDBOX_IMAGE}" "${image_alias}" >/dev/null
+  if [[ -z "${ZEUS_SANDBOX_TOKEN:-}" ]]; then
+    ZEUS_SANDBOX_TOKEN="$(openssl rand -hex 32)"
+    set_env_value ZEUS_SANDBOX_TOKEN "${ZEUS_SANDBOX_TOKEN}"
+  fi
+  export ZEUS_SANDBOX_TOKEN
+  export ZEUS_SANDBOX_ENVIRONMENT="${digest}"
+  state_volume="zeus-${ZEUS_PROFILE}-sandbox-state"
+  if ! volume_exists "${state_volume}"; then
+    container volume create --label dev.zeus-harness.managed=true -s 1G "${state_volume}" >/dev/null
+  fi
+  recreate_stateless_container "${ZEUS_SANDBOX_CONTAINER}" 15
+  if [[ "${1:-}" == "test" ]]; then
+    set -- --publish 127.0.0.1:18090:8090
+  else
+    set --
+  fi
+  container run "$@" --detach --name "${ZEUS_SANDBOX_CONTAINER}" \
+    --network "${ZEUS_NETWORK}" --cpus 2 --memory 2G --read-only \
+    --cap-drop ALL --cap-add SYS_ADMIN --cap-add SETUID --cap-add SETGID --cap-add CHOWN --cap-add DAC_READ_SEARCH \
+    --tmpfs /run --tmpfs /tmp --volume "${state_volume}:/var/lib/zeus-sandbox" \
+    --label dev.zeus-harness.managed=true --label dev.zeus-harness.project=zeus \
+    --env ZEUS_SANDBOX_TOKEN --env ZEUS_SANDBOX_ENVIRONMENT "${image_alias}" >/dev/null
+  sandbox_ip="$(container_ipv4 "${ZEUS_SANDBOX_CONTAINER}")"
+  export ZEUS_SANDBOX_URL="http://${sandbox_ip}:8090/"
+  for ((attempt = 1; attempt <= 30; attempt += 1)); do
+    # Do not container-exec during startup: that process would occupy the cgroup
+    # root while the launcher enables child controllers (the no-internal-process rule).
+    if python3 -c 'import os,json,urllib.request; r=urllib.request.Request(os.environ["ZEUS_SANDBOX_URL"]+"health",data=b"{}",headers={"Authorization":"Bearer "+os.environ["ZEUS_SANDBOX_TOKEN"]}); opener=urllib.request.build_opener(urllib.request.ProxyHandler({})); assert json.load(opener.open(r,timeout=2))["environment"]==os.environ["ZEUS_SANDBOX_ENVIRONMENT"]' >/dev/null 2>&1; then
+      echo "Sandbox ready with environment ${digest}."
+      return
+    fi
+    sleep 1
+  done
+  die "Sandbox readiness failed; API was not restarted."
+}
+
+test_sandbox() (
+  require_container_cli
+  ensure_container_system
+  load_local_env
+  ensure_network
+  ZEUS_SANDBOX_CONTAINER="zeus-sandbox-test"
+  ZEUS_PROFILE="sandbox-test"
+  export ZEUS_CODE_STORAGE_ENABLED=true
+  trap 'stop_container "${ZEUS_SANDBOX_CONTAINER}" 15; container delete "${ZEUS_SANDBOX_CONTAINER}" >/dev/null 2>&1 || true' EXIT
+  start_sandbox test
+  export ZEUS_SANDBOX_URL="http://127.0.0.1:18090/"
+  python3 - "${REPO_ROOT}/.zeus/sandbox-test.env" <<'PYCONFIG'
+import os, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+fd = os.open(p, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+os.fchmod(fd, 0o600)
+with os.fdopen(fd, 'w') as stream:
+    for key in ('ZEUS_SANDBOX_URL', 'ZEUS_SANDBOX_TOKEN', 'ZEUS_SANDBOX_ENVIRONMENT'):
+        stream.write(key + '=' + os.environ[key] + '\n')
+PYCONFIG
+  (cd "${REPO_ROOT}" && PYTHONDONTWRITEBYTECODE=1 python3 apps/zeus-api/sandbox/test_live.py)
+  container exec "${ZEUS_SANDBOX_CONTAINER}" python3 -c 'from pathlib import Path; assert not list(Path("/run/zeus-jobs").iterdir()); assert not [p for p in Path("/sys/fs/cgroup/zeus-sandbox").iterdir() if p.is_dir()]; print("No remaining job directories or cgroups")'
+)
+
 start_api() {
   ensure_api_image
   bootstrap_database
@@ -709,6 +794,25 @@ start_api() {
   set --
   if [[ -n "${ZEUS_API_DNS:-}" ]]; then
     set -- --dns "${ZEUS_API_DNS}"
+  fi
+  if [[ "${ZEUS_SANDBOX_ENABLED:-false}" == "true" ]]; then
+    start_sandbox
+    set -- "$@" --env ZEUS_SANDBOX_URL --env ZEUS_SANDBOX_TOKEN
+  fi
+  # Opt-in code state is kept outside the replaceable API container.
+  if [[ "${ZEUS_CODE_STORAGE_ENABLED:-false}" == "true" ]]; then
+    local code_volume="zeus-${ZEUS_PROFILE}-code"
+    if ! volume_exists "${code_volume}"; then
+      container volume create --label dev.zeus-harness.managed=true \
+        --label dev.zeus-harness.project=zeus -s 10G "${code_volume}" >/dev/null
+      # Initialize only a new volume. Apple container cannot attach a live API's
+      # writable disk to a second VM during a rolling local replacement.
+      container run --remove --user 0 --entrypoint /usr/bin/install \
+        --volume "${code_volume}:/var/lib/zeus-code" "${ZEUS_API_IMAGE}" \
+        -d -m 0700 -o 10001 -g 10001 /var/lib/zeus-code >/dev/null
+    fi
+    set -- "$@" --volume "${code_volume}:/var/lib/zeus-code" \
+      --env ZEUS_CODE_STORAGE_ROOT=/var/lib/zeus-code
   fi
   recreate_stateless_container "${ZEUS_API_CONTAINER}" 60
   container run \
@@ -864,11 +968,16 @@ up_target() {
       if container_is_running "${ZEUS_GATEWAY_CONTAINER}"; then
         gateway_was_running=true
       fi
-      start_mailpit
-      if [[ "${ZEUS_PROFILE}" == "e2e" ]]; then
+      if ! container_is_running "${ZEUS_MAILPIT_CONTAINER}"; then
+        start_mailpit
+      fi
+      if [[ "${ZEUS_PROFILE}" == "e2e" ]] && ! container_is_running "${ZEUS_E2E_OPENAI_CONTAINER}"; then
         start_e2e_openai
       fi
-      start_api
+      # A Web-only update must not interrupt healthy executions or rerun migrations.
+      if ! container_is_running "${ZEUS_API_CONTAINER}"; then
+        start_api
+      fi
       start_web
       if [[ "${gateway_was_running}" == true ]]; then
         start_gateway
@@ -906,6 +1015,7 @@ down_target() {
       ;;
     api)
       stop_container "${ZEUS_API_CONTAINER}" 60
+      stop_container "${ZEUS_SANDBOX_CONTAINER}" 15
       ;;
     web)
       stop_container "${ZEUS_WEB_CONTAINER}" 10
@@ -917,6 +1027,7 @@ down_target() {
       stop_container "${ZEUS_GATEWAY_CONTAINER}" 10
       stop_container "${ZEUS_WEB_CONTAINER}" 10
       stop_container "${ZEUS_API_CONTAINER}" 60
+      stop_container "${ZEUS_SANDBOX_CONTAINER}" 15
       if [[ "${ZEUS_PROFILE}" == "e2e" ]]; then
         stop_container "${ZEUS_E2E_OPENAI_CONTAINER}" 10
       fi
@@ -947,13 +1058,14 @@ status_target() {
     -v target="${target}" \
     -v postgres="${ZEUS_POSTGRES_CONTAINER}" \
     -v mailpit="${ZEUS_MAILPIT_CONTAINER}" \
+    -v sandbox="${ZEUS_SANDBOX_CONTAINER}" \
     -v api="${ZEUS_API_CONTAINER}" \
     -v web="${ZEUS_WEB_CONTAINER}" \
     -v gateway="${ZEUS_GATEWAY_CONTAINER}" \
     -v openai="${ZEUS_E2E_OPENAI_CONTAINER}" \
     -v include_openai="${include_openai}" '
       NR == 1 { print; next }
-      target == "all" && ($1 == postgres || $1 == mailpit || (include_openai == "true" && $1 == openai) || $1 == api || $1 == web || $1 == gateway) { print; next }
+      target == "all" && ($1 == postgres || $1 == mailpit || (include_openai == "true" && $1 == openai) || $1 == api || $1 == sandbox || $1 == web || $1 == gateway) { print; next }
       target == "postgres" && $1 == postgres { print; next }
       target == "mailpit" && $1 == mailpit { print; next }
       target == "openai" && $1 == openai { print; next }
@@ -1144,6 +1256,10 @@ run_e2e_command() {
   fi
 
   case "${command_name}" in
+    test-sandbox)
+      require_no_extra_args "$@"
+      test_sandbox
+      ;;
     test-db)
       require_no_extra_args "$@"
       require_command node

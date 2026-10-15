@@ -1,4 +1,4 @@
-import { withTaskReturn } from '$lib/task-return';
+import { taskReturnTo, withTaskReturn } from '$lib/task-return';
 import { fail, redirect, type RequestEvent } from '@sveltejs/kit';
 import { jsonRequest, requestJson, ZeusApiError } from '$lib/api/client';
 import type { components } from '$lib/api/generated/schema';
@@ -44,7 +44,7 @@ export async function saveStudioResource(event: StudioEvent, apiBaseUrl?: string
   const form = await event.request.formData();
   const text = (name: string) => typeof form.get(name) === 'string' ? String(form.get(name)).trim() : '';
   const values = Object.fromEntries(
-    ['name', 'description', 'instructions', 'base_url', 'model', 'connection_id', 'agent_version_id', 'model_profile_id', 'max_steps', 'max_runtime_seconds', 'token_budget', 'resource_id']
+    ['name', 'description', 'instructions', 'base_url', 'model', 'connection_id', 'agent_version_id', 'model_profile_id', 'max_steps', 'max_runtime_seconds', 'wait_timeout_seconds', 'business_timeout_seconds', 'token_budget', 'resource_id', 'repository_id', 'repository_commit', 'execution_environment']
       .map((name) => [name, text(name)])
   );
   values.capability_ids = form.getAll('capability_id').filter((value): value is string => typeof value === 'string').join(',');
@@ -72,14 +72,26 @@ export async function saveStudioResource(event: StudioEvent, apiBaseUrl?: string
             if (!values.instructions || values.instructions.length > 200_000) throw new Error('请填写 Agent 指令，最多 200000 个字符。');
             payload = { instructions: values.instructions, configuration: {}, model_profile_id: studioId(values.model_profile_id) };
           } else {
+            if (values.repository_id || values.repository_commit) {
+              studioId(values.repository_id);
+              if (!/^[0-9a-f]{40}$/.test(values.repository_commit)) throw new Error('请同时填写仓库 ID 和完整的 40 位小写 commit。');
+            }
+            if (values.execution_environment && (!/^sha256:[0-9a-f]{64}$/.test(values.execution_environment) || !values.repository_id)) throw new Error('执行环境需要固定镜像摘要，并绑定代码仓库。');
             const allowed = form.getAll('capability_id').map((value) => studioId(String(value)));
             payload = {
               agent_version_id: studioId(values.agent_version_id),
+              execution_environment: values.execution_environment || null,
+              code_repository: values.repository_id ? { repository_id: studioId(values.repository_id), commit: values.repository_commit } : null,
               capability_policy: { allowed },
               approval_policy: { require_high_risk: true, fail_on_denial: false },
               max_steps: integer(text('max_steps'), 1, 1024),
               max_runtime_seconds: integer(text('max_runtime_seconds'), 1, 86_400),
               token_budget: integer(text('token_budget'), 1, 10_000_000),
+              time_policy: {
+                runtime_clock: 'active',
+                wait_timeout_seconds: integer(text('wait_timeout_seconds') || '604800', 1, 31_536_000),
+                business_timeout_seconds: integer(text('business_timeout_seconds') || '2592000', 1, 31_536_000)
+              },
               retry_policy: { model_network_attempts: 2, capability_attempts: 0 },
               input_schema: {}, output_schema: {}
             };
@@ -89,6 +101,8 @@ export async function saveStudioResource(event: StudioEvent, apiBaseUrl?: string
           const revision = integer(text('revision'), 1, Number.MAX_SAFE_INTEGER);
           await requestStudioJson(context.apiFetch, options, `/${resource}/${id}/active-version`,
             jsonRequest('POST', { version_id: studioId(text('version_id')) }, { 'if-match': `"revision-${revision}"` }));
+          const returnTo = taskReturnTo(text('return_to'));
+          if (returnTo) target = resource === 'agents' ? `/${workspaceId}/workflows` : returnTo;
         } else throw new Error('请选择创建版本或发布版本。');
       }
     } else if (resource === 'connections' && intent === 'create') {
@@ -150,5 +164,5 @@ export async function saveStudioResource(event: StudioEvent, apiBaseUrl?: string
     }
     return fail(400, { type: 'error' as const, message: error instanceof Error ? error.message : '配置无效。', values });
   }
-  redirect(303, withTaskReturn(target, text('return_to')));
+  redirect(303, target === taskReturnTo(text('return_to')) ? target : withTaskReturn(target, text('return_to')));
 }

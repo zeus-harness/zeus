@@ -382,7 +382,7 @@ pub async fn list_runs(
         "select id, organization_id, workspace_id, workflow_version_id, work_item_id,
                 session_id, parent_run_id, retry_of_run_id, status, input, output,
                 error_code, error_detail, attempt_count, cancel_requested_at,
-                started_at, finished_at, created_at, updated_at
+                started_at, finished_at, created_at, updated_at, deadline_at, wait_expires_at
          from runs
          where organization_id = $1 and workspace_id = $2
            and ($3::uuid is null or work_item_id = $3)
@@ -504,7 +504,7 @@ pub async fn retry_run(
         "select id, organization_id, workspace_id, workflow_version_id, work_item_id,
                 session_id, parent_run_id, retry_of_run_id, status, input, output,
                 error_code, error_detail, attempt_count, cancel_requested_at,
-                started_at, finished_at, created_at, updated_at
+                started_at, finished_at, created_at, updated_at, deadline_at, wait_expires_at
          from runs where id = $1 and organization_id = $2 and workspace_id = $3 for update",
     )
     .bind(run_id)
@@ -529,7 +529,7 @@ pub async fn retry_run(
          returning id, organization_id, workspace_id, workflow_version_id, work_item_id,
                    session_id, parent_run_id, retry_of_run_id, status, input, output,
                    error_code, error_detail, attempt_count, cancel_requested_at,
-                   started_at, finished_at, created_at, updated_at",
+                   started_at, finished_at, created_at, updated_at, deadline_at, wait_expires_at",
     )
     .bind(auth.organization_id)
     .bind(workspace_id)
@@ -613,7 +613,7 @@ async fn insert_run(
          returning id, organization_id, workspace_id, workflow_version_id, work_item_id,
                    session_id, parent_run_id, retry_of_run_id, status, input, output,
                    error_code, error_detail, attempt_count, cancel_requested_at,
-                   started_at, finished_at, created_at, updated_at",
+                   started_at, finished_at, created_at, updated_at, deadline_at, wait_expires_at",
     )
     .bind(auth.organization_id)
     .bind(workspace_id)
@@ -699,7 +699,7 @@ pub(super) async fn load_run(
         "select id, organization_id, workspace_id, workflow_version_id, work_item_id,
                 session_id, parent_run_id, retry_of_run_id, status, input, output,
                 error_code, error_detail, attempt_count, cancel_requested_at,
-                started_at, finished_at, created_at, updated_at
+                started_at, finished_at, created_at, updated_at, deadline_at, wait_expires_at
          from runs where id = $1 and organization_id = $2 and workspace_id = $3",
     )
     .bind(run_id)
@@ -708,6 +708,42 @@ pub(super) async fn load_run(
     .fetch_one(&mut **transaction)
     .await
     .map_err(Into::into)
+}
+
+/// Creates an isolated conversation invocation using the same Run/event invariants as Studio.
+pub(crate) async fn insert_conversation_run(
+    transaction: &mut Transaction<'_, Postgres>,
+    auth: &AuthContext,
+    workspace_id: Uuid,
+    workflow_version_id: Uuid,
+    message: &str,
+    request_key: &str,
+    work_item_id: Option<Uuid>,
+) -> Result<RunResponse, ApiError> {
+    let input = json!({"studio_resource_mode": "preview"});
+    validate_run_input(&input, Some(message))?;
+    let session = session::insert_session(
+        transaction,
+        auth,
+        workspace_id,
+        work_item_id,
+        "群聊 Agent 调用",
+    )
+    .await?;
+    insert_run(
+        transaction,
+        auth,
+        workspace_id,
+        NewRun {
+            workflow_version_id,
+            session_id: session.id,
+            work_item_id,
+            input: &input,
+            message: Some(message),
+            idempotency_key: request_key,
+        },
+    )
+    .await
 }
 
 #[cfg(test)]

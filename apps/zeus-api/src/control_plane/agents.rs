@@ -474,6 +474,10 @@ pub struct WorkflowVersionResponse {
     pub max_runtime_seconds: i32,
     pub token_budget: Option<i64>,
     pub retry_policy: Value,
+    #[serde(default = "default_time_policy")]
+    pub time_policy: Value,
+    pub code_repository: Option<Value>,
+    pub execution_environment: Option<String>,
     pub created_by: Option<Uuid>,
     pub created_at: OffsetDateTime,
 }
@@ -499,6 +503,10 @@ pub struct CreateWorkflowVersionRequest {
     pub token_budget: Option<i64>,
     #[serde(default = "default_retry_policy")]
     pub retry_policy: Value,
+    #[serde(default = "default_time_policy")]
+    pub time_policy: Value,
+    pub code_repository: Option<Value>,
+    pub execution_environment: Option<String>,
 }
 
 pub async fn list_workflows(
@@ -685,7 +693,7 @@ pub async fn list_workflow_versions(
         "select id, organization_id, workspace_id, workflow_id, version_number,
                 agent_version_id, model_profile_id, input_schema, output_schema,
                 capability_policy, approval_policy, experience_policy, max_steps,
-                max_runtime_seconds, token_budget, retry_policy, created_by, created_at
+                max_runtime_seconds, token_budget, retry_policy, time_policy, code_repository, execution_environment, created_by, created_at
          from workflow_versions
          where organization_id = $1 and workspace_id = $2 and workflow_id = $3
          order by version_number desc limit 200",
@@ -772,12 +780,12 @@ pub async fn create_workflow_version(
             organization_id, workspace_id, workflow_id, version_number,
             agent_version_id, model_profile_id, input_schema, output_schema,
             capability_policy, approval_policy, experience_policy, max_steps,
-            max_runtime_seconds, token_budget, retry_policy, created_by
-         ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            max_runtime_seconds, token_budget, retry_policy, time_policy, code_repository, execution_environment, created_by
+         ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
          returning id, organization_id, workspace_id, workflow_id, version_number,
                    agent_version_id, model_profile_id, input_schema, output_schema,
                    capability_policy, approval_policy, experience_policy, max_steps,
-                   max_runtime_seconds, token_budget, retry_policy, created_by, created_at",
+                   max_runtime_seconds, token_budget, retry_policy, time_policy, code_repository, execution_environment, created_by, created_at",
     )
     .bind(auth.organization_id)
     .bind(workspace_id)
@@ -794,6 +802,9 @@ pub async fn create_workflow_version(
     .bind(request.max_runtime_seconds)
     .bind(request.token_budget)
     .bind(request.retry_policy)
+    .bind(request.time_policy)
+    .bind(request.code_repository)
+    .bind(request.execution_environment)
     .bind(auth.user_id)
     .fetch_one(&mut *transaction)
     .await?;
@@ -825,7 +836,7 @@ pub async fn get_workflow_version(
         "select id, organization_id, workspace_id, workflow_id, version_number,
                 agent_version_id, model_profile_id, input_schema, output_schema,
                 capability_policy, approval_policy, experience_policy, max_steps,
-                max_runtime_seconds, token_budget, retry_policy, created_by, created_at
+                max_runtime_seconds, token_budget, retry_policy, time_policy, code_repository, execution_environment, created_by, created_at
          from workflow_versions
          where id = $1 and workflow_id = $2 and organization_id = $3 and workspace_id = $4",
     )
@@ -964,7 +975,52 @@ async fn load_workflow(
     .map_err(Into::into)
 }
 
+fn default_time_policy() -> Value {
+    json!({ "runtime_clock": "active", "wait_timeout_seconds": 604_800,
+            "business_timeout_seconds": 2_592_000 })
+}
+
+fn validate_time_policy(value: &Value) -> Result<(), ApiError> {
+    let valid = value.as_object().is_some_and(|policy| {
+        policy.len() == 3
+            && policy.get("runtime_clock").and_then(Value::as_str) == Some("active")
+            && policy
+                .get("wait_timeout_seconds")
+                .and_then(Value::as_i64)
+                .is_some_and(|seconds| (1..=31_536_000).contains(&seconds))
+            && policy
+                .get("business_timeout_seconds")
+                .and_then(Value::as_i64)
+                .is_some_and(|seconds| (1..=31_536_000).contains(&seconds))
+    });
+    if valid {
+        Ok(())
+    } else {
+        Err(ApiError::Validation("time_policy requires active runtime_clock and integer wait/business timeouts between 1 and 31536000 seconds".to_owned()))
+    }
+}
+
 fn validate_workflow_version(request: &CreateWorkflowVersionRequest) -> Result<(), ApiError> {
+    validate_time_policy(&request.time_policy)?;
+    if let Some(environment) = &request.execution_environment
+        && (!crate::execution::sandbox::valid_environment(environment)
+            || request.code_repository.is_none())
+    {
+        return Err(ApiError::Validation(
+            "execution_environment requires an image digest and code_repository".to_owned(),
+        ));
+    }
+    if let Some(value) = &request.code_repository {
+        let binding: crate::execution::code_workspace::RepositoryBinding =
+            serde_json::from_value(value.clone())
+                .map_err(|_| ApiError::Validation("invalid code_repository".to_owned()))?;
+        if !binding.is_valid() || serde_json::to_value(&binding).ok().as_ref() != Some(value) {
+            return Err(ApiError::Validation(
+                "code_repository requires a repository ID and full lowercase commit hash"
+                    .to_owned(),
+            ));
+        }
+    }
     for (value, name) in [
         (&request.input_schema, "input_schema"),
         (&request.output_schema, "output_schema"),
@@ -1043,8 +1099,23 @@ mod tests {
     use super::{CreateWorkflowVersionRequest, validate_workflow_version};
 
     #[test]
+    fn durable_time_policy_rejects_ambiguous_or_unbounded_limits() {
+        assert!(super::validate_time_policy(&super::default_time_policy()).is_ok());
+        for value in [
+            json!({}),
+            json!({"runtime_clock":"wall"}),
+            json!({"runtime_clock":"active", "wait_timeout_seconds":0,"business_timeout_seconds":300}),
+            json!({"runtime_clock":"active", "wait_timeout_seconds":1.5,"business_timeout_seconds":300}),
+            json!({"runtime_clock":"active", "wait_timeout_seconds":60,"business_timeout_seconds":31_536_001}),
+            json!({"runtime_clock":"active", "wait_timeout_seconds":60,"business_timeout_seconds":300,"unknown":true}),
+        ] {
+            assert!(super::validate_time_policy(&value).is_err());
+        }
+    }
+
+    #[test]
     fn workflow_limits_are_rejected_before_database_work() {
-        let request = CreateWorkflowVersionRequest {
+        let mut request = CreateWorkflowVersionRequest {
             agent_version_id: uuid::Uuid::now_v7(),
             model_profile_id: Some(uuid::Uuid::now_v7()),
             input_schema: json!({}),
@@ -1056,7 +1127,15 @@ mod tests {
             max_runtime_seconds: 900,
             token_budget: None,
             retry_policy: json!({}),
+            time_policy: super::default_time_policy(),
+            code_repository: None,
+            execution_environment: None,
         };
+        assert!(validate_workflow_version(&request).is_err());
+        request.max_steps = 1;
+        request.max_runtime_seconds = 86_400;
+        assert!(validate_workflow_version(&request).is_ok());
+        request.max_runtime_seconds = 3 * 86_400;
         assert!(validate_workflow_version(&request).is_err());
     }
 }

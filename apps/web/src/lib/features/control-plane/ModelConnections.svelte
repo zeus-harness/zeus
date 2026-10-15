@@ -30,7 +30,7 @@
 <main class="space-y-6 px-5 py-7 lg:px-8 lg:py-9">
   <PageHeader title={isConnection ? '模型供应商' : '模型目录'} eyebrow="Organization settings"
     description={isConnection ? '连接兼容 OpenAI API 的模型服务。先保存供应商密钥，再填写模型地址并检查连接。密钥加密保存。' : '为模型指定连接、API 地址和模型 ID，同一供应商可添加多个模型，供组织内所有工作空间的智能体使用。'} />
-  {#if returnTo}<Button href={returnTo} variant="outline">返回原工作项继续处理</Button>{/if}
+  {#if returnTo}<Button href={returnTo} variant="outline">{returnTo.includes('/studio') ? '返回原会话继续处理' : '返回原工作项继续处理'}</Button>{/if}
   <SetupJourney {organizationId} workspaceId={taskWorkspace} current={resource} {returnTo} configured={[...(models.connections.length ? ['connections'] : []), ...(models.modelProfiles.length ? ['model-profiles'] : [])]} />
   {#if isConnection && models.connections.length > 0}<Button href={withTaskReturn(`${base}/settings/model-profiles`, returnTo)}>继续：配置模型与检查连接</Button>{/if}
   {#if !isConnection && taskWorkspace && models.modelProfiles.length > 0}<Button href={withTaskReturn(`/${taskWorkspace}/agents?template=requirements`, returnTo)}>连接检查完成后：配置智能体</Button>{/if}
@@ -38,7 +38,7 @@
   {#if form?.type === 'error'}<p class="rounded-lg border border-destructive p-4 text-sm text-destructive" role="alert">{form.message}</p>{/if}
   {#if form?.type === 'success'}<p role="status" class="rounded-lg border border-border p-4 text-sm">{form.message}</p>{/if}
   {#if saved}<p class="rounded-lg border border-border p-4 text-sm" role="status">{isConnection ? '供应商密钥已更新。' : '模型配置已保存，组织内的 Agent 可选择此模型。'}</p>{/if}
-  {#if saved && !isConnection}<Button href="/workspaces">选择工作空间，继续配置 Agent</Button>{/if}
+  {#if saved && !isConnection && !taskWorkspace}<Button href="/workspaces">选择工作空间，继续配置 Agent</Button>{/if}
   <div class="grid items-start gap-6 lg:grid-cols-2">
     <Card.Root>
       <Card.Header><Card.Title>{isConnection ? '添加模型供应商' : '添加模型配置'}</Card.Title></Card.Header>

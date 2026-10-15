@@ -1,7 +1,7 @@
 @import '@zeus/ui/styles.css';
 
 html {
-  color-scheme: dark;
+  color-scheme: light dark;
   background: var(--background);
 }
 
@@ -14,4 +14,18 @@ body {
 button,
 a {
   -webkit-tap-highlight-color: transparent;
+}
+
+/* Business surfaces use the existing shared components and token palette. */
+[data-slot="button"], [data-slot="input"], [data-slot="textarea"], [data-slot="native-select"] {
+  border-radius: var(--radius-md);
+}
+[data-slot="card"] { border-radius: var(--radius-xl); }
+:where(a, button, summary, input, textarea, select):focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 3px;
+}
+@media (max-width: 640px) {
+  [data-slot="button"] { min-height: 44px; }
+  input, textarea, select { font-size: 16px; }
 }

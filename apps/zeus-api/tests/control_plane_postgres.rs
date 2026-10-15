@@ -1240,6 +1240,186 @@ async fn control_plane_uses_rls_and_supports_versioned_resources() {
     let (_, unrelated_approvals) = expect_json(unrelated_approvals, StatusCode::OK).await;
     assert_eq!(unrelated_approvals, json!([]));
 
+    // Two independent human decisions: resource authority, then initiator confirmation.
+    let authority_run = Uuid::now_v7();
+    sqlx::query("insert into runs(id,organization_id,workspace_id,workflow_version_id,session_id,created_by,idempotency_key,status)
+      select $1,organization_id,workspace_id,workflow_version_id,session_id,$2,$1::text,'waiting_approval' from runs where id=$3")
+      .bind(authority_run).bind(existing_user_id).bind(linked_run_id).execute(&owner_pool).await.unwrap();
+    let authority_call = Uuid::now_v7();
+    sqlx::query("insert into tool_calls(id,organization_id,workspace_id,run_id,session_id,capability_id,call_key,fence_token,status,input)
+      select $1,organization_id,workspace_id,$2,session_id,capability_id,$1::text,0,'pending_approval','{}' from tool_calls where id=$3")
+      .bind(authority_call).bind(authority_run).bind(tool_call_id).execute(&owner_pool).await.unwrap();
+    let authority_approval = Uuid::now_v7();
+    sqlx::query("insert into approvals(id,organization_id,workspace_id,run_id,tool_call_id,kind,requested_by,input_snapshot,capability_revision,binding_revision,expires_at)
+      select $1,organization_id,workspace_id,run_id,id,'resource_access',$3,input,(select revision from capability_definitions where id=tool_calls.capability_id),(select revision from workspace_capabilities where capability_id=tool_calls.capability_id and workspace_id=tool_calls.workspace_id),now()+interval '1 day' from tool_calls where id=$2")
+      .bind(authority_approval).bind(authority_call).bind(existing_user_id).execute(&owner_pool).await.unwrap();
+    let authority_url =
+        format!("/api/v1/workspaces/{workspace_id}/approvals/{authority_approval}/approve");
+    let denied = send(
+        &app,
+        Method::POST,
+        &authority_url,
+        &token,
+        Some(json!({"reason":"service account cannot authorize"})),
+        &[],
+    )
+    .await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let backup_owner = Uuid::now_v7();
+    sqlx::query("insert into users(id,email,display_name,status,email_verified_at) values($1,$2,'Backup Owner','active',now())")
+        .bind(backup_owner).bind(format!("backup-{backup_owner}@example.test")).execute(&owner_pool).await.unwrap();
+    sqlx::query("insert into organization_memberships(organization_id,user_id,role,status) values($1,$2,'member','active')")
+        .bind(organization_id).bind(backup_owner).execute(&owner_pool).await.unwrap();
+    sqlx::query("insert into workspace_memberships(organization_id,workspace_id,user_id,role,status) values($1,$2,$3,'owner','active')")
+        .bind(organization_id).bind(workspace_id).bind(backup_owner).execute(&owner_pool).await.unwrap();
+    // An organization owner with only builder membership cannot authorize Workspace resources.
+    sqlx::query(
+        "update workspace_memberships set role='builder' where workspace_id=$1 and user_id=$2",
+    )
+    .bind(workspace_id)
+    .bind(existing_user_id)
+    .execute(&owner_pool)
+    .await
+    .unwrap();
+    let denied = send_user(
+        &app,
+        Method::POST,
+        &authority_url,
+        &existing_session_token,
+        &existing_csrf_token,
+        Some(json!({"reason":"builder cannot authorize"})),
+        &[],
+    )
+    .await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    sqlx::query(
+        "update workspace_memberships set role='owner' where workspace_id=$1 and user_id=$2",
+    )
+    .bind(workspace_id)
+    .bind(existing_user_id)
+    .execute(&owner_pool)
+    .await
+    .unwrap();
+    let approved = send_user(
+        &app,
+        Method::POST,
+        &authority_url,
+        &existing_session_token,
+        &existing_csrf_token,
+        Some(json!({"reason":"Approve exact test resource and input"})),
+        &[],
+    )
+    .await;
+    assert_eq!(approved.status(), StatusCode::NO_CONTENT);
+    let state: (String, String) = sqlx::query_as(
+        "select r.status,t.status from runs r join tool_calls t on t.run_id=r.id where t.id=$1",
+    )
+    .bind(authority_call)
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        state,
+        ("waiting_approval".into(), "pending_approval".into())
+    );
+    let execution_approval: Uuid =
+        sqlx::query_scalar("select id from approvals where tool_call_id=$1 and kind='execution'")
+            .bind(authority_call)
+            .fetch_one(&owner_pool)
+            .await
+            .unwrap();
+    let execution_url =
+        format!("/api/v1/workspaces/{workspace_id}/approvals/{execution_approval}/approve");
+    // A different requester prevents an owner from confirming another person's command.
+    sqlx::query("update approvals set requested_by=null where id=$1")
+        .bind(execution_approval)
+        .execute(&owner_pool)
+        .await
+        .unwrap();
+    let denied = send_user(
+        &app,
+        Method::POST,
+        &execution_url,
+        &existing_session_token,
+        &existing_csrf_token,
+        Some(json!({})),
+        &[],
+    )
+    .await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    sqlx::query("update approvals set requested_by=$2 where id=$1")
+        .bind(execution_approval)
+        .bind(existing_user_id)
+        .execute(&owner_pool)
+        .await
+        .unwrap();
+    let confirmed = send_user(
+        &app,
+        Method::POST,
+        &execution_url,
+        &existing_session_token,
+        &existing_csrf_token,
+        Some(json!({})),
+        &[],
+    )
+    .await;
+    assert_eq!(confirmed.status(), StatusCode::NO_CONTENT);
+    let valid: bool = sqlx::query_scalar("select zeus_private.tool_authority_valid($1)")
+        .bind(authority_call)
+        .fetch_one(&owner_pool)
+        .await
+        .unwrap();
+    assert!(valid, "both decisions authorize the exact call");
+    sqlx::query("update tool_calls set input='{\"changed\":true}' where id=$1")
+        .bind(authority_call)
+        .execute(&owner_pool)
+        .await
+        .unwrap();
+    let valid: bool = sqlx::query_scalar("select zeus_private.tool_authority_valid($1)")
+        .bind(authority_call)
+        .fetch_one(&owner_pool)
+        .await
+        .unwrap();
+    assert!(!valid, "changed arguments must not reuse approval");
+    sqlx::query("update tool_calls set input='{}' where id=$1")
+        .bind(authority_call)
+        .execute(&owner_pool)
+        .await
+        .unwrap();
+    sqlx::query("update approvals set authorized_until=now()-interval '1 second' where id=$1")
+        .bind(authority_approval)
+        .execute(&owner_pool)
+        .await
+        .unwrap();
+    let valid: bool = sqlx::query_scalar("select zeus_private.tool_authority_valid($1)")
+        .bind(authority_call)
+        .fetch_one(&owner_pool)
+        .await
+        .unwrap();
+    assert!(!valid, "expired authority cannot execute");
+    sqlx::query("update approvals set authorized_until=now()+interval '1 hour' where id=$1")
+        .bind(authority_approval)
+        .execute(&owner_pool)
+        .await
+        .unwrap();
+    let revoked = send_user(
+        &app,
+        Method::POST,
+        &format!("/api/v1/workspaces/{workspace_id}/approvals/{authority_approval}/revoke"),
+        &existing_session_token,
+        &existing_csrf_token,
+        Some(json!({"reason":"Test revocation before execution"})),
+        &[],
+    )
+    .await;
+    assert_eq!(revoked.status(), StatusCode::NO_CONTENT);
+    let valid: bool = sqlx::query_scalar("select zeus_private.tool_authority_valid($1)")
+        .bind(authority_call)
+        .fetch_one(&owner_pool)
+        .await
+        .unwrap();
+    assert!(!valid, "revoked grant cannot execute");
+
     // Human result acceptance is tenant-scoped, append-only, and revision protected.
     let review_url = format!("/api/v1/workspaces/{workspace_id}/work-items/{work_item_id}/reviews");
     let review_body =

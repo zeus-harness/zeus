@@ -3,6 +3,7 @@
 mod approval;
 mod event_trace;
 mod run;
+pub(crate) use run::insert_conversation_run;
 mod session;
 mod shared;
 
@@ -11,7 +12,7 @@ use event_trace::{event_limit, last_event_sequence};
 #[cfg(test)]
 use run::{validate_run_input, validate_run_status_filter};
 
-pub use approval::{__path_list_approvals, approve, list_approvals, reject};
+pub use approval::{__path_list_approvals, __path_revoke, approve, list_approvals, reject, revoke};
 pub use event_trace::{
     get_run_trace, get_run_usage, list_child_runs, list_run_events, list_session_events,
     stream_run_events,

@@ -417,7 +417,16 @@ fn validate_workspace_capability_request(
     policy: &Value,
 ) -> Result<(), ApiError> {
     validate_timeout_seconds(timeout_seconds)?;
-    require_object(policy, "policy")
+    require_object(policy, "policy")?;
+    if policy
+        .get("resource_authorization_required")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(ApiError::Validation(
+            "resource_authorization_required must be boolean".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_json_schema(schema: &Value, field: &str) -> Result<(), ApiError> {

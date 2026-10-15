@@ -1,6 +1,7 @@
 <script lang="ts">
   import { beforeNavigate } from '$app/navigation';
   import { enhance } from '$app/forms';
+  import { workItemScopeHref } from '$lib/work-item-filters';
   import { page } from '$app/state';
   import type { MemberOption } from '$lib/server/member-options';
   import { statusLabel } from '$lib/features/status-labels';
@@ -95,18 +96,19 @@
 </script>
 
 <svelte:window onbeforeunload={(event) => { if (draftDirty && !submitting) { event.preventDefault(); event.returnValue = ''; } }} />
-<svelte:head><title>Zeus · 工作项</title></svelte:head>
+<svelte:head><title>任务 · Zeus</title></svelte:head>
 
 <main class="px-5 py-7 lg:px-8 lg:py-9">
   <PageHeader
-    eyebrow="Workspace queue"
-    title="工作项"
-    description="从任务进入 Agent。状态、负责人和下一动作保持在主视图。"
+    eyebrow="团队工作"
+    title="任务"
+    description="查找团队目标和负责人，进入任务查看执行进度、审批和结果。"
   >
     {#snippet actions()}
-      <Button onclick={() => (createOpenOverride = true)}><Plus class="size-4" />新建工作项</Button>
+      <Button href={`${workspaceBase}/new`}><Plus class="size-4" />发起任务</Button>
     {/snippet}
   </PageHeader>
+  <button type="button" class="mt-4 text-xs text-muted-foreground underline" onclick={() => (createOpenOverride = true)}>高级创建：仅保存工作项</button>
 
   {#if form?.type === 'error' && !feedbackDismissed}
     <div class="mt-5 rounded-xl border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive" role="alert">{form.message}</div>
@@ -115,7 +117,7 @@
   {#if !hasWorkspaceData}
     <div class="mt-7"><WorkspaceStatus status={data.result.status} message={data.result.message} httpStatus={data.result.httpStatus} /></div>
   {:else}
-    <nav class="mt-5 flex flex-wrap gap-3" aria-label="工作项范围"><Button href={`${workspaceBase}/work-items`} variant={!data.view ? 'secondary' : 'ghost'}>全部工作项</Button><Button href="?view=created" variant={data.view === 'created' ? 'secondary' : 'ghost'}>我创建的</Button><Button href="?view=unassigned" variant={data.view === 'unassigned' ? 'secondary' : 'ghost'}>未分配</Button></nav>
+    <nav class="mt-5 flex flex-wrap gap-3" aria-label="工作项范围"><Button href={workItemScopeHref(page.url, '')} variant={!data.view ? 'secondary' : 'ghost'}>全部任务</Button><Button href={workItemScopeHref(page.url, 'created')} variant={data.view === 'created' ? 'secondary' : 'ghost'}>我创建的</Button><Button href={workItemScopeHref(page.url, 'unassigned')} variant={data.view === 'unassigned' ? 'secondary' : 'ghost'}>未分配</Button></nav>
     <Card.Root class="mt-7">
       <Card.Header class="gap-4 border-b border-border">
         <form method="GET" class="grid gap-3 sm:grid-cols-2 xl:grid-cols-[minmax(12rem,1fr)_10rem_minmax(14rem,1fr)_auto] sm:items-end">
@@ -134,7 +136,14 @@
           </div>
           <div class="space-y-2">
             <Label for="assignee-filter">负责人</Label>
-            <MemberPicker id="assignee-filter" members={data.members} limited={data.memberOptionsLimited} value={data.filterAssigneeUserId} emptyLabel="全部负责人" />
+            {#if data.view === 'unassigned'}
+              <p id="assignee-filter" class="rounded-md border border-border p-2 text-sm">未分配负责人</p>
+              <p class="text-xs text-muted-foreground">要查找指定负责人，请切换到全部工作项或我创建的。</p>
+            {:else}
+              {#key page.url.pathname + page.url.search}
+                <MemberPicker id="assignee-filter" members={data.members} limited={data.memberOptionsLimited} value={data.filterAssigneeUserId} emptyLabel="全部负责人" />
+              {/key}
+            {/if}
           </div>
           <Button type="submit" variant="outline"><Filter class="size-4" />筛选</Button>
         </form>
@@ -173,8 +182,8 @@
           </div>
         {:else}
           <div class="py-6">
-            <EmptyState title="没有符合条件的工作项" description="调整筛选条件，或创建一条新的团队工作项。">
-              {#snippet action()}<Button onclick={() => (createOpenOverride = true)} variant="outline">新建工作项</Button>{#if data.filterStatus || data.filterAssigneeUserId || data.search}<Button href={`${workspaceBase}/work-items`} variant="ghost">清除筛选</Button>{/if}{/snippet}
+            <EmptyState title="没有符合条件的任务" description="调整筛选条件，或描述一个新目标。">
+              {#snippet action()}<Button href={`${workspaceBase}/new`} variant="outline">发起任务</Button>{#if data.filterStatus || data.filterAssigneeUserId || data.search}<Button href={`${workspaceBase}/work-items`} variant="ghost">清除筛选</Button>{/if}{/snippet}
             </EmptyState>
           </div>
         {/if}

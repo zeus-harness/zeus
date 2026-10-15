@@ -1,4 +1,6 @@
-export function workItemNextAction(status: string, runStatus: string | undefined, hasWorkflow: boolean, canEdit: boolean) {
+export function workItemNextAction(status: string, runStatus: string | undefined, hasWorkflow: boolean, canEdit: boolean, review?: string) {
+  if (status === 'completed') return { title: '工作已完成', description: '可以查看交付结果和验收记录。', action: '查看结果与验收', href: '#acceptance' };
+  if (review === 'accepted' && runStatus === 'succeeded' && status !== 'canceled') return { title: '最新结果已验收通过', description: '如业务工作也已结束，请明确标记工作完成。', action: '查看验收与完成工作', href: '#acceptance' };
   if (status === 'canceled') return { title: '任务已取消', description: canEdit ? '要继续处理，请先将状态恢复为待处理。' : '请联系任务负责人恢复任务。', action: canEdit ? '恢复任务' : '', href: '#update-status' };
   if (runStatus === 'waiting_approval') return { title: '执行正在等待审批', description: '先查看需要授权的操作，再决定是否批准。', action: '查看运行与审批', href: '#execution' };
   if (runStatus && ['queued', 'running', 'waiting_child'].includes(runStatus)) return { title: '任务正在执行', description: '查看本次运行进度，完成后再核对结果。', action: '查看执行进度', href: '#execution' };

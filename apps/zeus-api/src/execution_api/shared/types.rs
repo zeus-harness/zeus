@@ -113,6 +113,10 @@ pub struct RunResponse {
     pub error_detail: Option<String>,
     pub attempt_count: i32,
     #[serde(with = "time::serde::rfc3339::option")]
+    pub deadline_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub wait_expires_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
     pub cancel_requested_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub started_at: Option<OffsetDateTime>,
@@ -179,6 +183,14 @@ pub struct RunUsageSummaryResponse {
 
 #[derive(Debug, Serialize, ToSchema, FromRow)]
 pub struct ApprovalResponse {
+    pub kind: String,
+    pub requested_by: Option<Uuid>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub authorized_until: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub revoked_at: Option<OffsetDateTime>,
+    #[sqlx(skip)]
+    pub can_decide: bool,
     pub id: Uuid,
     pub run_id: Uuid,
     pub tool_call_id: Uuid,
@@ -272,6 +284,9 @@ pub struct TraceExperienceInjectionResponse {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RunTraceResponse {
+    pub conversation_id: Option<Uuid>,
+    #[serde(default)]
+    pub code_checkpoints: Vec<CodeCheckpointResponse>,
     pub run: RunResponse,
     pub run_events: Vec<RunEventResponse>,
     pub session_events: Vec<SessionEventResponse>,
@@ -280,6 +295,17 @@ pub struct RunTraceResponse {
     pub usage: RunUsageSummaryResponse,
     pub linked_runs: Vec<TraceRunLinkResponse>,
     pub experience_injections: Vec<TraceExperienceInjectionResponse>,
+}
+
+#[derive(Debug, Serialize, ToSchema, FromRow)]
+pub struct CodeCheckpointResponse {
+    pub id: Uuid,
+    pub repository_id: Uuid,
+    pub base_commit: String,
+    pub checkpoint_commit: String,
+    pub fence_token: i64,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
 }
 
 #[cfg(test)]

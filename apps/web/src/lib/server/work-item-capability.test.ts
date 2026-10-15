@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { enableWorkItemRead, workItemReadDefinition } from './work-item-capability';
+import { enableWorkItemRead, workItemReadDefinition, enableSandboxExec, sandboxExecDefinition } from './work-item-capability';
 
 const workspaceId = '019f0000-0000-7000-8000-000000000001';
 const organizationId = '019f0000-0000-7000-8000-000000000002';
@@ -63,5 +63,28 @@ describe('WorkItem capability setup', () => {
     const input = event(() => { calls += 1; return Response.json({}); }, capabilityId);
     expect(await enableWorkItemRead(input, 'http://api.test')).toMatchObject({ status: 409 });
     expect(calls).toBe(0);
+  });
+});
+
+describe('Sandbox capability setup', () => {
+  it('requires approval even when the submitted form omits the checkbox', async () => {
+    let writes = 0;
+    const input = event(async (request) => {
+      if (request.method === 'GET') return Response.json({ items: request.url.includes('capability-definitions') ? [{ ...sandboxExecDefinition, id: capabilityId }] : [] });
+      writes += 1;
+      expect(await request.json()).toMatchObject({ capability_id: capabilityId, enabled: true, approval_required: true, timeout_seconds: 60 });
+      return Response.json({});
+    });
+    input.request = new Request(input.url, { method: 'POST', body: new FormData() });
+    await expect(enableSandboxExec(input, 'http://api.test')).rejects.toMatchObject({ status: 303 });
+    expect(writes).toBe(1);
+  });
+
+  it('does not enable a sandbox after Organization registration is denied', async () => {
+    const input = event((request) => {
+      expect(request.url).toContain(`/organizations/${organizationId}/capability-definitions`);
+      return request.method === 'GET' ? Response.json({ items: [] }) : Response.json({}, { status: 403 });
+    });
+    expect(await enableSandboxExec(input, 'http://api.test')).toMatchObject({ status: 403 });
   });
 });

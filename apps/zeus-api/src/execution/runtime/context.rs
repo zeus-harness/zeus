@@ -27,20 +27,28 @@ impl DurableRunExecutor {
                     coalesce(current_run.max_runtime_seconds_override, wv.max_runtime_seconds)
                       as max_runtime_seconds,
                     coalesce(current_run.token_budget_override, wv.token_budget) as token_budget,
-                    wv.retry_policy,
-                    coalesce(current_run.started_at, now()) as started_at
+                    wv.retry_policy, wv.code_repository, wv.execution_environment,
+                    coalesce(current_run.started_at, now()) as started_at,
+                    current_run.active_started_at, current_run.active_elapsed_ms,
+                    current_run.time_policy, current_run.deadline_at
              from workflow_versions wv
              join runs current_run on current_run.id = $4
              join agent_versions av on av.id = wv.agent_version_id
              join model_profiles mp on mp.id = wv.model_profile_id
              join connections c on c.id = mp.connection_id
+             join run_model_configuration_bindings b on b.run_id = current_run.id
              where wv.id = $1
                and wv.organization_id = $2 and wv.workspace_id = $3
                and av.organization_id = $2 and av.workspace_id = $3
                and mp.organization_id = $2 and mp.workspace_id is null
                and c.organization_id = $2 and c.workspace_id is null
                and current_run.organization_id = $2 and current_run.workspace_id = $3
-               and mp.archived_at is null and c.archived_at is null",
+               and mp.archived_at is null and c.archived_at is null
+               and b.organization_id = $2 and b.workspace_id = $3
+               and b.model_profile_id = mp.id and b.model_profile_revision = mp.revision
+               and b.model_connection_id = c.id and b.model_connection_revision = c.revision
+               and b.configuration_sha256 = sha256(convert_to(
+                 jsonb_build_array(mp.base_url,mp.model,mp.configuration,c.configuration)::text,'UTF8'))",
         )
         .bind(run.workflow_version_id)
         .bind(run.organization_id)

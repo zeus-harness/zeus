@@ -1,4 +1,9 @@
 <script lang="ts">
+  import { approvalKindLabel, approvalAuthorityLabel } from '$lib/approval-policy';
+  import ResultContent from '$lib/features/results/ResultContent.svelte';
+  import { displayTimestamp } from '$lib/display-timestamp';
+  import { statusLabel } from '$lib/features/status-labels';
+  import type { components } from '$lib/api/generated/schema';
   import { invalidateAll } from '$app/navigation';
   import { onDestroy } from 'svelte';
   import { ArrowLeft, RotateCcw, Square } from '@lucide/svelte';
@@ -61,9 +66,7 @@
     if (snapshotRefreshTimer !== null) clearTimeout(snapshotRefreshTimer);
   });
 
-  function dateLabel(value: string | null): string {
-    return value ? value.replace('T', ' ').replace(/\.\d+Z$/, ' UTC').replace('Z', ' UTC') : '—';
-  }
+  const dateLabel = displayTimestamp;
 
   function formatJson(value: unknown): string {
     try {
@@ -100,14 +103,19 @@
     <div class="mt-5 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
       <div class="min-w-0">
         <div class="flex flex-wrap items-center gap-2">
-          <Badge variant={statusVariant(trace.run.status)}>{trace.run.status}</Badge>
+          <Badge variant={statusVariant(trace.run.status)}>{statusLabel(trace.run.status)}</Badge>
           <span class="text-xs text-muted-foreground">执行尝试 {trace.run.attempt_count}</span>
         </div>
         <h1 class="mt-3 text-2xl font-semibold tracking-tight sm:text-3xl">Agent 运行</h1>
         {#if trace.run.work_item_id}
-          <a class="mt-2 inline-flex text-sm text-primary hover:underline" href={`${workspaceBase}/work-items/${trace.run.work_item_id}`}>返回关联 WorkItem</a>
+          <a class="mt-2 inline-flex text-sm text-primary hover:underline" href={`${workspaceBase}/work-items/${trace.run.work_item_id}`}>返回关联工作项</a>
         {:else}
-          <p class="mt-2 text-sm text-muted-foreground">该 Run 没有关联 WorkItem。</p>
+          <p class="mt-2 text-sm text-muted-foreground">{trace.conversation_id ? '这是组织群聊中明确发起的一次 Agent 调用，结果会回到原会话。' : '这是独立会话中的一次运行。'}</p>
+        {/if}
+        {#if trace.conversation_id}
+          <a class="mt-3 block text-sm underline" href={`/organizations/${trace.run.organization_id}/im?conversation=${trace.conversation_id}`}>返回原群聊</a>
+        {:else}
+          <a class="mt-3 block text-sm underline" href={`${workspaceBase}/studio?${trace.run.work_item_id ? `work_item=${trace.run.work_item_id}&` : 'discuss=1&'}run=${trace.run.id}`}>继续此会话</a>
         {/if}
         {#if reprocessing && trace.run.work_item_id}
           <section class="mt-3 space-y-2 rounded-lg border p-3" aria-label="重新处理依据">
@@ -133,9 +141,13 @@
             <Button type="submit" variant="destructive"><Square class="size-4" />取消</Button>
           </form>
         {:else if canRetry}
-          <form method="POST" action="?/retry">
-            <Button type="submit" variant="outline" class="w-full"><RotateCcw class="size-4" />创建重试 Run</Button>
-          </form>
+          {#if trace.conversation_id && !trace.run.work_item_id}
+            <p class="max-w-xs text-sm text-muted-foreground">如需重试，请返回原群聊发送新消息并重新调用 Agent，新的结果仍会回到群聊。</p>
+          {:else}
+            <form method="POST" action="?/retry">
+              <Button type="submit" variant="outline" class="w-full"><RotateCcw class="size-4" />创建重试 Run</Button>
+            </form>
+          {/if}
         {/if}
       </div>
     </div>
@@ -147,9 +159,32 @@
       </Alert.Root>
     {/if}
 
+    {#if trace.run.output !== null && trace.run.output !== undefined}
+      <Card.Root class="mt-6">
+        <Card.Header>
+          <Card.Title>运行结果</Card.Title>
+          <Card.Description>本次运行的最终输出。</Card.Description>
+        </Card.Header>
+        <Card.Content>
+          {#if outputText !== null}
+            <div data-testid="run-output-content"><ResultContent text={outputText} /></div>
+            <details class="mt-4">
+              <summary class="cursor-pointer text-xs text-muted-foreground">查看原始 JSON</summary>
+              <pre class="mt-2 max-h-[32rem] overflow-auto rounded-lg bg-muted p-4 font-mono text-xs leading-5">{formatJson(trace.run.output)}</pre>
+            </details>
+          {:else}
+            <pre class="max-h-[32rem] overflow-auto rounded-lg bg-muted p-4 font-mono text-xs leading-5">{formatJson(trace.run.output)}</pre>
+          {/if}
+        </Card.Content>
+      </Card.Root>
+    {:else if ['succeeded', 'failed', 'canceled'].includes(trace.run.status)}
+      <div class="mt-6"><EmptyState title="运行已结束，但没有输出" description="检查错误信息和事件时间线，确认终态原因。" /></div>
+    {/if}
+
+    <details class="mt-6"><summary class="cursor-pointer text-sm">执行统计与期限</summary>
     <section class="mt-8 grid gap-4 sm:grid-cols-2 xl:grid-cols-5" aria-label="Run 摘要">
       <Card.Root size="sm">
-        <Card.Header><Card.Description>状态</Card.Description><Card.Title>{trace.run.status}</Card.Title></Card.Header>
+        <Card.Header><Card.Description>状态</Card.Description><Card.Title>{statusLabel(trace.run.status)}</Card.Title></Card.Header>
       </Card.Root>
       <Card.Root size="sm">
         <Card.Header><Card.Description>执行尝试</Card.Description><Card.Title>{trace.run.attempt_count}</Card.Title></Card.Header>
@@ -164,6 +199,27 @@
         <Card.Header><Card.Description>子运行</Card.Description><Card.Title>{childRuns.length}</Card.Title></Card.Header>
       </Card.Root>
     </section>
+
+    {#if trace.run.deadline_at}
+      <section class="mt-6 space-y-2 rounded-xl border border-border p-4" aria-label="流程期限">
+        <p class="text-sm">流程截止时间：{dateLabel(trace.run.deadline_at)}</p>
+        {#if trace.run.wait_expires_at}<p class="text-sm">本次等待截止时间：{dateLabel(trace.run.wait_expires_at)}</p><p class="text-xs text-muted-foreground">等待期间不占用执行槽位，也不消耗执行预算。完成审批后自动恢复；到期后自动取消。</p>{/if}
+      </section>
+    {/if}
+
+    </details>
+
+    {#if trace.code_checkpoints?.length}
+      <details class="rounded-lg border border-border p-4">
+        <summary class="cursor-pointer text-sm font-medium">代码检查点（最近 {trace.code_checkpoints.length} 条）</summary>
+        <p class="mt-2 text-xs text-muted-foreground">恢复时使用本次运行的最新检查点，Workflow 的初始 commit 保持不变。</p>
+        <ul class="mt-3 space-y-3">
+          {#each trace.code_checkpoints as checkpoint (checkpoint.id)}
+            <li class="text-xs"><p>{dateLabel(checkpoint.created_at)} · 执行代次 {checkpoint.fence_token}</p><p class="mt-1 break-all font-mono">{checkpoint.checkpoint_commit}</p></li>
+          {/each}
+        </ul>
+      </details>
+    {/if}
 
     {#if trace.run.error_code || trace.run.error_detail}
       <section class="mt-6 rounded-xl border border-destructive/40 bg-destructive/10 p-4" aria-label="Run error">
@@ -180,60 +236,49 @@
       </section>
     {/if}
 
-    {#if trace.run.output !== null && trace.run.output !== undefined}
-      <Card.Root class="mt-6">
-        <Card.Header>
-          <Card.Title>运行结果</Card.Title>
-          <Card.Description>这是该 Run 已持久化的最终输出。</Card.Description>
-        </Card.Header>
-        <Card.Content>
-          {#if outputText !== null}
-            <div data-testid="run-output-content" class="whitespace-pre-wrap break-words text-sm leading-7">{outputText}</div>
-            <details class="mt-4">
-              <summary class="cursor-pointer text-xs text-muted-foreground">查看原始 JSON</summary>
-              <pre class="mt-2 max-h-[32rem] overflow-auto rounded-lg bg-muted p-4 font-mono text-xs leading-5">{formatJson(trace.run.output)}</pre>
-            </details>
-          {:else}
-            <pre class="max-h-[32rem] overflow-auto rounded-lg bg-muted p-4 font-mono text-xs leading-5">{formatJson(trace.run.output)}</pre>
-          {/if}
-        </Card.Content>
-      </Card.Root>
-    {:else if ['succeeded', 'failed', 'canceled'].includes(trace.run.status)}
-      <div class="mt-6"><EmptyState title="Run 已结束，但没有输出" description="检查错误信息和事件时间线，确认终态原因。" /></div>
-    {/if}
 
     <section class="mt-6" aria-label="工具审批">
       <Card.Root>
         <Card.Header>
           <Card.Title><span id="run-approvals">工具审批</span></Card.Title>
-          <Card.Description>{pendingApprovals.length} 条等待处理。HTTP 结果决定最终状态。</Card.Description>
+          <Card.Description>{pendingApprovals.length} 条等待处理。核对操作内容后决定是否允许执行。</Card.Description>
         </Card.Header>
         <Card.Content>
           {#if trace.approvals.length > 0}
             <div class="space-y-3">
               {#each trace.approvals as approval (approval.id)}
+                {@const tool = trace.tool_calls.find((item: components['schemas']['TraceToolCallResponse']) => item.id === approval.tool_call_id)}
+                {@const definition = data.catalog.find((item: components['schemas']['CapabilityDefinitionResponse']) => item.id === tool?.capability_id)}
                 <div class="rounded-lg border border-border p-4">
                   <div class="flex flex-wrap items-start justify-between gap-3">
                     <div>
-                      <p class="text-sm font-medium">工具调用审批</p>
-                      <p class="mt-1 font-mono text-xs text-muted-foreground">{approval.tool_call_id}</p>
+                      <p class="text-sm font-medium">{approvalKindLabel(approval.kind)} · {definition?.display_name ?? '工具操作'}</p>
+                      <p class="mt-1 text-xs text-muted-foreground">{approvalAuthorityLabel(approval.kind)}</p>
+                      {#if approval.revoked_at}<p class="text-destructive">授权已撤销</p>{/if}
                       <p class="mt-1 text-xs text-muted-foreground">请求于 {dateLabel(approval.requested_at)}</p>
                     </div>
-                    <Badge variant={statusVariant(approval.status)}>{approval.status}</Badge>
+                    <Badge variant={statusVariant(approval.status)}>{statusLabel(approval.status)}</Badge>
                   </div>
+                  {#if tool}
+                    <div class="mt-3 rounded-md bg-muted p-3 text-sm">
+                      <p class="font-medium">待执行内容</p>
+                      {#if definition?.executor_key === 'builtin.work_item_read'}<p class="mt-2">读取本次运行关联工作项的标题、描述和输入，不修改数据。</p>{/if}
+                      <pre class="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words text-xs">{JSON.stringify(tool.input, null, 2)}</pre>
+                    </div>
+                  {/if}
                   {#if approval.reason}<p class="mt-3 text-sm text-muted-foreground">{approval.reason}</p>{/if}
-                  {#if approval.status === 'pending'}
+                  {#if approval.status === 'pending' && approval.can_decide}
                     <div class="mt-4 grid gap-2 sm:grid-cols-2">
                       <form method="POST" action="?/decide" class="space-y-2">
                         <input type="hidden" name="approval_id" value={approval.id} />
                         <input type="hidden" name="decision" value="approve" />
-                        <Input name="reason" aria-label="批准理由" placeholder="批准理由（可选）" />
+                        <Input name="reason" aria-label="批准理由" placeholder="批准理由" required={approval.kind === 'resource_access'} />
                         <Button type="submit" class="min-h-11 w-full">批准</Button>
                       </form>
                       <form method="POST" action="?/decide" class="space-y-2">
                         <input type="hidden" name="approval_id" value={approval.id} />
                         <input type="hidden" name="decision" value="reject" />
-                        <Input name="reason" aria-label="拒绝理由" placeholder="拒绝理由（可选）" />
+                        <Input name="reason" aria-label="拒绝理由" placeholder="拒绝理由" required={approval.kind === 'resource_access'} />
                         <Button type="submit" variant="destructive" class="min-h-11 w-full">拒绝</Button>
                       </form>
                     </div>

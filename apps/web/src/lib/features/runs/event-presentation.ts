@@ -5,6 +5,8 @@ export function eventLabel(event: RunEvent): string {
   const terminal = getTerminalRunStatus(event);
   if (terminal) return { succeeded: '运行完成', failed: '运行失败', canceled: '运行已取消' }[terminal] ?? terminal;
   const labels: Record<string, string> = {
+    'code.prepared': '代码工作区已准备', 'code.checkpoint_saved': '代码检查点已保存',
+    'run.deadline_exceeded': '等待或流程期限已到',
     run_queued: '进入队列', 'run.claimed': '领取执行', 'runtime.started': '开始执行',
     'experience.selection_completed': '经验选择完成', 'model.requested': '请求模型',
     'model.completed': '模型响应完成', 'tool.requested': '请求工具调用',

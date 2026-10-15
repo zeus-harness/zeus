@@ -286,8 +286,9 @@ impl DurableRunExecutor {
                 organization_id, workspace_id, workflow_version_id, work_item_id,
                 session_id, parent_run_id, root_run_id, depth,
                 token_budget_override, max_runtime_seconds_override,
-                input, idempotency_key
-             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                input, idempotency_key, created_by
+             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                 (select created_by from runs where id=$6 and organization_id=$1 and workspace_id=$2))
              returning id",
         )
         .bind(run.organization_id)

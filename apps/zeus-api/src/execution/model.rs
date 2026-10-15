@@ -95,6 +95,8 @@ pub type OpenAiToolDefinition = ToolDefinition;
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ModelCompletion {
     pub assistant_text: String,
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub usage: TokenUsage,
     pub provider_request_id: String,
@@ -429,12 +431,16 @@ fn serialize_model_message(message: &ModelMessage) -> Result<Value, ModelError> 
         })),
         ModelMessage::Assistant {
             content,
+            reasoning_content,
             tool_calls,
         } => {
             let mut message = json!({
                 "role": "assistant",
                 "content": content,
             });
+            if let Some(reasoning) = reasoning_content {
+                message["reasoning_content"] = Value::String(reasoning.clone());
+            }
             if !tool_calls.is_empty() {
                 let serialized_calls = tool_calls
                     .iter()
@@ -580,6 +586,8 @@ struct ChatCompletionDelta {
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
     tool_calls: Vec<ChatCompletionToolCallDelta>,
 }
 
@@ -671,6 +679,7 @@ impl ChatCompletionUsage {
 #[derive(Default)]
 struct CompletionAccumulator {
     assistant_text: String,
+    reasoning_content: Option<String>,
     tool_calls: Vec<PartialToolCall>,
     usage: Option<TokenUsage>,
 }
@@ -690,6 +699,11 @@ impl CompletionAccumulator {
         for choice in chunk.choices {
             if choice.index != 0 {
                 continue;
+            }
+            if let Some(reasoning) = choice.delta.reasoning_content {
+                self.reasoning_content
+                    .get_or_insert_default()
+                    .push_str(&reasoning);
             }
             if let Some(content) = choice.delta.content {
                 self.assistant_text.push_str(&content);
@@ -754,6 +768,7 @@ impl CompletionAccumulator {
 
         Ok(ModelCompletion {
             assistant_text: self.assistant_text,
+            reasoning_content: self.reasoning_content,
             tool_calls,
             usage: self.usage.unwrap_or_default(),
             provider_request_id,
@@ -860,6 +875,7 @@ mod tests {
             "choices": [{
                 "index": 0,
                 "delta": {
+                    "reasoning_content": "fixture ",
                     "tool_calls": [{
                         "index": 0,
                         "id": "call_1",
@@ -875,6 +891,7 @@ mod tests {
                 "index": 0,
                 "delta": {
                     "content": "Checking.",
+                    "reasoning_content": "reasoning",
                     "tool_calls": [{
                         "index": 0,
                         "function": { "arguments": "Paris\"}" }
@@ -902,6 +919,18 @@ mod tests {
             .expect("completion finishes");
 
         assert_eq!(completion.assistant_text, "Checking.");
+        assert_eq!(
+            completion.reasoning_content.as_deref(),
+            Some("fixture reasoning")
+        );
+        let replay = ModelMessage::Assistant {
+            content: Some(completion.assistant_text.clone()),
+            reasoning_content: completion.reasoning_content.clone(),
+            tool_calls: completion.tool_calls.clone(),
+        };
+        let wire = serialize_model_messages(&[replay]).unwrap();
+        assert_eq!(wire[0]["reasoning_content"], "fixture reasoning");
+        assert_eq!(wire[0]["tool_calls"][0]["id"], "call_1");
         assert_eq!(completion.tool_calls.len(), 1);
         assert_eq!(completion.tool_calls[0].call_id, "call_1");
         assert_eq!(completion.tool_calls[0].capability, "orders.lookup");

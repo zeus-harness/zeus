@@ -168,3 +168,28 @@ describe('Workspace selection action', () => {
     ).rejects.toMatchObject({ status: 303, location: '/workspace-1' });
   });
 });
+
+describe('Organization-only IM context', () => {
+  function chatEvent(fetcher: typeof fetch) {
+    const event = selectionEvent(fetcher);
+    event.request = new Request(event.url, { method: 'POST', headers: { cookie: 'zeus_session=session; zeus_csrf=csrf' }, body: new URLSearchParams({ organization_id: 'org-1', organization_only: 'yes', return_to: 'https://untrusted.test' }) });
+    return event;
+  }
+  it('selects only the organization with no workspace permission and rotates cookies', async () => {
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async input => {
+      if (String(input).endsWith('/organizations')) return json([{ ...organizations[0], workspaces: [] }]);
+      if (String(input).endsWith('/me')) return json(principal);
+      return contextResponse();
+    });
+    const event = chatEvent(fetcher);
+    await expect(select(event)).rejects.toMatchObject({ status: 303, location: '/organizations/org-1/im' });
+    const call = fetcher.mock.calls.find(([input]) => String(input).endsWith('/context'));
+    expect(JSON.parse(String(call?.[1]?.body))).toEqual({ organization_id: 'org-1', workspace_id: null });
+    expect(event.cookies.set).toHaveBeenCalledTimes(2);
+  });
+  it('rejects support-only organization access without selecting a context', async () => {
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async input => String(input).endsWith('/me') ? json(principal) : json([{ ...organizations[0], organization_role: null, support_access: true }]));
+    await expect(select(chatEvent(fetcher))).rejects.toMatchObject({ status: 403 });
+    expect(fetcher.mock.calls.some(([input]) => String(input).endsWith('/context'))).toBe(false);
+  });
+});

@@ -23,6 +23,15 @@ function event(resource: string, values: Record<string, string>, mutate: (reques
 }
 
 describe('Agent Studio actions', () => {
+  it.each(['agents', 'workflows'])('continues setup after explicitly publishing %s', async resource => {
+    const returnTo = `/${workspaceId}/studio?work_item=${resourceId}`;
+    const input = event(resource, { intent: 'activate', resource_id: resourceId, version_id: versionId, revision: '3', return_to: returnTo }, request => {
+      expect(request.headers.get('if-match')).toBe('"revision-3"');
+      return Response.json({});
+    });
+    const target = resource === 'agents' ? `/${workspaceId}/workflows?${new URLSearchParams({return_to: returnTo})}` : returnTo;
+    await expect(saveStudioResource(input, 'http://api.test')).rejects.toMatchObject({ status: 303, location: target });
+  });
   it('carries the requirements template into the draft without publishing or running', async () => {
     let writes = 0;
     const input = event('agents', { intent: 'create', name: '需求整理助手', template: 'requirements' }, () => {
@@ -99,8 +108,34 @@ describe('Agent Studio actions', () => {
     await expect(saveStudioResource(input, 'http://api.test')).rejects.toMatchObject({ status: 303 });
     const body = await saved?.json();
     expect(body.agent_version_id).toBe(versionId);
+    expect(body.time_policy).toEqual({ runtime_clock: 'active', wait_timeout_seconds: 604800, business_timeout_seconds: 2592000 });
     expect(body).not.toHaveProperty('model_profile_id');
     expect(body).not.toHaveProperty('connection_id');
+  });
+
+  it('pins a sandbox environment to a repository on the new Workflow version', async () => {
+    let saved: Request | undefined;
+    const digest = 'sha256:' + 'a'.repeat(64);
+    const input = event('workflows', { intent: 'version', resource_id: resourceId, agent_version_id: versionId,
+      max_steps: '8', max_runtime_seconds: '120', token_budget: '4000', repository_id: resourceId,
+      repository_commit: 'b'.repeat(40), execution_environment: digest }, (request) => {
+      saved = request;
+      return Response.json({ id: resourceId });
+    });
+    await expect(saveStudioResource(input, 'http://api.test')).rejects.toMatchObject({ status: 303 });
+    expect(await saved?.json()).toMatchObject({ execution_environment: digest,
+      code_repository: { repository_id: resourceId, commit: 'b'.repeat(40) } });
+  });
+
+  it.each(['alpine:latest', 'sha256:' + 'a'.repeat(64)])('rejects an unbound or mutable sandbox environment %s', async (digest) => {
+    let writes = 0;
+    const input = event('workflows', { intent: 'version', resource_id: resourceId, agent_version_id: versionId,
+      max_steps: '8', max_runtime_seconds: '120', token_budget: '4000', execution_environment: digest }, () => {
+      writes += 1;
+      return Response.json({});
+    });
+    expect(await saveStudioResource(input, 'http://api.test')).toMatchObject({ status: 400 });
+    expect(writes).toBe(0);
   });
 
   it('explains a legacy Agent without a model and preserves entered values', async () => {
@@ -160,5 +195,26 @@ describe('Agent Studio actions', () => {
       () => { called = true; return Response.json({}); });
     expect(await saveStudioResource(input, 'http://api.test')).toMatchObject({ status: 400 });
     expect(called).toBe(false);
+  });
+});
+
+describe('Workflow repository binding', () => {
+  it('pins a registered repository and immutable commit', async () => {
+    let saved: Request | undefined;
+    const input = event('workflows', { intent: 'version', resource_id: resourceId, agent_version_id: versionId,
+      max_steps: '8', max_runtime_seconds: '120', token_budget: '4000', repository_id: resourceId, repository_commit: 'a'.repeat(40) }, request => {
+        saved = request; return Response.json({ id: resourceId });
+      });
+    await expect(saveStudioResource(input, 'http://api.test')).rejects.toMatchObject({ status: 303 });
+    expect(await saved?.json()).toMatchObject({ code_repository: { repository_id: resourceId, commit: 'a'.repeat(40) } });
+  });
+  it.each(['main', '', '--option'])('rejects incomplete or mutable commit %s before writing', async commit => {
+    let writes = 0;
+    const input = event('workflows', { intent: 'version', resource_id: resourceId, agent_version_id: versionId,
+      max_steps: '8', max_runtime_seconds: '120', token_budget: '4000', repository_id: resourceId, repository_commit: commit }, () => {
+        writes++; return Response.json({});
+      });
+    expect(await saveStudioResource(input, 'http://api.test')).toMatchObject({ status: 400 });
+    expect(writes).toBe(0);
   });
 });

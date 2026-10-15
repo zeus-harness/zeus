@@ -27,9 +27,30 @@ impl DurableRunExecutor {
     ) -> Result<Value, RuntimeControl> {
         let plan = self.load_plan(run).await?;
         let deadline = plan.remaining_runtime()?;
-        match tokio::time::timeout(deadline, self.run_loop(run, &plan, cancellation)).await {
+        let cancellation_requested = cancellation.clone();
+        let execution = tokio::time::timeout(deadline, async {
+            let binding = self.prepare_code(run, &plan).await?;
+            let result = self.run_loop(run, &plan, cancellation).await;
+            if matches!(
+                &result,
+                Ok(_) | Err(RuntimeControl::WaitingApproval | RuntimeControl::WaitingChild)
+            ) && let Some(binding) = binding
+            {
+                self.checkpoint_code(run, &binding).await?;
+            }
+            result
+        });
+        let outcome = tokio::select! {
+            () = cancellation_requested.cancelled() => return Err(RuntimeControl::Canceled),
+            outcome = execution => outcome,
+        };
+        match outcome {
             Ok(result) => result,
-            Err(_) => Err(RuntimeFailure::Limit("run_timeout").into()),
+            Err(_) => Err(plan
+                .remaining_runtime()
+                .err()
+                .unwrap_or(RuntimeFailure::Limit("run_timeout"))
+                .into()),
         }
     }
 
@@ -99,7 +120,15 @@ impl DurableRunExecutor {
 
             let events = self.load_session_events(run).await?;
             let experience = self.load_experience_context(run, plan).await?;
-            let system_prompt = render_system_prompt(&plan.instructions, &experience);
+            let mut system_prompt = render_system_prompt(&plan.instructions, &experience);
+            if plan
+                .capability_policy
+                .get("studio_chat")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                system_prompt.push_str("\nZeus 资源操作约定：资源工具返回 status=proposed 时，仅生成待确认预览，尚未创建资源；告诉用户在预览卡中确认。返回 open 才是已创建的待处理工作项，unpublished 才是未发布流程。不得把 open 称为草稿，不得臆测指派等操作需要审批。用户说先确认、草稿、不要创建时不要直接创建，应提供可确认的建议。聊天不自动执行业务流程。");
+            }
             let context = SessionContextBuilder::default()
                 .with_system_prompt(&system_prompt)
                 .build(&events)
@@ -242,13 +271,17 @@ impl DurableRunExecutor {
 
         let mut transaction = self.begin_fenced(run).await?;
         let mut assistant_event_id = None;
-        if !completion.assistant_text.is_empty() {
+        if !completion.assistant_text.is_empty() || !completion.tool_calls.is_empty() {
             assistant_event_id = Some(
                 append_session_event(
                     &mut transaction,
                     run,
                     "assistant_message",
-                    json!({ "content": completion.assistant_text }),
+                    json!({
+                        "content": completion.assistant_text,
+                        "reasoning_content": completion.reasoning_content,
+                        "tool_calls_follow": !completion.tool_calls.is_empty(),
+                    }),
                 )
                 .await?,
             );
@@ -259,7 +292,8 @@ impl DurableRunExecutor {
                 .get(&call.capability)
                 .copied()
                 .ok_or(RuntimeFailure::InvalidModelTool)?;
-            let requires_approval = capability.needs_approval(&plan.approval_policy);
+            let requires_approval = capability.resource_authorization_required
+                || capability.needs_approval(&plan.approval_policy);
             let status = if requires_approval {
                 "pending_approval"
             } else {
@@ -317,13 +351,20 @@ impl DurableRunExecutor {
             if requires_approval {
                 sqlx::query(
                     "insert into approvals (
-                        organization_id, workspace_id, run_id, tool_call_id
-                     ) values ($1, $2, $3, $4)",
+                        organization_id, workspace_id, run_id, tool_call_id, kind, requested_by, input_snapshot, capability_revision, binding_revision, expires_at
+                     ) select $1, $2, $3, $4, $5, created_by, $6,
+                         $7, $8, least(deadline_at,
+                         now() + make_interval(secs => (time_policy->>'wait_timeout_seconds')::integer))
+                       from runs where id = $3",
                 )
                 .bind(run.organization_id)
                 .bind(run.workspace_id)
                 .bind(run.run_id)
                 .bind(tool_call_id)
+                .bind(if capability.resource_authorization_required { "resource_access" } else { "execution" })
+                .bind(&call.arguments)
+                .bind(capability.capability_revision)
+                .bind(capability.binding_revision)
                 .execute(&mut *transaction)
                 .await?;
             }

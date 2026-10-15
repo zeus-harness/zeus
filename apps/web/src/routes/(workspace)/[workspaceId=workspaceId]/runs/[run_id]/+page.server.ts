@@ -1,3 +1,4 @@
+import { loadCapabilityCatalog } from '$lib/api/agent-studio';
 import { fail, redirect } from '@sveltejs/kit';
 import { env } from '$env/dynamic/private';
 import type { Actions, PageServerLoad } from './$types';
@@ -28,7 +29,8 @@ async function actionWorkspace(event: Parameters<NonNullable<Actions['cancel']>>
 }
 
 export const load: PageServerLoad = async ({ fetch, parent, request, params, url }) => {
-  const { status: authStatus } = await parent();
+  const context = await parent();
+  const { status: authStatus } = context;
   const apiFetch = serverApiFetcher(fetch, request.headers.get('cookie'), url.origin);
   const workspaceContext = {
     authStatus,
@@ -43,7 +45,11 @@ export const load: PageServerLoad = async ({ fetch, parent, request, params, url
     )
   ]);
 
+  let catalog: Awaited<ReturnType<typeof loadCapabilityCatalog>>['items'] = [];
+  try { catalog = (await loadCapabilityCatalog(apiFetch, env.ZEUS_API_URL, context.activeOrganization.organization_id)).items; }
+  catch { /* Names are optional; trace authorization remains authoritative. */ }
   return {
+    catalog,
     trace,
     childRuns,
     runId: params.run_id,
@@ -79,7 +85,7 @@ export const actions: Actions = {
         context.apiFetch,
         { apiBaseUrl: env.ZEUS_API_URL, workspaceId: context.workspaceId },
         event.params.run_id,
-        crypto.randomUUID()
+        `retry-${event.params.run_id}`
       );
       retryRunId = retry.id;
     } catch (error) {

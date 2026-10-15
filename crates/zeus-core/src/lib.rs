@@ -1,5 +1,6 @@
 //! IO-free domain model for Zeus.
 
+mod approval;
 mod capability;
 mod event;
 mod id;
@@ -13,6 +14,7 @@ mod usage;
 mod work_item;
 mod workflow;
 
+pub use approval::can_decide_approval;
 pub use capability::{CapabilityPolicy, IdempotencyMode, RiskLevel};
 pub use event::{
     ActorKind, ActorRef, EventEnvelope, SessionEvent, SessionEventKind, ToolPairError,

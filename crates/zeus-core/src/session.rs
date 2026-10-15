@@ -27,29 +27,51 @@ impl SessionContext {
     ///
     /// Returns [`SessionContextError::ToolPairs`] when the event slice has an
     /// orphan, duplicate, or unfinished tool call.
+    #[allow(clippy::too_many_lines)] // Keep replay ordering and tool-boundary handling together.
     pub fn from_events(events: &[SessionEvent]) -> Result<Self, SessionContextError> {
         validate_tool_pairs(events)?;
 
         let mut messages = Vec::new();
         let mut open_tool_calls = Vec::new();
+        let mut assistant_for_tools = None;
         let mut pending_call_ids = HashSet::new();
         let mut queued_steering = VecDeque::new();
 
         for event in events {
             match &event.kind {
                 SessionEventKind::UserMessage { content } => {
-                    flush_tool_calls(&mut messages, &mut open_tool_calls);
+                    flush_tool_calls(
+                        &mut messages,
+                        &mut open_tool_calls,
+                        &mut assistant_for_tools,
+                    );
                     if pending_call_ids.is_empty() {
                         flush_steering(&mut messages, &mut queued_steering);
                     }
                     messages.push(ModelMessage::user(content.clone()));
                 }
                 SessionEventKind::AssistantMessage { content } => {
-                    flush_tool_calls(&mut messages, &mut open_tool_calls);
+                    flush_tool_calls(
+                        &mut messages,
+                        &mut open_tool_calls,
+                        &mut assistant_for_tools,
+                    );
                     if pending_call_ids.is_empty() {
                         flush_steering(&mut messages, &mut queued_steering);
                     }
-                    messages.push(ModelMessage::assistant(content.clone()));
+                    messages.push(ModelMessage::Assistant {
+                        content: Some(content.clone()),
+                        reasoning_content: event
+                            .envelope
+                            .payload
+                            .get("reasoning_content")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        tool_calls: Vec::new(),
+                    });
+                    assistant_for_tools = (event.envelope.payload.get("tool_calls_follow")
+                        == Some(&Value::Bool(true)))
+                    .then_some(messages.len() - 1);
                 }
                 SessionEventKind::ToolCall {
                     call_id,
@@ -75,7 +97,11 @@ impl SessionContext {
                     result,
                     synthetic,
                 } => {
-                    flush_tool_calls(&mut messages, &mut open_tool_calls);
+                    flush_tool_calls(
+                        &mut messages,
+                        &mut open_tool_calls,
+                        &mut assistant_for_tools,
+                    );
                     messages.push(ModelMessage::tool(ToolResult {
                         call_id: call_id.clone(),
                         content: result.clone(),
@@ -94,7 +120,11 @@ impl SessionContext {
                 }
                 SessionEventKind::ApprovalResult { .. }
                 | SessionEventKind::FollowUpMessage { .. } => {
-                    flush_tool_calls(&mut messages, &mut open_tool_calls);
+                    flush_tool_calls(
+                        &mut messages,
+                        &mut open_tool_calls,
+                        &mut assistant_for_tools,
+                    );
                     if pending_call_ids.is_empty() {
                         flush_steering(&mut messages, &mut queued_steering);
                     }
@@ -102,7 +132,11 @@ impl SessionContext {
             }
         }
 
-        flush_tool_calls(&mut messages, &mut open_tool_calls);
+        flush_tool_calls(
+            &mut messages,
+            &mut open_tool_calls,
+            &mut assistant_for_tools,
+        );
         flush_steering(&mut messages, &mut queued_steering);
 
         Ok(Self { messages })
@@ -164,11 +198,22 @@ pub enum SessionContextError {
     ToolPairs(#[from] ToolPairError),
 }
 
-fn flush_tool_calls(messages: &mut Vec<ModelMessage>, open_tool_calls: &mut Vec<ToolCall>) {
+fn flush_tool_calls(
+    messages: &mut Vec<ModelMessage>,
+    open_tool_calls: &mut Vec<ToolCall>,
+    assistant_for_tools: &mut Option<usize>,
+) {
     if !open_tool_calls.is_empty() {
-        messages.push(ModelMessage::assistant_with_tool_calls(std::mem::take(
-            open_tool_calls,
-        )));
+        let calls = std::mem::take(open_tool_calls);
+        if assistant_for_tools
+            .take()
+            .is_some_and(|index| index + 1 == messages.len())
+            && let Some(ModelMessage::Assistant { tool_calls, .. }) = messages.last_mut()
+        {
+            tool_calls.extend(calls);
+        } else {
+            messages.push(ModelMessage::assistant_with_tool_calls(calls));
+        }
     }
 }
 
@@ -205,6 +250,60 @@ mod tests {
                 payload: json!({}),
             },
             kind,
+        }
+    }
+
+    #[test]
+    fn approval_resume_preserves_one_assistant_turn_with_provider_reasoning() {
+        for content in ["", "Checking the request."] {
+            let mut assistant = event(
+                1,
+                SessionEventKind::AssistantMessage {
+                    content: content.into(),
+                },
+            );
+            assistant.envelope.payload =
+                json!({"reasoning_content":"fixture reasoning", "tool_calls_follow":true});
+            let events = vec![
+                assistant,
+                event(
+                    2,
+                    SessionEventKind::ToolCall {
+                        call_id: "call-1".into(),
+                        capability: "read".into(),
+                    },
+                ),
+                event(
+                    3,
+                    SessionEventKind::ApprovalResult {
+                        approval_id: Uuid::nil(),
+                        approved: false,
+                    },
+                ),
+                event(
+                    4,
+                    SessionEventKind::ToolResult {
+                        call_id: "call-1".into(),
+                        result: json!({"code":"approval_rejected"}),
+                        synthetic: true,
+                    },
+                ),
+            ];
+            let restored: Vec<SessionEvent> =
+                serde_json::from_value(serde_json::to_value(&events).unwrap()).unwrap();
+            let context = SessionContext::from_events(&restored).unwrap();
+            assert_eq!(context.messages().len(), 2);
+            assert!(
+                matches!(&context.messages()[0], ModelMessage::Assistant { content: text, reasoning_content: Some(reasoning), tool_calls }
+                if text.as_deref()==Some(content) && reasoning=="fixture reasoning" && tool_calls.len()==1)
+            );
+            assert!(matches!(
+                &context.messages()[1],
+                ModelMessage::Tool {
+                    synthetic: true,
+                    ..
+                }
+            ));
         }
     }
 

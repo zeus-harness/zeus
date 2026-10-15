@@ -1,7 +1,9 @@
 use axum::Router;
 
+pub mod code_workspace;
 pub mod model;
 pub mod runtime;
+pub mod sandbox;
 pub mod supervisor;
 
 use crate::{AppState, execution_api};

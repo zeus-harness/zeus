@@ -103,6 +103,16 @@ export function listWorkItemAttachments(
 
 export type WorkItemReview = components['schemas']['WorkItemReviewResponse'];
 export type WorkItemReviewPage = components['schemas']['WorkItemReviewPageResponse'];
+export type WorkItemArchive = components['schemas']['WorkItemArchiveResponse'];
+
+export function getWorkItemArchive(fetcher: ApiFetcher, options: WorkspaceRequestOptions, workItemId: string): Promise<WorkItemArchive | null> {
+  return requestWorkspaceJson(fetcher, options, `/work-items/${encodeURIComponent(workItemId)}/archive`);
+}
+
+export function archiveWorkItem(fetcher: ApiFetcher, options: WorkspaceRequestOptions, workItemId: string, revision: number, input: components['schemas']['ArchiveWorkItemRequest'], idempotencyKey: string): Promise<WorkItemArchive> {
+  return requestWorkspaceJson(fetcher, options, `/work-items/${encodeURIComponent(workItemId)}/archive`,
+    jsonRequest('POST', input, { 'If-Match': `"revision-${revision}"`, 'Idempotency-Key': idempotencyKey }));
+}
 
 export function listWorkItemReviews(fetcher: ApiFetcher, options: WorkspaceRequestOptions, workItemId: string, cursor?: string): Promise<WorkItemReviewPage> {
   return requestWorkspaceJson(fetcher, options, `/work-items/${encodeURIComponent(workItemId)}/reviews`, undefined, { limit: 50, cursor });

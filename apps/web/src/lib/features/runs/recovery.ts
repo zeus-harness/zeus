@@ -11,8 +11,9 @@ export function runRecovery(status: string, code: string | null): string | null 
       return '模型服务限流。等待额度恢复或降低并发后再创建重试 Run。';
     case 'model_request_rejected':
     case 'invalid_model_configuration':
+      return '请 Organization Owner 检查组织模型地址、模型 ID、连接密钥及配置是否已归档，再创建重试 Run。';
     case 'runtime_configuration_unavailable':
-      return '请 Workspace Owner 检查模型地址、模型 ID、连接密钥及配置是否已归档，再创建重试 Run。';
+      return '运行绑定的配置已改变或不可用。请 Organization Owner 核对组织模型与供应商配置，再创建新尝试使用当前配置；原 Run 不会换用新配置继续执行。';
     case 'token_budget_exceeded':
     case 'token_budget_exhausted':
     case 'max_steps_exceeded':

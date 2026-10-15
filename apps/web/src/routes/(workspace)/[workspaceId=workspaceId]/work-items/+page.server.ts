@@ -43,6 +43,12 @@ export const load: PageServerLoad = async ({ fetch, parent, params, request, url
   const status = url.searchParams.get('status') || undefined;
   const assigneeUserId = url.searchParams.get('assignee_user_id') || undefined;
   const view = url.searchParams.get('view') ?? '';
+  if (view === 'unassigned' && assigneeUserId) {
+    const canonical = new URL(url);
+    canonical.searchParams.delete('assignee_user_id');
+    canonical.searchParams.delete('cursor');
+    redirect(307, canonical.pathname + canonical.search);
+  }
   const cursor = url.searchParams.get('cursor') || undefined;
   const result = await loadWorkspaceData(
     apiFetch,
